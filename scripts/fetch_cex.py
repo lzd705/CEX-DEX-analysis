@@ -393,6 +393,31 @@ def read_token_config(path: Path):
     return rows
 
 
+def read_exchange_rows(path: Path):
+    """Read existing exchange facts with numeric fields restored."""
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+    numeric_fields = ["open", "high", "low", "close", "base_volume", "quote_volume_usd"]
+    for row in rows:
+        for field in numeric_fields:
+            value = row.get(field)
+            row[field] = float(value) if value not in (None, "") else None
+    return rows
+
+
+def merge_exchange_rows(existing_rows, new_rows):
+    """Upsert exchange facts by token, exchange, symbol, and date."""
+    merged = {
+        (row["token_symbol"], row["exchange"], row["cex_symbol"], row["date"]): row
+        for row in existing_rows
+    }
+    for row in new_rows:
+        merged[(row["token_symbol"], row["exchange"], row["cex_symbol"], row["date"])] = row
+    return list(merged.values())
+
+
 def filter_token_rows(rows, token_symbols):
     """Keep only explicitly requested token symbols."""
     if token_symbols is None:
@@ -1088,14 +1113,33 @@ def write_coverage_rows(rows, output_path: Path):
         writer.writerows(rows)
 
 
-def main(token_symbols=None, exchanges=None) -> None:
+def main(
+    token_symbols=None,
+    exchanges=None,
+    append=False,
+    start_date=None,
+    end_date=None,
+    limit_days=LIMIT_DAYS,
+) -> None:
     """Fetch CEX data into processed CSV files."""
+    global LIMIT_DAYS
+    LIMIT_DAYS = limit_days
     token_rows = filter_token_rows(read_token_config(TOKEN_CONFIG_PATH), token_symbols)
     selected_exchanges = exchanges or EXCHANGES
     unknown_exchanges = sorted(set(selected_exchanges) - set(EXCHANGES))
     if unknown_exchanges:
         raise ValueError("Unsupported exchanges: %s" % ", ".join(unknown_exchanges))
     rows = build_rows(token_rows, selected_exchanges)
+    rows = [
+        row
+        for row in rows
+        if (start_date is None or row["date"] >= start_date)
+        and (end_date is None or row["date"] <= end_date)
+    ]
+    if append:
+        if token_symbols is None:
+            raise ValueError("--append requires --tokens")
+        rows = merge_exchange_rows(read_exchange_rows(EXCHANGE_OUTPUT_PATH), rows)
     stable_exchanges = select_stable_exchanges(
         rows,
         minimum_exchange_count=min(MIN_EXCHANGE_COUNT, len(selected_exchanges)),
@@ -1130,13 +1174,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Fetch daily CEX market facts")
     parser.add_argument("--tokens", help="Comma-separated token symbols")
     parser.add_argument("--exchanges", help="Comma-separated exchange names")
+    parser.add_argument("--append", action="store_true", help="Upsert selected Token rows")
+    parser.add_argument("--start", help="Inclusive UTC date")
+    parser.add_argument("--end", help="Inclusive UTC date")
+    parser.add_argument("--limit-days", type=int, default=LIMIT_DAYS)
     args = parser.parse_args()
 
     tokens = [item.strip().upper() for item in (args.tokens or "").split(",") if item.strip()] or None
     exchanges = [item.strip().lower() for item in (args.exchanges or "").split(",") if item.strip()] or None
-    return tokens, exchanges
+    return tokens, exchanges, args.append, args.start, args.end, args.limit_days
 
 
 if __name__ == "__main__":
-    selected_tokens, selected_exchanges = parse_args()
-    main(selected_tokens, selected_exchanges)
+    selected_tokens, selected_exchanges, append_rows, start_date, end_date, limit_days = parse_args()
+    main(selected_tokens, selected_exchanges, append_rows, start_date, end_date, limit_days)

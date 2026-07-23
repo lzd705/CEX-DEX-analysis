@@ -24,9 +24,27 @@ from scripts.fetch_dex import filter_token_rows
 from scripts.fetch_dex import replace_token_rows
 from scripts.fetch_dex import deduplicate_pool_volume_rows
 from scripts.fetch_dex import TOP_POOL_COUNT
+from scripts.fetch_dex import merge_pool_volume_rows
 
 
 class FetchDexTests(unittest.TestCase):
+    def test_merge_pool_volume_rows_preserves_other_tokens_and_dates(self):
+        existing = [
+            {"date": "2026-01-01", "token_symbol": "UNI", "chain": "eth", "pool_address": "0xuni", "close": "1"},
+            {"date": "2026-01-01", "token_symbol": "AAVE", "chain": "eth", "pool_address": "0xaave", "close": "2"},
+        ]
+        updated = [
+            {"date": "2026-01-01", "token_symbol": "UNI", "chain": "eth", "pool_address": "0xuni", "close": "1.5"},
+            {"date": "2026-01-02", "token_symbol": "UNI", "chain": "eth", "pool_address": "0xuni", "close": "1.6"},
+        ]
+
+        result = merge_pool_volume_rows(existing, updated)
+
+        by_key = {(row["token_symbol"], row["date"]): row for row in result}
+        self.assertEqual(by_key[("UNI", "2026-01-01")]["close"], "1.5")
+        self.assertEqual(by_key[("UNI", "2026-01-02")]["close"], "1.6")
+        self.assertEqual(by_key[("AAVE", "2026-01-01")]["close"], "2")
+
     def test_every_configured_token_has_chain_config(self):
         token_rows = read_token_config(TOKEN_CONFIG_PATH)
         chain_rows = read_token_chain_config(TOKEN_CHAIN_CONFIG_PATH, token_rows)

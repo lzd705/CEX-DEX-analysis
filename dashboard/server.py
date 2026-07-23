@@ -5,18 +5,25 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import hmac
 import json
 import math
 import os
+import re
 import statistics
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
+try:
+    from dashboard.admin import AdminService
+except ModuleNotFoundError:
+    from admin import AdminService
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD_ROOT = Path(__file__).resolve().parent
@@ -31,6 +38,28 @@ DEX_FILENAME = "dex_pool_volume_daily.csv"
 VENDOR_FILES = {
     "/vendor/lucide.js": DASHBOARD_ROOT / "node_modules/lucide/dist/umd/lucide.min.js",
 }
+
+
+def load_local_environment(path: Path) -> None:
+    """Load simple KEY=VALUE entries without executing the local env file."""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+load_local_environment(PROJECT_ROOT / ".env")
+ADMIN_SERVICE = AdminService()
 
 
 def parse_number(value: str | None) -> float | None:
@@ -320,14 +349,63 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=str(STATIC_ROOT), **kwargs)
 
-    def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def send_json(
+        self,
+        payload: Any,
+        status: HTTPStatus = HTTPStatus.OK,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def read_json(self) -> dict[str, Any]:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length < 0 or content_length > 16_384:
+            raise ValueError("Request body is too large")
+        payload = json.loads(self.rfile.read(content_length) or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
+    def admin_session_token(self) -> str | None:
+        cookie = SimpleCookie()
+        cookie.load(self.headers.get("Cookie", ""))
+        morsel = cookie.get("admin_session")
+        return morsel.value if morsel else None
+
+    def require_admin(self, *, csrf: bool = False) -> tuple[str, dict[str, Any]] | None:
+        session_token = self.admin_session_token()
+        session = ADMIN_SERVICE.get_session(session_token)
+        if not session:
+            self.send_json({"error": "Administrator authentication required"}, HTTPStatus.UNAUTHORIZED)
+            return None
+        if csrf and not hmac.compare_digest(
+            self.headers.get("X-CSRF-Token", ""),
+            session["csrf_token"],
+        ):
+            self.send_json({"error": "Invalid CSRF token"}, HTTPStatus.FORBIDDEN)
+            return None
+        return session_token or "", session
+
+    def admin_cookie(self, session_token: str, *, clear: bool = False) -> str:
+        secure = os.environ.get("ADMIN_COOKIE_SECURE", "").lower() in {"1", "true", "yes"}
+        parts = [
+            f"admin_session={'' if clear else session_token}",
+            "Path=/api/admin",
+            "HttpOnly",
+            "SameSite=Strict",
+            f"Max-Age={0 if clear else 8 * 60 * 60}",
+        ]
+        if secure:
+            parts.append("Secure")
+        return "; ".join(parts)
 
     def end_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -366,6 +444,20 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             except (FileNotFoundError, ValueError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
+        if parsed.path == "/api/admin/session":
+            session = ADMIN_SERVICE.get_session(self.admin_session_token())
+            self.send_json(ADMIN_SERVICE.public_session(session))
+            return
+        if parsed.path == "/api/admin/tokens":
+            authenticated = self.require_admin()
+            if authenticated:
+                self.send_json({"tokens": ADMIN_SERVICE.configured_tokens()})
+            return
+        if parsed.path == "/api/admin/jobs":
+            authenticated = self.require_admin()
+            if authenticated:
+                self.send_json({"jobs": ADMIN_SERVICE.list_jobs()})
+            return
         if parsed.path == "/health":
             try:
                 cex_path, dex_path = resolve_data_paths()
@@ -374,6 +466,60 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 self.send_json({"status": "degraded", "data_ready": False, "error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
             return
         super().do_GET()
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        try:
+            payload = self.read_json()
+        except (ValueError, json.JSONDecodeError) as error:
+            self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if path == "/api/admin/login":
+            try:
+                session_token, session = ADMIN_SERVICE.login(
+                    self.client_address[0],
+                    str(payload.get("username", ""))[:80],
+                    str(payload.get("password", ""))[:512],
+                )
+            except RuntimeError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            except PermissionError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.TOO_MANY_REQUESTS)
+                return
+            except ValueError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.UNAUTHORIZED)
+                return
+            self.send_json(session, extra_headers={"Set-Cookie": self.admin_cookie(session_token)})
+            return
+
+        if path == "/api/admin/logout":
+            authenticated = self.require_admin(csrf=True)
+            if not authenticated:
+                return
+            session_token, _ = authenticated
+            ADMIN_SERVICE.logout(session_token)
+            self.send_json(
+                {"authenticated": False},
+                extra_headers={"Set-Cookie": self.admin_cookie(session_token, clear=True)},
+            )
+            return
+
+        if path == "/api/admin/jobs":
+            authenticated = self.require_admin(csrf=True)
+            if not authenticated:
+                return
+            _, session = authenticated
+            try:
+                job = ADMIN_SERVICE.create_job(payload, session["username"])
+            except (ValueError, OSError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json(job, HTTPStatus.ACCEPTED)
+            return
+
+        self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
 
 def parse_args() -> argparse.Namespace:

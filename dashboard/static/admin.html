@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Market Monitor Admin</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/admin.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark">CD</div>
+        <div>
+          <h1>Market Monitor Admin</h1>
+          <p>Authenticated data refresh workspace</p>
+        </div>
+      </div>
+      <a class="monitor-link" href="/">
+        <i data-lucide="chart-no-axes-combined"></i>
+        <span>Market Monitor</span>
+      </a>
+    </header>
+
+    <main class="admin-main">
+      <div id="admin-error" class="error-banner" hidden></div>
+
+      <section id="login-view" class="login-view">
+        <form id="login-form" class="login-panel">
+          <div class="admin-section-header">
+            <div>
+              <h2>Administrator sign in</h2>
+              <p id="login-status">Checking server configuration</p>
+            </div>
+            <i data-lucide="shield-check"></i>
+          </div>
+          <label>
+            <span>Username</span>
+            <input id="admin-username" name="username" autocomplete="username" required>
+          </label>
+          <label>
+            <span>Password</span>
+            <input id="admin-password" name="password" type="password" autocomplete="current-password" required>
+          </label>
+          <button id="login-button" class="admin-primary" type="submit">
+            <i data-lucide="log-in"></i>
+            <span>Sign in</span>
+          </button>
+        </form>
+      </section>
+
+      <section id="admin-view" hidden>
+        <div class="admin-toolbar">
+          <div>
+            <span class="admin-kicker">Signed in as</span>
+            <strong id="session-user"></strong>
+          </div>
+          <button id="logout-button" class="admin-secondary" type="button" title="Sign out">
+            <i data-lucide="log-out"></i>
+            <span>Sign out</span>
+          </button>
+        </div>
+
+        <section class="refresh-section">
+          <div class="admin-section-header">
+            <div>
+              <h2>Refresh market facts</h2>
+              <p>Configured Tokens · latest completed UTC day · maximum 180 days</p>
+            </div>
+            <span class="read-only-tag">CEX + DEX</span>
+          </div>
+          <form id="refresh-form" class="refresh-form">
+            <label>
+              <span>Token</span>
+              <select id="refresh-token" required></select>
+            </label>
+            <label>
+              <span>Start date</span>
+              <input id="refresh-start" type="date" required>
+            </label>
+            <label>
+              <span>End date</span>
+              <input id="refresh-end" type="date" required>
+            </label>
+            <button id="refresh-button" class="admin-primary" type="submit">
+              <i data-lucide="database-zap"></i>
+              <span>Queue refresh</span>
+            </button>
+          </form>
+        </section>
+
+        <section class="jobs-section">
+          <div class="admin-section-header">
+            <div>
+              <h2>Refresh jobs</h2>
+              <p id="jobs-summary">No jobs loaded</p>
+            </div>
+            <button id="reload-jobs" class="icon-only" type="button" title="Reload jobs" aria-label="Reload jobs">
+              <i data-lucide="refresh-cw"></i>
+            </button>
+          </div>
+          <div class="admin-table-wrap">
+            <table class="jobs-table">
+              <thead>
+                <tr>
+                  <th>Created</th>
+                  <th>Token</th>
+                  <th>Window</th>
+                  <th>Status</th>
+                  <th>Finished</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody id="jobs-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/vendor/lucide.js"></script>
+    <script src="/admin.js"></script>
+  </body>
+</html>

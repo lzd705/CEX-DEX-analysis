@@ -1,7 +1,7 @@
 # CEX / DEX Market Monitor
 
-This frontend presents market facts only. It does not expose candidate factors,
-future returns, research notes, or administrator controls.
+The public frontend presents market facts only. Administrator controls live on
+a separate server-authenticated page.
 
 ## Required local data
 
@@ -25,14 +25,27 @@ npm --prefix dashboard install
 
 Open `http://127.0.0.1:8765`.
 
+Local startup binds to `127.0.0.1` by default. Set `HOST=0.0.0.0` only in a
+controlled deployment environment.
+
 To keep the code and data in separate locations, set `MARKET_DATA_DIR`:
 
 ```bash
 MARKET_DATA_DIR=/srv/cex-dex/current ./scripts/run_dashboard.sh
 ```
 
-The Docker image uses the same contract and expects a read-only data volume at
-`/app/data/local`.
+The Docker image uses the same contract and expects an external data volume at
+`/app/data/local`. Use a read-only mount when administrator refresh is disabled
+and a service-account-owned writable mount when it is enabled.
+
+## Administrator page
+
+After configuring `.env` as described in `docs/admin-operations.md`, open
+`http://127.0.0.1:8765/admin.html`.
+
+The backend validates the session, CSRF token, configured Token, and refresh
+window before starting a one-at-a-time pipeline job. Successful jobs atomically
+publish the two detailed CSVs back into `data/local/`.
 
 ## Display contract
 

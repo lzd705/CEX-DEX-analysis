@@ -1,7 +1,7 @@
 # Public deployment boundary
 
-Market Monitor is read-only. It has no browser endpoint for changing data, no
-administrator form, and no persistent user state.
+Market Monitor is read-only for ordinary visitors. Administrator APIs remain
+disabled until `ADMIN_PASSWORD_HASH` is configured.
 
 Production should run the application container separately from its data:
 
@@ -23,7 +23,10 @@ new reviewed data snapshot by atomically switching `/srv/cex-dex/current` to a
 new version and restarting the container. Keep prior snapshot directories for
 rollback.
 
-The server exposes only static files, `GET /api/market`, and `GET /health`.
+That read-only mount is appropriate when administrator refresh is disabled. An
+administrator-enabled deployment needs a writable data mount owned only by the
+service account, plus `ADMIN_COOKIE_SECURE=true`.
+
 Security headers block framing, external scripts, device permissions, and
-cross-origin content. A reverse proxy should provide HTTPS, access logs, rate
+cross-origin content. A reverse proxy must provide HTTPS, access logs, rate
 limits, and the public domain.

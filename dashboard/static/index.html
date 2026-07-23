@@ -69,10 +69,12 @@
             <option value="volatility">Daily Volatility</option>
           </select>
         </label>
-        <label class="search-control">
-          <i data-lucide="search"></i>
-          <input id="token-search" type="search" placeholder="Filter token" autocomplete="off">
-        </label>
+        <div class="search-control">
+          <input id="token-search" type="search" placeholder="Search token" aria-label="Token symbol" autocomplete="off">
+          <button id="search-token" type="button" title="Search token" aria-label="Search token">
+            <i data-lucide="search"></i>
+          </button>
+        </div>
         <div id="row-count" class="row-count"></div>
       </section>
 

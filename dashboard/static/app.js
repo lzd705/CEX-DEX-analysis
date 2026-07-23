@@ -2,6 +2,7 @@ const app = {
   payload: null,
   scope: "combined",
   selections: {},
+  searchQuery: "",
 };
 
 const byId = (id) => document.getElementById(id);
@@ -174,7 +175,7 @@ function tokenRows(tokenSummary, cexOptions, dexOptions) {
 
 function renderTable() {
   ensureSelections();
-  const query = byId("token-search").value.trim().toUpperCase();
+  const query = app.searchQuery;
   const cexByToken = grouped(app.payload.cex_markets);
   const dexByToken = grouped(app.payload.dex_pools);
   const tokens = app.payload.tokens
@@ -253,6 +254,10 @@ function setPreset(days) {
 }
 
 function bindEvents() {
+  const applyTokenSearch = () => {
+    app.searchQuery = byId("token-search").value.trim().toUpperCase();
+    renderTable();
+  };
   byId("apply-window").addEventListener("click", () => {
     loadMarket(byId("date-start").value, byId("date-end").value).catch(showError);
   });
@@ -271,7 +276,11 @@ function bindEvents() {
     });
   });
   byId("sort-field").addEventListener("change", renderTable);
-  byId("token-search").addEventListener("input", renderTable);
+  byId("search-token").addEventListener("click", applyTokenSearch);
+  byId("token-search").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") applyTokenSearch();
+  });
+  byId("token-search").addEventListener("search", applyTokenSearch);
 }
 
 bindEvents();

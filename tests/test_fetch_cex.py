@@ -31,9 +31,27 @@ from scripts.fetch_cex import aggregate_cex_rows
 from scripts.fetch_cex import build_coverage_rows
 from scripts.fetch_cex import select_stable_exchanges
 from scripts.fetch_cex import write_exchange_rows
+from scripts.fetch_cex import merge_exchange_rows
 
 
 class FetchCexTests(unittest.TestCase):
+    def test_merge_exchange_rows_updates_only_matching_natural_key(self):
+        existing = [
+            {"date": "2026-01-01", "token_symbol": "UNI", "exchange": "binance", "cex_symbol": "UNI/USDT", "close": 1.0},
+            {"date": "2026-01-01", "token_symbol": "AAVE", "exchange": "binance", "cex_symbol": "AAVE/USDT", "close": 2.0},
+        ]
+        updated = [
+            {"date": "2026-01-01", "token_symbol": "UNI", "exchange": "binance", "cex_symbol": "UNI/USDT", "close": 1.5},
+            {"date": "2026-01-02", "token_symbol": "UNI", "exchange": "binance", "cex_symbol": "UNI/USDT", "close": 1.6},
+        ]
+
+        result = merge_exchange_rows(existing, updated)
+
+        by_key = {(row["token_symbol"], row["date"]): row for row in result}
+        self.assertEqual(by_key[("UNI", "2026-01-01")]["close"], 1.5)
+        self.assertEqual(by_key[("UNI", "2026-01-02")]["close"], 1.6)
+        self.assertEqual(by_key[("AAVE", "2026-01-01")]["close"], 2.0)
+
     def test_default_minimum_exchange_count_is_three(self):
         self.assertEqual(MIN_EXCHANGE_COUNT, 3)
 

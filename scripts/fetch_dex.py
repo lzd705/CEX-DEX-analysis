@@ -185,6 +185,17 @@ def replace_token_rows(existing_rows, new_rows, token_symbols):
     return result
 
 
+def merge_pool_volume_rows(existing_rows, new_rows):
+    """Upsert pool facts by token, chain, pool, and date."""
+    merged = {
+        (row["token_symbol"], row["chain"], row["pool_address"], row["date"]): row
+        for row in existing_rows
+    }
+    for row in new_rows:
+        merged[(row["token_symbol"], row["chain"], row["pool_address"], row["date"])] = row
+    return list(merged.values())
+
+
 def deduplicate_pool_volume_rows(rows):
     """Keep one row for each token-pool-date combination."""
     seen = set()
@@ -703,8 +714,16 @@ def fetch_selected_tokens(token_rows, chain_rows_by_token):
     return selected_pools, pool_volume_rows
 
 
-def main(token_symbols=None, append=False) -> None:
+def main(
+    token_symbols=None,
+    append=False,
+    start_date=None,
+    end_date=None,
+    limit_days=LIMIT_DAYS,
+) -> None:
     """Fetch DEX data into processed CSV files."""
+    global LIMIT_DAYS
+    LIMIT_DAYS = limit_days
     all_token_rows = read_token_config(TOKEN_CONFIG_PATH)
     token_rows = filter_token_rows(all_token_rows, token_symbols)
     chain_rows = read_token_chain_config(TOKEN_CHAIN_CONFIG_PATH, all_token_rows)
@@ -714,6 +733,12 @@ def main(token_symbols=None, append=False) -> None:
         token_rows,
         chain_rows_by_token,
     )
+    pool_volume_rows = [
+        row
+        for row in pool_volume_rows
+        if (start_date is None or row["date"] >= start_date)
+        and (end_date is None or row["date"] <= end_date)
+    ]
 
     expected_token_count = len(token_rows)
 
@@ -728,11 +753,7 @@ def main(token_symbols=None, append=False) -> None:
             selected_pools,
             token_symbols,
         )
-        pool_volume_rows = replace_token_rows(
-            existing_pool_volume_rows,
-            pool_volume_rows,
-            token_symbols,
-        )
+        pool_volume_rows = merge_pool_volume_rows(existing_pool_volume_rows, pool_volume_rows)
         expected_token_count = len(all_token_rows)
 
     pool_volume_rows = deduplicate_pool_volume_rows(pool_volume_rows)
@@ -760,6 +781,9 @@ def parse_args():
         action="store_true",
         help="Replace selected tokens and preserve existing token rows",
     )
+    parser.add_argument("--start", help="Inclusive UTC date")
+    parser.add_argument("--end", help="Inclusive UTC date")
+    parser.add_argument("--limit-days", type=int, default=LIMIT_DAYS)
     args = parser.parse_args()
 
     token_symbols = None
@@ -770,9 +794,9 @@ def parse_args():
             if cleaned:
                 token_symbols.append(cleaned)
 
-    return token_symbols, args.append
+    return token_symbols, args.append, args.start, args.end, args.limit_days
 
 
 if __name__ == "__main__":
-    selected_tokens, append_rows = parse_args()
-    main(selected_tokens, append_rows)
+    selected_tokens, append_rows, start_date, end_date, limit_days = parse_args()
+    main(selected_tokens, append_rows, start_date, end_date, limit_days)
