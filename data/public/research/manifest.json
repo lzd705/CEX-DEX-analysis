@@ -1,0 +1,42 @@
+{
+  "snapshot_version": "1.0.0",
+  "generated_at": "2026-07-08T21:45:03+08:00",
+  "source_commit": "fe0b31a351ed82f51c06a1d72079652277ddb9c4",
+  "source_directory": "data/a_review/research",
+  "public_directory": "data/public/research",
+  "synthetic": false,
+  "redistribution_note": "Curated research snapshot; review DATA_USAGE.md before redistribution.",
+  "files": {
+    "factor_panel.csv": {
+      "rows": 1780,
+      "tokens": [
+        "AAVE",
+        "ARB",
+        "CRV",
+        "ENA",
+        "LDO",
+        "LINK",
+        "OP",
+        "PENDLE",
+        "PEPE",
+        "UNI"
+      ],
+      "start_date": "2026-01-09",
+      "end_date": "2026-07-05",
+      "columns": 54,
+      "sha256": "2cfab19b0c4f6e6623fccb1af5696d4020d9fcccf6e71ee713ad267d5976c146"
+    },
+    "candidate_factor_forward_returns.csv": {
+      "rows": 147,
+      "sha256": "dfc83bccbc7587058d5d5c04a1db401405301ca7548228c2174defaf68bbbb51"
+    },
+    "coverage_summary.csv": {
+      "rows": 10,
+      "sha256": "38e0d971620ffebd135c4199e5dba4e181d31a0138be4f2a2714001c0182ca50"
+    },
+    "cex_scope_sensitivity.csv": {
+      "rows": 3,
+      "sha256": "3283f53c33bb8b78053cea4a04727b36fbfcd740ed667e012429b89229f86c0b"
+    }
+  }
+}

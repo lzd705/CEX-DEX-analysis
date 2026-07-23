@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dashboard/node_modules/
+dashboard/state/*.local.json
+dashboard/state/*.local.jsonl
+.env
+data/a_review/
+data/raw/
+data/research/

@@ -1,0 +1,4 @@
+scope,cex_exchange_count,weighted_dex_share,median_token_day_dex_share,cex_to_dex_ratio,source_commit,snapshot_note
+Binance + OKX,2,0.1197,0.1083,7.35,ae968f7,Same DEX top-pool sample
+Binance + OKX + Bybit,3,0.0882,0.0802,10.34,ae968f7,Same DEX top-pool sample
+All 10 exchanges,10,0.0520,0.0413,18.23,ae968f7,Same DEX top-pool sample

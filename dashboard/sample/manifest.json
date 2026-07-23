@@ -1,0 +1,21 @@
+{
+  "sample_version": "1.0.0",
+  "generated_by": "research/make_mock_data.py and research/run_research.py",
+  "license": "CC0-1.0",
+  "synthetic": true,
+  "panel": {
+    "path": "data/mock/research/factor_panel.csv",
+    "rows": 595,
+    "tokens": [
+      "AAVE",
+      "ARB",
+      "LINK",
+      "OP",
+      "UNI"
+    ],
+    "start_date": "2026-01-01",
+    "end_date": "2026-04-29"
+  },
+  "factor_results_path": "data/mock/research/candidate_factor_forward_returns.csv",
+  "coverage_path": "data/mock/research/coverage_summary.csv"
+}
