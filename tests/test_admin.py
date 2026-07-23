@@ -21,6 +21,7 @@ class AdminServiceTest(unittest.TestCase):
                 username="research-admin",
                 password_hash=hash_password("a-secure-test-password"),
                 job_dir=Path(directory),
+                login_required=True,
             )
 
             token, public_session = service.login(
@@ -55,6 +56,7 @@ class AdminServiceTest(unittest.TestCase):
                 username="admin",
                 password_hash=hash_password("a-secure-test-password"),
                 job_dir=Path(directory),
+                login_required=True,
             )
             for _ in range(5):
                 with self.assertRaises(ValueError):
