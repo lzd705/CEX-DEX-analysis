@@ -43,7 +43,8 @@ The application code is versioned in GitHub. Runtime CSVs live in the ignored
 `MARKET_DATA_DIR`.
 
 Administrator setup is documented in `docs/admin-operations.md`. The page is
-served at `/admin.html` but remains disabled until a password hash is supplied.
+served at `/admin.html`. It supports password authentication by default or an
+explicit no-login mode through `ADMIN_LOGIN_REQUIRED=false`.
 
 ## Future scope
 

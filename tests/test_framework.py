@@ -48,15 +48,17 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertNotIn("factor", (html + javascript).lower())
         self.assertNotIn("admin", (html + javascript).lower())
 
-    def test_administrator_is_a_separate_server_authenticated_page(self):
+    def test_administrator_is_a_separate_server_controlled_page(self):
         admin_html = (PROJECT_ROOT / "dashboard/static/admin.html").read_text(encoding="utf-8")
         admin_javascript = (PROJECT_ROOT / "dashboard/static/admin.js").read_text(encoding="utf-8")
+        admin_backend = (PROJECT_ROOT / "dashboard/admin.py").read_text(encoding="utf-8")
         server = (PROJECT_ROOT / "dashboard/server.py").read_text(encoding="utf-8")
 
         self.assertIn('id="login-form"', admin_html)
         self.assertIn('id="refresh-form"', admin_html)
         self.assertIn("/api/admin/login", admin_javascript)
         self.assertIn("require_admin(csrf=True)", server)
+        self.assertIn("ADMIN_LOGIN_REQUIRED", admin_backend)
         self.assertNotIn("ADMIN_PASSWORD_HASH=", admin_html + admin_javascript)
 
 

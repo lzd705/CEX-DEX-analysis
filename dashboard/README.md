@@ -43,9 +43,13 @@ and a service-account-owned writable mount when it is enabled.
 After configuring `.env` as described in `docs/admin-operations.md`, open
 `http://127.0.0.1:8765/admin.html`.
 
-The backend validates the session, CSRF token, configured Token, and refresh
-window before starting a one-at-a-time pipeline job. Successful jobs atomically
-publish the two detailed CSVs back into `data/local/`.
+Set `ADMIN_LOGIN_REQUIRED=false` only when the deployment should intentionally
+open the administrator workspace without a login.
+
+With login enabled, the backend validates the session and CSRF token. In both
+modes it validates the configured Token and refresh window before starting a
+one-at-a-time pipeline job. Successful jobs atomically publish the two detailed
+CSVs back into `data/local/`.
 
 ## Display contract
 

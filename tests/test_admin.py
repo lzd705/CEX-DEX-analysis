@@ -35,6 +35,20 @@ class AdminServiceTest(unittest.TestCase):
             service.logout(token)
             self.assertIsNone(service.get_session(token))
 
+    def test_open_mode_skips_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = AdminService(
+                job_dir=Path(directory),
+                login_required=False,
+            )
+
+            session = service.public_session(None)
+
+            self.assertTrue(session["authenticated"])
+            self.assertTrue(session["configured"])
+            self.assertFalse(session["login_required"])
+            self.assertEqual(session["username"], "open-admin")
+
     def test_repeated_invalid_logins_are_rate_limited(self):
         with tempfile.TemporaryDirectory() as directory:
             service = AdminService(
@@ -99,6 +113,31 @@ class AdminServiceTest(unittest.TestCase):
             self.assertIn("AAVE", command)
             self.assertNotIn("shell", run.call_args.kwargs)
             self.assertEqual(service.jobs[job_id]["status"], "succeeded")
+
+    def test_create_job_rejects_when_another_job_is_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=Path(directory),
+            )
+            service.jobs["active-job"] = {
+                "job_id": "active-job",
+                "status": "running",
+                "created_at": "2026-07-23T00:00:00+00:00",
+            }
+
+            with patch.object(
+                service,
+                "validate_job",
+                return_value={
+                    "token_symbol": "AAVE",
+                    "start_date": "2026-07-01",
+                    "end_date": "2026-07-22",
+                },
+            ):
+                with self.assertRaises(RuntimeError):
+                    service.create_job({}, "admin")
 
 
 if __name__ == "__main__":

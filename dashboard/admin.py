@@ -26,6 +26,7 @@ PASSWORD_ITERATIONS = 600_000
 SESSION_SECONDS = 8 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_LOGIN_FAILURES = 5
+OPEN_ADMIN_USERNAME = "open-admin"
 
 
 def encode_part(value: bytes) -> str:
@@ -77,9 +78,17 @@ class AdminService:
         username: str | None = None,
         password_hash: str | None = None,
         job_dir: Path | None = None,
+        login_required: bool | None = None,
     ) -> None:
         self.username = username if username is not None else os.environ.get("ADMIN_USERNAME", "admin")
         self.password_hash = password_hash if password_hash is not None else os.environ.get("ADMIN_PASSWORD_HASH", "")
+        if login_required is None:
+            login_required = os.environ.get("ADMIN_LOGIN_REQUIRED", "true").lower() not in {
+                "0",
+                "false",
+                "no",
+            }
+        self.login_required = login_required
         configured_job_dir = os.environ.get("ADMIN_JOB_DIR")
         self.job_dir = job_dir or (Path(configured_job_dir).expanduser() if configured_job_dir else DEFAULT_JOB_DIR)
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -91,7 +100,7 @@ class AdminService:
 
     @property
     def configured(self) -> bool:
-        return bool(self.username and self.password_hash)
+        return not self.login_required or bool(self.username and self.password_hash)
 
     def _load_jobs(self) -> None:
         if not self.job_dir.exists():
@@ -115,6 +124,8 @@ class AdminService:
         return failures
 
     def login(self, client_ip: str, username: str, password: str) -> tuple[str, dict[str, Any]]:
+        if not self.login_required:
+            raise RuntimeError("Administrator login is disabled")
         if not self.configured:
             raise RuntimeError("Administrator authentication is not configured")
         with self.state_lock:
@@ -158,11 +169,25 @@ class AdminService:
             self.sessions.pop(session_token, None)
 
     def public_session(self, session: dict[str, Any] | None) -> dict[str, Any]:
+        if not self.login_required:
+            return {
+                "authenticated": True,
+                "configured": True,
+                "login_required": False,
+                "username": OPEN_ADMIN_USERNAME,
+                "csrf_token": "",
+                "expires_at": None,
+            }
         if not session:
-            return {"authenticated": False, "configured": self.configured}
+            return {
+                "authenticated": False,
+                "configured": self.configured,
+                "login_required": True,
+            }
         return {
             "authenticated": True,
             "configured": self.configured,
+            "login_required": True,
             "username": session["username"],
             "csrf_token": session["csrf_token"],
             "expires_at": session["expires_at"].isoformat(),
@@ -204,6 +229,8 @@ class AdminService:
             "error": None,
         }
         with self.state_lock:
+            if any(existing.get("status") in {"queued", "running"} for existing in self.jobs.values()):
+                raise RuntimeError("Another refresh job is already queued or running")
             self.jobs[job_id] = job
             self._save_job(job)
         threading.Thread(target=self._run_job, args=(job_id,), daemon=True).start()

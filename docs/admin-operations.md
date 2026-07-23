@@ -18,6 +18,16 @@ http://127.0.0.1:8765/admin.html
 
 The plaintext password is never written by the setup script.
 
+To run the administrator workspace without a login, set:
+
+```env
+ADMIN_LOGIN_REQUIRED=false
+```
+
+Open mode skips authentication but keeps Token/date validation and permits only
+one queued or running refresh job at a time. Anyone who can reach
+`/admin.html` can request a data refresh while this mode is enabled.
+
 ## Refresh contract
 
 The administrator selects one of the 30 configured Tokens and an inclusive UTC
@@ -44,6 +54,7 @@ Job state and server-only logs live under `data/local/admin/jobs/`.
   HttpOnly SameSite cookie.
 - Data-changing requests require a session-specific CSRF token.
 - Repeated login failures are rate limited.
+- Open mode is opt-in through `ADMIN_LOGIN_REQUIRED=false`.
 - Pipeline commands use fixed argument arrays without a shell.
 - Production requires HTTPS and `ADMIN_COOKIE_SECURE=true`.
 - The data directory must be writable only by the deployment service account.

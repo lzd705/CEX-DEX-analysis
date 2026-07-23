@@ -381,6 +381,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         return morsel.value if morsel else None
 
     def require_admin(self, *, csrf: bool = False) -> tuple[str, dict[str, Any]] | None:
+        if not ADMIN_SERVICE.login_required:
+            return "", {
+                "username": "open-admin",
+                "csrf_token": "",
+            }
         session_token = self.admin_session_token()
         session = ADMIN_SERVICE.get_session(session_token)
         if not session:
@@ -476,6 +481,9 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/admin/login":
+            if not ADMIN_SERVICE.login_required:
+                self.send_json({"error": "Administrator login is disabled"}, HTTPStatus.NOT_FOUND)
+                return
             try:
                 session_token, session = ADMIN_SERVICE.login(
                     self.client_address[0],
@@ -495,6 +503,9 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/admin/logout":
+            if not ADMIN_SERVICE.login_required:
+                self.send_json(ADMIN_SERVICE.public_session(None))
+                return
             authenticated = self.require_admin(csrf=True)
             if not authenticated:
                 return
@@ -513,6 +524,9 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             _, session = authenticated
             try:
                 job = ADMIN_SERVICE.create_job(payload, session["username"])
+            except RuntimeError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.CONFLICT)
+                return
             except (ValueError, OSError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
                 return

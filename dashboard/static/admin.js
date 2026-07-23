@@ -85,7 +85,8 @@ async function showWorkspace(session) {
   admin.session = session;
   byId("login-view").hidden = true;
   byId("admin-view").hidden = false;
-  byId("session-user").textContent = session.username;
+  byId("session-user").textContent = session.login_required === false ? "Open access" : session.username;
+  byId("logout-button").hidden = session.login_required === false;
   setDefaultDates();
   await Promise.all([loadTokens(), loadJobs()]);
   startPolling();
@@ -98,7 +99,9 @@ async function initializeAdmin() {
     byId("login-button").disabled = true;
     return;
   }
-  byId("login-status").textContent = "Server-side authentication enabled";
+  byId("login-status").textContent = session.login_required === false
+    ? "Administrator login disabled"
+    : "Server-side authentication enabled";
   if (session.authenticated) await showWorkspace(session);
 }
 
