@@ -45,6 +45,8 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertIn('data-scope="cex"', html)
         self.assertIn('data-scope="dex"', html)
         self.assertIn('id="search-token"', html)
+        self.assertIn("DEFAULT_MARKET_CACHE_KEY", javascript)
+        self.assertIn("Cached through", javascript)
         self.assertNotIn("factor", (html + javascript).lower())
         self.assertNotIn("admin", (html + javascript).lower())
 

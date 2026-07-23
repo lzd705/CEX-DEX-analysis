@@ -4,6 +4,7 @@ const app = {
   selections: {},
   searchQuery: "",
 };
+const DEFAULT_MARKET_CACHE_KEY = "market-monitor:default-payload:v1";
 
 const byId = (id) => document.getElementById(id);
 const compactCurrency = new Intl.NumberFormat("en-US", {
@@ -219,6 +220,43 @@ function showError(error) {
   byId("error-banner").textContent = error.message || String(error);
 }
 
+function isMarketPayload(payload) {
+  return Boolean(
+    payload
+    && payload.metadata
+    && Array.isArray(payload.tokens)
+    && Array.isArray(payload.cex_markets)
+    && Array.isArray(payload.dex_pools)
+  );
+}
+
+function readDefaultMarketCache() {
+  try {
+    const payload = JSON.parse(window.localStorage.getItem(DEFAULT_MARKET_CACHE_KEY));
+    return isMarketPayload(payload) ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeDefaultMarketCache(payload) {
+  try {
+    window.localStorage.setItem(DEFAULT_MARKET_CACHE_KEY, JSON.stringify(payload));
+  } catch {
+    // The network response still renders when browser storage is unavailable.
+  }
+}
+
+function displayMarket(payload, { cached = false } = {}) {
+  app.payload = payload;
+  byId("error-banner").hidden = true;
+  updateMetadata();
+  if (cached) {
+    byId("freshness").textContent = `Cached through ${payload.metadata.available_end} · refreshing`;
+  }
+  renderTable();
+}
+
 async function loadMarket(start = "", end = "") {
   byId("apply-window").disabled = true;
   const query = new URLSearchParams();
@@ -228,10 +266,8 @@ async function loadMarket(start = "", end = "") {
     const response = await fetch(`/api/market?${query.toString()}`);
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "Market data failed to load");
-    app.payload = payload;
-    byId("error-banner").hidden = true;
-    updateMetadata();
-    renderTable();
+    displayMarket(payload);
+    if (!start && !end) writeDefaultMarketCache(payload);
   } finally {
     byId("apply-window").disabled = false;
   }
@@ -284,5 +320,7 @@ function bindEvents() {
 }
 
 bindEvents();
+const cachedPayload = readDefaultMarketCache();
+if (cachedPayload) displayMarket(cachedPayload, { cached: true });
 loadMarket().catch(showError);
 if (window.lucide) window.lucide.createIcons();
