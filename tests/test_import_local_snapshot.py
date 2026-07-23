@@ -16,6 +16,17 @@ class ImportLocalSnapshotTest(unittest.TestCase):
                 row = {column: "value" for column in ordered_columns}
                 row["date"] = "2026-01-01"
                 row["token_symbol"] = "BTC"
+                for column in {
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "base_volume",
+                    "quote_volume_usd",
+                    "dex_volume_usd",
+                    "pool_tvl_usd",
+                } & set(ordered_columns):
+                    row[column] = "1"
                 with (source / filename).open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.DictWriter(handle, fieldnames=ordered_columns, lineterminator="\n")
                     writer.writeheader()
@@ -26,6 +37,7 @@ class ImportLocalSnapshotTest(unittest.TestCase):
             self.assertEqual(set(counts), set(FILES))
             self.assertTrue((target / "cex_exchange_volume_daily.csv").exists())
             self.assertTrue((target / "dex_pool_volume_daily.csv").exists())
+            self.assertTrue((target / "market_facts.sqlite3").exists())
 
 
 if __name__ == "__main__":

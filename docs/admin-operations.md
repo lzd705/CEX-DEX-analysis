@@ -43,9 +43,14 @@ The server queues one job at a time. A job:
 2. refreshes the selected Token from CEX and DEX sources;
 3. upserts rows by venue/pool/date without deleting other Tokens or older dates;
 4. validates both detailed CSV schemas;
-5. atomically replaces the files under `data/local/`.
+5. builds an indexed SQLite database with source hashes and an import record;
+6. validates database integrity and row counts;
+7. publishes the reviewed CSV copies and atomically replaces
+   `market_facts.sqlite3` as the runtime commit point under `data/local/`.
 
 Job state and server-only logs live under `data/local/admin/jobs/`.
+The public server opens `market_facts.sqlite3` read-only. Existing requests
+continue using the previous complete file until replacement finishes.
 
 ## Security boundary
 

@@ -12,6 +12,8 @@ class FrameworkStructureTest(unittest.TestCase):
             ".dockerignore",
             ".gitignore",
             "README.md",
+            "data/schema/001_market_facts.sql",
+            "scripts/market_database.py",
             "scripts/run_dashboard.sh",
         ]
 
@@ -23,6 +25,8 @@ class FrameworkStructureTest(unittest.TestCase):
         dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
         self.assertIn("COPY --chown=dashboard:dashboard dashboard ./dashboard", dockerfile)
+        self.assertIn("COPY --chown=dashboard:dashboard scripts ./scripts", dockerfile)
+        self.assertIn("COPY --chown=dashboard:dashboard data/schema ./data/schema", dockerfile)
         self.assertIn('VOLUME ["/app/data/local"]', dockerfile)
         self.assertNotIn("COPY --chown=dashboard:dashboard data/public", dockerfile)
         self.assertNotIn("data/a_review", dockerfile)

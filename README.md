@@ -30,7 +30,7 @@ study, or public data-edit controls.
 # Refresh facts from source APIs. This does not build factors.
 python3 scripts/run_fact_pipeline.py
 
-# Import a reviewed snapshot without committing CSVs to Git.
+# Import a reviewed snapshot and atomically publish the indexed runtime database.
 python3 scripts/import_local_snapshot.py data/processed
 
 # Start the local monitor.
@@ -38,9 +38,11 @@ npm --prefix dashboard install
 ./scripts/run_dashboard.sh
 ```
 
-The application code is versioned in GitHub. Runtime CSVs live in the ignored
-`data/local/` directory or an external directory selected by
-`MARKET_DATA_DIR`.
+The application code and SQLite schema are versioned in GitHub. Reviewed CSV
+inputs and the generated `market_facts.sqlite3` runtime database live in the
+ignored `data/local/` directory, or an external directory selected by
+`MARKET_DATA_DIR`. The website queries SQLite; it does not rescan all CSV rows
+on each request. See `data/README.md` for the full data lifecycle.
 
 Administrator setup is documented in `docs/admin-operations.md`. The page is
 served at `/admin.html`. It supports password authentication by default or an

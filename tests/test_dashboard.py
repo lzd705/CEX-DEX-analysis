@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dashboard import server
+from scripts.market_database import build_database
 
 
 def write_csv(path, fieldnames, rows):
@@ -124,6 +125,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIsNone(server.parse_number(""))
         self.assertIsNone(server.parse_number("nan"))
         self.assertEqual(server.parse_number("12.5"), 12.5)
+        self.assertEqual(server.parse_number(12.5), 12.5)
 
     def test_payload_contains_only_market_facts_and_token_level_spread(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
@@ -187,6 +189,25 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertFalse(plain_compressed)
         self.assertLess(len(body), len(plain_body))
         self.assertEqual(json.loads(gzip.decompress(body)), payload)
+
+    def test_sqlite_runtime_matches_csv_facts(self):
+        data_dir = self.cex_path.parent
+        database_path = data_dir / server.DATABASE_FILENAME
+        build_database(data_dir, database_path)
+
+        with patch.dict(
+            server.os.environ,
+            {"MARKET_DATABASE": str(database_path)},
+            clear=True,
+        ):
+            payload = server.build_market_payload("2026-01-01", "2026-01-02")
+
+        self.assertEqual(payload["metadata"]["storage"]["engine"], "sqlite")
+        self.assertEqual(payload["metadata"]["token_count"], 1)
+        self.assertEqual(len(payload["cex_markets"]), 2)
+        self.assertEqual(len(payload["dex_pools"]), 1)
+        self.assertAlmostEqual(payload["tokens"][0]["price_spread"], 105 / 102 - 1)
+        self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)
 
 
 if __name__ == "__main__":

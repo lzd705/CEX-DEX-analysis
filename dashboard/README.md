@@ -5,12 +5,13 @@ a separate server-authenticated page.
 
 ## Required local data
 
-Place these two detailed daily files in `data/local/`:
+Import these two detailed daily files into `data/local/`:
 
 - `cex_exchange_volume_daily.csv`
 - `dex_pool_volume_daily.csv`
 
-The directory is ignored by Git. Import a reviewed A-side snapshot with:
+The directory is ignored by Git. Importing a reviewed A-side snapshot also
+builds `data/local/market_facts.sqlite3`, which is the indexed runtime store:
 
 ```bash
 python3 scripts/import_local_snapshot.py /path/to/data/processed
@@ -34,6 +35,11 @@ To keep the code and data in separate locations, set `MARKET_DATA_DIR`:
 MARKET_DATA_DIR=/srv/cex-dex/current ./scripts/run_dashboard.sh
 ```
 
+The server prefers `market_facts.sqlite3` in that directory and opens it
+read-only. `MARKET_DATABASE=/srv/cex-dex/current/market_facts.sqlite3` selects
+a database explicitly. CSV remains the auditable input and fallback, not the
+normal online query layer.
+
 The Docker image uses the same contract and expects an external data volume at
 `/app/data/local`. Use a read-only mount when administrator refresh is disabled
 and a service-account-owned writable mount when it is enabled.
@@ -49,7 +55,7 @@ open the administrator workspace without a login.
 With login enabled, the backend validates the session and CSRF token. In both
 modes it validates the configured Token and refresh window before starting a
 one-at-a-time pipeline job. Successful jobs atomically publish the two detailed
-CSVs back into `data/local/`.
+CSVs and a validated SQLite database back into `data/local/`.
 
 ## Display contract
 

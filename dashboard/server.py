@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import statistics
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -37,6 +38,7 @@ DEFAULT_DATA_DIRS = [
 ]
 CEX_FILENAME = "cex_exchange_volume_daily.csv"
 DEX_FILENAME = "dex_pool_volume_daily.csv"
+DATABASE_FILENAME = "market_facts.sqlite3"
 VENDOR_FILES = {
     "/vendor/lucide.js": DASHBOARD_ROOT / "node_modules/lucide/dist/umd/lucide.min.js",
 }
@@ -64,13 +66,15 @@ load_local_environment(PROJECT_ROOT / ".env")
 ADMIN_SERVICE = AdminService()
 
 
-def parse_number(value: str | None) -> float | None:
+def parse_number(value: str | float | int | None) -> float | None:
     """Parse a finite number while preserving missing values as null."""
-    if value is None or value.strip() == "":
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() == "":
         return None
     try:
         number = float(value)
-    except ValueError:
+    except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
 
@@ -104,6 +108,34 @@ def resolve_data_paths() -> tuple[Path, Path]:
             return cex_path, dex_path
     checked = ", ".join(str(path) for path in candidates)
     raise FileNotFoundError(f"No detailed market snapshot found. Checked: {checked}")
+
+
+def resolve_database_path() -> Path | None:
+    """Prefer the published SQLite snapshot unless explicit CSV files are configured."""
+    if os.environ.get("MARKET_CEX_DATA") or os.environ.get("MARKET_DEX_DATA"):
+        return None
+
+    explicit_database = os.environ.get("MARKET_DATABASE")
+    if explicit_database:
+        database_path = Path(explicit_database).expanduser().resolve()
+        if not database_path.exists():
+            raise FileNotFoundError(f"Configured market database does not exist: {database_path}")
+        return database_path
+
+    configured_dir = os.environ.get("MARKET_DATA_DIR")
+    candidates = [Path(configured_dir).expanduser().resolve()] if configured_dir else DEFAULT_DATA_DIRS
+    for data_dir in candidates:
+        database_path = data_dir / DATABASE_FILENAME
+        if database_path.exists():
+            return database_path
+    return None
+
+
+def connect_database(database_path: Path) -> sqlite3.Connection:
+    """Open the published database read-only so web requests cannot mutate facts."""
+    connection = sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
 def iter_csv(path: Path) -> Iterable[dict[str, str]]:
@@ -312,7 +344,7 @@ def file_metadata(path: Path) -> dict[str, Any]:
 
 
 def data_signature(paths: Iterable[Path]) -> tuple[tuple[str, int, int], ...]:
-    """Return a cache key that changes whenever a published CSV changes."""
+    """Return a cache key that changes whenever a published data file changes."""
     signature = []
     for path in paths:
         stat = path.stat()
@@ -353,6 +385,109 @@ def _build_market_payload_cached(
             "token_count": len({row["token_symbol"] for row in cex_markets + dex_pools}),
             "grain": "venue/pool summary over selected daily observations",
             "sources": [file_metadata(cex_path), file_metadata(dex_path)],
+            "storage": {"engine": "csv"},
+            "tvl_note": "Pool TVL is a latest-fetch snapshot, not a historical daily series.",
+        },
+        "tokens": build_token_summaries(cex_markets, dex_pools),
+        "cex_markets": cex_markets,
+        "dex_pools": dex_pools,
+    }
+
+
+@lru_cache(maxsize=32)
+def _build_database_payload_cached(
+    start: str | None,
+    end: str | None,
+    database_path_text: str,
+    _signature: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    database_path = Path(database_path_text)
+    connection = connect_database(database_path)
+    try:
+        state = connection.execute(
+            """
+            SELECT s.*, r.run_id, r.imported_at
+            FROM dataset_state state
+            JOIN dataset_snapshots s ON s.snapshot_id = state.snapshot_id
+            JOIN import_runs r ON r.run_id = state.import_run_id
+            WHERE state.singleton_id = 1
+            """
+        ).fetchone()
+        if state is None:
+            raise ValueError("Market database does not contain a published dataset state")
+
+        available_start = state["available_start"]
+        available_end = state["available_end"]
+        effective_end = parse_iso_date(end) or available_end
+        default_start = (date.fromisoformat(effective_end) - timedelta(days=29)).isoformat()
+        effective_start = parse_iso_date(start) or max(available_start, default_start)
+        if effective_start > effective_end:
+            raise ValueError("start date must not be after end date")
+        if effective_start < available_start or effective_end > available_end:
+            raise ValueError(f"date window must be within {available_start} and {available_end}")
+
+        cex_rows = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT date, token_symbol, exchange, cex_symbol, open, high, low,
+                       close, base_volume, quote_volume_usd
+                FROM cex_market_daily
+                WHERE date BETWEEN ? AND ?
+                ORDER BY date, token_symbol, exchange, cex_symbol
+                """,
+                (effective_start, effective_end),
+            )
+        ]
+        dex_rows = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT date, token_symbol, chain, dex, pool_address, pool_name,
+                       open, high, low, close, dex_volume_usd, pool_tvl_usd
+                FROM dex_pool_daily
+                WHERE date BETWEEN ? AND ?
+                ORDER BY date, token_symbol, chain, dex, pool_address
+                """,
+                (effective_start, effective_end),
+            )
+        ]
+    finally:
+        connection.close()
+
+    cex_markets = summarize_cex(cex_rows)
+    dex_pools = summarize_dex(dex_rows)
+    if not cex_markets and not dex_pools:
+        raise ValueError("No market observations exist in the selected time window")
+
+    return {
+        "metadata": {
+            "available_start": available_start,
+            "available_end": available_end,
+            "start_date": effective_start,
+            "end_date": effective_end,
+            "token_count": len({row["token_symbol"] for row in cex_markets + dex_pools}),
+            "grain": "venue/pool summary over selected daily observations",
+            "sources": [
+                {
+                    "name": state["cex_source_name"],
+                    "bytes": state["cex_source_bytes"],
+                    "modified_at": state["imported_at"],
+                    "sha256": state["cex_sha256"][:16],
+                },
+                {
+                    "name": state["dex_source_name"],
+                    "bytes": state["dex_source_bytes"],
+                    "modified_at": state["imported_at"],
+                    "sha256": state["dex_sha256"][:16],
+                },
+            ],
+            "storage": {
+                "engine": "sqlite",
+                "schema_version": 1,
+                "snapshot_id": state["snapshot_id"],
+                "import_run_id": state["run_id"],
+            },
             "tvl_note": "Pool TVL is a latest-fetch snapshot, not a historical daily series.",
         },
         "tokens": build_token_summaries(cex_markets, dex_pools),
@@ -362,6 +497,11 @@ def _build_market_payload_cached(
 
 
 def build_market_payload(start: str | None = None, end: str | None = None) -> dict[str, Any]:
+    database_path = resolve_database_path()
+    if database_path is not None:
+        signature = data_signature([database_path])
+        return _build_database_payload_cached(start, end, str(database_path), signature)
+
     cex_path, dex_path = resolve_data_paths()
     signature = data_signature([cex_path, dex_path])
     return _build_market_payload_cached(start, end, str(cex_path), str(dex_path), signature)
@@ -507,8 +647,18 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/health":
             try:
+                database_path = resolve_database_path()
+                if database_path is not None:
+                    self.send_json({"status": "ok", "data_ready": True, "storage": "sqlite"})
+                    return
                 cex_path, dex_path = resolve_data_paths()
-                self.send_json({"status": "ok", "data_ready": cex_path.exists() and dex_path.exists()})
+                self.send_json(
+                    {
+                        "status": "ok",
+                        "data_ready": cex_path.exists() and dex_path.exists(),
+                        "storage": "csv",
+                    }
+                )
             except FileNotFoundError as error:
                 self.send_json({"status": "degraded", "data_ready": False, "error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
             return

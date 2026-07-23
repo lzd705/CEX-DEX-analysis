@@ -18,6 +18,9 @@ RUN groupadd --system dashboard \
     && chown -R dashboard:dashboard /app/data
 
 COPY --chown=dashboard:dashboard dashboard ./dashboard
+COPY --chown=dashboard:dashboard scripts ./scripts
+COPY --chown=dashboard:dashboard config ./config
+COPY --chown=dashboard:dashboard data/schema ./data/schema
 COPY --from=frontend-dependencies /app/dashboard/node_modules /app/dashboard/node_modules
 
 USER dashboard

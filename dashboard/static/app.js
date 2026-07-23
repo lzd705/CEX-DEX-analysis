@@ -210,9 +210,14 @@ function updateMetadata() {
   end.value = metadata.end_date;
   byId("available-range").textContent = `Available ${metadata.available_start} to ${metadata.available_end}`;
   byId("freshness").textContent = `Data through ${metadata.available_end}`;
-  byId("source-list").textContent = metadata.sources
+  const sourceText = metadata.sources
     .map((source) => `${source.name} · ${source.sha256}`)
     .join(" | ");
+  const storage = metadata.storage || { engine: "csv" };
+  const storageText = storage.engine === "sqlite"
+    ? `SQLite snapshot · ${storage.snapshot_id}`
+    : "CSV fallback";
+  byId("source-list").textContent = `${storageText} | ${sourceText}`;
 }
 
 function showError(error) {
