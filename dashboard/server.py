@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import hashlib
 import hmac
 import json
@@ -13,6 +14,7 @@ import re
 import statistics
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -309,8 +311,25 @@ def file_metadata(path: Path) -> dict[str, Any]:
     }
 
 
-def build_market_payload(start: str | None = None, end: str | None = None) -> dict[str, Any]:
-    cex_path, dex_path = resolve_data_paths()
+def data_signature(paths: Iterable[Path]) -> tuple[tuple[str, int, int], ...]:
+    """Return a cache key that changes whenever a published CSV changes."""
+    signature = []
+    for path in paths:
+        stat = path.stat()
+        signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+    return tuple(signature)
+
+
+@lru_cache(maxsize=32)
+def _build_market_payload_cached(
+    start: str | None,
+    end: str | None,
+    cex_path_text: str,
+    dex_path_text: str,
+    _signature: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    cex_path = Path(cex_path_text)
+    dex_path = Path(dex_path_text)
     available_start, available_end = dataset_bounds([cex_path, dex_path])
     effective_end = parse_iso_date(end) or available_end
     default_start = (date.fromisoformat(effective_end) - timedelta(days=29)).isoformat()
@@ -342,6 +361,20 @@ def build_market_payload(start: str | None = None, end: str | None = None) -> di
     }
 
 
+def build_market_payload(start: str | None = None, end: str | None = None) -> dict[str, Any]:
+    cex_path, dex_path = resolve_data_paths()
+    signature = data_signature([cex_path, dex_path])
+    return _build_market_payload_cached(start, end, str(cex_path), str(dex_path), signature)
+
+
+def encode_json_payload(payload: Any, accept_encoding: str = "") -> tuple[bytes, bool]:
+    """Serialize JSON and compress substantial responses when the client supports gzip."""
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(raw) >= 1024 and "gzip" in accept_encoding.lower():
+        return gzip.compress(raw, compresslevel=5), True
+    return raw, False
+
+
 class MarketMonitorHandler(SimpleHTTPRequestHandler):
     server_version = "CexDexMarketMonitor"
     sys_version = ""
@@ -355,11 +388,17 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         status: HTTPStatus = HTTPStatus.OK,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        body, compressed = encode_json_payload(
+            payload,
+            self.headers.get("Accept-Encoding", ""),
+        )
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
@@ -413,6 +452,9 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         return "; ".join(parts)
 
     def end_headers(self) -> None:
+        request_path = urlparse(self.path).path
+        if not request_path.startswith("/api/") and request_path != "/health":
+            self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")

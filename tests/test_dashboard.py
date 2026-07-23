@@ -1,4 +1,6 @@
 import csv
+import gzip
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -159,6 +161,32 @@ class MarketMonitorServerTest(unittest.TestCase):
         token = payload["tokens"][0]
         self.assertEqual(token["spread_date"], "2026-01-02")
         self.assertAlmostEqual(token["price_spread"], 105 / 102 - 1)
+
+    def test_payload_cache_invalidates_when_source_file_changes(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            first = server.build_market_payload("2026-01-01", "2026-01-02")
+
+            with self.cex_path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle, lineterminator="\n")
+                writer.writerow(
+                    ["2026-01-02", "BTC", "kraken", "BTC/USDT", "", "", "", "103", "", "300"]
+                )
+
+            second = server.build_market_payload("2026-01-01", "2026-01-02")
+
+        self.assertEqual(len(first["cex_markets"]), 2)
+        self.assertEqual(len(second["cex_markets"]), 3)
+
+    def test_large_json_payload_uses_gzip_when_supported(self):
+        payload = {"rows": ["repeated-market-fact"] * 500}
+
+        body, compressed = server.encode_json_payload(payload, "br, gzip")
+        plain_body, plain_compressed = server.encode_json_payload(payload, "")
+
+        self.assertTrue(compressed)
+        self.assertFalse(plain_compressed)
+        self.assertLess(len(body), len(plain_body))
+        self.assertEqual(json.loads(gzip.decompress(body)), payload)
 
 
 if __name__ == "__main__":
