@@ -1,69 +1,29 @@
-# Public Read-only Sharing
+# Public deployment boundary
 
-The dashboard has two intentionally separate runtime modes.
+Market Monitor is read-only. It has no browser endpoint for changing data, no
+administrator form, and no persistent user state.
 
-![Public read-only dashboard](assets/dashboard-public.png)
-
-## Private workspace
-
-```bash
-./scripts/run_dashboard.sh
-```
-
-Private mode reads the richest local research panel and enables notes,
-checklists, state saves, and append-only history. It binds to `127.0.0.1` by
-default and should not be exposed directly to the internet.
-
-## Public read-only mode
+Production should run the application container separately from its data:
 
 ```bash
-./scripts/run_public_dashboard.sh --port 8766
+docker build -t cex-dex-market-monitor .
+docker run --rm \
+  -p 8765:8765 \
+  --mount type=bind,src=/srv/cex-dex/current,dst=/app/data/local,readonly \
+  cex-dex-market-monitor
 ```
 
-Public mode:
+The mounted directory must contain:
 
-- defaults to the curated 10-token panel under `data/public/`;
-- rejects data paths outside `data/public/`, `data/mock/`, and `dashboard/sample/`;
-- removes the private workspace tab and save controls;
-- rejects `POST /api/state` with HTTP 403;
-- does not return private state or history;
-- exposes only aggregate fields selected by `scripts/build_public_snapshot.py`.
+- `cex_exchange_volume_daily.csv`
+- `dex_pool_volume_daily.csv`
 
-For a temporary HTTPS link that can be opened from any network, run:
+Deploy a new application commit without changing the data directory. Publish a
+new reviewed data snapshot by atomically switching `/srv/cex-dex/current` to a
+new version and restarting the container. Keep prior snapshot directories for
+rollback.
 
-```bash
-./scripts/share_public_dashboard.sh
-```
-
-The command prints a random `https://…trycloudflare.com` address. It lasts only
-while the command and this computer remain running. Cloudflare documents Quick
-Tunnels as a testing and demo facility, not a permanent hosting service.
-
-The command listens on all network interfaces. On the same network, another
-person can open `http://YOUR_LOCAL_IP:8766` while the process is running and
-the local firewall permits the connection.
-
-## Long-running public deployment
-
-The included Docker image always starts in public read-only mode:
-
-```bash
-docker build -t market-structure-dashboard .
-docker run --rm -p 8765:8765 market-structure-dashboard
-```
-
-This repository includes `render.yaml` for a long-running Render deployment.
-Render builds the Docker image from the linked GitHub branch, checks `/health`,
-and supplies a stable public HTTPS URL. Automatic deploys run only after the
-GitHub checks pass.
-
-The Dockerfile copies only the dashboard application and `data/public/` into a
-non-root runtime image. Do not mount private state files or review directories
-into the public container. Review `DATA_USAGE.md` before each data refresh.
-
-## Update workflow
-
-1. Refresh or replace the reviewed B-side panel.
-2. Run `make release` to rebuild `data/public/` and run all checks.
-3. Review `data/public/research/manifest.json` and the dashboard locally.
-4. Commit and push. Render deploys the tested commit automatically.
+The server exposes only static files, `GET /api/market`, and `GET /health`.
+Security headers block framing, external scripts, device permissions, and
+cross-origin content. A reverse proxy should provide HTTPS, access logs, rate
+limits, and the public domain.

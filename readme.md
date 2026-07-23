@@ -1,117 +1,46 @@
-‘’‘
-一. 网站总目的：用户可以选择token，对比cex和dex两个市场中的价格、成交量、回报率等事实，发现异常或结构性机会。
+# CEX-DEX Market Monitor 1.0
 
-需求1：用户可以针对某个token选择一个交易所或者一个pool去观察差异
-需求2：用户可以了解到这个token的一些基础事实例如价格，
-cex-dex价差，
-成交量，
-回报率，
-波动性，
-需求3：用户可以了解到这个token的流动性和交易成本例如TVL，
-depth，
-滑点，
-交易费率
-需求4：用户可以清晰观察到这个token在两个市场之间的差异，标注出异常值
-需求5：用户可以选择一个时间窗口查看这个token发生的event
-需求6：用户可以了解到数据来源，数据更新时间，数据缺失等问题
+## Product boundary
 
-。。。
-需求10: 管理员可以直接在网站内部通过输入或选择token，来实现更新数据，且该功能对用户有权限限制
-’‘’
+The first product is a fact-only Market Monitor. A user selects a time window,
+a Token, one CEX pair, and one DEX pool, then compares source-backed market
+facts. This release does not include factors, future-return research, event
+study, work notes, or administrator data-update controls.
 
-一. 网站总目的：帮助具备一定市场经验的用户，选择特定 Token、CEX 交易对和 DEX 流动性池，对比其价格、交易活动、收益与流动性状况，识别两个市场之间值得进一步研究的异常差异。网站提供事实与异常信号，不直接把异常解释为可执行的交易或套利机会。
+## Current requirements
 
-需求1:
-选择明确的比较对象
-用户可以选择一个 Token，并分别指定：
-一个 CEX 及其交易对；
-一个 DEX 及其流动性池；
-一个观察时间范围。
-系统应清楚展示交易所、交易对、链、DEX 和 pool，而不只是显示“CEX 平均值”和“DEX 平均值”。
+1. Show explicit CEX exchange/pair and DEX chain/protocol/pool identities.
+2. Put the global start and end date controls at the top of the page.
+3. Display price, selected-window return, daily realized volatility, USD
+   volume, DEX TVL snapshot, and CEX-DEX price spread.
+4. Keep spread at Token comparison level, not duplicated as a CEX or DEX
+   property.
+5. Sort descending by USD volume by default, with `综合`, `CEX`, and `DEX`
+   sorting scopes.
+6. Show data coverage, latest date, source file versions, missing values, and
+   metric limitations.
+7. Preserve missing values as null. Never replace unavailable facts with zero.
 
-需求2:
-了解 Token 的市场表现
-用户可以查看所选 Token 在指定市场中的基础事实，包括：
-当前或每日价格；
-成交额；
-不同周期收益率；
-波动率；
-CEX–DEX 价格差及价差比例。
-
-需求3：了解流动性与交易成本
-用户可以查看当前数据能够支持的流动性指标，包括：
-DEX pool TVL；
-CEX 成交额或可用的订单簿深度；
-DEX 预估滑点或价格冲击；
-CEX、DEX 交易费率；
-必要时列出 Gas 成本。
-
-需求4：突出跨市场差异和异常
-用户可以通过统一时间轴和同口径指标，清晰比较 CEX 与 DEX 的：
-价格及价差；
-成交额及成交额变化；
-收益率和波动率；
-流动性状况。
-系统根据明确规则标注异常值
-
-
-需求5: 用户选择 Token 和时间窗口后，可以查看该时间范围内与该 Token 相关的市场事件，辅助理解价格、成交量、价差或流动性异常发生时的市场背景。
-事件信息应包括：
-事件发生时间；
-事件标题与简要说明；
-事件类型，例如上币、下币、协议升级、安全事件、监管动态或代币解锁；
-涉及的 Token、交易所、协议或链；
-信息来源及原始链接；
-事件与异常指标在时间上的对应关系。
-
-用户可以：
-自定义事件观察窗口；
-按事件类型筛选；
-在价格、成交量和价差图表上查看事件标记；
-点击事件查看详情和来源；
-对比事件发生前后一定时间内的市场指标变化。
-
-
-需求6：理解数据口径和限制
-用户可以查看每项指标的数据来源、更新时间、计算方法和缺失情况，
-从而判断不同交易所、交易对和 pool 的数据是否具有可比性。
-
-
-
-需求10: 增加一个仅限管理员使用的数据更新功能。
-管理员登录后，可以在网站后台输入或选择 Token、开始日期和结束日期，并提交数据更新任务。系统随后自动抓取相应的 CEX、DEX 和价格数据，完成数据清洗、质量检查和因子重新计算，再将更新后的结果发布到公开看板。这样以后更新数据不需要再通过 Codex 手动运行脚本和修改 CSV。
-普通用户只能查看和筛选数据，不能执行更新操作。所有数据修改权限都需要在服务器端进行验证，API 密钥也只能保存在服务器中。为了避免异常数据直接影响网站，新数据应先生成待发布版本，通过检查后再由管理员确认发布，同时保留历史版本，以便出现问题时回滚。
-对于已经配置过的 Token，管理员只需选择 Token 和日期范围；如果是新增 Token，还需要补充所属链、合约地址和交易对等基本信息，不能只根据 Token 名称自动判断。
-
----
-
-## Website V1 framework
-
-本仓库的 `website-v1` 分支提供可复用的 CEX/DEX 研究网站框架。它将公开网站、公开数据快照和内部数据采集流程分开，当前不操作腾讯云生产网站。
-
-### 本地运行
+## Local workflow
 
 ```bash
+# Refresh facts from source APIs. This does not build factors.
+python3 scripts/run_fact_pipeline.py
+
+# Import a reviewed snapshot without committing CSVs to Git.
+python3 scripts/import_local_snapshot.py data/processed
+
+# Start the local monitor.
 npm --prefix dashboard install
 ./scripts/run_dashboard.sh
 ```
 
-浏览器访问 `http://localhost:8765`。可以通过 `PORT` 环境变量修改端口。
+The application code is versioned in GitHub. Runtime CSVs live in the ignored
+`data/local/` directory or an external directory selected by
+`MARKET_DATA_DIR`.
 
-### 目录
+## Future scope
 
-```text
-dashboard/          Python 服务和静态前端
-data/public/        允许公开网站读取的数据快照
-scripts/            本地运行与后续发布脚本
-tests/              数据边界和服务测试
-Dockerfile          腾讯云或其他容器环境的运行定义
-```
-
-### 腾讯云替换原则
-
-新版最终可以沿用旧网站的腾讯云环境和域名，但部署前应先备份旧网站代码、配置和可恢复数据。先使用临时端口验证新版，再切换原域名；确认稳定后才永久删除旧内容。本分支不执行生产删除或域名切换。
-
-### 数据边界
-
-Docker 镜像只复制 `dashboard/` 和 `data/public/`。`data/raw/`、`data/a_review/`、本地状态、API 密钥和内部研究文件不得进入公开镜像。网站中的异常是研究线索，不代表可执行套利机会。
+Events, depth, slippage, fee/gas data, anomaly rules, and authenticated
+administrator updates require separate data contracts and acceptance tests.
+They are deliberately outside this first Market Monitor.

@@ -1,0 +1,31 @@
+token_symbol,coingecko_id,chain,contract_address,cex_symbol,primary_cex,secondary_cex,dex_source,primary_dex,pool_address,notes
+UNI,uniswap,eth,0x1f9840a85d5af5bf1d1762f925bdaddc4201f984,UNI/USDT,binance,okx,geckoterminal,uniswap_v3,,DeFi DEX governance token
+AAVE,aave,eth,0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9,AAVE/USDT,binance,okx,geckoterminal,uniswap_v3,,DeFi lending blue chip
+LINK,chainlink,eth,0x514910771af9ca656af840dff83e8264ecf986ca,LINK/USDT,binance,okx,geckoterminal,uniswap_v3,,Oracle infrastructure token
+ARB,arbitrum,arbitrum,0x912ce59144191c1204e64559fe8253a0e49e6548,ARB/USDT,binance,okx,geckoterminal,uniswap_v3,,Layer 2 token on Arbitrum
+OP,optimism,optimism,0x4200000000000000000000000000000000000042,OP/USDT,binance,okx,geckoterminal,velodrome_or_uniswap_v3,,Layer 2 token on Optimism
+LDO,lido-dao,eth,0x5a98fcbea516cf06857215779fd812ca3bef1b32,LDO/USDT,binance,okx,geckoterminal,uniswap_v3,,Liquid staking governance token
+CRV,curve-dao-token,eth,0xd533a949740bb3306d119cc777fa900ba034cd52,CRV/USDT,binance,okx,geckoterminal,curve_or_uniswap_v3,,Curve ecosystem token
+PENDLE,pendle,eth,0x808507121b80c02388fad14726482e061b8da827,PENDLE/USDT,binance,okx,geckoterminal,uniswap_v3,,Yield trading DeFi token
+PEPE,pepe,eth,0x6982508145454ce325ddbe47a25d4ec3d2311933,PEPE/USDT,binance,okx,geckoterminal,uniswap_v2_or_v3,,Meme token with high market attention
+ENA,ethena,eth,0x57e114b691db790c35207b2e685d4a43181e6061,ENA/USDT,binance,okx,geckoterminal,uniswap_v3,,Ethena ecosystem token
+COMP,compound-governance-token,eth,0xc00e94cb662c3520282e6f5717214004a7f26888,COMP/USDT,binance,okx,geckoterminal,uniswap_v3,,DeFi lending governance token
+MORPHO,morpho,eth,0x58d97b57bb95320f9a05dc918aef65434969c2b2,MORPHO/USDT,binance,okx,geckoterminal,uniswap_v3,,DeFi lending protocol token
+SUSHI,sushi,eth,0x6b3595068778dd592e39a122f4f5a5cf09c90fe2,SUSHI/USDT,binance,okx,geckoterminal,sushiswap_or_uniswap,,Multichain DEX governance token
+1INCH,1inch,eth,0x111111111117dc0aa78b770fa6a738034120c302,1INCH/USDT,binance,okx,geckoterminal,uniswap_v3,,DEX aggregator token
+CAKE,pancakeswap-token,bsc,0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82,CAKE/USDT,binance,bybit,geckoterminal,pancakeswap,,BNB Chain DEX token
+GMX,gmx,arbitrum,0xfc5a1a6eb076a2c7ad06ed22c90d7e710e35ad0a,GMX/USDT,binance,okx,geckoterminal,uniswap_v3,,Arbitrum derivatives DEX token
+SNX,havven,eth,0xc011a73ee8576fb46f5e1c5751ca3b9fe0af2a6f,SNX/USDT,binance,okx,geckoterminal,uniswap_v3,,Onchain derivatives protocol token
+ONDO,ondo-finance,eth,0xfaba6f8e4a5e8ab82f62fe7c39859fa577269be3,ONDO/USDT,binance,okx,geckoterminal,uniswap_v3,,Real world asset protocol token
+EIGEN,eigenlayer,eth,0xec53bf9167f50cdeb3ae105f56099aaab9061f83,EIGEN/USDT,binance,okx,geckoterminal,uniswap_v3,,Restaking protocol token
+ETHFI,ether-fi,eth,0xfe0c30065b384f05761f15d0cc899d4f9f9cc0eb,ETHFI/USDT,binance,okx,geckoterminal,uniswap_v3,,Liquid restaking protocol token
+GRT,the-graph,eth,0xc944e90c64b2c07662a292be6244bdf05cda44a7,GRT/USDT,binance,okx,geckoterminal,uniswap_v3,,Blockchain indexing infrastructure token
+ENS,ethereum-name-service,eth,0xc18360217d8f7ab5e7c516566761ea12ce7f9d72,ENS/USDT,binance,okx,geckoterminal,uniswap_v3,,Onchain identity token
+WLD,worldcoin-wld,optimism,0xdc6ff44d5d932cbd77b52e5612ba0529dc6226f1,WLD/USDT,binance,okx,geckoterminal,uniswap_v3,,Digital identity ecosystem token
+STRK,starknet,starknet,0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d,STRK/USDT,binance,okx,geckoterminal,ekubo_or_myswap,,Starknet Layer 2 token
+ZK,zksync,zksync,0x5a7d6b2f92c77fad6ccabd7ee0624e64907eaf3e,ZK/USDT,binance,okx,geckoterminal,syncswap,,ZKsync Layer 2 token
+JUP,jupiter-exchange-solana,solana,JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN,JUP/USDT,binance,okx,geckoterminal,raydium_or_meteora,,Solana DEX aggregator token
+RAY,raydium,solana,4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R,RAY/USDT,binance,okx,geckoterminal,raydium,,Solana AMM token
+JTO,jito-governance-token,solana,jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL,JTO/USDT,binance,okx,geckoterminal,raydium_or_meteora,,Solana liquid staking governance token
+BONK,bonk,solana,DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263,BONK/USDT,binance,okx,geckoterminal,raydium_or_orca,,Solana meme token
+SHIB,shiba-inu,eth,0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce,SHIB/USDT,binance,okx,geckoterminal,uniswap_v2_or_v3,,Ethereum meme token

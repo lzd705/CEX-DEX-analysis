@@ -9,3 +9,5 @@ dashboard/state/*.local.jsonl
 data/a_review/
 data/raw/
 data/research/
+data/processed/
+data/local/

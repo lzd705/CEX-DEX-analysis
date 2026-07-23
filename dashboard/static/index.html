@@ -3,218 +3,110 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light">
-    <title>Market Structure Lab</title>
+    <meta name="color-scheme" content="dark">
+    <title>CEX / DEX Market Monitor</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <div class="app-shell">
-      <aside class="sidebar">
-        <div class="brand-block">
-          <div class="brand-mark">MS</div>
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark">CD</div>
+        <div>
+          <h1>CEX / DEX Market Monitor</h1>
+          <p>Venue-level facts, aligned on daily UTC observations</p>
+        </div>
+      </div>
+      <div class="status-cluster">
+        <span class="status-dot"></span>
+        <span id="freshness">Loading data</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="time-toolbar" aria-label="Global time window">
+        <div class="toolbar-title">
+          <i data-lucide="calendar-range"></i>
           <div>
-            <div class="brand-name">Market Structure Lab</div>
-            <div class="brand-subtitle">CEX / DEX research console</div>
+            <strong>Time window</strong>
+            <span id="available-range">Checking available dates</span>
           </div>
         </div>
-
-        <section class="filter-section">
-          <div class="section-label">Token</div>
-          <div id="token-list" class="token-list"></div>
-        </section>
-
-        <section class="filter-section">
-          <label class="section-label" for="metric-select">对比指标</label>
-          <select id="metric-select"></select>
-          <div id="metric-unit" class="field-meta"></div>
-        </section>
-
-        <section class="filter-section date-grid">
+        <div class="date-fields">
           <label>
-            <span class="section-label">开始日期</span>
+            <span>Start</span>
             <input id="date-start" type="date">
           </label>
+          <span class="date-arrow">to</span>
           <label>
-            <span class="section-label">结束日期</span>
+            <span>End</span>
             <input id="date-end" type="date">
           </label>
-        </section>
-
-        <section class="filter-section">
-          <label class="toggle-row">
-            <input id="normalize-toggle" type="checkbox">
-            <span class="toggle-track"><span></span></span>
-            <span>按 Token 标准化</span>
-          </label>
-        </section>
-
-        <div class="sidebar-actions">
-          <button id="save-state" class="button button-primary" type="button">
-            <i data-lucide="save"></i><span>保存状态</span>
-          </button>
-          <button id="export-data" class="button button-secondary" type="button">
-            <i data-lucide="download"></i><span>导出筛选数据</span>
-          </button>
         </div>
-        <div id="save-status" class="save-status">本地状态待载入</div>
-        <div id="public-status" class="public-status" hidden>公开只读模式 · 合成样例数据</div>
-      </aside>
+        <div class="preset-group" role="group" aria-label="Time presets">
+          <button type="button" data-days="7">7D</button>
+          <button type="button" data-days="30" class="active">30D</button>
+          <button type="button" data-days="90">90D</button>
+          <button type="button" data-days="all">All</button>
+        </div>
+        <button id="apply-window" class="icon-command" type="button" title="Apply time window">
+          <i data-lucide="refresh-cw"></i>
+          <span>Apply</span>
+        </button>
+      </section>
 
-      <main class="main-content">
-        <header class="topbar">
-          <div>
-            <h1>市场结构研究看板</h1>
-            <p id="source-line">正在读取研究面板</p>
-          </div>
-          <div class="freshness-badge"><span class="status-dot"></span><span id="freshness">载入中</span></div>
-        </header>
+      <section class="monitor-toolbar">
+        <div class="segmented-control" role="group" aria-label="Sort market scope">
+          <button type="button" data-scope="combined" class="active">综合</button>
+          <button type="button" data-scope="cex">CEX</button>
+          <button type="button" data-scope="dex">DEX</button>
+        </div>
+        <label class="sort-control">
+          <span>Sort by</span>
+          <select id="sort-field">
+            <option value="volume">USD Volume</option>
+            <option value="spread">Absolute Spread</option>
+            <option value="return">Window Return</option>
+            <option value="volatility">Daily Volatility</option>
+          </select>
+        </label>
+        <label class="search-control">
+          <i data-lucide="search"></i>
+          <input id="token-search" type="search" placeholder="Filter token" autocomplete="off">
+        </label>
+        <div id="row-count" class="row-count"></div>
+      </section>
 
-        <nav class="tabs" aria-label="Dashboard views">
-          <button class="tab active" data-view="overview" type="button">总览</button>
-          <button class="tab" data-view="factors" type="button">因子比较</button>
-          <button class="tab" data-view="workspace" type="button">研究进度</button>
-        </nav>
+      <div id="error-banner" class="error-banner" hidden></div>
 
-        <div id="error-banner" class="error-banner" hidden></div>
+      <section class="market-panel">
+        <div class="table-scroll">
+          <table id="market-table">
+            <thead>
+              <tr>
+                <th class="sticky-token">Token / Market</th>
+                <th>Venue</th>
+                <th>Pair / Pool</th>
+                <th>Latest Price</th>
+                <th>Window Return</th>
+                <th>Daily Volatility</th>
+                <th>USD Volume</th>
+                <th>TVL Snapshot</th>
+                <th>CEX-DEX Spread</th>
+                <th>Coverage</th>
+              </tr>
+            </thead>
+            <tbody id="market-body"></tbody>
+          </table>
+        </div>
+      </section>
 
-        <section id="view-overview" class="view active">
-          <div id="kpi-grid" class="kpi-grid"></div>
+      <footer>
+        <div id="source-list"></div>
+        <div>Spread = selected DEX price / selected CEX price - 1 on their latest common date. It appears only on the Token row.</div>
+        <div>TVL is the latest fetch snapshot and is not presented as historical daily TVL.</div>
+      </footer>
+    </main>
 
-          <div class="dashboard-grid two-columns">
-            <article class="panel panel-wide">
-              <div class="panel-header">
-                <div>
-                  <h2 id="metric-title">指标时间序列</h2>
-                  <p id="metric-subtitle">按所选 Token 与时间区间</p>
-                </div>
-                <div class="legend-note" id="selection-count"></div>
-              </div>
-              <div class="chart-wrap chart-tall"><canvas id="metric-chart"></canvas></div>
-            </article>
-
-            <article class="panel">
-              <div class="panel-header">
-                <div>
-                  <h2>Token 横向比较</h2>
-                  <p id="comparison-subtitle">所选指标的期间中位数</p>
-                </div>
-              </div>
-              <div class="chart-wrap"><canvas id="comparison-chart"></canvas></div>
-            </article>
-
-            <article class="panel">
-              <div class="panel-header">
-                <div>
-                  <h2>CEX 与 DEX 成交额</h2>
-                  <p>每日合计，USD，对数坐标</p>
-                </div>
-              </div>
-              <div class="chart-wrap"><canvas id="volume-chart"></canvas></div>
-            </article>
-
-            <article id="scope-panel" class="panel panel-wide">
-              <div class="panel-header">
-                <div>
-                  <h2>CEX 口径敏感性</h2>
-                  <p>同一 DEX 样本下，不同 CEX 汇总范围的 Observed DEX Share</p>
-                </div>
-                <span class="snapshot-tag">A-side ae968f7 snapshot</span>
-              </div>
-              <div class="chart-wrap chart-medium"><canvas id="scope-chart"></canvas></div>
-            </article>
-          </div>
-
-          <article class="panel data-table-panel">
-            <div class="panel-header">
-              <div>
-                <h2>Token 覆盖明细</h2>
-                <p>成交额、池集中度与数据完整度</p>
-              </div>
-            </div>
-            <div class="table-wrap"><table id="coverage-table"></table></div>
-          </article>
-        </section>
-
-        <section id="view-factors" class="view">
-          <div class="factor-controls">
-            <label>
-              <span class="section-label">候选因子</span>
-              <select id="factor-select"></select>
-            </label>
-            <div class="segmented-control" role="group" aria-label="Return horizon">
-              <button type="button" data-horizon="1d">1D</button>
-              <button type="button" data-horizon="3d">3D</button>
-              <button type="button" data-horizon="7d" class="active">7D</button>
-              <button type="button" data-horizon="14d">14D</button>
-            </div>
-          </div>
-          <div class="dashboard-grid two-columns">
-            <article class="panel panel-wide">
-              <div class="panel-header">
-                <div>
-                  <h2 id="factor-chart-title">因子分组与未来收益</h2>
-                  <p>从最低分组到最高分组，柱高为平均未来收益</p>
-                </div>
-              </div>
-              <div class="chart-wrap chart-tall"><canvas id="factor-chart"></canvas></div>
-            </article>
-            <article class="panel">
-              <div class="panel-header">
-                <div><h2>最高组与最低组</h2><p>多空差与样本数量</p></div>
-              </div>
-              <div id="factor-summary" class="factor-summary"></div>
-            </article>
-            <article class="panel">
-              <div class="panel-header">
-                <div><h2>数据边界</h2><p>当前结果解释范围</p></div>
-              </div>
-              <ul class="caveat-list">
-                <li>Observed DEX Share 仅代表已抓取来源。</li>
-                <li>DEX 方向字段缺少 swap-level 数据，保持空值。</li>
-                <li>日频 lead-lag 不能证明日内因果关系。</li>
-                <li>因子表现是候选筛选结果，不是交易建议。</li>
-              </ul>
-            </article>
-          </div>
-        </section>
-
-        <section id="view-workspace" class="view">
-          <div class="workspace-grid">
-            <article class="panel">
-              <div class="panel-header">
-                <div><h2>工作清单</h2><p id="progress-label">0 / 0 已完成</p></div>
-              </div>
-              <div class="progress-track"><div id="progress-bar"></div></div>
-              <div id="checklist" class="checklist"></div>
-            </article>
-
-            <article class="panel notes-panel">
-              <div class="panel-header">
-                <div><h2>研究记录</h2><p>保存在 dashboard/state/work_status.local.json</p></div>
-              </div>
-              <textarea id="research-notes" placeholder="记录会议结论、异常、待验证假设和下一步……"></textarea>
-            </article>
-
-            <article class="panel panel-wide">
-              <div class="panel-header">
-                <div><h2>数据状态</h2><p>当前看板读取的本地数据快照</p></div>
-              </div>
-              <div id="data-status-grid" class="data-status-grid"></div>
-            </article>
-
-            <article class="panel panel-wide">
-              <div class="panel-header">
-                <div><h2>保存历史</h2><p>追加记录数据版本、筛选条件与任务进度</p></div>
-              </div>
-              <div id="history-list" class="history-list"></div>
-            </article>
-          </div>
-        </section>
-      </main>
-    </div>
-
-    <script src="/vendor/chart.umd.js"></script>
-    <script src="/vendor/chartjs-adapter-date-fns.js"></script>
     <script src="/vendor/lucide.js"></script>
     <script src="/app.js"></script>
   </body>
