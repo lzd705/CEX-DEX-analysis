@@ -23,6 +23,9 @@ study, or public data-edit controls.
 7. Preserve missing values as null. Never replace unavailable facts with zero.
 8. Keep administrator authentication and refresh APIs separate from the public
    Market Monitor.
+9. Publish an auditable market catalog and a two-venue daily comparison that
+   exposes raw closes, daily USD volume, absolute price spread, and
+   midpoint-relative bps.
 
 ## Local workflow
 
@@ -43,6 +46,8 @@ inputs and the generated `market_facts.sqlite3` runtime database live in the
 ignored `data/local/` directory, or an external directory selected by
 `MARKET_DATA_DIR`. The website queries SQLite; it does not rescan all CSV rows
 on each request. See `data/README.md` for the full data lifecycle.
+The public catalog and comparison contract is documented in
+`docs/market-facts-contract.md`.
 
 Administrator setup is documented in `docs/admin-operations.md`. The page is
 served at `/admin.html`. It supports password authentication by default or an

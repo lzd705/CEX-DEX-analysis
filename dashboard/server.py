@@ -25,8 +25,18 @@ from urllib.parse import parse_qs, urlparse
 
 try:
     from dashboard.admin import AdminService
+    from dashboard.market_facts import (
+        catalog_contract,
+        catalog_from_market_payload,
+        compare_daily_rows,
+    )
 except ModuleNotFoundError:
     from admin import AdminService
+    from market_facts import (
+        catalog_contract,
+        catalog_from_market_payload,
+        compare_daily_rows,
+    )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD_ROOT = Path(__file__).resolve().parent
@@ -507,6 +517,183 @@ def build_market_payload(start: str | None = None, end: str | None = None) -> di
     return _build_market_payload_cached(start, end, str(cex_path), str(dex_path), signature)
 
 
+def build_market_catalog() -> dict[str, Any]:
+    """Return every observed market plus the versioned fact contract."""
+    default_payload = build_market_payload()
+    metadata = default_payload["metadata"]
+    full_payload = build_market_payload(
+        metadata["available_start"],
+        metadata["available_end"],
+    )
+    return catalog_from_market_payload(full_payload)
+
+
+def validate_fact_window(
+    start: str | None,
+    end: str | None,
+    available_start: str,
+    available_end: str,
+) -> tuple[str, str]:
+    effective_end = parse_iso_date(end) or available_end
+    default_start = (date.fromisoformat(effective_end) - timedelta(days=29)).isoformat()
+    effective_start = parse_iso_date(start) or max(available_start, default_start)
+    if effective_start > effective_end:
+        raise ValueError("start date must not be after end date")
+    if effective_start < available_start or effective_end > available_end:
+        raise ValueError(f"date window must be within {available_start} and {available_end}")
+    return effective_start, effective_end
+
+
+def database_market_rows(
+    database_path: Path,
+    market: dict[str, Any],
+    start: str,
+    end: str,
+) -> list[dict[str, Any]]:
+    connection = connect_database(database_path)
+    try:
+        if market["market_type"] == "cex":
+            rows = connection.execute(
+                """
+                SELECT date, close AS price_usd, quote_volume_usd AS volume_usd
+                FROM cex_market_daily
+                WHERE token_symbol = ? AND exchange = ? AND cex_symbol = ?
+                  AND date BETWEEN ? AND ?
+                ORDER BY date
+                """,
+                (
+                    market["token_symbol"],
+                    market["exchange"],
+                    market["instrument"],
+                    start,
+                    end,
+                ),
+            )
+        else:
+            rows = connection.execute(
+                """
+                SELECT date, close AS price_usd, dex_volume_usd AS volume_usd
+                FROM dex_pool_daily
+                WHERE token_symbol = ? AND chain = ? AND pool_address = ?
+                  AND date BETWEEN ? AND ?
+                ORDER BY date
+                """,
+                (
+                    market["token_symbol"],
+                    market["chain"],
+                    market["pool_address"],
+                    start,
+                    end,
+                ),
+            )
+        return [
+            {
+                "date": row["date"],
+                "price_usd": parse_number(row["price_usd"]),
+                "volume_usd": parse_number(row["volume_usd"]),
+            }
+            for row in rows
+        ]
+    finally:
+        connection.close()
+
+
+def csv_market_rows(
+    market: dict[str, Any],
+    start: str,
+    end: str,
+) -> list[dict[str, Any]]:
+    cex_path, dex_path = resolve_data_paths()
+    path = cex_path if market["market_type"] == "cex" else dex_path
+    result = []
+    for row in rows_in_window(path, start, end):
+        if row.get("token_symbol") != market["token_symbol"]:
+            continue
+        if market["market_type"] == "cex":
+            if row.get("exchange") != market["exchange"] or row.get("cex_symbol") != market["instrument"]:
+                continue
+            volume = row.get("quote_volume_usd")
+        else:
+            if row.get("chain") != market["chain"] or row.get("pool_address") != market["pool_address"]:
+                continue
+            volume = row.get("dex_volume_usd")
+        result.append(
+            {
+                "date": row["date"],
+                "price_usd": parse_number(row.get("close")),
+                "volume_usd": parse_number(volume),
+            }
+        )
+    return sorted(result, key=lambda row: row["date"])
+
+
+def selected_market_rows(
+    market: dict[str, Any],
+    start: str,
+    end: str,
+) -> list[dict[str, Any]]:
+    database_path = resolve_database_path()
+    if database_path is not None:
+        return database_market_rows(database_path, market, start, end)
+    return csv_market_rows(market, start, end)
+
+
+def build_market_comparison(
+    token_symbol: str | None,
+    market_a_id: str | None,
+    market_b_id: str | None,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, Any]:
+    """Return aligned raw daily facts for two selected markets."""
+    if not token_symbol or not market_a_id or not market_b_id:
+        raise ValueError("token, market_a, and market_b are required")
+    token = token_symbol.upper()
+    if market_a_id == market_b_id:
+        raise ValueError("market_a and market_b must be different")
+
+    catalog = build_market_catalog()
+    metadata = catalog["metadata"]
+    effective_start, effective_end = validate_fact_window(
+        start,
+        end,
+        metadata["available_start"],
+        metadata["available_end"],
+    )
+    markets = {
+        market["market_id"]: market
+        for market in catalog["markets"]
+        if market["token_symbol"] == token
+    }
+    market_a = markets.get(market_a_id)
+    market_b = markets.get(market_b_id)
+    if market_a is None or market_b is None:
+        raise ValueError("Selected market is not cataloged for the requested token")
+
+    rows_a = selected_market_rows(market_a, effective_start, effective_end)
+    rows_b = selected_market_rows(market_b, effective_start, effective_end)
+    observations = compare_daily_rows(rows_a, rows_b)
+    comparable = [row for row in observations if row["spread_bps"] is not None]
+    return {
+        "metadata": {
+            **catalog_contract(),
+            "available_start": metadata["available_start"],
+            "available_end": metadata["available_end"],
+            "start_date": effective_start,
+            "end_date": effective_end,
+            "sources": metadata["sources"],
+            "storage": metadata["storage"],
+            "comparison_days": len(comparable),
+            "union_observation_days": len(observations),
+        },
+        "token_symbol": token,
+        "market_a": market_a,
+        "market_b": market_b,
+        "latest_comparable_observation": comparable[-1] if comparable else None,
+        "observations": observations,
+    }
+
+
 def encode_json_payload(payload: Any, accept_encoding: str = "") -> tuple[bytes, bool]:
     """Serialize JSON and compress substantial responses when the client supports gzip."""
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -619,6 +806,27 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/markets/catalog":
+            try:
+                self.send_json(build_market_catalog())
+            except (FileNotFoundError, ValueError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/markets/compare":
+            query = parse_qs(parsed.query)
+            try:
+                self.send_json(
+                    build_market_comparison(
+                        token_symbol=query.get("token", [None])[0],
+                        market_a_id=query.get("market_a", [None])[0],
+                        market_b_id=query.get("market_b", [None])[0],
+                        start=query.get("start", [None])[0],
+                        end=query.get("end", [None])[0],
+                    )
+                )
+            except (FileNotFoundError, ValueError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path == "/api/market":
             query = parse_qs(parsed.query)
             try:

@@ -54,6 +54,81 @@
         </button>
       </section>
 
+      <section class="facts-workbench" aria-labelledby="facts-title">
+        <div class="facts-heading">
+          <div>
+            <span class="eyebrow">P0 · auditable market facts</span>
+            <h2 id="facts-title">Two-venue daily comparison</h2>
+            <p>Select one Token and any two cataloged venues. Values are unfilled daily source observations.</p>
+          </div>
+          <span class="contract-badge">Daily UTC · USD quote</span>
+        </div>
+
+        <div class="facts-controls">
+          <label>
+            <span>Token</span>
+            <select id="facts-token" aria-label="Comparison token"></select>
+          </label>
+          <label>
+            <span>Venue A</span>
+            <select id="facts-market-a" aria-label="First comparison venue"></select>
+          </label>
+          <label>
+            <span>Venue B</span>
+            <select id="facts-market-b" aria-label="Second comparison venue"></select>
+          </label>
+          <button id="compare-markets" class="compare-command" type="button">
+            Compare
+          </button>
+        </div>
+
+        <div id="comparison-error" class="error-banner" hidden></div>
+        <div class="comparison-summary">
+          <div>
+            <span>Latest comparable date</span>
+            <strong id="compare-date">—</strong>
+          </div>
+          <div>
+            <span>Absolute spread</span>
+            <strong id="compare-absolute">—</strong>
+          </div>
+          <div>
+            <span>Midpoint bps</span>
+            <strong id="compare-bps">—</strong>
+          </div>
+          <div>
+            <span>Comparable days</span>
+            <strong id="compare-days">—</strong>
+          </div>
+        </div>
+
+        <div class="comparison-table-scroll">
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th>Date (UTC)</th>
+                <th id="market-a-price-heading">A Price (USD)</th>
+                <th id="market-a-volume-heading">A Volume (USD)</th>
+                <th id="market-b-price-heading">B Price (USD)</th>
+                <th id="market-b-volume-heading">B Volume (USD)</th>
+                <th>Absolute Spread (USD)</th>
+                <th>Spread (bps)</th>
+                <th>Missing rule</th>
+              </tr>
+            </thead>
+            <tbody id="comparison-body">
+              <tr><td colspan="8" class="missing">Loading market catalog</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details class="facts-contract">
+          <summary>Data contract and audit trail</summary>
+          <div id="facts-contract-copy"></div>
+          <div id="facts-source-copy"></div>
+        </details>
+      </section>
+
       <section class="monitor-toolbar">
         <div class="segmented-control" role="group" aria-label="Sort market scope">
           <button type="button" data-scope="combined" class="active">综合</button>
@@ -105,6 +180,7 @@
       <footer>
         <div id="source-list"></div>
         <div>Spread = selected DEX price / selected CEX price - 1 on their latest common date. It appears only on the Token row.</div>
+        <div>The comparison workbench uses absolute midpoint-relative bps; it does not infer bid/ask spread, depth, or slippage.</div>
         <div>TVL is the latest fetch snapshot and is not presented as historical daily TVL.</div>
       </footer>
     </main>

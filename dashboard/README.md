@@ -66,3 +66,8 @@ CSVs and a validated SQLite database back into `data/local/`.
 - Spread is calculated from those two selected prices and appears only on the
   token summary row.
 - Missing values stay `N/A`; CEX-inapplicable TVL and row-level spread use `--`.
+- The comparison workbench selects one Token and any two cataloged markets,
+  then displays unfilled daily closes, daily USD volume, absolute USD spread,
+  and midpoint-relative bps.
+- `/api/markets/catalog` is the audit entrypoint; `/api/markets/compare` accepts
+  only cataloged market IDs for the requested Token.

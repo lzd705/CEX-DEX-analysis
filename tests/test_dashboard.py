@@ -138,6 +138,62 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertAlmostEqual(payload["tokens"][0]["price_spread"], 105 / 102 - 1)
         self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)
 
+    def test_catalog_identifies_markets_and_declares_fact_contract(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            catalog = server.build_market_catalog()
+
+        self.assertEqual(catalog["metadata"]["catalog_version"], 1)
+        self.assertEqual(catalog["metadata"]["time_grain"], "1 day, UTC")
+        self.assertEqual(catalog["metadata"]["price_quote_asset"], "USD")
+        self.assertIn("not order-book depth", catalog["metadata"]["semantic_boundary"])
+        self.assertEqual(catalog["tokens"], ["BTC"])
+        market_ids = {market["market_id"] for market in catalog["markets"]}
+        self.assertEqual(
+            market_ids,
+            {
+                "cex:binance:BTC/USDT",
+                "cex:okx:BTC/USDT",
+                "dex:eth:uniswap:0xpool",
+            },
+        )
+
+    def test_comparison_returns_raw_daily_facts_absolute_spread_and_bps(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            result = server.build_market_comparison(
+                "BTC",
+                "cex:binance:BTC/USDT",
+                "dex:eth:uniswap:0xpool",
+                "2026-01-01",
+                "2026-01-02",
+            )
+
+        self.assertEqual(result["metadata"]["comparison_days"], 2)
+        self.assertEqual(result["market_a"]["price_quote_asset"], "USD")
+        self.assertEqual(result["observations"][0]["market_a"]["price_usd"], 100)
+        self.assertEqual(result["observations"][0]["market_a"]["volume_usd"], 1000)
+        self.assertEqual(result["observations"][0]["market_b"]["price_usd"], 101)
+        self.assertEqual(result["observations"][0]["market_b"]["volume_usd"], 300)
+        self.assertEqual(result["observations"][0]["absolute_spread_usd"], 1)
+        self.assertAlmostEqual(
+            result["observations"][0]["spread_bps"],
+            1 / 100.5 * 10_000,
+        )
+
+    def test_comparison_rejects_same_or_wrong_token_market(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "must be different"):
+                server.build_market_comparison(
+                    "BTC",
+                    "cex:binance:BTC/USDT",
+                    "cex:binance:BTC/USDT",
+                )
+            with self.assertRaisesRegex(ValueError, "not cataloged"):
+                server.build_market_comparison(
+                    "ETH",
+                    "cex:binance:BTC/USDT",
+                    "dex:eth:uniswap:0xpool",
+                )
+
     def test_date_window_limits_volume_and_coverage(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
             payload = server.build_market_payload("2026-01-02", "2026-01-02")

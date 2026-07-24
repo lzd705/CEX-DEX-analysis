@@ -121,6 +121,111 @@ main { min-width: 0; padding: 14px 18px 30px; }
 .icon-command svg { width: 14px; height: 14px; }
 .icon-command:disabled { cursor: wait; opacity: .55; }
 
+.facts-workbench {
+  margin-top: 10px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, #171b21 0%, var(--surface) 100%);
+}
+.facts-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+.facts-heading h2 { margin: 4px 0 3px; font-size: 20px; }
+.facts-heading p { margin: 0; color: var(--muted); font-size: 13px; }
+.eyebrow {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 850;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+}
+.contract-badge {
+  padding: 6px 9px;
+  border: 1px solid #477e83;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: #a9e1e5;
+  font-size: 12px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+.facts-controls {
+  display: grid;
+  grid-template-columns: minmax(110px, .55fr) minmax(240px, 1.5fr) minmax(240px, 1.5fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 16px;
+}
+.facts-controls label span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+.facts-controls select {
+  width: 100%;
+  height: 42px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--text);
+}
+.compare-command {
+  height: 42px;
+  padding: 0 18px;
+  border: 1px solid #477e83;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #091315;
+  font-weight: 850;
+}
+.compare-command:disabled { cursor: wait; opacity: .55; }
+.comparison-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  background: var(--line);
+}
+.comparison-summary > div { padding: 12px 14px; background: var(--surface-2); }
+.comparison-summary span { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; }
+.comparison-summary strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 17px;
+}
+.comparison-table-scroll {
+  max-height: 390px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-top: 0;
+}
+.comparison-table { min-width: 1250px; font-size: 13px; }
+.comparison-table th,
+.comparison-table td { text-align: right; }
+.comparison-table th:first-child,
+.comparison-table td:first-child,
+.comparison-table th:last-child,
+.comparison-table td:last-child { text-align: left; }
+.facts-contract {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  background: #12151a;
+  color: var(--muted);
+  font-size: 12px;
+}
+.facts-contract summary { cursor: pointer; color: #b8c0ca; font-weight: 750; }
+.facts-contract div { margin-top: 7px; line-height: 1.6; }
+
 .monitor-toolbar { min-height: 66px; margin-top: 8px; border-bottom: 0; }
 .sort-control { display: flex; align-items: center; gap: 8px; }
 .sort-control span { margin: 0; }
@@ -204,11 +309,17 @@ footer {
   line-height: 1.6;
 }
 
+@media (max-width: 1250px) {
+  .facts-controls { grid-template-columns: 1fr 1fr; }
+  .compare-command { width: 100%; }
+}
+
 @media (max-width: 900px) {
   .time-toolbar { align-items: stretch; flex-wrap: wrap; position: relative; }
   .toolbar-title { width: 100%; }
   .search-control { margin-left: 0; }
   .monitor-toolbar { flex-wrap: wrap; }
+  .comparison-summary { grid-template-columns: 1fr 1fr; }
   .table-scroll { max-height: none; }
 }
 
@@ -222,6 +333,11 @@ footer {
   .preset-group { width: 100%; }
   .preset-group button { flex: 1; }
   .icon-command { width: 100%; justify-content: center; }
+  .facts-workbench { padding: 14px 10px; }
+  .facts-heading { display: block; }
+  .contract-badge { display: inline-block; margin-top: 10px; }
+  .facts-controls { grid-template-columns: 1fr; }
+  .comparison-summary { grid-template-columns: 1fr; }
   .search-control { width: 100%; }
   .search-control input { flex: 1; width: auto; }
 }
