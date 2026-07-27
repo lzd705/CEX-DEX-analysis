@@ -117,6 +117,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             "MARKET_CEX_DATA": str(self.cex_path),
             "MARKET_DEX_DATA": str(self.dex_path),
         }
+        self.tvl_path = data_dir / server.TVL_FILENAME
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -137,6 +138,58 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertNotIn("factor_results", payload)
         self.assertAlmostEqual(payload["tokens"][0]["price_spread"], 105 / 102 - 1)
         self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)
+
+    def test_point_in_time_tvl_snapshot_overlays_legacy_ohlcv_value(self):
+        write_csv(
+            self.tvl_path,
+            [
+                "snapshot_id",
+                "observed_at",
+                "token_symbol",
+                "chain",
+                "pool_address",
+                "tvl_usd",
+                "tvl_method",
+                "source",
+                "source_endpoint",
+                "raw_response_sha256",
+                "status",
+            ],
+            [
+                {
+                    "snapshot_id": "tvl-snapshot-1",
+                    "observed_at": "2026-07-27T01:02:03+00:00",
+                    "token_symbol": "BTC",
+                    "chain": "eth",
+                    "pool_address": "0xpool",
+                    "tvl_usd": "7654.32",
+                    "tvl_method": "geckoterminal_reserve_in_usd",
+                    "source": "GeckoTerminal API v2",
+                    "source_endpoint": "https://example.test/pool",
+                    "raw_response_sha256": "abc123",
+                    "status": "observed",
+                }
+            ],
+        )
+        environment = {
+            **self.environment,
+            "MARKET_TVL_DATA": str(self.tvl_path),
+        }
+
+        with patch.dict(server.os.environ, environment, clear=True):
+            payload = server.build_market_payload("2026-01-01", "2026-01-02")
+            catalog = server.build_market_catalog()
+
+        pool = payload["dex_pools"][0]
+        self.assertEqual(pool["tvl_usd"], 7654.32)
+        self.assertEqual(pool["tvl_status"], "observed")
+        self.assertEqual(pool["tvl_observed_at"], "2026-07-27T01:02:03+00:00")
+        self.assertEqual(payload["metadata"]["tvl_snapshot"]["matched_market_rows"], 1)
+        catalog_pool = next(
+            market for market in catalog["markets"] if market["market_type"] == "dex"
+        )
+        self.assertEqual(catalog_pool["tvl_usd"], 7654.32)
+        self.assertEqual(catalog_pool["tvl_method"], "geckoterminal_reserve_in_usd")
 
     def test_catalog_identifies_markets_and_declares_fact_contract(self):
         with patch.dict(server.os.environ, self.environment, clear=True):

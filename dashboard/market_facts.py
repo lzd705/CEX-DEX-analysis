@@ -130,6 +130,10 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "price_quote_asset": PRICE_QUOTE_ASSET,
                 "source_quote_asset_label": "USD (GeckoTerminal currency=usd)",
                 "source": "GeckoTerminal API v2 daily pool OHLCV",
+                "tvl_usd": row.get("tvl_usd"),
+                "tvl_status": row.get("tvl_status"),
+                "tvl_observed_at": row.get("tvl_observed_at"),
+                "tvl_method": row.get("tvl_method"),
                 "observed_start": row["price_points"][0]["date"] if row["price_points"] else None,
                 "observed_end": row["latest_date"],
                 "observation_days": row["observation_days"],
@@ -141,6 +145,7 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "available_end": payload["metadata"]["available_end"],
         "sources": payload["metadata"]["sources"],
         "storage": payload["metadata"]["storage"],
+        "tvl_snapshot": payload["metadata"].get("tvl_snapshot"),
         "cex_normalization_note": (
             "The displayed instrument is the configured canonical pair label. "
             "Adapters normalize source prices and volume to USD; USDT pairs use a "

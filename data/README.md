@@ -20,6 +20,18 @@ The two reviewed CSV inputs are:
 - `cex_exchange_volume_daily.csv`
 - `dex_pool_volume_daily.csv`
 
+Point-in-time TVL has a separate lifecycle from daily OHLCV:
+
+- `data/processed/dex_pool_tvl_snapshot.csv` is the current collection awaiting
+  review;
+- `data/local/dex_pool_tvl_latest.csv` is the complete latest pool snapshot used
+  by the website;
+- `data/local/dex_pool_tvl_history.csv` is append-only normalized history;
+- `data/raw/tvl/<snapshot_id>/` retains source responses and a manifest.
+
+TVL publication does not rebuild the historical SQLite database because a
+current source-reported reserve is not a daily historical fact.
+
 CSV remains the interchange and audit format. The web API does not scan CSV
 when `market_facts.sqlite3` is present.
 

@@ -33,6 +33,9 @@ study, or public data-edit controls.
 # Refresh facts from source APIs. This does not build factors.
 python3 scripts/run_fact_pipeline.py
 
+# Refresh source-reported point-in-time TVL for every published DEX pool.
+python3 scripts/fetch_tvl.py --publish-local
+
 # Import a reviewed snapshot and atomically publish the indexed runtime database.
 python3 scripts/import_local_snapshot.py data/processed
 
@@ -48,6 +51,8 @@ ignored `data/local/` directory, or an external directory selected by
 on each request. See `data/README.md` for the full data lifecycle.
 The public catalog and comparison contract is documented in
 `docs/market-facts-contract.md`.
+The separate point-in-time TVL lifecycle and missing-value rules are documented
+in `docs/tvl-data-contract.md`.
 
 Administrator setup is documented in `docs/admin-operations.md`. The page is
 served at `/admin.html`. It supports password authentication by default or an
@@ -55,6 +60,7 @@ explicit no-login mode through `ADMIN_LOGIN_REQUIRED=false`.
 
 ## Future scope
 
-Events, depth, slippage, fee/gas data, anomaly rules, historical-end-date
+Events, depth, slippage, fee/gas data, anomaly rules, historical TVL backfills,
+historical-end-date
 backfills, and adding previously unconfigured Tokens require separate data
 contracts and acceptance tests.

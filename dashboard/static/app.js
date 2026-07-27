@@ -60,6 +60,13 @@ function formatRawVolume(value) {
   return finite(value) ? `$${rawVolume.format(value)}` : "N/A";
 }
 
+function formatUtcTimestamp(value) {
+  if (!value) return "time unavailable";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return `${parsed.toISOString().replace("T", " ").slice(0, 19)} UTC`;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -156,6 +163,9 @@ function metricClass(value) {
 function marketRow(token, market, row, options) {
   const label = market === "cex" ? "CEX" : "DEX";
   const tvl = market === "dex" ? formatCurrency(row?.tvl_usd) : "--";
+  const tvlTitle = market === "dex"
+    ? `${row?.tvl_status || "unavailable"} · ${formatUtcTimestamp(row?.tvl_observed_at)}`
+    : "TVL is not applicable to CEX order books";
   if (!row) {
     return `<tr class="market-row ${market}"><td class="sticky-token market-label">${label}</td><td colspan="9" class="missing">No observations in this window</td></tr>`;
   }
@@ -170,7 +180,7 @@ function marketRow(token, market, row, options) {
     <td class="${metricClass(row.window_return)}">${formatPercent(row.window_return)}</td>
     <td>${formatPercent(row.daily_volatility)}</td>
     <td>${formatCurrency(row.volume_usd)}</td>
-    <td>${tvl}</td>
+    <td title="${escapeHtml(tvlTitle)}">${tvl}</td>
     <td class="not-applicable">--</td>
     <td>${row.observation_days}D · ${escapeHtml(row.latest_date)}</td>
   </tr>`;
@@ -241,6 +251,10 @@ function updateMetadata() {
     ? `SQLite snapshot · ${storage.snapshot_id}`
     : "CSV fallback";
   byId("source-list").textContent = `${storageText} | ${sourceText}`;
+  const tvl = metadata.tvl_snapshot;
+  byId("tvl-source-status").textContent = tvl
+    ? `TVL snapshot ${formatUtcTimestamp(tvl.observed_at)} · ${tvl.status_counts.observed}/${tvl.pool_rows} observed · ${tvl.method}`
+    : metadata.tvl_note;
 }
 
 function factsMarketLabel(market) {
@@ -291,6 +305,9 @@ function updateFactsContract() {
     `Catalog v${metadata.catalog_version}.`,
     metadata.cex_normalization_note,
     `Sources: ${metadata.sources.map((source) => `${source.name} (${source.sha256})`).join(" | ")}.`,
+    metadata.tvl_snapshot
+      ? `TVL: ${metadata.tvl_snapshot.status_counts.observed}/${metadata.tvl_snapshot.pool_rows} pools observed at ${formatUtcTimestamp(metadata.tvl_snapshot.observed_at)}.`
+      : "",
   ].join(" ");
 }
 

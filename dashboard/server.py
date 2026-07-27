@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import gzip
 import hashlib
@@ -49,6 +50,7 @@ DEFAULT_DATA_DIRS = [
 CEX_FILENAME = "cex_exchange_volume_daily.csv"
 DEX_FILENAME = "dex_pool_volume_daily.csv"
 DATABASE_FILENAME = "market_facts.sqlite3"
+TVL_FILENAME = "dex_pool_tvl_latest.csv"
 VENDOR_FILES = {
     "/vendor/lucide.js": DASHBOARD_ROOT / "node_modules/lucide/dist/umd/lucide.min.js",
 }
@@ -138,6 +140,30 @@ def resolve_database_path() -> Path | None:
         database_path = data_dir / DATABASE_FILENAME
         if database_path.exists():
             return database_path
+    return None
+
+
+def resolve_tvl_path() -> Path | None:
+    """Resolve an optional point-in-time TVL snapshot independently of OHLCV."""
+    explicit_tvl = os.environ.get("MARKET_TVL_DATA")
+    if explicit_tvl:
+        tvl_path = Path(explicit_tvl).expanduser().resolve()
+        if not tvl_path.exists():
+            raise FileNotFoundError(f"Configured TVL snapshot does not exist: {tvl_path}")
+        return tvl_path
+    if os.environ.get("MARKET_CEX_DATA") or os.environ.get("MARKET_DEX_DATA"):
+        return None
+    explicit_database = os.environ.get("MARKET_DATABASE")
+    if explicit_database:
+        sibling = Path(explicit_database).expanduser().resolve().parent / TVL_FILENAME
+        return sibling if sibling.exists() else None
+
+    configured_dir = os.environ.get("MARKET_DATA_DIR")
+    candidates = [Path(configured_dir).expanduser().resolve()] if configured_dir else DEFAULT_DATA_DIRS
+    for data_dir in candidates:
+        tvl_path = data_dir / TVL_FILENAME
+        if tvl_path.exists():
+            return tvl_path
     return None
 
 
@@ -362,6 +388,118 @@ def data_signature(paths: Iterable[Path]) -> tuple[tuple[str, int, int], ...]:
     return tuple(signature)
 
 
+@lru_cache(maxsize=8)
+def _load_tvl_snapshot_cached(
+    path_text: str,
+    _signature: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    path = Path(path_text)
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {
+            "snapshot_id",
+            "observed_at",
+            "token_symbol",
+            "chain",
+            "pool_address",
+            "tvl_usd",
+            "tvl_method",
+            "source",
+            "source_endpoint",
+            "raw_response_sha256",
+            "status",
+        }
+        missing = sorted(required - set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(f"{path.name} is missing TVL columns: {', '.join(missing)}")
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"{path.name} contains no TVL rows")
+
+    latest: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in rows:
+        key = (
+            row["token_symbol"].upper(),
+            row["chain"].lower(),
+            row["pool_address"].lower()
+            if row["pool_address"].startswith("0x")
+            else row["pool_address"],
+        )
+        if key not in latest or row["observed_at"] > latest[key]["observed_at"]:
+            latest[key] = row
+    snapshot_ids = sorted({row["snapshot_id"] for row in rows if row.get("snapshot_id")})
+    return {
+        "path": path,
+        "rows": latest,
+        "snapshot_ids": snapshot_ids,
+        "observed_at": max(row["observed_at"] for row in rows),
+        "status_counts": {
+            status: sum(row.get("status") == status for row in rows)
+            for status in ("observed", "missing", "not_found", "failed")
+        },
+    }
+
+
+def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict[str, Any]:
+    """Overlay current source-reported TVL without rewriting historical OHLCV."""
+    result = copy.deepcopy(payload)
+    if tvl_path is None:
+        for pool in result["dex_pools"]:
+            pool["tvl_status"] = "legacy_ohlcv_snapshot" if pool.get("tvl_usd") is not None else "unavailable"
+            pool["tvl_observed_at"] = None
+            pool["tvl_method"] = "legacy_geckoterminal_reserve_in_usd"
+        return result
+
+    snapshot = _load_tvl_snapshot_cached(
+        str(tvl_path),
+        data_signature([tvl_path]),
+    )
+    matched = 0
+    for pool in result["dex_pools"]:
+        chain, _ = pool["venue"].split(" / ", 1)
+        address = pool["pool_address"]
+        key = (
+            pool["token_symbol"].upper(),
+            chain.lower(),
+            address.lower() if address.startswith("0x") else address,
+        )
+        tvl_row = snapshot["rows"].get(key)
+        if tvl_row is None:
+            pool["tvl_usd"] = None
+            pool["tvl_status"] = "not_cataloged_in_snapshot"
+            pool["tvl_observed_at"] = None
+            pool["tvl_method"] = None
+            continue
+        matched += 1
+        pool["tvl_usd"] = (
+            parse_number(tvl_row.get("tvl_usd"))
+            if tvl_row.get("status") == "observed"
+            else None
+        )
+        pool["tvl_status"] = tvl_row.get("status")
+        pool["tvl_observed_at"] = tvl_row.get("observed_at") or None
+        pool["tvl_method"] = tvl_row.get("tvl_method") or None
+        pool["tvl_source_endpoint"] = tvl_row.get("source_endpoint") or None
+        pool["tvl_raw_response_sha256"] = tvl_row.get("raw_response_sha256") or None
+
+    metadata = result["metadata"]
+    metadata["tvl_note"] = (
+        "Pool TVL is a separate point-in-time GeckoTerminal reserve_in_usd "
+        "snapshot. It is not historical daily TVL and it is not market depth."
+    )
+    metadata["tvl_snapshot"] = {
+        "snapshot_ids": snapshot["snapshot_ids"],
+        "observed_at": snapshot["observed_at"],
+        "pool_rows": len(snapshot["rows"]),
+        "matched_market_rows": matched,
+        "status_counts": snapshot["status_counts"],
+        "source": file_metadata(tvl_path),
+        "method": "geckoterminal_reserve_in_usd",
+    }
+    metadata["sources"].append(file_metadata(tvl_path))
+    return result
+
+
 @lru_cache(maxsize=32)
 def _build_market_payload_cached(
     start: str | None,
@@ -507,14 +645,17 @@ def _build_database_payload_cached(
 
 
 def build_market_payload(start: str | None = None, end: str | None = None) -> dict[str, Any]:
+    tvl_path = resolve_tvl_path()
     database_path = resolve_database_path()
     if database_path is not None:
         signature = data_signature([database_path])
-        return _build_database_payload_cached(start, end, str(database_path), signature)
+        payload = _build_database_payload_cached(start, end, str(database_path), signature)
+        return overlay_tvl_snapshot(payload, tvl_path)
 
     cex_path, dex_path = resolve_data_paths()
     signature = data_signature([cex_path, dex_path])
-    return _build_market_payload_cached(start, end, str(cex_path), str(dex_path), signature)
+    payload = _build_market_payload_cached(start, end, str(cex_path), str(dex_path), signature)
+    return overlay_tvl_snapshot(payload, tvl_path)
 
 
 def build_market_catalog() -> dict[str, Any]:
