@@ -168,6 +168,7 @@
                 <th>Daily Volatility</th>
                 <th>USD Volume</th>
                 <th>TVL Snapshot</th>
+                <th>CEX Depth ±100 bps</th>
                 <th>CEX-DEX Spread</th>
                 <th>Coverage</th>
               </tr>
@@ -180,9 +181,11 @@
       <footer>
         <div id="source-list"></div>
         <div id="tvl-source-status">TVL snapshot status loading</div>
+        <div id="depth-source-status">CEX depth snapshot status loading</div>
         <div>Spread = selected DEX price / selected CEX price - 1 on their latest common date. It appears only on the Token row.</div>
-        <div>The comparison workbench uses absolute midpoint-relative bps; it does not infer bid/ask spread, depth, or slippage.</div>
+        <div>The daily comparison workbench uses cross-market midpoint-relative bps; it does not infer bid/ask spread, depth, or slippage from OHLCV.</div>
         <div>TVL is the latest fetch snapshot and is not presented as historical daily TVL.</div>
+        <div>CEX depth is a real point-in-time order-book snapshot. A ≥ prefix means the returned levels did not prove complete ±100 bps coverage.</div>
       </footer>
     </main>
 

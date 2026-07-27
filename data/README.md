@@ -32,6 +32,19 @@ Point-in-time TVL has a separate lifecycle from daily OHLCV:
 TVL publication does not rebuild the historical SQLite database because a
 current source-reported reserve is not a daily historical fact.
 
+CEX order-book depth also has a separate point-in-time lifecycle:
+
+- `data/processed/cex_depth_snapshot.csv` is the current collection awaiting
+  review;
+- `data/local/cex_depth_latest.csv` is the latest market snapshot used by the
+  website;
+- `data/local/cex_depth_history.csv` is append-only normalized history;
+- `data/raw/cex-depth/<snapshot_id>/` retains public order-book responses,
+  quote-conversion responses, failures, and a manifest.
+
+Depth publication does not rebuild the historical SQLite database. The server
+overlays the latest snapshot on the cataloged CEX market identities.
+
 CSV remains the interchange and audit format. The web API does not scan CSV
 when `market_facts.sqlite3` is present.
 

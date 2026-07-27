@@ -21,6 +21,12 @@ They must be different and both must belong to the requested Token.
 | Spread bps | `absolute spread / midpoint(price_a, price_b) * 10,000` |
 | Grain | One UTC day |
 
+When a separately published `cex_depth_latest.csv` exists, CEX catalog entries
+also expose point-in-time best bid/ask, quoted spread, and 10/25/50/100 bps
+order-book depth. Those fields are not part of the daily comparison series.
+Their calculation, quote conversion, completeness flags, and audit contract are
+defined in `docs/cex-depth-data-contract.md`.
+
 CEX configured pair labels normally use USDT. The current adapter contract uses
 USDT as a 1:1 USD proxy; Upbit KRW observations are converted through the
 daily USDT/KRW rate. Some adapters fetch a venue-native USD pair even when the
@@ -45,9 +51,11 @@ same UTC date. Volume is never replaced with zero.
 
 ## Explicit non-claims
 
-The input is daily aggregate OHLCV. It is not order-book depth, top-of-book
-bid/ask spread, an executable quote, or measured slippage. The comparison page
-must not relabel it as any of those concepts.
+The comparison input is daily aggregate OHLCV. It is not order-book depth,
+top-of-book bid/ask spread, an executable quote, or measured slippage. The
+comparison page must not relabel it as any of those concepts. Separately
+collected CEX order-book fields retain their own point-in-time timestamps and
+must not be presented as daily history or guaranteed execution.
 
 ## Known-answer fixtures
 

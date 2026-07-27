@@ -34,5 +34,7 @@ Source reviewed: original repository branch `feature/data-pipeline`, commit
   selection bias for historical comparisons.
 - DEX TVL is a latest-fetch snapshot. The current collector does not provide
   historical daily TVL.
-- Order-book depth, slippage, fee, gas, and event facts are not present in the
-  current two-file Market Monitor contract.
+- CEX order-book depth is a separate latest-fetch snapshot with explicit
+  truncation flags; it is not reconstructed tick history or measured slippage.
+- Slippage, fee, gas, and event facts are not present in the current Market
+  Monitor contract.

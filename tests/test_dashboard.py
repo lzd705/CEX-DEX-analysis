@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dashboard import server
+from scripts.fetch_cex_depth import DEPTH_COLUMNS_ALL
 from scripts.market_database import build_database
 
 
@@ -118,6 +119,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             "MARKET_DEX_DATA": str(self.dex_path),
         }
         self.tvl_path = data_dir / server.TVL_FILENAME
+        self.depth_path = data_dir / server.CEX_DEPTH_FILENAME
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -190,6 +192,61 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         self.assertEqual(catalog_pool["tvl_usd"], 7654.32)
         self.assertEqual(catalog_pool["tvl_method"], "geckoterminal_reserve_in_usd")
+
+    def test_point_in_time_cex_depth_overlays_cataloged_market(self):
+        depth_row = {field: "" for field in DEPTH_COLUMNS_ALL}
+        depth_row.update(
+            {
+                "snapshot_id": "depth-snapshot-1",
+                "observed_at": "2026-07-27T02:03:04+00:00",
+                "response_received_at": "2026-07-27T02:03:05+00:00",
+                "token_symbol": "BTC",
+                "exchange": "binance",
+                "cex_symbol": "BTC/USDT",
+                "source_instrument": "BTCUSDT",
+                "source_quote_asset": "USDT",
+                "quote_conversion_method": "USDT=USD proxy",
+                "best_bid": "100",
+                "best_ask": "100.1",
+                "midpoint": "100.05",
+                "spread_quote": "0.1",
+                "spread_bps": "9.995002498750624",
+                "total_depth_10bps_usd": "1000",
+                "total_depth_25bps_usd": "2000",
+                "total_depth_50bps_usd": "3000",
+                "total_depth_100bps_usd": "4000",
+                "depth_10bps_complete": "1",
+                "depth_25bps_complete": "1",
+                "depth_50bps_complete": "1",
+                "depth_100bps_complete": "0",
+                "depth_method": "midpoint_symmetric_quote_notional",
+                "source_endpoint": "https://example.test/depth",
+                "raw_response_sha256": "def456",
+                "status": "partial",
+            }
+        )
+        write_csv(self.depth_path, DEPTH_COLUMNS_ALL, [depth_row])
+        environment = {
+            **self.environment,
+            "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
+        }
+
+        with patch.dict(server.os.environ, environment, clear=True):
+            payload = server.build_market_payload("2026-01-01", "2026-01-02")
+            catalog = server.build_market_catalog()
+
+        binance = next(row for row in payload["cex_markets"] if row["venue"] == "binance")
+        self.assertEqual(binance["depth_status"], "partial")
+        self.assertEqual(binance["total_depth_100bps_usd"], 4000)
+        self.assertFalse(binance["depth_100bps_complete"])
+        self.assertEqual(payload["metadata"]["cex_depth_snapshot"]["matched_market_rows"], 1)
+        catalog_binance = next(
+            market
+            for market in catalog["markets"]
+            if market["market_id"] == "cex:binance:BTC/USDT"
+        )
+        self.assertEqual(catalog_binance["total_depth_100bps_usd"], 4000)
+        self.assertEqual(catalog_binance["depth_status"], "partial")
 
     def test_catalog_identifies_markets_and_declares_fact_contract(self):
         with patch.dict(server.os.environ, self.environment, clear=True):

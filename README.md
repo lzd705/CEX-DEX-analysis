@@ -13,7 +13,8 @@ study, or public data-edit controls.
 1. Show explicit CEX exchange/pair and DEX chain/protocol/pool identities.
 2. Put the global start and end date controls at the top of the page.
 3. Display price, selected-window return, daily realized volatility, USD
-   volume, DEX TVL snapshot, and CEX-DEX price spread.
+   volume, DEX TVL snapshot, CEX ±100 bps depth snapshot, and CEX-DEX price
+   spread.
 4. Keep spread at Token comparison level, not duplicated as a CEX or DEX
    property.
 5. Sort descending by USD volume by default, with `综合`, `CEX`, and `DEX`
@@ -36,6 +37,9 @@ python3 scripts/run_fact_pipeline.py
 # Refresh source-reported point-in-time TVL for every published DEX pool.
 python3 scripts/fetch_tvl.py --publish-local
 
+# Refresh real point-in-time order-book depth for every published CEX market.
+python3 scripts/fetch_cex_depth.py --publish-local
+
 # Import a reviewed snapshot and atomically publish the indexed runtime database.
 python3 scripts/import_local_snapshot.py data/processed
 
@@ -53,6 +57,8 @@ The public catalog and comparison contract is documented in
 `docs/market-facts-contract.md`.
 The separate point-in-time TVL lifecycle and missing-value rules are documented
 in `docs/tvl-data-contract.md`.
+The CEX order-book bands, quote conversion, truncation rules, and raw-response
+audit trail are documented in `docs/cex-depth-data-contract.md`.
 
 Administrator setup is documented in `docs/admin-operations.md`. The page is
 served at `/admin.html`. It supports password authentication by default or an
@@ -60,7 +66,7 @@ explicit no-login mode through `ADMIN_LOGIN_REQUIRED=false`.
 
 ## Future scope
 
-Events, depth, slippage, fee/gas data, anomaly rules, historical TVL backfills,
-historical-end-date
+Events, slippage, fee/gas data, anomaly rules, historical TVL backfills,
+historical CEX depth scheduling, historical-end-date
 backfills, and adding previously unconfigured Tokens require separate data
 contracts and acceptance tests.

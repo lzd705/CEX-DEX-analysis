@@ -48,6 +48,11 @@ function formatCurrency(value) {
   return finite(value) ? compactCurrency.format(value) : "N/A";
 }
 
+function formatDepth(value, complete) {
+  if (!finite(value)) return "N/A";
+  return `${complete ? "" : "≥"}${compactCurrency.format(value)}`;
+}
+
 function formatPercent(value) {
   return finite(value) ? percent.format(value) : "N/A";
 }
@@ -166,8 +171,19 @@ function marketRow(token, market, row, options) {
   const tvlTitle = market === "dex"
     ? `${row?.tvl_status || "unavailable"} · ${formatUtcTimestamp(row?.tvl_observed_at)}`
     : "TVL is not applicable to CEX order books";
+  const depth = market === "cex"
+    ? formatDepth(row?.total_depth_100bps_usd, row?.depth_100bps_complete)
+    : "--";
+  const depthTitle = market === "cex"
+    ? [
+      row?.depth_status || "unavailable",
+      formatUtcTimestamp(row?.depth_observed_at),
+      row?.depth_100bps_complete ? "complete ±100 bps band" : "observed lower bound",
+      row?.depth_source_instrument || row?.instrument || "instrument unavailable",
+    ].join(" · ")
+    : "CEX order-book depth is not applicable to DEX pools";
   if (!row) {
-    return `<tr class="market-row ${market}"><td class="sticky-token market-label">${label}</td><td colspan="9" class="missing">No observations in this window</td></tr>`;
+    return `<tr class="market-row ${market}"><td class="sticky-token market-label">${label}</td><td colspan="10" class="missing">No observations in this window</td></tr>`;
   }
   return `<tr class="market-row ${market}">
     <td class="sticky-token market-label"><span class="market-dot"></span>${label}</td>
@@ -181,6 +197,7 @@ function marketRow(token, market, row, options) {
     <td>${formatPercent(row.daily_volatility)}</td>
     <td>${formatCurrency(row.volume_usd)}</td>
     <td title="${escapeHtml(tvlTitle)}">${tvl}</td>
+    <td title="${escapeHtml(depthTitle)}">${depth}</td>
     <td class="not-applicable">--</td>
     <td>${row.observation_days}D · ${escapeHtml(row.latest_date)}</td>
   </tr>`;
@@ -200,6 +217,7 @@ function tokenRows(tokenSummary, cexOptions, dexOptions) {
       <td>--</td>
       <td>${formatCurrency(combinedVolume)}</td>
       <td>${formatCurrency(dex?.tvl_usd)}</td>
+      <td>${formatDepth(cex?.total_depth_100bps_usd, cex?.depth_100bps_complete)}</td>
       <td class="${metricClass(spread)} spread-value">${formatPercent(spread)}<span class="spread-date">${spreadDate || ""}</span></td>
       <td>${cexOptions.length} CEX · ${dexOptions.length} pools</td>
     </tr>
@@ -255,6 +273,10 @@ function updateMetadata() {
   byId("tvl-source-status").textContent = tvl
     ? `TVL snapshot ${formatUtcTimestamp(tvl.observed_at)} · ${tvl.status_counts.observed}/${tvl.pool_rows} observed · ${tvl.method}`
     : metadata.tvl_note;
+  const depth = metadata.cex_depth_snapshot;
+  byId("depth-source-status").textContent = depth
+    ? `CEX depth ${formatUtcTimestamp(depth.observed_at)} · ${depth.status_counts.observed} complete · ${depth.status_counts.partial} partial · ${depth.status_counts.failed} failed · ${depth.method}`
+    : metadata.cex_depth_note;
 }
 
 function factsMarketLabel(market) {
@@ -307,6 +329,9 @@ function updateFactsContract() {
     `Sources: ${metadata.sources.map((source) => `${source.name} (${source.sha256})`).join(" | ")}.`,
     metadata.tvl_snapshot
       ? `TVL: ${metadata.tvl_snapshot.status_counts.observed}/${metadata.tvl_snapshot.pool_rows} pools observed at ${formatUtcTimestamp(metadata.tvl_snapshot.observed_at)}.`
+      : "",
+    metadata.cex_depth_snapshot
+      ? `CEX depth: ${metadata.cex_depth_snapshot.status_counts.observed} complete, ${metadata.cex_depth_snapshot.status_counts.partial} partial, ${metadata.cex_depth_snapshot.status_counts.failed} failed at ${formatUtcTimestamp(metadata.cex_depth_snapshot.observed_at)}.`
       : "",
   ].join(" ");
 }

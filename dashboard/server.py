@@ -51,6 +51,7 @@ CEX_FILENAME = "cex_exchange_volume_daily.csv"
 DEX_FILENAME = "dex_pool_volume_daily.csv"
 DATABASE_FILENAME = "market_facts.sqlite3"
 TVL_FILENAME = "dex_pool_tvl_latest.csv"
+CEX_DEPTH_FILENAME = "cex_depth_latest.csv"
 VENDOR_FILES = {
     "/vendor/lucide.js": DASHBOARD_ROOT / "node_modules/lucide/dist/umd/lucide.min.js",
 }
@@ -164,6 +165,30 @@ def resolve_tvl_path() -> Path | None:
         tvl_path = data_dir / TVL_FILENAME
         if tvl_path.exists():
             return tvl_path
+    return None
+
+
+def resolve_cex_depth_path() -> Path | None:
+    """Resolve an optional point-in-time CEX depth snapshot."""
+    explicit_depth = os.environ.get("MARKET_CEX_DEPTH_DATA")
+    if explicit_depth:
+        depth_path = Path(explicit_depth).expanduser().resolve()
+        if not depth_path.exists():
+            raise FileNotFoundError(f"Configured CEX depth snapshot does not exist: {depth_path}")
+        return depth_path
+    if os.environ.get("MARKET_CEX_DATA") or os.environ.get("MARKET_DEX_DATA"):
+        return None
+    explicit_database = os.environ.get("MARKET_DATABASE")
+    if explicit_database:
+        sibling = Path(explicit_database).expanduser().resolve().parent / CEX_DEPTH_FILENAME
+        return sibling if sibling.exists() else None
+
+    configured_dir = os.environ.get("MARKET_DATA_DIR")
+    candidates = [Path(configured_dir).expanduser().resolve()] if configured_dir else DEFAULT_DATA_DIRS
+    for data_dir in candidates:
+        depth_path = data_dir / CEX_DEPTH_FILENAME
+        if depth_path.exists():
+            return depth_path
     return None
 
 
@@ -500,6 +525,165 @@ def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict
     return result
 
 
+@lru_cache(maxsize=8)
+def _load_cex_depth_snapshot_cached(
+    path_text: str,
+    _signature: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    path = Path(path_text)
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {
+            "snapshot_id",
+            "observed_at",
+            "response_received_at",
+            "token_symbol",
+            "exchange",
+            "cex_symbol",
+            "source_instrument",
+            "source_quote_asset",
+            "quote_conversion_method",
+            "best_bid",
+            "best_ask",
+            "midpoint",
+            "spread_quote",
+            "spread_bps",
+            "total_depth_10bps_usd",
+            "total_depth_25bps_usd",
+            "total_depth_50bps_usd",
+            "total_depth_100bps_usd",
+            "depth_10bps_complete",
+            "depth_25bps_complete",
+            "depth_50bps_complete",
+            "depth_100bps_complete",
+            "depth_method",
+            "source_endpoint",
+            "raw_response_sha256",
+            "status",
+        }
+        missing = sorted(required - set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(f"{path.name} is missing CEX depth columns: {', '.join(missing)}")
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"{path.name} contains no CEX depth rows")
+
+    latest: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in rows:
+        key = (
+            row["token_symbol"].upper(),
+            row["exchange"].lower(),
+            row["cex_symbol"].upper(),
+        )
+        if key not in latest or row["response_received_at"] > latest[key]["response_received_at"]:
+            latest[key] = row
+    snapshot_ids = sorted({row["snapshot_id"] for row in rows if row.get("snapshot_id")})
+    return {
+        "path": path,
+        "rows": latest,
+        "snapshot_ids": snapshot_ids,
+        "observed_at": max(row["observed_at"] for row in rows),
+        "status_counts": {
+            status: sum(row.get("status") == status for row in rows)
+            for status in ("observed", "partial", "failed")
+        },
+    }
+
+
+def overlay_cex_depth_snapshot(
+    payload: dict[str, Any],
+    depth_path: Path | None,
+) -> dict[str, Any]:
+    """Overlay current real order-book depth without rewriting daily OHLCV."""
+    result = copy.deepcopy(payload)
+    if depth_path is None:
+        for market in result["cex_markets"]:
+            market["depth_status"] = "unavailable"
+            market["depth_observed_at"] = None
+            market["depth_method"] = None
+        result["metadata"]["cex_depth_note"] = (
+            "CEX depth snapshot is unavailable. Daily volume is not used as a depth proxy."
+        )
+        return result
+
+    snapshot = _load_cex_depth_snapshot_cached(
+        str(depth_path),
+        data_signature([depth_path]),
+    )
+    matched = 0
+    numeric_fields = (
+        "best_bid",
+        "best_ask",
+        "midpoint",
+        "spread_quote",
+        "spread_bps",
+        "total_depth_10bps_usd",
+        "total_depth_25bps_usd",
+        "total_depth_50bps_usd",
+        "total_depth_100bps_usd",
+    )
+    completeness_fields = (
+        "depth_10bps_complete",
+        "depth_25bps_complete",
+        "depth_50bps_complete",
+        "depth_100bps_complete",
+    )
+    for market in result["cex_markets"]:
+        key = (
+            market["token_symbol"].upper(),
+            market["venue"].lower(),
+            market["instrument"].upper(),
+        )
+        depth_row = snapshot["rows"].get(key)
+        if depth_row is None:
+            market["depth_status"] = "not_cataloged_in_snapshot"
+            market["depth_observed_at"] = None
+            market["depth_method"] = None
+            for field in numeric_fields:
+                market[field] = None
+            for field in completeness_fields:
+                market[field] = False
+            continue
+
+        matched += 1
+        market["depth_status"] = depth_row.get("status")
+        market["depth_observed_at"] = depth_row.get("observed_at") or None
+        market["depth_method"] = depth_row.get("depth_method") or None
+        market["depth_source_instrument"] = depth_row.get("source_instrument") or None
+        market["depth_source_quote_asset"] = depth_row.get("source_quote_asset") or None
+        market["depth_quote_conversion_method"] = (
+            depth_row.get("quote_conversion_method") or None
+        )
+        market["depth_source_endpoint"] = depth_row.get("source_endpoint") or None
+        market["depth_raw_response_sha256"] = (
+            depth_row.get("raw_response_sha256") or None
+        )
+        observed = depth_row.get("status") in {"observed", "partial"}
+        for field in numeric_fields:
+            market[field] = parse_number(depth_row.get(field)) if observed else None
+        for field in completeness_fields:
+            market[field] = observed and depth_row.get(field) == "1"
+
+    metadata = result["metadata"]
+    metadata["cex_depth_note"] = (
+        "CEX depth is a separate point-in-time public spot order-book snapshot. "
+        "USD values are quote notional inside symmetric midpoint bands. Partial "
+        "bands are observed lower bounds, not complete depth."
+    )
+    metadata["cex_depth_snapshot"] = {
+        "snapshot_ids": snapshot["snapshot_ids"],
+        "observed_at": snapshot["observed_at"],
+        "market_rows": len(snapshot["rows"]),
+        "matched_market_rows": matched,
+        "status_counts": snapshot["status_counts"],
+        "bands_bps": [10, 25, 50, 100],
+        "source": file_metadata(depth_path),
+        "method": "midpoint_symmetric_quote_notional",
+    }
+    metadata["sources"].append(file_metadata(depth_path))
+    return result
+
+
 @lru_cache(maxsize=32)
 def _build_market_payload_cached(
     start: str | None,
@@ -646,16 +830,19 @@ def _build_database_payload_cached(
 
 def build_market_payload(start: str | None = None, end: str | None = None) -> dict[str, Any]:
     tvl_path = resolve_tvl_path()
+    depth_path = resolve_cex_depth_path()
     database_path = resolve_database_path()
     if database_path is not None:
         signature = data_signature([database_path])
         payload = _build_database_payload_cached(start, end, str(database_path), signature)
-        return overlay_tvl_snapshot(payload, tvl_path)
+        payload = overlay_tvl_snapshot(payload, tvl_path)
+        return overlay_cex_depth_snapshot(payload, depth_path)
 
     cex_path, dex_path = resolve_data_paths()
     signature = data_signature([cex_path, dex_path])
     payload = _build_market_payload_cached(start, end, str(cex_path), str(dex_path), signature)
-    return overlay_tvl_snapshot(payload, tvl_path)
+    payload = overlay_tvl_snapshot(payload, tvl_path)
+    return overlay_cex_depth_snapshot(payload, depth_path)
 
 
 def build_market_catalog() -> dict[str, Any]:
