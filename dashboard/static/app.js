@@ -166,7 +166,7 @@ function marketRow(token, market, row, options) {
         ${selectOptions(options, marketId(row))}
       </select>
     </td>
-    <td>${formatPrice(row.price_usd)}</td>
+    <td class="price-cell">${formatPrice(row.price_usd)}</td>
     <td class="${metricClass(row.window_return)}">${formatPercent(row.window_return)}</td>
     <td>${formatPercent(row.daily_volatility)}</td>
     <td>${formatCurrency(row.volume_usd)}</td>
@@ -185,7 +185,7 @@ function tokenRows(tokenSummary, cexOptions, dexOptions) {
       <td class="sticky-token token-name">${escapeHtml(token)}</td>
       <td>Selected markets</td>
       <td><span class="share-label">Observed DEX ${formatPercent(observedShare)}</span></td>
-      <td><span class="paired-value">${formatPrice(cexSpreadPrice)} / ${formatPrice(dexSpreadPrice)}</span></td>
+      <td class="price-cell"><span class="paired-value">${formatPrice(cexSpreadPrice)} / ${formatPrice(dexSpreadPrice)}</span></td>
       <td>--</td>
       <td>--</td>
       <td>${formatCurrency(combinedVolume)}</td>

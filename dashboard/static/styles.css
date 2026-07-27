@@ -279,6 +279,10 @@ td {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 td:first-child, td:nth-child(2), td:nth-child(3) { text-align: left; }
+td.price-cell {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 .sticky-token { position: sticky; left: 0; z-index: 5; background: inherit; }
 th.sticky-token { z-index: 12; background: #1c2027; }
 .token-row { background: var(--surface-3); }

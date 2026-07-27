@@ -43,6 +43,7 @@ class FrameworkStructureTest(unittest.TestCase):
     def test_market_monitor_has_no_factor_or_admin_surface(self):
         html = (PROJECT_ROOT / "dashboard/static/index.html").read_text(encoding="utf-8")
         javascript = (PROJECT_ROOT / "dashboard/static/app.js").read_text(encoding="utf-8")
+        styles = (PROJECT_ROOT / "dashboard/static/styles.css").read_text(encoding="utf-8")
 
         self.assertIn('id="date-start"', html)
         self.assertIn('id="date-end"', html)
@@ -51,6 +52,8 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertIn('id="search-token"', html)
         self.assertIn("DEFAULT_MARKET_CACHE_KEY", javascript)
         self.assertIn("Cached through", javascript)
+        self.assertIn('class="price-cell"', javascript)
+        self.assertIn("td.price-cell", styles)
         self.assertNotIn("factor", (html + javascript).lower())
         self.assertNotIn("admin", (html + javascript).lower())
 
