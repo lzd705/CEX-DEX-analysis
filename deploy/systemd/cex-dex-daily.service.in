@@ -1,0 +1,12 @@
+[Unit]
+Description=CEX/DEX daily OHLCV and TVL collection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_ROOT@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 scripts/run_collection_cycle.py --profile daily --publish-local
+TimeoutStartSec=75min
+Nice=10

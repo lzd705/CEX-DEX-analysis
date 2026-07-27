@@ -141,6 +141,24 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertAlmostEqual(payload["tokens"][0]["price_spread"], 105 / 102 - 1)
         self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)
 
+    def test_payload_reports_source_specific_ranges_and_freshness(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            payload = server.build_market_payload("2026-01-01", "2026-01-02")
+            catalog = server.build_market_catalog()
+
+        ranges = payload["metadata"]["source_date_ranges"]
+        self.assertEqual(ranges["cex_daily"]["available_end"], "2026-01-02")
+        self.assertEqual(ranges["dex_daily"]["available_end"], "2026-01-02")
+        self.assertEqual(
+            payload["metadata"]["freshness"]["common_comparable_end"],
+            "2026-01-02",
+        )
+        self.assertEqual(payload["metadata"]["freshness"]["overall_status"], "stale")
+        self.assertEqual(
+            catalog["metadata"]["freshness"]["common_comparable_end"],
+            "2026-01-02",
+        )
+
     def test_point_in_time_tvl_snapshot_overlays_legacy_ohlcv_value(self):
         write_csv(
             self.tvl_path,

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run CEX/DEX daily facts after the completed UTC day
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+

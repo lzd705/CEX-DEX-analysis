@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 
 try:
     from dashboard.admin import AdminService
+    from dashboard.freshness import build_source_freshness
     from dashboard.market_facts import (
         catalog_contract,
         catalog_from_market_payload,
@@ -33,6 +34,7 @@ try:
     )
 except ModuleNotFoundError:
     from admin import AdminService
+    from freshness import build_source_freshness
     from market_facts import (
         catalog_contract,
         catalog_from_market_payload,
@@ -211,6 +213,16 @@ def dataset_bounds(paths: Iterable[Path]) -> tuple[str, str]:
     if not dates:
         raise ValueError("Market data files contain no dated rows")
     return min(dates), max(dates)
+
+
+def csv_date_bounds(path: Path) -> dict[str, str]:
+    dates = [row["date"] for row in iter_csv(path) if row.get("date")]
+    if not dates:
+        raise ValueError(f"{path.name} contains no dated rows")
+    return {
+        "available_start": min(dates),
+        "available_end": max(dates),
+    }
 
 
 def rows_in_window(path: Path, start_date: str, end_date: str) -> list[dict[str, str]]:
@@ -694,7 +706,16 @@ def _build_market_payload_cached(
 ) -> dict[str, Any]:
     cex_path = Path(cex_path_text)
     dex_path = Path(dex_path_text)
-    available_start, available_end = dataset_bounds([cex_path, dex_path])
+    cex_bounds = csv_date_bounds(cex_path)
+    dex_bounds = csv_date_bounds(dex_path)
+    available_start = min(
+        cex_bounds["available_start"],
+        dex_bounds["available_start"],
+    )
+    available_end = max(
+        cex_bounds["available_end"],
+        dex_bounds["available_end"],
+    )
     effective_end = parse_iso_date(end) or available_end
     default_start = (date.fromisoformat(effective_end) - timedelta(days=29)).isoformat()
     effective_start = parse_iso_date(start) or max(available_start, default_start)
@@ -712,6 +733,10 @@ def _build_market_payload_cached(
         "metadata": {
             "available_start": available_start,
             "available_end": available_end,
+            "source_date_ranges": {
+                "cex_daily": cex_bounds,
+                "dex_daily": dex_bounds,
+            },
             "start_date": effective_start,
             "end_date": effective_end,
             "token_count": len({row["token_symbol"] for row in cex_markets + dex_pools}),
@@ -758,6 +783,22 @@ def _build_database_payload_cached(
         if effective_start < available_start or effective_end > available_end:
             raise ValueError(f"date window must be within {available_start} and {available_end}")
 
+        cex_bounds_row = connection.execute(
+            "SELECT MIN(date) AS available_start, MAX(date) AS available_end "
+            "FROM cex_market_daily"
+        ).fetchone()
+        dex_bounds_row = connection.execute(
+            "SELECT MIN(date) AS available_start, MAX(date) AS available_end "
+            "FROM dex_pool_daily"
+        ).fetchone()
+        cex_bounds = {
+            "available_start": cex_bounds_row["available_start"],
+            "available_end": cex_bounds_row["available_end"],
+        }
+        dex_bounds = {
+            "available_start": dex_bounds_row["available_start"],
+            "available_end": dex_bounds_row["available_end"],
+        }
         cex_rows = [
             dict(row)
             for row in connection.execute(
@@ -796,6 +837,10 @@ def _build_database_payload_cached(
         "metadata": {
             "available_start": available_start,
             "available_end": available_end,
+            "source_date_ranges": {
+                "cex_daily": cex_bounds,
+                "dex_daily": dex_bounds,
+            },
             "start_date": effective_start,
             "end_date": effective_end,
             "token_count": len({row["token_symbol"] for row in cex_markets + dex_pools}),
@@ -828,6 +873,25 @@ def _build_database_payload_cached(
     }
 
 
+def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach dynamic source-specific freshness without caching wall-clock age."""
+    metadata = payload["metadata"]
+    metadata["freshness"] = build_source_freshness(
+        metadata.get("source_date_ranges", {}),
+        tvl_observed_at=(
+            metadata.get("tvl_snapshot", {}).get("observed_at")
+            if metadata.get("tvl_snapshot")
+            else None
+        ),
+        depth_observed_at=(
+            metadata.get("cex_depth_snapshot", {}).get("observed_at")
+            if metadata.get("cex_depth_snapshot")
+            else None
+        ),
+    )
+    return payload
+
+
 def build_market_payload(start: str | None = None, end: str | None = None) -> dict[str, Any]:
     tvl_path = resolve_tvl_path()
     depth_path = resolve_cex_depth_path()
@@ -836,13 +900,15 @@ def build_market_payload(start: str | None = None, end: str | None = None) -> di
         signature = data_signature([database_path])
         payload = _build_database_payload_cached(start, end, str(database_path), signature)
         payload = overlay_tvl_snapshot(payload, tvl_path)
-        return overlay_cex_depth_snapshot(payload, depth_path)
+        payload = overlay_cex_depth_snapshot(payload, depth_path)
+        return attach_freshness_metadata(payload)
 
     cex_path, dex_path = resolve_data_paths()
     signature = data_signature([cex_path, dex_path])
     payload = _build_market_payload_cached(start, end, str(cex_path), str(dex_path), signature)
     payload = overlay_tvl_snapshot(payload, tvl_path)
-    return overlay_cex_depth_snapshot(payload, depth_path)
+    payload = overlay_cex_depth_snapshot(payload, depth_path)
+    return attach_freshness_metadata(payload)
 
 
 def build_market_catalog() -> dict[str, Any]:
@@ -1007,6 +1073,8 @@ def build_market_comparison(
             **catalog_contract(),
             "available_start": metadata["available_start"],
             "available_end": metadata["available_end"],
+            "source_date_ranges": metadata.get("source_date_ranges", {}),
+            "freshness": metadata.get("freshness"),
             "start_date": effective_start,
             "end_date": effective_end,
             "sources": metadata["sources"],
@@ -1183,19 +1251,18 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/health":
             try:
-                database_path = resolve_database_path()
-                if database_path is not None:
-                    self.send_json({"status": "ok", "data_ready": True, "storage": "sqlite"})
-                    return
-                cex_path, dex_path = resolve_data_paths()
+                payload = build_market_payload()
+                metadata = payload["metadata"]
                 self.send_json(
                     {
                         "status": "ok",
-                        "data_ready": cex_path.exists() and dex_path.exists(),
-                        "storage": "csv",
+                        "data_ready": True,
+                        "storage": metadata["storage"]["engine"],
+                        "data_status": metadata["freshness"]["overall_status"],
+                        "freshness": metadata["freshness"],
                     }
                 )
-            except FileNotFoundError as error:
+            except (FileNotFoundError, ValueError) as error:
                 self.send_json({"status": "degraded", "data_ready": False, "error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
             return
         super().do_GET()

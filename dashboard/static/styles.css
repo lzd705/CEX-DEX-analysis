@@ -49,6 +49,12 @@ button, select, input[type="date"] { cursor: pointer; }
 .brand p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
 .status-cluster { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; white-space: nowrap; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--positive); }
+.status-cluster[data-status="stale"] { color: var(--negative); }
+.status-cluster[data-status="stale"] .status-dot { background: var(--negative); }
+.status-cluster[data-status="partial"],
+.status-cluster[data-status="unavailable"] { color: var(--amber); }
+.status-cluster[data-status="partial"] .status-dot,
+.status-cluster[data-status="unavailable"] .status-dot { background: var(--amber); }
 
 main { min-width: 0; padding: 14px 18px 30px; }
 .time-toolbar,

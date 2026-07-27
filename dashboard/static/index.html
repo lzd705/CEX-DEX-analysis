@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260727-tvl-depth-v1">
+    <link rel="stylesheet" href="/styles.css?v=20260727-collection-v1">
   </head>
   <body>
     <header class="app-header">
@@ -16,7 +16,7 @@
           <p>Venue-level facts, aligned on daily UTC observations</p>
         </div>
       </div>
-      <div class="status-cluster">
+      <div id="freshness-cluster" class="status-cluster" data-status="loading">
         <span class="status-dot"></span>
         <span id="freshness">Loading data</span>
       </div>
@@ -180,6 +180,7 @@
 
       <footer>
         <div id="source-list"></div>
+        <div id="daily-source-status">Daily source freshness loading</div>
         <div id="tvl-source-status">TVL snapshot status loading</div>
         <div id="depth-source-status">CEX depth snapshot status loading</div>
         <div>Spread = selected DEX price / selected CEX price - 1 on their latest common date. It appears only on the Token row.</div>
@@ -190,6 +191,6 @@
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/app.js?v=20260727-tvl-depth-v1"></script>
+    <script src="/app.js?v=20260727-collection-v1"></script>
   </body>
 </html>

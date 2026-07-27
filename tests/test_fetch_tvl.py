@@ -122,8 +122,8 @@ class FetchTvlTest(unittest.TestCase):
                 connection.executemany(
                     "INSERT INTO dex_pool_daily VALUES (?, ?, ?, ?, ?)",
                     [
-                        ("UNI", "eth", "uniswap_v3", "0xpool", "UNI / USDC"),
-                        ("UNI", "eth", "uniswap_v3", "0xpool", "UNI / USDC"),
+                        ("UNI", "eth", "uniswap_v3", "0xpool", "UNI / USDC 0.3%"),
+                        ("UNI", "eth", "uniswap_v3", "0xpool", "UNI / USDC 0.05%"),
                         ("AAVE", "eth", "uniswap_v3", "0xaave", "AAVE / USDC"),
                     ],
                 )
@@ -135,6 +135,10 @@ class FetchTvlTest(unittest.TestCase):
 
         self.assertEqual(len(rows), 2)
         self.assertEqual({row["token_symbol"] for row in rows}, {"UNI", "AAVE"})
+        self.assertEqual(
+            next(row for row in rows if row["token_symbol"] == "UNI")["pool_name"],
+            "UNI / USDC 0.05%",
+        )
 
     def test_csv_inventory_deduplicates_daily_rows(self):
         with tempfile.TemporaryDirectory() as directory_name:

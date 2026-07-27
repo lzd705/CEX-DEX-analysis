@@ -206,7 +206,7 @@ class FetchCexDepthTest(unittest.TestCase):
                 connection.executemany(
                     "INSERT INTO cex_market_daily VALUES (?, ?, ?)",
                     [
-                        ("UNI", "binance", "UNI/USDT"),
+                        ("UNI", "binance", "UNI/BUSD"),
                         ("UNI", "binance", "UNI/USDT"),
                         ("AAVE", "okx", "AAVE/USDT"),
                     ],
@@ -223,7 +223,7 @@ class FetchCexDepthTest(unittest.TestCase):
                 writer.writeheader()
                 writer.writerows(
                     [
-                        market(),
+                        market(symbol="UNI/BUSD"),
                         market(),
                         market(token="AAVE", exchange="okx", symbol="AAVE/USDT"),
                     ]
@@ -234,6 +234,18 @@ class FetchCexDepthTest(unittest.TestCase):
 
         self.assertEqual(len(database_rows), 2)
         self.assertEqual(len(csv_rows), 2)
+        self.assertEqual(
+            next(row for row in database_rows if row["token_symbol"] == "UNI")[
+                "cex_symbol"
+            ],
+            "UNI/USDT",
+        )
+        self.assertEqual(
+            next(row for row in csv_rows if row["token_symbol"] == "UNI")[
+                "cex_symbol"
+            ],
+            "UNI/USDT",
+        )
 
     def test_collect_writes_raw_manifest_and_complete_inventory(self):
         response = json.dumps(

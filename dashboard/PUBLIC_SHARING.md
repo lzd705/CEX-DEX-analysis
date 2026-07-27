@@ -32,3 +32,7 @@ service account, plus `ADMIN_COOKIE_SECURE=true`.
 Security headers block framing, external scripts, device permissions, and
 cross-origin content. A reverse proxy must provide HTTPS, access logs, rate
 limits, and the public domain.
+
+Production collection timers and the writable-data boundary are documented in
+`docs/collection-operations.md`. Do not install the timers against a read-only
+data mount.

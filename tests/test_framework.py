@@ -14,7 +14,10 @@ class FrameworkStructureTest(unittest.TestCase):
             "README.md",
             "data/schema/001_market_facts.sql",
             "scripts/market_database.py",
+            "scripts/run_collection_cycle.py",
             "scripts/run_dashboard.sh",
+            "deploy/systemd/cex-dex-daily.timer",
+            "deploy/systemd/cex-dex-depth.timer",
         ]
 
         for relative_path in required_paths:
@@ -31,6 +34,19 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertNotIn("COPY --chown=dashboard:dashboard data/public", dockerfile)
         self.assertNotIn("data/a_review", dockerfile)
         self.assertNotIn("data/raw", dockerfile)
+
+    def test_collection_timers_use_coordinated_profiles_and_realistic_timeout(self):
+        daily_service = (
+            PROJECT_ROOT / "deploy/systemd/cex-dex-daily.service.in"
+        ).read_text(encoding="utf-8")
+        depth_service = (
+            PROJECT_ROOT / "deploy/systemd/cex-dex-depth.service.in"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("--profile daily --publish-local", daily_service)
+        self.assertNotIn("--fail-fast", daily_service)
+        self.assertIn("TimeoutStartSec=75min", daily_service)
+        self.assertIn("--profile depth --publish-local --fail-fast", depth_service)
 
     def test_framework_is_not_bound_to_render(self):
         self.assertFalse((PROJECT_ROOT / "render.yaml").exists())
@@ -52,8 +68,10 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertIn('id="search-token"', html)
         self.assertIn('id="tvl-source-status"', html)
         self.assertIn('id="depth-source-status"', html)
+        self.assertIn('id="daily-source-status"', html)
         self.assertIn("DEFAULT_MARKET_CACHE_KEY", javascript)
         self.assertIn("Cached through", javascript)
+        self.assertIn("common comparable end", javascript)
         self.assertIn("TVL snapshot", javascript)
         self.assertIn("CEX depth", javascript)
         self.assertIn('class="price-cell"', javascript)

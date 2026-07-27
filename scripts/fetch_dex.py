@@ -13,6 +13,7 @@ This first version is intentionally simple:
 import argparse
 import csv
 import json
+import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -21,6 +22,11 @@ from datetime import datetime
 from datetime import timezone
 from pathlib import Path
 
+try:
+    import certifi
+except ImportError:  # pragma: no cover - system trust remains the safe fallback
+    certifi = None
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TOKEN_CONFIG_PATH = PROJECT_ROOT / "config/tokens.csv"
@@ -28,14 +34,17 @@ TOKEN_CHAIN_CONFIG_PATH = PROJECT_ROOT / "config/token_chains.csv"
 DEX_POOLS_OUTPUT_PATH = PROJECT_ROOT / "data/processed/dex_pools.csv"
 DEX_POOL_VOLUME_OUTPUT_PATH = PROJECT_ROOT / "data/processed/dex_pool_volume_daily.csv"
 DEX_VOLUME_OUTPUT_PATH = PROJECT_ROOT / "data/processed/dex_volume_daily.csv"
+TVL_LATEST_PATH = PROJECT_ROOT / "data/local/dex_pool_tvl_latest.csv"
 
 GECKOTERMINAL_BASE_URL = "https://api.geckoterminal.com/api/v2"
 LIMIT_DAYS = 180
 REQUEST_SLEEP_SECONDS = 15.0
+INCREMENTAL_POOL_SLEEP_SECONDS = 13.0
 MAX_RETRIES = 3
 MIN_HISTORY_DAYS = 120
 MAX_POOL_CANDIDATES = 8
 TOP_POOL_COUNT = 5
+TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where()) if certifi else ssl.create_default_context()
 
 
 def safe_float(value) -> float:
@@ -63,7 +72,8 @@ def get_retry_wait_seconds(status_code, retry_after) -> int:
         return 65
 
     try:
-        return int(retry_after)
+        wait_seconds = int(retry_after)
+        return wait_seconds if wait_seconds > 0 else 65
     except ValueError:
         return 65
 
@@ -112,7 +122,7 @@ def request_json(url: str):
 
     while attempt < MAX_RETRIES:
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=30, context=TLS_CONTEXT) as response:
                 text = response.read().decode("utf-8")
                 data = json.loads(text)
                 return data
@@ -128,6 +138,7 @@ def request_json(url: str):
             if wait_seconds <= 0:
                 raise
 
+            wait_seconds = wait_seconds * (2 ** attempt)
             attempt = attempt + 1
             print("Rate limited. Waiting %s seconds before retry." % wait_seconds)
             time.sleep(wait_seconds)
@@ -231,6 +242,122 @@ def group_chain_rows_by_token(rows):
         grouped[token_symbol].append(row)
 
     return grouped
+
+
+def load_existing_pool_inventory(
+    pool_volume_path,
+    tvl_latest_path,
+    chain_rows_by_token,
+    token_symbols,
+):
+    """Build an exact OHLCV inventory from published pool and TVL facts.
+
+    The daily pool file is authoritative for the tracked token-pool identities.
+    The latest TVL snapshot supplies base/quote token ids so the incremental
+    request cannot silently fetch the wrong side of a pool. Missing metadata
+    sends that token through normal discovery. Pools whose advertised
+    base/quote pair excludes the target token are explicitly rejected.
+    """
+    requested = {token_symbol.upper() for token_symbol in token_symbols}
+    latest_by_pool = {}
+    for row in read_csv_rows(pool_volume_path):
+        token_symbol = row.get("token_symbol", "").upper()
+        if token_symbol not in requested:
+            continue
+        key = (token_symbol, row.get("chain", ""), row.get("pool_address", ""))
+        current = latest_by_pool.get(key)
+        if current is None or row.get("date", "") > current.get("date", ""):
+            latest_by_pool[key] = row
+
+    tvl_by_pool = {}
+    for row in read_csv_rows(tvl_latest_path):
+        key = (
+            row.get("token_symbol", "").upper(),
+            row.get("chain", ""),
+            row.get("pool_address", ""),
+        )
+        tvl_by_pool[key] = row
+
+    contracts = {}
+    for token_symbol, rows in chain_rows_by_token.items():
+        for row in rows:
+            contracts[(token_symbol.upper(), row["chain"])] = row["contract_address"]
+
+    pools_by_token = {}
+    unresolved_tokens = set()
+    invalid_pool_keys = set()
+    for key, daily in latest_by_pool.items():
+        token_symbol, chain, pool_address = key
+        tvl = tvl_by_pool.get(key)
+        contract_address = contracts.get((token_symbol, chain))
+        if tvl is None or not contract_address:
+            unresolved_tokens.add(token_symbol)
+            continue
+
+        target_id = ("%s_%s" % (chain, contract_address)).lower()
+        base_token_id = tvl.get("base_token_id", "")
+        quote_token_id = tvl.get("quote_token_id", "")
+        token_ids = {base_token_id.lower(), quote_token_id.lower()}
+        if target_id not in token_ids:
+            invalid_pool_keys.add(key)
+            continue
+
+        pool = {
+            "token_symbol": token_symbol,
+            "chain": chain,
+            "contract_address": contract_address,
+            "pool_rank": 0,
+            "dex": tvl.get("source_dex") or daily.get("dex", ""),
+            "pool_address": pool_address,
+            "pool_name": tvl.get("source_pool_name") or daily.get("pool_name", ""),
+            "pool_tvl_usd": optional_float(tvl.get("tvl_usd")),
+            "volume_24h_usd": optional_float(tvl.get("volume_24h_usd")),
+            "ohlcv_token": "base" if base_token_id.lower() == target_id else "quote",
+            "base_token_id": base_token_id,
+            "quote_token_id": quote_token_id,
+        }
+        pools_by_token.setdefault(token_symbol, []).append(pool)
+
+    resolved_pools = []
+    resolved_tokens = set()
+    for token_symbol in sorted(requested):
+        token_pools = pools_by_token.get(token_symbol, [])
+        if token_symbol in unresolved_tokens or not token_pools:
+            unresolved_tokens.add(token_symbol)
+            continue
+        token_pools.sort(
+            key=lambda pool: (
+                -safe_float(pool.get("volume_24h_usd")),
+                pool["chain"],
+                pool["pool_address"],
+            )
+        )
+        for pool_rank, pool in enumerate(token_pools, start=1):
+            pool["pool_rank"] = pool_rank
+            resolved_pools.append(pool)
+        resolved_tokens.add(token_symbol)
+
+    return (
+        resolved_pools,
+        sorted(unresolved_tokens),
+        sorted(resolved_tokens),
+        sorted(invalid_pool_keys),
+    )
+
+
+def remove_pool_rows(rows, pool_keys):
+    """Remove pool histories whose target token cannot be represented by OHLCV."""
+    invalid = set(pool_keys)
+    return [
+        row
+        for row in rows
+        if (
+            row.get("token_symbol", "").upper(),
+            row.get("chain", ""),
+            row.get("pool_address", ""),
+        )
+        not in invalid
+    ]
 
 
 def read_token_chain_config(path: Path, token_rows):
@@ -714,6 +841,60 @@ def fetch_selected_tokens(token_rows, chain_rows_by_token):
     return selected_pools, pool_volume_rows
 
 
+def fetch_existing_pools(pools):
+    """Fetch OHLCV directly for a validated published pool inventory."""
+    pool_volume_rows = []
+    failed_pools = []
+    pool_count = len(pools)
+
+    for index, pool in enumerate(pools, start=1):
+        try:
+            ohlcv_list = fetch_pool_ohlcv(pool)
+        except Exception as error:
+            print(
+                "Existing pool failed %s/%s %s %s: %s"
+                % (
+                    index,
+                    pool_count,
+                    pool["token_symbol"],
+                    pool["pool_address"],
+                    error,
+                )
+            )
+            ohlcv_list = []
+        if not ohlcv_list:
+            failed_pools.append(
+                "%s:%s:%s"
+                % (pool["token_symbol"], pool["chain"], pool["pool_address"])
+            )
+
+        for ohlcv in ohlcv_list:
+            pool_volume_rows.append(
+                convert_ohlcv_row(ohlcv, pool, include_tvl_snapshot=False)
+            )
+
+        print(
+            "Fetched existing pool %s/%s: %s %s (%s rows)"
+            % (
+                index,
+                pool_count,
+                pool["token_symbol"],
+                pool["pool_address"],
+                len(ohlcv_list),
+            )
+        )
+        if index < pool_count:
+            time.sleep(INCREMENTAL_POOL_SLEEP_SECONDS)
+
+    if failed_pools:
+        raise RuntimeError(
+            "Incremental DEX refresh is incomplete for %s pools: %s"
+            % (len(failed_pools), ",".join(failed_pools))
+        )
+
+    return pool_volume_rows
+
+
 def main(
     token_symbols=None,
     append=False,
@@ -729,10 +910,49 @@ def main(
     chain_rows = read_token_chain_config(TOKEN_CHAIN_CONFIG_PATH, all_token_rows)
     chain_rows_by_token = group_chain_rows_by_token(chain_rows)
 
-    selected_pools, pool_volume_rows = fetch_selected_tokens(
-        token_rows,
-        chain_rows_by_token,
-    )
+    selected_pools = []
+    pool_volume_rows = []
+    discovery_token_rows = token_rows
+    invalid_pool_keys = []
+    if append:
+        if token_symbols is None:
+            raise ValueError("--append requires --tokens")
+        (
+            selected_pools,
+            unresolved_tokens,
+            resolved_tokens,
+            invalid_pool_keys,
+        ) = load_existing_pool_inventory(
+            DEX_POOL_VOLUME_OUTPUT_PATH,
+            TVL_LATEST_PATH,
+            chain_rows_by_token,
+            token_symbols,
+        )
+        if invalid_pool_keys:
+            print(
+                "Dropping %s pools whose OHLCV base/quote excludes the target token"
+                % len(invalid_pool_keys)
+            )
+        if selected_pools:
+            print(
+                "Reusing %s published pools for %s tokens"
+                % (len(selected_pools), len(resolved_tokens))
+            )
+            pool_volume_rows.extend(fetch_existing_pools(selected_pools))
+        discovery_token_rows = filter_token_rows(token_rows, unresolved_tokens)
+        if unresolved_tokens:
+            print(
+                "Running pool discovery for unresolved tokens: %s"
+                % ",".join(unresolved_tokens)
+            )
+
+    if discovery_token_rows:
+        discovered_pools, discovered_rows = fetch_selected_tokens(
+            discovery_token_rows,
+            chain_rows_by_token,
+        )
+        selected_pools.extend(discovered_pools)
+        pool_volume_rows.extend(discovered_rows)
     pool_volume_rows = [
         row
         for row in pool_volume_rows
@@ -743,11 +963,12 @@ def main(
     expected_token_count = len(token_rows)
 
     if append:
-        if token_symbols is None:
-            raise ValueError("--append requires --tokens")
-
         existing_pools = read_csv_rows(DEX_POOLS_OUTPUT_PATH)
         existing_pool_volume_rows = read_csv_rows(DEX_POOL_VOLUME_OUTPUT_PATH)
+        existing_pool_volume_rows = remove_pool_rows(
+            existing_pool_volume_rows,
+            invalid_pool_keys,
+        )
         selected_pools = replace_token_rows(
             existing_pools,
             selected_pools,

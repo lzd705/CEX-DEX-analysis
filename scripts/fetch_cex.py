@@ -10,6 +10,7 @@ This version is intentionally simple:
 import csv
 import argparse
 import json
+import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -17,6 +18,11 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
+
+try:
+    import certifi
+except ImportError:  # pragma: no cover - system trust remains the safe fallback
+    certifi = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +34,7 @@ LIMIT_DAYS = 180
 MIN_HISTORY_DAYS = 120
 MIN_EXCHANGE_COUNT = 3
 PRICE_EXCHANGE = "binance"
+TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where()) if certifi else ssl.create_default_context()
 
 BINANCE_BASE_URLS = [
     "https://api.binance.com",
@@ -441,7 +448,7 @@ def fetch_binance_klines(binance_symbol: str, limit_days: int):
         url = base_url + "/api/v3/klines?" + encoded_query
 
         try:
-            with urllib.request.urlopen(url, timeout=30) as response:
+            with urllib.request.urlopen(url, timeout=30, context=TLS_CONTEXT) as response:
                 text = response.read().decode("utf-8")
                 data = json.loads(text)
                 return data
@@ -455,7 +462,7 @@ def request_json(url: str):
     """Request JSON with a basic User-Agent."""
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
 
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=30, context=TLS_CONTEXT) as response:
         text = response.read().decode("utf-8")
         data = json.loads(text)
 

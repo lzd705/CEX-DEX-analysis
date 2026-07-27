@@ -31,14 +31,17 @@ study, or public data-edit controls.
 ## Local workflow
 
 ```bash
-# Refresh facts from source APIs. This does not build factors.
-python3 scripts/run_fact_pipeline.py
+# Run the complete incremental collection cycle and publish every fact family.
+python3 scripts/run_collection_cycle.py --profile full --publish-local
 
-# Refresh source-reported point-in-time TVL for every published DEX pool.
-python3 scripts/fetch_tvl.py --publish-local
+# Daily schedule profile: incremental CEX/DEX OHLCV plus point-in-time TVL.
+python3 scripts/run_collection_cycle.py --profile daily --publish-local
 
-# Refresh real point-in-time order-book depth for every published CEX market.
-python3 scripts/fetch_cex_depth.py --publish-local
+# Hourly schedule profile: point-in-time CEX order-book depth.
+python3 scripts/run_collection_cycle.py --profile depth --publish-local
+
+# Manual recovery profile: retry only the point-in-time TVL snapshot.
+python3 scripts/run_collection_cycle.py --profile tvl --publish-local
 
 # Import a reviewed snapshot and atomically publish the indexed runtime database.
 python3 scripts/import_local_snapshot.py data/processed
@@ -59,6 +62,8 @@ The separate point-in-time TVL lifecycle and missing-value rules are documented
 in `docs/tvl-data-contract.md`.
 The CEX order-book bands, quote conversion, truncation rules, and raw-response
 audit trail are documented in `docs/cex-depth-data-contract.md`.
+Collection profiles, locks, manifests, freshness thresholds, systemd timers,
+and recovery behavior are documented in `docs/collection-operations.md`.
 
 Administrator setup is documented in `docs/admin-operations.md`. The page is
 served at `/admin.html`. It supports password authentication by default or an
@@ -66,7 +71,6 @@ explicit no-login mode through `ADMIN_LOGIN_REQUIRED=false`.
 
 ## Future scope
 
-Events, slippage, fee/gas data, anomaly rules, historical TVL backfills,
-historical CEX depth scheduling, historical-end-date
-backfills, and adding previously unconfigured Tokens require separate data
-contracts and acceptance tests.
+Events, DEX executable slippage, fee/gas data, anomaly rules, historical TVL
+backfills, historical-end-date backfills, and adding previously unconfigured
+Tokens require separate data contracts and acceptance tests.

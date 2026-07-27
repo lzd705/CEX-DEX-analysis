@@ -1,6 +1,8 @@
+import csv
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from scripts.fetch_dex import choose_main_pool
 from scripts.fetch_dex import choose_top_pools
@@ -24,10 +26,18 @@ from scripts.fetch_dex import filter_token_rows
 from scripts.fetch_dex import replace_token_rows
 from scripts.fetch_dex import deduplicate_pool_volume_rows
 from scripts.fetch_dex import TOP_POOL_COUNT
+from scripts.fetch_dex import TLS_CONTEXT
 from scripts.fetch_dex import merge_pool_volume_rows
+from scripts.fetch_dex import load_existing_pool_inventory
+from scripts.fetch_dex import remove_pool_rows
+from scripts.fetch_dex import fetch_existing_pools
 
 
 class FetchDexTests(unittest.TestCase):
+    def test_https_requests_use_a_verified_tls_context(self):
+        self.assertEqual(TLS_CONTEXT.verify_mode, 2)
+        self.assertTrue(TLS_CONTEXT.check_hostname)
+
     def test_merge_pool_volume_rows_preserves_other_tokens_and_dates(self):
         existing = [
             {"date": "2026-01-01", "token_symbol": "UNI", "chain": "eth", "pool_address": "0xuni", "close": "1"},
@@ -44,6 +54,151 @@ class FetchDexTests(unittest.TestCase):
         self.assertEqual(by_key[("UNI", "2026-01-01")]["close"], "1.5")
         self.assertEqual(by_key[("UNI", "2026-01-02")]["close"], "1.6")
         self.assertEqual(by_key[("AAVE", "2026-01-01")]["close"], "2")
+
+    def test_existing_pool_inventory_uses_exact_quote_side_and_rejects_invalid_pool(self):
+        with TemporaryDirectory() as temp_dir:
+            pool_path = Path(temp_dir) / "pools.csv"
+            tvl_path = Path(temp_dir) / "tvl.csv"
+            with pool_path.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "date",
+                        "token_symbol",
+                        "chain",
+                        "dex",
+                        "pool_address",
+                        "pool_name",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {
+                            "date": "2026-07-25",
+                            "token_symbol": "CRV",
+                            "chain": "eth",
+                            "dex": "uniswap_v3",
+                            "pool_address": "0xvalid",
+                            "pool_name": "WETH / CRV",
+                        },
+                        {
+                            "date": "2026-07-25",
+                            "token_symbol": "CRV",
+                            "chain": "eth",
+                            "dex": "curve",
+                            "pool_address": "0xinvalid",
+                            "pool_name": "USD / WETH / CRV",
+                        },
+                    ]
+                )
+            with tvl_path.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "token_symbol",
+                        "chain",
+                        "pool_address",
+                        "source_dex",
+                        "source_pool_name",
+                        "base_token_id",
+                        "quote_token_id",
+                        "tvl_usd",
+                        "volume_24h_usd",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {
+                            "token_symbol": "CRV",
+                            "chain": "eth",
+                            "pool_address": "0xvalid",
+                            "source_dex": "uniswap_v3",
+                            "source_pool_name": "WETH / CRV",
+                            "base_token_id": "eth_0xweth",
+                            "quote_token_id": "eth_0xcrv",
+                            "tvl_usd": "100",
+                            "volume_24h_usd": "50",
+                        },
+                        {
+                            "token_symbol": "CRV",
+                            "chain": "eth",
+                            "pool_address": "0xinvalid",
+                            "source_dex": "curve",
+                            "source_pool_name": "USD / WETH / CRV",
+                            "base_token_id": "eth_0xusd",
+                            "quote_token_id": "eth_0xweth",
+                            "tvl_usd": "200",
+                            "volume_24h_usd": "60",
+                        },
+                    ]
+                )
+
+            pools, unresolved, resolved, invalid = load_existing_pool_inventory(
+                pool_path,
+                tvl_path,
+                {"CRV": [{"chain": "eth", "contract_address": "0xcrv"}]},
+                ["CRV"],
+            )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(resolved, ["CRV"])
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0]["pool_address"], "0xvalid")
+        self.assertEqual(pools[0]["ohlcv_token"], "quote")
+        self.assertEqual(invalid, [("CRV", "eth", "0xinvalid")])
+
+    def test_remove_pool_rows_only_drops_exact_invalid_identity(self):
+        rows = [
+            {
+                "token_symbol": "CRV",
+                "chain": "eth",
+                "pool_address": "0xinvalid",
+            },
+            {
+                "token_symbol": "CRV",
+                "chain": "arbitrum",
+                "pool_address": "0xinvalid",
+            },
+            {
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "pool_address": "0xinvalid",
+            },
+        ]
+
+        result = remove_pool_rows(rows, [("CRV", "eth", "0xinvalid")])
+
+        self.assertEqual(result, rows[1:])
+
+    def test_existing_pool_refresh_rejects_any_missing_pool_response(self):
+        pools = [
+            {
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "pool_address": "0xone",
+                "dex": "uniswap",
+                "pool_name": "UNI / USD",
+                "pool_tvl_usd": None,
+            },
+            {
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "pool_address": "0xtwo",
+                "dex": "uniswap",
+                "pool_name": "UNI / WETH",
+                "pool_tvl_usd": None,
+            },
+        ]
+        observed = [[1704067200, 1, 2, 0.5, 1.5, 100]]
+
+        with patch(
+            "scripts.fetch_dex.fetch_pool_ohlcv",
+            side_effect=[observed, []],
+        ), patch("scripts.fetch_dex.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "incomplete for 1 pools"):
+                fetch_existing_pools(pools)
 
     def test_every_configured_token_has_chain_config(self):
         token_rows = read_token_config(TOKEN_CONFIG_PATH)
@@ -140,6 +295,10 @@ class FetchDexTests(unittest.TestCase):
     def test_get_retry_wait_seconds_uses_retry_after_header(self):
         result = get_retry_wait_seconds(429, "12")
         self.assertEqual(result, 12)
+
+    def test_get_retry_wait_seconds_rejects_zero_retry_after(self):
+        result = get_retry_wait_seconds(429, "0")
+        self.assertEqual(result, 65)
 
     def test_get_status_code_detects_429_from_error_text(self):
         error = RuntimeError("HTTP Error 429: Too Many Requests")

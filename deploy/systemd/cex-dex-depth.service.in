@@ -1,0 +1,13 @@
+[Unit]
+Description=CEX/DEX hourly CEX order-book depth collection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_ROOT@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 scripts/run_collection_cycle.py --profile depth --publish-local --fail-fast
+TimeoutStartSec=20min
+Nice=10
+

@@ -164,6 +164,8 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
         **catalog_contract(),
         "available_start": payload["metadata"]["available_start"],
         "available_end": payload["metadata"]["available_end"],
+        "source_date_ranges": payload["metadata"].get("source_date_ranges", {}),
+        "freshness": payload["metadata"].get("freshness"),
         "sources": payload["metadata"]["sources"],
         "storage": payload["metadata"]["storage"],
         "tvl_snapshot": payload["metadata"].get("tvl_snapshot"),

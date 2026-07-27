@@ -219,7 +219,11 @@ def load_markets_from_database(database_path: Path) -> list[dict[str, str]]:
             """
             SELECT token_symbol, exchange, cex_symbol
             FROM cex_market_daily
-            GROUP BY token_symbol, exchange, cex_symbol
+            WHERE rowid IN (
+                SELECT MAX(rowid)
+                FROM cex_market_daily
+                GROUP BY token_symbol, exchange
+            )
             ORDER BY exchange, token_symbol, cex_symbol
             """
         ).fetchall()
@@ -235,20 +239,24 @@ def load_markets_from_csv(csv_path: Path) -> list[dict[str, str]]:
         missing = sorted(required - set(reader.fieldnames or []))
         if missing:
             raise ValueError(f"{csv_path.name} is missing columns: {', '.join(missing)}")
-        unique = {
-            (
+        unique = {}
+        for row in reader:
+            if not (
+                row.get("token_symbol")
+                and row.get("exchange")
+                and row.get("cex_symbol")
+            ):
+                continue
+            key = (
                 row["token_symbol"].upper(),
                 row["exchange"].lower(),
-                row["cex_symbol"].upper(),
-            ): {
+            )
+            unique[key] = {
                 "token_symbol": row["token_symbol"].upper(),
                 "exchange": row["exchange"].lower(),
                 "cex_symbol": row["cex_symbol"].upper(),
             }
-            for row in reader
-            if row.get("token_symbol") and row.get("exchange") and row.get("cex_symbol")
-        }
-    return [unique[key] for key in sorted(unique, key=lambda item: (item[1], item[0], item[2]))]
+    return [unique[key] for key in sorted(unique, key=lambda item: (item[1], item[0]))]
 
 
 def load_cataloged_markets(

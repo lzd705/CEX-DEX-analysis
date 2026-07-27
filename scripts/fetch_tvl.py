@@ -124,7 +124,11 @@ def load_pools_from_database(database_path: Path) -> list[dict[str, str]]:
             """
             SELECT token_symbol, chain, dex, pool_address, pool_name
             FROM dex_pool_daily
-            GROUP BY token_symbol, chain, dex, pool_address, pool_name
+            WHERE rowid IN (
+                SELECT MAX(rowid)
+                FROM dex_pool_daily
+                GROUP BY token_symbol, chain, pool_address
+            )
             ORDER BY chain, token_symbol, dex, pool_address
             """
         ).fetchall()

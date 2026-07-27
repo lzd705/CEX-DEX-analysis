@@ -69,6 +69,18 @@ Each database contains:
 - immutable dataset snapshot records;
 - import-run history and one explicit current-state pointer.
 
+Coordinated collection state lives under `data/local/collection/`:
+
+- `runs/<run_id>/manifest.json` records the ordered commands, exit codes,
+  durations, log hashes, fact-file hashes, coverage, and freshness for one run;
+- `runs/<run_id>/*.log` retains complete collector output;
+- `latest.json` points to the latest completed collection manifest;
+- `collection.lock` prevents daily and hourly timers from writing concurrently.
+
+The cycle manifest does not claim a cross-source atomic transaction. Daily
+SQLite, TVL latest/history, and CEX depth latest/history each retain their own
+atomic publication boundary.
+
 The server opens the database read-only. Set `MARKET_DATABASE` to select a
 specific file, or `MARKET_DATA_DIR` to select the directory containing it.
 Explicit `MARKET_CEX_DATA` and `MARKET_DEX_DATA` enable the CSV fallback.

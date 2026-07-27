@@ -27,6 +27,7 @@ from scripts.fetch_cex import make_mexc_symbol
 from scripts.fetch_cex import make_okx_inst_id
 from scripts.fetch_cex import make_upbit_market_candidates
 from scripts.fetch_cex import MIN_EXCHANGE_COUNT
+from scripts.fetch_cex import TLS_CONTEXT
 from scripts.fetch_cex import aggregate_cex_rows
 from scripts.fetch_cex import build_coverage_rows
 from scripts.fetch_cex import select_stable_exchanges
@@ -35,6 +36,10 @@ from scripts.fetch_cex import merge_exchange_rows
 
 
 class FetchCexTests(unittest.TestCase):
+    def test_https_requests_use_a_verified_tls_context(self):
+        self.assertEqual(TLS_CONTEXT.verify_mode, 2)
+        self.assertTrue(TLS_CONTEXT.check_hostname)
+
     def test_merge_exchange_rows_updates_only_matching_natural_key(self):
         existing = [
             {"date": "2026-01-01", "token_symbol": "UNI", "exchange": "binance", "cex_symbol": "UNI/USDT", "close": 1.0},

@@ -249,6 +249,18 @@ function renderTable() {
   });
 }
 
+function dailyFreshnessText(label, item) {
+  if (!item || !item.available_end) return `${label} unavailable`;
+  return `${label} through ${item.available_end} · ${item.status} · lag ${item.lag_days}d`;
+}
+
+function snapshotFreshnessText(item) {
+  if (!item || item.age_hours === null || item.age_hours === undefined) {
+    return "freshness unavailable";
+  }
+  return `${item.status} · age ${item.age_hours.toFixed(1)}h`;
+}
+
 function updateMetadata() {
   const metadata = app.payload.metadata;
   const start = byId("date-start");
@@ -260,7 +272,24 @@ function updateMetadata() {
   start.value = metadata.start_date;
   end.value = metadata.end_date;
   byId("available-range").textContent = `Available ${metadata.available_start} to ${metadata.available_end}`;
-  byId("freshness").textContent = `Data through ${metadata.available_end}`;
+  const freshness = metadata.freshness;
+  if (freshness) {
+    byId("freshness").textContent = [
+      `CEX ${freshness.cex_daily.available_end || "unavailable"}`,
+      `DEX ${freshness.dex_daily.available_end || "unavailable"}`,
+      `common ${freshness.common_comparable_end || "unavailable"}`,
+    ].join(" · ");
+    byId("freshness-cluster").dataset.status = freshness.overall_status;
+    byId("daily-source-status").textContent = [
+      dailyFreshnessText("CEX daily", freshness.cex_daily),
+      dailyFreshnessText("DEX daily", freshness.dex_daily),
+      `common comparable end ${freshness.common_comparable_end || "unavailable"}`,
+    ].join(" | ");
+  } else {
+    byId("freshness").textContent = `Data through ${metadata.available_end}`;
+    byId("freshness-cluster").dataset.status = "unavailable";
+    byId("daily-source-status").textContent = "Source-specific freshness unavailable";
+  }
   const sourceText = metadata.sources
     .map((source) => `${source.name} · ${source.sha256}`)
     .join(" | ");
@@ -271,11 +300,11 @@ function updateMetadata() {
   byId("source-list").textContent = `${storageText} | ${sourceText}`;
   const tvl = metadata.tvl_snapshot;
   byId("tvl-source-status").textContent = tvl
-    ? `TVL snapshot ${formatUtcTimestamp(tvl.observed_at)} · ${tvl.status_counts.observed}/${tvl.pool_rows} observed · ${tvl.method}`
+    ? `TVL snapshot ${formatUtcTimestamp(tvl.observed_at)} · ${tvl.status_counts.observed}/${tvl.pool_rows} observed · ${snapshotFreshnessText(freshness?.dex_tvl)} · ${tvl.method}`
     : metadata.tvl_note;
   const depth = metadata.cex_depth_snapshot;
   byId("depth-source-status").textContent = depth
-    ? `CEX depth ${formatUtcTimestamp(depth.observed_at)} · ${depth.status_counts.observed} complete · ${depth.status_counts.partial} partial · ${depth.status_counts.failed} failed · ${depth.method}`
+    ? `CEX depth ${formatUtcTimestamp(depth.observed_at)} · ${depth.status_counts.observed} complete · ${depth.status_counts.partial} partial · ${depth.status_counts.failed} failed · ${snapshotFreshnessText(freshness?.cex_depth)} · ${depth.method}`
     : metadata.cex_depth_note;
 }
 
