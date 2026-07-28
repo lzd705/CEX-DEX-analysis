@@ -1,5 +1,5 @@
 [Unit]
-Description=Run CEX depth collection hourly
+Description=Run CEX and DEX depth collection hourly
 
 [Timer]
 OnCalendar=*-*-* *:05:00 UTC
@@ -8,4 +8,3 @@ AccuracySec=1min
 
 [Install]
 WantedBy=timers.target
-

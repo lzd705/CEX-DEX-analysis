@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from dashboard import server
 from scripts.fetch_cex_depth import DEPTH_COLUMNS_ALL
+from scripts.fetch_dex_depth import DEX_DEPTH_COLUMNS
 from scripts.market_database import build_database
 
 
@@ -120,6 +121,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         }
         self.tvl_path = data_dir / server.TVL_FILENAME
         self.depth_path = data_dir / server.CEX_DEPTH_FILENAME
+        self.dex_depth_path = data_dir / server.DEX_DEPTH_FILENAME
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -265,6 +267,70 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         self.assertEqual(catalog_binance["total_depth_100bps_usd"], 4000)
         self.assertEqual(catalog_binance["depth_status"], "partial")
+
+    def test_fixed_block_dex_depth_overlays_pool_without_using_tvl_proxy(self):
+        depth_row = {field: "" for field in DEX_DEPTH_COLUMNS}
+        depth_row.update(
+            {
+                "snapshot_id": "dex-depth-1",
+                "observed_at": "2026-07-28T01:02:03+00:00",
+                "response_received_at": "2026-07-28T01:02:04+00:00",
+                "token_symbol": "BTC",
+                "chain": "eth",
+                "dex": "uniswap",
+                "pool_address": "0xpool",
+                "protocol_model": "concentrated_liquidity_v3",
+                "block_number": "123456",
+                "fee_bps": "30",
+                "pool_state_price_usd": "104.8",
+                "source_target_price_usd": "105",
+                "price_difference_bps": "19.066",
+                "sell_depth_10bps_usd": "400",
+                "buy_depth_10bps_usd": "600",
+                "total_depth_10bps_usd": "1000",
+                "sell_depth_25bps_usd": "800",
+                "buy_depth_25bps_usd": "1200",
+                "total_depth_25bps_usd": "2000",
+                "sell_depth_50bps_usd": "1200",
+                "buy_depth_50bps_usd": "1800",
+                "total_depth_50bps_usd": "3000",
+                "sell_depth_100bps_usd": "1600",
+                "buy_depth_100bps_usd": "2400",
+                "total_depth_100bps_usd": "4000",
+                "depth_10bps_complete": "1",
+                "depth_25bps_complete": "1",
+                "depth_50bps_complete": "1",
+                "depth_100bps_complete": "1",
+                "depth_method": "fixed_block_pool_state_marginal_price_band",
+                "source_endpoint": "https://rpc.example.test",
+                "raw_response_sha256": "abc123",
+                "status": "observed",
+            }
+        )
+        write_csv(self.dex_depth_path, DEX_DEPTH_COLUMNS, [depth_row])
+        environment = {
+            **self.environment,
+            "MARKET_DEX_DEPTH_DATA": str(self.dex_depth_path),
+        }
+
+        with patch.dict(server.os.environ, environment, clear=True):
+            payload = server.build_market_payload("2026-01-01", "2026-01-02")
+            catalog = server.build_market_catalog()
+
+        pool = payload["dex_pools"][0]
+        self.assertEqual(pool["dex_depth_status"], "observed")
+        self.assertEqual(pool["total_depth_100bps_usd"], 4000)
+        self.assertEqual(pool["dex_depth_block_number"], 123456)
+        self.assertTrue(pool["depth_100bps_complete"])
+        self.assertEqual(
+            payload["metadata"]["dex_depth_snapshot"]["matched_market_rows"],
+            1,
+        )
+        catalog_pool = next(
+            market for market in catalog["markets"] if market["market_type"] == "dex"
+        )
+        self.assertEqual(catalog_pool["depth_status"], "observed")
+        self.assertEqual(catalog_pool["total_depth_100bps_usd"], 4000)
 
     def test_catalog_identifies_markets_and_declares_fact_contract(self):
         with patch.dict(server.os.environ, self.environment, clear=True):

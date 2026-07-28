@@ -3,7 +3,8 @@
 The four fact families retain separate publication semantics:
 
 - daily CEX/DEX OHLCV is incrementally upserted and atomically indexed in SQLite;
-- TVL and CEX depth append immutable normalized history and replace latest views.
+- TVL, CEX depth, and DEX pool-state depth append immutable normalized history
+  and replace latest views.
 
 This runner coordinates those collectors, records every command and result in a
 single manifest, and emits source-specific freshness without pretending that the
@@ -39,10 +40,12 @@ DEFAULT_LATEST_STATUS = DEFAULT_DATA_DIR / "collection/latest.json"
 DEFAULT_LOCK_FILE = DEFAULT_DATA_DIR / "collection/collection.lock"
 TOKEN_CONFIG = PROJECT_ROOT / "config/tokens.csv"
 PROFILE_STEPS = {
-    "full": ("daily", "tvl", "depth"),
+    "full": ("daily", "tvl", "depth", "dex_depth"),
     "daily": ("daily", "tvl"),
     "tvl": ("tvl",),
-    "depth": ("depth",),
+    "depth": ("depth", "dex_depth"),
+    "cex_depth": ("depth",),
+    "dex_depth": ("dex_depth",),
 }
 DAILY_FILENAMES = {
     "cex_daily": "cex_exchange_volume_daily.csv",
@@ -51,6 +54,7 @@ DAILY_FILENAMES = {
 SNAPSHOT_FILENAMES = {
     "dex_tvl": "dex_pool_tvl_latest.csv",
     "cex_depth": "cex_depth_latest.csv",
+    "dex_depth": "dex_depth_latest.csv",
 }
 
 
@@ -137,21 +141,27 @@ def build_collection_status(
     dex_path = data_dir / DAILY_FILENAMES["dex_daily"]
     tvl_path = data_dir / SNAPSHOT_FILENAMES["dex_tvl"]
     depth_path = data_dir / SNAPSHOT_FILENAMES["cex_depth"]
+    dex_depth_path = data_dir / SNAPSHOT_FILENAMES["dex_depth"]
     source_date_ranges = {
         "cex_daily": csv_date_bounds(cex_path),
         "dex_daily": csv_date_bounds(dex_path),
     }
     tvl = snapshot_summary(tvl_path)
     depth = snapshot_summary(depth_path)
+    dex_depth = snapshot_summary(dex_depth_path)
     return {
         "checked_at": utc_text(checked_at),
         "source_date_ranges": source_date_ranges,
         "tvl_snapshot": tvl,
         "cex_depth_snapshot": depth,
+        "dex_depth_snapshot": dex_depth,
         "freshness": build_source_freshness(
             source_date_ranges,
             tvl_observed_at=tvl.get("observed_at") if tvl else None,
             depth_observed_at=depth.get("observed_at") if depth else None,
+            dex_depth_observed_at=(
+                dex_depth.get("observed_at") if dex_depth else None
+            ),
             now=checked_at,
         ),
         "files": {
@@ -252,10 +262,17 @@ def build_step_commands(
             ]
             if publish_local:
                 command.append("--publish-local")
-        else:
+        elif step == "depth":
             command = [
                 python_executable,
                 str(PROJECT_ROOT / "scripts/fetch_cex_depth.py"),
+            ]
+            if publish_local:
+                command.append("--publish-local")
+        else:
+            command = [
+                python_executable,
+                str(PROJECT_ROOT / "scripts/fetch_dex_depth.py"),
             ]
             if publish_local:
                 command.append("--publish-local")
@@ -288,6 +305,7 @@ def validate_step_freshness(name: str, status: dict[str, Any]) -> list[str]:
         "daily": ("cex_daily", "dex_daily"),
         "tvl": ("dex_tvl",),
         "depth": ("cex_depth",),
+        "dex_depth": ("dex_depth",),
     }[name]
     freshness = status["freshness"]
     return [
@@ -391,6 +409,7 @@ def run_collection_cycle(
                             "daily": ("cex_daily", "dex_daily"),
                             "tvl": ("dex_tvl",),
                             "depth": ("cex_depth",),
+                            "dex_depth": ("dex_depth",),
                         }[name]
                     },
                     "status": "passed" if not invalid_sources else "failed",

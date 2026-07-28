@@ -13,6 +13,8 @@ class FrameworkStructureTest(unittest.TestCase):
             ".gitignore",
             "README.md",
             "data/schema/001_market_facts.sql",
+            "docs/dex-depth-data-contract.md",
+            "scripts/fetch_dex_depth.py",
             "scripts/market_database.py",
             "scripts/run_collection_cycle.py",
             "scripts/run_dashboard.sh",
@@ -46,7 +48,9 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertIn("--profile daily --publish-local", daily_service)
         self.assertNotIn("--fail-fast", daily_service)
         self.assertIn("TimeoutStartSec=75min", daily_service)
-        self.assertIn("--profile depth --publish-local --fail-fast", depth_service)
+        self.assertIn("--profile depth --publish-local", depth_service)
+        self.assertNotIn("--fail-fast", depth_service)
+        self.assertIn("TimeoutStartSec=30min", depth_service)
 
     def test_framework_is_not_bound_to_render(self):
         self.assertFalse((PROJECT_ROOT / "render.yaml").exists())
@@ -68,12 +72,14 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertIn('id="search-token"', html)
         self.assertIn('id="tvl-source-status"', html)
         self.assertIn('id="depth-source-status"', html)
+        self.assertIn('id="dex-depth-source-status"', html)
         self.assertIn('id="daily-source-status"', html)
         self.assertIn("DEFAULT_MARKET_CACHE_KEY", javascript)
         self.assertIn("Cached through", javascript)
         self.assertIn("common comparable end", javascript)
         self.assertIn("TVL snapshot", javascript)
         self.assertIn("CEX depth", javascript)
+        self.assertIn("DEX depth", javascript)
         self.assertIn('class="price-cell"', javascript)
         self.assertIn("td.price-cell", styles)
         self.assertNotIn("factor", (html + javascript).lower())

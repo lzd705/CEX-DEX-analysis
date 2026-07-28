@@ -27,6 +27,11 @@ order-book depth. Those fields are not part of the daily comparison series.
 Their calculation, quote conversion, completeness flags, and audit contract are
 defined in `docs/cex-depth-data-contract.md`.
 
+When `dex_depth_latest.csv` exists, DEX catalog entries expose fixed-block
+10/25/50/100 bps sell, buy, and total pool-state depth, protocol model, fee,
+block number, completeness, and source lineage. Unsupported protocols remain
+`null`. The exact contract is `docs/dex-depth-data-contract.md`.
+
 CEX configured pair labels normally use USDT. The current adapter contract uses
 USDT as a 1:1 USD proxy; Upbit KRW observations are converted through the
 daily USDT/KRW rate. Some adapters fetch a venue-native USD pair even when the
@@ -55,7 +60,9 @@ The comparison input is daily aggregate OHLCV. It is not order-book depth,
 top-of-book bid/ask spread, an executable quote, or measured slippage. The
 comparison page must not relabel it as any of those concepts. Separately
 collected CEX order-book fields retain their own point-in-time timestamps and
-must not be presented as daily history or guaranteed execution.
+must not be presented as daily history or guaranteed execution. Separately
+collected DEX pool-state fields are also point-in-time measurements and exclude
+gas, MEV, and post-block state changes.
 
 ## Known-answer fixtures
 

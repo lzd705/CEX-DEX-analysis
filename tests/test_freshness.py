@@ -62,15 +62,16 @@ class FreshnessTest(unittest.TestCase):
             },
             tvl_observed_at="2026-07-26T11:00:00+00:00",
             depth_observed_at="2026-07-27T10:30:00+00:00",
+            dex_depth_observed_at="2026-07-27T10:45:00+00:00",
             now=NOW,
         )
 
         self.assertEqual(result["common_comparable_end"], "2026-07-23")
         self.assertEqual(result["dex_tvl"]["status"], "current")
         self.assertEqual(result["cex_depth"]["status"], "current")
+        self.assertEqual(result["dex_depth"]["status"], "current")
         self.assertEqual(result["overall_status"], "stale")
 
 
 if __name__ == "__main__":
     unittest.main()
-

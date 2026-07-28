@@ -81,8 +81,8 @@ def catalog_contract() -> dict[str, Any]:
         },
         "semantic_boundary": (
             "Daily OHLCV fields are not order-book depth, quoted bid/ask spread, "
-            "executable price, or measured slippage. CEX depth and quoted spread "
-            "appear only when a separate point-in-time order-book snapshot exists."
+            "executable price, or measured slippage. CEX order-book depth and DEX "
+            "pool-state depth appear only when separate point-in-time snapshots exist."
         ),
     }
 
@@ -155,6 +155,31 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "tvl_status": row.get("tvl_status"),
                 "tvl_observed_at": row.get("tvl_observed_at"),
                 "tvl_method": row.get("tvl_method"),
+                "depth_status": row.get("dex_depth_status"),
+                "depth_observed_at": row.get("dex_depth_observed_at"),
+                "depth_method": row.get("dex_depth_method"),
+                "depth_protocol_model": row.get("dex_depth_protocol_model"),
+                "depth_block_number": row.get("dex_depth_block_number"),
+                "fee_bps": row.get("fee_bps"),
+                "pool_state_price_usd": row.get("pool_state_price_usd"),
+                "source_target_price_usd": row.get("source_target_price_usd"),
+                "price_difference_bps": row.get("price_difference_bps"),
+                "sell_depth_10bps_usd": row.get("sell_depth_10bps_usd"),
+                "buy_depth_10bps_usd": row.get("buy_depth_10bps_usd"),
+                "total_depth_10bps_usd": row.get("total_depth_10bps_usd"),
+                "sell_depth_25bps_usd": row.get("sell_depth_25bps_usd"),
+                "buy_depth_25bps_usd": row.get("buy_depth_25bps_usd"),
+                "total_depth_25bps_usd": row.get("total_depth_25bps_usd"),
+                "sell_depth_50bps_usd": row.get("sell_depth_50bps_usd"),
+                "buy_depth_50bps_usd": row.get("buy_depth_50bps_usd"),
+                "total_depth_50bps_usd": row.get("total_depth_50bps_usd"),
+                "sell_depth_100bps_usd": row.get("sell_depth_100bps_usd"),
+                "buy_depth_100bps_usd": row.get("buy_depth_100bps_usd"),
+                "total_depth_100bps_usd": row.get("total_depth_100bps_usd"),
+                "depth_10bps_complete": row.get("depth_10bps_complete", False),
+                "depth_25bps_complete": row.get("depth_25bps_complete", False),
+                "depth_50bps_complete": row.get("depth_50bps_complete", False),
+                "depth_100bps_complete": row.get("depth_100bps_complete", False),
                 "observed_start": row["price_points"][0]["date"] if row["price_points"] else None,
                 "observed_end": row["latest_date"],
                 "observation_days": row["observation_days"],
@@ -170,12 +195,14 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "storage": payload["metadata"]["storage"],
         "tvl_snapshot": payload["metadata"].get("tvl_snapshot"),
         "cex_depth_snapshot": payload["metadata"].get("cex_depth_snapshot"),
+        "dex_depth_snapshot": payload["metadata"].get("dex_depth_snapshot"),
         "cex_normalization_note": (
             "The displayed instrument is the configured canonical pair label. "
             "Adapters normalize source prices and volume to USD; USDT pairs use a "
             "1 USDT = 1 USD proxy, and venue-native raw pair labels may differ."
         ),
         "cex_depth_note": payload["metadata"].get("cex_depth_note"),
+        "dex_depth_note": payload["metadata"].get("dex_depth_note"),
     }
     return {
         "metadata": metadata,

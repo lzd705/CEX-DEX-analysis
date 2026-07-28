@@ -14,7 +14,7 @@ import os
 import re
 import sqlite3
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from http.cookies import SimpleCookie
@@ -54,6 +54,7 @@ DEX_FILENAME = "dex_pool_volume_daily.csv"
 DATABASE_FILENAME = "market_facts.sqlite3"
 TVL_FILENAME = "dex_pool_tvl_latest.csv"
 CEX_DEPTH_FILENAME = "cex_depth_latest.csv"
+DEX_DEPTH_FILENAME = "dex_depth_latest.csv"
 VENDOR_FILES = {
     "/vendor/lucide.js": DASHBOARD_ROOT / "node_modules/lucide/dist/umd/lucide.min.js",
 }
@@ -189,6 +190,39 @@ def resolve_cex_depth_path() -> Path | None:
     candidates = [Path(configured_dir).expanduser().resolve()] if configured_dir else DEFAULT_DATA_DIRS
     for data_dir in candidates:
         depth_path = data_dir / CEX_DEPTH_FILENAME
+        if depth_path.exists():
+            return depth_path
+    return None
+
+
+def resolve_dex_depth_path() -> Path | None:
+    """Resolve an optional point-in-time DEX pool-state depth snapshot."""
+    explicit_depth = os.environ.get("MARKET_DEX_DEPTH_DATA")
+    if explicit_depth:
+        depth_path = Path(explicit_depth).expanduser().resolve()
+        if not depth_path.exists():
+            raise FileNotFoundError(
+                f"Configured DEX depth snapshot does not exist: {depth_path}"
+            )
+        return depth_path
+    if os.environ.get("MARKET_CEX_DATA") or os.environ.get("MARKET_DEX_DATA"):
+        return None
+    explicit_database = os.environ.get("MARKET_DATABASE")
+    if explicit_database:
+        sibling = (
+            Path(explicit_database).expanduser().resolve().parent
+            / DEX_DEPTH_FILENAME
+        )
+        return sibling if sibling.exists() else None
+
+    configured_dir = os.environ.get("MARKET_DATA_DIR")
+    candidates = (
+        [Path(configured_dir).expanduser().resolve()]
+        if configured_dir
+        else DEFAULT_DATA_DIRS
+    )
+    for data_dir in candidates:
+        depth_path = data_dir / DEX_DEPTH_FILENAME
         if depth_path.exists():
             return depth_path
     return None
@@ -696,6 +730,188 @@ def overlay_cex_depth_snapshot(
     return result
 
 
+@lru_cache(maxsize=8)
+def _load_dex_depth_snapshot_cached(
+    path_text: str,
+    _signature: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    path = Path(path_text)
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {
+            "snapshot_id",
+            "observed_at",
+            "response_received_at",
+            "token_symbol",
+            "chain",
+            "dex",
+            "pool_address",
+            "protocol_model",
+            "block_number",
+            "fee_bps",
+            "pool_state_price_usd",
+            "source_target_price_usd",
+            "price_difference_bps",
+            "sell_depth_10bps_usd",
+            "buy_depth_10bps_usd",
+            "total_depth_10bps_usd",
+            "sell_depth_25bps_usd",
+            "buy_depth_25bps_usd",
+            "total_depth_25bps_usd",
+            "sell_depth_50bps_usd",
+            "buy_depth_50bps_usd",
+            "total_depth_50bps_usd",
+            "sell_depth_100bps_usd",
+            "buy_depth_100bps_usd",
+            "total_depth_100bps_usd",
+            "depth_10bps_complete",
+            "depth_25bps_complete",
+            "depth_50bps_complete",
+            "depth_100bps_complete",
+            "depth_method",
+            "source_endpoint",
+            "raw_response_sha256",
+            "status",
+            "error",
+        }
+        missing = sorted(required - set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(
+                f"{path.name} is missing DEX depth columns: {', '.join(missing)}"
+            )
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"{path.name} contains no DEX depth rows")
+
+    latest: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in rows:
+        address = row["pool_address"]
+        key = (
+            row["token_symbol"].upper(),
+            row["chain"].lower(),
+            address.lower() if address.startswith("0x") else address,
+        )
+        if (
+            key not in latest
+            or row["response_received_at"] > latest[key]["response_received_at"]
+        ):
+            latest[key] = row
+    snapshot_ids = sorted(
+        {row["snapshot_id"] for row in rows if row.get("snapshot_id")}
+    )
+    return {
+        "path": path,
+        "rows": latest,
+        "snapshot_ids": snapshot_ids,
+        "observed_at": max(row["observed_at"] for row in rows),
+        "status_counts": dict(
+            Counter(row.get("status") or "missing_status" for row in rows)
+        ),
+    }
+
+
+def overlay_dex_depth_snapshot(
+    payload: dict[str, Any],
+    depth_path: Path | None,
+) -> dict[str, Any]:
+    """Overlay fixed-block DEX pool-state depth without using TVL as a proxy."""
+    result = copy.deepcopy(payload)
+    if depth_path is None:
+        for pool in result["dex_pools"]:
+            pool["dex_depth_status"] = "unavailable"
+            pool["dex_depth_observed_at"] = None
+            pool["dex_depth_method"] = None
+        result["metadata"]["dex_depth_note"] = (
+            "DEX pool-state depth snapshot is unavailable. TVL and daily volume "
+            "are not used as depth proxies."
+        )
+        return result
+
+    snapshot = _load_dex_depth_snapshot_cached(
+        str(depth_path),
+        data_signature([depth_path]),
+    )
+    matched = 0
+    numeric_fields = [
+        "fee_bps",
+        "pool_state_price_usd",
+        "source_target_price_usd",
+        "price_difference_bps",
+    ] + [
+        f"{side}_depth_{band}bps_usd"
+        for band in (10, 25, 50, 100)
+        for side in ("sell", "buy", "total")
+    ]
+    completeness_fields = [
+        f"depth_{band}bps_complete"
+        for band in (10, 25, 50, 100)
+    ]
+    for pool in result["dex_pools"]:
+        chain, _ = pool["venue"].split(" / ", 1)
+        address = pool["pool_address"]
+        key = (
+            pool["token_symbol"].upper(),
+            chain.lower(),
+            address.lower() if address.startswith("0x") else address,
+        )
+        depth_row = snapshot["rows"].get(key)
+        if depth_row is None:
+            pool["dex_depth_status"] = "not_cataloged_in_snapshot"
+            pool["dex_depth_observed_at"] = None
+            pool["dex_depth_method"] = None
+            for field in numeric_fields:
+                pool[field] = None
+            for field in completeness_fields:
+                pool[field] = False
+            continue
+
+        matched += 1
+        pool["dex_depth_status"] = depth_row.get("status")
+        pool["dex_depth_observed_at"] = depth_row.get("observed_at") or None
+        pool["dex_depth_method"] = depth_row.get("depth_method") or None
+        pool["dex_depth_protocol_model"] = (
+            depth_row.get("protocol_model") or None
+        )
+        pool["dex_depth_block_number"] = (
+            int(depth_row["block_number"])
+            if depth_row.get("block_number")
+            else None
+        )
+        pool["dex_depth_source_endpoint"] = (
+            depth_row.get("source_endpoint") or None
+        )
+        pool["dex_depth_raw_response_sha256"] = (
+            depth_row.get("raw_response_sha256") or None
+        )
+        pool["dex_depth_error"] = depth_row.get("error") or None
+        measured = depth_row.get("status") in {"observed", "partial"}
+        for field in numeric_fields:
+            pool[field] = (
+                parse_number(depth_row.get(field)) if measured else None
+            )
+        for field in completeness_fields:
+            pool[field] = measured and depth_row.get(field) == "1"
+
+    metadata = result["metadata"]
+    metadata["dex_depth_note"] = (
+        "DEX depth is measured from one fixed EVM block by integrating each "
+        "supported pool's actual invariant and active tick liquidity to marginal "
+        "price bands. Unsupported protocols remain null; TVL is never substituted."
+    )
+    metadata["dex_depth_snapshot"] = {
+        "snapshot_ids": snapshot["snapshot_ids"],
+        "observed_at": snapshot["observed_at"],
+        "pool_rows": len(snapshot["rows"]),
+        "matched_market_rows": matched,
+        "status_counts": snapshot["status_counts"],
+        "bands_bps": [10, 25, 50, 100],
+        "source": file_metadata(depth_path),
+        "method": "fixed_block_pool_state_marginal_price_band",
+    }
+    metadata["sources"].append(file_metadata(depth_path))
+    return result
+
+
 @lru_cache(maxsize=32)
 def _build_market_payload_cached(
     start: str | None,
@@ -888,6 +1104,11 @@ def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
             if metadata.get("cex_depth_snapshot")
             else None
         ),
+        dex_depth_observed_at=(
+            metadata.get("dex_depth_snapshot", {}).get("observed_at")
+            if metadata.get("dex_depth_snapshot")
+            else None
+        ),
     )
     return payload
 
@@ -895,12 +1116,14 @@ def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
 def build_market_payload(start: str | None = None, end: str | None = None) -> dict[str, Any]:
     tvl_path = resolve_tvl_path()
     depth_path = resolve_cex_depth_path()
+    dex_depth_path = resolve_dex_depth_path()
     database_path = resolve_database_path()
     if database_path is not None:
         signature = data_signature([database_path])
         payload = _build_database_payload_cached(start, end, str(database_path), signature)
         payload = overlay_tvl_snapshot(payload, tvl_path)
         payload = overlay_cex_depth_snapshot(payload, depth_path)
+        payload = overlay_dex_depth_snapshot(payload, dex_depth_path)
         return attach_freshness_metadata(payload)
 
     cex_path, dex_path = resolve_data_paths()
@@ -908,6 +1131,7 @@ def build_market_payload(start: str | None = None, end: str | None = None) -> di
     payload = _build_market_payload_cached(start, end, str(cex_path), str(dex_path), signature)
     payload = overlay_tvl_snapshot(payload, tvl_path)
     payload = overlay_cex_depth_snapshot(payload, depth_path)
+    payload = overlay_dex_depth_snapshot(payload, dex_depth_path)
     return attach_freshness_metadata(payload)
 
 

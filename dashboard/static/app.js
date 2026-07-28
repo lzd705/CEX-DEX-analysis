@@ -171,17 +171,24 @@ function marketRow(token, market, row, options) {
   const tvlTitle = market === "dex"
     ? `${row?.tvl_status || "unavailable"} · ${formatUtcTimestamp(row?.tvl_observed_at)}`
     : "TVL is not applicable to CEX order books";
-  const depth = market === "cex"
-    ? formatDepth(row?.total_depth_100bps_usd, row?.depth_100bps_complete)
-    : "--";
-  const depthTitle = market === "cex"
-    ? [
-      row?.depth_status || "unavailable",
-      formatUtcTimestamp(row?.depth_observed_at),
-      row?.depth_100bps_complete ? "complete ±100 bps band" : "observed lower bound",
-      row?.depth_source_instrument || row?.instrument || "instrument unavailable",
-    ].join(" · ")
-    : "CEX order-book depth is not applicable to DEX pools";
+  const depth = formatDepth(
+    row?.total_depth_100bps_usd,
+    row?.depth_100bps_complete,
+  );
+  const depthStatus = market === "cex"
+    ? row?.depth_status
+    : row?.dex_depth_status;
+  const depthObservedAt = market === "cex"
+    ? row?.depth_observed_at
+    : row?.dex_depth_observed_at;
+  const depthTitle = [
+    depthStatus || "unavailable",
+    formatUtcTimestamp(depthObservedAt),
+    row?.depth_100bps_complete ? "complete ±100 bps band" : "lower bound or unavailable",
+    market === "cex"
+      ? (row?.depth_source_instrument || row?.instrument || "instrument unavailable")
+      : (row?.dex_depth_protocol_model || row?.dex_depth_error || "pool model unavailable"),
+  ].join(" · ");
   if (!row) {
     return `<tr class="market-row ${market}"><td class="sticky-token market-label">${label}</td><td colspan="10" class="missing">No observations in this window</td></tr>`;
   }
@@ -217,7 +224,7 @@ function tokenRows(tokenSummary, cexOptions, dexOptions) {
       <td>--</td>
       <td>${formatCurrency(combinedVolume)}</td>
       <td>${formatCurrency(dex?.tvl_usd)}</td>
-      <td>${formatDepth(cex?.total_depth_100bps_usd, cex?.depth_100bps_complete)}</td>
+      <td><span class="paired-value">${formatDepth(cex?.total_depth_100bps_usd, cex?.depth_100bps_complete)} / ${formatDepth(dex?.total_depth_100bps_usd, dex?.depth_100bps_complete)}</span></td>
       <td class="${metricClass(spread)} spread-value">${formatPercent(spread)}<span class="spread-date">${spreadDate || ""}</span></td>
       <td>${cexOptions.length} CEX · ${dexOptions.length} pools</td>
     </tr>
@@ -306,6 +313,11 @@ function updateMetadata() {
   byId("depth-source-status").textContent = depth
     ? `CEX depth ${formatUtcTimestamp(depth.observed_at)} · ${depth.status_counts.observed} complete · ${depth.status_counts.partial} partial · ${depth.status_counts.failed} failed · ${snapshotFreshnessText(freshness?.cex_depth)} · ${depth.method}`
     : metadata.cex_depth_note;
+  const dexDepth = metadata.dex_depth_snapshot;
+  const dexStatuses = dexDepth?.status_counts || {};
+  byId("dex-depth-source-status").textContent = dexDepth
+    ? `DEX depth ${formatUtcTimestamp(dexDepth.observed_at)} · ${dexStatuses.observed || 0} complete · ${dexStatuses.partial || 0} partial · ${dexStatuses.unsupported || 0} unsupported · ${dexStatuses.failed || 0} failed · ${snapshotFreshnessText(freshness?.dex_depth)} · ${dexDepth.method}`
+    : metadata.dex_depth_note;
 }
 
 function factsMarketLabel(market) {
@@ -361,6 +373,9 @@ function updateFactsContract() {
       : "",
     metadata.cex_depth_snapshot
       ? `CEX depth: ${metadata.cex_depth_snapshot.status_counts.observed} complete, ${metadata.cex_depth_snapshot.status_counts.partial} partial, ${metadata.cex_depth_snapshot.status_counts.failed} failed at ${formatUtcTimestamp(metadata.cex_depth_snapshot.observed_at)}.`
+      : "",
+    metadata.dex_depth_snapshot
+      ? `DEX depth: ${metadata.dex_depth_snapshot.status_counts.observed || 0} complete, ${metadata.dex_depth_snapshot.status_counts.partial || 0} partial, ${metadata.dex_depth_snapshot.status_counts.unsupported || 0} unsupported, ${metadata.dex_depth_snapshot.status_counts.failed || 0} failed at ${formatUtcTimestamp(metadata.dex_depth_snapshot.observed_at)}.`
       : "",
   ].join(" ");
 }

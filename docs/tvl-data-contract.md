@@ -10,7 +10,7 @@ provider as the pool's total liquidity/reserve in USD. The website labels this
 as source-reported point-in-time TVL. It is not:
 
 - a historical daily TVL series;
-- CEX order-book or DEX executable depth;
+- CEX order-book or DEX pool-state depth;
 - active Uniswap V3 liquidity;
 - a substitute for protocol-specific reserve, tick, or quote data.
 
@@ -77,3 +77,5 @@ default, and honors 429 backoff before retrying.
   view.
 - The website exposes TVL observation time, method, status, and source lineage
   through its market payload and catalog.
+- DEX depth reads this snapshot only for pool inventory and token USD prices;
+  it never converts TVL itself into depth.

@@ -66,6 +66,10 @@ CSVs and a validated SQLite database back into `data/local/`.
 - Spread is calculated from those two selected prices and appears only on the
   token summary row.
 - Missing values stay `N/A`; CEX-inapplicable TVL and row-level spread use `--`.
+- The shared depth column displays CEX order-book depth for CEX rows and
+  fixed-block pool-state depth for supported DEX rows, both within ±100 bps.
+- DEX protocols without an audited adapter display `N/A`, not a TVL-based
+  estimate.
 - The comparison workbench selects one Token and any two cataloged markets,
   then displays unfilled daily closes, daily USD volume, absolute USD spread,
   and midpoint-relative bps.

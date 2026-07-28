@@ -61,6 +61,17 @@ class CollectionCycleTest(unittest.TestCase):
                 }
             ],
         )
+        write_csv(
+            self.data_dir / "dex_depth_latest.csv",
+            ["snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "dex-depth-1",
+                    "observed_at": "2026-07-27T10:45:00+00:00",
+                    "status": "observed",
+                }
+            ],
+        )
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -81,13 +92,22 @@ class CollectionCycleTest(unittest.TestCase):
             tokens=["UNI", "AAVE"],
         )
 
-        self.assertEqual([name for name, _ in commands], ["daily", "tvl", "depth"])
+        self.assertEqual(
+            [name for name, _ in commands],
+            ["daily", "tvl", "depth", "dex_depth"],
+        )
         daily = commands[0][1]
         self.assertIn("--append", daily)
         self.assertEqual(daily[daily.index("--tokens") + 1], "UNI,AAVE")
         self.assertEqual(daily[daily.index("--start") + 1], "2026-07-20")
         self.assertEqual(daily[daily.index("--end") + 1], "2026-07-26")
         self.assertTrue(all("--publish-local" in command for _, command in commands))
+        self.assertTrue(
+            any(
+                item.endswith("scripts/fetch_dex_depth.py")
+                for item in commands[-1][1]
+            )
+        )
 
     def test_tvl_profile_builds_manual_recovery_command(self):
         commands = build_step_commands(

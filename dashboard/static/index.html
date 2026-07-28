@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260727-collection-v1">
+    <link rel="stylesheet" href="/styles.css?v=20260728-dex-depth-v1">
   </head>
   <body>
     <header class="app-header">
@@ -52,6 +52,27 @@
           <i data-lucide="refresh-cw"></i>
           <span>Apply</span>
         </button>
+      </section>
+
+      <section class="beginner-guide" aria-labelledby="beginner-guide-title">
+        <div class="guide-heading">
+          <span class="eyebrow">Web3 零基础先看这里</span>
+          <h2 id="beginner-guide-title">三个数字，回答三个不同问题</h2>
+        </div>
+        <div class="guide-grid">
+          <article>
+            <strong>Volume · 成交量</strong>
+            <span>过去这段时间已经成交了多少钱。它讲的是“过去发生了什么”。</span>
+          </article>
+          <article>
+            <strong>TVL · 池内资金</strong>
+            <span>现在池子里总共有多少钱。钱很多，不代表都集中在当前价格附近。</span>
+          </article>
+          <article>
+            <strong>Depth · 深度</strong>
+            <span>现在交易到价格移动 1% 前，大约能吃下多少美元。越大通常越不容易被一笔交易推价。</span>
+          </article>
+        </div>
       </section>
 
       <section class="facts-workbench" aria-labelledby="facts-title">
@@ -168,7 +189,7 @@
                 <th>Daily Volatility</th>
                 <th>USD Volume</th>
                 <th>TVL Snapshot</th>
-                <th>CEX Depth ±100 bps</th>
+                <th>Depth within 1% (±100 bps)</th>
                 <th>CEX-DEX Spread</th>
                 <th>Coverage</th>
               </tr>
@@ -183,14 +204,16 @@
         <div id="daily-source-status">Daily source freshness loading</div>
         <div id="tvl-source-status">TVL snapshot status loading</div>
         <div id="depth-source-status">CEX depth snapshot status loading</div>
+        <div id="dex-depth-source-status">DEX depth snapshot status loading</div>
         <div>Spread = selected DEX price / selected CEX price - 1 on their latest common date. It appears only on the Token row.</div>
         <div>The daily comparison workbench uses cross-market midpoint-relative bps; it does not infer bid/ask spread, depth, or slippage from OHLCV.</div>
         <div>TVL is the latest fetch snapshot and is not presented as historical daily TVL.</div>
         <div>CEX depth is a real point-in-time order-book snapshot. A ≥ prefix means the returned levels did not prove complete ±100 bps coverage.</div>
+        <div>DEX depth is calculated from one fixed blockchain block for supported V2/V3 pools. Unsupported pool types stay N/A; TVL is never used as a substitute.</div>
       </footer>
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/app.js?v=20260727-collection-v1"></script>
+    <script src="/app.js?v=20260728-dex-depth-v1"></script>
   </body>
 </html>
