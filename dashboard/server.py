@@ -8,12 +8,13 @@ import csv
 import gzip
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
+import posixpath
 import re
 import sqlite3
-import statistics
 import threading
 import time
 from collections import Counter, defaultdict
@@ -24,23 +25,31 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 try:
     from dashboard.admin import AdminService
     from dashboard.freshness import build_source_freshness
     from dashboard.market_facts import (
+        attach_explicit_dex_counts,
+        build_token_summaries as build_fact_token_summaries,
         catalog_contract,
         catalog_from_market_payload,
         compare_daily_rows,
+        enrich_market_quality,
+        market_series_statistics,
     )
 except ModuleNotFoundError:
     from admin import AdminService
     from freshness import build_source_freshness
     from market_facts import (
+        attach_explicit_dex_counts,
+        build_token_summaries as build_fact_token_summaries,
         catalog_contract,
         catalog_from_market_payload,
         compare_daily_rows,
+        enrich_market_quality,
+        market_series_statistics,
     )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -61,12 +70,20 @@ VENDOR_FILES = {
     "/vendor/lucide.js": STATIC_ROOT / "vendor/lucide.min.js",
 }
 API_FRESHNESS_CACHE_SECONDS = 60
+LARGE_PAYLOAD_CACHE_SIZE = 8
+SERIALIZED_RESPONSE_CACHE_SIZE = 32
 PUBLIC_API_CACHE_LOCK = threading.RLock()
+SOURCE_CACHE_GENERATION_LOCK = threading.RLock()
+_SOURCE_CACHE_GENERATION: tuple[tuple[str, int, int], ...] | None = None
+_PUBLIC_RESPONSE_CACHE_GENERATION: (
+    tuple[tuple[tuple[str, int, int], ...], int] | None
+) = None
 PUBLIC_API_QUERY_FIELDS = {
     "catalog": (),
     "market": ("start", "end"),
     "compare": ("token", "market_a", "market_b", "start", "end"),
 }
+ADMIN_STATIC_PATHS = {"/admin.html", "/admin.js"}
 
 
 def load_local_environment(path: Path) -> None:
@@ -285,45 +302,44 @@ def latest_non_null(rows: list[dict[str, Any]], field: str) -> float | None:
 
 
 def price_observations(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
-    """Return sorted finite daily closes."""
+    """Return sorted finite, positive daily closes."""
     observations = [
         (row["date"], parse_number(row.get("close")))
         for row in rows
-        if parse_number(row.get("close")) is not None
+        if (
+            parse_number(row.get("close")) is not None
+            and parse_number(row.get("close")) > 0
+        )
     ]
     return sorted(observations)
 
 
 def price_statistics(rows: list[dict[str, Any]]) -> tuple[float | None, float | None, float | None]:
-    """Return latest price, window return, and daily log-return volatility."""
-    observations = price_observations(rows)
-    if not observations:
-        return None, None, None
-
-    latest_price = observations[-1][1]
-    first_price = observations[0][1]
-    window_return = (
-        latest_price / first_price - 1
-        if len(observations) >= 2 and first_price and latest_price is not None
-        else None
+    """Backward-compatible tuple backed by the auditable series contract."""
+    result = market_series_statistics(rows)
+    return (
+        result["price_usd"],
+        result["window_return"],
+        result["daily_volatility"],
     )
-    log_returns = [
-        math.log(current[1] / previous[1])
-        for previous, current in zip(observations, observations[1:])
-        if previous[1] and current[1] and previous[1] > 0 and current[1] > 0
-    ]
-    daily_volatility = statistics.stdev(log_returns) if len(log_returns) >= 2 else None
-    return latest_price, window_return, daily_volatility
 
 
-def summarize_cex(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+def summarize_cex(
+    rows: list[dict[str, str]],
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         groups[(row["token_symbol"], row["exchange"], row["cex_symbol"])].append(row)
 
     summaries = []
     for (token, exchange, symbol), market_rows in groups.items():
-        price, window_return, volatility = price_statistics(market_rows)
+        statistics_payload = market_series_statistics(
+            market_rows,
+            requested_start=requested_start,
+            requested_end=requested_end,
+        )
         volumes = [parse_number(row.get("quote_volume_usd")) for row in market_rows]
         summaries.append(
             {
@@ -331,20 +347,22 @@ def summarize_cex(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 "market": "cex",
                 "venue": exchange,
                 "instrument": symbol,
-                "price_usd": price,
-                "window_return": window_return,
-                "daily_volatility": volatility,
+                **statistics_payload,
                 "volume_usd": sum(value for value in volumes if value is not None),
                 "tvl_usd": None,
-                "observation_days": len({row["date"] for row in market_rows}),
-                "latest_date": max(row["date"] for row in market_rows),
+                "observation_days": statistics_payload["observation_count"],
+                "latest_date": statistics_payload["latest_observed_date"],
                 "price_points": [{"date": day, "price_usd": value} for day, value in price_observations(market_rows)],
             }
         )
     return sorted(summaries, key=lambda row: (row["token_symbol"], -row["volume_usd"], row["venue"]))
 
 
-def summarize_dex(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+def summarize_dex(
+    rows: list[dict[str, str]],
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         groups[
@@ -363,7 +381,11 @@ def summarize_dex(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
             key=lambda row: (row["date"], row.get("pool_name", "")),
         )
         pool_name = latest_row.get("pool_name") or address
-        price, window_return, volatility = price_statistics(pool_rows)
+        statistics_payload = market_series_statistics(
+            pool_rows,
+            requested_start=requested_start,
+            requested_end=requested_end,
+        )
         volumes = [parse_number(row.get("dex_volume_usd")) for row in pool_rows]
         summaries.append(
             {
@@ -372,13 +394,11 @@ def summarize_dex(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 "venue": f"{chain} / {dex}",
                 "instrument": pool_name,
                 "pool_address": address,
-                "price_usd": price,
-                "window_return": window_return,
-                "daily_volatility": volatility,
+                **statistics_payload,
                 "volume_usd": sum(value for value in volumes if value is not None),
                 "tvl_usd": latest_non_null(pool_rows, "pool_tvl_usd"),
-                "observation_days": len({row["date"] for row in pool_rows}),
-                "latest_date": max(row["date"] for row in pool_rows),
+                "observation_days": statistics_payload["observation_count"],
+                "latest_date": statistics_payload["latest_observed_date"],
                 "price_points": [{"date": day, "price_usd": value} for day, value in price_observations(pool_rows)],
             }
         )
@@ -417,36 +437,7 @@ def build_token_summaries(
     cex_markets: list[dict[str, Any]],
     dex_pools: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    primary_cex = select_primary(cex_markets)
-    primary_dex = select_primary(dex_pools)
-    cex_volume: dict[str, float] = defaultdict(float)
-    dex_volume: dict[str, float] = defaultdict(float)
-    for row in cex_markets:
-        cex_volume[row["token_symbol"]] += row["volume_usd"]
-    for row in dex_pools:
-        dex_volume[row["token_symbol"]] += row["volume_usd"]
-
-    tokens = sorted(set(primary_cex) | set(primary_dex))
-    summaries = []
-    for token in tokens:
-        cex = primary_cex.get(token)
-        dex = primary_dex.get(token)
-        comparison_date, _, _, spread = common_price_comparison(cex, dex)
-        total_volume = cex_volume[token] + dex_volume[token]
-        summaries.append(
-            {
-                "token_symbol": token,
-                "cex_volume_usd": cex_volume[token],
-                "dex_volume_usd": dex_volume[token],
-                "total_volume_usd": total_volume,
-                "observed_dex_share": dex_volume[token] / total_volume if total_volume else None,
-                "price_spread": spread,
-                "spread_date": comparison_date,
-                "primary_cex_id": f"{cex['venue']}|{cex['instrument']}" if cex else None,
-                "primary_dex_id": dex.get("pool_address") if dex else None,
-            }
-        )
-    return summaries
+    return build_fact_token_summaries(cex_markets, dex_pools)
 
 
 def file_metadata(path: Path) -> dict[str, Any]:
@@ -607,9 +598,17 @@ def _load_cex_depth_snapshot_cached(
             "midpoint",
             "spread_quote",
             "spread_bps",
+            "bid_depth_10bps_usd",
+            "ask_depth_10bps_usd",
             "total_depth_10bps_usd",
+            "bid_depth_25bps_usd",
+            "ask_depth_25bps_usd",
             "total_depth_25bps_usd",
+            "bid_depth_50bps_usd",
+            "ask_depth_50bps_usd",
             "total_depth_50bps_usd",
+            "bid_depth_100bps_usd",
+            "ask_depth_100bps_usd",
             "total_depth_100bps_usd",
             "depth_10bps_complete",
             "depth_25bps_complete",
@@ -676,9 +675,17 @@ def overlay_cex_depth_snapshot(
         "midpoint",
         "spread_quote",
         "spread_bps",
+        "bid_depth_10bps_usd",
+        "ask_depth_10bps_usd",
         "total_depth_10bps_usd",
+        "bid_depth_25bps_usd",
+        "ask_depth_25bps_usd",
         "total_depth_25bps_usd",
+        "bid_depth_50bps_usd",
+        "ask_depth_50bps_usd",
         "total_depth_50bps_usd",
+        "bid_depth_100bps_usd",
+        "ask_depth_100bps_usd",
         "total_depth_100bps_usd",
     )
     completeness_fields = (
@@ -925,7 +932,25 @@ def overlay_dex_depth_snapshot(
     return result
 
 
-@lru_cache(maxsize=32)
+def finalize_fact_contract(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach quality, aggregation, and count semantics after all snapshots."""
+    cex_markets = [enrich_market_quality(row) for row in payload["cex_markets"]]
+    dex_pools = [enrich_market_quality(row) for row in payload["dex_pools"]]
+    metadata = {
+        **catalog_contract(),
+        **payload["metadata"],
+    }
+    metadata = attach_explicit_dex_counts(metadata, dex_pools)
+    return {
+        **payload,
+        "metadata": metadata,
+        "tokens": build_fact_token_summaries(cex_markets, dex_pools),
+        "cex_markets": cex_markets,
+        "dex_pools": dex_pools,
+    }
+
+
+@lru_cache(maxsize=LARGE_PAYLOAD_CACHE_SIZE)
 def _build_market_payload_cached(
     start: str | None,
     end: str | None,
@@ -953,8 +978,16 @@ def _build_market_payload_cached(
     if effective_start < available_start or effective_end > available_end:
         raise ValueError(f"date window must be within {available_start} and {available_end}")
 
-    cex_markets = summarize_cex(rows_in_window(cex_path, effective_start, effective_end))
-    dex_pools = summarize_dex(rows_in_window(dex_path, effective_start, effective_end))
+    cex_markets = summarize_cex(
+        rows_in_window(cex_path, effective_start, effective_end),
+        effective_start,
+        effective_end,
+    )
+    dex_pools = summarize_dex(
+        rows_in_window(dex_path, effective_start, effective_end),
+        effective_start,
+        effective_end,
+    )
     if not cex_markets and not dex_pools:
         raise ValueError("No market observations exist in the selected time window")
 
@@ -980,7 +1013,7 @@ def _build_market_payload_cached(
     }
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=LARGE_PAYLOAD_CACHE_SIZE)
 def _build_database_payload_cached(
     start: str | None,
     end: str | None,
@@ -1057,8 +1090,8 @@ def _build_database_payload_cached(
     finally:
         connection.close()
 
-    cex_markets = summarize_cex(cex_rows)
-    dex_pools = summarize_dex(dex_rows)
+    cex_markets = summarize_cex(cex_rows, effective_start, effective_end)
+    dex_pools = summarize_dex(dex_rows, effective_start, effective_end)
     if not cex_markets and not dex_pools:
         raise ValueError("No market observations exist in the selected time window")
 
@@ -1166,7 +1199,7 @@ def market_payload_cache_key(
     )
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=LARGE_PAYLOAD_CACHE_SIZE)
 def _build_enriched_payload_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]:
     (
         start,
@@ -1202,18 +1235,24 @@ def _build_enriched_payload_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]
         payload,
         Path(depth_path_text) if depth_path_text else None,
     )
-    return overlay_dex_depth_snapshot(
+    payload = overlay_dex_depth_snapshot(
         payload,
         Path(dex_depth_path_text) if dex_depth_path_text else None,
     )
+    return finalize_fact_contract(payload)
 
 
 def build_market_payload(
     start: str | None = None,
     end: str | None = None,
 ) -> dict[str, Any]:
-    cache_key = market_payload_cache_key(start, end)
-    return attach_freshness_metadata(_build_enriched_payload_cached(cache_key))
+    # Keep generation validation, assembly, and the lru_cache write-back in one
+    # critical section. Otherwise a concurrent cache clear can finish while an
+    # old miss is still computing, allowing that old key to be inserted again.
+    with SOURCE_CACHE_GENERATION_LOCK:
+        ensure_source_cache_generation(api_source_signature())
+        cache_key = market_payload_cache_key(start, end)
+        return attach_freshness_metadata(_build_enriched_payload_cached(cache_key))
 
 
 @lru_cache(maxsize=8)
@@ -1223,20 +1262,21 @@ def _build_market_catalog_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]:
 
 def build_market_catalog() -> dict[str, Any]:
     """Return every observed market plus the versioned fact contract."""
-    default_payload = build_market_payload()
-    metadata = default_payload["metadata"]
-    cache_key = market_payload_cache_key(
-        metadata["available_start"],
-        metadata["available_end"],
-    )
-    catalog = _build_market_catalog_cached(cache_key)
-    return {
-        **catalog,
-        "metadata": {
-            **catalog["metadata"],
-            "freshness": metadata.get("freshness"),
-        },
-    }
+    with SOURCE_CACHE_GENERATION_LOCK:
+        default_payload = build_market_payload()
+        metadata = default_payload["metadata"]
+        cache_key = market_payload_cache_key(
+            metadata["available_start"],
+            metadata["available_end"],
+        )
+        catalog = _build_market_catalog_cached(cache_key)
+        return {
+            **catalog,
+            "metadata": {
+                **catalog["metadata"],
+                "freshness": metadata.get("freshness"),
+            },
+        }
 
 
 def validate_fact_window(
@@ -1458,7 +1498,7 @@ def _build_public_api_payload(
     raise ValueError(f"Unknown public API route: {route}")
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=SERIALIZED_RESPONSE_CACHE_SIZE)
 def _build_public_api_response_cached(
     route: str,
     query_items: tuple[tuple[str, str], ...],
@@ -1471,6 +1511,65 @@ def _build_public_api_response_cached(
     )
 
 
+def clear_runtime_caches() -> None:
+    """Drop every payload derived from a previous published source generation."""
+    global _SOURCE_CACHE_GENERATION, _PUBLIC_RESPONSE_CACHE_GENERATION
+    with SOURCE_CACHE_GENERATION_LOCK:
+        for cached_builder in (
+            _load_tvl_snapshot_cached,
+            _load_cex_depth_snapshot_cached,
+            _load_dex_depth_snapshot_cached,
+            _build_market_payload_cached,
+            _build_database_payload_cached,
+            _build_enriched_payload_cached,
+            _build_market_catalog_cached,
+            _build_public_api_response_cached,
+        ):
+            cached_builder.cache_clear()
+        _SOURCE_CACHE_GENERATION = None
+        _PUBLIC_RESPONSE_CACHE_GENERATION = None
+
+
+def ensure_source_cache_generation(
+    source_signature: tuple[tuple[str, int, int], ...],
+) -> None:
+    """Retain only one complete source generation instead of 32 large copies."""
+    global _SOURCE_CACHE_GENERATION, _PUBLIC_RESPONSE_CACHE_GENERATION
+    with SOURCE_CACHE_GENERATION_LOCK:
+        if _SOURCE_CACHE_GENERATION is None:
+            _SOURCE_CACHE_GENERATION = source_signature
+            return
+        if _SOURCE_CACHE_GENERATION == source_signature:
+            return
+        for cached_builder in (
+            _load_tvl_snapshot_cached,
+            _load_cex_depth_snapshot_cached,
+            _load_dex_depth_snapshot_cached,
+            _build_market_payload_cached,
+            _build_database_payload_cached,
+            _build_enriched_payload_cached,
+            _build_market_catalog_cached,
+            _build_public_api_response_cached,
+        ):
+            cached_builder.cache_clear()
+        _SOURCE_CACHE_GENERATION = source_signature
+        _PUBLIC_RESPONSE_CACHE_GENERATION = None
+
+
+def ensure_public_response_cache_generation(
+    source_signature: tuple[tuple[str, int, int], ...],
+    freshness_bucket: int,
+) -> None:
+    """Bound serialized responses to the active source and freshness minute."""
+    global _PUBLIC_RESPONSE_CACHE_GENERATION
+    generation = (source_signature, freshness_bucket)
+    with SOURCE_CACHE_GENERATION_LOCK:
+        if _PUBLIC_RESPONSE_CACHE_GENERATION == generation:
+            return
+        _build_public_api_response_cached.cache_clear()
+        _PUBLIC_RESPONSE_CACHE_GENERATION = generation
+
+
 def build_public_api_response(
     route: str,
     query_items: tuple[tuple[str, str], ...],
@@ -1478,17 +1577,22 @@ def build_public_api_response(
 ) -> tuple[bytes, bool]:
     """Use one cold-cache builder so concurrent misses do not duplicate work."""
     with PUBLIC_API_CACHE_LOCK:
-        if not accepts_gzip:
-            return encode_json_payload(
-                _build_public_api_payload(route, query_items),
-                "",
+        with SOURCE_CACHE_GENERATION_LOCK:
+            if not accepts_gzip:
+                return encode_json_payload(
+                    _build_public_api_payload(route, query_items),
+                    "",
+                )
+            source_signature = api_source_signature()
+            freshness_bucket = api_freshness_bucket()
+            ensure_source_cache_generation(source_signature)
+            ensure_public_response_cache_generation(source_signature, freshness_bucket)
+            return _build_public_api_response_cached(
+                route,
+                query_items,
+                source_signature,
+                freshness_bucket,
             )
-        return _build_public_api_response_cached(
-            route,
-            query_items,
-            api_source_signature(),
-            api_freshness_bucket(),
-        )
 
 
 def public_api_query_items(
@@ -1503,6 +1607,28 @@ def public_api_query_items(
         (name, query[name][0])
         for name in fields
         if query.get(name) and query[name][0] is not None
+    )
+
+
+def is_loopback_host(host: str) -> bool:
+    """Accept only an explicit loopback bind for the write-capable admin surface."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def is_admin_surface_path(path: str) -> bool:
+    normalized = (
+        "/" + posixpath.normpath(unquote(path)).lstrip("/")
+    ).casefold()
+    return (
+        normalized in ADMIN_STATIC_PATHS
+        or normalized == "/admin"
+        or normalized == "/api/admin"
+        or normalized.startswith("/api/admin/")
     )
 
 
@@ -1570,8 +1696,15 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         morsel = cookie.get("admin_session")
         return morsel.value if morsel else None
 
+    def admin_surface_available(self) -> bool:
+        bound_host = str(self.server.server_address[0])
+        return ADMIN_SERVICE.available and is_loopback_host(bound_host)
+
     def require_admin(self, *, csrf: bool = False) -> tuple[str, dict[str, Any]] | None:
-        if not ADMIN_SERVICE.login_required:
+        if not self.admin_surface_available():
+            self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+            return None
+        if ADMIN_SERVICE.open_mode:
             return "", {
                 "username": "open-admin",
                 "csrf_token": "",
@@ -1630,6 +1763,12 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if is_admin_surface_path(parsed.path) and not self.admin_surface_available():
+            if parsed.path.startswith("/api/"):
+                self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
+            return
         if parsed.path == "/api/markets/catalog":
             try:
                 self.send_public_api("catalog", {})
@@ -1684,6 +1823,9 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if is_admin_surface_path(path) and not self.admin_surface_available():
+            self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+            return
         try:
             payload = self.read_json()
         except (ValueError, json.JSONDecodeError) as error:
@@ -1691,7 +1833,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/admin/login":
-            if not ADMIN_SERVICE.login_required:
+            if ADMIN_SERVICE.open_mode:
                 self.send_json({"error": "Administrator login is disabled"}, HTTPStatus.NOT_FOUND)
                 return
             try:
@@ -1713,7 +1855,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/admin/logout":
-            if not ADMIN_SERVICE.login_required:
+            if ADMIN_SERVICE.open_mode:
                 self.send_json(ADMIN_SERVICE.public_session(None))
                 return
             authenticated = self.require_admin(csrf=True)
@@ -1758,6 +1900,11 @@ def main() -> None:
     args = parse_args()
     if args.data_dir:
         os.environ["MARKET_DATA_DIR"] = str(Path(args.data_dir).expanduser().resolve())
+    if ADMIN_SERVICE.available and not is_loopback_host(args.host):
+        raise SystemExit(
+            "Administrator surface requires a loopback bind. "
+            "Run behind an HTTPS reverse proxy or disable ADMIN_ENABLED."
+        )
     server = ThreadingHTTPServer((args.host, args.port), MarketMonitorHandler)
     print(f"Market Monitor running at http://{args.host}:{args.port}")
     try:

@@ -1,11 +1,11 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260728-expert-v1">
+    <link rel="stylesheet" href="/styles.css?v=20260728-quality-v5">
   </head>
   <body>
     <header class="app-header">
@@ -16,7 +16,13 @@
           <p>Venue-level facts, aligned on daily UTC observations</p>
         </div>
       </div>
-      <div id="freshness-cluster" class="status-cluster" data-status="loading">
+      <div
+        id="freshness-cluster"
+        class="status-cluster"
+        data-status="loading"
+        role="status"
+        aria-live="polite"
+      >
         <span class="status-dot"></span>
         <span id="freshness">Loading data</span>
       </div>
@@ -54,7 +60,14 @@
         </button>
       </section>
 
-      <section class="facts-workbench" aria-labelledby="facts-title">
+      <div id="market-loading" class="status-banner" role="status" aria-live="polite" hidden></div>
+
+      <section
+        id="facts-workbench"
+        class="facts-workbench"
+        aria-labelledby="facts-title"
+        aria-busy="true"
+      >
         <div class="facts-heading">
           <div>
             <span class="eyebrow">P0 · auditable market facts</span>
@@ -82,7 +95,10 @@
           </button>
         </div>
 
-        <div id="comparison-error" class="error-banner" hidden></div>
+        <div id="comparison-status" class="status-banner" role="status" aria-live="polite">
+          Loading comparison catalog…
+        </div>
+        <div id="comparison-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
         <div class="comparison-summary">
           <div>
             <span>Latest comparable date</span>
@@ -93,7 +109,7 @@
             <strong id="compare-absolute">—</strong>
           </div>
           <div>
-            <span>Midpoint bps</span>
+            <span>Midpoint-relative spread</span>
             <strong id="compare-bps">—</strong>
           </div>
           <div>
@@ -102,18 +118,24 @@
           </div>
         </div>
 
-        <div class="comparison-table-scroll">
+        <div
+          class="comparison-table-scroll"
+          role="region"
+          aria-label="Daily two-market comparison observations"
+          tabindex="0"
+        >
           <table class="comparison-table">
+            <caption>Daily observations for the selected two markets; missing values are never filled.</caption>
             <thead>
               <tr>
-                <th>Date (UTC)</th>
-                <th id="market-a-price-heading">A Price (USD)</th>
-                <th id="market-a-volume-heading">A Volume (USD)</th>
-                <th id="market-b-price-heading">B Price (USD)</th>
-                <th id="market-b-volume-heading">B Volume (USD)</th>
-                <th>Absolute Spread (USD)</th>
-                <th>Spread (bps)</th>
-                <th>Missing rule</th>
+                <th scope="col">Date (UTC)</th>
+                <th scope="col" id="market-a-price-heading">A Price (USD)</th>
+                <th scope="col" id="market-a-volume-heading">A Volume (USD)</th>
+                <th scope="col" id="market-b-price-heading">B Price (USD)</th>
+                <th scope="col" id="market-b-volume-heading">B Volume (USD)</th>
+                <th scope="col">Absolute Price Difference (USD)</th>
+                <th scope="col">Midpoint-relative Spread (bps)</th>
+                <th scope="col">Missing-value Rule</th>
               </tr>
             </thead>
             <tbody id="comparison-body">
@@ -131,12 +153,12 @@
 
       <section class="monitor-toolbar">
         <div class="segmented-control" role="group" aria-label="Sort market scope">
-          <button type="button" data-scope="combined" class="active">综合</button>
-          <button type="button" data-scope="cex">CEX</button>
-          <button type="button" data-scope="dex">DEX</button>
+          <button type="button" data-scope="combined" class="active" aria-pressed="true">Aggregate</button>
+          <button type="button" data-scope="cex" aria-pressed="false">CEX</button>
+          <button type="button" data-scope="dex" aria-pressed="false">DEX</button>
         </div>
         <label class="sort-control">
-          <span>Sort by</span>
+          <span>Rank by</span>
           <select id="sort-field">
             <option value="volume">USD Volume</option>
             <option value="spread">Absolute Spread</option>
@@ -150,27 +172,50 @@
             <i data-lucide="search"></i>
           </button>
         </div>
+        <button id="export-csv" class="secondary-command" type="button" title="Export visible facts as CSV">
+          <i data-lucide="download"></i>
+          <span>Export CSV</span>
+        </button>
         <div id="row-count" class="row-count"></div>
       </section>
 
-      <div id="error-banner" class="error-banner" hidden></div>
+      <div id="market-status" class="status-banner" role="status" aria-live="polite" hidden></div>
+      <div id="error-banner" class="error-banner" role="alert" aria-live="assertive" hidden></div>
 
-      <section class="market-panel">
-        <div class="table-scroll">
+      <details class="quality-legend">
+        <summary>Quality flags and metric definitions</summary>
+        <div class="quality-legend-grid">
+          <span><strong>Aggregate</strong> sums every cataloged market in the selected window.</span>
+          <span><strong>Selected</strong> refers only to the two markets shown for that Token.</span>
+          <span><strong>Partial</strong> depth is a lower bound and uses the ≥ prefix.</span>
+          <span><strong>Unsupported</strong> stays N/A; TVL and volume never substitute for depth.</span>
+          <span><strong>Off-market</strong> flags a pool-state price that diverges materially from the source price.</span>
+          <span><strong>Tiny pool</strong> warns that a mathematically valid pool may not be economically representative.</span>
+        </div>
+      </details>
+
+      <section id="market-panel" class="market-panel" aria-busy="true">
+        <div
+          class="table-scroll"
+          role="region"
+          aria-label="Token and selected market facts"
+          tabindex="0"
+        >
           <table id="market-table">
+            <caption>Aggregate Token facts followed by the selected CEX and DEX market facts.</caption>
             <thead>
               <tr>
-                <th class="sticky-token">Token / Market</th>
-                <th>Venue</th>
-                <th>Pair / Pool</th>
-                <th>Latest Price</th>
-                <th>Window Return</th>
-                <th>Daily Volatility</th>
-                <th>USD Volume</th>
-                <th>TVL Snapshot</th>
-                <th>Depth within 1% (±100 bps)</th>
-                <th>CEX-DEX Spread</th>
-                <th>Coverage</th>
+                <th scope="col" class="sticky-token">Token / Market</th>
+                <th scope="col">Selection</th>
+                <th scope="col">Pair / Metric</th>
+                <th scope="col">Latest Comparable Price</th>
+                <th scope="col">Window Return</th>
+                <th scope="col">Daily Volatility</th>
+                <th scope="col">USD Volume</th>
+                <th scope="col">TVL Snapshot</th>
+                <th scope="col">Depth Bands (USD)</th>
+                <th scope="col">Selected DEX/CEX Spread</th>
+                <th scope="col">Coverage &amp; Quality</th>
               </tr>
             </thead>
             <tbody id="market-body"></tbody>
@@ -184,8 +229,8 @@
         <div id="tvl-source-status">TVL snapshot status loading</div>
         <div id="depth-source-status">CEX depth snapshot status loading</div>
         <div id="dex-depth-source-status">DEX depth snapshot status loading</div>
-        <div>Spread = selected DEX price / selected CEX price - 1 on their latest common date. It appears only on the Token row.</div>
-        <div>The daily comparison workbench uses cross-market midpoint-relative bps; it does not infer bid/ask spread, depth, or slippage from OHLCV.</div>
+        <div>Selected-market spread = selected DEX price / selected CEX price - 1 on their latest common date. It appears only on the Token row.</div>
+        <div>The comparison workbench separately reports midpoint-relative spread in bps. Neither measure is a bid/ask spread or executable slippage estimate.</div>
         <div>TVL is the latest fetch snapshot and is not presented as historical daily TVL.</div>
         <div>CEX depth is a real point-in-time order-book snapshot. A ≥ prefix means the returned levels did not prove complete ±100 bps coverage.</div>
         <div>DEX depth is calculated from one fixed blockchain block for supported V2/V3 pools. Unsupported pool types stay N/A; TVL is never used as a substitute.</div>
@@ -193,6 +238,6 @@
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/app.js?v=20260728-expert-v1"></script>
+    <script src="/app.js?v=20260728-quality-v5"></script>
   </body>
 </html>

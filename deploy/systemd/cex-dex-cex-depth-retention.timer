@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily CEX depth raw-response retention
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 UTC
+Persistent=true
+RandomizedDelaySec=20m
+Unit=cex-dex-cex-depth-retention.service
+
+[Install]
+WantedBy=timers.target

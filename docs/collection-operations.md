@@ -111,6 +111,23 @@ The hourly depth service is also not fail-fast: DEX depth is still attempted
 when an independent CEX venue fails, and vice versa. The final cycle remains
 failed when either supported collection step fails its freshness gate.
 
+## Raw CEX depth retention
+
+Hourly order-book responses grow much faster than normalized facts. Keep the
+recent JSON snapshots directly inspectable, then compress and eventually
+expire them with the dedicated retention command. It is a dry run by default:
+
+```bash
+python3 scripts/retain_cex_depth_raw.py
+python3 scripts/retain_cex_depth_raw.py --apply
+```
+
+The default 7-day raw and 30-day archive periods are operational defaults, not
+a data-contract claim. Review the printed actions and the research/audit
+retention requirement before applying or enabling
+`cex-dex-cex-depth-retention.timer`. See
+`docs/production-hardening.md` for the systemd template and safety boundary.
+
 ## Operational acceptance
 
 - The correct canonical repository and branch are checked before deployment.

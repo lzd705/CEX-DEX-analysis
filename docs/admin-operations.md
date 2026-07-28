@@ -1,5 +1,9 @@
 # Administrator Operations
 
+The administrator surface is absent by default. With `ADMIN_ENABLED` unset or
+false, `/admin.html`, `/admin.js`, and every `/api/admin/*` route return 404.
+Supplying a username or password hash alone does not expose the routes.
+
 ## Local setup
 
 Generate a password verifier:
@@ -8,9 +12,18 @@ Generate a password verifier:
 python3 scripts/admin_password.py
 ```
 
-Copy `.env.example` to `.env`, set `ADMIN_USERNAME`, and paste the generated
-value as `ADMIN_PASSWORD_HASH`. `.env` is ignored by Git. Restart the server,
-then open:
+Copy `.env.example` to `.env`, set the following values, and paste the generated
+value as `ADMIN_PASSWORD_HASH`. `.env` is ignored by Git.
+
+```env
+ADMIN_ENABLED=true
+ADMIN_LOGIN_REQUIRED=true
+ADMIN_ALLOW_OPEN_LOCAL=false
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD_HASH=pbkdf2_sha256$...
+```
+
+Restart a server bound to loopback, then open:
 
 ```text
 http://127.0.0.1:8765/admin.html
@@ -18,15 +31,18 @@ http://127.0.0.1:8765/admin.html
 
 The plaintext password is never written by the setup script.
 
-To run the administrator workspace without a login, set:
+For isolated local development only, open mode requires both explicit flags:
 
 ```env
+ADMIN_ENABLED=true
 ADMIN_LOGIN_REQUIRED=false
+ADMIN_ALLOW_OPEN_LOCAL=true
 ```
 
-Open mode skips authentication but keeps Token/date validation and permits only
-one queued or running refresh job at a time. Anyone who can reach
-`/admin.html` can request a data refresh while this mode is enabled.
+Open mode is rejected when the application is bound to `0.0.0.0`, `::`, a
+public address, or a hostname other than `localhost`. It skips authentication
+but keeps Token/date validation and permits only one queued or running refresh
+job at a time. Do not use it behind a reverse proxy.
 
 ## Refresh contract
 
@@ -59,10 +75,18 @@ continue using the previous complete file until replacement finishes.
   HttpOnly SameSite cookie.
 - Data-changing requests require a session-specific CSRF token.
 - Repeated login failures are rate limited.
-- Open mode is opt-in through `ADMIN_LOGIN_REQUIRED=false`.
+- The entire surface is opt-in through `ADMIN_ENABLED=true`; a valid generated
+  verifier is also required in login mode.
+- Open mode additionally requires `ADMIN_ALLOW_OPEN_LOCAL=true` and a loopback
+  application bind.
 - Pipeline commands use fixed argument arrays without a shell.
 - Production requires HTTPS and `ADMIN_COOKIE_SECURE=true`.
 - The data directory must be writable only by the deployment service account.
+
+The public Nginx example in `deploy/nginx/cex-dex-dashboard.conf.in` blocks the
+administrator surface. Operate it through an SSH tunnel, VPN-restricted
+hostname, or a separately reviewed proxy policy rather than exposing it on the
+public dashboard hostname.
 
 The administrator page does not make the collector capable of arbitrary
 historical backfills. Supporting an older `end_date` requires source-specific

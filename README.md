@@ -5,7 +5,8 @@
 The first product is a fact-only Market Monitor. A user selects a time window,
 a Token, one CEX pair, and one DEX pool, then compares source-backed market
 facts. A separate authenticated administrator page can refresh configured
-Tokens. This release does not include factors, future-return research, event
+Tokens when explicitly enabled; the entire administrator surface is absent by
+default. This release does not include factors, future-return research, event
 study, or public data-edit controls.
 
 ## Current requirements
@@ -13,12 +14,13 @@ study, or public data-edit controls.
 1. Show explicit CEX exchange/pair and DEX chain/protocol/pool identities.
 2. Put the global start and end date controls at the top of the page.
 3. Display price, selected-window return, daily realized volatility, USD
-   volume, DEX TVL snapshot, CEX and supported-pool DEX ±100 bps depth
+   volume, DEX TVL snapshot, CEX and supported-pool DEX 10/25/50/100 bps depth
    snapshots, and CEX-DEX price spread.
 4. Keep spread at Token comparison level, not duplicated as a CEX or DEX
    property.
-5. Sort descending by USD volume by default, with `综合`, `CEX`, and `DEX`
-   sorting scopes.
+5. Sort Tokens by aggregate volume across all cataloged markets, while keeping
+   the selected CEX pair and DEX pool facts explicit. Aggregate, CEX, and DEX
+   sorting scopes do not redefine the selected-market rows.
 6. Show data coverage, latest date, source file versions, missing values, and
    metric limitations.
 7. Preserve missing values as null. Never replace unavailable facts with zero.
@@ -68,8 +70,35 @@ Collection profiles, locks, manifests, freshness thresholds, systemd timers,
 and recovery behavior are documented in `docs/collection-operations.md`.
 
 Administrator setup is documented in `docs/admin-operations.md`. The page is
-served at `/admin.html`. It supports password authentication by default or an
-explicit no-login mode through `ADMIN_LOGIN_REQUIRED=false`.
+absent unless `ADMIN_ENABLED=true`. Login mode requires a generated password
+verifier. An unauthenticated mode exists only for explicit loopback development
+and requires both `ADMIN_LOGIN_REQUIRED=false` and
+`ADMIN_ALLOW_OPEN_LOCAL=true`; the server rejects that mode on non-loopback
+binds.
+
+Production must keep the Python process on loopback and expose the read-only
+dashboard through the Nginx HTTPS example. The systemd service, Nginx template,
+health check, rollback procedure, cache behavior, and CEX-depth raw retention
+timer are documented in `docs/production-hardening.md`. The deployable files
+are `deploy/systemd/cex-dex-dashboard.service.in`,
+`deploy/nginx/cex-dex-dashboard.conf.in`,
+`scripts/retain_cex_depth_raw.py`, and
+`deploy/systemd/cex-dex-cex-depth-retention.service.in` plus
+`deploy/systemd/cex-dex-cex-depth-retention.timer`.
+
+## Fact semantics
+
+- Token-level volume and DEX share are aggregate facts across all cataloged
+  markets in the selected window. The expanded CEX and DEX rows describe only
+  the selected pair and pool.
+- Window return is first-to-last observed close. Daily realized volatility uses
+  log returns only between adjacent UTC calendar days; intervals crossing a
+  missing day are excluded and reported as gaps.
+- TVL is a source-reported point-in-time pool snapshot. CEX order-book depth
+  and DEX pool-state depth are separately collected point-in-time snapshots.
+  None is historical daily liquidity, and TVL is never converted into depth.
+- Price spread and midpoint-relative bps compare the selected CEX pair and DEX
+  pool only when both have prices on the same UTC date.
 
 ## Future scope
 

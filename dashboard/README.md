@@ -26,8 +26,10 @@ npm --prefix dashboard install
 
 Open `http://127.0.0.1:8765`.
 
-Local startup binds to `127.0.0.1` by default. Set `HOST=0.0.0.0` only in a
-controlled deployment environment.
+Local startup binds to `127.0.0.1` by default. Keep the host process on
+loopback in production; the Nginx reverse proxy is the only public listener.
+The container image binds inside its own network namespace, so publish its
+host port to `127.0.0.1` only, as shown in `dashboard/PUBLIC_SHARING.md`.
 
 To keep the code and data in separate locations, set `MARKET_DATA_DIR`:
 
@@ -46,11 +48,15 @@ and a service-account-owned writable mount when it is enabled.
 
 ## Administrator page
 
-After configuring `.env` as described in `docs/admin-operations.md`, open
+The administrator page and every `/api/admin/*` route return 404 by default.
+After setting `ADMIN_ENABLED=true` and configuring login mode as described in
+`docs/admin-operations.md`, open
 `http://127.0.0.1:8765/admin.html`.
 
-Set `ADMIN_LOGIN_REQUIRED=false` only when the deployment should intentionally
-open the administrator workspace without a login.
+An open administrator workspace is limited to isolated local development. It
+requires `ADMIN_ENABLED=true`, `ADMIN_LOGIN_REQUIRED=false`, and
+`ADMIN_ALLOW_OPEN_LOCAL=true`; the server rejects it on a non-loopback bind.
+Do not use open mode behind a reverse proxy.
 
 With login enabled, the backend validates the session and CSRF token. In both
 modes it validates the configured Token and refresh window before starting a
@@ -60,14 +66,22 @@ CSVs and a validated SQLite database back into `data/local/`.
 ## Display contract
 
 - The global time window is the first control in the main content.
-- Tokens default to descending selected-market USD volume.
-- `综合`, `CEX`, and `DEX` change the sorting scope.
+- Tokens default to descending aggregate USD volume across all cataloged
+  markets. Aggregate, CEX, and DEX change the token-level sorting scope.
 - Each token can select one CEX pair and one DEX pool.
+- Token-level aggregate CEX/DEX volume and DEX share do not change when a
+  different pair or pool is selected. Expanded rows show selected-market facts.
 - Spread is calculated from those two selected prices and appears only on the
   token summary row.
+- Window return uses first-to-last observed close. Daily realized volatility
+  uses only adjacent UTC-day log returns; intervals across missing days are
+  excluded and reported in coverage metadata.
 - Missing values stay `N/A`; CEX-inapplicable TVL and row-level spread use `--`.
-- The shared depth column displays CEX order-book depth for CEX rows and
-  fixed-block pool-state depth for supported DEX rows, both within ±100 bps.
+- TVL is a source-reported point-in-time pool snapshot. It is neither a
+  historical daily series nor executable depth.
+- The shared depth column displays point-in-time CEX order-book depth for CEX
+  rows and fixed-block DEX pool-state depth for supported DEX rows at
+  10/25/50/100 bps. TVL is never converted into depth.
 - DEX protocols without an audited adapter display `N/A`, not a TVL-based
   estimate.
 - The comparison workbench selects one Token and any two cataloged markets,
@@ -86,3 +100,16 @@ cache key includes every published daily, TVL, CEX-depth, and DEX-depth source,
 so a changed snapshot invalidates both the assembled payload and compressed
 JSON response. Concurrent cold misses are single-flight to avoid duplicate
 catalog builds and gzip work.
+
+## Production boundary
+
+Run the application on loopback under
+`deploy/systemd/cex-dex-dashboard.service.in` and expose only the read-only
+dashboard through `deploy/nginx/cex-dex-dashboard.conf.in`. The proxy provides
+HTTPS, access logs, and rate limiting while blocking all administrator routes.
+See `docs/production-hardening.md` for installation, health checks, rollback,
+cache generations, and the dry-run-first CEX-depth raw-response retention
+script and systemd timer:
+`scripts/retain_cex_depth_raw.py` and
+`deploy/systemd/cex-dex-cex-depth-retention.service.in` plus
+`deploy/systemd/cex-dex-cex-depth-retention.timer`.

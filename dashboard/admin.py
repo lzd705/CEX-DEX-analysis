@@ -27,6 +27,32 @@ SESSION_SECONDS = 8 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_LOGIN_FAILURES = 5
 OPEN_ADMIN_USERNAME = "open-admin"
+TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def environment_flag(name: str, default: bool = False) -> bool:
+    """Read an explicit boolean flag without treating arbitrary text as truthy."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in TRUE_VALUES
+
+
+def password_hash_is_configured(encoded: str) -> bool:
+    """Reject empty, placeholder, malformed, or materially weakened verifiers."""
+    try:
+        algorithm, iterations_text, salt_text, digest_text = encoded.split("$", 3)
+        iterations = int(iterations_text)
+        salt = decode_part(salt_text)
+        digest = decode_part(digest_text)
+    except (ValueError, TypeError):
+        return False
+    return (
+        algorithm == PASSWORD_ALGORITHM
+        and iterations >= 100_000
+        and len(salt) >= 16
+        and len(digest) == hashlib.sha256().digest_size
+    )
 
 
 def encode_part(value: bytes) -> str:
@@ -79,9 +105,12 @@ class AdminService:
         password_hash: str | None = None,
         job_dir: Path | None = None,
         login_required: bool | None = None,
+        enabled: bool | None = None,
+        allow_open_local: bool | None = None,
     ) -> None:
         self.username = username if username is not None else os.environ.get("ADMIN_USERNAME", "admin")
         self.password_hash = password_hash if password_hash is not None else os.environ.get("ADMIN_PASSWORD_HASH", "")
+        self.enabled = environment_flag("ADMIN_ENABLED") if enabled is None else enabled
         if login_required is None:
             login_required = os.environ.get("ADMIN_LOGIN_REQUIRED", "true").lower() not in {
                 "0",
@@ -89,6 +118,11 @@ class AdminService:
                 "no",
             }
         self.login_required = login_required
+        self.allow_open_local = (
+            environment_flag("ADMIN_ALLOW_OPEN_LOCAL")
+            if allow_open_local is None
+            else allow_open_local
+        )
         configured_job_dir = os.environ.get("ADMIN_JOB_DIR")
         self.job_dir = job_dir or (Path(configured_job_dir).expanduser() if configured_job_dir else DEFAULT_JOB_DIR)
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -100,7 +134,21 @@ class AdminService:
 
     @property
     def configured(self) -> bool:
-        return not self.login_required or bool(self.username and self.password_hash)
+        if not self.enabled:
+            return False
+        if self.login_required:
+            return bool(self.username and password_hash_is_configured(self.password_hash))
+        return self.allow_open_local
+
+    @property
+    def open_mode(self) -> bool:
+        """Open mode is an explicit, local-development-only escape hatch."""
+        return self.configured and not self.login_required
+
+    @property
+    def available(self) -> bool:
+        """The HTTP surface stays absent until every required control is configured."""
+        return self.configured
 
     def _load_jobs(self) -> None:
         if not self.job_dir.exists():
@@ -124,6 +172,8 @@ class AdminService:
         return failures
 
     def login(self, client_ip: str, username: str, password: str) -> tuple[str, dict[str, Any]]:
+        if not self.enabled:
+            raise RuntimeError("Administrator surface is disabled")
         if not self.login_required:
             raise RuntimeError("Administrator login is disabled")
         if not self.configured:
@@ -169,10 +219,18 @@ class AdminService:
             self.sessions.pop(session_token, None)
 
     def public_session(self, session: dict[str, Any] | None) -> dict[str, Any]:
-        if not self.login_required:
+        if not self.available:
+            return {
+                "authenticated": False,
+                "configured": False,
+                "enabled": self.enabled,
+                "login_required": self.login_required,
+            }
+        if self.open_mode:
             return {
                 "authenticated": True,
                 "configured": True,
+                "enabled": True,
                 "login_required": False,
                 "username": OPEN_ADMIN_USERNAME,
                 "csrf_token": "",
@@ -182,11 +240,13 @@ class AdminService:
             return {
                 "authenticated": False,
                 "configured": self.configured,
+                "enabled": True,
                 "login_required": True,
             }
         return {
             "authenticated": True,
             "configured": self.configured,
+            "enabled": True,
             "login_required": True,
             "username": session["username"],
             "csrf_token": session["csrf_token"],

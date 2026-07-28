@@ -145,6 +145,16 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertNotIn("factor_results", payload)
         self.assertAlmostEqual(payload["tokens"][0]["price_spread"], 105 / 102 - 1)
         self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)
+        token = payload["tokens"][0]
+        self.assertEqual(token["aggregate_cex_volume_usd"], 2400)
+        self.assertEqual(token["aggregate_dex_volume_usd"], 700)
+        self.assertEqual(token["aggregate_volume_usd"], 3100)
+        self.assertEqual(token["selected_cex_volume_usd"], 2200)
+        self.assertEqual(token["selected_dex_volume_usd"], 700)
+        self.assertIsInstance(token["primary_cex_selection_reason"], dict)
+        self.assertIn("market_quality_thresholds", payload["metadata"])
+        self.assertEqual(payload["metadata"]["dex_market_series_rows"], 1)
+        self.assertEqual(payload["metadata"]["dex_unique_pool_count"], 1)
 
     def test_payload_reports_source_specific_ranges_and_freshness(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
@@ -234,9 +244,17 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "midpoint": "100.05",
                 "spread_quote": "0.1",
                 "spread_bps": "9.995002498750624",
+                "bid_depth_10bps_usd": "400",
+                "ask_depth_10bps_usd": "600",
                 "total_depth_10bps_usd": "1000",
+                "bid_depth_25bps_usd": "800",
+                "ask_depth_25bps_usd": "1200",
                 "total_depth_25bps_usd": "2000",
+                "bid_depth_50bps_usd": "1200",
+                "ask_depth_50bps_usd": "1800",
                 "total_depth_50bps_usd": "3000",
+                "bid_depth_100bps_usd": "1600",
+                "ask_depth_100bps_usd": "2400",
                 "total_depth_100bps_usd": "4000",
                 "depth_10bps_complete": "1",
                 "depth_25bps_complete": "1",
@@ -260,6 +278,8 @@ class MarketMonitorServerTest(unittest.TestCase):
 
         binance = next(row for row in payload["cex_markets"] if row["venue"] == "binance")
         self.assertEqual(binance["depth_status"], "partial")
+        self.assertEqual(binance["bid_depth_100bps_usd"], 1600)
+        self.assertEqual(binance["ask_depth_100bps_usd"], 2400)
         self.assertEqual(binance["total_depth_100bps_usd"], 4000)
         self.assertFalse(binance["depth_100bps_complete"])
         self.assertEqual(payload["metadata"]["cex_depth_snapshot"]["matched_market_rows"], 1)
@@ -269,6 +289,8 @@ class MarketMonitorServerTest(unittest.TestCase):
             if market["market_id"] == "cex:binance:BTC/USDT"
         )
         self.assertEqual(catalog_binance["total_depth_100bps_usd"], 4000)
+        self.assertEqual(catalog_binance["bid_depth_100bps_usd"], 1600)
+        self.assertEqual(catalog_binance["ask_depth_100bps_usd"], 2400)
         self.assertEqual(catalog_binance["depth_status"], "partial")
 
     def test_fixed_block_dex_depth_overlays_pool_without_using_tvl_proxy(self):
@@ -444,6 +466,42 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(primary_cex["observation_days"], 1)
         self.assertIsNone(primary_cex["window_return"])
 
+    def test_api_statistics_exclude_cross_gap_returns_and_report_coverage(self):
+        with self.cex_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(
+                [
+                    "2026-01-04",
+                    "BTC",
+                    "binance",
+                    "BTC/USDT",
+                    "",
+                    "",
+                    "",
+                    "108",
+                    "",
+                    "1400",
+                ]
+            )
+
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            payload = server.build_market_payload("2026-01-01", "2026-01-04")
+
+        binance = next(
+            row for row in payload["cex_markets"] if row["venue"] == "binance"
+        )
+        self.assertEqual(binance["observation_count"], 3)
+        self.assertEqual(binance["requested_window_days"], 4)
+        self.assertEqual(binance["coverage_ratio"], 0.75)
+        self.assertEqual(binance["return_interval_count"], 1)
+        self.assertEqual(binance["skipped_gap_interval_count"], 1)
+        self.assertEqual(binance["max_gap_days"], 1)
+        self.assertIsNone(binance["daily_volatility"])
+        self.assertEqual(
+            binance["daily_volatility_method"],
+            "adjacent_utc_daily_log_returns_only_v1",
+        )
+
     def test_invalid_date_window_is_rejected(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
             with self.assertRaises(ValueError):
@@ -575,6 +633,72 @@ class MarketMonitorServerTest(unittest.TestCase):
             "@license lucide v0.468.0",
             lucide_path.read_text(encoding="utf-8")[:200],
         )
+
+    def test_expert_dashboard_static_contract_prevents_stale_and_ambiguous_results(self):
+        index = (server.STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+        app_js = (server.STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('<html lang="en">', index)
+        self.assertIn('id="comparison-status"', index)
+        self.assertIn('role="alert"', index)
+        self.assertIn('aria-busy="true"', index)
+        self.assertIn("Midpoint-relative Spread (bps)", index)
+        self.assertIn("Selected DEX/CEX Spread", index)
+        self.assertIn('id="export-csv"', index)
+        self.assertNotIn("综合", index)
+
+        self.assertIn("new AbortController()", app_js)
+        self.assertIn("comparisonController.abort()", app_js)
+        self.assertIn("marketController.abort()", app_js)
+        comparison_loader = app_js[
+            app_js.index("async function loadComparison()"):
+            app_js.index("async function loadCatalog()")
+        ]
+        market_loader = app_js[
+            app_js.index("async function loadMarket("):
+            app_js.index("function setPreset(")
+        ]
+        self.assertLess(
+            comparison_loader.index("invalidateComparisonRequest()"),
+            comparison_loader.index("validateDateRange()"),
+        )
+        self.assertLess(
+            market_loader.index("invalidateMarketRequest()"),
+            market_loader.index("validateDateRange("),
+        )
+        self.assertIn("clearComparisonResult(", comparison_loader)
+        self.assertIn("clearMarketResult(", market_loader)
+        self.assertIn("marketA === marketB", comparison_loader)
+        self.assertIn('hideStatus(byId("market-status"))', app_js)
+        self.assertIn("app.payload = null;", app_js)
+        self.assertIn("No current market result.", app_js)
+        self.assertIn("validateDateRange()", app_js)
+        self.assertIn("selectionOverrides", app_js)
+        self.assertIn("user-selected (not current primary)", app_js)
+        self.assertIn("aggregate_cex_volume_usd", app_js)
+        self.assertIn("aggregate_dex_volume_share", app_js)
+        self.assertIn("Aggregate DEX", app_js)
+        self.assertIn("formatShare(aggregates.aggregateDexShare)", app_js)
+        self.assertIn("value !== 0 && Math.abs(value) < 1", app_js)
+        self.assertIn("quality_flags", app_js)
+        self.assertNotIn("Observed DEX ${formatPercent(observedShare)}", app_js)
+
+    def test_market_table_has_accessible_mobile_card_and_depth_contracts(self):
+        index = (server.STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+        app_js = (server.STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+        styles = (server.STATIC_ROOT / "styles.css").read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(index.count("<caption>"), 2)
+        self.assertIn('scope="col"', index)
+        self.assertIn('aria-label="Token and selected market facts"', index)
+        self.assertIn('aria-label="${escapeHtml(`${token} selected ${label} market`)}"', app_js)
+        for band in (10, 25, 50, 100):
+            self.assertIn(str(band), app_js)
+        self.assertIn('const sideA = market === "cex" ? "bid" : "buy";', app_js)
+        self.assertIn('const sideB = market === "cex" ? "ask" : "sell";', app_js)
+        self.assertIn("#market-table td::before", styles)
+        self.assertIn('content: attr(data-label)', styles)
+        self.assertIn("min-height: 44px", styles)
 
     def test_sqlite_runtime_matches_csv_facts(self):
         data_dir = self.cex_path.parent
