@@ -541,22 +541,28 @@ class MarketMonitorServerTest(unittest.TestCase):
             time.sleep(0.02)
             return payload
 
-        with (
-            patch.object(
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            with patch.object(
                 server,
                 "api_source_signature",
                 return_value=(("facts.sqlite3", 1, 100),),
-            ),
-            patch.object(server, "api_freshness_bucket", return_value=100),
-            patch.object(server, "build_market_catalog", side_effect=slow_catalog) as build_catalog,
-            ThreadPoolExecutor(max_workers=8) as executor,
-        ):
-            responses = list(
-                executor.map(
-                    lambda _: server.build_public_api_response("catalog", (), True),
-                    range(8),
-                )
-            )
+            ):
+                with patch.object(server, "api_freshness_bucket", return_value=100):
+                    with patch.object(
+                        server,
+                        "build_market_catalog",
+                        side_effect=slow_catalog,
+                    ) as build_catalog:
+                        responses = list(
+                            executor.map(
+                                lambda _: server.build_public_api_response(
+                                    "catalog",
+                                    (),
+                                    True,
+                                ),
+                                range(8),
+                            )
+                        )
 
         self.assertEqual(build_catalog.call_count, 1)
         self.assertTrue(all(response == responses[0] for response in responses))
