@@ -1006,6 +1006,29 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn("formatShare(aggregates.aggregateDexShare)", app_js)
         self.assertIn("value !== 0 && Math.abs(value) < 1", app_js)
         self.assertIn("quality_flags", app_js)
+        self.assertIn('id="facts-market-a-warning-trigger"', index)
+        self.assertIn('id="facts-market-b-warning-trigger"', index)
+        self.assertIn('aria-controls="facts-market-a-warning-tooltip"', index)
+        self.assertIn('aria-controls="facts-market-b-warning-tooltip"', index)
+        self.assertIn('aria-describedby="facts-market-a-warning-tooltip"', index)
+        self.assertIn('aria-describedby="facts-market-b-warning-tooltip"', index)
+        for slot in ("a", "b"):
+            trigger_start = index.index(f'id="facts-market-{slot}-warning-trigger"')
+            tooltip_start = index.index(f'id="facts-market-{slot}-warning-tooltip"')
+            trigger_markup = index[trigger_start:tooltip_start]
+            tooltip_markup = index[tooltip_start:tooltip_start + 220]
+            self.assertIn('data-lucide="info"', trigger_markup)
+            self.assertIn('role="tooltip"', tooltip_markup)
+        market_label = app_js[
+            app_js.index("function factsMarketLabel(market)"):
+            app_js.index("function factsMarketsForToken(token)")
+        ]
+        self.assertNotIn("quality_status", market_label)
+        self.assertIn("function factsMarketWarningFlags(market)", app_js)
+        self.assertIn("function bindFactsMarketWarningEvents()", app_js)
+        self.assertIn('event.key === "Escape"', app_js)
+        self.assertIn('document.addEventListener("pointerdown"', app_js)
+        self.assertIn('document.addEventListener("keydown"', app_js)
         self.assertNotIn("Observed DEX ${formatPercent(observedShare)}", app_js)
 
     def test_market_table_has_accessible_mobile_card_and_depth_contracts(self):
@@ -1153,6 +1176,306 @@ assert.equal(
   preferredCatalogMarket([flaggedDex, goodDex], "dex", null).market_id,
   goodDex.market_id,
 );
+
+const warningMarket = {
+  market_type: "dex",
+  market_id: "dex:test:warning:GOOD",
+  venue: "ethereum / test",
+  instrument: "GOOD / USD <pool>",
+  quality_status: "warning",
+  depth_status: "unsupported",
+  quality_flag_details: [
+    {
+      code: "depth_unsupported",
+      severity: "warning",
+      message: "Executable depth is unsupported for this market.",
+      observed_value: "unsupported",
+      threshold: null,
+    },
+    {
+      code: "tiny_pool",
+      severity: "warning",
+      message: "Pool TVL is below the quality threshold.",
+      observed_value: 5000,
+      threshold: 100000,
+    },
+  ],
+};
+const warningFlags = factsMarketWarningFlags(warningMarket);
+assert.equal(warningFlags.length, 2);
+assert.equal(warningFlags[1].observedValue, 5000);
+assert.equal(warningFlags[1].threshold, 100000);
+assert.match(qualityFlagMeasurement(warningFlags[1]), /Observed \$5,000 · minimum \$100,000/);
+const warningMarkup = factsMarketWarningMarkup(
+  "Market A",
+  warningMarket,
+  warningFlags,
+  "warning",
+);
+assert.match(warningMarkup, /Depth unsupported/);
+assert.match(warningMarkup, /Tiny pool/);
+assert.match(warningMarkup, /GOOD \/ USD &lt;pool&gt;/);
+assert.doesNotMatch(warningMarkup, /GOOD \/ USD <pool>/);
+
+const cleanMarket = {
+  market_type: "cex",
+  market_id: "cex:test:GOOD/USDT",
+  venue: "test",
+  instrument: "GOOD/USDT",
+  quality_status: "ok",
+  depth_status: "observed",
+};
+assert.deepEqual(factsMarketWarningFlags(cleanMarket), []);
+assert.deepEqual(factsMarketWarningFlags(null), []);
+
+const unexplainedWarning = {
+  ...cleanMarket,
+  market_id: "cex:test:warning:GOOD/USDT",
+  quality_status: "warning",
+};
+const fallbackFlags = factsMarketWarningFlags(unexplainedWarning);
+assert.equal(fallbackFlags.length, 1);
+assert.equal(fallbackFlags[0].code, "catalog_quality_status");
+assert.match(fallbackFlags[0].explanation, /did not supply a structured reason/);
+
+const unexplainedInfo = {
+  ...cleanMarket,
+  market_id: "cex:test:info:GOOD/USDT",
+  quality_status: "info",
+};
+const fallbackInfoFlags = factsMarketWarningFlags(unexplainedInfo);
+assert.equal(fallbackInfoFlags.length, 1);
+assert.equal(fallbackInfoFlags[0].severity, "info");
+
+const zeroDepthMarket = {
+  ...cleanMarket,
+  total_depth_10bps_usd: 0,
+  quality_status: "warning",
+  quality_flags: ["zero_depth_10bps"],
+  quality_flag_details: [{
+    code: "zero_depth_10bps",
+    severity: "warning",
+    message: "No executable notional was observed inside the ±10 bps band.",
+    observed_value: 0,
+    threshold: { band_bps: 10, quoted_spread_bps: 25 },
+  }],
+};
+const zeroDepthFlags = factsMarketWarningFlags(zeroDepthMarket);
+assert.equal(
+  zeroDepthFlags.filter((flag) => flag.code === "zero_depth_10bps").length,
+  1,
+);
+assert.equal(zeroDepthFlags.length, 1);
+
+const notCatalogedMarket = {
+  ...cleanMarket,
+  depth_status: "not_cataloged_in_snapshot",
+  quality_status: "info",
+  quality_flags: ["depth_unavailable"],
+  quality_flag_details: [{
+    code: "depth_unavailable",
+    severity: "info",
+    message: "No executable-depth observation is available.",
+    observed_value: "not_cataloged_in_snapshot",
+    threshold: null,
+  }],
+};
+const notCatalogedFlags = factsMarketWarningFlags(notCatalogedMarket);
+assert.equal(notCatalogedFlags.length, 1);
+assert.equal(notCatalogedFlags[0].code, "depth_unavailable");
+assert.equal(notCatalogedFlags[0].severity, "info");
+
+const mixedCodesOnly = {
+  market_type: "dex",
+  market_id: "dex:test:mixed:GOOD",
+  venue: "ethereum / test",
+  instrument: "GOOD / USD",
+  quality_status: "critical",
+  depth_status: "unsupported_protocol",
+  tvl_usd: 5000,
+  price_difference_bps: 750,
+  quality_flags: [
+    "depth_unsupported",
+    "tiny_pool",
+    "off_market_pool_state_price",
+  ],
+};
+const mixedCodeFlags = factsMarketWarningFlags(mixedCodesOnly);
+assert.deepEqual(
+  Object.fromEntries(mixedCodeFlags.map((flag) => [flag.code, flag.severity])),
+  {
+    depth_unsupported: "warning",
+    tiny_pool: "warning",
+    off_market_pool_state_price: "critical",
+  },
+);
+assert.equal(factsMarketWarningSeverity(mixedCodesOnly, mixedCodeFlags), "critical");
+
+assert.equal(
+  qualityFlagMeasurement({
+    code: "zero_depth_10bps",
+    observedValue: 0,
+    threshold: { band_bps: 10, quoted_spread_bps: 25 },
+  }),
+  "Observed $0 in the ±10 bps band · quoted spread 25 bps",
+);
+assert.equal(
+  qualityFlagMeasurement({
+    code: "tiny_pool",
+    observedValue: 99999.99,
+    threshold: 100000,
+  }),
+  "Observed $99,999.99 · minimum $100,000",
+);
+assert.equal(
+  qualityFlagMeasurement({
+    code: "low_daily_coverage",
+    observedValue: 0.79999,
+    threshold: 0.8,
+  }),
+  "Observed 79.999% · minimum 80%",
+);
+assert.equal(
+  qualityFlagMeasurement({
+    code: "wide_quoted_spread",
+    observedValue: 100.0001,
+    threshold: 100,
+  }),
+  "Observed 100.0001 bps · maximum 100 bps",
+);
+assert.equal(
+  qualityFlagMeasurement({
+    code: "off_market_pool_state_price",
+    observedValue: -500.0001,
+    threshold: 500,
+  }),
+  "Observed -500.0001 bps · threshold 500 bps",
+);
+
+function fakeClassList() {
+  const values = new Set();
+  return {
+    add: (...items) => items.forEach((item) => values.add(item)),
+    remove: (...items) => items.forEach((item) => values.delete(item)),
+    contains: (item) => values.has(item),
+  };
+}
+
+function fakeElement(parentElement = null) {
+  const listeners = {};
+  const attributes = {};
+  return {
+    parentElement,
+    listeners,
+    attributes,
+    classList: fakeClassList(),
+    dataset: {},
+    hidden: false,
+    innerHTML: "",
+    textContent: "",
+    addEventListener: (type, callback) => {
+      listeners[type] = callback;
+    },
+    contains: (candidate) => candidate === null ? false : candidate === this,
+    getAttribute: (name) => attributes[name] ?? null,
+    removeAttribute: (name) => {
+      delete attributes[name];
+    },
+    setAttribute: (name, value) => {
+      attributes[name] = String(value);
+    },
+  };
+}
+
+const warningDom = {};
+for (const slot of ["a", "b"]) {
+  const shell = fakeElement();
+  const anchor = fakeElement(shell);
+  const trigger = fakeElement(anchor);
+  const tooltip = fakeElement(anchor);
+  const status = fakeElement(anchor);
+  anchor.hidden = true;
+  trigger.hidden = true;
+  anchor.contains = (candidate) => (
+    candidate === anchor
+    || candidate === trigger
+    || candidate === tooltip
+    || candidate === status
+  );
+  warningDom[`facts-market-${slot}-warning`] = anchor;
+  warningDom[`facts-market-${slot}-warning-trigger`] = trigger;
+  warningDom[`facts-market-${slot}-warning-tooltip`] = tooltip;
+  warningDom[`facts-market-${slot}-warning-status`] = status;
+}
+const documentListeners = {};
+global.document = {
+  activeElement: null,
+  addEventListener: (type, callback) => {
+    documentListeners[type] = callback;
+  },
+  getElementById: (id) => warningDom[id] || null,
+};
+
+renderFactsMarketWarning("a", warningMarket);
+renderFactsMarketWarning("b", warningMarket);
+assert.equal(warningDom["facts-market-a-warning"].hidden, false);
+assert.equal(
+  warningDom["facts-market-a-warning"].parentElement.classList.contains("has-market-warning"),
+  true,
+);
+bindFactsMarketWarningEvents();
+
+const anchorA = warningDom["facts-market-a-warning"];
+const triggerA = warningDom["facts-market-a-warning-trigger"];
+const tooltipA = warningDom["facts-market-a-warning-tooltip"];
+const anchorB = warningDom["facts-market-b-warning"];
+const triggerB = warningDom["facts-market-b-warning-trigger"];
+const tooltipB = warningDom["facts-market-b-warning-tooltip"];
+
+anchorA.listeners.pointerenter();
+assert.equal(tooltipA.hidden, false);
+anchorA.listeners.pointerleave();
+assert.equal(tooltipA.hidden, true);
+
+global.document.activeElement = triggerA;
+anchorA.listeners.focusin();
+anchorA.listeners.pointerleave();
+assert.equal(tooltipA.hidden, false);
+global.document.activeElement = null;
+anchorA.listeners.focusout({ relatedTarget: null });
+assert.equal(tooltipA.hidden, true);
+
+global.document.activeElement = triggerA;
+triggerA.listeners.click({ stopPropagation: () => {} });
+assert.equal(anchorA.dataset.pinned, "true");
+assert.equal(tooltipA.hidden, false);
+anchorB.listeners.pointerenter();
+assert.equal(tooltipA.hidden, false);
+assert.equal(tooltipB.hidden, true);
+
+documentListeners.pointerdown({ target: { closest: () => null } });
+assert.equal(tooltipA.hidden, true);
+assert.equal(anchorA.dataset.pinned, "false");
+
+global.document.activeElement = null;
+anchorB.listeners.pointerenter();
+assert.equal(tooltipB.hidden, false);
+documentListeners.keydown({ key: "Escape" });
+assert.equal(tooltipB.hidden, true);
+
+global.document.activeElement = triggerB;
+triggerB.listeners.click({ stopPropagation: () => {} });
+assert.equal(tooltipA.hidden, true);
+assert.equal(tooltipB.hidden, false);
+
+renderFactsMarketWarning("a", cleanMarket);
+assert.equal(anchorA.hidden, true);
+assert.equal(anchorA.parentElement.classList.contains("has-market-warning"), false);
+renderFactsMarketWarning("b", null);
+assert.equal(anchorB.hidden, true);
+
+delete global.document;
+
 const badOnlyCex = depthFixture();
 badOnlyCex.token_symbol = "BAD";
 assert.equal(

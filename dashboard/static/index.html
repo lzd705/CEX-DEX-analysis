@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260728-depth-curve-v1">
+    <link rel="stylesheet" href="/styles.css?v=20260728-warning-tooltip-v1">
   </head>
   <body>
     <header class="app-header">
@@ -78,18 +78,80 @@
         </div>
 
         <div class="facts-controls">
-          <label>
-            <span>Token</span>
+          <div class="facts-control">
+            <label for="facts-token">Token</label>
             <select id="facts-token" aria-label="Comparison token"></select>
-          </label>
-          <label>
-            <span>Market A</span>
-            <select id="facts-market-a" aria-label="Market A" aria-describedby="selector-policy"></select>
-          </label>
-          <label>
-            <span>Market B</span>
-            <select id="facts-market-b" aria-label="Market B" aria-describedby="selector-policy"></select>
-          </label>
+          </div>
+          <div class="facts-control">
+            <label for="facts-market-a">Market A</label>
+            <div class="market-selector-shell">
+              <select
+                id="facts-market-a"
+                aria-label="Market A"
+                aria-describedby="selector-policy facts-market-a-warning-status"
+              ></select>
+              <div id="facts-market-a-warning" class="market-warning-anchor" hidden>
+                <button
+                  id="facts-market-a-warning-trigger"
+                  class="market-warning-trigger"
+                  type="button"
+                  aria-label="Market A quality alert details"
+                  aria-controls="facts-market-a-warning-tooltip"
+                  aria-describedby="facts-market-a-warning-tooltip"
+                  aria-expanded="false"
+                  hidden
+                >
+                  <i data-lucide="info"></i>
+                </button>
+                <div
+                  id="facts-market-a-warning-tooltip"
+                  class="market-warning-tooltip"
+                  role="tooltip"
+                  hidden
+                ></div>
+                <span
+                  id="facts-market-a-warning-status"
+                  class="sr-only"
+                  aria-live="polite"
+                ></span>
+              </div>
+            </div>
+          </div>
+          <div class="facts-control">
+            <label for="facts-market-b">Market B</label>
+            <div class="market-selector-shell">
+              <select
+                id="facts-market-b"
+                aria-label="Market B"
+                aria-describedby="selector-policy facts-market-b-warning-status"
+              ></select>
+              <div id="facts-market-b-warning" class="market-warning-anchor" hidden>
+                <button
+                  id="facts-market-b-warning-trigger"
+                  class="market-warning-trigger"
+                  type="button"
+                  aria-label="Market B quality alert details"
+                  aria-controls="facts-market-b-warning-tooltip"
+                  aria-describedby="facts-market-b-warning-tooltip"
+                  aria-expanded="false"
+                  hidden
+                >
+                  <i data-lucide="info"></i>
+                </button>
+                <div
+                  id="facts-market-b-warning-tooltip"
+                  class="market-warning-tooltip"
+                  role="tooltip"
+                  hidden
+                ></div>
+                <span
+                  id="facts-market-b-warning-status"
+                  class="sr-only"
+                  aria-live="polite"
+                ></span>
+              </div>
+            </div>
+          </div>
           <button id="compare-markets" class="compare-command" type="button">
             Compare
           </button>
@@ -353,6 +415,6 @@
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/app.js?v=20260728-depth-curve-v1"></script>
+    <script src="/app.js?v=20260728-warning-tooltip-v1"></script>
   </body>
 </html>

@@ -49,6 +49,25 @@ const QUALITY_FLAG_LABELS = {
   low_daily_coverage: "Low daily coverage",
   stale_snapshot: "Stale snapshot",
 };
+const QUALITY_FLAG_DEFAULT_SEVERITIES = {
+  depth_unavailable: "info",
+  depth_unsupported: "warning",
+  unsupported_depth: "warning",
+  depth_partial: "warning",
+  partial_depth: "warning",
+  depth_failed: "critical",
+  failed_depth: "critical",
+  depth_not_cataloged: "info",
+  zero_depth_10bps: "warning",
+  zero_depth_inside_spread: "warning",
+  tiny_pool: "warning",
+  off_market_pool_state_price: "warning",
+  off_market_price: "warning",
+  wide_quoted_spread: "warning",
+  low_daily_coverage: "warning",
+  stale_snapshot: "warning",
+};
+const QUALITY_SEVERITY_RANK = { info: 1, warning: 2, critical: 3 };
 
 const byId = (id) => document.getElementById(id);
 const compactCurrency = new Intl.NumberFormat("en-US", {
@@ -119,6 +138,19 @@ function formatRatio(value) {
   return finite(value)
     ? new Intl.NumberFormat("en-US", { style: "percent", maximumFractionDigits: 1 }).format(value)
     : "N/A";
+}
+
+function formatQualityRatio(value) {
+  return finite(value)
+    ? new Intl.NumberFormat("en-US", {
+        style: "percent",
+        maximumFractionDigits: 4,
+      }).format(value)
+    : "N/A";
+}
+
+function formatQualityUsd(value) {
+  return finite(value) ? `$${rawUsd.format(value)}` : "N/A";
 }
 
 function formatRawUsd(value) {
@@ -301,51 +333,138 @@ function metricClass(value) {
 }
 
 function qualityFlagObjects(row, market) {
+  if (!row) return [];
   const suppliedDetails = Array.isArray(row?.quality_flag_details)
     ? row.quality_flag_details.map((flag) => ({
         code: flag.code,
         severity: flag.severity || "warning",
         explanation: flag.explanation || flag.message || "",
+        observedValue: flag.observed_value ?? flag.observedValue ?? null,
+        threshold: flag.threshold ?? null,
       }))
     : [];
   const suppliedCodes = Array.isArray(row?.quality_flags)
     ? row.quality_flags.map((flag) => (
         typeof flag === "string"
-          ? { code: flag, severity: "warning", explanation: "" }
+          ? {
+              code: flag,
+              severity: QUALITY_FLAG_DEFAULT_SEVERITIES[flag] || "warning",
+              explanation: "",
+              observedValue: null,
+              threshold: null,
+            }
           : {
               code: flag.code,
               severity: flag.severity || "warning",
               explanation: flag.explanation || flag.message || "",
+              observedValue: flag.observed_value ?? flag.observedValue ?? null,
+              threshold: flag.threshold ?? null,
             }
       ))
     : [];
   const flags = [...suppliedDetails, ...suppliedCodes];
-  const add = (code, severity, explanation) => {
-    if (!flags.some((flag) => flag.code === code)) flags.push({ code, severity, explanation });
+  const add = (
+    code,
+    severity,
+    explanation,
+    observedValue = null,
+    threshold = null,
+  ) => {
+    const existing = flags.find((flag) => flag.code === code);
+    if (!existing) {
+      flags.push({
+        code,
+        severity,
+        explanation,
+        observedValue,
+        threshold,
+      });
+      return;
+    }
+    if (!existing.explanation && explanation) existing.explanation = explanation;
+    if (
+      (QUALITY_SEVERITY_RANK[severity] || 0)
+      > (QUALITY_SEVERITY_RANK[existing.severity] || 0)
+    ) {
+      existing.severity = severity;
+    }
+    if (existing.observedValue === null && observedValue !== null) {
+      existing.observedValue = observedValue;
+    }
+    if (existing.threshold === null && threshold !== null) existing.threshold = threshold;
   };
-  const status = market === "cex" ? row?.depth_status : row?.dex_depth_status;
-  if (status === "unsupported") add("depth_unsupported", "warning", row?.dex_depth_error || "");
-  if (status === "partial") add("depth_partial", "warning", "Returned levels are a lower bound.");
-  if (status === "failed") add("depth_failed", "critical", "Depth collection failed.");
-  if (status === "not_cataloged_in_snapshot") {
-    add("depth_not_cataloged", "warning", "Market was not present in the latest depth snapshot.");
+  const status = market === "cex"
+    ? row?.depth_status
+    : row?.dex_depth_status ?? row?.depth_status;
+  const normalizedStatus = String(status || "").toLowerCase();
+  if (["unsupported", "unsupported_protocol", "unsupported_chain"].includes(normalizedStatus)) {
+    add(
+      "depth_unsupported",
+      "warning",
+      row?.dex_depth_error || "Executable depth is unsupported for this market.",
+      status,
+    );
+  }
+  if (normalizedStatus === "partial") {
+    add(
+      "depth_partial",
+      "warning",
+      "Returned levels are a lower bound.",
+      status,
+    );
+  }
+  if (["failed", "error"].includes(normalizedStatus)) {
+    add("depth_failed", "critical", "Depth collection failed.", status);
+  }
+  const knownDepthStatuses = new Set([
+    "observed",
+    "complete",
+    "partial",
+    "unsupported",
+    "unsupported_protocol",
+    "unsupported_chain",
+    "failed",
+    "error",
+  ]);
+  if (!knownDepthStatuses.has(normalizedStatus)) {
+    add(
+      "depth_unavailable",
+      "info",
+      normalizedStatus === "not_cataloged_in_snapshot"
+        ? "Market was not present in the latest depth snapshot."
+        : "No executable-depth observation is available.",
+      status,
+    );
   }
   if (
-    status === "observed"
+    ["observed", "partial", "complete"].includes(normalizedStatus)
     && row?.total_depth_10bps_usd === 0
   ) {
     add(
-      "zero_depth_inside_spread",
+      "zero_depth_10bps",
       "warning",
       "The ±10 bps band may lie inside the quoted spread.",
+      0,
+      {
+        band_bps: 10,
+        quoted_spread_bps: row?.spread_bps ?? row?.quoted_spread_bps ?? null,
+      },
     );
   }
-  const thresholds = app.payload?.metadata?.market_quality_thresholds
+  const thresholds = app.catalog?.metadata?.market_quality_thresholds
+    || app.catalog?.metadata?.quality_thresholds
+    || app.payload?.metadata?.market_quality_thresholds
     || app.payload?.metadata?.quality_thresholds
     || {};
   const tinyPoolThreshold = thresholds.tiny_pool_tvl_usd ?? 100_000;
   if (market === "dex" && finite(row?.tvl_usd) && row.tvl_usd < tinyPoolThreshold) {
-    add("tiny_pool", "warning", `TVL is below ${formatCurrency(tinyPoolThreshold)}.`);
+    add(
+      "tiny_pool",
+      "warning",
+      `TVL is below ${formatCurrency(tinyPoolThreshold)}.`,
+      row.tvl_usd,
+      tinyPoolThreshold,
+    );
   }
   const deviationThreshold = thresholds.off_market_price_deviation_bps ?? 100;
   const criticalDeviationThreshold = thresholds.critical_off_market_price_deviation_bps ?? 500;
@@ -358,30 +477,105 @@ function qualityFlagObjects(row, market) {
       "off_market_pool_state_price",
       Math.abs(row.price_difference_bps) > criticalDeviationThreshold ? "critical" : "warning",
       `Pool-state/source deviation is ${bpsFormat.format(row.price_difference_bps)} bps.`,
+      row.price_difference_bps,
+      Math.abs(row.price_difference_bps) > criticalDeviationThreshold
+        ? criticalDeviationThreshold
+        : deviationThreshold,
     );
   }
   const wideSpreadThreshold = thresholds.wide_cex_quoted_spread_bps ?? 100;
+  const quotedSpreadBps = row?.spread_bps ?? row?.quoted_spread_bps;
   if (
     market === "cex"
-    && finite(row?.spread_bps)
-    && row.spread_bps > wideSpreadThreshold
+    && finite(quotedSpreadBps)
+    && quotedSpreadBps > wideSpreadThreshold
   ) {
-    add("wide_quoted_spread", "warning", `Quoted spread is ${bpsFormat.format(row.spread_bps)} bps.`);
+    add(
+      "wide_quoted_spread",
+      "warning",
+      `Quoted spread is ${bpsFormat.format(quotedSpreadBps)} bps.`,
+      quotedSpreadBps,
+      wideSpreadThreshold,
+    );
   }
-  if (finite(row?.coverage_ratio) && row.coverage_ratio < 0.8) {
-    add("low_daily_coverage", "warning", `Daily coverage is ${formatRatio(row.coverage_ratio)}.`);
+  const coverageThreshold = thresholds.minimum_primary_coverage_ratio ?? 0.8;
+  if (finite(row?.coverage_ratio) && row.coverage_ratio < coverageThreshold) {
+    add(
+      "low_daily_coverage",
+      "warning",
+      `Daily coverage is ${formatRatio(row.coverage_ratio)}.`,
+      row.coverage_ratio,
+      coverageThreshold,
+    );
   }
   return flags.filter(
     (flag, index, values) => values.findIndex((candidate) => candidate.code === flag.code) === index,
   );
 }
 
+function qualityFlagLabel(flag) {
+  return QUALITY_FLAG_LABELS[flag.code]
+    || flag.code.replaceAll("_", " ").replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function qualityFlagMeasurement(flag) {
+  const observed = flag.observedValue;
+  const threshold = flag.threshold;
+  if (flag.code === "low_daily_coverage") {
+    const values = [
+      finite(observed) ? `Observed ${formatQualityRatio(observed)}` : "",
+      finite(threshold) ? `minimum ${formatQualityRatio(threshold)}` : "",
+    ].filter(Boolean);
+    return values.join(" · ");
+  }
+  if (flag.code === "tiny_pool") {
+    const values = [
+      finite(observed) ? `Observed ${formatQualityUsd(observed)}` : "",
+      finite(threshold) ? `minimum ${formatQualityUsd(threshold)}` : "",
+    ].filter(Boolean);
+    return values.join(" · ");
+  }
+  if (flag.code === "off_market_pool_state_price") {
+    const values = [
+      finite(observed) ? `Observed ${rawUsd.format(observed)} bps` : "",
+      finite(threshold) ? `threshold ${rawUsd.format(threshold)} bps` : "",
+    ].filter(Boolean);
+    return values.join(" · ");
+  }
+  if (flag.code === "wide_quoted_spread") {
+    const values = [
+      finite(observed) ? `Observed ${rawUsd.format(observed)} bps` : "",
+      finite(threshold) ? `maximum ${rawUsd.format(threshold)} bps` : "",
+    ].filter(Boolean);
+    return values.join(" · ");
+  }
+  if (
+    flag.code === "zero_depth_10bps"
+    || flag.code === "zero_depth_inside_spread"
+  ) {
+    const band = finite(threshold?.band_bps) ? `±${threshold.band_bps} bps band` : "inner band";
+    const spread = finite(threshold?.quoted_spread_bps)
+      ? ` · quoted spread ${rawUsd.format(threshold.quoted_spread_bps)} bps`
+      : "";
+    return finite(observed)
+      ? `Observed ${formatQualityUsd(observed)} in the ${band}${spread}`
+      : "";
+  }
+  if (typeof observed === "string" && observed) return `Observed status: ${observed}`;
+  if (finite(observed) || finite(threshold)) {
+    return [
+      finite(observed) ? `Observed ${rawUsd.format(observed)}` : "",
+      finite(threshold) ? `threshold ${rawUsd.format(threshold)}` : "",
+    ].filter(Boolean).join(" · ");
+  }
+  return "";
+}
+
 function renderQualityBadges(flags) {
   if (!flags.length) return '<span class="quality-flag good">No quality flags</span>';
   return flags.map((flag) => {
     const severityClass = flag.severity === "critical" ? "danger" : "warn";
-    const label = QUALITY_FLAG_LABELS[flag.code]
-      || flag.code.replaceAll("_", " ").replace(/\b\w/g, (character) => character.toUpperCase());
+    const label = qualityFlagLabel(flag);
     return `<span class="quality-flag ${severityClass}" title="${escapeHtml(flag.explanation)}">`
       + `${escapeHtml(label)}</span>`;
   }).join("");
@@ -681,10 +875,7 @@ function updateMetadata() {
 
 function factsMarketLabel(market) {
   const type = market.market_type.toUpperCase();
-  const quality = market.quality_status && market.quality_status !== "ok"
-    ? ` · ${market.quality_status}`
-    : "";
-  return `${type} · ${market.venue} · ${market.instrument}${quality}`;
+  return `${type} · ${market.venue} · ${market.instrument}`;
 }
 
 function factsMarketsForToken(token) {
@@ -696,6 +887,162 @@ function factsOptions(markets, selectedId) {
     `<option value="${escapeHtml(market.market_id)}" ${market.market_id === selectedId ? "selected" : ""}>`
       + `${escapeHtml(factsMarketLabel(market))}</option>`
   )).join("");
+}
+
+function factsMarketWarningFlags(market) {
+  if (!market) return [];
+  const flags = qualityFlagObjects(market, market?.market_type);
+  if (flags.length || !market?.quality_status || market.quality_status === "ok") return flags;
+  return [{
+    code: "catalog_quality_status",
+    severity: ["info", "warning", "critical"].includes(market.quality_status)
+      ? market.quality_status
+      : "warning",
+    explanation: (
+      `The catalog reported a ${market.quality_status} quality status `
+      + "but did not supply a structured reason."
+    ),
+    observedValue: market.quality_status,
+    threshold: null,
+  }];
+}
+
+function factsMarketWarningSeverity(market, flags) {
+  if (market?.quality_status === "critical" || flags.some((flag) => flag.severity === "critical")) {
+    return "critical";
+  }
+  if (market?.quality_status === "warning" || flags.some((flag) => flag.severity === "warning")) {
+    return "warning";
+  }
+  return "info";
+}
+
+function factsMarketWarningMarkup(slotLabel, market, flags, severity) {
+  const alertLabel = flags.length === 1 ? "quality alert" : "quality alerts";
+  const items = flags.map((flag) => {
+    const measurement = qualityFlagMeasurement(flag);
+    const explanation = flag.explanation || "No additional explanation was supplied.";
+    return `<li class="market-warning-item" data-severity="${escapeHtml(flag.severity)}">
+      <div class="market-warning-item-heading">
+        <strong>${escapeHtml(qualityFlagLabel(flag))}</strong>
+        <span>${escapeHtml(flag.severity)}</span>
+      </div>
+      <p>${escapeHtml(explanation)}</p>
+      ${measurement ? `<small>${escapeHtml(measurement)}</small>` : ""}
+    </li>`;
+  }).join("");
+  return `
+    <div class="market-warning-tooltip-heading">
+      <strong>${escapeHtml(slotLabel)} · ${escapeHtml(severity)}</strong>
+      <span>${flags.length} ${alertLabel}</span>
+    </div>
+    <div class="market-warning-market">${escapeHtml(factsMarketLabel(market))}</div>
+    <ul>${items}</ul>
+  `;
+}
+
+function hideFactsMarketWarning(slot, { force = false } = {}) {
+  const anchor = byId(`facts-market-${slot}-warning`);
+  const trigger = byId(`facts-market-${slot}-warning-trigger`);
+  const tooltip = byId(`facts-market-${slot}-warning-tooltip`);
+  if (!anchor || !trigger || !tooltip) return;
+  if (!force && anchor.dataset.pinned === "true") return;
+  anchor.dataset.pinned = "false";
+  tooltip.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+}
+
+function showFactsMarketWarning(slot) {
+  const trigger = byId(`facts-market-${slot}-warning-trigger`);
+  const tooltip = byId(`facts-market-${slot}-warning-tooltip`);
+  if (!trigger || trigger.hidden || !tooltip) return;
+  const protectedOtherWarning = ["a", "b"].some((otherSlot) => {
+    if (otherSlot === slot) return false;
+    const otherAnchor = byId(`facts-market-${otherSlot}-warning`);
+    return (
+      otherAnchor?.dataset.pinned === "true"
+      || otherAnchor?.contains(document.activeElement)
+    );
+  });
+  if (protectedOtherWarning) return;
+  closeFactsMarketWarnings(slot);
+  tooltip.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+}
+
+function closeFactsMarketWarnings(exceptSlot = null) {
+  ["a", "b"].forEach((slot) => {
+    if (slot !== exceptSlot) hideFactsMarketWarning(slot, { force: true });
+  });
+}
+
+function renderFactsMarketWarning(slot, market) {
+  const slotLabel = `Market ${slot.toUpperCase()}`;
+  const anchor = byId(`facts-market-${slot}-warning`);
+  const trigger = byId(`facts-market-${slot}-warning-trigger`);
+  const tooltip = byId(`facts-market-${slot}-warning-tooltip`);
+  const status = byId(`facts-market-${slot}-warning-status`);
+  const shell = anchor.parentElement;
+  const flags = factsMarketWarningFlags(market);
+  hideFactsMarketWarning(slot, { force: true });
+  if (!flags.length) {
+    anchor.hidden = true;
+    shell.classList.remove("has-market-warning");
+    trigger.hidden = true;
+    anchor.removeAttribute("data-severity");
+    tooltip.textContent = "";
+    status.textContent = `${slotLabel} has no quality alerts.`;
+    return;
+  }
+  const severity = factsMarketWarningSeverity(market, flags);
+  const alertLabel = flags.length === 1 ? "quality alert" : "quality alerts";
+  anchor.hidden = false;
+  shell.classList.add("has-market-warning");
+  anchor.dataset.severity = severity;
+  trigger.hidden = false;
+  trigger.setAttribute(
+    "aria-label",
+    `${slotLabel} ${severity} details: ${flags.length} ${alertLabel}`,
+  );
+  tooltip.innerHTML = factsMarketWarningMarkup(slotLabel, market, flags, severity);
+  status.textContent = `${slotLabel} has ${flags.length} ${alertLabel}. Use the information button for details.`;
+}
+
+function renderFactsMarketWarnings() {
+  const { marketA, marketB } = selectedLiquidityMarkets();
+  renderFactsMarketWarning("a", marketA);
+  renderFactsMarketWarning("b", marketB);
+}
+
+function bindFactsMarketWarningEvents() {
+  ["a", "b"].forEach((slot) => {
+    const anchor = byId(`facts-market-${slot}-warning`);
+    const trigger = byId(`facts-market-${slot}-warning-trigger`);
+    anchor.addEventListener("pointerenter", () => showFactsMarketWarning(slot));
+    anchor.addEventListener("pointerleave", () => {
+      if (!anchor.contains(document.activeElement)) hideFactsMarketWarning(slot);
+    });
+    anchor.addEventListener("focusin", () => showFactsMarketWarning(slot));
+    anchor.addEventListener("focusout", (event) => {
+      if (!anchor.contains(event.relatedTarget)) {
+        hideFactsMarketWarning(slot, { force: true });
+      }
+    });
+    trigger.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const shouldPin = anchor.dataset.pinned !== "true";
+      closeFactsMarketWarnings(slot);
+      anchor.dataset.pinned = String(shouldPin);
+      if (shouldPin) showFactsMarketWarning(slot);
+      else hideFactsMarketWarning(slot, { force: true });
+    });
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest?.(".market-warning-anchor")) closeFactsMarketWarnings();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeFactsMarketWarnings();
+  });
 }
 
 function catalogMarketMatchesPrimary(market, tokenSummary) {
@@ -1458,6 +1805,7 @@ function populateFactsMarkets({ preserve = false } = {}) {
   }
   byId("facts-market-a").innerHTML = factsOptions(markets, marketA?.market_id);
   byId("facts-market-b").innerHTML = factsOptions(markets, marketB?.market_id);
+  renderFactsMarketWarnings();
   renderLiquidityCurve();
 }
 
@@ -1957,6 +2305,7 @@ function bindEvents() {
         .filter((market) => market.market_id !== byId("facts-market-a").value);
       if (alternatives.length) byId("facts-market-b").value = alternatives[0].market_id;
     }
+    renderFactsMarketWarnings();
     renderLiquidityCurve();
     loadComparison();
   });
@@ -1966,6 +2315,7 @@ function bindEvents() {
         .filter((market) => market.market_id !== byId("facts-market-b").value);
       if (alternatives.length) byId("facts-market-a").value = alternatives[0].market_id;
     }
+    renderFactsMarketWarnings();
     renderLiquidityCurve();
     loadComparison();
   });
@@ -1992,6 +2342,7 @@ function bindEvents() {
     });
   });
   bindLiquidityTooltipEvents();
+  bindFactsMarketWarningEvents();
   const scheduleLiquidityResize = () => {
     if (app.liquidityResizeScheduled) return;
     app.liquidityResizeScheduled = true;

@@ -196,7 +196,8 @@ main { min-width: 0; padding: 14px 18px 30px; }
   align-items: end;
   margin-top: 16px;
 }
-.facts-controls label span {
+.facts-control { min-width: 0; }
+.facts-control > label {
   display: block;
   margin-bottom: 4px;
   color: var(--muted);
@@ -212,6 +213,132 @@ main { min-width: 0; padding: 14px 18px 30px; }
   background: var(--surface-2);
   color: var(--text);
 }
+.market-selector-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+}
+.market-selector-shell.has-market-warning {
+  grid-template-columns: minmax(0, 1fr) 44px;
+}
+.market-warning-anchor {
+  position: relative;
+  width: 44px;
+  height: 44px;
+}
+.market-warning-trigger {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #6c5732;
+  border-radius: 4px;
+  background: #2b2418;
+  color: var(--amber);
+}
+.market-warning-trigger:hover {
+  border-color: #a98245;
+  background: #332918;
+}
+.market-warning-anchor[data-severity="critical"] .market-warning-trigger {
+  border-color: #7e3943;
+  background: #311b20;
+  color: var(--negative);
+}
+.market-warning-anchor[data-severity="info"] .market-warning-trigger {
+  border-color: #477e83;
+  background: var(--accent-soft);
+  color: #9de0e5;
+}
+.market-warning-trigger svg {
+  width: 17px;
+  height: 17px;
+  pointer-events: none;
+}
+.market-warning-tooltip {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 7px);
+  right: 0;
+  width: min(380px, calc(100vw - 44px));
+  max-height: min(440px, 65vh);
+  overflow-y: auto;
+  padding: 12px;
+  border: 1px solid #6c5732;
+  border-radius: 4px;
+  background: rgba(15, 17, 21, .98);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .48);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+}
+.market-warning-anchor[data-severity="critical"] .market-warning-tooltip {
+  border-color: #7e3943;
+}
+.market-warning-anchor[data-severity="info"] .market-warning-tooltip {
+  border-color: #477e83;
+}
+.market-warning-tooltip-heading,
+.market-warning-item-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.market-warning-tooltip-heading strong {
+  color: var(--amber);
+  font-size: 13px;
+  text-transform: capitalize;
+}
+.market-warning-anchor[data-severity="critical"] .market-warning-tooltip-heading strong {
+  color: var(--negative);
+}
+.market-warning-anchor[data-severity="info"] .market-warning-tooltip-heading strong {
+  color: #9de0e5;
+}
+.market-warning-tooltip-heading span,
+.market-warning-market {
+  color: var(--muted);
+}
+.market-warning-market {
+  margin-top: 3px;
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.market-warning-tooltip ul {
+  display: grid;
+  gap: 9px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.market-warning-item {
+  padding-left: 9px;
+  border-left: 2px solid var(--amber);
+}
+.market-warning-item[data-severity="critical"] { border-left-color: var(--negative); }
+.market-warning-item[data-severity="info"] { border-left-color: var(--accent); }
+.market-warning-item-heading strong { font-size: 12px; }
+.market-warning-item-heading span {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+.market-warning-item p {
+  margin: 3px 0 0;
+  color: #cfd4db;
+}
+.market-warning-item small {
+  display: block;
+  margin-top: 3px;
+  color: #f0c77f;
+}
+.market-warning-item[data-severity="critical"] small { color: #ff9ba7; }
+.market-warning-item[data-severity="info"] small { color: #9de0e5; }
 .selector-policy {
   margin: 7px 0 0;
   color: var(--muted);
@@ -832,6 +959,10 @@ footer {
   .facts-heading { display: block; }
   .contract-badge { display: inline-block; margin-top: 10px; }
   .facts-controls { grid-template-columns: 1fr; }
+  .market-warning-tooltip {
+    width: min(380px, calc(100vw - 32px));
+    max-height: 55vh;
+  }
   .comparison-summary { grid-template-columns: 1fr; }
   .liquidity-panel { padding: 12px 8px; }
   .liquidity-toggles { display: grid; grid-template-columns: 1fr; }
