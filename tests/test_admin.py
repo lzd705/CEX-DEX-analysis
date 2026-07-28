@@ -480,6 +480,7 @@ class AdminServiceTest(unittest.TestCase):
         self.assertIn("--host @BIND_HOST@", user_service)
         self.assertIn("Restart=on-failure", user_service)
         self.assertIn("WantedBy=default.target", user_service)
+        self.assertNotIn("CapabilityBoundingSet=", user_service)
         self.assertIn("listen 443 ssl", nginx)
         self.assertIn("return 301 https://@DOMAIN@$request_uri;", nginx)
         self.assertNotIn("https://$host$request_uri", nginx)

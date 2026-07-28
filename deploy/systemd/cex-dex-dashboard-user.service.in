@@ -20,7 +20,6 @@ StandardError=journal
 SyslogIdentifier=cex-dex-dashboard
 NoNewPrivileges=true
 PrivateTmp=true
-CapabilityBoundingSet=
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
