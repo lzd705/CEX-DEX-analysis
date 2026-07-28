@@ -9,6 +9,8 @@ from dashboard.market_facts import (
     catalog_from_market_payload,
     compare_daily_rows,
     decimal_adjust,
+    dex_market_id,
+    dex_pool_id,
     market_quality_assessment,
     market_series_statistics,
     select_primary_market,
@@ -49,6 +51,16 @@ class MarketFactKnownAnswerTests(unittest.TestCase):
     def test_decimal_adjustment_rejects_fractional_base_units(self):
         with self.assertRaises(ValueError):
             decimal_adjust("1.5", 6)
+
+    def test_dex_identity_only_lowercases_evm_addresses(self):
+        self.assertEqual(
+            dex_pool_id("ETH", "Uniswap_V3", "0xAbCd"),
+            "dex:eth:uniswap_v3:0xabcd",
+        )
+        self.assertEqual(
+            dex_market_id("Solana", "Orca", "AbCdEf", "btc"),
+            "dex:solana:orca:AbCdEf:BTC",
+        )
 
     def test_comparison_keeps_union_dates_and_does_not_fill(self):
         rows_a = [

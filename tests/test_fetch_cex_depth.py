@@ -6,20 +6,32 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.fetch_cex_depth import (
     DEPTH_BANDS_BPS,
+    EXECUTION_LATEST_FILENAME,
     HISTORY_FILENAME,
     LATEST_FILENAME,
     collect_depth,
+    collect_depth_with_execution,
     depth_metrics,
+    ensure_full_publish_scope,
+    execution_rows_for_book,
+    failed_execution_rows,
     load_markets_from_csv,
     load_markets_from_database,
     observed_row,
     parse_book,
+    publish_execution_snapshot,
     publish_snapshot,
     source_request,
     validate_snapshot,
+)
+from scripts.execution_cost import (
+    EXECUTION_DIRECTIONS,
+    EXECUTION_NOTIONALS_USD,
+    validate_execution_snapshot,
 )
 
 
@@ -56,6 +68,11 @@ def complete_book():
 
 
 class FetchCexDepthTest(unittest.TestCase):
+    def test_filtered_collection_cannot_replace_published_inventory(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            ensure_full_publish_scope(True, {"UNI"}, set())
+        ensure_full_publish_scope(False, {"UNI"}, {"binance"})
+
     def test_depth_metrics_known_answer_and_complete_bands(self):
         result = depth_metrics(
             complete_book()["bids"],
@@ -73,6 +90,125 @@ class FetchCexDepthTest(unittest.TestCase):
         self.assertEqual(result["ask_depth_10bps_usd"], "300.03")
         self.assertEqual(result["total_depth_10bps_usd"], "500.01")
         self.assertTrue(all(result[f"depth_{band}bps_complete"] == "1" for band in DEPTH_BANDS_BPS))
+
+    def execution_rows(self, book):
+        return execution_rows_for_book(
+            market(),
+            book,
+            snapshot_id="depth-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+
+    def test_execution_cost_known_answer_walks_partial_final_level(self):
+        book = complete_book()
+        book["bids"] = [
+            (Decimal("99"), Decimal("6")),
+            (Decimal("98"), Decimal("1000")),
+        ]
+        book["asks"] = [
+            (Decimal("101"), Decimal("4")),
+            (Decimal("102"), Decimal("1000")),
+        ]
+        rows = self.execution_rows(book)
+        sell = next(
+            row
+            for row in rows
+            if row["direction"] == "sell_token"
+            and row["requested_notional_usd"] == "1000"
+        )
+        buy = next(
+            row
+            for row in rows
+            if row["direction"] == "buy_token"
+            and row["requested_notional_usd"] == "1000"
+        )
+        self.assertEqual(sell["target_token_quantity"], "10")
+        self.assertEqual(sell["filled_token_quantity"], "10")
+        self.assertEqual(sell["quote_amount"], "986")
+        self.assertEqual(sell["filled_vwap_quote_per_token"], "98.6")
+        self.assertEqual(sell["quoted_execution_cost_usd"], "14")
+        self.assertEqual(sell["quoted_execution_cost_bps"], "140")
+        self.assertEqual(buy["quote_amount"], "1016")
+        self.assertEqual(buy["filled_vwap_quote_per_token"], "101.6")
+        self.assertEqual(buy["quoted_execution_cost_usd"], "16")
+        self.assertEqual(buy["quoted_execution_cost_bps"], "160")
+        self.assertEqual(sell["fee_status"], "excluded_unknown_account_tier")
+        self.assertEqual(sell["excluded_costs"], "taker_fee,lot_size,latency")
+        validate_execution_snapshot(["cex:binance:UNI/USDT"], rows)
+
+    def test_limited_execution_retains_partial_fill_but_withholds_cost(self):
+        book = complete_book()
+        book["bids"] = [(Decimal("99"), Decimal("2"))]
+        book["asks"] = [(Decimal("101"), Decimal("2"))]
+        rows = self.execution_rows(book)
+        for direction, expected_quote in (
+            ("sell_token", "198"),
+            ("buy_token", "202"),
+        ):
+            row = next(
+                item
+                for item in rows
+                if item["direction"] == direction
+                and item["requested_notional_usd"] == "1000"
+            )
+            self.assertEqual(row["status"], "partial")
+            self.assertEqual(row["status_reason"], "source_level_limit")
+            self.assertEqual(row["filled_token_quantity"], "2")
+            self.assertEqual(row["fill_ratio"], "0.2")
+            self.assertEqual(row["quote_amount"], expected_quote)
+            self.assertEqual(row["filled_vwap_quote_per_token"], "")
+            self.assertEqual(row["quoted_execution_cost_usd"], "")
+            self.assertEqual(row["quoted_execution_cost_bps"], "")
+        validate_execution_snapshot(["cex:binance:UNI/USDT"], rows)
+
+    def test_full_book_shortfall_is_explicitly_unfillable_not_a_cost(self):
+        book = complete_book()
+        book["bids"] = [(Decimal("99"), Decimal("2"))]
+        book["asks"] = [(Decimal("101"), Decimal("2"))]
+        book["full_book_reported"] = True
+        row = next(
+            item
+            for item in self.execution_rows(book)
+            if item["direction"] == "sell_token"
+            and item["requested_notional_usd"] == "1000"
+        )
+        self.assertEqual(row["status"], "partial")
+        self.assertEqual(
+            row["status_reason"],
+            "full_book_insufficient_liquidity",
+        )
+        self.assertEqual(row["quoted_execution_cost_usd"], "")
+
+    def test_validation_rejects_nonmonotonic_source_level_walk(self):
+        book = complete_book()
+        book["bids"] = [
+            (Decimal("99"), Decimal("10")),
+            (Decimal("99.9"), Decimal("1000")),
+        ]
+        book["asks"] = [(Decimal("101"), Decimal("1000"))]
+        rows = self.execution_rows(book)
+        with self.assertRaisesRegex(
+            ValueError,
+            "cost decreases|VWAP improves",
+        ):
+            validate_execution_snapshot(["cex:binance:UNI/USDT"], rows)
+
+    def test_failed_row_marks_every_execution_scenario_failed(self):
+        rows = failed_execution_rows(
+            market(),
+            snapshot_id="depth-failed",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            error=RuntimeError("source unavailable"),
+        )
+        self.assertEqual(len(rows), 10)
+        self.assertEqual({row["status"] for row in rows}, {"failed"})
+        self.assertTrue(
+            all(row["quoted_execution_cost_usd"] == "" for row in rows)
+        )
+        self.assertEqual({row["state_observed_at"] for row in rows}, {""})
+        validate_execution_snapshot(["cex:binance:UNI/USDT"], rows)
 
     def test_limited_book_is_marked_partial_not_complete(self):
         book = complete_book()
@@ -261,7 +397,7 @@ class FetchCexDepthTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory_name:
             raw_root = Path(directory_name)
-            snapshot_id, rows = collect_depth(
+            snapshot_id, rows, execution_rows = collect_depth_with_execution(
                 [market()],
                 raw_root=raw_root,
                 request=fake_request,
@@ -272,7 +408,80 @@ class FetchCexDepthTest(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "observed")
         self.assertEqual(manifest["market_count"], 1)
         self.assertEqual(manifest["status_counts"]["observed"], 1)
+        self.assertEqual(
+            manifest["execution_notionals_usd"],
+            [1000, 5000, 10000, 50000, 100000],
+        )
+        self.assertEqual(
+            manifest["execution_cost_status_counts"],
+            {
+                "observed": 1,
+                "partial": 9,
+                "unsupported": 0,
+                "failed": 0,
+            },
+        )
+        self.assertEqual(manifest["execution_cost_row_count"], 10)
         validate_snapshot([market()], rows)
+        validate_execution_snapshot(
+            ["cex:binance:UNI/USDT"],
+            execution_rows,
+        )
+
+    def test_execution_failure_preserves_observed_depth_and_raw_source(self):
+        response = json.dumps(
+            {
+                "bids": [["99.99", "2"], ["98.9", "5"]],
+                "asks": [["100.01", "3"], ["101.1", "7"]],
+                "lastUpdateId": 123,
+            }
+        ).encode()
+
+        def fake_request(_url):
+            return json.loads(response), response
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            raw_root = Path(directory_name)
+            with patch(
+                "scripts.fetch_cex_depth.execution_rows_for_book",
+                side_effect=RuntimeError("calculation defect"),
+            ):
+                snapshot_id, rows, execution_rows = collect_depth_with_execution(
+                    [market()],
+                    raw_root=raw_root,
+                    request=fake_request,
+                    sleep_seconds=0,
+                )
+            raw_path = raw_root / snapshot_id / "001-binance-UNI.json"
+            raw_bytes = raw_path.read_bytes()
+            manifest = json.loads(
+                (raw_root / snapshot_id / "manifest.json").read_text()
+            )
+
+        self.assertEqual(rows[0]["status"], "observed")
+        self.assertEqual(
+            rows[0]["raw_response_sha256"],
+            hashlib.sha256(response).hexdigest(),
+        )
+        self.assertEqual(raw_bytes, response)
+        self.assertEqual(len(execution_rows), 10)
+        self.assertEqual({row["status"] for row in execution_rows}, {"failed"})
+        self.assertEqual(
+            {row["status_reason"] for row in execution_rows},
+            {"execution_calculation_failed"},
+        )
+        self.assertEqual(
+            {row["state_observed_at"] for row in execution_rows},
+            {""},
+        )
+        self.assertTrue(
+            all("calculation defect" in row["error"] for row in execution_rows)
+        )
+        self.assertEqual(manifest["status_counts"]["observed"], 1)
+        self.assertEqual(
+            manifest["execution_cost_status_counts"]["failed"],
+            10,
+        )
 
     def test_invalid_success_response_retains_source_raw_and_endpoint(self):
         valid_response = json.dumps(
@@ -293,7 +502,7 @@ class FetchCexDepthTest(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory_name:
             raw_root = Path(directory_name)
-            snapshot_id, rows = collect_depth(
+            snapshot_id, rows, execution_rows = collect_depth_with_execution(
                 inventory,
                 raw_root=raw_root,
                 request=fake_request,
@@ -309,6 +518,16 @@ class FetchCexDepthTest(unittest.TestCase):
         self.assertEqual(
             failed["raw_response_sha256"],
             hashlib.sha256(empty_response).hexdigest(),
+        )
+        failed_execution = [
+            row
+            for row in execution_rows
+            if row["market_id"] == "cex:binance:AAVE/USDT"
+        ]
+        self.assertEqual(len(failed_execution), 10)
+        self.assertEqual(
+            {row["status"] for row in failed_execution},
+            {"failed"},
         )
 
     def test_validate_requires_exact_inventory_and_observed_book(self):
@@ -343,6 +562,86 @@ class FetchCexDepthTest(unittest.TestCase):
 
         self.assertEqual([row["snapshot_id"] for row in history], ["depth-1", "depth-2"])
         self.assertEqual([row["snapshot_id"] for row in latest], ["depth-2"])
+
+    def test_execution_publish_replaces_latest_without_unbounded_history(self):
+        book = complete_book()
+        book["bids"] = [(Decimal("99"), Decimal("2000"))]
+        book["asks"] = [(Decimal("101"), Decimal("2000"))]
+        first = execution_rows_for_book(
+            market(),
+            book,
+            snapshot_id="depth-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+        second = execution_rows_for_book(
+            market(),
+            book,
+            snapshot_id="depth-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            publish_execution_snapshot(
+                first,
+                expected_market_ids=["cex:binance:UNI/USDT"],
+                output_dir=directory / "processed",
+                publish_dir=directory / "local",
+            )
+            publish_execution_snapshot(
+                second,
+                expected_market_ids=["cex:binance:UNI/USDT"],
+                output_dir=directory / "processed",
+                publish_dir=directory / "local",
+            )
+            with (
+                directory / "local" / EXECUTION_LATEST_FILENAME
+            ).open(newline="", encoding="utf-8") as handle:
+                latest = list(csv.DictReader(handle))
+            history_exists = (
+                directory / "local" / "cex_execution_cost_history.csv"
+            ).exists()
+
+        self.assertFalse(history_exists)
+        self.assertEqual(len(latest), 10)
+        self.assertEqual({row["snapshot_id"] for row in latest}, {"depth-2"})
+        self.assertEqual(
+            {
+                (row["direction"], row["requested_notional_usd"])
+                for row in latest
+            },
+            {
+                (direction, str(int(notional)))
+                for direction in EXECUTION_DIRECTIONS
+                for notional in EXECUTION_NOTIONALS_USD
+            },
+        )
+
+    def test_execution_publisher_rejects_incomplete_inventory_before_write(self):
+        rows = execution_rows_for_book(
+            market(),
+            complete_book(),
+            snapshot_id="depth-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            output_dir = Path(directory_name)
+            with self.assertRaisesRegex(ValueError, "coverage"):
+                publish_execution_snapshot(
+                    rows,
+                    expected_market_ids=[
+                        "cex:binance:UNI/USDT",
+                        "cex:okx:AAVE/USDT",
+                    ],
+                    output_dir=output_dir,
+                )
+            current_exists = (
+                output_dir / "cex_execution_cost_snapshot.csv"
+            ).exists()
+
+        self.assertFalse(current_exists)
 
 
 if __name__ == "__main__":

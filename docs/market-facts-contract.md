@@ -7,6 +7,9 @@
   semantic limits.
 - `GET /api/markets/compare?token=...&market_a=...&market_b=...&start=...&end=...`
   returns the union of the two selected markets' daily UTC observations.
+- `GET /api/markets/execution-cost?token=...&market_a=...&market_b=...`
+  returns independent point-in-time $1k/$5k/$10k/$50k/$100k quoted execution
+  facts for the same exact market identities.
 
 `market_a` and `market_b` are exact `market_id` values returned by the catalog.
 They must be different and both must belong to the requested Token.
@@ -31,6 +34,13 @@ When `dex_depth_latest.csv` exists, DEX catalog entries expose fixed-block
 10/25/50/100 bps sell, buy, and total pool-state depth, protocol model, fee,
 block number, completeness, and source lineage. Unsupported protocols remain
 `null`. The exact contract is `docs/dex-depth-data-contract.md`.
+
+The independent execution-cost endpoint is backed by
+`cex_execution_cost_latest.csv` and `dex_execution_cost_latest.csv`. It never
+interpolates the four depth bands. Complete, partial, unsupported, and failed
+semantics, fee scope, formulas, and publication gates are defined in
+`docs/execution-cost-data-contract.md`. Its requested notionals are JSON
+numbers; measured Decimal facts remain exact base-10 strings or `null`.
 
 CEX configured pair labels normally use USDT. The current adapter contract uses
 USDT as a 1:1 USD proxy; Upbit KRW observations are converted through the

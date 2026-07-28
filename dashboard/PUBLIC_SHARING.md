@@ -28,6 +28,8 @@ The mounted directory must contain:
 - `dex_pool_volume_daily.csv`
 - `cex_depth_latest.csv`
 - `dex_depth_latest.csv`
+- `cex_execution_cost_latest.csv`
+- `dex_execution_cost_latest.csv`
 - `dex_pool_tvl_latest.csv`
 
 Deploy a new application commit without changing the data directory. In the

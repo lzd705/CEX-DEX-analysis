@@ -1,10 +1,12 @@
 """Run auditable CEX/DEX fact collection profiles under one process lock.
 
-The four fact families retain separate publication semantics:
+The fact families retain separate publication semantics:
 
 - daily CEX/DEX OHLCV is incrementally upserted and atomically indexed in SQLite;
-- TVL, CEX depth, and DEX pool-state depth append immutable normalized history
-  and replace latest views.
+- TVL, CEX depth, and DEX pool-state depth append normalized history and
+  replace latest views;
+- fixed-notional execution cost atomically replaces validated latest/current
+  views and deliberately does not rewrite one unbounded hourly history CSV.
 
 This runner coordinates those collectors, records every command and result in a
 single manifest, and emits source-specific freshness without pretending that the
@@ -55,6 +57,8 @@ SNAPSHOT_FILENAMES = {
     "dex_tvl": "dex_pool_tvl_latest.csv",
     "cex_depth": "cex_depth_latest.csv",
     "dex_depth": "dex_depth_latest.csv",
+    "cex_execution_cost": "cex_execution_cost_latest.csv",
+    "dex_execution_cost": "dex_execution_cost_latest.csv",
 }
 
 
@@ -111,6 +115,13 @@ def snapshot_summary(path: Path) -> dict[str, Any] | None:
         "snapshot_ids": sorted(
             {row["snapshot_id"] for row in rows if row.get("snapshot_id")}
         ),
+        "source_snapshot_ids": sorted(
+            {
+                row["source_snapshot_id"]
+                for row in rows
+                if row.get("source_snapshot_id")
+            }
+        ),
         "observed_at": max(
             (row["observed_at"] for row in rows if row.get("observed_at")),
             default=None,
@@ -142,6 +153,8 @@ def build_collection_status(
     tvl_path = data_dir / SNAPSHOT_FILENAMES["dex_tvl"]
     depth_path = data_dir / SNAPSHOT_FILENAMES["cex_depth"]
     dex_depth_path = data_dir / SNAPSHOT_FILENAMES["dex_depth"]
+    cex_execution_path = data_dir / SNAPSHOT_FILENAMES["cex_execution_cost"]
+    dex_execution_path = data_dir / SNAPSHOT_FILENAMES["dex_execution_cost"]
     source_date_ranges = {
         "cex_daily": csv_date_bounds(cex_path),
         "dex_daily": csv_date_bounds(dex_path),
@@ -149,12 +162,16 @@ def build_collection_status(
     tvl = snapshot_summary(tvl_path)
     depth = snapshot_summary(depth_path)
     dex_depth = snapshot_summary(dex_depth_path)
+    cex_execution = snapshot_summary(cex_execution_path)
+    dex_execution = snapshot_summary(dex_execution_path)
     return {
         "checked_at": utc_text(checked_at),
         "source_date_ranges": source_date_ranges,
         "tvl_snapshot": tvl,
         "cex_depth_snapshot": depth,
         "dex_depth_snapshot": dex_depth,
+        "cex_execution_cost_snapshot": cex_execution,
+        "dex_execution_cost_snapshot": dex_execution,
         "freshness": build_source_freshness(
             source_date_ranges,
             tvl_observed_at=tvl.get("observed_at") if tvl else None,
@@ -300,7 +317,7 @@ def default_step_runner(command: list[str], log_path: Path) -> int:
 
 
 def validate_step_freshness(name: str, status: dict[str, Any]) -> list[str]:
-    """Return stale/unavailable sources that make a scheduled step invalid."""
+    """Return stale, unavailable, or wholly unusable scheduled outputs."""
     expected_sources = {
         "daily": ("cex_daily", "dex_daily"),
         "tvl": ("dex_tvl",),
@@ -308,11 +325,68 @@ def validate_step_freshness(name: str, status: dict[str, Any]) -> list[str]:
         "dex_depth": ("dex_depth",),
     }[name]
     freshness = status["freshness"]
-    return [
+    invalid = [
         source
         for source in expected_sources
         if freshness[source]["status"] != "current"
     ]
+    snapshot_requirement = {
+        "tvl": ("tvl_snapshot", "dex_tvl"),
+        "depth": ("cex_depth_snapshot", "cex_depth"),
+        "dex_depth": ("dex_depth_snapshot", "dex_depth"),
+    }.get(name)
+    if snapshot_requirement is not None:
+        snapshot_key, source_name = snapshot_requirement
+        snapshot = status.get(snapshot_key)
+        counts = snapshot.get("status_counts", {}) if snapshot else {}
+        measured_count = int(counts.get("observed", 0)) + int(
+            counts.get("partial", 0)
+        )
+        if measured_count == 0:
+            invalid.append(f"{source_name}_no_measured_rows")
+
+    execution_requirement = {
+        "depth": ("cex_execution_cost_snapshot", "cex_depth_snapshot"),
+        "dex_depth": ("dex_execution_cost_snapshot", "dex_depth_snapshot"),
+    }.get(name)
+    if execution_requirement is not None:
+        execution_key, source_key = execution_requirement
+        execution_source_name = (
+            execution_key[:-9]
+            if execution_key.endswith("_snapshot")
+            else execution_key
+        )
+        execution_snapshot = status.get(execution_key)
+        source_snapshot = status.get(source_key)
+        if execution_snapshot is None:
+            invalid.append(execution_source_name)
+        elif source_snapshot is None or (
+            execution_snapshot.get("source_snapshot_ids")
+            != source_snapshot.get("snapshot_ids")
+        ):
+            invalid.append(f"{execution_source_name}_lineage")
+        if execution_snapshot is not None:
+            execution_counts = execution_snapshot.get("status_counts", {})
+            measured_execution_count = int(
+                execution_counts.get("observed", 0)
+            ) + int(execution_counts.get("partial", 0))
+            failed_execution_count = int(execution_counts.get("failed", 0))
+            if name == "depth" and measured_execution_count == 0:
+                invalid.append(
+                    f"{execution_source_name}_no_measured_rows"
+                )
+            elif (
+                name == "dex_depth"
+                and measured_execution_count == 0
+                and failed_execution_count > 0
+            ):
+                # An inventory containing only explicit unsupported adapters is
+                # a truthful result. Any failed supported adapter without one
+                # measured V2 result must not be reported as a successful run.
+                invalid.append(
+                    f"{execution_source_name}_supported_rows_all_failed"
+                )
+    return invalid
 
 
 def log_tail(path: Path, lines: int = 20) -> list[str]:
@@ -401,17 +475,26 @@ def run_collection_cycle(
             if exit_code == 0 and should_validate:
                 post_step_status = build_collection_status(data_dir, now=started)
                 invalid_sources = validate_step_freshness(name, post_step_status)
+                validation_sources = {
+                    source: post_step_status["freshness"][source]
+                    for source in {
+                        "daily": ("cex_daily", "dex_daily"),
+                        "tvl": ("dex_tvl",),
+                        "depth": ("cex_depth",),
+                        "dex_depth": ("dex_depth",),
+                    }[name]
+                }
+                if name == "depth":
+                    validation_sources["cex_execution_cost"] = (
+                        post_step_status["cex_execution_cost_snapshot"]
+                    )
+                elif name == "dex_depth":
+                    validation_sources["dex_execution_cost"] = (
+                        post_step_status["dex_execution_cost_snapshot"]
+                    )
                 validation = {
                     "checked": True,
-                    "sources": {
-                        source: post_step_status["freshness"][source]
-                        for source in {
-                            "daily": ("cex_daily", "dex_daily"),
-                            "tvl": ("dex_tvl",),
-                            "depth": ("cex_depth",),
-                            "dex_depth": ("dex_depth",),
-                        }[name]
-                    },
+                    "sources": validation_sources,
                     "status": "passed" if not invalid_sources else "failed",
                 }
                 if invalid_sources:

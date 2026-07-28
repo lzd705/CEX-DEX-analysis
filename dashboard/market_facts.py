@@ -674,9 +674,12 @@ def cex_market_id(exchange: str, instrument: str) -> str:
 
 def dex_pool_id(chain: str, dex: str, pool_address: str) -> str:
     """Return the stable identity of one on-chain liquidity pool."""
+    address = pool_address.strip()
+    if address.startswith("0x"):
+        address = address.lower()
     return (
         f"dex:{chain.strip().lower()}:{dex.strip().lower()}:"
-        f"{pool_address.strip().lower()}"
+        f"{address}"
     )
 
 

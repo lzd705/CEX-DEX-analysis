@@ -10,12 +10,12 @@ python3 scripts/run_collection_cycle.py --profile PROFILE --publish-local
 
 | Profile | Ordered steps | Intended cadence |
 | --- | --- | --- |
-| `full` | incremental daily OHLCV, TVL, CEX depth, DEX depth | manual catch-up and release validation |
+| `full` | incremental daily OHLCV, TVL, CEX/DEX depth and fixed-notional cost | manual catch-up and release validation |
 | `daily` | incremental daily OHLCV, TVL | daily at 00:30 UTC |
 | `tvl` | TVL only | manual retry/recovery |
-| `depth` | CEX depth, then DEX depth | hourly at minute 05 UTC |
-| `cex_depth` | CEX depth only | manual retry/recovery |
-| `dex_depth` | DEX depth only | manual retry/recovery |
+| `depth` | CEX depth/cost, then DEX depth/cost | hourly at minute 05 UTC |
+| `cex_depth` | CEX depth and fixed-notional cost from one book snapshot | manual retry/recovery |
+| `dex_depth` | DEX depth and fixed-notional cost from one fixed block | manual retry/recovery |
 
 The daily step reads the current CEX and DEX end dates, starts from the older
 source with a three-day overlap, and ends at the latest completed UTC day. It
@@ -52,7 +52,9 @@ The separate fact lifecycles remain explicit:
   `import_local_snapshot.py`;
 - TVL appends normalized history, then atomically replaces its latest snapshot;
 - CEX and DEX depth each append normalized history, then atomically replace
-  their own latest snapshots.
+  their own latest snapshots. Their matching long-form execution-cost
+  latest views reuse the same raw response/fixed-block lineage. Retained raw
+  responses and manifests are the execution audit history for this release.
 
 A full collection manifest coordinates these publications but does not claim
 that the CSVs, histories, latest snapshots, and SQLite database form one
@@ -138,6 +140,16 @@ retention requirement before applying or enabling
 - CEX depth inventory matches every cataloged Token/exchange/pair key.
 - DEX depth inventory matches every TVL Token/chain/pool key, including explicit
   unsupported rows.
+- Each CEX and DEX execution-cost inventory contains exactly five notionals by
+  two directions for every corresponding source market, with no duplicate
+  scenario keys.
+- Execution-cost publication passes formula, fill-state, monotonicity, fee
+  scope, missing-value, and source-lineage validation. Partial scenarios never
+  publish a full-request VWAP or quoted cost.
+- A timestamp-fresh TVL/depth snapshot with zero observed or partial rows is a
+  failed scheduled step. CEX execution must contain a measured row; DEX
+  execution may be wholly `unsupported`, but any wholly failed supported
+  adapter set is a failed step.
 - Raw responses and collector manifests remain available for audit.
 - Collection and publication failures never zero-fill missing values.
 - The public API and rendered page display separate source dates and stale

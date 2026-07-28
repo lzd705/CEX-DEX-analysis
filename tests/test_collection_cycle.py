@@ -10,6 +10,7 @@ from scripts.run_collection_cycle import (
     build_step_commands,
     resolve_incremental_window,
     run_collection_cycle,
+    validate_step_freshness,
 )
 
 
@@ -67,6 +68,30 @@ class CollectionCycleTest(unittest.TestCase):
             [
                 {
                     "snapshot_id": "dex-depth-1",
+                    "observed_at": "2026-07-27T10:45:00+00:00",
+                    "status": "observed",
+                }
+            ],
+        )
+        write_csv(
+            self.data_dir / "cex_execution_cost_latest.csv",
+            ["snapshot_id", "source_snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "depth-1",
+                    "source_snapshot_id": "depth-1",
+                    "observed_at": "2026-07-27T10:30:00+00:00",
+                    "status": "observed",
+                }
+            ],
+        )
+        write_csv(
+            self.data_dir / "dex_execution_cost_latest.csv",
+            ["snapshot_id", "source_snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "dex-depth-1",
+                    "source_snapshot_id": "dex-depth-1",
                     "observed_at": "2026-07-27T10:45:00+00:00",
                     "status": "observed",
                 }
@@ -135,6 +160,10 @@ class CollectionCycleTest(unittest.TestCase):
         )
         self.assertEqual(status["freshness"]["common_comparable_end"], "2026-07-22")
         self.assertEqual(status["tvl_snapshot"]["status_counts"], {"observed": 1})
+        self.assertEqual(
+            status["cex_execution_cost_snapshot"]["source_snapshot_ids"],
+            ["depth-1"],
+        )
 
     def test_successful_cycle_writes_per_step_logs_and_latest_manifest(self):
         def runner(command, log_path):
@@ -201,6 +230,99 @@ class CollectionCycleTest(unittest.TestCase):
         self.assertEqual(result["steps"][0]["exit_code"], 3)
         self.assertEqual(result["steps"][0]["validation"]["status"], "failed")
         self.assertIn("dex_daily", result["steps"][0]["error"])
+
+    def test_depth_step_fails_when_matching_execution_snapshot_is_missing(self):
+        (self.data_dir / "cex_execution_cost_latest.csv").unlink()
+
+        def runner(command, log_path):
+            log_path.write_text("collector exited zero\n", encoding="utf-8")
+            return 0
+
+        result = run_collection_cycle(
+            "cex_depth",
+            publish_local=True,
+            data_dir=self.data_dir,
+            run_root=self.root / "runs",
+            latest_status_path=self.root / "latest.json",
+            lock_path=self.root / "collection.lock",
+            now=NOW,
+            fail_fast=True,
+            step_runner=runner,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["steps"][0]["exit_code"], 3)
+        self.assertIn("cex_execution_cost", result["steps"][0]["error"])
+
+    def test_fresh_all_failed_cex_snapshots_cannot_masquerade_as_success(self):
+        write_csv(
+            self.data_dir / "cex_depth_latest.csv",
+            ["snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "depth-failed",
+                    "observed_at": "2026-07-27T11:30:00+00:00",
+                    "status": "failed",
+                }
+            ],
+        )
+        write_csv(
+            self.data_dir / "cex_execution_cost_latest.csv",
+            ["snapshot_id", "source_snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "depth-failed",
+                    "source_snapshot_id": "depth-failed",
+                    "observed_at": "2026-07-27T11:30:00+00:00",
+                    "status": "failed",
+                }
+            ],
+        )
+
+        status = build_collection_status(self.data_dir, now=NOW)
+        self.assertEqual(status["freshness"]["cex_depth"]["status"], "current")
+        invalid = validate_step_freshness("depth", status)
+
+        self.assertIn("cex_depth_no_measured_rows", invalid)
+        self.assertIn("cex_execution_cost_no_measured_rows", invalid)
+
+    def test_dex_unsupported_execution_is_truthful_but_all_failed_is_not(self):
+        write_csv(
+            self.data_dir / "dex_execution_cost_latest.csv",
+            ["snapshot_id", "source_snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "dex-depth-1",
+                    "source_snapshot_id": "dex-depth-1",
+                    "observed_at": "2026-07-27T10:45:00+00:00",
+                    "status": "unsupported",
+                }
+            ],
+        )
+        unsupported_status = build_collection_status(self.data_dir, now=NOW)
+        self.assertNotIn(
+            "dex_execution_cost_supported_rows_all_failed",
+            validate_step_freshness("dex_depth", unsupported_status),
+        )
+
+        write_csv(
+            self.data_dir / "dex_execution_cost_latest.csv",
+            ["snapshot_id", "source_snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "dex-depth-1",
+                    "source_snapshot_id": "dex-depth-1",
+                    "observed_at": "2026-07-27T10:45:00+00:00",
+                    "status": "failed",
+                }
+            ],
+        )
+        failed_status = build_collection_status(self.data_dir, now=NOW)
+
+        self.assertIn(
+            "dex_execution_cost_supported_rows_all_failed",
+            validate_step_freshness("dex_depth", failed_status),
+        )
 
 
 if __name__ == "__main__":

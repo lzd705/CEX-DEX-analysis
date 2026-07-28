@@ -15,6 +15,7 @@ import os
 import posixpath
 import re
 import sqlite3
+import sys
 import threading
 import time
 from collections import Counter, defaultdict
@@ -53,6 +54,19 @@ except ModuleNotFoundError:
     )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.execution_cost import (
+    EXECUTION_COST_COLUMNS,
+    EXECUTION_COST_CONTRACT_VERSION,
+    EXECUTION_DIRECTIONS,
+    EXECUTION_NOTIONALS_USD,
+    NOTIONAL_DEFINITION,
+    execution_api_rows,
+    validate_execution_snapshot,
+)
+
 DASHBOARD_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = DASHBOARD_ROOT / "static"
 DEFAULT_DATA_DIRS = [
@@ -66,6 +80,8 @@ DATABASE_FILENAME = "market_facts.sqlite3"
 TVL_FILENAME = "dex_pool_tvl_latest.csv"
 CEX_DEPTH_FILENAME = "cex_depth_latest.csv"
 DEX_DEPTH_FILENAME = "dex_depth_latest.csv"
+CEX_EXECUTION_COST_FILENAME = "cex_execution_cost_latest.csv"
+DEX_EXECUTION_COST_FILENAME = "dex_execution_cost_latest.csv"
 VENDOR_FILES = {
     "/vendor/lucide.js": STATIC_ROOT / "vendor/lucide.min.js",
 }
@@ -82,6 +98,7 @@ PUBLIC_API_QUERY_FIELDS = {
     "catalog": (),
     "market": ("start", "end"),
     "compare": ("token", "market_a", "market_b", "start", "end"),
+    "execution_cost": ("token", "market_a", "market_b"),
 }
 ADMIN_STATIC_PATHS = {"/admin.html", "/admin.js"}
 
@@ -252,6 +269,52 @@ def resolve_dex_depth_path() -> Path | None:
         if depth_path.exists():
             return depth_path
     return None
+
+
+def resolve_execution_cost_path(
+    filename: str,
+    environment_key: str,
+) -> Path | None:
+    """Resolve an optional long-form execution-cost snapshot."""
+    explicit = os.environ.get(environment_key)
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Configured execution-cost snapshot does not exist: {path}"
+            )
+        return path
+    if os.environ.get("MARKET_CEX_DATA") or os.environ.get("MARKET_DEX_DATA"):
+        return None
+    explicit_database = os.environ.get("MARKET_DATABASE")
+    if explicit_database:
+        sibling = Path(explicit_database).expanduser().resolve().parent / filename
+        return sibling if sibling.exists() else None
+    configured_dir = os.environ.get("MARKET_DATA_DIR")
+    candidates = (
+        [Path(configured_dir).expanduser().resolve()]
+        if configured_dir
+        else DEFAULT_DATA_DIRS
+    )
+    for data_dir in candidates:
+        path = data_dir / filename
+        if path.exists():
+            return path
+    return None
+
+
+def resolve_cex_execution_cost_path() -> Path | None:
+    return resolve_execution_cost_path(
+        CEX_EXECUTION_COST_FILENAME,
+        "MARKET_CEX_EXECUTION_COST_DATA",
+    )
+
+
+def resolve_dex_execution_cost_path() -> Path | None:
+    return resolve_execution_cost_path(
+        DEX_EXECUTION_COST_FILENAME,
+        "MARKET_DEX_EXECUTION_COST_DATA",
+    )
 
 
 def connect_database(database_path: Path) -> sqlite3.Connection:
@@ -1447,6 +1510,228 @@ def build_market_comparison(
     }
 
 
+@lru_cache(maxsize=8)
+def _load_execution_cost_snapshot_cached(
+    path_text: str,
+    _signature: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    path = Path(path_text)
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        missing = sorted(set(EXECUTION_COST_COLUMNS) - set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(
+                f"{path.name} is missing execution-cost columns: "
+                + ", ".join(missing)
+            )
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"{path.name} contains no execution-cost rows")
+    market_ids = {row["market_id"] for row in rows if row.get("market_id")}
+    validate_execution_snapshot(market_ids, rows)
+    by_market: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        by_market[row["market_id"]].append(row)
+    for market_rows in by_market.values():
+        market_rows.sort(
+            key=lambda row: (
+                float(row["requested_notional_usd"]),
+                EXECUTION_DIRECTIONS.index(row["direction"]),
+            )
+        )
+    state_times = [
+        row["state_observed_at"]
+        for row in rows
+        if row.get("state_observed_at")
+    ]
+    return {
+        "path": path,
+        "rows": rows,
+        "by_market": by_market,
+        "snapshot_ids": sorted(
+            {row["snapshot_id"] for row in rows if row.get("snapshot_id")}
+        ),
+        "source_snapshot_ids": sorted(
+            {
+                row["source_snapshot_id"]
+                for row in rows
+                if row.get("source_snapshot_id")
+            }
+        ),
+        "observed_at": max(
+            (row["observed_at"] for row in rows if row.get("observed_at")),
+            default=None,
+        ),
+        "state_observed_at": max(state_times, default=None),
+        "market_count": len(by_market),
+        "row_count": len(rows),
+        "status_counts": dict(
+            Counter(row.get("status") or "missing_status" for row in rows)
+        ),
+    }
+
+
+def load_execution_cost_snapshot(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    return _load_execution_cost_snapshot_cached(
+        str(path),
+        data_signature([path]),
+    )
+
+
+def _timestamp_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def _execution_snapshot_metadata(
+    snapshot: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if snapshot is None:
+        return None
+    return {
+        "snapshot_ids": snapshot["snapshot_ids"],
+        "source_snapshot_ids": snapshot["source_snapshot_ids"],
+        "observed_at": snapshot["observed_at"],
+        "state_observed_at": snapshot["state_observed_at"],
+        "market_count": snapshot["market_count"],
+        "row_count": snapshot["row_count"],
+        "status_counts": snapshot["status_counts"],
+        "source": file_metadata(snapshot["path"]),
+    }
+
+
+def build_execution_cost_comparison(
+    token_symbol: str | None,
+    market_a_id: str | None,
+    market_b_id: str | None,
+) -> dict[str, Any]:
+    """Return source-backed fixed-notional facts for two exact catalog markets."""
+    if not token_symbol or not market_a_id or not market_b_id:
+        raise ValueError("token, market_a, and market_b are required")
+    if market_a_id == market_b_id:
+        raise ValueError("market_a and market_b must be different")
+    token = token_symbol.upper()
+    catalog = build_market_catalog()
+    markets = {
+        market["market_id"]: market
+        for market in catalog["markets"]
+        if market["token_symbol"] == token
+    }
+    market_a = markets.get(market_a_id)
+    market_b = markets.get(market_b_id)
+    if market_a is None or market_b is None:
+        raise ValueError("Selected market is not cataloged for the requested token")
+
+    selected_market_types = {
+        market_a["market_type"],
+        market_b["market_type"],
+    }
+    snapshot_paths = {
+        "cex": resolve_cex_execution_cost_path,
+        "dex": resolve_dex_execution_cost_path,
+    }
+    snapshots = {
+        market_type: load_execution_cost_snapshot(
+            snapshot_paths[market_type]()
+        )
+        for market_type in selected_market_types
+    }
+
+    def market_result(market: dict[str, Any]) -> dict[str, Any]:
+        snapshot = snapshots.get(market["market_type"])
+        if snapshot is None:
+            return {
+                "market": market,
+                "status": "unavailable",
+                "rows": [],
+            }
+        rows = snapshot["by_market"].get(market["market_id"])
+        if rows is None:
+            return {
+                "market": market,
+                "status": "not_cataloged_in_snapshot",
+                "rows": [],
+            }
+        return {
+            "market": market,
+            "status": "available",
+            "rows": execution_api_rows(rows, number_parser=parse_number),
+        }
+
+    result_a = market_result(market_a)
+    result_b = market_result(market_b)
+    times = []
+    for result in (result_a, result_b):
+        if not result["rows"]:
+            times.append(None)
+            continue
+        values = {
+            row.get("state_observed_at")
+            for row in result["rows"]
+            if row.get("state_observed_at")
+        }
+        times.append(_timestamp_seconds(max(values)) if values else None)
+    skew = (
+        abs(times[0] - times[1])
+        if times[0] is not None and times[1] is not None
+        else None
+    )
+    return {
+        "metadata": {
+            "contract_version": EXECUTION_COST_CONTRACT_VERSION,
+            "notionals_usd": [int(value) for value in EXECUTION_NOTIONALS_USD],
+            "directions": list(EXECUTION_DIRECTIONS),
+            "notional_definition": NOTIONAL_DEFINITION,
+            "reference_prices": {
+                "cex": "same-snapshot best bid/ask midpoint",
+                "dex": "same-block pre-trade pre-fee marginal pool price",
+            },
+            "formula": {
+                "sell_token": (
+                    "(reference_notional_usd - quote_amount_usd) / "
+                    "reference_notional_usd * 10000"
+                ),
+                "buy_token": (
+                    "(quote_amount_usd - reference_notional_usd) / "
+                    "reference_notional_usd * 10000"
+                ),
+            },
+            "numeric_encoding": {
+                "requested_notional_usd": "JSON number",
+                "measured_decimal_fields": (
+                    "exact base-10 JSON strings; null when unavailable"
+                ),
+            },
+            "cost_scope": (
+                "Source-mechanics quoted cost, not realized or all-in cost. "
+                "CEX account taker fees are excluded. Supported DEX V2 quotes "
+                "include protocol pool fees while gas, router fees, transfer "
+                "taxes, and MEV are excluded. DEX V3 execution is explicitly "
+                "unsupported in this release."
+            ),
+            "missing_value_rule": (
+                "Partial, unsupported, failed, unavailable, and not-cataloged "
+                "full-request cost fields remain null; they are never zero-filled "
+                "or interpolated from depth bands."
+            ),
+            "snapshot_skew_seconds": skew,
+            "snapshots": {
+                market_type: _execution_snapshot_metadata(snapshot)
+                for market_type, snapshot in snapshots.items()
+            },
+        },
+        "token_symbol": token,
+        "market_a": result_a,
+        "market_b": result_b,
+    }
+
+
 def encode_json_payload(payload: Any, accept_encoding: str = "") -> tuple[bytes, bool]:
     """Serialize JSON and compress substantial responses when the client supports gzip."""
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -1467,6 +1752,8 @@ def api_source_signature() -> tuple[tuple[str, int, int], ...]:
         resolve_tvl_path(),
         resolve_cex_depth_path(),
         resolve_dex_depth_path(),
+        resolve_cex_execution_cost_path(),
+        resolve_dex_execution_cost_path(),
     ):
         if optional_path is not None:
             paths.append(optional_path)
@@ -1495,6 +1782,12 @@ def _build_public_api_payload(
             start=query.get("start"),
             end=query.get("end"),
         )
+    if route == "execution_cost":
+        return build_execution_cost_comparison(
+            token_symbol=query.get("token"),
+            market_a_id=query.get("market_a"),
+            market_b_id=query.get("market_b"),
+        )
     raise ValueError(f"Unknown public API route: {route}")
 
 
@@ -1519,6 +1812,7 @@ def clear_runtime_caches() -> None:
             _load_tvl_snapshot_cached,
             _load_cex_depth_snapshot_cached,
             _load_dex_depth_snapshot_cached,
+            _load_execution_cost_snapshot_cached,
             _build_market_payload_cached,
             _build_database_payload_cached,
             _build_enriched_payload_cached,
@@ -1545,6 +1839,7 @@ def ensure_source_cache_generation(
             _load_tvl_snapshot_cached,
             _load_cex_depth_snapshot_cached,
             _load_dex_depth_snapshot_cached,
+            _load_execution_cost_snapshot_cached,
             _build_market_payload_cached,
             _build_database_payload_cached,
             _build_enriched_payload_cached,
@@ -1779,6 +2074,13 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("compare", query)
+            except (FileNotFoundError, ValueError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/markets/execution-cost":
+            query = parse_qs(parsed.query)
+            try:
+                self.send_public_api("execution_cost", query)
             except (FileNotFoundError, ValueError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return

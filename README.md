@@ -15,7 +15,9 @@ study, or public data-edit controls.
 2. Put the global start and end date controls at the top of the page.
 3. Display price, selected-window return, daily realized volatility, USD
    volume, DEX TVL snapshot, CEX and supported-pool DEX 10/25/50/100 bps depth
-   snapshots, and CEX-DEX price spread.
+   snapshots, and CEX-DEX price spread. Collect and expose fixed-notional
+   quoted execution-cost facts through the independent API; their dashboard
+   visualization is the next product phase.
 4. Keep spread at Token comparison level, not duplicated as a CEX or DEX
    property.
 5. Sort Tokens by aggregate volume across all cataloged markets, while keeping
@@ -39,7 +41,7 @@ python3 scripts/run_collection_cycle.py --profile full --publish-local
 # Daily schedule profile: incremental CEX/DEX OHLCV plus point-in-time TVL.
 python3 scripts/run_collection_cycle.py --profile daily --publish-local
 
-# Hourly schedule profile: CEX order-book plus DEX fixed-block pool-state depth.
+# Hourly profile: depth plus fixed-notional costs from the same captured states.
 python3 scripts/run_collection_cycle.py --profile depth --publish-local
 
 # Manual recovery profile: retry only the point-in-time TVL snapshot.
@@ -66,6 +68,9 @@ The CEX order-book bands, quote conversion, truncation rules, and raw-response
 audit trail are documented in `docs/cex-depth-data-contract.md`.
 The supported DEX invariant/tick models, fixed-block rule, unsupported statuses,
 and execution limitations are documented in `docs/dex-depth-data-contract.md`.
+The fixed-notional definition, quoted-cost formulas, fee scope, long-form
+files, statuses, and hard validation gates are documented in
+`docs/execution-cost-data-contract.md`.
 Collection profiles, locks, manifests, freshness thresholds, systemd timers,
 and recovery behavior are documented in `docs/collection-operations.md`.
 
@@ -97,6 +102,11 @@ are `deploy/systemd/cex-dex-dashboard.service.in`,
 - TVL is a source-reported point-in-time pool snapshot. CEX order-book depth
   and DEX pool-state depth are separately collected point-in-time snapshots.
   None is historical daily liquidity, and TVL is never converted into depth.
+- Fixed-notional quoted cost walks the original CEX levels or executes the
+  supported DEX V2 invariant captured by those collectors. DEX V3 execution is
+  explicitly unsupported in this release. Cost is never interpolated from the
+  four depth bands. CEX account fees and DEX gas/router/MEV costs stay
+  explicitly outside the quoted-cost fact.
 - Price spread and midpoint-relative bps compare the selected CEX pair and DEX
   pool only when both have prices on the same UTC date.
 

@@ -33,7 +33,12 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import Counter
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR, localcontext
+from decimal import (
+    Decimal,
+    InvalidOperation,
+    ROUND_FLOOR,
+    localcontext,
+)
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -41,6 +46,25 @@ try:
     import certifi
 except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
+
+try:
+    from scripts.execution_cost import (
+        EXECUTION_COST_COLUMNS,
+        EXECUTION_DIRECTIONS,
+        EXECUTION_NOTIONALS_USD,
+        execution_fact_row,
+        status_counts as execution_status_counts,
+        validate_execution_snapshot,
+    )
+except ModuleNotFoundError:
+    from execution_cost import (
+        EXECUTION_COST_COLUMNS,
+        EXECUTION_DIRECTIONS,
+        EXECUTION_NOTIONALS_USD,
+        execution_fact_row,
+        status_counts as execution_status_counts,
+        validate_execution_snapshot,
+    )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -52,9 +76,16 @@ DEFAULT_RAW_ROOT = PROJECT_ROOT / "data/raw/dex-depth"
 CURRENT_FILENAME = "dex_depth_snapshot.csv"
 LATEST_FILENAME = "dex_depth_latest.csv"
 HISTORY_FILENAME = "dex_depth_history.csv"
+EXECUTION_CURRENT_FILENAME = "dex_execution_cost_snapshot.csv"
+EXECUTION_LATEST_FILENAME = "dex_execution_cost_latest.csv"
 
 DEPTH_BANDS_BPS = (10, 25, 50, 100)
 DEX_DEPTH_METHOD = "fixed_block_pool_state_marginal_price_band"
+DEX_EXECUTION_METHOD = "fixed_block_pool_state_exact_target_quantity_v1"
+DEX_EXECUTION_REFERENCE = "pre_fee_pool_state_marginal_price"
+DEX_EXECUTION_EXCLUDED_COSTS = (
+    "gas,router_fee,token_transfer_tax,MEV,post_block_state_changes"
+)
 REQUEST_SLEEP_SECONDS = 0.15
 MAX_RETRIES = 4
 Q96 = Decimal(2**96)
@@ -195,7 +226,14 @@ def decimal_text(value: Decimal | int | float | str | None) -> str:
     number = finite_decimal(value)
     if number == 0:
         return "0"
-    return format(number.normalize(), "f")
+    # Decimal.normalize() applies the active context precision and can silently
+    # round large raw-unit facts.  Fixed-point formatting preserves every
+    # coefficient digit; only insignificant fractional trailing zeroes are
+    # removed.
+    text = format(number, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 def bool_text(value: bool) -> str:
@@ -533,6 +571,77 @@ def v2_band_amounts(
     }
 
 
+def _v2_integer(value: Decimal, *, label: str) -> int:
+    number = finite_decimal(value)
+    if number != number.to_integral_value():
+        raise ValueError(f"{label} must be an integer raw-unit value")
+    integer = int(number)
+    if integer <= 0:
+        raise ValueError(f"{label} must be positive")
+    return integer
+
+
+def _v2_fee_numerator(fee_bps: Decimal) -> int:
+    fee = finite_decimal(fee_bps)
+    if fee != fee.to_integral_value():
+        raise ValueError("V2 fee_bps must be an integer")
+    fee_integer = int(fee)
+    if not 0 <= fee_integer < 10_000:
+        raise ValueError("V2 fee_bps must be in [0, 10000)")
+    return 10_000 - fee_integer
+
+
+def v2_exact_input_quote(
+    reserve_in: Decimal,
+    reserve_out: Decimal,
+    fee_bps: Decimal,
+    amount_in: Decimal,
+) -> Decimal:
+    """Return integer quote output for one V2 exact-input swap."""
+    reserve_in_integer = _v2_integer(reserve_in, label="reserve_in")
+    reserve_out_integer = _v2_integer(reserve_out, label="reserve_out")
+    amount_in_integer = _v2_integer(amount_in, label="amount_in")
+    fee_denominator = 10_000
+    fee_numerator = _v2_fee_numerator(fee_bps)
+    amount_in_with_fee = amount_in_integer * fee_numerator
+    output = (
+        amount_in_with_fee
+        * reserve_out_integer
+        // (
+            reserve_in_integer * fee_denominator
+            + amount_in_with_fee
+        )
+    )
+    return Decimal(output)
+
+
+def v2_exact_output_quote(
+    reserve_in: Decimal,
+    reserve_out: Decimal,
+    fee_bps: Decimal,
+    amount_out: Decimal,
+) -> Decimal | None:
+    """Return integer gross input, or ``None`` when exact output is impossible."""
+    reserve_in_integer = _v2_integer(reserve_in, label="reserve_in")
+    reserve_out_integer = _v2_integer(reserve_out, label="reserve_out")
+    amount_out_integer = _v2_integer(amount_out, label="amount_out")
+    if amount_out_integer >= reserve_out_integer:
+        return None
+    fee_denominator = 10_000
+    fee_numerator = _v2_fee_numerator(fee_bps)
+    numerator = (
+        reserve_in_integer
+        * amount_out_integer
+        * fee_denominator
+    )
+    denominator = (
+        reserve_out_integer - amount_out_integer
+    ) * fee_numerator
+    # V2 getAmountIn-style implementations add one raw input unit after the
+    # exact integer division; Decimal context precision never participates.
+    return Decimal(numerator // denominator + 1)
+
+
 def tick_sqrt_ratio_x96(tick: int) -> Decimal:
     if not -887272 <= tick <= 887272:
         raise ValueError("tick outside Uniswap V3 bounds")
@@ -801,11 +910,371 @@ def pool_state_price_usd(
 ) -> Decimal:
     if raw_token1_per_token0 <= 0:
         raise ValueError("pool state price must be positive")
+    with localcontext() as context:
+        context.prec = 200
+        return (
+            raw_token1_per_token0 * token1_price
+            if target_position_index == 0
+            else token0_price / raw_token1_per_token0
+        )
+
+
+def dex_market_id(pool: dict[str, str]) -> str:
+    chain, address = pool_key(pool["chain"], pool["pool_address"])
     return (
-        raw_token1_per_token0 * token1_price
-        if target_position_index == 0
-        else token0_price / raw_token1_per_token0
+        f"dex:{chain}:{pool['dex'].strip().lower()}:"
+        f"{address}:{pool['token_symbol'].strip().upper()}"
     )
+
+
+def block_timestamp_text(block: dict[str, Any]) -> str:
+    from datetime import datetime, timezone
+
+    raw = block.get("timestamp")
+    if raw is None:
+        raise ValueError("fixed block is missing timestamp")
+    timestamp = int(raw, 16) if isinstance(raw, str) else int(raw)
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+
+
+def _execution_common(
+    pool: dict[str, str],
+    *,
+    snapshot_id: str,
+    request_started_at: str,
+    response_received_at: str,
+    protocol: str,
+    block_number: int | None = None,
+    block_timestamp: str = "",
+    source_endpoint: str = "",
+    raw_response_sha256: str = "",
+    target_token_address: str = "",
+    target_token_decimals: int | None = None,
+    quote_token_address: str = "",
+    quote_token_decimals: int | None = None,
+    fee_bps: Decimal | None = None,
+) -> dict[str, Any]:
+    common: dict[str, Any] = {
+        "snapshot_id": snapshot_id,
+        "source_snapshot_id": snapshot_id,
+        "calculation_method": DEX_EXECUTION_METHOD,
+        "observed_at": response_received_at,
+        "state_observed_at": block_timestamp,
+        "request_started_at": request_started_at,
+        "response_received_at": response_received_at,
+        "market_id": dex_market_id(pool),
+        "market_type": "dex",
+        "token_symbol": pool["token_symbol"].upper(),
+        "chain": pool["chain"].lower(),
+        "dex": pool["dex"].lower(),
+        "pool_address": pool["pool_address"],
+        "block_number": str(block_number) if block_number is not None else "",
+        "block_timestamp": block_timestamp,
+        "protocol_model": protocol,
+        "target_token_address": target_token_address,
+        "target_token_decimals": (
+            str(target_token_decimals)
+            if target_token_decimals is not None
+            else ""
+        ),
+        "quote_token_address": quote_token_address,
+        "quote_token_decimals": (
+            str(quote_token_decimals)
+            if quote_token_decimals is not None
+            else ""
+        ),
+        "reference_price_method": DEX_EXECUTION_REFERENCE,
+        "usd_price_source_snapshot_id": pool.get("snapshot_id", ""),
+        "usd_price_observed_at": (
+            pool.get("response_received_at")
+            or pool.get("observed_at")
+            or ""
+        ),
+        "fee_status": "included_protocol_fee" if fee_bps is not None else "",
+        "fee_rate_bps": decimal_text(fee_bps),
+        "usd_conversion_status": (
+            "observed_inventory_token_price"
+            if target_token_address and quote_token_address
+            else ""
+        ),
+        "excluded_costs": DEX_EXECUTION_EXCLUDED_COSTS,
+        "source": "fixed-block EVM JSON-RPC pool state",
+        "source_endpoint": source_endpoint,
+        "source_sequence": str(block_number) if block_number is not None else "",
+        "raw_response_sha256": raw_response_sha256,
+    }
+    return common
+
+
+def terminal_execution_rows(
+    pool: dict[str, str],
+    *,
+    snapshot_id: str,
+    request_started_at: str,
+    response_received_at: str,
+    protocol: str,
+    status: str,
+    status_reason: str,
+    error: str,
+    block_number: int | None = None,
+    block_timestamp: str = "",
+    source_endpoint: str = "",
+    raw_response_sha256: str = "",
+) -> list[dict[str, str]]:
+    common = _execution_common(
+        pool,
+        snapshot_id=snapshot_id,
+        request_started_at=request_started_at,
+        response_received_at=response_received_at,
+        protocol=protocol,
+        block_number=block_number,
+        block_timestamp=block_timestamp,
+        source_endpoint=source_endpoint,
+        raw_response_sha256=raw_response_sha256,
+    )
+    return [
+        execution_fact_row(
+            common=common,
+            direction=direction,
+            requested_notional_usd=notional,
+            status=status,
+            status_reason=status_reason,
+            error=error,
+        )
+        for notional in EXECUTION_NOTIONALS_USD
+        for direction in EXECUTION_DIRECTIONS
+    ]
+
+
+def _human_token1_per_token0(
+    reserve0_raw: Decimal,
+    reserve1_raw: Decimal,
+    token0_decimals: int,
+    token1_decimals: int,
+) -> Decimal:
+    if reserve0_raw <= 0 or reserve1_raw <= 0:
+        raise ValueError("pool ending reserves must be positive")
+    with localcontext() as context:
+        context.prec = 200
+        return (
+            reserve1_raw
+            / (Decimal(10) ** token1_decimals)
+            / (reserve0_raw / (Decimal(10) ** token0_decimals))
+        )
+
+
+def _target_quote_ratio(
+    token1_per_token0: Decimal,
+    target_position_index: int,
+) -> Decimal:
+    if token1_per_token0 <= 0:
+        raise ValueError("pool target/quote ratio must be positive")
+    with localcontext() as context:
+        context.prec = 200
+        return (
+            token1_per_token0
+            if target_position_index == 0
+            else Decimal(1) / token1_per_token0
+        )
+
+
+def _quantized_target(
+    requested_notional_usd: Decimal,
+    reference_price_quote_per_token: Decimal,
+    quote_to_usd: Decimal,
+    target_decimals: int,
+) -> tuple[Decimal, Decimal]:
+    scale = Decimal(10) ** target_decimals
+    with localcontext() as context:
+        context.prec = 200
+        raw = (
+            requested_notional_usd
+            / (reference_price_quote_per_token * quote_to_usd)
+            * scale
+        ).to_integral_value(rounding=ROUND_FLOOR)
+    if raw <= 0:
+        raise ValueError("execution target is below one Token base unit")
+    return raw, raw / scale
+
+
+def v2_execution_rows(
+    pool: dict[str, str],
+    *,
+    common: dict[str, Any],
+    target_position_index: int,
+    token0_decimals: int,
+    token1_decimals: int,
+    token0_price: Decimal,
+    token1_price: Decimal,
+    reserve0: Decimal,
+    reserve1: Decimal,
+    fee_bps: Decimal,
+) -> list[dict[str, str]]:
+    """Calculate V2 execution facts under a precision-safe Decimal context."""
+    with localcontext() as context:
+        context.prec = 200
+        return _v2_execution_rows(
+            pool,
+            common=common,
+            target_position_index=target_position_index,
+            token0_decimals=token0_decimals,
+            token1_decimals=token1_decimals,
+            token0_price=token0_price,
+            token1_price=token1_price,
+            reserve0=reserve0,
+            reserve1=reserve1,
+            fee_bps=fee_bps,
+        )
+
+
+def _v2_execution_rows(
+    pool: dict[str, str],
+    *,
+    common: dict[str, Any],
+    target_position_index: int,
+    token0_decimals: int,
+    token1_decimals: int,
+    token0_price: Decimal,
+    token1_price: Decimal,
+    reserve0: Decimal,
+    reserve1: Decimal,
+    fee_bps: Decimal,
+) -> list[dict[str, str]]:
+    scale0 = Decimal(10) ** token0_decimals
+    scale1 = Decimal(10) ** token1_decimals
+    starting_ratio = _human_token1_per_token0(
+        reserve0,
+        reserve1,
+        token0_decimals,
+        token1_decimals,
+    )
+    reference_quote = _target_quote_ratio(starting_ratio, target_position_index)
+    quote_to_usd = token1_price if target_position_index == 0 else token0_price
+    target_scale = scale0 if target_position_index == 0 else scale1
+    quote_scale = scale1 if target_position_index == 0 else scale0
+    rows: list[dict[str, str]] = []
+
+    for notional in EXECUTION_NOTIONALS_USD:
+        target_raw, target_quantity = _quantized_target(
+            notional,
+            reference_quote,
+            quote_to_usd,
+            token0_decimals if target_position_index == 0 else token1_decimals,
+        )
+        if target_position_index == 0:
+            sell_quote_raw = v2_exact_input_quote(
+                reserve0, reserve1, fee_bps, target_raw
+            )
+            sell_ending_ratio = _human_token1_per_token0(
+                reserve0 + target_raw,
+                reserve1 - sell_quote_raw,
+                token0_decimals,
+                token1_decimals,
+            )
+            buy_quote_raw = v2_exact_output_quote(
+                reserve1, reserve0, fee_bps, target_raw
+            )
+            buy_ending_ratio = (
+                _human_token1_per_token0(
+                    reserve0 - target_raw,
+                    reserve1 + buy_quote_raw,
+                    token0_decimals,
+                    token1_decimals,
+                )
+                if buy_quote_raw is not None
+                else None
+            )
+        else:
+            sell_quote_raw = v2_exact_input_quote(
+                reserve1, reserve0, fee_bps, target_raw
+            )
+            sell_ending_ratio = _human_token1_per_token0(
+                reserve0 - sell_quote_raw,
+                reserve1 + target_raw,
+                token0_decimals,
+                token1_decimals,
+            )
+            buy_quote_raw = v2_exact_output_quote(
+                reserve0, reserve1, fee_bps, target_raw
+            )
+            buy_ending_ratio = (
+                _human_token1_per_token0(
+                    reserve0 + buy_quote_raw,
+                    reserve1 - target_raw,
+                    token0_decimals,
+                    token1_decimals,
+                )
+                if buy_quote_raw is not None
+                else None
+            )
+
+        rows.append(
+            execution_fact_row(
+                common=common,
+                direction="sell_token",
+                requested_notional_usd=notional,
+                status="observed",
+                status_reason="full_target_quantity_filled",
+                reference_price_quote_per_token=reference_quote,
+                quote_to_usd=quote_to_usd,
+                target_token_quantity=target_quantity,
+                filled_token_quantity=target_quantity,
+                quote_amount=sell_quote_raw / quote_scale,
+                levels_or_ticks_consumed=1,
+                ending_marginal_price_quote_per_token=_target_quote_ratio(
+                    sell_ending_ratio,
+                    target_position_index,
+                ),
+            )
+        )
+        if buy_quote_raw is None:
+            rows.append(
+                execution_fact_row(
+                    common=common,
+                    direction="buy_token",
+                    requested_notional_usd=notional,
+                    status="partial",
+                    status_reason="full_pool_reserve_insufficient",
+                    reference_price_quote_per_token=reference_quote,
+                    quote_to_usd=quote_to_usd,
+                    target_token_quantity=target_quantity,
+                )
+            )
+        else:
+            assert buy_ending_ratio is not None
+            rows.append(
+                execution_fact_row(
+                    common=common,
+                    direction="buy_token",
+                    requested_notional_usd=notional,
+                    status="observed",
+                    status_reason="full_target_quantity_filled",
+                    reference_price_quote_per_token=reference_quote,
+                    quote_to_usd=quote_to_usd,
+                    target_token_quantity=target_quantity,
+                    filled_token_quantity=target_quantity,
+                    quote_amount=buy_quote_raw / quote_scale,
+                    levels_or_ticks_consumed=1,
+                    ending_marginal_price_quote_per_token=_target_quote_ratio(
+                        buy_ending_ratio,
+                        target_position_index,
+                    ),
+                )
+            )
+    return rows
+
+
+def _sqrt_human_token1_per_token0(
+    sqrt_price_x96: Decimal,
+    token0_decimals: int,
+    token1_decimals: int,
+) -> Decimal:
+    with localcontext() as context:
+        context.prec = 100
+        return (
+            (sqrt_price_x96 / Q96) ** 2
+            * (Decimal(10) ** (token0_decimals - token1_decimals))
+        )
 
 
 def observed_pool_row(
@@ -813,11 +1282,12 @@ def observed_pool_row(
     *,
     snapshot_id: str,
     block_number: int,
+    block_timestamp: str,
     client: RpcClient,
     request_started_at: str,
     raw_response_sha256: str,
     protocol: str,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], list[dict[str, str]]]:
     block_tag = hex(block_number)
     pool_address = pool["pool_address"].lower()
     price_map = price_map_from_inventory(pool)
@@ -907,9 +1377,11 @@ def observed_pool_row(
                 "zero_complete": True,
                 "one_complete": True,
             }
-        raw_ratio = (
-            reserve1 / (Decimal(10) ** token1_decimals)
-            / (reserve0 / (Decimal(10) ** token0_decimals))
+        raw_ratio = _human_token1_per_token0(
+            reserve0,
+            reserve1,
+            token0_decimals,
+            token1_decimals,
         )
     else:
         assert sqrt_price_x96 is not None
@@ -978,11 +1450,13 @@ def observed_pool_row(
         token0_price=token0_price,
         token1_price=token1_price,
     )
-    price_difference_bps = (
-        abs(state_price - source_target_price)
-        / ((state_price + source_target_price) / Decimal(2))
-        * Decimal(10_000)
-    )
+    with localcontext() as context:
+        context.prec = 200
+        price_difference_bps = (
+            abs(state_price - source_target_price)
+            / ((state_price + source_target_price) / Decimal(2))
+            * Decimal(10_000)
+        )
     row.update(
         {
             "protocol_model": protocol,
@@ -1020,7 +1494,79 @@ def observed_pool_row(
         if all(row[f"depth_{band}bps_complete"] == "1" for band in DEPTH_BANDS_BPS)
         else "partial"
     )
-    return row
+    response_received_at = row["response_received_at"]
+    if protocol == "concentrated_liquidity_v3":
+        # The depth bands above are valid pool-state facts, but producing an
+        # executable V3 quote requires protocol-identical integer swap math at
+        # every step and tick crossing.  The removed continuous Decimal
+        # approximation was not strong enough to publish as an exact fact.
+        return row, terminal_execution_rows(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            protocol=protocol,
+            status="unsupported",
+            status_reason="exact_integer_swap_math_not_implemented",
+            error="V3 exact integer swap math is not implemented",
+            block_number=block_number,
+            block_timestamp=block_timestamp,
+            source_endpoint=client.endpoint,
+            raw_response_sha256=raw_response_sha256,
+        )
+
+    target_token = token0 if target_index == 0 else token1
+    quote_token = token1 if target_index == 0 else token0
+    target_decimals = token0_decimals if target_index == 0 else token1_decimals
+    quote_decimals = token1_decimals if target_index == 0 else token0_decimals
+    try:
+        common = _execution_common(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            protocol=protocol,
+            block_number=block_number,
+            block_timestamp=block_timestamp,
+            source_endpoint=client.endpoint,
+            raw_response_sha256=raw_response_sha256,
+            target_token_address=target_token,
+            target_token_decimals=target_decimals,
+            quote_token_address=quote_token,
+            quote_token_decimals=quote_decimals,
+            fee_bps=fee_bps,
+        )
+        execution_rows = v2_execution_rows(
+            pool,
+            common=common,
+            target_position_index=target_index,
+            token0_decimals=token0_decimals,
+            token1_decimals=token1_decimals,
+            token0_price=token0_price,
+            token1_price=token1_price,
+            reserve0=reserve0,
+            reserve1=reserve1,
+            fee_bps=fee_bps,
+        )
+    except Exception as execution_error:
+        # Depth is already a valid independent fact at this point.  A defect or
+        # unsupported edge in the derived execution calculation must not erase
+        # that successfully observed pool-state snapshot.
+        execution_rows = terminal_execution_rows(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            protocol=protocol,
+            status="failed",
+            status_reason="execution_calculation_failed",
+            error=f"{type(execution_error).__name__}: {execution_error}",
+            block_number=block_number,
+            block_timestamp=block_timestamp,
+            source_endpoint=client.endpoint,
+            raw_response_sha256=raw_response_sha256,
+        )
+    return row, execution_rows
 
 
 def raw_transcript_bytes(
@@ -1050,13 +1596,13 @@ def raw_transcript_bytes(
     ).encode("utf-8")
 
 
-def collect_dex_depth(
+def collect_dex_depth_with_execution(
     pools: list[dict[str, str]],
     *,
     raw_root: Path = DEFAULT_RAW_ROOT,
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
     rpc_factory: Callable[[str, str], RpcClient] = RpcClient,
-) -> tuple[str, list[dict[str, str]]]:
+) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
     from datetime import datetime, timezone
 
     snapshot_id = (
@@ -1068,7 +1614,9 @@ def collect_dex_depth(
     snapshot_raw_dir.mkdir(parents=True, exist_ok=False)
     clients: dict[str, RpcClient] = {}
     blocks: dict[str, int] = {}
+    block_timestamps: dict[str, str] = {}
     rows: list[dict[str, str]] = []
+    execution_rows: list[dict[str, str]] = []
 
     for index, pool in enumerate(pools, start=1):
         request_started_at = utc_now_text()
@@ -1078,14 +1626,27 @@ def collect_dex_depth(
             pool["pool_address"],
         )
         if protocol == "unsupported":
+            response_received_at = utc_now_text()
             row = unsupported_row(
                 pool,
                 snapshot_id=snapshot_id,
                 request_started_at=request_started_at,
-                response_received_at=utc_now_text(),
+                response_received_at=response_received_at,
                 reason=unsupported_reason,
             )
             rows.append(row)
+            execution_rows.extend(
+                terminal_execution_rows(
+                    pool,
+                    snapshot_id=snapshot_id,
+                    request_started_at=request_started_at,
+                    response_received_at=response_received_at,
+                    protocol="unsupported",
+                    status="unsupported",
+                    status_reason="unsupported_protocol_or_chain",
+                    error=unsupported_reason,
+                )
+            )
             print(
                 f"[{index}/{len(pools)}] {pool['token_symbol']} "
                 f"{pool['chain']} {pool['dex']}: unsupported",
@@ -1096,29 +1657,58 @@ def collect_dex_depth(
         chain = pool["chain"].lower()
         rpc_url = rpc_url_for_chain(chain)
         if not rpc_url:
+            response_received_at = utc_now_text()
+            reason = f"missing_rpc_endpoint:{chain}"
             row = unsupported_row(
                 pool,
                 snapshot_id=snapshot_id,
                 request_started_at=request_started_at,
-                response_received_at=utc_now_text(),
-                reason=f"missing_rpc_endpoint:{chain}",
+                response_received_at=response_received_at,
+                reason=reason,
             )
             rows.append(row)
+            execution_rows.extend(
+                terminal_execution_rows(
+                    pool,
+                    snapshot_id=snapshot_id,
+                    request_started_at=request_started_at,
+                    response_received_at=response_received_at,
+                    protocol="unsupported",
+                    status="unsupported",
+                    status_reason="unsupported_protocol_or_chain",
+                    error=reason,
+                )
+            )
             continue
         client = clients.setdefault(chain, rpc_factory(chain, rpc_url))
-        if chain not in blocks:
-            blocks[chain] = client.block_number()
-        block_number = blocks[chain]
         record_start = len(client.records)
+        block_number = blocks.get(chain)
+        block_timestamp = block_timestamps.get(chain, "")
         raw_path = (
             snapshot_raw_dir
             / f"{index:03d}-{chain}-{pool['token_symbol']}-{pool['dex']}.json"
         )
         try:
-            row = observed_pool_row(
+            if block_number is None:
+                block_number = client.block_number()
+                block = client.block(hex(block_number))
+                returned_number = block.get("number")
+                if returned_number is not None:
+                    normalized_number = (
+                        int(returned_number, 16)
+                        if isinstance(returned_number, str)
+                        else int(returned_number)
+                    )
+                    if normalized_number != block_number:
+                        raise ValueError("fixed block response number does not match")
+                block_timestamp = block_timestamp_text(block)
+                blocks[chain] = block_number
+                block_timestamps[chain] = block_timestamp
+            row, pool_execution_rows = observed_pool_row(
                 pool,
                 snapshot_id=snapshot_id,
                 block_number=block_number,
+                block_timestamp=block_timestamp,
                 client=client,
                 request_started_at=request_started_at,
                 raw_response_sha256="",
@@ -1131,7 +1721,10 @@ def collect_dex_depth(
                 records=client.records[record_start:],
             )
             raw_path.write_bytes(transcript)
-            row["raw_response_sha256"] = hashlib.sha256(transcript).hexdigest()
+            raw_hash = hashlib.sha256(transcript).hexdigest()
+            row["raw_response_sha256"] = raw_hash
+            for execution_row in pool_execution_rows:
+                execution_row["raw_response_sha256"] = raw_hash
         except Exception as error:
             transcript = raw_transcript_bytes(
                 pool=pool,
@@ -1141,23 +1734,42 @@ def collect_dex_depth(
                 error=error,
             )
             raw_path.write_bytes(transcript)
+            raw_hash = hashlib.sha256(transcript).hexdigest()
+            response_received_at = utc_now_text()
             row = base_row(
                 pool,
                 snapshot_id=snapshot_id,
                 request_started_at=request_started_at,
-                response_received_at=utc_now_text(),
+                response_received_at=response_received_at,
             )
             row.update(
                 {
                     "protocol_model": protocol,
-                    "block_number": str(block_number),
+                    "block_number": (
+                        str(block_number) if block_number is not None else ""
+                    ),
                     "source_endpoint": client.endpoint,
-                    "raw_response_sha256": hashlib.sha256(transcript).hexdigest(),
+                    "raw_response_sha256": raw_hash,
                     "status": "failed",
                     "error": f"{type(error).__name__}: {error}",
                 }
             )
+            pool_execution_rows = terminal_execution_rows(
+                pool,
+                snapshot_id=snapshot_id,
+                request_started_at=request_started_at,
+                response_received_at=response_received_at,
+                protocol=protocol,
+                status="failed",
+                status_reason="pool_state_collection_failed",
+                error=f"{type(error).__name__}: {error}",
+                block_number=block_number,
+                block_timestamp=block_timestamp,
+                source_endpoint=client.endpoint,
+                raw_response_sha256=raw_hash,
+            )
         rows.append(row)
+        execution_rows.extend(pool_execution_rows)
         print(
             f"[{index}/{len(pools)}] {pool['token_symbol']} "
             f"{pool['chain']} {pool['dex']}: {row['status']}",
@@ -1172,7 +1784,13 @@ def collect_dex_depth(
         "pool_count": len(rows),
         "token_count": len({row["token_symbol"] for row in rows}),
         "chain_blocks": blocks,
+        "chain_block_timestamps": block_timestamps,
         "depth_bands_bps": list(DEPTH_BANDS_BPS),
+        "execution_notionals_usd": [
+            int(value) for value in EXECUTION_NOTIONALS_USD
+        ],
+        "execution_row_count": len(execution_rows),
+        "execution_status_counts": execution_status_counts(execution_rows),
         "status_counts": dict(Counter(row["status"] for row in rows)),
         "raw_files": sorted(path.name for path in snapshot_raw_dir.glob("*.json")),
     }
@@ -1181,6 +1799,27 @@ def collect_dex_depth(
         encoding="utf-8",
     )
     validate_snapshot(pools, rows)
+    validate_execution_snapshot(
+        [dex_market_id(pool) for pool in pools],
+        execution_rows,
+    )
+    return snapshot_id, rows, execution_rows
+
+
+def collect_dex_depth(
+    pools: list[dict[str, str]],
+    *,
+    raw_root: Path = DEFAULT_RAW_ROOT,
+    sleep_seconds: float = REQUEST_SLEEP_SECONDS,
+    rpc_factory: Callable[[str, str], RpcClient] = RpcClient,
+) -> tuple[str, list[dict[str, str]]]:
+    """Backward-compatible depth-only return shape."""
+    snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
+        pools,
+        raw_root=raw_root,
+        sleep_seconds=sleep_seconds,
+        rpc_factory=rpc_factory,
+    )
     return snapshot_id, rows
 
 
@@ -1247,6 +1886,29 @@ def atomic_write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def atomic_write_execution_csv(
+    path: Path,
+    rows: list[dict[str, str]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=EXECUTION_COST_COLUMNS,
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(
+                {field: row.get(field, "") for field in EXECUTION_COST_COLUMNS}
+                for row in rows
+            )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def publish_snapshot(
     rows: list[dict[str, str]],
     *,
@@ -1300,6 +1962,41 @@ def publish_snapshot(
     return result
 
 
+def publish_execution_snapshot(
+    rows: list[dict[str, str]],
+    *,
+    expected_market_ids: Iterable[str],
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    publish_dir: Path | None = None,
+) -> dict[str, Any]:
+    # Publication is the hard boundary: a caller cannot write a superficially
+    # valid subset that omits one inventory market or one of its ten scenarios.
+    validate_execution_snapshot(expected_market_ids, rows)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    current_path = output_dir / EXECUTION_CURRENT_FILENAME
+    atomic_write_execution_csv(current_path, rows)
+    result: dict[str, Any] = {
+        "execution_current_path": str(current_path),
+        "execution_row_count": len(rows),
+    }
+    if publish_dir is None:
+        return result
+
+    publish_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_execution_csv(
+        publish_dir / EXECUTION_LATEST_FILENAME,
+        rows,
+    )
+    result.update(
+        {
+            "execution_latest_path": str(
+                publish_dir / EXECUTION_LATEST_FILENAME
+            ),
+        }
+    )
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect fixed-block DEX pool-state depth"
@@ -1321,11 +2018,22 @@ def parse_filter(value: str | None, *, upper: bool) -> set[str]:
     return {transform(item.strip()) for item in value.split(",") if item.strip()}
 
 
+def ensure_full_publish_scope(
+    publish_local: bool,
+    *filters: set[str],
+) -> None:
+    if publish_local and any(filters):
+        raise ValueError(
+            "--publish-local cannot be combined with token or chain filters"
+        )
+
+
 def main() -> None:
     args = parse_args()
     pools = load_pool_inventory(args.tvl_csv)
     tokens = parse_filter(args.tokens, upper=True)
     chains = parse_filter(args.chains, upper=False)
+    ensure_full_publish_scope(args.publish_local, tokens, chains)
     if tokens:
         pools = [row for row in pools if row["token_symbol"].upper() in tokens]
     if chains:
@@ -1333,7 +2041,7 @@ def main() -> None:
     if not pools:
         raise ValueError("No DEX pools match the requested filters")
 
-    snapshot_id, rows = collect_dex_depth(
+    snapshot_id, rows, execution_rows = collect_dex_depth_with_execution(
         pools,
         raw_root=args.raw_root,
         sleep_seconds=max(0.0, args.sleep_seconds),
@@ -1343,6 +2051,14 @@ def main() -> None:
         output_dir=args.output_dir,
         publish_dir=DEFAULT_PUBLISH_DIR if args.publish_local else None,
     )
+    result.update(
+        publish_execution_snapshot(
+            execution_rows,
+            expected_market_ids=[dex_market_id(pool) for pool in pools],
+            output_dir=args.output_dir,
+            publish_dir=DEFAULT_PUBLISH_DIR if args.publish_local else None,
+        )
+    )
     counts = Counter(row["status"] for row in rows)
     result.update(
         {
@@ -1350,6 +2066,9 @@ def main() -> None:
             "token_count": len({row["token_symbol"] for row in rows}),
             "pool_count": len(rows),
             "status_counts": dict(counts),
+            "execution_status_counts": execution_status_counts(
+                execution_rows
+            ),
         }
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

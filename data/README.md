@@ -45,8 +45,37 @@ CEX order-book depth also has a separate point-in-time lifecycle:
 Depth publication does not rebuild the historical SQLite database. The server
 overlays the latest snapshot on the cataloged CEX market identities.
 
-CSV remains the interchange and audit format. The web API does not scan CSV
-when `market_facts.sqlite3` is present.
+DEX fixed-block depth has the matching point-in-time lifecycle:
+
+- `data/processed/dex_depth_snapshot.csv` is the current calculation awaiting
+  review;
+- `data/local/dex_depth_latest.csv` is the latest complete pool inventory;
+- `data/local/dex_depth_history.csv` is append-only normalized history;
+- `data/raw/dex-depth/<snapshot_id>/` retains fixed-block JSON-RPC transcripts
+  and a manifest.
+
+Fixed-notional quoted execution cost is published independently from both
+catalog and depth rows:
+
+- `data/processed/{cex,dex}_execution_cost_snapshot.csv` contains the current
+  calculation;
+- `data/local/{cex,dex}_execution_cost_latest.csv` contains exactly ten
+  scenarios per current market.
+
+The execution files reuse the corresponding depth raw hash and source snapshot.
+They are validated as five notionals by two directions per market. Partial,
+unsupported, and failed full-request costs remain blank. The public endpoint
+keeps measured Decimals as exact base-10 strings rather than lossy JSON floats.
+
+There is intentionally no monolithic execution-cost history CSV. Hourly
+market-by-direction-by-notional rows would make that file grow without bound
+and force every collection to reread, sort, and rewrite all history. Raw depth
+transcripts and manifests remain available for audit. A future historical store
+must use immutable date/snapshot partitions with an explicit retention policy.
+
+CSV remains the interchange and audit format. Daily market APIs do not scan
+their source CSVs when `market_facts.sqlite3` is present; point-in-time TVL,
+depth, and execution overlays read their separately validated latest files.
 
 ## Publish workflow
 
@@ -78,8 +107,8 @@ Coordinated collection state lives under `data/local/collection/`:
 - `collection.lock` prevents daily and hourly timers from writing concurrently.
 
 The cycle manifest does not claim a cross-source atomic transaction. Daily
-SQLite, TVL latest/history, and CEX depth latest/history each retain their own
-atomic publication boundary.
+SQLite, TVL, CEX/DEX depth, and each CEX/DEX execution latest snapshot retain
+their own atomic publication boundary.
 
 The server opens the database read-only. Set `MARKET_DATABASE` to select a
 specific file, or `MARKET_DATA_DIR` to select the directory containing it.

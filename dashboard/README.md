@@ -107,6 +107,12 @@ CSVs and a validated SQLite database back into `data/local/`.
   selected snapshots are not claimed to be synchronized.
 - `/api/markets/catalog` is the audit entrypoint; `/api/markets/compare` accepts
   only cataloged market IDs for the requested Token.
+- `/api/markets/execution-cost` accepts the same exact Token/A/B identities and
+  returns the separate long-form $1k/$5k/$10k/$50k/$100k quoted-cost facts.
+  It states CEX/DEX fee scope, exclusions, source snapshots, partial reasons,
+  and snapshot skew; it never derives cost from the four depth markers.
+  Requested notionals are JSON numbers, while measured Decimal facts are exact
+  base-10 strings (or `null`) to avoid silent IEEE-754 precision loss.
 
 Catalog version 2 distinguishes a stable DEX `pool_id` from a globally unique
 token-price-series `market_id`. This prevents one pool observed from both token
@@ -114,10 +120,10 @@ perspectives, or a pool whose displayed fee label changes, from producing
 ambiguous selectors.
 
 Public fact responses use a signature-aware, one-minute in-process cache. The
-cache key includes every published daily, TVL, CEX-depth, and DEX-depth source,
-so a changed snapshot invalidates both the assembled payload and compressed
-JSON response. Concurrent cold misses are single-flight to avoid duplicate
-catalog builds and gzip work.
+cache key includes every published daily, TVL, CEX-depth, DEX-depth, and
+execution-cost source, so a changed snapshot invalidates both the assembled
+payload and compressed JSON response. Concurrent cold misses are single-flight
+to avoid duplicate catalog builds and gzip work.
 
 ## Production boundary
 

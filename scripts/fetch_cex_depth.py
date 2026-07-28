@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -53,6 +53,14 @@ try:
         make_okx_inst_id,
         make_upbit_market_candidates,
     )
+    from scripts.execution_cost import (
+        EXECUTION_COST_COLUMNS,
+        EXECUTION_DIRECTIONS,
+        EXECUTION_NOTIONALS_USD,
+        execution_fact_row,
+        status_counts as execution_status_counts,
+        validate_execution_snapshot,
+    )
 except ModuleNotFoundError:
     from fetch_cex import (
         make_binance_symbol,
@@ -68,6 +76,14 @@ except ModuleNotFoundError:
         make_okx_inst_id,
         make_upbit_market_candidates,
     )
+    from execution_cost import (
+        EXECUTION_COST_COLUMNS,
+        EXECUTION_DIRECTIONS,
+        EXECUTION_NOTIONALS_USD,
+        execution_fact_row,
+        status_counts as execution_status_counts,
+        validate_execution_snapshot,
+    )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +97,8 @@ TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where()) if certifi else
 CURRENT_FILENAME = "cex_depth_snapshot.csv"
 LATEST_FILENAME = "cex_depth_latest.csv"
 HISTORY_FILENAME = "cex_depth_history.csv"
+EXECUTION_CURRENT_FILENAME = "cex_execution_cost_snapshot.csv"
+EXECUTION_LATEST_FILENAME = "cex_execution_cost_latest.csv"
 DEPTH_BANDS_BPS = (10, 25, 50, 100)
 REQUEST_SLEEP_SECONDS = 0.15
 MAX_RETRIES = 3
@@ -633,6 +651,9 @@ def upbit_book(
             result["quote_to_usd"] = Decimal(1) / krw_per_usdt
             result["quote_conversion_endpoint"] = fx_url
             result["quote_conversion_response_sha256"] = hashlib.sha256(fx_raw).hexdigest()
+            result["quote_conversion_observed_at"] = (
+                fx_book.get("source_observed_at") or ""
+            )
             result["quote_conversion_raw"] = fx_raw
             return result
         except Exception as error:
@@ -726,6 +747,197 @@ def depth_metrics(
         result[f"total_depth_{band}bps_usd"] = decimal_text(bid_depth + ask_depth)
         result[f"depth_{band}bps_complete"] = "1" if bid_complete and ask_complete else "0"
     return result
+
+
+def _walk_book_for_base_quantity(
+    levels: list[tuple[Decimal, Decimal]],
+    target_base_quantity: Decimal,
+) -> tuple[Decimal, Decimal, int, Decimal | None, bool]:
+    """Walk normalized levels and partially consume only the final price level."""
+    target = finite_decimal(target_base_quantity, positive=True)
+    with localcontext() as context:
+        context.prec = 100
+        filled = Decimal(0)
+        quote_amount = Decimal(0)
+        remaining = target
+        levels_consumed = 0
+        ending_price: Decimal | None = None
+        for price_value, quantity_value in levels:
+            price = finite_decimal(price_value, positive=True)
+            quantity = finite_decimal(quantity_value, positive=True)
+            take = min(quantity, remaining)
+            filled += take
+            quote_amount += price * take
+            remaining -= take
+            levels_consumed += 1
+            ending_price = price
+            if remaining == 0:
+                break
+    return filled, quote_amount, levels_consumed, ending_price, remaining == 0
+
+
+def cex_market_id(market: dict[str, str]) -> str:
+    return (
+        f"cex:{market['exchange'].lower()}:"
+        f"{market['cex_symbol'].upper()}"
+    )
+
+
+def usd_conversion_status(book: dict[str, Any]) -> str:
+    quote_asset = str(book["source_quote_asset"]).upper()
+    if quote_asset == "USD":
+        return "identity_usd"
+    if quote_asset == "USDT":
+        return "proxy_usdt_equals_usd"
+    if quote_asset == "KRW":
+        return "observed_krw_usdt_midpoint_with_usdt_usd_proxy"
+    return "observed_quote_conversion"
+
+
+def execution_rows_for_book(
+    market: dict[str, str],
+    book: dict[str, Any],
+    *,
+    snapshot_id: str,
+    request_started_at: str,
+    response_received_at: str,
+) -> list[dict[str, str]]:
+    """Build ten long-form CEX execution facts from the same raw depth book."""
+    conversion = finite_decimal(book["quote_to_usd"], positive=True)
+    with localcontext() as context:
+        context.prec = 100
+        midpoint = (
+            book["bids"][0][0] + book["asks"][0][0]
+        ) / Decimal(2)
+    state_observed_at = book.get("source_observed_at") or response_received_at
+    common = {
+        "snapshot_id": snapshot_id,
+        "source_snapshot_id": snapshot_id,
+        "calculation_method": "normalized_order_book_level_walk",
+        "observed_at": state_observed_at,
+        "state_observed_at": state_observed_at,
+        "request_started_at": request_started_at,
+        "response_received_at": response_received_at,
+        "market_id": cex_market_id(market),
+        "market_type": "cex",
+        "token_symbol": market["token_symbol"].upper(),
+        "exchange": market["exchange"].lower(),
+        "cex_symbol": market["cex_symbol"].upper(),
+        "source_instrument": book["source_instrument"],
+        "base_asset": market["cex_symbol"].split("/", 1)[0].upper(),
+        "source_quote_asset": book["source_quote_asset"],
+        "reference_price_method": "order_book_midpoint",
+        "usd_price_source_snapshot_id": (
+            snapshot_id if book.get("quote_conversion_response_sha256") else ""
+        ),
+        "usd_price_observed_at": book.get("quote_conversion_observed_at", ""),
+        "fee_status": "excluded_unknown_account_tier",
+        "usd_conversion_status": usd_conversion_status(book),
+        "excluded_costs": "taker_fee,lot_size,latency",
+        "source": f"{market['exchange']} public spot order-book API",
+        "source_endpoint": book["source_endpoint"],
+        "source_sequence": book.get("source_sequence", ""),
+        "raw_response_sha256": hashlib.sha256(book["raw"]).hexdigest(),
+    }
+    full_book_reported = bool(book.get("full_book_reported"))
+    rows: list[dict[str, str]] = []
+    with localcontext() as context:
+        context.prec = 100
+        midpoint_usd = midpoint * conversion
+        for notional in EXECUTION_NOTIONALS_USD:
+            target_base_quantity = notional / midpoint_usd
+            for direction, levels in (
+                ("sell_token", book["bids"]),
+                ("buy_token", book["asks"]),
+            ):
+                (
+                    filled,
+                    quote_amount,
+                    levels_consumed,
+                    ending_price,
+                    complete,
+                ) = _walk_book_for_base_quantity(
+                    levels,
+                    target_base_quantity,
+                )
+                if complete:
+                    status = "observed"
+                    status_reason = "target_filled"
+                elif full_book_reported:
+                    status = "partial"
+                    status_reason = "full_book_insufficient_liquidity"
+                else:
+                    status = "partial"
+                    status_reason = "source_level_limit"
+                rows.append(
+                    execution_fact_row(
+                        common=common,
+                        direction=direction,
+                        requested_notional_usd=notional,
+                        status=status,
+                        status_reason=status_reason,
+                        reference_price_quote_per_token=midpoint,
+                        quote_to_usd=conversion,
+                        target_token_quantity=target_base_quantity,
+                        filled_token_quantity=filled,
+                        quote_amount=quote_amount,
+                        levels_or_ticks_consumed=levels_consumed,
+                        ending_marginal_price_quote_per_token=ending_price,
+                    )
+                )
+    return rows
+
+
+def failed_execution_rows(
+    market: dict[str, str],
+    *,
+    snapshot_id: str,
+    request_started_at: str,
+    response_received_at: str,
+    error: Exception,
+    source_endpoint: str = "",
+    source_instrument: str = "",
+    source_quote_asset: str = "",
+    source_sequence: str = "",
+    raw_response_sha256: str = "",
+    status_reason: str = "order_book_fetch_or_normalization_failed",
+) -> list[dict[str, str]]:
+    common = {
+        "snapshot_id": snapshot_id,
+        "source_snapshot_id": snapshot_id,
+        "calculation_method": "normalized_order_book_level_walk",
+        "observed_at": response_received_at,
+        "state_observed_at": "",
+        "request_started_at": request_started_at,
+        "response_received_at": response_received_at,
+        "market_id": cex_market_id(market),
+        "market_type": "cex",
+        "token_symbol": market["token_symbol"].upper(),
+        "exchange": market["exchange"].lower(),
+        "cex_symbol": market["cex_symbol"].upper(),
+        "source_instrument": source_instrument,
+        "base_asset": market["cex_symbol"].split("/", 1)[0].upper(),
+        "source_quote_asset": source_quote_asset,
+        "fee_status": "excluded_unknown_account_tier",
+        "excluded_costs": "taker_fee,lot_size,latency",
+        "source": f"{market['exchange']} public spot order-book API",
+        "source_endpoint": source_endpoint,
+        "source_sequence": source_sequence,
+        "raw_response_sha256": raw_response_sha256,
+    }
+    error_text = f"{type(error).__name__}: {error}"
+    return [
+        execution_fact_row(
+            common=common,
+            direction=direction,
+            requested_notional_usd=notional,
+            status="failed",
+            status_reason=status_reason,
+            error=error_text,
+        )
+        for notional in EXECUTION_NOTIONALS_USD
+        for direction in EXECUTION_DIRECTIONS
+    ]
 
 
 def base_row(
@@ -843,17 +1055,18 @@ def safe_component(value: str) -> str:
     return "".join(character if character.isalnum() else "-" for character in value).strip("-")
 
 
-def collect_depth(
+def collect_depth_with_execution(
     markets: list[dict[str, str]],
     *,
     raw_root: Path = DEFAULT_RAW_ROOT,
     request: Callable[[str], tuple[Any, bytes]] = request_json,
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
-) -> tuple[str, list[dict[str, str]]]:
+) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
     snapshot_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     snapshot_raw_dir = raw_root / snapshot_id
     snapshot_raw_dir.mkdir(parents=True, exist_ok=False)
     rows: list[dict[str, str]] = []
+    execution_rows: list[dict[str, str]] = []
 
     for index, market in enumerate(markets, start=1):
         request_started_at = utc_now_text()
@@ -880,6 +1093,28 @@ def collect_depth(
                 request_started_at=request_started_at,
                 response_received_at=response_received_at,
             )
+            try:
+                market_execution_rows = execution_rows_for_book(
+                    market,
+                    book,
+                    snapshot_id=snapshot_id,
+                    request_started_at=request_started_at,
+                    response_received_at=response_received_at,
+                )
+            except Exception as execution_error:
+                market_execution_rows = failed_execution_rows(
+                    market,
+                    snapshot_id=snapshot_id,
+                    request_started_at=request_started_at,
+                    response_received_at=response_received_at,
+                    error=execution_error,
+                    source_endpoint=book["source_endpoint"],
+                    source_instrument=book["source_instrument"],
+                    source_quote_asset=book["source_quote_asset"],
+                    source_sequence=book.get("source_sequence", ""),
+                    raw_response_sha256=hashlib.sha256(book["raw"]).hexdigest(),
+                    status_reason="execution_calculation_failed",
+                )
         except Exception as error:
             response_received_at = utc_now_text()
             source_endpoint = ""
@@ -930,7 +1165,19 @@ def collect_depth(
                 source_quote_asset=source_quote_asset,
                 raw_response_sha256=raw_response_sha256,
             )
+            market_execution_rows = failed_execution_rows(
+                market,
+                snapshot_id=snapshot_id,
+                request_started_at=request_started_at,
+                response_received_at=response_received_at,
+                error=error,
+                source_endpoint=source_endpoint,
+                source_instrument=source_instrument,
+                source_quote_asset=source_quote_asset,
+                raw_response_sha256=raw_response_sha256,
+            )
         rows.append(row)
+        execution_rows.extend(market_execution_rows)
         print(
             f"[{index}/{len(markets)}] {market['token_symbol']} "
             f"{market['exchange']}: {row['status']}",
@@ -946,6 +1193,10 @@ def collect_depth(
         "token_count": len({row["token_symbol"] for row in rows}),
         "exchange_count": len({row["exchange"] for row in rows}),
         "depth_bands_bps": list(DEPTH_BANDS_BPS),
+        "execution_notionals_usd": [int(value) for value in EXECUTION_NOTIONALS_USD],
+        "execution_cost_row_count": len(execution_rows),
+        "execution_cost_status_counts": execution_status_counts(execution_rows),
+        "execution_cost_fee_status": "excluded_unknown_account_tier",
         "status_counts": {
             status: sum(row["status"] == status for row in rows)
             for status in ("observed", "partial", "failed")
@@ -957,6 +1208,27 @@ def collect_depth(
         encoding="utf-8",
     )
     validate_snapshot(markets, rows)
+    validate_execution_snapshot(
+        [cex_market_id(market) for market in markets],
+        execution_rows,
+    )
+    return snapshot_id, rows, execution_rows
+
+
+def collect_depth(
+    markets: list[dict[str, str]],
+    *,
+    raw_root: Path = DEFAULT_RAW_ROOT,
+    request: Callable[[str], tuple[Any, bytes]] = request_json,
+    sleep_seconds: float = REQUEST_SLEEP_SECONDS,
+) -> tuple[str, list[dict[str, str]]]:
+    """Preserve the original depth-only return contract for existing callers."""
+    snapshot_id, rows, _execution_rows = collect_depth_with_execution(
+        markets,
+        raw_root=raw_root,
+        request=request,
+        sleep_seconds=sleep_seconds,
+    )
     return snapshot_id, rows
 
 
@@ -1008,6 +1280,29 @@ def atomic_write_csv(path: Path, rows: list[dict[str, str]]) -> None:
             writer.writeheader()
             writer.writerows(
                 {field: row.get(field, "") for field in DEPTH_COLUMNS_ALL}
+                for row in rows
+            )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_write_execution_csv(
+    path: Path,
+    rows: list[dict[str, str]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=EXECUTION_COST_COLUMNS,
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(
+                {field: row.get(field, "") for field in EXECUTION_COST_COLUMNS}
                 for row in rows
             )
         os.replace(temporary, path)
@@ -1071,6 +1366,38 @@ def publish_snapshot(
     return result
 
 
+def publish_execution_snapshot(
+    rows: list[dict[str, str]],
+    *,
+    expected_market_ids: Iterable[str],
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    publish_dir: Path | None = None,
+) -> dict[str, Any]:
+    validate_execution_snapshot(expected_market_ids, rows)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    current_path = output_dir / EXECUTION_CURRENT_FILENAME
+    atomic_write_execution_csv(current_path, rows)
+    result: dict[str, Any] = {
+        "current_path": str(current_path),
+        "row_count": len(rows),
+        "status_counts": execution_status_counts(rows),
+    }
+    if publish_dir is None:
+        return result
+
+    publish_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_execution_csv(
+        publish_dir / EXECUTION_LATEST_FILENAME,
+        rows,
+    )
+    result.update(
+        {
+            "latest_path": str(publish_dir / EXECUTION_LATEST_FILENAME),
+        }
+    )
+    return result
+
+
 def parse_list(value: str | None, *, upper: bool) -> list[str] | None:
     if not value:
         return None
@@ -1094,11 +1421,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def ensure_full_publish_scope(
+    publish_local: bool,
+    *filters: set[str],
+) -> None:
+    if publish_local and any(filters):
+        raise ValueError(
+            "--publish-local cannot be combined with token or exchange filters"
+        )
+
+
 def main() -> None:
     args = parse_args()
     markets = load_cataloged_markets(args.database, args.cex_csv)
     tokens = set(parse_list(args.tokens, upper=True) or [])
     exchanges = set(parse_list(args.exchanges, upper=False) or [])
+    ensure_full_publish_scope(args.publish_local, tokens, exchanges)
     if tokens:
         markets = [row for row in markets if row["token_symbol"] in tokens]
     if exchanges:
@@ -1106,7 +1444,7 @@ def main() -> None:
     if not markets:
         raise ValueError("No cataloged CEX markets match the requested filters")
 
-    snapshot_id, rows = collect_depth(
+    snapshot_id, rows, execution_rows = collect_depth_with_execution(
         markets,
         raw_root=args.raw_root,
         sleep_seconds=max(0.0, args.sleep_seconds),
@@ -1115,6 +1453,12 @@ def main() -> None:
         rows,
         output_dir=args.output_dir,
         publish_dir=DEFAULT_PUBLISH_DIR if args.publish_local else None,
+    )
+    result["execution_cost"] = publish_execution_snapshot(
+        execution_rows,
+        output_dir=args.output_dir,
+        publish_dir=DEFAULT_PUBLISH_DIR if args.publish_local else None,
+        expected_market_ids=[cex_market_id(market) for market in markets],
     )
     result.update(
         {
@@ -1125,6 +1469,10 @@ def main() -> None:
             "observed_count": sum(row["status"] == "observed" for row in rows),
             "partial_count": sum(row["status"] == "partial" for row in rows),
             "failed_count": sum(row["status"] == "failed" for row in rows),
+            "execution_cost_row_count": len(execution_rows),
+            "execution_cost_status_counts": execution_status_counts(
+                execution_rows
+            ),
         }
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

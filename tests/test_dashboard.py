@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +13,11 @@ from unittest.mock import patch
 from dashboard import server
 from scripts.fetch_cex_depth import DEPTH_COLUMNS_ALL
 from scripts.fetch_dex_depth import DEX_DEPTH_COLUMNS
+from scripts.execution_cost import (
+    EXECUTION_COST_COLUMNS,
+    EXECUTION_NOTIONALS_USD,
+    execution_fact_row,
+)
 from scripts.market_database import build_database
 
 
@@ -125,9 +131,108 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.tvl_path = data_dir / server.TVL_FILENAME
         self.depth_path = data_dir / server.CEX_DEPTH_FILENAME
         self.dex_depth_path = data_dir / server.DEX_DEPTH_FILENAME
+        self.cex_execution_path = (
+            data_dir / server.CEX_EXECUTION_COST_FILENAME
+        )
+        self.dex_execution_path = (
+            data_dir / server.DEX_EXECUTION_COST_FILENAME
+        )
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    @staticmethod
+    def execution_rows(
+        market_id,
+        market_type,
+        *,
+        state_observed_at,
+    ):
+        if market_type == "cex":
+            identity = {
+                "exchange": "binance",
+                "cex_symbol": "BTC/USDT",
+                "source_instrument": "BTCUSDT",
+                "base_asset": "BTC",
+                "source_quote_asset": "USDT",
+                "reference_price_method": "order_book_midpoint",
+                "fee_status": "excluded_unknown_account_tier",
+                "usd_conversion_status": "USDT=USD proxy",
+                "excluded_costs": "taker_fee,lot_size,latency",
+            }
+        else:
+            identity = {
+                "chain": "eth",
+                "dex": "uniswap",
+                "pool_address": "0xpool",
+                "block_number": "123",
+                "block_timestamp": state_observed_at,
+                "source_sequence": "123",
+                "protocol_model": "constant_product_v2",
+                "target_token_address": "0xtarget",
+                "target_token_decimals": "8",
+                "quote_token_address": "0xquote",
+                "quote_token_decimals": "6",
+                "reference_price_method": "fixed_block_pool_state_marginal_price",
+                "fee_status": "included_protocol_fee",
+                "fee_rate_bps": "30",
+                "usd_price_source_snapshot_id": "tvl-1",
+                "usd_price_observed_at": state_observed_at,
+                "usd_conversion_status": "tvl_inventory_token_price",
+                "excluded_costs": "gas,router_fee,transfer_tax,MEV",
+            }
+        common = {
+            "snapshot_id": f"{market_type}-execution-1",
+            "source_snapshot_id": f"{market_type}-depth-1",
+            "calculation_method": f"{market_type}_fixture_walk",
+            "observed_at": "2026-01-02T00:02:00+00:00",
+            "state_observed_at": state_observed_at,
+            "request_started_at": "2026-01-02T00:00:00+00:00",
+            "response_received_at": "2026-01-02T00:02:00+00:00",
+            "market_id": market_id,
+            "market_type": market_type,
+            "token_symbol": "BTC",
+            "source": f"{market_type} fixture source",
+            "source_endpoint": "https://example.test/source",
+            "raw_response_sha256": "a" * 64,
+            **identity,
+        }
+        rows = []
+        for index, notional in enumerate(
+            EXECUTION_NOTIONALS_USD,
+            start=1,
+        ):
+            target = notional / Decimal(100)
+            rate = Decimal(index) / Decimal(10_000)
+            for direction in ("sell_token", "buy_token"):
+                quote = notional * (
+                    Decimal(1) - rate
+                    if direction == "sell_token"
+                    else Decimal(1) + rate
+                )
+                rows.append(
+                    execution_fact_row(
+                        common=common,
+                        direction=direction,
+                        requested_notional_usd=notional,
+                        status="observed",
+                        status_reason="target_filled",
+                        reference_price_quote_per_token=100,
+                        quote_to_usd=1,
+                        target_token_quantity=target,
+                        filled_token_quantity=target,
+                        quote_amount=quote,
+                        levels_or_ticks_consumed=index,
+                        ending_marginal_price_quote_per_token=(
+                            Decimal(100) * (
+                                Decimal(1) - rate
+                                if direction == "sell_token"
+                                else Decimal(1) + rate
+                            )
+                        ),
+                    )
+                )
+        return rows
 
     def test_parse_number_preserves_missing_values(self):
         self.assertIsNone(server.parse_number(""))
@@ -433,6 +538,205 @@ class MarketMonitorServerTest(unittest.TestCase):
                     "cex:binance:BTC/USDT",
                     "dex:eth:uniswap:0xpool:BTC",
                 )
+
+    def test_execution_cost_api_returns_long_form_source_backed_facts(self):
+        cex_id = "cex:binance:BTC/USDT"
+        dex_id = "dex:eth:uniswap:0xpool:BTC"
+        write_csv(
+            self.cex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            self.execution_rows(
+                cex_id,
+                "cex",
+                state_observed_at="2026-01-02T00:00:00+00:00",
+            ),
+        )
+        write_csv(
+            self.dex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            self.execution_rows(
+                dex_id,
+                "dex",
+                state_observed_at="2026-01-02T00:01:00+00:00",
+            ),
+        )
+        environment = {
+            **self.environment,
+            "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
+            "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
+        }
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, environment, clear=True):
+                payload = server.build_execution_cost_comparison(
+                    "BTC",
+                    cex_id,
+                    dex_id,
+                )
+                encoded, compressed = server.build_public_api_response(
+                    "execution_cost",
+                    (
+                        ("market_a", cex_id),
+                        ("market_b", dex_id),
+                        ("token", "BTC"),
+                    ),
+                    False,
+                )
+        finally:
+            server.clear_runtime_caches()
+
+        self.assertFalse(compressed)
+        self.assertEqual(json.loads(encoded)["token_symbol"], "BTC")
+        self.assertEqual(payload["market_a"]["status"], "available")
+        self.assertEqual(payload["market_b"]["status"], "available")
+        self.assertEqual(len(payload["market_a"]["rows"]), 10)
+        self.assertEqual(len(payload["market_b"]["rows"]), 10)
+        self.assertEqual(payload["metadata"]["snapshot_skew_seconds"], 60)
+        self.assertEqual(
+            payload["market_a"]["rows"][0]["fee_status"],
+            "excluded_unknown_account_tier",
+        )
+        self.assertEqual(
+            payload["market_b"]["rows"][0]["fee_status"],
+            "included_protocol_fee",
+        )
+        self.assertEqual(
+            payload["market_a"]["rows"][0]["quoted_execution_cost_bps"],
+            "1",
+        )
+
+    def test_execution_cost_api_requires_two_exact_token_market_ids(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "must be different"):
+                server.build_execution_cost_comparison(
+                    "BTC",
+                    "cex:binance:BTC/USDT",
+                    "cex:binance:BTC/USDT",
+                )
+            with self.assertRaisesRegex(ValueError, "not cataloged"):
+                server.build_execution_cost_comparison(
+                    "UNI",
+                    "cex:binance:BTC/USDT",
+                    "dex:eth:uniswap:0xpool:BTC",
+                )
+
+    def test_execution_cost_api_does_not_load_an_unselected_broken_source(self):
+        cex_id = "cex:binance:BTC/USDT"
+        write_csv(
+            self.cex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            self.execution_rows(
+                cex_id,
+                "cex",
+                state_observed_at="2026-01-02T00:00:00+00:00",
+            ),
+        )
+        self.dex_execution_path.write_text("broken\nvalue\n", encoding="utf-8")
+        environment = {
+            **self.environment,
+            "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
+            "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
+        }
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, environment, clear=True):
+                payload = server.build_execution_cost_comparison(
+                    "BTC",
+                    cex_id,
+                    "cex:okx:BTC/USDT",
+                )
+        finally:
+            server.clear_runtime_caches()
+
+        self.assertEqual(payload["market_a"]["status"], "available")
+        self.assertEqual(
+            payload["market_b"]["status"],
+            "not_cataloged_in_snapshot",
+        )
+        self.assertNotIn("dex", payload["metadata"]["snapshots"])
+
+    def test_execution_cost_api_joins_case_sensitive_solana_pool_identity(self):
+        solana_address = "AbCdEfGh"
+        solana_id = f"dex:solana:orca:{solana_address}:BTC"
+        eth_id = "dex:eth:uniswap:0xpool:BTC"
+        with self.dex_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(
+                [
+                    "2026-01-02",
+                    "BTC",
+                    "solana",
+                    "orca",
+                    solana_address,
+                    "WBTC / USDC",
+                    "",
+                    "",
+                    "",
+                    "100",
+                    "10",
+                    "1000",
+                ]
+            )
+        solana_common = {
+            "snapshot_id": "dex-execution-1",
+            "source_snapshot_id": "dex-depth-1",
+            "calculation_method": "unsupported_pool_model",
+            "observed_at": "2026-01-02T00:02:00+00:00",
+            "request_started_at": "2026-01-02T00:00:00+00:00",
+            "response_received_at": "2026-01-02T00:02:00+00:00",
+            "market_id": solana_id,
+            "market_type": "dex",
+            "token_symbol": "BTC",
+            "chain": "solana",
+            "dex": "orca",
+            "pool_address": solana_address,
+            "protocol_model": "unsupported",
+            "source": "fixture",
+        }
+        solana_rows = [
+            execution_fact_row(
+                common=solana_common,
+                direction=direction,
+                requested_notional_usd=notional,
+                status="unsupported",
+                status_reason="unsupported_protocol_or_chain",
+            )
+            for notional in EXECUTION_NOTIONALS_USD
+            for direction in ("sell_token", "buy_token")
+        ]
+        write_csv(
+            self.dex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            [
+                *self.execution_rows(
+                    eth_id,
+                    "dex",
+                    state_observed_at="2026-01-02T00:01:00+00:00",
+                ),
+                *solana_rows,
+            ],
+        )
+        environment = {
+            **self.environment,
+            "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
+        }
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, environment, clear=True):
+                payload = server.build_execution_cost_comparison(
+                    "BTC",
+                    solana_id,
+                    eth_id,
+                )
+        finally:
+            server.clear_runtime_caches()
+
+        self.assertEqual(payload["market_a"]["market"]["market_id"], solana_id)
+        self.assertEqual(payload["market_a"]["status"], "available")
+        self.assertEqual(
+            {row["status"] for row in payload["market_a"]["rows"]},
+            {"unsupported"},
+        )
 
     def test_same_dex_pool_has_unique_token_series_ids(self):
         with self.dex_path.open("a", newline="", encoding="utf-8") as handle:
