@@ -10,6 +10,8 @@ DAILY_MAX_LAG_DAYS = 1
 TVL_MAX_AGE_HOURS = 26.0
 CEX_DEPTH_MAX_AGE_HOURS = 2.0
 DEX_DEPTH_MAX_AGE_HOURS = 2.0
+CEX_EXECUTION_MAX_AGE_HOURS = 2.0
+DEX_EXECUTION_MAX_AGE_HOURS = 2.0
 
 
 def utc_now() -> datetime:
@@ -95,6 +97,8 @@ def build_source_freshness(
     tvl_observed_at: str | None = None,
     depth_observed_at: str | None = None,
     dex_depth_observed_at: str | None = None,
+    cex_execution_observed_at: str | None = None,
+    dex_execution_observed_at: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     checked_at = (now or utc_now()).astimezone(timezone.utc)
@@ -126,6 +130,18 @@ def build_source_freshness(
         now=checked_at,
         max_age_hours=DEX_DEPTH_MAX_AGE_HOURS,
     )
+    cex_execution = snapshot_freshness(
+        "cex_execution",
+        cex_execution_observed_at,
+        now=checked_at,
+        max_age_hours=CEX_EXECUTION_MAX_AGE_HOURS,
+    )
+    dex_execution = snapshot_freshness(
+        "dex_execution",
+        dex_execution_observed_at,
+        now=checked_at,
+        max_age_hours=DEX_EXECUTION_MAX_AGE_HOURS,
+    )
     daily_ends = [
         item["available_end"]
         for item in (cex_daily, dex_daily)
@@ -133,7 +149,15 @@ def build_source_freshness(
     ]
     statuses = [
         item["status"]
-        for item in (cex_daily, dex_daily, tvl, depth, dex_depth)
+        for item in (
+            cex_daily,
+            dex_daily,
+            tvl,
+            depth,
+            dex_depth,
+            cex_execution,
+            dex_execution,
+        )
     ]
     if "stale" in statuses:
         overall_status = "stale"
@@ -150,4 +174,6 @@ def build_source_freshness(
         "dex_tvl": tvl,
         "cex_depth": depth,
         "dex_depth": dex_depth,
+        "cex_execution": cex_execution,
+        "dex_execution": dex_execution,
     }

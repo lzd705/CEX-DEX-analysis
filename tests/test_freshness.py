@@ -63,6 +63,8 @@ class FreshnessTest(unittest.TestCase):
             tvl_observed_at="2026-07-26T11:00:00+00:00",
             depth_observed_at="2026-07-27T10:30:00+00:00",
             dex_depth_observed_at="2026-07-27T10:45:00+00:00",
+            cex_execution_observed_at="2026-07-27T11:00:00+00:00",
+            dex_execution_observed_at="2026-07-27T11:15:00+00:00",
             now=NOW,
         )
 
@@ -70,7 +72,28 @@ class FreshnessTest(unittest.TestCase):
         self.assertEqual(result["dex_tvl"]["status"], "current")
         self.assertEqual(result["cex_depth"]["status"], "current")
         self.assertEqual(result["dex_depth"]["status"], "current")
+        self.assertEqual(result["cex_execution"]["status"], "current")
+        self.assertEqual(result["dex_execution"]["status"], "current")
+        self.assertEqual(
+            result["cex_execution"]["observed_at"],
+            "2026-07-27T11:00:00+00:00",
+        )
         self.assertEqual(result["overall_status"], "stale")
+
+    def test_execution_freshness_never_inherits_depth_timestamp(self):
+        result = build_source_freshness(
+            {},
+            depth_observed_at="2026-07-27T11:45:00+00:00",
+            dex_depth_observed_at="2026-07-27T11:45:00+00:00",
+            cex_execution_observed_at="2026-07-27T08:00:00+00:00",
+            dex_execution_observed_at=None,
+            now=NOW,
+        )
+
+        self.assertEqual(result["cex_depth"]["status"], "current")
+        self.assertEqual(result["cex_execution"]["status"], "stale")
+        self.assertEqual(result["cex_execution"]["age_hours"], 4)
+        self.assertEqual(result["dex_execution"]["status"], "unavailable")
 
 
 if __name__ == "__main__":

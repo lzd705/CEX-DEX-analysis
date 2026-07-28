@@ -147,12 +147,18 @@ class MarketMonitorServerTest(unittest.TestCase):
         market_type,
         *,
         state_observed_at,
+        status="observed",
+        status_reason=None,
+        exchange="binance",
+        cex_symbol="BTC/USDT",
+        source_instrument="BTCUSDT",
+        zero_cost=False,
     ):
         if market_type == "cex":
             identity = {
-                "exchange": "binance",
-                "cex_symbol": "BTC/USDT",
-                "source_instrument": "BTCUSDT",
+                "exchange": exchange,
+                "cex_symbol": cex_symbol,
+                "source_instrument": source_instrument,
                 "base_asset": "BTC",
                 "source_quote_asset": "USDT",
                 "reference_price_method": "order_book_midpoint",
@@ -197,6 +203,10 @@ class MarketMonitorServerTest(unittest.TestCase):
             "raw_response_sha256": "a" * 64,
             **identity,
         }
+        if status in {"unsupported", "failed"}:
+            # Terminal execution rows retain identity and lineage, not measured
+            # numeric result fields such as an applied fee rate.
+            common.pop("fee_rate_bps", None)
         rows = []
         for index, notional in enumerate(
             EXECUTION_NOTIONALS_USD,
@@ -205,22 +215,58 @@ class MarketMonitorServerTest(unittest.TestCase):
             target = notional / Decimal(100)
             rate = Decimal(index) / Decimal(10_000)
             for direction in ("sell_token", "buy_token"):
-                quote = notional * (
-                    Decimal(1) - rate
+                if status in {"unsupported", "failed"}:
+                    rows.append(
+                        execution_fact_row(
+                            common=common,
+                            direction=direction,
+                            requested_notional_usd=notional,
+                            status=status,
+                            status_reason=(
+                                status_reason
+                                or (
+                                    "unsupported_protocol_or_chain"
+                                    if status == "unsupported"
+                                    else "execution_calculation_failed"
+                                )
+                            ),
+                            error=(
+                                "fixture execution failure"
+                                if status == "failed"
+                                else "fixture unsupported market"
+                            ),
+                        )
+                    )
+                    continue
+                filled_target = (
+                    target / Decimal(2)
+                    if status == "partial"
+                    else target
+                )
+                reference_for_fill = filled_target * Decimal(100)
+                quote = reference_for_fill * (
+                    Decimal(1) - (Decimal(0) if zero_cost else rate)
                     if direction == "sell_token"
-                    else Decimal(1) + rate
+                    else Decimal(1) + (Decimal(0) if zero_cost else rate)
                 )
                 rows.append(
                     execution_fact_row(
                         common=common,
                         direction=direction,
                         requested_notional_usd=notional,
-                        status="observed",
-                        status_reason="target_filled",
+                        status=status,
+                        status_reason=(
+                            status_reason
+                            or (
+                                "source_level_limit"
+                                if status == "partial"
+                                else "target_filled"
+                            )
+                        ),
                         reference_price_quote_per_token=100,
                         quote_to_usd=1,
                         target_token_quantity=target,
-                        filled_token_quantity=target,
+                        filled_token_quantity=filled_target,
                         quote_amount=quote,
                         levels_or_ticks_consumed=index,
                         ending_marginal_price_quote_per_token=(
@@ -331,6 +377,15 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         self.assertEqual(catalog_pool["tvl_usd"], 7654.32)
         self.assertEqual(catalog_pool["tvl_method"], "geckoterminal_reserve_in_usd")
+        self.assertEqual(catalog_pool["tvl_snapshot_id"], "tvl-snapshot-1")
+        self.assertEqual(
+            catalog_pool["tvl_source_endpoint"],
+            "https://example.test/pool",
+        )
+        self.assertEqual(
+            catalog_pool["tvl_raw_response_sha256"],
+            "abc123",
+        )
 
     def test_point_in_time_cex_depth_overlays_cataloged_market(self):
         depth_row = {field: "" for field in DEPTH_COLUMNS_ALL}
@@ -350,9 +405,9 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "midpoint": "100.05",
                 "spread_quote": "0.1",
                 "spread_bps": "9.995002498750624",
-                "bid_depth_10bps_usd": "400",
-                "ask_depth_10bps_usd": "600",
-                "total_depth_10bps_usd": "1000",
+                "bid_depth_10bps_usd": "0",
+                "ask_depth_10bps_usd": "0",
+                "total_depth_10bps_usd": "0",
                 "bid_depth_25bps_usd": "800",
                 "ask_depth_25bps_usd": "1200",
                 "total_depth_25bps_usd": "2000",
@@ -381,6 +436,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         with patch.dict(server.os.environ, environment, clear=True):
             payload = server.build_market_payload("2026-01-01", "2026-01-02")
             catalog = server.build_market_catalog()
+            quality = server.build_market_quality("BTC")
 
         binance = next(row for row in payload["cex_markets"] if row["venue"] == "binance")
         self.assertEqual(binance["depth_status"], "partial")
@@ -398,8 +454,16 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(catalog_binance["bid_depth_100bps_usd"], 1600)
         self.assertEqual(catalog_binance["ask_depth_100bps_usd"], 2400)
         self.assertEqual(catalog_binance["depth_status"], "partial")
+        self.assertEqual(
+            catalog_binance["depth_snapshot_id"],
+            "depth-snapshot-1",
+        )
+        self.assertEqual(
+            catalog_binance["depth_source_endpoint"],
+            "https://example.test/depth",
+        )
         for band, bid, ask, total, complete in (
-            (10, 400, 600, 1000, True),
+            (10, 0, 0, 0, True),
             (25, 800, 1200, 2000, True),
             (50, 1200, 1800, 3000, True),
             (100, 1600, 2400, 4000, False),
@@ -408,6 +472,26 @@ class MarketMonitorServerTest(unittest.TestCase):
             self.assertEqual(catalog_binance[f"ask_depth_{band}bps_usd"], ask)
             self.assertEqual(catalog_binance[f"total_depth_{band}bps_usd"], total)
             self.assertEqual(catalog_binance[f"depth_{band}bps_complete"], complete)
+        quality_binance = next(
+            market
+            for market in quality["markets"]
+            if market["market_id"] == "cex:binance:BTC/USDT"
+        )
+        self.assertEqual(
+            quality_binance["facts"]["depth"]["bands_bps"]["10"][
+                "total_usd"
+            ],
+            0,
+        )
+        self.assertIn(
+            "zero_depth_10bps",
+            {
+                flag["code"]
+                for flag in quality_binance["facts"]["depth"][
+                    "quality_flags"
+                ]
+            },
+        )
 
     def test_fixed_block_dex_depth_overlays_pool_without_using_tvl_proxy(self):
         depth_row = {field: "" for field in DEX_DEPTH_COLUMNS}
@@ -522,6 +606,22 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertAlmostEqual(
             result["observations"][0]["spread_bps"],
             1 / 100.5 * 10_000,
+        )
+        self.assertAlmostEqual(
+            result["market_a_statistics"]["window_return"],
+            102 / 100 - 1,
+        )
+        self.assertAlmostEqual(
+            result["market_b_statistics"]["window_return"],
+            105 / 101 - 1,
+        )
+        self.assertEqual(
+            result["market_a_statistics"]["daily_volatility_method"],
+            "adjacent_utc_daily_log_returns_only_v1",
+        )
+        self.assertEqual(
+            result["market_a_statistics"]["coverage_ratio"],
+            1,
         )
 
     def test_comparison_rejects_same_or_wrong_token_market(self):
@@ -655,6 +755,234 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         self.assertNotIn("dex", payload["metadata"]["snapshots"])
 
+    def test_quality_api_all_preserves_fact_applicability_and_missing_states(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            payload = server.build_market_quality("btc")
+
+        self.assertEqual(payload["token_symbol"], "BTC")
+        self.assertEqual(payload["metadata"]["scope"], "all")
+        self.assertEqual(
+            payload["metadata"]["facts"],
+            ["daily", "tvl", "depth", "execution"],
+        )
+        self.assertEqual(len(payload["markets"]), 3)
+        by_id = {
+            market["market_id"]: market
+            for market in payload["markets"]
+        }
+        binance = by_id["cex:binance:BTC/USDT"]["facts"]
+        pool = by_id["dex:eth:uniswap:0xpool:BTC"]["facts"]
+        self.assertEqual(binance["daily"]["status"], "observed")
+        self.assertEqual(binance["tvl"]["status"], "not_applicable")
+        self.assertIsNone(binance["tvl"]["value_usd"])
+        self.assertEqual(binance["depth"]["status"], "unavailable")
+        self.assertEqual(binance["execution"]["status"], "unavailable")
+        self.assertEqual(pool["tvl"]["status"], "legacy_ohlcv_snapshot")
+        self.assertEqual(pool["tvl"]["value_usd"], 5000)
+        self.assertEqual(pool["depth"]["status"], "unavailable")
+        self.assertIn(
+            "Measured zero remains zero",
+            payload["metadata"]["missing_value_rule"],
+        )
+
+    def test_quality_api_selected_scope_validates_exact_token_market_ids(self):
+        cex_id = "cex:binance:BTC/USDT"
+        dex_id = "dex:eth:uniswap:0xpool:BTC"
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            selected = server.build_market_quality(
+                "BTC",
+                "selected",
+                cex_id,
+                dex_id,
+            )
+            with self.assertRaisesRegex(ValueError, "scope must"):
+                server.build_market_quality("BTC", "pair")
+            with self.assertRaisesRegex(ValueError, "are required"):
+                server.build_market_quality(
+                    "BTC",
+                    "selected",
+                    cex_id,
+                    None,
+                )
+            with self.assertRaisesRegex(ValueError, "must be different"):
+                server.build_market_quality(
+                    "BTC",
+                    "selected",
+                    cex_id,
+                    cex_id,
+                )
+            with self.assertRaisesRegex(ValueError, "requested token"):
+                server.build_market_quality(
+                    "BTC",
+                    "selected",
+                    cex_id,
+                    "dex:eth:uniswap:0xpool:ETH",
+                )
+            with self.assertRaisesRegex(ValueError, "not cataloged"):
+                server.build_market_quality("ETH")
+
+        self.assertEqual(
+            [market["market_id"] for market in selected["markets"]],
+            [cex_id, dex_id],
+        )
+        self.assertEqual(
+            selected["metadata"]["selected_market_ids"],
+            [cex_id, dex_id],
+        )
+
+    def test_quality_api_distinguishes_execution_states_and_preserves_zero(self):
+        binance_id = "cex:binance:BTC/USDT"
+        okx_id = "cex:okx:BTC/USDT"
+        kraken_id = "cex:kraken:BTC/USDT"
+        dex_id = "dex:eth:uniswap:0xpool:BTC"
+        with self.cex_path.open("a", newline="", encoding="utf-8") as handle:
+            csv.writer(handle, lineterminator="\n").writerow(
+                [
+                    "2026-01-02",
+                    "BTC",
+                    "kraken",
+                    "BTC/USDT",
+                    "",
+                    "",
+                    "",
+                    "100",
+                    "",
+                    "50",
+                ]
+            )
+        write_csv(
+            self.cex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            [
+                *self.execution_rows(
+                    binance_id,
+                    "cex",
+                    state_observed_at="2026-01-02T00:00:00+00:00",
+                    zero_cost=True,
+                ),
+                *self.execution_rows(
+                    okx_id,
+                    "cex",
+                    state_observed_at="2026-01-02T00:00:30+00:00",
+                    status="failed",
+                    exchange="okx",
+                    source_instrument="BTC-USDT",
+                ),
+            ],
+        )
+        write_csv(
+            self.dex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            self.execution_rows(
+                dex_id,
+                "dex",
+                state_observed_at="2026-01-02T00:01:00+00:00",
+                status="unsupported",
+            ),
+        )
+        environment = {
+            **self.environment,
+            "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
+            "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
+        }
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, environment, clear=True):
+                quality = server.build_market_quality("BTC")
+                execution = server.build_execution_cost_comparison(
+                    "BTC",
+                    binance_id,
+                    okx_id,
+                )
+        finally:
+            server.clear_runtime_caches()
+
+        by_id = {
+            market["market_id"]: market["facts"]["execution"]
+            for market in quality["markets"]
+        }
+        self.assertEqual(by_id[binance_id]["status"], "observed")
+        self.assertEqual(by_id[okx_id]["status"], "failed")
+        self.assertEqual(
+            by_id[dex_id]["status"],
+            "unsupported",
+            by_id[dex_id],
+        )
+        self.assertEqual(
+            by_id[kraken_id]["status"],
+            "not_cataloged_in_snapshot",
+        )
+        self.assertEqual(
+            by_id[binance_id]["raw_response_sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(
+            by_id[okx_id]["status_reason_counts"],
+            {"execution_calculation_failed": 10},
+        )
+        self.assertEqual(
+            execution["market_a"]["rows"][0][
+                "quoted_execution_cost_bps"
+            ],
+            "0",
+        )
+        self.assertIsNone(
+            execution["market_b"]["rows"][0][
+                "quoted_execution_cost_bps"
+            ]
+        )
+        self.assertEqual(
+            quality["metadata"]["freshness"]["cex_execution"][
+                "observed_at"
+            ],
+            "2026-01-02T00:00:30+00:00",
+        )
+        self.assertEqual(
+            quality["metadata"]["freshness"]["dex_execution"][
+                "observed_at"
+            ],
+            "2026-01-02T00:01:00+00:00",
+        )
+
+    def test_quality_api_reports_partial_execution_without_cost_claim(self):
+        binance_id = "cex:binance:BTC/USDT"
+        write_csv(
+            self.cex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            self.execution_rows(
+                binance_id,
+                "cex",
+                state_observed_at="2026-01-02T00:00:00+00:00",
+                status="partial",
+            ),
+        )
+        environment = {
+            **self.environment,
+            "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
+        }
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, environment, clear=True):
+                quality = server.build_market_quality("BTC")
+                execution = server.build_execution_cost_comparison(
+                    "BTC",
+                    binance_id,
+                    "cex:okx:BTC/USDT",
+                )
+        finally:
+            server.clear_runtime_caches()
+
+        binance_quality = next(
+            market["facts"]["execution"]
+            for market in quality["markets"]
+            if market["market_id"] == binance_id
+        )
+        self.assertEqual(binance_quality["status"], "partial")
+        self.assertEqual(binance_quality["status_counts"], {"partial": 10})
+        first = execution["market_a"]["rows"][0]
+        self.assertEqual(first["fill_ratio"], "0.5")
+        self.assertIsNone(first["quoted_execution_cost_bps"])
+
     def test_execution_cost_api_joins_case_sensitive_solana_pool_identity(self):
         solana_address = "AbCdEfGh"
         solana_id = f"dex:solana:orca:{solana_address}:BTC"
@@ -728,6 +1056,7 @@ class MarketMonitorServerTest(unittest.TestCase):
                     solana_id,
                     eth_id,
                 )
+                quality = server.build_market_quality("BTC")
         finally:
             server.clear_runtime_caches()
 
@@ -736,6 +1065,22 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(
             {row["status"] for row in payload["market_a"]["rows"]},
             {"unsupported"},
+        )
+        solana_quality = next(
+            market
+            for market in quality["markets"]
+            if market["market_id"] == solana_id
+        )
+        self.assertEqual(
+            solana_quality["facts"]["execution"]["status"],
+            "unsupported",
+        )
+        self.assertFalse(
+            any(
+                market["market_id"]
+                == f"dex:solana:orca:{solana_address.lower()}:BTC"
+                for market in quality["markets"]
+            )
         )
 
     def test_same_dex_pool_has_unique_token_series_ids(self):
@@ -915,6 +1260,25 @@ class MarketMonitorServerTest(unittest.TestCase):
                 ("end", "2026-01-02"),
             ),
         )
+        self.assertEqual(
+            server.public_api_query_items(
+                "quality",
+                {
+                    "token": ["BTC"],
+                    "scope": ["selected"],
+                    "market_a": ["cex:binance:BTC/USDT"],
+                    "market_b": ["dex:eth:uniswap:0xpool:BTC"],
+                    "start": ["2026-01-01"],
+                    "unbounded": ["ignored"],
+                },
+            ),
+            (
+                ("token", "BTC"),
+                ("scope", "selected"),
+                ("market_a", "cex:binance:BTC/USDT"),
+                ("market_b", "dex:eth:uniswap:0xpool:BTC"),
+            ),
+        )
 
     def test_public_api_cold_miss_is_single_flight(self):
         server._build_public_api_response_cached.cache_clear()
@@ -959,6 +1323,33 @@ class MarketMonitorServerTest(unittest.TestCase):
             lucide_path.read_text(encoding="utf-8")[:200],
         )
 
+    def test_only_declared_spa_routes_serve_the_application_shell(self):
+        handler = object.__new__(server.MarketMonitorHandler)
+        handler.directory = str(server.STATIC_ROOT)
+        shell = str(server.STATIC_ROOT / "index.html")
+        for path in (
+            "/screener",
+            "/tokens/aave/markets",
+            "/tokens/AAVE/compare?marketA=encoded",
+            "/tokens/1INCH/liquidity",
+            "/tokens/BTC/quality",
+            "/methodology",
+            "/methodology/execution-cost",
+        ):
+            self.assertTrue(server.is_spa_shell_path(path), path)
+            self.assertEqual(handler.translate_path(path), shell, path)
+
+        for path in (
+            "/tokens/AAVE",
+            "/tokens/AAVE/compare/extra",
+            "/tokens/AAVE/compare.js",
+            "/methodology/Execution-Cost",
+            "/api/not-a-real-endpoint",
+            "/missing-static.js",
+        ):
+            self.assertFalse(server.is_spa_shell_path(path), path)
+            self.assertNotEqual(handler.translate_path(path), shell, path)
+
     def test_expert_dashboard_static_contract_prevents_stale_and_ambiguous_results(self):
         index = (server.STATIC_ROOT / "index.html").read_text(encoding="utf-8")
         app_js = (server.STATIC_ROOT / "app.js").read_text(encoding="utf-8")
@@ -968,7 +1359,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn('role="alert"', index)
         self.assertIn('aria-busy="true"', index)
         self.assertIn("Midpoint-relative Spread (bps)", index)
-        self.assertIn("Selected DEX/CEX Spread", index)
+        self.assertIn("Primary Price Gap", index)
         self.assertIn('id="export-csv"', index)
         self.assertNotIn("综合", index)
 
@@ -999,10 +1390,15 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn("No current market result.", app_js)
         self.assertIn("validateDateRange()", app_js)
         self.assertIn("selectionOverrides", app_js)
-        self.assertIn("user-selected (not current primary)", app_js)
+        self.assertIn('state.pairMode = "manual";', app_js)
+        self.assertIn(
+            "A and B must be different. Choose another market explicitly.",
+            app_js,
+        )
+        self.assertIn("The previous markets were cleared.", app_js)
         self.assertIn("aggregate_cex_volume_usd", app_js)
         self.assertIn("aggregate_dex_volume_share", app_js)
-        self.assertIn("Aggregate DEX", app_js)
+        self.assertIn("formatCurrency(aggregates.aggregateDex)", app_js)
         self.assertIn("formatShare(aggregates.aggregateDexShare)", app_js)
         self.assertIn("value !== 0 && Math.abs(value) < 1", app_js)
         self.assertIn("quality_flags", app_js)
@@ -1010,15 +1406,14 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn('id="facts-market-b-warning-trigger"', index)
         self.assertIn('aria-controls="facts-market-a-warning-tooltip"', index)
         self.assertIn('aria-controls="facts-market-b-warning-tooltip"', index)
-        self.assertIn('aria-describedby="facts-market-a-warning-tooltip"', index)
-        self.assertIn('aria-describedby="facts-market-b-warning-tooltip"', index)
+        self.assertGreaterEqual(index.count('aria-haspopup="dialog"'), 2)
         for slot in ("a", "b"):
             trigger_start = index.index(f'id="facts-market-{slot}-warning-trigger"')
             tooltip_start = index.index(f'id="facts-market-{slot}-warning-tooltip"')
             trigger_markup = index[trigger_start:tooltip_start]
             tooltip_markup = index[tooltip_start:tooltip_start + 220]
             self.assertIn('data-lucide="info"', trigger_markup)
-            self.assertIn('role="tooltip"', tooltip_markup)
+            self.assertIn('role="dialog"', tooltip_markup)
         market_label = app_js[
             app_js.index("function factsMarketLabel(market)"):
             app_js.index("function factsMarketsForToken(token)")
@@ -1039,11 +1434,21 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertGreaterEqual(index.count("<caption>"), 2)
         self.assertIn('scope="col"', index)
         self.assertIn('aria-label="Token and selected market facts"', index)
-        self.assertIn('aria-label="${escapeHtml(`${token} selected ${label} market`)}"', app_js)
+        self.assertIn(
+            'aria-label="Selected Token market inventory"',
+            index,
+        )
+        self.assertIn('data-set-market-slot="a"', app_js)
+        self.assertIn('data-set-market-slot="b"', app_js)
+        self.assertIn('aria-pressed="${String(selectedA)}"', app_js)
+        self.assertIn('aria-pressed="${String(selectedB)}"', app_js)
         for band in (10, 25, 50, 100):
             self.assertIn(str(band), app_js)
-        self.assertIn('const sideA = market === "cex" ? "bid" : "buy";', app_js)
-        self.assertIn('const sideB = market === "cex" ? "ask" : "sell";', app_js)
+        self.assertIn("function liquiditySideDefinition(market)", app_js)
+        self.assertIn('sellField: "bid"', app_js)
+        self.assertIn('buyField: "ask"', app_js)
+        self.assertIn('sellField: "sell"', app_js)
+        self.assertIn('buyField: "buy"', app_js)
         self.assertIn("#market-table td::before", styles)
         self.assertIn('content: attr(data-label)', styles)
         self.assertIn("min-height: 44px", styles)

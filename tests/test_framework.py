@@ -80,8 +80,8 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertIn("TVL snapshot", javascript)
         self.assertIn("CEX depth", javascript)
         self.assertIn("DEX depth", javascript)
-        self.assertIn('class="price-cell"', javascript)
-        self.assertIn("td.price-cell", styles)
+        self.assertIn('class="token-row screener-token-row"', javascript)
+        self.assertIn(".workspace-market-table", styles)
         self.assertNotIn("factor", (html + javascript).lower())
         self.assertNotIn("admin", (html + javascript).lower())
 

@@ -179,6 +179,16 @@ def build_collection_status(
             dex_depth_observed_at=(
                 dex_depth.get("observed_at") if dex_depth else None
             ),
+            cex_execution_observed_at=(
+                cex_execution.get("observed_at")
+                if cex_execution
+                else None
+            ),
+            dex_execution_observed_at=(
+                dex_execution.get("observed_at")
+                if dex_execution
+                else None
+            ),
             now=checked_at,
         ),
         "files": {

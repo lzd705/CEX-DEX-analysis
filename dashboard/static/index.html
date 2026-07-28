@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260728-warning-tooltip-v1">
+    <link rel="stylesheet" href="/styles.css?v=20260728-token-workspace-v6">
   </head>
   <body>
     <header class="app-header">
@@ -16,6 +16,11 @@
           <p>Venue-level facts, aligned on daily UTC observations</p>
         </div>
       </div>
+      <nav class="primary-navigation" aria-label="Primary navigation">
+        <a href="/screener" data-app-route="screener">Screener</a>
+        <a href="/tokens/AAVE/markets" data-app-route="workspace">Token Research</a>
+        <a href="/methodology" data-app-route="methodology">Methodology</a>
+      </nav>
       <div
         id="freshness-cluster"
         class="status-cluster"
@@ -29,7 +34,9 @@
     </header>
 
     <main>
-      <section class="time-toolbar" aria-label="Global time window">
+      <div id="route-announcer" class="sr-only" role="status" aria-live="polite"></div>
+
+      <section id="time-toolbar" class="time-toolbar" aria-label="Daily fact time window">
         <div class="toolbar-title">
           <i data-lucide="calendar-range"></i>
           <div>
@@ -49,10 +56,10 @@
           </label>
         </div>
         <div class="preset-group" role="group" aria-label="Time presets">
-          <button type="button" data-days="7">7D</button>
-          <button type="button" data-days="30" class="active">30D</button>
-          <button type="button" data-days="90">90D</button>
-          <button type="button" data-days="all">All</button>
+          <button type="button" data-days="7" aria-pressed="false">7D</button>
+          <button type="button" data-days="30" class="active" aria-pressed="true">30D</button>
+          <button type="button" data-days="90" aria-pressed="false">90D</button>
+          <button type="button" data-days="all" aria-pressed="false">All</button>
         </div>
         <button id="apply-window" class="icon-command" type="button" title="Apply time window">
           <i data-lucide="refresh-cw"></i>
@@ -61,21 +68,39 @@
       </section>
 
       <div id="market-loading" class="status-banner" role="status" aria-live="polite" hidden></div>
+      <div id="global-error" class="error-banner global-error" role="alert" aria-live="assertive" hidden></div>
 
       <section
         id="facts-workbench"
-        class="facts-workbench"
+        class="facts-workbench app-view"
+        data-app-view="workspace"
         aria-labelledby="facts-title"
-        aria-busy="true"
+        aria-busy="false"
+        hidden
       >
         <div class="facts-heading">
           <div>
-            <span class="eyebrow">P0 · auditable market facts</span>
-            <h2 id="facts-title">Two-market fact comparison</h2>
-            <p>Select one Token and any two cataloged markets. Snapshot depth and unfilled daily observations retain separate time semantics.</p>
+            <a id="back-to-screener" class="back-link" href="/screener">
+              <i data-lucide="arrow-left"></i>
+              Back to Screener
+            </a>
+            <span class="eyebrow">Single Token research workspace</span>
+            <h2 id="facts-title">Token Research</h2>
+            <p id="workspace-description">Select one Token, then move through its markets, daily comparison, liquidity, and data quality without losing the selected pair.</p>
           </div>
-          <span class="contract-badge">Daily series + latest depth</span>
+          <div class="workspace-heading-meta">
+            <span id="workspace-market-count" class="contract-badge">Loading markets</span>
+            <span id="workspace-as-of" class="contract-badge">Checking timestamps</span>
+            <span id="workspace-quality-status" class="contract-badge">Checking quality</span>
+          </div>
         </div>
+
+        <nav class="workspace-tabs" aria-label="Token research pages">
+          <a href="/tokens/AAVE/markets" data-workspace-page="markets">Markets</a>
+          <a href="/tokens/AAVE/compare" data-workspace-page="compare">Compare</a>
+          <a href="/tokens/AAVE/liquidity" data-workspace-page="liquidity">Liquidity &amp; Execution</a>
+          <a href="/tokens/AAVE/quality" data-workspace-page="quality">Data Quality</a>
+        </nav>
 
         <div class="facts-controls">
           <div class="facts-control">
@@ -97,7 +122,7 @@
                   type="button"
                   aria-label="Market A quality alert details"
                   aria-controls="facts-market-a-warning-tooltip"
-                  aria-describedby="facts-market-a-warning-tooltip"
+                  aria-haspopup="dialog"
                   aria-expanded="false"
                   hidden
                 >
@@ -106,7 +131,8 @@
                 <div
                   id="facts-market-a-warning-tooltip"
                   class="market-warning-tooltip"
-                  role="tooltip"
+                  role="dialog"
+                  aria-label="Market A quality details"
                   hidden
                 ></div>
                 <span
@@ -132,7 +158,7 @@
                   type="button"
                   aria-label="Market B quality alert details"
                   aria-controls="facts-market-b-warning-tooltip"
-                  aria-describedby="facts-market-b-warning-tooltip"
+                  aria-haspopup="dialog"
                   aria-expanded="false"
                   hidden
                 >
@@ -141,7 +167,8 @@
                 <div
                   id="facts-market-b-warning-tooltip"
                   class="market-warning-tooltip"
-                  role="tooltip"
+                  role="dialog"
+                  aria-label="Market B quality details"
                   hidden
                 ></div>
                 <span
@@ -153,18 +180,61 @@
             </div>
           </div>
           <button id="compare-markets" class="compare-command" type="button">
-            Compare
+            Apply pair
           </button>
         </div>
         <p id="selector-policy" class="selector-policy">
           Initial A/B choices prefer markets with integrity-valid measured depth and no depth-relevant quality flags. The daily comparison uses the same selected market IDs, so its defaults can differ from the quality-weighted primary market.
         </p>
+        <div id="workspace-context-notice" class="status-banner" role="status" aria-live="polite" hidden></div>
+
+        <section id="workspace-page-markets" class="workspace-page" data-workspace-view="markets">
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">Market inventory</span>
+              <h3>Where this Token trades</h3>
+              <p>Review every cataloged CEX instrument and DEX pool for the selected Token. Set any two distinct markets as A and B before moving to comparison or execution analysis.</p>
+            </div>
+            <div class="segmented-control" role="group" aria-label="Market type filter">
+              <button type="button" data-workspace-market-type="all" class="active" aria-pressed="true">All</button>
+              <button type="button" data-workspace-market-type="cex" aria-pressed="false">CEX</button>
+              <button type="button" data-workspace-market-type="dex" aria-pressed="false">DEX</button>
+            </div>
+          </div>
+          <div class="table-scroll" role="region" aria-label="Selected Token market inventory" tabindex="0">
+            <table id="workspace-market-table" class="workspace-market-table">
+              <caption>All cataloged markets for the selected Token with current fact availability.</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Market</th>
+                  <th scope="col">Type</th>
+                  <th scope="col">Latest Price</th>
+                  <th scope="col">Window Volume</th>
+                  <th scope="col">TVL</th>
+                  <th scope="col">±100 bps Depth</th>
+                  <th scope="col">Coverage</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Pair Actions</th>
+                </tr>
+              </thead>
+              <tbody id="workspace-market-body">
+                <tr><td colspan="9" class="missing">Loading Token markets</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
 
         <div id="comparison-status" class="status-banner" role="status" aria-live="polite">
           Loading comparison catalog…
         </div>
         <div id="comparison-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
-        <section class="liquidity-panel" aria-labelledby="liquidity-title">
+        <section
+          id="workspace-page-liquidity"
+          class="workspace-page liquidity-panel"
+          data-workspace-view="liquidity"
+          aria-labelledby="liquidity-title"
+          hidden
+        >
           <div class="liquidity-heading">
             <div>
               <span class="eyebrow">P1 · point-in-time source-backed depth</span>
@@ -221,7 +291,7 @@
                 viewBox="0 0 760 360"
                 preserveAspectRatio="xMidYMid meet"
                 role="group"
-                aria-labelledby="liquidity-svg-title liquidity-svg-description"
+                aria-label="Discrete cumulative liquidity depth profile"
                 focusable="false"
               ></svg>
               <div id="liquidity-empty" class="liquidity-empty" hidden>
@@ -259,15 +329,96 @@
                 </tr>
               </thead>
               <tbody id="liquidity-table-body">
-                <tr><td colspan="9" class="missing">Loading depth snapshots</td></tr>
+                <tr><td data-label="Status" colspan="9" class="missing">Loading depth snapshots</td></tr>
               </tbody>
             </table>
           </div>
 
           <div id="liquidity-market-a-meta" class="liquidity-market-meta"></div>
           <div id="liquidity-market-b-meta" class="liquidity-market-meta"></div>
+
+          <section class="execution-panel" aria-labelledby="execution-title">
+            <div class="page-heading">
+              <div>
+                <span class="eyebrow">Fixed-notional source mechanics</span>
+                <h3 id="execution-title">Execution cost</h3>
+                <p>Walk the same source-backed order book or supported pool state at the five collected USD notionals. These are quoted mechanics, not realized all-in trading costs.</p>
+              </div>
+              <div class="execution-controls">
+                <div class="segmented-control" role="group" aria-label="Execution direction">
+                  <button type="button" data-execution-direction="buy_token" class="active" aria-pressed="true">Buy Token</button>
+                  <button type="button" data-execution-direction="sell_token" aria-pressed="false">Sell Token</button>
+                </div>
+                <label>
+                  <span>Notional</span>
+                  <select id="execution-notional" aria-label="Execution notional in USD">
+                    <option value="1000">$1,000</option>
+                    <option value="5000">$5,000</option>
+                    <option value="10000" selected>$10,000</option>
+                    <option value="50000">$50,000</option>
+                    <option value="100000">$100,000</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div id="execution-status" class="status-banner" role="status" aria-live="polite">
+              Loading execution facts…
+            </div>
+            <div id="execution-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+            <div class="execution-summary" aria-label="Selected execution scenario">
+              <div>
+                <span id="execution-a-label">Market A cost</span>
+                <strong id="execution-a-cost">—</strong>
+                <small id="execution-a-fill">—</small>
+              </div>
+              <div>
+                <span id="execution-b-label">Market B cost</span>
+                <strong id="execution-b-cost">—</strong>
+                <small id="execution-b-fill">—</small>
+              </div>
+              <div>
+                <span>Execution snapshot skew</span>
+                <strong id="execution-skew">—</strong>
+                <small>Different from depth snapshot skew</small>
+              </div>
+              <div>
+                <span>Fee scope</span>
+                <strong id="execution-fee-scope">—</strong>
+                <small>CEX account fees may be excluded</small>
+              </div>
+            </div>
+            <div class="liquidity-table-scroll" role="region" aria-label="Fixed-notional execution cost values" tabindex="0">
+              <table class="liquidity-table execution-table">
+                <caption>Execution cost and fill ratio for each collected notional in the selected direction.</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Requested Notional</th>
+                    <th scope="col" id="execution-a-cost-heading">A Cost</th>
+                    <th scope="col">A Fill</th>
+                    <th scope="col">A Status</th>
+                    <th scope="col" id="execution-b-cost-heading">B Cost</th>
+                    <th scope="col">B Fill</th>
+                    <th scope="col">B Status</th>
+                  </tr>
+                </thead>
+                <tbody id="execution-table-body">
+                  <tr><td data-label="Status" colspan="7" class="missing">Loading execution facts</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p id="execution-method-note" class="method-note">
+              CEX values include visible-book spread and impact but exclude account-specific taker fees. Supported DEX V2 values include the pool fee; gas, router fees, token taxes, latency, and MEV are excluded.
+              <a href="/methodology/execution-cost" data-methodology-link="execution-cost">How execution cost is calculated</a>
+            </p>
+          </section>
         </section>
 
+        <section
+          id="workspace-page-compare"
+          class="workspace-page"
+          data-workspace-view="compare"
+          hidden
+        >
         <div class="daily-comparison-heading">
           <div>
             <h3>Daily price and volume comparison</h3>
@@ -292,6 +443,22 @@
           <div>
             <span>Comparable days</span>
             <strong id="compare-days">—</strong>
+          </div>
+          <div>
+            <span>Market A return</span>
+            <strong id="compare-a-return">—</strong>
+          </div>
+          <div>
+            <span>Market B return</span>
+            <strong id="compare-b-return">—</strong>
+          </div>
+          <div>
+            <span>Market A daily volatility</span>
+            <strong id="compare-a-volatility">—</strong>
+          </div>
+          <div>
+            <span>Market B daily volatility</span>
+            <strong id="compare-b-volatility">—</strong>
           </div>
         </div>
 
@@ -320,14 +487,64 @@
             </tbody>
           </table>
         </div>
+        </section>
 
-        <details class="facts-contract">
-          <summary>Data contract and audit trail</summary>
-          <div id="facts-contract-copy"></div>
-          <div id="facts-source-copy"></div>
-        </details>
+        <section
+          id="workspace-page-quality"
+          class="workspace-page"
+          data-workspace-view="quality"
+          hidden
+        >
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">Fact × Market audit</span>
+              <h3>Data Quality</h3>
+              <p>Separate observed values, partial lower bounds, unsupported methods, collection failures, and genuinely missing facts for this Token.</p>
+            </div>
+            <div class="segmented-control" role="group" aria-label="Data quality scope">
+              <button type="button" data-quality-scope="all" class="active" aria-pressed="true">All markets</button>
+              <button type="button" data-quality-scope="selected" aria-pressed="false">Selected A &amp; B</button>
+            </div>
+          </div>
+          <div id="quality-status" class="status-banner" role="status" aria-live="polite">
+            Loading Token quality facts…
+          </div>
+          <div id="quality-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+          <div class="table-scroll" role="region" aria-label="Token fact quality matrix" tabindex="0">
+            <table id="quality-table" class="quality-table">
+              <caption>Quality state for daily facts, TVL, depth, and execution by market.</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Market</th>
+                  <th scope="col">Daily Facts</th>
+                  <th scope="col">TVL</th>
+                  <th scope="col">Depth</th>
+                  <th scope="col">Execution</th>
+                  <th scope="col">Current Reasons</th>
+                </tr>
+              </thead>
+              <tbody id="quality-body">
+                <tr><td colspan="6" class="missing">Loading quality facts</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
       </section>
 
+      <section
+        id="screener-view"
+        class="app-view"
+        data-app-view="screener"
+        aria-labelledby="screener-title"
+      >
+      <div class="view-heading">
+        <div>
+          <span class="eyebrow">Cross-Token discovery</span>
+          <h2 id="screener-title">Market Screener</h2>
+          <p>Rank every covered Token in one row, then open a dedicated workspace to inspect its markets, comparison, liquidity, and evidence.</p>
+        </div>
+        <span class="contract-badge">Fact-only · no forecasts</span>
+      </div>
       <section class="monitor-toolbar">
         <div class="segmented-control" role="group" aria-label="Sort market scope">
           <button type="button" data-scope="combined" class="active" aria-pressed="true">Aggregate</button>
@@ -344,7 +561,7 @@
           </select>
         </label>
         <div class="search-control">
-          <input id="token-search" type="search" placeholder="Search token" aria-label="Token symbol" autocomplete="off">
+          <input id="token-search" type="search" placeholder="Search token symbol" aria-label="Search token symbol" autocomplete="off">
           <button id="search-token" type="button" title="Search token" aria-label="Search token">
             <i data-lucide="search"></i>
           </button>
@@ -353,23 +570,11 @@
           <i data-lucide="download"></i>
           <span>Export CSV</span>
         </button>
-        <div id="row-count" class="row-count"></div>
+        <div id="row-count" class="row-count" role="status" aria-live="polite" aria-atomic="true"></div>
       </section>
 
       <div id="market-status" class="status-banner" role="status" aria-live="polite" hidden></div>
       <div id="error-banner" class="error-banner" role="alert" aria-live="assertive" hidden></div>
-
-      <details class="quality-legend">
-        <summary>Quality flags and metric definitions</summary>
-        <div class="quality-legend-grid">
-          <span><strong>Aggregate</strong> sums every cataloged market in the selected window.</span>
-          <span><strong>Selected</strong> refers only to the two markets shown for that Token.</span>
-          <span><strong>Partial</strong> depth is a lower bound and uses the ≥ prefix.</span>
-          <span><strong>Unsupported</strong> stays N/A; TVL and volume never substitute for depth.</span>
-          <span><strong>Off-market</strong> flags a pool-state price that diverges materially from the source price.</span>
-          <span><strong>Tiny pool</strong> warns that a mathematically valid pool may not be economically representative.</span>
-        </div>
-      </details>
 
       <section id="market-panel" class="market-panel" aria-busy="true">
         <div
@@ -379,26 +584,92 @@
           tabindex="0"
         >
           <table id="market-table">
-            <caption>Aggregate Token facts followed by the selected CEX and DEX market facts.</caption>
+            <caption>One-row Token screener for the selected daily fact window.</caption>
             <thead>
               <tr>
-                <th scope="col" class="sticky-token">Token / Market</th>
-                <th scope="col">Selection</th>
-                <th scope="col">Pair / Metric</th>
-                <th scope="col">Latest Comparable Price</th>
-                <th scope="col">Window Return</th>
-                <th scope="col">Daily Volatility</th>
-                <th scope="col">USD Volume</th>
-                <th scope="col">TVL Snapshot</th>
-                <th scope="col">Depth Bands (USD)</th>
-                <th scope="col">Selected DEX/CEX Spread</th>
-                <th scope="col">Coverage &amp; Quality</th>
+                <th scope="col" class="sticky-token">Token</th>
+                <th scope="col">Covered Markets</th>
+                <th scope="col">Aggregate USD Volume</th>
+                <th scope="col">DEX Share</th>
+                <th scope="col">Primary Price Gap</th>
+                <th scope="col">Primary ±100 bps Depth</th>
+                <th scope="col">Primary DEX TVL</th>
+                <th scope="col">Quality</th>
+                <th scope="col">Research</th>
               </tr>
             </thead>
             <tbody id="market-body"></tbody>
           </table>
         </div>
       </section>
+      </section>
+
+      <section
+        id="methodology-view"
+        class="app-view methodology-view"
+        data-app-view="methodology"
+        aria-labelledby="methodology-title"
+        hidden
+      >
+        <div class="view-heading">
+          <div>
+            <span class="eyebrow">Definitions, formulas, and boundaries</span>
+            <h2 id="methodology-title">Methodology</h2>
+            <p>Use this page for the general meaning of each fact. Use a Token’s Data Quality page for the current status of a specific market.</p>
+          </div>
+          <span class="contract-badge">Versioned fact contracts</span>
+        </div>
+
+        <div class="methodology-grid">
+          <article id="daily-facts" class="methodology-card">
+            <i data-lucide="chart-no-axes-combined"></i>
+            <h3>Daily Price, Volume, Return &amp; Volatility</h3>
+            <p>Prices are USD-normalized daily closes. Window return uses the first and last observed close. Daily volatility uses only adjacent UTC-day log returns; gaps are excluded and values are never forward-filled.</p>
+          </article>
+          <article id="tvl" class="methodology-card">
+            <i data-lucide="landmark"></i>
+            <h3>DEX TVL</h3>
+            <p>TVL is the latest source-reported pool reserve in USD. It is a point-in-time pool-size fact, not historical TVL, active concentrated liquidity, or executable depth.</p>
+          </article>
+          <article id="depth" class="methodology-card">
+            <i data-lucide="waves"></i>
+            <h3>10/25/50/100 bps Depth</h3>
+            <p>CEX depth sums visible order-book notional inside midpoint-relative bands. Supported DEX depth scans fixed-block pool state. Partial values are lower bounds and use ≥; unsupported protocols remain N/A.</p>
+          </article>
+          <article id="execution-cost" class="methodology-card">
+            <i data-lucide="route"></i>
+            <h3>Fixed-notional Execution Cost</h3>
+            <p>CEX scenarios walk visible order-book levels. Supported DEX V2 scenarios use exact integer constant-product mechanics. DEX pool fees are included where supported; CEX account fees, gas, latency, router costs, transfer taxes, and MEV are excluded.</p>
+          </article>
+          <article id="quality-states" class="methodology-card">
+            <i data-lucide="shield-check"></i>
+            <h3>Quality States</h3>
+            <p><strong>Observed</strong> is measured. <strong>Partial</strong> is usable with a stated boundary. <strong>Unsupported</strong> means no audited method exists. <strong>Failed</strong> is a collection error. <strong>N/A</strong> means the fact does not apply. A measured zero remains zero.</p>
+          </article>
+          <article id="scope-boundaries" class="methodology-card">
+            <i data-lucide="circle-off"></i>
+            <h3>Current Fact Boundary</h3>
+            <p>Funding rates are not collected and therefore do not appear. Trading-fee treatment is reported inside execution facts: supported DEX pool fees can be included, while account-specific CEX fees remain excluded.</p>
+          </article>
+        </div>
+
+        <details class="quality-legend" open>
+          <summary>Quality flags and metric definitions</summary>
+          <div class="quality-legend-grid">
+            <span><strong>Aggregate</strong> sums every cataloged market in the selected daily window.</span>
+            <span><strong>Selected</strong> refers only to Market A and Market B for one Token.</span>
+            <span><strong>Partial</strong> depth is a lower bound and uses the ≥ prefix.</span>
+            <span><strong>Unsupported</strong> stays N/A; TVL and volume never substitute for depth.</span>
+            <span><strong>Off-market</strong> flags a pool-state price that diverges materially from its source price.</span>
+            <span><strong>Tiny pool</strong> warns that a valid pool may not be economically representative.</span>
+          </div>
+        </details>
+
+        <details class="facts-contract" open>
+          <summary>Current data contract and audit trail</summary>
+          <div id="facts-contract-copy"></div>
+          <div id="facts-source-copy"></div>
+        </details>
 
       <footer>
         <div id="source-list"></div>
@@ -406,15 +677,18 @@
         <div id="tvl-source-status">TVL snapshot status loading</div>
         <div id="depth-source-status">CEX depth snapshot status loading</div>
         <div id="dex-depth-source-status">DEX depth snapshot status loading</div>
-        <div>Selected-market spread = selected DEX price / selected CEX price - 1 on their latest common date. It appears only on the Token row.</div>
+        <div id="execution-source-status">Execution snapshot status loading</div>
+        <div>Primary-market price gap = primary DEX price / primary CEX price - 1 on their latest common date. It appears only on the Token row.</div>
         <div>The comparison workbench separately reports midpoint-relative spread in bps. Neither measure is a bid/ask spread or executable slippage estimate.</div>
         <div>TVL is the latest fetch snapshot and is not presented as historical daily TVL.</div>
         <div>CEX depth is a real point-in-time order-book snapshot. A ≥ prefix means the returned levels did not prove complete ±100 bps coverage.</div>
         <div>DEX depth is calculated from one fixed blockchain block for supported V2/V3 pools. Unsupported pool types stay N/A; TVL is never used as a substitute.</div>
       </footer>
+      </section>
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/app.js?v=20260728-warning-tooltip-v1"></script>
+    <script src="/navigation.js?v=20260728-token-workspace-v6"></script>
+    <script src="/app.js?v=20260728-token-workspace-v6"></script>
   </body>
 </html>

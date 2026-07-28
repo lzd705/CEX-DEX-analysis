@@ -20,6 +20,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from functools import lru_cache
 from http.cookies import SimpleCookie
 from http import HTTPStatus
@@ -99,8 +100,17 @@ PUBLIC_API_QUERY_FIELDS = {
     "market": ("start", "end"),
     "compare": ("token", "market_a", "market_b", "start", "end"),
     "execution_cost": ("token", "market_a", "market_b"),
+    "quality": ("token", "scope", "market_a", "market_b"),
 }
 ADMIN_STATIC_PATHS = {"/admin.html", "/admin.js"}
+SPA_TOKEN_PAGES = {"markets", "compare", "liquidity", "quality"}
+SPA_TOKEN_ROUTE = re.compile(
+    r"/tokens/[A-Za-z0-9][A-Za-z0-9._-]*/"
+    r"(?:markets|compare|liquidity|quality)/?"
+)
+SPA_METHODOLOGY_ROUTE = re.compile(
+    r"/methodology/[a-z0-9]+(?:-[a-z0-9]+)*/?"
+)
 
 
 def load_local_environment(path: Path) -> None:
@@ -586,6 +596,11 @@ def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict
             pool["tvl_status"] = "legacy_ohlcv_snapshot" if pool.get("tvl_usd") is not None else "unavailable"
             pool["tvl_observed_at"] = None
             pool["tvl_method"] = "legacy_geckoterminal_reserve_in_usd"
+            pool["tvl_snapshot_id"] = None
+            pool["tvl_source"] = None
+            pool["tvl_source_endpoint"] = None
+            pool["tvl_raw_response_sha256"] = None
+            pool["tvl_error"] = None
         return result
 
     snapshot = _load_tvl_snapshot_cached(
@@ -607,6 +622,11 @@ def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict
             pool["tvl_status"] = "not_cataloged_in_snapshot"
             pool["tvl_observed_at"] = None
             pool["tvl_method"] = None
+            pool["tvl_snapshot_id"] = None
+            pool["tvl_source"] = None
+            pool["tvl_source_endpoint"] = None
+            pool["tvl_raw_response_sha256"] = None
+            pool["tvl_error"] = None
             continue
         matched += 1
         pool["tvl_usd"] = (
@@ -617,8 +637,11 @@ def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict
         pool["tvl_status"] = tvl_row.get("status")
         pool["tvl_observed_at"] = tvl_row.get("observed_at") or None
         pool["tvl_method"] = tvl_row.get("tvl_method") or None
+        pool["tvl_snapshot_id"] = tvl_row.get("snapshot_id") or None
+        pool["tvl_source"] = tvl_row.get("source") or None
         pool["tvl_source_endpoint"] = tvl_row.get("source_endpoint") or None
         pool["tvl_raw_response_sha256"] = tvl_row.get("raw_response_sha256") or None
+        pool["tvl_error"] = tvl_row.get("error") or None
 
     metadata = result["metadata"]
     metadata["tvl_note"] = (
@@ -722,6 +745,11 @@ def overlay_cex_depth_snapshot(
             market["depth_status"] = "unavailable"
             market["depth_observed_at"] = None
             market["depth_method"] = None
+            market["depth_snapshot_id"] = None
+            market["depth_source"] = None
+            market["depth_source_endpoint"] = None
+            market["depth_raw_response_sha256"] = None
+            market["depth_error"] = None
         result["metadata"]["cex_depth_note"] = (
             "CEX depth snapshot is unavailable. Daily volume is not used as a depth proxy."
         )
@@ -768,6 +796,11 @@ def overlay_cex_depth_snapshot(
             market["depth_status"] = "not_cataloged_in_snapshot"
             market["depth_observed_at"] = None
             market["depth_method"] = None
+            market["depth_snapshot_id"] = None
+            market["depth_source"] = None
+            market["depth_source_endpoint"] = None
+            market["depth_raw_response_sha256"] = None
+            market["depth_error"] = None
             for field in numeric_fields:
                 market[field] = None
             for field in completeness_fields:
@@ -778,6 +811,8 @@ def overlay_cex_depth_snapshot(
         market["depth_status"] = depth_row.get("status")
         market["depth_observed_at"] = depth_row.get("observed_at") or None
         market["depth_method"] = depth_row.get("depth_method") or None
+        market["depth_snapshot_id"] = depth_row.get("snapshot_id") or None
+        market["depth_source"] = depth_row.get("source") or None
         market["depth_source_instrument"] = depth_row.get("source_instrument") or None
         market["depth_source_quote_asset"] = depth_row.get("source_quote_asset") or None
         market["depth_quote_conversion_method"] = (
@@ -787,6 +822,7 @@ def overlay_cex_depth_snapshot(
         market["depth_raw_response_sha256"] = (
             depth_row.get("raw_response_sha256") or None
         )
+        market["depth_error"] = depth_row.get("error") or None
         observed = depth_row.get("status") in {"observed", "partial"}
         for field in numeric_fields:
             market[field] = parse_number(depth_row.get(field)) if observed else None
@@ -904,6 +940,11 @@ def overlay_dex_depth_snapshot(
             pool["dex_depth_status"] = "unavailable"
             pool["dex_depth_observed_at"] = None
             pool["dex_depth_method"] = None
+            pool["dex_depth_snapshot_id"] = None
+            pool["dex_depth_source"] = None
+            pool["dex_depth_source_endpoint"] = None
+            pool["dex_depth_raw_response_sha256"] = None
+            pool["dex_depth_error"] = None
         result["metadata"]["dex_depth_note"] = (
             "DEX pool-state depth snapshot is unavailable. TVL and daily volume "
             "are not used as depth proxies."
@@ -942,6 +983,11 @@ def overlay_dex_depth_snapshot(
             pool["dex_depth_status"] = "not_cataloged_in_snapshot"
             pool["dex_depth_observed_at"] = None
             pool["dex_depth_method"] = None
+            pool["dex_depth_snapshot_id"] = None
+            pool["dex_depth_source"] = None
+            pool["dex_depth_source_endpoint"] = None
+            pool["dex_depth_raw_response_sha256"] = None
+            pool["dex_depth_error"] = None
             for field in numeric_fields:
                 pool[field] = None
             for field in completeness_fields:
@@ -952,6 +998,8 @@ def overlay_dex_depth_snapshot(
         pool["dex_depth_status"] = depth_row.get("status")
         pool["dex_depth_observed_at"] = depth_row.get("observed_at") or None
         pool["dex_depth_method"] = depth_row.get("depth_method") or None
+        pool["dex_depth_snapshot_id"] = depth_row.get("snapshot_id") or None
+        pool["dex_depth_source"] = depth_row.get("source") or None
         pool["dex_depth_protocol_model"] = (
             depth_row.get("protocol_model") or None
         )
@@ -1198,6 +1246,17 @@ def _build_database_payload_cached(
     }
 
 
+def execution_freshness_observed_at(path: Path | None) -> str | None:
+    """Read the execution fact's own state time without borrowing depth time."""
+    if path is None:
+        return None
+    try:
+        snapshot = load_execution_cost_snapshot(path)
+    except (OSError, ValueError):
+        return None
+    return snapshot.get("state_observed_at") if snapshot else None
+
+
 def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     """Attach dynamic freshness without mutating the cached fact payload."""
     result = {
@@ -1205,6 +1264,8 @@ def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         "metadata": {**payload["metadata"]},
     }
     metadata = result["metadata"]
+    cex_execution_path = resolve_cex_execution_cost_path()
+    dex_execution_path = resolve_dex_execution_cost_path()
     metadata["freshness"] = build_source_freshness(
         metadata.get("source_date_ranges", {}),
         tvl_observed_at=(
@@ -1221,6 +1282,12 @@ def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
             metadata.get("dex_depth_snapshot", {}).get("observed_at")
             if metadata.get("dex_depth_snapshot")
             else None
+        ),
+        cex_execution_observed_at=execution_freshness_observed_at(
+            cex_execution_path
+        ),
+        dex_execution_observed_at=execution_freshness_observed_at(
+            dex_execution_path
         ),
     )
     return result
@@ -1486,6 +1553,18 @@ def build_market_comparison(
 
     rows_a = selected_market_rows(market_a, effective_start, effective_end)
     rows_b = selected_market_rows(market_b, effective_start, effective_end)
+    statistics_a = market_series_statistics(
+        rows_a,
+        price_field="price_usd",
+        requested_start=effective_start,
+        requested_end=effective_end,
+    )
+    statistics_b = market_series_statistics(
+        rows_b,
+        price_field="price_usd",
+        requested_start=effective_start,
+        requested_end=effective_end,
+    )
     observations = compare_daily_rows(rows_a, rows_b)
     comparable = [row for row in observations if row["spread_bps"] is not None]
     return {
@@ -1505,6 +1584,8 @@ def build_market_comparison(
         "token_symbol": token,
         "market_a": market_a,
         "market_b": market_b,
+        "market_a_statistics": statistics_a,
+        "market_b_statistics": statistics_b,
         "latest_comparable_observation": comparable[-1] if comparable else None,
         "observations": observations,
     }
@@ -1732,6 +1813,440 @@ def build_execution_cost_comparison(
     }
 
 
+QUALITY_CONTRACT_VERSION = 1
+QUALITY_STATUS_SEMANTICS = {
+    "observed": "A source-backed fact is present.",
+    "partial": "Only part of the requested execution or depth is proved.",
+    "unsupported": "No audited adapter exists for this market model.",
+    "failed": "A supported collection or calculation failed.",
+    "unavailable": "No current snapshot is configured or published.",
+    "not_cataloged_in_snapshot": (
+        "A current snapshot exists, but it contains no row for this market."
+    ),
+    "not_applicable": "This fact is not defined for this market type.",
+}
+
+
+def _quality_lineage(
+    *,
+    status: str,
+    observed_at: str | None = None,
+    source: str | None = None,
+    source_endpoint: str | None = None,
+    method: str | None = None,
+    reason: str | None = None,
+    snapshot_id: str | None = None,
+    dataset_sha256: str | None = None,
+    raw_response_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Return one stable set of fields shared by every quality fact."""
+    return {
+        "status": status,
+        "observed_at": observed_at,
+        "source": source,
+        "source_endpoint": source_endpoint,
+        "method": method,
+        "reason": reason,
+        "snapshot_id": snapshot_id,
+        "dataset_sha256": dataset_sha256,
+        "raw_response_sha256": raw_response_sha256,
+    }
+
+
+def _dataset_source_for_market(
+    metadata: dict[str, Any],
+    market_type: str,
+) -> dict[str, Any] | None:
+    expected_name = CEX_FILENAME if market_type == "cex" else DEX_FILENAME
+    sources = metadata.get("sources") or []
+    for source in sources:
+        if source.get("name") == expected_name:
+            return source
+    daily_sources = sources[:2]
+    fallback_index = 0 if market_type == "cex" else 1
+    return (
+        daily_sources[fallback_index]
+        if len(daily_sources) > fallback_index
+        else None
+    )
+
+
+def _quality_flags_for_fact(
+    market: dict[str, Any],
+    fact: str,
+) -> list[dict[str, Any]]:
+    details = market.get("quality_flag_details") or []
+    if fact == "daily":
+        codes = {"low_daily_coverage"}
+    elif fact == "tvl":
+        codes = {"tiny_pool"}
+    elif fact == "depth":
+        codes = {
+            "depth_unavailable",
+            "depth_unsupported",
+            "unsupported_depth",
+            "depth_partial",
+            "partial_depth",
+            "depth_failed",
+            "failed_depth",
+            "depth_not_cataloged",
+            "zero_depth_10bps",
+            "zero_depth_inside_spread",
+            "off_market_pool_state_price",
+            "off_market_price",
+            "wide_quoted_spread",
+        }
+    else:
+        codes = set()
+    return [
+        detail
+        for detail in details
+        if detail.get("code") in codes
+    ]
+
+
+def _daily_quality_fact(
+    market: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    observation_days = market.get("observation_days")
+    observed = (
+        isinstance(observation_days, (int, float))
+        and not isinstance(observation_days, bool)
+        and observation_days > 0
+    )
+    dataset_source = _dataset_source_for_market(
+        metadata,
+        market["market_type"],
+    )
+    return {
+        **_quality_lineage(
+            status="observed" if observed else "unavailable",
+            observed_at=market.get("observed_end"),
+            source=market.get("source"),
+            method="daily_close_no_fill",
+            reason=None if observed else "no_daily_observations",
+            dataset_sha256=(
+                dataset_source.get("sha256") if dataset_source else None
+            ),
+        ),
+        "observed_start": market.get("observed_start"),
+        "observed_end": market.get("observed_end"),
+        "observation_days": observation_days,
+        "requested_window_days": market.get("requested_window_days"),
+        "coverage_ratio": market.get("coverage_ratio"),
+        "quality_flags": _quality_flags_for_fact(market, "daily"),
+    }
+
+
+def _tvl_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
+    if market["market_type"] == "cex":
+        return {
+            **_quality_lineage(
+                status="not_applicable",
+                reason="cex_markets_do_not_have_pool_tvl",
+            ),
+            "value_usd": None,
+            "quality_flags": [],
+        }
+    status = market.get("tvl_status") or "unavailable"
+    return {
+        **_quality_lineage(
+            status=status,
+            observed_at=market.get("tvl_observed_at"),
+            source=market.get("tvl_source"),
+            source_endpoint=market.get("tvl_source_endpoint"),
+            method=market.get("tvl_method"),
+            reason=market.get("tvl_error"),
+            snapshot_id=market.get("tvl_snapshot_id"),
+            raw_response_sha256=market.get("tvl_raw_response_sha256"),
+        ),
+        # An observed zero is a real value.  Do not use truthiness here.
+        "value_usd": market.get("tvl_usd"),
+        "quality_flags": _quality_flags_for_fact(market, "tvl"),
+    }
+
+
+def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
+    market_type = market["market_type"]
+    status = market.get("depth_status") or "unavailable"
+    bands = {}
+    for band in (10, 25, 50, 100):
+        sell_prefix = "bid" if market_type == "cex" else "sell"
+        buy_prefix = "ask" if market_type == "cex" else "buy"
+        bands[str(band)] = {
+            "sell_token_usd": market.get(
+                f"{sell_prefix}_depth_{band}bps_usd"
+            ),
+            "buy_token_usd": market.get(
+                f"{buy_prefix}_depth_{band}bps_usd"
+            ),
+            "total_usd": market.get(f"total_depth_{band}bps_usd"),
+            "complete": bool(market.get(f"depth_{band}bps_complete")),
+        }
+    return {
+        **_quality_lineage(
+            status=status,
+            observed_at=market.get("depth_observed_at"),
+            source=market.get("depth_source"),
+            source_endpoint=market.get("depth_source_endpoint"),
+            method=market.get("depth_method"),
+            reason=market.get("depth_error"),
+            snapshot_id=market.get("depth_snapshot_id"),
+            raw_response_sha256=market.get(
+                "depth_raw_response_sha256"
+            ),
+        ),
+        "block_number": market.get("depth_block_number"),
+        "protocol_model": market.get("depth_protocol_model"),
+        "bands_bps": bands,
+        "quality_flags": _quality_flags_for_fact(market, "depth"),
+    }
+
+
+def _execution_quality_source(
+    resolver,
+) -> dict[str, Any]:
+    try:
+        path = resolver()
+    except FileNotFoundError as error:
+        return {"snapshot": None, "error": str(error)}
+    if path is None:
+        return {"snapshot": None, "error": None}
+    try:
+        return {"snapshot": load_execution_cost_snapshot(path), "error": None}
+    except (OSError, ValueError) as error:
+        return {"snapshot": None, "error": str(error)}
+
+
+def _one_execution_value(
+    rows: list[dict[str, str]],
+    field: str,
+) -> str | None:
+    values = sorted(
+        {
+            str(row.get(field))
+            for row in rows
+            if row.get(field) not in (None, "")
+        }
+    )
+    return values[0] if len(values) == 1 else None
+
+
+def _execution_quality_fact(
+    market: dict[str, Any],
+    source_state: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = source_state["snapshot"]
+    load_error = source_state["error"]
+    if load_error is not None:
+        return {
+            **_quality_lineage(
+                status="failed",
+                reason=f"execution_snapshot_invalid: {load_error}",
+            ),
+            "published_at": None,
+            "status_counts": {"failed": 1},
+            "status_reason_counts": {
+                "execution_snapshot_invalid": 1,
+            },
+            "scenario_count": 0,
+        }
+    if snapshot is None:
+        return {
+            **_quality_lineage(
+                status="unavailable",
+                reason="execution_snapshot_unavailable",
+            ),
+            "published_at": None,
+            "status_counts": {},
+            "status_reason_counts": {},
+            "scenario_count": 0,
+        }
+    rows = snapshot["by_market"].get(market["market_id"])
+    if rows is None:
+        return {
+            **_quality_lineage(
+                status="not_cataloged_in_snapshot",
+                reason="execution_market_not_cataloged_in_snapshot",
+            ),
+            "published_at": snapshot.get("observed_at"),
+            "status_counts": {},
+            "status_reason_counts": {},
+            "scenario_count": 0,
+        }
+
+    status_counts = Counter(
+        row.get("status") or "failed"
+        for row in rows
+    )
+    status_priority = ("failed", "partial", "unsupported", "observed")
+    status = next(
+        candidate
+        for candidate in status_priority
+        if status_counts.get(candidate)
+    )
+    reason_counts = Counter(
+        row.get("status_reason") or "missing_status_reason"
+        for row in rows
+    )
+    state_times = sorted(
+        {
+            row["state_observed_at"]
+            for row in rows
+            if row.get("state_observed_at")
+        }
+    )
+    published_times = sorted(
+        {
+            row["observed_at"]
+            for row in rows
+            if row.get("observed_at")
+        }
+    )
+    errors = sorted(
+        {
+            row["error"]
+            for row in rows
+            if row.get("error")
+        }
+    )
+    return {
+        **_quality_lineage(
+            status=status,
+            observed_at=state_times[-1] if state_times else None,
+            source=_one_execution_value(rows, "source"),
+            source_endpoint=_one_execution_value(
+                rows,
+                "source_endpoint",
+            ),
+            method=_one_execution_value(rows, "calculation_method"),
+            reason=(
+                sorted(reason_counts)[0]
+                if len(reason_counts) == 1
+                else "mixed_execution_status_reasons"
+            ),
+            snapshot_id=_one_execution_value(rows, "snapshot_id"),
+            raw_response_sha256=_one_execution_value(
+                rows,
+                "raw_response_sha256",
+            ),
+        ),
+        "source_snapshot_id": _one_execution_value(
+            rows,
+            "source_snapshot_id",
+        ),
+        "published_at": published_times[-1] if published_times else None,
+        "status_counts": dict(sorted(status_counts.items())),
+        "status_reason_counts": dict(sorted(reason_counts.items())),
+        "errors": errors,
+        "scenario_count": len(rows),
+        "directions": sorted(
+            {row["direction"] for row in rows if row.get("direction")}
+        ),
+        "notionals_usd": sorted(
+            {
+                int(Decimal(row["requested_notional_usd"]))
+                for row in rows
+                if row.get("requested_notional_usd")
+            }
+        ),
+    }
+
+
+def build_market_quality(
+    token_symbol: str | None,
+    scope: str | None = None,
+    market_a_id: str | None = None,
+    market_b_id: str | None = None,
+) -> dict[str, Any]:
+    """Return a fact-by-market quality inventory for one exact Token."""
+    if not token_symbol:
+        raise ValueError("token is required")
+    token = token_symbol.strip().upper()
+    normalized_scope = (scope or "all").strip().lower()
+    if normalized_scope not in {"all", "selected"}:
+        raise ValueError("scope must be all or selected")
+
+    catalog = build_market_catalog()
+    token_markets = [
+        market
+        for market in catalog["markets"]
+        if market["token_symbol"] == token
+    ]
+    if not token_markets:
+        raise ValueError("Token is not cataloged")
+    by_id = {market["market_id"]: market for market in token_markets}
+    selected_ids: list[str] = []
+    if normalized_scope == "selected":
+        if not market_a_id or not market_b_id:
+            raise ValueError(
+                "market_a and market_b are required for selected scope"
+            )
+        if market_a_id == market_b_id:
+            raise ValueError("market_a and market_b must be different")
+        if market_a_id not in by_id or market_b_id not in by_id:
+            raise ValueError(
+                "Selected market is not cataloged for the requested token"
+            )
+        selected_ids = [market_a_id, market_b_id]
+        token_markets = [by_id[market_id] for market_id in selected_ids]
+
+    execution_sources = {
+        "cex": _execution_quality_source(
+            resolve_cex_execution_cost_path
+        ),
+        "dex": _execution_quality_source(
+            resolve_dex_execution_cost_path
+        ),
+    }
+    quality_markets = []
+    for market in token_markets:
+        quality_markets.append(
+            {
+                "market_id": market["market_id"],
+                "token_symbol": market["token_symbol"],
+                "market_type": market["market_type"],
+                "venue": market["venue"],
+                "instrument": market["instrument"],
+                "chain": market.get("chain"),
+                "pool_address": market.get("pool_address"),
+                "quality_status": market.get("quality_status"),
+                "quality_flags": market.get("quality_flag_details") or [],
+                "facts": {
+                    "daily": _daily_quality_fact(
+                        market,
+                        catalog["metadata"],
+                    ),
+                    "tvl": _tvl_quality_fact(market),
+                    "depth": _depth_quality_fact(market),
+                    "execution": _execution_quality_fact(
+                        market,
+                        execution_sources[market["market_type"]],
+                    ),
+                },
+            }
+        )
+    return {
+        "metadata": {
+            "contract_version": QUALITY_CONTRACT_VERSION,
+            "scope": normalized_scope,
+            "selected_market_ids": selected_ids,
+            "facts": ["daily", "tvl", "depth", "execution"],
+            "status_semantics": QUALITY_STATUS_SEMANTICS,
+            "freshness": catalog["metadata"].get("freshness"),
+            "sources": catalog["metadata"].get("sources", []),
+            "missing_value_rule": (
+                "Measured zero remains zero. Missing, unavailable, failed, "
+                "unsupported, not-cataloged, and not-applicable facts remain "
+                "distinct and are never zero-filled."
+            ),
+        },
+        "token_symbol": token,
+        "markets": quality_markets,
+    }
+
+
 def encode_json_payload(payload: Any, accept_encoding: str = "") -> tuple[bytes, bool]:
     """Serialize JSON and compress substantial responses when the client supports gzip."""
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -1785,6 +2300,13 @@ def _build_public_api_payload(
     if route == "execution_cost":
         return build_execution_cost_comparison(
             token_symbol=query.get("token"),
+            market_a_id=query.get("market_a"),
+            market_b_id=query.get("market_b"),
+        )
+    if route == "quality":
+        return build_market_quality(
+            token_symbol=query.get("token"),
+            scope=query.get("scope"),
             market_a_id=query.get("market_a"),
             market_b_id=query.get("market_b"),
         )
@@ -1913,6 +2435,18 @@ def is_loopback_host(host: str) -> bool:
         return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
     except ValueError:
         return False
+
+
+def is_spa_shell_path(path: str) -> bool:
+    """Return true only for the dashboard's declared client-side routes."""
+    decoded = unquote(urlparse(path).path)
+    if decoded in {"/screener", "/screener/", "/methodology", "/methodology/"}:
+        return True
+    token_match = SPA_TOKEN_ROUTE.fullmatch(decoded)
+    if token_match:
+        page = decoded.rstrip("/").rsplit("/", 1)[-1]
+        return page in SPA_TOKEN_PAGES
+    return SPA_METHODOLOGY_ROUTE.fullmatch(decoded) is not None
 
 
 def is_admin_surface_path(path: str) -> bool:
@@ -2054,6 +2588,8 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         request_path = urlparse(path).path
         if request_path in VENDOR_FILES:
             return str(VENDOR_FILES[request_path])
+        if is_spa_shell_path(request_path):
+            return str(STATIC_ROOT / "index.html")
         return super().translate_path(path)
 
     def do_GET(self) -> None:  # noqa: N802
@@ -2081,6 +2617,13 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("execution_cost", query)
+            except (FileNotFoundError, ValueError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/markets/quality":
+            query = parse_qs(parsed.query)
+            try:
+                self.send_public_api("quality", query)
             except (FileNotFoundError, ValueError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return

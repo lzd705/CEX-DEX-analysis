@@ -768,6 +768,13 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "depth_status": row.get("depth_status"),
                 "depth_observed_at": row.get("depth_observed_at"),
                 "depth_method": row.get("depth_method"),
+                "depth_snapshot_id": row.get("depth_snapshot_id"),
+                "depth_source": row.get("depth_source"),
+                "depth_source_endpoint": row.get("depth_source_endpoint"),
+                "depth_raw_response_sha256": row.get(
+                    "depth_raw_response_sha256"
+                ),
+                "depth_error": row.get("depth_error"),
                 "depth_source_instrument": row.get("depth_source_instrument"),
                 "depth_source_quote_asset": row.get("depth_source_quote_asset"),
                 "depth_quote_conversion_method": row.get(
@@ -851,9 +858,25 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "tvl_status": row.get("tvl_status"),
                 "tvl_observed_at": row.get("tvl_observed_at"),
                 "tvl_method": row.get("tvl_method"),
+                "tvl_snapshot_id": row.get("tvl_snapshot_id"),
+                "tvl_source": row.get("tvl_source"),
+                "tvl_source_endpoint": row.get("tvl_source_endpoint"),
+                "tvl_raw_response_sha256": row.get(
+                    "tvl_raw_response_sha256"
+                ),
+                "tvl_error": row.get("tvl_error"),
                 "depth_status": row.get("dex_depth_status"),
                 "depth_observed_at": row.get("dex_depth_observed_at"),
                 "depth_method": row.get("dex_depth_method"),
+                "depth_snapshot_id": row.get("dex_depth_snapshot_id"),
+                "depth_source": row.get("dex_depth_source"),
+                "depth_source_endpoint": row.get(
+                    "dex_depth_source_endpoint"
+                ),
+                "depth_raw_response_sha256": row.get(
+                    "dex_depth_raw_response_sha256"
+                ),
+                "depth_error": row.get("dex_depth_error"),
                 "depth_protocol_model": row.get("dex_depth_protocol_model"),
                 "depth_block_number": row.get("dex_depth_block_number"),
                 "fee_bps": row.get("fee_bps"),
