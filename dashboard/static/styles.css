@@ -43,6 +43,17 @@ caption {
   white-space: nowrap;
   border: 0;
 }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 .app-header {
   height: 76px;
@@ -201,6 +212,11 @@ main { min-width: 0; padding: 14px 18px 30px; }
   background: var(--surface-2);
   color: var(--text);
 }
+.selector-policy {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
 .compare-command {
   min-height: 44px;
   padding: 0 18px;
@@ -233,6 +249,316 @@ main { min-width: 0; padding: 14px 18px 30px; }
   border-color: #276748;
   background: #133526;
   color: #9ce3bd;
+}
+.liquidity-panel {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  background: #12151a;
+}
+.liquidity-heading,
+.daily-comparison-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+.liquidity-heading h3,
+.daily-comparison-heading h3 {
+  margin: 4px 0 3px;
+  font-size: 17px;
+}
+.liquidity-heading p,
+.daily-comparison-heading p {
+  max-width: 760px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.liquidity-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.liquidity-status {
+  margin-top: 12px;
+  padding: 9px 11px;
+  border-left: 3px solid var(--amber);
+  background: #292315;
+  color: #f0cc87;
+  font-size: 12px;
+}
+.liquidity-status[data-state="success"] {
+  border-color: var(--positive);
+  background: #122a20;
+  color: #9ce3bd;
+}
+.liquidity-status[data-state="critical"] {
+  border-color: var(--negative);
+  background: #321a20;
+  color: #ffb4bf;
+}
+.liquidity-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  background: var(--line);
+}
+.liquidity-summary > div {
+  min-width: 0;
+  padding: 11px 13px;
+  background: var(--surface-2);
+}
+.liquidity-summary span {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.liquidity-summary strong {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 16px;
+}
+.liquidity-figure {
+  margin: 10px 0 0;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+}
+.liquidity-plot {
+  position: relative;
+  min-height: 360px;
+  overflow: hidden;
+  background:
+    linear-gradient(180deg, rgba(86, 180, 188, .035), transparent 46%),
+    #161a20;
+}
+#liquidity-chart {
+  display: block;
+  width: 100%;
+  height: 360px;
+}
+.liquidity-grid-line {
+  stroke: #303742;
+  stroke-width: 1;
+}
+.liquidity-x-guide {
+  stroke: #29303a;
+  stroke-dasharray: 3 5;
+  stroke-width: 1;
+}
+.liquidity-axis-line {
+  stroke: #697382;
+  stroke-width: 1.2;
+}
+.liquidity-zero-rail {
+  stroke: var(--amber);
+  stroke-dasharray: 5 4;
+  stroke-width: 1.3;
+}
+.liquidity-axis-label,
+.liquidity-axis-title,
+.liquidity-scale-label,
+.liquidity-zero-label {
+  fill: var(--muted);
+  font-family: Inter, ui-sans-serif, sans-serif;
+  font-size: 11px;
+}
+.liquidity-axis-title {
+  fill: #b7bec8;
+  font-size: 12px;
+  font-weight: 700;
+}
+.liquidity-scale-label {
+  fill: #c4cbd4;
+  font-weight: 700;
+}
+.liquidity-zero-label {
+  fill: var(--amber);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+.liquidity-marker,
+.liquidity-lower-bound-ring {
+  color: var(--accent);
+  stroke: currentColor;
+}
+.series-a-total,
+.series-a-sell,
+.series-a-buy {
+  color: #65c5ce;
+}
+.series-b-total,
+.series-b-sell,
+.series-b-buy {
+  color: #e8b15c;
+}
+.liquidity-marker {
+  stroke-width: 2.4;
+  vector-effect: non-scaling-stroke;
+}
+.liquidity-marker.filled {
+  fill: currentColor;
+  fill-opacity: .82;
+}
+.liquidity-marker.outlined {
+  fill: none;
+  stroke-width: 3;
+}
+.liquidity-lower-bound-ring {
+  fill: none;
+  stroke-dasharray: 2.5 2.5;
+  stroke-width: 1.6;
+  vector-effect: non-scaling-stroke;
+}
+.liquidity-focus-ring {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.liquidity-point { cursor: help; }
+.liquidity-point:focus { outline: none; }
+.liquidity-point:focus .liquidity-focus-ring {
+  stroke: #fff;
+  stroke-dasharray: 2 2;
+}
+.liquidity-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: var(--missing);
+  text-align: center;
+}
+.liquidity-tooltip {
+  position: absolute;
+  z-index: 3;
+  top: 10px;
+  left: 50%;
+  width: min(720px, calc(100% - 24px));
+  padding: 8px 10px;
+  transform: translateX(-50%);
+  border: 1px solid #657180;
+  border-radius: 3px;
+  background: rgba(10, 12, 16, .96);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, .35);
+  color: #edf0f3;
+  font-size: 11px;
+  line-height: 1.45;
+  pointer-events: none;
+}
+.liquidity-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+  color: #c8ced6;
+  font-size: 11px;
+}
+.liquidity-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.liquidity-legend-marker {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  color: var(--accent);
+}
+.liquidity-legend-marker.series-a-total,
+.liquidity-legend-marker.series-a-sell,
+.liquidity-legend-marker.series-a-buy {
+  color: #65c5ce;
+}
+.liquidity-legend-marker.series-b-total,
+.liquidity-legend-marker.series-b-sell,
+.liquidity-legend-marker.series-b-buy {
+  color: #e8b15c;
+}
+.liquidity-legend-marker.filled { background: currentColor; }
+.liquidity-legend-marker.outlined { background: #161a20; }
+.liquidity-legend-marker.diamond {
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+.liquidity-figure figcaption {
+  padding: 0 12px 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.liquidity-table-scroll {
+  max-height: 330px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-top: 0;
+}
+.liquidity-table {
+  min-width: 1140px;
+  font-size: 12px;
+}
+.liquidity-table th,
+.liquidity-table td {
+  height: 43px;
+  padding: 7px 10px;
+  text-align: right;
+}
+.liquidity-table th:first-child,
+.liquidity-table td:first-child {
+  text-align: left;
+}
+.liquidity-table tbody th {
+  z-index: 1;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.liquidity-market-meta {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 9px 11px;
+  border-left: 3px solid var(--amber);
+  background: var(--surface-2);
+  font-size: 11px;
+}
+.liquidity-market-meta[data-state="success"] { border-color: var(--positive); }
+.liquidity-market-meta[data-state="critical"] { border-color: var(--negative); }
+.liquidity-market-meta > div:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.liquidity-market-meta strong {
+  color: #e5e9ed;
+  overflow-wrap: anywhere;
+}
+.liquidity-market-meta span { color: var(--muted); }
+.liquidity-market-meta .quality-badges {
+  flex: 0 1 auto;
+  margin-top: 0;
+}
+.liquidity-integrity-error {
+  color: #ffb4bf !important;
+  font-weight: 700;
+}
+.daily-comparison-heading {
+  align-items: center;
+  margin-top: 18px;
 }
 .comparison-summary {
   display: grid;
@@ -470,6 +796,12 @@ footer {
   .search-control { margin-left: 0; }
   .monitor-toolbar { flex-wrap: wrap; }
   .comparison-summary { grid-template-columns: 1fr 1fr; }
+  .liquidity-heading { display: block; }
+  .liquidity-toggles {
+    justify-content: flex-start;
+    margin-top: 12px;
+  }
+  .liquidity-summary { grid-template-columns: 1fr 1fr; }
   .table-scroll { max-height: none; }
   .quality-legend-grid { grid-template-columns: 1fr 1fr; }
 }
@@ -501,6 +833,88 @@ footer {
   .contract-badge { display: inline-block; margin-top: 10px; }
   .facts-controls { grid-template-columns: 1fr; }
   .comparison-summary { grid-template-columns: 1fr; }
+  .liquidity-panel { padding: 12px 8px; }
+  .liquidity-toggles { display: grid; grid-template-columns: 1fr; }
+  .liquidity-toggles .segmented-control { display: flex; width: 100%; }
+  .liquidity-toggles .segmented-control button { flex: 1; }
+  .liquidity-summary { grid-template-columns: 1fr; }
+  .liquidity-summary span { white-space: normal; }
+  .liquidity-plot { min-height: 300px; }
+  #liquidity-chart {
+    height: 300px;
+    aspect-ratio: auto;
+  }
+  .liquidity-axis-label { font-size: 10px; }
+  .liquidity-axis-title { font-size: 11px; }
+  .liquidity-scale-label { font-size: 10px; }
+  .liquidity-tooltip {
+    top: 6px;
+    width: calc(100% - 12px);
+    font-size: 10px;
+  }
+  .liquidity-legend { display: grid; grid-template-columns: 1fr; }
+  .liquidity-table-scroll {
+    max-height: none;
+    overflow: visible;
+    border: 0;
+  }
+  .liquidity-table {
+    display: block;
+    min-width: 0;
+  }
+  .liquidity-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+  .liquidity-table tbody {
+    display: grid;
+    gap: 8px;
+  }
+  .liquidity-table tr {
+    display: grid;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    background: var(--surface-2);
+  }
+  .liquidity-table th,
+  .liquidity-table td,
+  .liquidity-table th:first-child,
+  .liquidity-table td:first-child {
+    position: static;
+    display: grid;
+    grid-template-columns: minmax(108px, .8fr) minmax(0, 1.2fr);
+    gap: 10px;
+    width: 100%;
+    min-height: 42px;
+    height: auto;
+    padding: 8px 9px;
+    border-bottom: 1px solid var(--line-soft);
+    background: transparent;
+    text-align: right;
+    white-space: normal;
+  }
+  .liquidity-table tr > :last-child { border-bottom: 0; }
+  .liquidity-table th::before,
+  .liquidity-table td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-family: Inter, ui-sans-serif, sans-serif;
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: .03em;
+    text-align: left;
+    text-transform: uppercase;
+  }
+  .liquidity-market-meta {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+  .liquidity-market-meta .quality-badges { justify-content: flex-start; }
+  .daily-comparison-heading { display: block; }
+  .daily-comparison-heading .contract-badge { margin-top: 8px; }
   .comparison-table-scroll {
     max-height: 430px;
     scrollbar-color: var(--accent) var(--surface-2);

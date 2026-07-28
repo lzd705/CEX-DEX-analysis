@@ -85,8 +85,26 @@ CSVs and a validated SQLite database back into `data/local/`.
 - DEX protocols without an audited adapter display `N/A`, not a TVL-based
   estimate.
 - The comparison workbench selects one Token and any two cataloged markets,
-  then displays unfilled daily closes, daily USD volume, absolute USD spread,
-  and midpoint-relative bps.
+  then displays both the latest point-in-time depth profile and the independent
+  unfilled daily price/volume series.
+- Initial A/B choices prefer markets with integrity-valid measured depth and no
+  depth-relevant quality flags. The daily comparison uses those same selected
+  market IDs, so its default can differ from the quality-weighted primary
+  market. Manual selection can still choose any cataloged market and exposes
+  unsupported or failed depth as `N/A`.
+- The depth profile plots only the four observed 10/25/50/100 bps thresholds;
+  markers are never connected or interpolated. Total depth is the default.
+  Directional mode normalizes CEX bid and DEX sell depth as `sell Token`, and
+  CEX ask and DEX buy depth as `buy Token`.
+- Log scale is the default for cross-market comparison. Real zero depth remains
+  on a labeled zero rail instead of receiving an artificial positive value.
+  Missing, unsupported, failed, and not-cataloged depth stays `N/A`.
+- An incomplete band is an observed lower bound, displayed with `>=` in exact
+  values and a dashed ring in the plot. The table, source method, block where
+  applicable, snapshot timestamps, and A/B snapshot skew remain visible for
+  audit.
+- The daily date controls do not change the latest depth snapshots, and the two
+  selected snapshots are not claimed to be synchronized.
 - `/api/markets/catalog` is the audit entrypoint; `/api/markets/compare` accepts
   only cataloged market IDs for the requested Token.
 

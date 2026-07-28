@@ -3,6 +3,10 @@ const app = {
   catalog: null,
   comparison: null,
   scope: "combined",
+  liquidityView: "total",
+  liquidityScale: "log",
+  liquidityEffectiveScale: null,
+  liquidityEffectiveScaleLabel: "",
   selections: {},
   selectionOverrides: {},
   searchQuery: "",
@@ -11,10 +15,22 @@ const app = {
   comparisonRequestId: 0,
   marketController: null,
   comparisonController: null,
+  liquidityLayoutMode: null,
+  liquidityResizeScheduled: false,
+  liquidityResizeObserver: null,
 };
 
 const DEFAULT_MARKET_CACHE_KEY = "market-monitor:default-payload:v2";
 const DEPTH_BANDS = [10, 25, 50, 100];
+const MEASURED_DEPTH_STATUSES = new Set(["observed", "complete", "partial"]);
+const LIQUIDITY_CHART = {
+  width: 760,
+  height: 360,
+  left: 78,
+  right: 24,
+  top: 24,
+  bottom: 302,
+};
 const QUALITY_FLAG_LABELS = {
   depth_unavailable: "Depth unavailable",
   depth_unsupported: "Depth unsupported",
@@ -64,7 +80,6 @@ const bpsFormat = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 4,
 });
-
 function finite(value) {
   return Number.isFinite(value);
 }
@@ -705,12 +720,724 @@ function catalogMarketScore(market, tokenSummary) {
 }
 
 function preferredCatalogMarket(markets, type, tokenSummary) {
-  return [...markets]
-    .filter((market) => market.market_type === type)
+  const candidates = markets.filter((market) => market.market_type === type);
+  const depthReadyCandidates = candidates.filter((market) => (
+    Boolean(liquidityRenderableMarket(market))
+  ));
+  const cleanDepthReadyCandidates = depthReadyCandidates.filter((market) => (
+    liquidityRelevantFlags(market).length === 0
+  ));
+  const rankedCandidates = cleanDepthReadyCandidates.length
+    ? cleanDepthReadyCandidates
+    : depthReadyCandidates.length
+      ? depthReadyCandidates
+      : candidates;
+  return [...rankedCandidates]
     .sort((a, b) => (
       catalogMarketScore(b, tokenSummary) - catalogMarketScore(a, tokenSummary)
       || a.market_id.localeCompare(b.market_id)
     ))[0];
+}
+
+function validDepth(value) {
+  return finite(value) && value >= 0;
+}
+
+function isMeasuredDepthStatus(market) {
+  return MEASURED_DEPTH_STATUSES.has(market?.depth_status);
+}
+
+function selectedLiquidityMarkets() {
+  if (!app.catalog) return { token: "", marketA: null, marketB: null };
+  const token = byId("facts-token").value;
+  const markets = factsMarketsForToken(token);
+  return {
+    token,
+    marketA: markets.find((market) => market.market_id === byId("facts-market-a").value) || null,
+    marketB: markets.find((market) => market.market_id === byId("facts-market-b").value) || null,
+  };
+}
+
+function liquiditySideDefinition(market) {
+  if (market?.market_type === "cex") {
+    return {
+      sellField: "bid",
+      buyField: "ask",
+      sellLabel: "Bid · sell Token",
+      buyLabel: "Ask · buy Token",
+    };
+  }
+  return {
+    sellField: "sell",
+    buyField: "buy",
+    sellLabel: "Sell Token",
+    buyLabel: "Buy Token",
+  };
+}
+
+function liquidityMarketLabel(slot, market) {
+  if (!market) return `${slot} · unavailable`;
+  return `${slot} · ${market.market_type.toUpperCase()} · ${market.venue} · ${market.instrument}`;
+}
+
+function liquidityDepthValue(market, band, component = "total") {
+  if (!market) return null;
+  const value = market[`${component}_depth_${band}bps_usd`];
+  return validDepth(value) ? value : null;
+}
+
+function liquidityDepthIssues(market) {
+  if (!market) return [];
+  const sides = liquiditySideDefinition(market);
+  const components = ["total", sides.sellField, sides.buyField];
+  const issues = [];
+  const measuredStatus = isMeasuredDepthStatus(market);
+  const shape = DEPTH_BANDS.map((band) => ({
+    band,
+    complete: Boolean(market[`depth_${band}bps_complete`]),
+    values: components.map((component) => market[`${component}_depth_${band}bps_usd`]),
+  }));
+  if (measuredStatus) {
+    shape.forEach(({ band, values }) => {
+      if (values.some((value) => !validDepth(value))) {
+        issues.push(`${market.depth_status} depth is missing a total or directional value at ±${band} bps`);
+      }
+    });
+    if (
+      (market.depth_status === "observed" || market.depth_status === "complete")
+      && shape.some(({ complete }) => !complete)
+    ) {
+      issues.push(`${market.depth_status} status contains an incomplete measured band`);
+    }
+    if (
+      market.depth_status === "partial"
+      && shape.every(({ complete }) => complete)
+    ) {
+      issues.push("partial status contains no incomplete measured band");
+    }
+  } else if (
+    shape.some(({ complete, values }) => (
+      complete || values.some((value) => value !== null && value !== undefined)
+    ))
+  ) {
+    issues.push(`${market.depth_status || "unavailable"} status contains measured depth fields`);
+  }
+  components.forEach((component) => {
+    let previous = null;
+    DEPTH_BANDS.forEach((band) => {
+      const value = market[`${component}_depth_${band}bps_usd`];
+      if (value !== null && value !== undefined && !validDepth(value)) {
+        issues.push(`${component} depth at ±${band} bps is negative or non-finite`);
+        return;
+      }
+      if (validDepth(value) && previous !== null) {
+        const tolerance = Math.max(1e-8, Math.abs(previous) * 1e-10);
+        if (value + tolerance < previous) {
+          issues.push(`${component} cumulative depth falls between measured bands`);
+        }
+      }
+      if (validDepth(value)) previous = value;
+    });
+  });
+  let incompleteSeen = false;
+  DEPTH_BANDS.forEach((band) => {
+    const total = liquidityDepthValue(market, band);
+    const sell = liquidityDepthValue(market, band, sides.sellField);
+    const buy = liquidityDepthValue(market, band, sides.buyField);
+    const hasPoint = total !== null || sell !== null || buy !== null;
+    const complete = Boolean(market[`depth_${band}bps_complete`]);
+    if (hasPoint && !complete) incompleteSeen = true;
+    if (hasPoint && complete && incompleteSeen) {
+      issues.push(`completeness returns to true at ±${band} bps after an incomplete band`);
+    }
+    if (total !== null && sell !== null && buy !== null) {
+      const tolerance = Math.max(1e-8, Math.abs(total) * 1e-10);
+      if (Math.abs(total - sell - buy) > tolerance) {
+        issues.push(`directional depth does not sum to total at ±${band} bps`);
+      }
+    }
+  });
+  return [...new Set(issues)];
+}
+
+function liquidityRenderableMarket(market, issues = liquidityDepthIssues(market)) {
+  return market && isMeasuredDepthStatus(market) && !issues.length ? market : null;
+}
+
+function preferredLiquidityToken(catalog) {
+  const withCleanPair = catalog.tokens.find((token) => {
+    const markets = catalog.markets.filter((market) => market.token_symbol === token);
+    return ["cex", "dex"].every((type) => {
+      const market = preferredCatalogMarket(markets, type, null);
+      return Boolean(
+        liquidityRenderableMarket(market)
+        && liquidityRelevantFlags(market).length === 0
+        && market.depth_status !== "partial"
+      );
+    });
+  });
+  if (withCleanPair) return withCleanPair;
+  const withBothMarketTypes = catalog.tokens.find((token) => {
+    const marketTypes = new Set(catalog.markets
+      .filter((market) => (
+        market.token_symbol === token && liquidityRenderableMarket(market)
+      ))
+      .map((market) => market.market_type));
+    return marketTypes.has("cex") && marketTypes.has("dex");
+  });
+  if (withBothMarketTypes) return withBothMarketTypes;
+  return catalog.tokens.find((token) => (
+    catalog.markets.filter((market) => (
+      market.token_symbol === token && liquidityRenderableMarket(market)
+    )).length >= 2
+  )) || catalog.tokens[0] || "";
+}
+
+function liquiditySeriesForMarket(slot, market) {
+  if (!liquidityRenderableMarket(market)) return [];
+  const sides = liquiditySideDefinition(market);
+  const configurations = app.liquidityView === "total"
+    ? [{
+        component: "total",
+        label: `${liquidityMarketLabel(slot, market)} · Total`,
+        className: `series-${slot.toLowerCase()}-total`,
+        filled: true,
+      }]
+    : [
+        {
+          component: sides.sellField,
+          label: `${liquidityMarketLabel(slot, market)} · ${sides.sellLabel}`,
+          className: `series-${slot.toLowerCase()}-sell`,
+          filled: true,
+        },
+        {
+          component: sides.buyField,
+          label: `${liquidityMarketLabel(slot, market)} · ${sides.buyLabel}`,
+          className: `series-${slot.toLowerCase()}-buy`,
+          filled: false,
+        },
+      ];
+  return configurations.map((configuration) => ({
+    ...configuration,
+    slot,
+    market,
+    points: DEPTH_BANDS.map((band) => ({
+      band,
+      value: liquidityDepthValue(market, band, configuration.component),
+      complete: Boolean(market[`depth_${band}bps_complete`]),
+    })),
+  })).filter((item) => item.points.some((point) => validDepth(point.value)));
+}
+
+function formatLiquidityAxisUsd(value) {
+  if (value === 0) return "$0";
+  if (Math.abs(value) < 1) return formatRawUsd(value);
+  return compactCurrency.format(value);
+}
+
+function formatExactDepth(value, complete) {
+  if (!validDepth(value)) return "N/A";
+  return `${complete ? "" : "≥"}${formatRawUsd(value)}`;
+}
+
+function formatSummaryDepth(value, complete) {
+  if (!validDepth(value)) return "N/A";
+  return `${complete ? "" : "≥"}${formatCurrency(value)}`;
+}
+
+function niceLinearMaximum(maximum) {
+  if (!validDepth(maximum) || maximum === 0) return 1;
+  const exponent = 10 ** Math.floor(Math.log10(maximum));
+  const fraction = maximum / exponent;
+  const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+  return niceFraction * exponent;
+}
+
+function liquidityAxis(values, dimensions) {
+  const { top, bottom } = dimensions;
+  const positive = values.filter((value) => value > 0);
+  const hasZero = values.some((value) => value === 0);
+  if (app.liquidityScale === "log" && positive.length) {
+    let minimumExponent = Math.floor(Math.log10(Math.min(...positive)));
+    let maximumExponent = Math.ceil(Math.log10(Math.max(...positive)));
+    if (minimumExponent === maximumExponent) {
+      minimumExponent -= 1;
+      maximumExponent += 1;
+    }
+    const exponentStep = Math.max(
+      1,
+      Math.ceil((maximumExponent - minimumExponent) / 5),
+    );
+    const exponents = [];
+    for (
+      let exponent = minimumExponent;
+      exponent <= maximumExponent;
+      exponent += exponentStep
+    ) {
+      exponents.push(exponent);
+    }
+    if (exponents.at(-1) !== maximumExponent) exponents.push(maximumExponent);
+    const positiveBottom = bottom - (hasZero ? 16 : 0);
+    const exponentSpan = maximumExponent - minimumExponent;
+    return {
+      mode: "log",
+      scaleLabel: hasZero ? "Log USD · measured zero rail" : "Log USD",
+      hasZero,
+      ticks: exponents.map((exponent) => 10 ** exponent),
+      y(value) {
+        if (value === 0) return bottom;
+        return positiveBottom - (
+          (Math.log10(value) - minimumExponent) / exponentSpan
+        ) * (positiveBottom - top);
+      },
+    };
+  }
+  if (!positive.length && hasZero) {
+    return {
+      mode: "linear",
+      scaleLabel: "All observed values are measured zero",
+      hasZero: true,
+      ticks: [0],
+      y() {
+        return bottom;
+      },
+    };
+  }
+  const maximum = niceLinearMaximum(Math.max(0, ...values));
+  return {
+    mode: "linear",
+    scaleLabel: app.liquidityScale === "log"
+      ? "All observed values are zero · linear zero baseline"
+      : "Linear USD",
+    hasZero,
+    ticks: [0, maximum * 0.25, maximum * 0.5, maximum * 0.75, maximum],
+    y(value) {
+      return bottom - (value / maximum) * (bottom - top);
+    },
+  };
+}
+
+function liquidityChartDimensions() {
+  const renderedWidth = byId("liquidity-plot")?.clientWidth;
+  if (window.matchMedia("(max-width: 700px)").matches) {
+    return {
+      width: Math.max(280, Math.round(renderedWidth || 320)),
+      height: 300,
+      left: 66,
+      right: 14,
+      top: 22,
+      bottom: 250,
+      layout: "mobile",
+    };
+  }
+  return {
+    ...LIQUIDITY_CHART,
+    width: Math.max(640, Math.round(renderedWidth || LIQUIDITY_CHART.width)),
+    layout: "desktop",
+  };
+}
+
+function liquidityTooltipText(series, point) {
+  const status = point.complete ? "complete measured band" : "observed lower bound";
+  const block = series.market.depth_block_number
+    ? `block ${series.market.depth_block_number}`
+    : "";
+  const flags = qualityFlagObjects(series.market, series.market.market_type)
+    .filter((flag) => flag.code !== "low_daily_coverage")
+    .map((flag) => QUALITY_FLAG_LABELS[flag.code] || flag.code.replaceAll("_", " "))
+    .join(", ");
+  return [
+    series.label,
+    `±${point.band} bps`,
+    formatExactDepth(point.value, point.complete),
+    status,
+    formatUtcTimestamp(series.market.depth_observed_at),
+    series.market.depth_method || "method unavailable",
+    block,
+    flags ? `flags: ${flags}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function liquidityMarkerMarkup(series, point, x, y) {
+  const markerClass = `liquidity-marker ${series.className}${series.filled ? " filled" : " outlined"}`;
+  const title = escapeHtml(liquidityTooltipText(series, point));
+  const circleRadius = app.liquidityView === "directional" && !series.filled ? 7 : 5;
+  const diamondRadius = app.liquidityView === "directional" && !series.filled ? 9 : 7;
+  const core = series.slot === "A"
+    ? `<circle class="${markerClass}" cx="${x}" cy="${y}" r="${circleRadius}"></circle>`
+    : `<path class="${markerClass}" d="M ${x} ${y - diamondRadius} L ${x + diamondRadius} ${y} L ${x} ${y + diamondRadius} L ${x - diamondRadius} ${y} Z"></path>`;
+  const incomplete = point.complete
+    ? ""
+    : series.slot === "A"
+      ? `<circle class="liquidity-lower-bound-ring ${series.className}" cx="${x}" cy="${y}" r="${circleRadius + 4}"></circle>`
+      : `<path class="liquidity-lower-bound-ring ${series.className}" d="M ${x} ${y - diamondRadius - 4} L ${x + diamondRadius + 4} ${y} L ${x} ${y + diamondRadius + 4} L ${x - diamondRadius - 4} ${y} Z"></path>`;
+  return `<g
+      class="liquidity-point"
+      tabindex="0"
+      role="graphics-symbol"
+      aria-label="${title}"
+      aria-describedby="liquidity-tooltip"
+      data-tooltip="${title}"
+    >
+      <title>${title}</title>
+      <circle class="liquidity-focus-ring" cx="${x}" cy="${y}" r="13"></circle>
+      ${incomplete}
+      ${core}
+    </g>`;
+}
+
+function renderLiquiditySvg(series) {
+  const svg = byId("liquidity-chart");
+  const dimensions = liquidityChartDimensions();
+  app.liquidityLayoutMode = dimensions.layout;
+  svg.setAttribute("viewBox", `0 0 ${dimensions.width} ${dimensions.height}`);
+  const plotWidth = dimensions.width - dimensions.left - dimensions.right;
+  const values = series.flatMap((item) => item.points)
+    .map((point) => point.value)
+    .filter(validDepth);
+  if (!values.length) {
+    svg.innerHTML = "";
+    app.liquidityEffectiveScale = null;
+    app.liquidityEffectiveScaleLabel = "";
+    byId("liquidity-empty").hidden = false;
+    return false;
+  }
+  byId("liquidity-empty").hidden = true;
+  const axis = liquidityAxis(values, dimensions);
+  app.liquidityEffectiveScale = axis.mode;
+  app.liquidityEffectiveScaleLabel = axis.scaleLabel;
+  const x = (band) => dimensions.left + (band / 100) * plotWidth;
+  const yGrid = axis.ticks.map((tick) => {
+    const y = axis.y(tick);
+    return `<line class="liquidity-grid-line" x1="${dimensions.left}" y1="${y}" x2="${dimensions.width - dimensions.right}" y2="${y}"></line>
+      <text class="liquidity-axis-label" x="${dimensions.left - 9}" y="${y + 4}" text-anchor="end">${escapeHtml(formatLiquidityAxisUsd(tick))}</text>`;
+  }).join("");
+  const zeroRail = axis.mode === "log" && axis.hasZero
+    ? `<line class="liquidity-zero-rail" x1="${dimensions.left}" y1="${dimensions.bottom}" x2="${dimensions.width - dimensions.right}" y2="${dimensions.bottom}"></line>
+       <text class="liquidity-axis-label" x="${dimensions.left - 9}" y="${dimensions.bottom + 4}" text-anchor="end">$0</text>
+       <text class="liquidity-zero-label" x="${dimensions.left + 6}" y="${dimensions.bottom - 5}">measured zero</text>`
+    : `<line class="liquidity-axis-line" x1="${dimensions.left}" y1="${dimensions.bottom}" x2="${dimensions.width - dimensions.right}" y2="${dimensions.bottom}"></line>`;
+  const xTicks = DEPTH_BANDS.map((band) => {
+    const xValue = x(band);
+    return `<line class="liquidity-x-guide" x1="${xValue}" y1="${dimensions.top}" x2="${xValue}" y2="${dimensions.bottom}"></line>
+      <text class="liquidity-axis-label" x="${xValue}" y="${dimensions.bottom + 22}" text-anchor="middle">±${band}</text>`;
+  }).join("");
+  const markers = series.map((item) => item.points
+    .filter((point) => validDepth(point.value))
+    .map((point) => liquidityMarkerMarkup(
+      item,
+      point,
+      Number(x(point.band).toFixed(2)),
+      Number(axis.y(point.value).toFixed(2)),
+    )).join("")).join("");
+  svg.innerHTML = `
+    <title id="liquidity-svg-title">Discrete cumulative liquidity depth profile</title>
+    <desc id="liquidity-svg-description">Measured point-in-time USD depth at four price-distance thresholds. No values are interpolated between markers.</desc>
+    ${yGrid}
+    ${xTicks}
+    ${zeroRail}
+    <line class="liquidity-axis-line" x1="${dimensions.left}" y1="${dimensions.top}" x2="${dimensions.left}" y2="${dimensions.bottom}"></line>
+    <text class="liquidity-axis-title" x="${(dimensions.left + dimensions.width - dimensions.right) / 2}" y="${dimensions.height - 12}" text-anchor="middle">Absolute distance from reference price (bps)</text>
+    <text class="liquidity-axis-title" transform="translate(16 ${(dimensions.top + dimensions.bottom) / 2}) rotate(-90)" text-anchor="middle">Cumulative source-backed depth (USD)</text>
+    <text class="liquidity-scale-label" x="${dimensions.width - dimensions.right}" y="${dimensions.top - 8}" text-anchor="end">${escapeHtml(axis.scaleLabel)}</text>
+    ${markers}
+  `;
+  return true;
+}
+
+function renderLiquidityLegend(series) {
+  byId("liquidity-legend").innerHTML = series.length
+    ? series.map((item) => `<div class="liquidity-legend-item">
+        <span class="liquidity-legend-marker ${item.className} ${item.filled ? "filled" : "outlined"} ${item.slot === "B" ? "diamond" : ""}" aria-hidden="true"></span>
+        <span>${escapeHtml(item.label)}</span>
+      </div>`).join("")
+    : '<span class="missing">No measured series for this view.</span>';
+}
+
+function liquidityCompletenessLabel(market, dataMarket, band, invalid) {
+  if (invalid) return "Invalid facts";
+  if (!dataMarket) return market?.depth_status || "Unavailable";
+  const sides = liquiditySideDefinition(dataMarket);
+  const hasValue = [
+    liquidityDepthValue(dataMarket, band),
+    liquidityDepthValue(dataMarket, band, sides.sellField),
+    liquidityDepthValue(dataMarket, band, sides.buyField),
+  ].some((value) => value !== null);
+  if (!hasValue) return dataMarket.depth_status || "Unavailable";
+  return dataMarket[`depth_${band}bps_complete`] ? "Complete" : "Lower bound";
+}
+
+function renderLiquidityTable(marketA, marketB, dataMarketA, dataMarketB, invalidA, invalidB) {
+  const sidesA = liquiditySideDefinition(marketA);
+  const sidesB = liquiditySideDefinition(marketB);
+  byId("liquidity-a-total-heading").textContent = "A Total";
+  byId("liquidity-a-sell-heading").textContent = `A ${sidesA.sellLabel}`;
+  byId("liquidity-a-buy-heading").textContent = `A ${sidesA.buyLabel}`;
+  byId("liquidity-b-total-heading").textContent = "B Total";
+  byId("liquidity-b-sell-heading").textContent = `B ${sidesB.sellLabel}`;
+  byId("liquidity-b-buy-heading").textContent = `B ${sidesB.buyLabel}`;
+  byId("liquidity-table-body").innerHTML = DEPTH_BANDS.map((band) => {
+    const completeA = Boolean(dataMarketA?.[`depth_${band}bps_complete`]);
+    const completeB = Boolean(dataMarketB?.[`depth_${band}bps_complete`]);
+    return `<tr>
+      <th scope="row" data-label="Band">±${band} bps</th>
+      <td data-label="A Total">${formatExactDepth(liquidityDepthValue(dataMarketA, band), completeA)}</td>
+      <td data-label="A Sell execution">${formatExactDepth(liquidityDepthValue(dataMarketA, band, sidesA.sellField), completeA)}</td>
+      <td data-label="A Buy execution">${formatExactDepth(liquidityDepthValue(dataMarketA, band, sidesA.buyField), completeA)}</td>
+      <td data-label="A Completeness">${escapeHtml(liquidityCompletenessLabel(marketA, dataMarketA, band, invalidA))}</td>
+      <td data-label="B Total">${formatExactDepth(liquidityDepthValue(dataMarketB, band), completeB)}</td>
+      <td data-label="B Sell execution">${formatExactDepth(liquidityDepthValue(dataMarketB, band, sidesB.sellField), completeB)}</td>
+      <td data-label="B Buy execution">${formatExactDepth(liquidityDepthValue(dataMarketB, band, sidesB.buyField), completeB)}</td>
+      <td data-label="B Completeness">${escapeHtml(liquidityCompletenessLabel(marketB, dataMarketB, band, invalidB))}</td>
+    </tr>`;
+  }).join("");
+}
+
+function liquidityRelevantFlags(market) {
+  const relevantCodes = new Set([
+    "depth_unavailable",
+    "depth_unsupported",
+    "unsupported_depth",
+    "depth_partial",
+    "partial_depth",
+    "depth_failed",
+    "failed_depth",
+    "depth_not_cataloged",
+    "zero_depth_10bps",
+    "zero_depth_inside_spread",
+    "tiny_pool",
+    "off_market_pool_state_price",
+    "off_market_price",
+    "wide_quoted_spread",
+  ]);
+  return qualityFlagObjects(market, market?.market_type)
+    .filter((flag) => relevantCodes.has(flag.code));
+}
+
+function renderLiquidityMarketMeta(slot, market, issues) {
+  const element = byId(`liquidity-market-${slot.toLowerCase()}-meta`);
+  if (!market) {
+    element.innerHTML = `<strong>${slot} · no selected market</strong>`;
+    element.dataset.state = "warning";
+    return;
+  }
+  const model = market.depth_protocol_model
+    ? `${market.depth_method || "method unavailable"} · ${market.depth_protocol_model}`
+    : market.depth_method || "method unavailable";
+  const block = market.depth_block_number ? ` · block ${market.depth_block_number}` : "";
+  const issueMarkup = issues.length
+    ? `<span class="liquidity-integrity-error">${escapeHtml(issues.join("; "))}</span>`
+    : "";
+  const status = market.depth_status || "unavailable";
+  const relevantFlags = liquidityRelevantFlags(market);
+  const hasCriticalFlag = relevantFlags.some((flag) => flag.severity === "critical");
+  element.dataset.state = issues.length || status === "failed" || hasCriticalFlag
+    ? "critical"
+    : status === "observed" || status === "complete"
+      ? relevantFlags.length
+        ? "warning"
+        : "success"
+      : "warning";
+  element.innerHTML = `
+    <div>
+      <strong>${escapeHtml(liquidityMarketLabel(slot, market))}</strong>
+      <span>${escapeHtml(status)} · ${escapeHtml(formatUtcTimestamp(market.depth_observed_at))}</span>
+      <span>${escapeHtml(model)}${escapeHtml(block)}</span>
+      ${issueMarkup}
+    </div>
+    <div class="quality-badges">${renderQualityBadges(relevantFlags)}</div>
+  `;
+}
+
+function liquiditySnapshotSkew(marketA, marketB) {
+  if (
+    !isMeasuredDepthStatus(marketA)
+    || !isMeasuredDepthStatus(marketB)
+    || liquidityDepthIssues(marketA).length
+    || liquidityDepthIssues(marketB).length
+  ) {
+    return null;
+  }
+  const timestampA = Date.parse(marketA?.depth_observed_at || "");
+  const timestampB = Date.parse(marketB?.depth_observed_at || "");
+  if (!Number.isFinite(timestampA) || !Number.isFinite(timestampB)) return null;
+  const seconds = Math.round(Math.abs(timestampA - timestampB) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  const totalMinutes = Math.round(seconds / 60);
+  return `${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m`;
+}
+
+function renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB) {
+  const completeA = Boolean(dataMarketA?.depth_100bps_complete);
+  const completeB = Boolean(dataMarketB?.depth_100bps_complete);
+  byId("liquidity-a-label").textContent = marketA
+    ? `A · ${marketA.venue} total at ±100 bps`
+    : "Market A at ±100 bps";
+  byId("liquidity-b-label").textContent = marketB
+    ? `B · ${marketB.venue} total at ±100 bps`
+    : "Market B at ±100 bps";
+  byId("liquidity-a-100").textContent = formatSummaryDepth(
+    liquidityDepthValue(dataMarketA, 100),
+    completeA,
+  );
+  byId("liquidity-b-100").textContent = formatSummaryDepth(
+    liquidityDepthValue(dataMarketB, 100),
+    completeB,
+  );
+  byId("liquidity-skew").textContent = liquiditySnapshotSkew(marketA, marketB) || "N/A";
+  const pairedBands = DEPTH_BANDS.filter((band) => (
+    liquidityDepthValue(dataMarketA, band) !== null
+    && liquidityDepthValue(dataMarketB, band) !== null
+    && dataMarketA?.[`depth_${band}bps_complete`]
+    && dataMarketB?.[`depth_${band}bps_complete`]
+  )).length;
+  byId("liquidity-paired-bands").textContent = `${pairedBands} / ${DEPTH_BANDS.length}`;
+}
+
+function renderLiquidityCurve() {
+  if (!app.catalog) return;
+  const { token, marketA, marketB } = selectedLiquidityMarkets();
+  const issuesA = liquidityDepthIssues(marketA);
+  const issuesB = liquidityDepthIssues(marketB);
+  const dataMarketA = liquidityRenderableMarket(marketA, issuesA);
+  const dataMarketB = liquidityRenderableMarket(marketB, issuesB);
+  const series = [
+    ...liquiditySeriesForMarket("A", marketA),
+    ...liquiditySeriesForMarket("B", marketB),
+  ];
+  const plotted = renderLiquiditySvg(series);
+  const plottedSlots = new Set(series.map((item) => item.slot));
+  const unavailableSlots = [
+    ["A", marketA],
+    ["B", marketB],
+  ].filter(([slot]) => !plottedSlots.has(slot));
+  const failedSlots = unavailableSlots
+    .filter(([, market]) => market?.depth_status === "failed")
+    .map(([slot]) => slot);
+  const partialSlots = [
+    ["A", marketA],
+    ["B", marketB],
+  ].filter(([, market]) => market?.depth_status === "partial");
+  const qualityWarningSlots = [
+    ["A", marketA],
+    ["B", marketB],
+  ].map(([slot, market]) => [slot, liquidityRelevantFlags(market)])
+    .filter(([, flags]) => flags.length);
+  const hasCriticalQualityFlag = qualityWarningSlots.some(([, flags]) => (
+    flags.some((flag) => flag.severity === "critical")
+  ));
+  renderLiquidityLegend(series);
+  renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB);
+  renderLiquidityTable(
+    marketA,
+    marketB,
+    dataMarketA,
+    dataMarketB,
+    Boolean(marketA && issuesA.length),
+    Boolean(marketB && issuesB.length),
+  );
+  renderLiquidityMarketMeta("A", marketA, issuesA);
+  renderLiquidityMarketMeta("B", marketB, issuesB);
+  const skew = liquiditySnapshotSkew(marketA, marketB);
+  const status = byId("liquidity-status");
+  const integrityIssues = [...issuesA, ...issuesB];
+  const scaleStatus = !plotted
+    ? "no drawable scale"
+    : app.liquidityScale === "log" && app.liquidityEffectiveScale !== "log"
+      ? "measured-zero baseline (log not applicable)"
+      : `${app.liquidityEffectiveScale || app.liquidityScale} scale`;
+  status.dataset.state = integrityIssues.length
+    ? "critical"
+    : failedSlots.length
+      ? "critical"
+      : hasCriticalQualityFlag
+        ? "critical"
+      : unavailableSlots.length
+        ? "warning"
+        : partialSlots.length
+          ? "warning"
+          : qualityWarningSlots.length
+            ? "warning"
+    : plotted
+      ? "success"
+      : "warning";
+  status.textContent = integrityIssues.length
+    ? `Invalid market series suppressed: ${integrityIssues.join("; ")}.`
+    : `${token || "Selected Token"} · ${app.liquidityView} markers · ${scaleStatus}`
+      + `${skew ? ` · snapshot skew ${skew}` : " · snapshot skew unavailable"}`
+      + `${unavailableSlots.length
+        ? ` · ${unavailableSlots.map(([slot, market]) => (
+            `Market ${slot} ${market?.depth_status || "unavailable"}`
+          )).join(", ")}; no missing depth was converted to zero`
+        : ""}`
+      + `${partialSlots.length
+        ? ` · ${partialSlots.map(([slot]) => `Market ${slot} partial`).join(", ")}; incomplete bands are lower bounds`
+        : ""}`
+      + `${qualityWarningSlots.length
+        ? ` · ${qualityWarningSlots.map(([slot, flags]) => (
+            `Market ${slot} flags: ${flags.map((flag) => (
+              QUALITY_FLAG_LABELS[flag.code] || flag.code.replaceAll("_", " ")
+            )).join(", ")}`
+          )).join("; ")}`
+        : ""}`
+      + ". Daily date controls do not change these point-in-time snapshots.";
+  byId("liquidity-chart-description").textContent = [
+    `${token || "Selected Token"} discrete depth profile.`,
+    `${app.liquidityView} view on ${scaleStatus}.`,
+    marketA
+      ? `${liquidityMarketLabel("A", marketA)} is ${marketA.depth_status || "unavailable"} at ${formatUtcTimestamp(marketA.depth_observed_at)}.`
+      : "Market A is unavailable.",
+    marketB
+      ? `${liquidityMarketLabel("B", marketB)} is ${marketB.depth_status || "unavailable"} at ${formatUtcTimestamp(marketB.depth_observed_at)}.`
+      : "Market B is unavailable.",
+    "Only the four labeled thresholds are measured; missing markets are not replaced with zero or TVL.",
+  ].join(" ");
+  hideLiquidityTooltip();
+}
+
+function showLiquidityTooltip(point) {
+  const tooltip = byId("liquidity-tooltip");
+  if (!point?.dataset.tooltip) return;
+  tooltip.textContent = point.dataset.tooltip;
+  tooltip.hidden = false;
+}
+
+function hideLiquidityTooltip() {
+  const tooltip = byId("liquidity-tooltip");
+  if (!tooltip) return;
+  tooltip.hidden = true;
+  tooltip.textContent = "";
+}
+
+function bindLiquidityTooltipEvents() {
+  const svg = byId("liquidity-chart");
+  const plot = byId("liquidity-plot");
+  svg.addEventListener("pointerover", (event) => {
+    showLiquidityTooltip(event.target.closest?.(".liquidity-point"));
+  });
+  svg.addEventListener("pointerout", (event) => {
+    const point = event.target.closest?.(".liquidity-point");
+    if (point && !point.contains(event.relatedTarget)) hideLiquidityTooltip();
+  });
+  svg.addEventListener("focusin", (event) => {
+    showLiquidityTooltip(event.target.closest?.(".liquidity-point"));
+  });
+  svg.addEventListener("focusout", (event) => {
+    const point = event.target.closest?.(".liquidity-point");
+    if (point && !point.contains(event.relatedTarget)) hideLiquidityTooltip();
+  });
+  plot.addEventListener("click", (event) => {
+    const point = event.target.closest?.(".liquidity-point");
+    if (point) showLiquidityTooltip(point);
+    else hideLiquidityTooltip();
+  });
+  plot.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideLiquidityTooltip();
+      plot.focus();
+    }
+  });
 }
 
 function populateFactsMarkets({ preserve = false } = {}) {
@@ -731,6 +1458,7 @@ function populateFactsMarkets({ preserve = false } = {}) {
   }
   byId("facts-market-a").innerHTML = factsOptions(markets, marketA?.market_id);
   byId("facts-market-b").innerHTML = factsOptions(markets, marketB?.market_id);
+  renderLiquidityCurve();
 }
 
 function updateFactsContract() {
@@ -914,7 +1642,9 @@ async function loadCatalog() {
   byId("facts-token").innerHTML = payload.tokens
     .map((token) => `<option value="${escapeHtml(token)}">${escapeHtml(token)}</option>`)
     .join("");
-  if (payload.tokens.includes(currentToken)) byId("facts-token").value = currentToken;
+  byId("facts-token").value = payload.tokens.includes(currentToken)
+    ? currentToken
+    : preferredLiquidityToken(payload);
   populateFactsMarkets();
   updateFactsContract();
   return payload;
@@ -1227,6 +1957,7 @@ function bindEvents() {
         .filter((market) => market.market_id !== byId("facts-market-a").value);
       if (alternatives.length) byId("facts-market-b").value = alternatives[0].market_id;
     }
+    renderLiquidityCurve();
     loadComparison();
   });
   byId("facts-market-b").addEventListener("change", () => {
@@ -1235,9 +1966,52 @@ function bindEvents() {
         .filter((market) => market.market_id !== byId("facts-market-b").value);
       if (alternatives.length) byId("facts-market-a").value = alternatives[0].market_id;
     }
+    renderLiquidityCurve();
     loadComparison();
   });
-  byId("compare-markets").addEventListener("click", loadComparison);
+  document.querySelectorAll("[data-liquidity-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      app.liquidityView = button.dataset.liquidityView;
+      document.querySelectorAll("[data-liquidity-view]").forEach((item) => {
+        const active = item === button;
+        item.classList.toggle("active", active);
+        item.setAttribute("aria-pressed", String(active));
+      });
+      renderLiquidityCurve();
+    });
+  });
+  document.querySelectorAll("[data-liquidity-scale]").forEach((button) => {
+    button.addEventListener("click", () => {
+      app.liquidityScale = button.dataset.liquidityScale;
+      document.querySelectorAll("[data-liquidity-scale]").forEach((item) => {
+        const active = item === button;
+        item.classList.toggle("active", active);
+        item.setAttribute("aria-pressed", String(active));
+      });
+      renderLiquidityCurve();
+    });
+  });
+  bindLiquidityTooltipEvents();
+  const scheduleLiquidityResize = () => {
+    if (app.liquidityResizeScheduled) return;
+    app.liquidityResizeScheduled = true;
+    window.queueMicrotask(() => {
+      app.liquidityResizeScheduled = false;
+      if (app.catalog) renderLiquidityCurve();
+    });
+  };
+  window.addEventListener("resize", scheduleLiquidityResize);
+  window.visualViewport?.addEventListener("resize", scheduleLiquidityResize);
+  window.matchMedia("(max-width: 700px)")
+    .addEventListener("change", scheduleLiquidityResize);
+  if (window.ResizeObserver) {
+    app.liquidityResizeObserver = new ResizeObserver(scheduleLiquidityResize);
+    app.liquidityResizeObserver.observe(byId("liquidity-plot"));
+  }
+  byId("compare-markets").addEventListener("click", () => {
+    renderLiquidityCurve();
+    loadComparison();
+  });
   byId("export-csv").addEventListener("click", exportVisibleCsv);
 }
 
@@ -1262,4 +2036,4 @@ async function initialize() {
   if (window.lucide) window.lucide.createIcons();
 }
 
-initialize();
+if (typeof document !== "undefined") initialize();

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260728-quality-v5">
+    <link rel="stylesheet" href="/styles.css?v=20260728-depth-curve-v1">
   </head>
   <body>
     <header class="app-header">
@@ -71,10 +71,10 @@
         <div class="facts-heading">
           <div>
             <span class="eyebrow">P0 · auditable market facts</span>
-            <h2 id="facts-title">Two-venue daily comparison</h2>
-            <p>Select one Token and any two cataloged venues. Values are unfilled daily source observations.</p>
+            <h2 id="facts-title">Two-market fact comparison</h2>
+            <p>Select one Token and any two cataloged markets. Snapshot depth and unfilled daily observations retain separate time semantics.</p>
           </div>
-          <span class="contract-badge">Daily UTC · USD quote</span>
+          <span class="contract-badge">Daily series + latest depth</span>
         </div>
 
         <div class="facts-controls">
@@ -83,22 +83,137 @@
             <select id="facts-token" aria-label="Comparison token"></select>
           </label>
           <label>
-            <span>Venue A</span>
-            <select id="facts-market-a" aria-label="First comparison venue"></select>
+            <span>Market A</span>
+            <select id="facts-market-a" aria-label="Market A" aria-describedby="selector-policy"></select>
           </label>
           <label>
-            <span>Venue B</span>
-            <select id="facts-market-b" aria-label="Second comparison venue"></select>
+            <span>Market B</span>
+            <select id="facts-market-b" aria-label="Market B" aria-describedby="selector-policy"></select>
           </label>
           <button id="compare-markets" class="compare-command" type="button">
             Compare
           </button>
         </div>
+        <p id="selector-policy" class="selector-policy">
+          Initial A/B choices prefer markets with integrity-valid measured depth and no depth-relevant quality flags. The daily comparison uses the same selected market IDs, so its defaults can differ from the quality-weighted primary market.
+        </p>
 
         <div id="comparison-status" class="status-banner" role="status" aria-live="polite">
           Loading comparison catalog…
         </div>
         <div id="comparison-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+        <section class="liquidity-panel" aria-labelledby="liquidity-title">
+          <div class="liquidity-heading">
+            <div>
+              <span class="eyebrow">P1 · point-in-time source-backed depth</span>
+              <h3 id="liquidity-title">Discrete cumulative depth profile</h3>
+              <p>Compare the four measured USD depth bands. Latest snapshots are independent of the daily date window and are not guaranteed to be synchronized.</p>
+            </div>
+            <div class="liquidity-toggles">
+              <div class="segmented-control" role="group" aria-label="Liquidity curve series">
+                <button type="button" data-liquidity-view="total" class="active" aria-pressed="true">Total</button>
+                <button type="button" data-liquidity-view="directional" aria-pressed="false">Directional</button>
+              </div>
+              <div class="segmented-control" role="group" aria-label="Liquidity curve vertical scale">
+                <button type="button" data-liquidity-scale="linear" aria-pressed="false">Linear</button>
+                <button type="button" data-liquidity-scale="log" class="active" aria-pressed="true">Log</button>
+              </div>
+            </div>
+          </div>
+
+          <div id="liquidity-status" class="liquidity-status" role="status" aria-live="polite">
+            Loading point-in-time depth snapshots…
+          </div>
+
+          <div class="liquidity-summary" aria-label="Selected liquidity comparison summary">
+            <div>
+              <span id="liquidity-a-label">Market A at ±100 bps</span>
+              <strong id="liquidity-a-100">—</strong>
+            </div>
+            <div>
+              <span id="liquidity-b-label">Market B at ±100 bps</span>
+              <strong id="liquidity-b-100">—</strong>
+            </div>
+            <div>
+              <span>Snapshot skew</span>
+              <strong id="liquidity-skew">—</strong>
+            </div>
+            <div>
+              <span>Complete paired bands</span>
+              <strong id="liquidity-paired-bands">—</strong>
+            </div>
+          </div>
+
+          <figure class="liquidity-figure">
+            <div
+              id="liquidity-plot"
+              class="liquidity-plot"
+              role="region"
+              aria-label="Interactive liquidity depth chart"
+              tabindex="0"
+              aria-labelledby="liquidity-title"
+              aria-describedby="liquidity-chart-description liquidity-method-note"
+            >
+              <svg
+                id="liquidity-chart"
+                viewBox="0 0 760 360"
+                preserveAspectRatio="xMidYMid meet"
+                role="group"
+                aria-labelledby="liquidity-svg-title liquidity-svg-description"
+                focusable="false"
+              ></svg>
+              <div id="liquidity-empty" class="liquidity-empty" hidden>
+                No source-backed depth bands are available for the selected markets.
+              </div>
+              <div id="liquidity-tooltip" class="liquidity-tooltip" role="tooltip" hidden></div>
+            </div>
+            <div id="liquidity-legend" class="liquidity-legend" aria-label="Liquidity curve legend"></div>
+            <figcaption id="liquidity-method-note">
+              Only markers at ±10, ±25, ±50, and ±100 bps are measured; no values are interpolated between them. A dashed outer ring and ≥ value denote an incomplete lower bound.
+            </figcaption>
+          </figure>
+
+          <p id="liquidity-chart-description" class="sr-only"></p>
+
+          <div
+            class="liquidity-table-scroll"
+            role="region"
+            aria-label="Exact liquidity depth values"
+            tabindex="0"
+          >
+            <table class="liquidity-table">
+              <caption>Exact cumulative USD depth for the selected two markets at each observed price-distance band.</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Band</th>
+                  <th scope="col" id="liquidity-a-total-heading">A Total</th>
+                  <th scope="col" id="liquidity-a-sell-heading">A Sell execution</th>
+                  <th scope="col" id="liquidity-a-buy-heading">A Buy execution</th>
+                  <th scope="col">A Completeness</th>
+                  <th scope="col" id="liquidity-b-total-heading">B Total</th>
+                  <th scope="col" id="liquidity-b-sell-heading">B Sell execution</th>
+                  <th scope="col" id="liquidity-b-buy-heading">B Buy execution</th>
+                  <th scope="col">B Completeness</th>
+                </tr>
+              </thead>
+              <tbody id="liquidity-table-body">
+                <tr><td colspan="9" class="missing">Loading depth snapshots</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div id="liquidity-market-a-meta" class="liquidity-market-meta"></div>
+          <div id="liquidity-market-b-meta" class="liquidity-market-meta"></div>
+        </section>
+
+        <div class="daily-comparison-heading">
+          <div>
+            <h3>Daily price and volume comparison</h3>
+            <p>UTC daily source observations inside the selected date window; missing values are never filled.</p>
+          </div>
+          <span class="contract-badge">Daily UTC · USD quote</span>
+        </div>
+
         <div class="comparison-summary">
           <div>
             <span>Latest comparable date</span>
@@ -238,6 +353,6 @@
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/app.js?v=20260728-quality-v5"></script>
+    <script src="/app.js?v=20260728-depth-curve-v1"></script>
   </body>
 </html>

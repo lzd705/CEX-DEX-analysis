@@ -1,6 +1,7 @@
 import csv
 import gzip
 import json
+import subprocess
 import tempfile
 import time
 import unittest
@@ -292,6 +293,16 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(catalog_binance["bid_depth_100bps_usd"], 1600)
         self.assertEqual(catalog_binance["ask_depth_100bps_usd"], 2400)
         self.assertEqual(catalog_binance["depth_status"], "partial")
+        for band, bid, ask, total, complete in (
+            (10, 400, 600, 1000, True),
+            (25, 800, 1200, 2000, True),
+            (50, 1200, 1800, 3000, True),
+            (100, 1600, 2400, 4000, False),
+        ):
+            self.assertEqual(catalog_binance[f"bid_depth_{band}bps_usd"], bid)
+            self.assertEqual(catalog_binance[f"ask_depth_{band}bps_usd"], ask)
+            self.assertEqual(catalog_binance[f"total_depth_{band}bps_usd"], total)
+            self.assertEqual(catalog_binance[f"depth_{band}bps_complete"], complete)
 
     def test_fixed_block_dex_depth_overlays_pool_without_using_tvl_proxy(self):
         depth_row = {field: "" for field in DEX_DEPTH_COLUMNS}
@@ -356,6 +367,16 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         self.assertEqual(catalog_pool["depth_status"], "observed")
         self.assertEqual(catalog_pool["total_depth_100bps_usd"], 4000)
+        for band, sell, buy, total in (
+            (10, 400, 600, 1000),
+            (25, 800, 1200, 2000),
+            (50, 1200, 1800, 3000),
+            (100, 1600, 2400, 4000),
+        ):
+            self.assertEqual(catalog_pool[f"sell_depth_{band}bps_usd"], sell)
+            self.assertEqual(catalog_pool[f"buy_depth_{band}bps_usd"], buy)
+            self.assertEqual(catalog_pool[f"total_depth_{band}bps_usd"], total)
+            self.assertTrue(catalog_pool[f"depth_{band}bps_complete"])
 
     def test_catalog_identifies_markets_and_declares_fact_contract(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
@@ -699,6 +720,157 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn("#market-table td::before", styles)
         self.assertIn('content: attr(data-label)', styles)
         self.assertIn("min-height: 44px", styles)
+
+    def test_liquidity_profile_compares_only_discrete_source_backed_depth(self):
+        index = (server.STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+        app_js = (server.STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+        styles = (server.STATIC_ROOT / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("Discrete cumulative depth profile", index)
+        self.assertIn('id="liquidity-chart"', index)
+        self.assertIn('id="liquidity-table-body"', index)
+        self.assertIn('aria-label="Exact liquidity depth values"', index)
+        self.assertIn("no values are interpolated between them", index)
+        self.assertIn('data-liquidity-view="directional"', index)
+        self.assertIn('data-liquidity-scale="log"', index)
+        self.assertIn('aria-label="Interactive liquidity depth chart"', index)
+        self.assertIn("quality-weighted primary market", index)
+        self.assertIn('role="group"', index)
+        self.assertNotIn('aria-hidden="true"', index[index.index('id="liquidity-chart"'):index.index('id="liquidity-empty"')])
+
+        self.assertIn("const DEPTH_BANDS = [10, 25, 50, 100];", app_js)
+        self.assertIn('sellField: "bid"', app_js)
+        self.assertIn('buyField: "ask"', app_js)
+        self.assertIn('sellField: "sell"', app_js)
+        self.assertIn('buyField: "buy"', app_js)
+        self.assertIn("function liquidityDepthIssues(market)", app_js)
+        self.assertIn("cleanDepthReadyCandidates.length", app_js)
+        self.assertIn("liquidityRelevantFlags(market).length === 0", app_js)
+        self.assertIn("MEASURED_DEPTH_STATUSES", app_js)
+        self.assertIn("new ResizeObserver(scheduleLiquidityResize)", app_js)
+        self.assertIn('window.visualViewport?.addEventListener("resize"', app_js)
+        self.assertIn("directional depth does not sum to total", app_js)
+        self.assertIn("status contains measured depth fields", app_js)
+        self.assertIn("depth is missing a total or directional value", app_js)
+        self.assertIn("cumulative depth falls between measured bands", app_js)
+        self.assertIn("completeness returns to true", app_js)
+        self.assertIn("function liquidityRenderableMarket", app_js)
+        self.assertIn("isMeasuredDepthStatus(market)", app_js)
+        self.assertIn('if (value === 0) return bottom;', app_js)
+        self.assertIn('<th scope="row" data-label="Band">', app_js)
+        self.assertNotIn("liquidity-series-line", app_js)
+
+        self.assertIn(".liquidity-zero-rail", styles)
+        self.assertIn(".liquidity-legend-marker.series-b-total", styles)
+        self.assertIn(".liquidity-lower-bound-ring", styles)
+        self.assertIn(".liquidity-point:focus .liquidity-focus-ring", styles)
+        self.assertIn(".liquidity-table td::before", styles)
+        self.assertIn("#liquidity-chart", styles)
+
+    def test_liquidity_profile_behavior_preserves_fact_boundaries(self):
+        app_js = (server.STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+        behavior_checks = r"""
+const assert = require("node:assert/strict");
+
+function depthFixture(status = "observed") {
+  const market = {
+    market_type: "cex",
+    market_id: "cex:test:UNI/USDT",
+    venue: "test",
+    instrument: "UNI/USDT",
+    depth_status: status,
+  };
+  for (const band of DEPTH_BANDS) {
+    market[`bid_depth_${band}bps_usd`] = band;
+    market[`ask_depth_${band}bps_usd`] = band * 2;
+    market[`total_depth_${band}bps_usd`] = band * 3;
+    market[`depth_${band}bps_complete`] = true;
+  }
+  return market;
+}
+
+assert.equal(formatSummaryDepth(0, true), "$0");
+assert.notEqual(formatSummaryDepth(0.0005167977547470759, true), "$0");
+assert.match(formatSummaryDepth(0.0005167977547470759, true), /^\$0\.0005/);
+
+const unsupported = depthFixture("unsupported");
+assert.match(liquidityDepthIssues(unsupported).join(";"), /status contains measured depth fields/);
+assert.deepEqual(liquiditySeriesForMarket("A", unsupported), []);
+assert.equal(liquidityRenderableMarket(unsupported), null);
+assert.equal(liquiditySnapshotSkew(depthFixture(), unsupported), null);
+
+const partial = depthFixture("partial");
+partial.depth_50bps_complete = false;
+partial.depth_100bps_complete = false;
+assert.deepEqual(liquidityDepthIssues(partial), []);
+assert.equal(liquiditySeriesForMarket("A", partial).length, 1);
+assert.equal(formatExactDepth(partial.total_depth_100bps_usd, false).startsWith("≥"), true);
+
+const missingSide = depthFixture("observed");
+missingSide.ask_depth_25bps_usd = null;
+assert.match(
+  liquidityDepthIssues(missingSide).join(";"),
+  /missing a total or directional value/,
+);
+assert.deepEqual(liquiditySeriesForMarket("A", missingSide), []);
+assert.equal(liquidityRenderableMarket(missingSide), null);
+
+app.liquidityScale = "log";
+const zeroAxis = liquidityAxis([0, 0, 0, 0], { top: 10, bottom: 100 });
+assert.deepEqual(zeroAxis.ticks, [0]);
+assert.equal(zeroAxis.y(0), 100);
+assert.match(zeroAxis.scaleLabel, /measured zero/);
+
+const goodCex = depthFixture();
+goodCex.token_symbol = "GOOD";
+const goodDex = {
+  ...depthFixture(),
+  token_symbol: "GOOD",
+  market_type: "dex",
+  market_id: "dex:test:pool:GOOD",
+};
+for (const band of DEPTH_BANDS) {
+  goodDex[`sell_depth_${band}bps_usd`] = band;
+  goodDex[`buy_depth_${band}bps_usd`] = band * 2;
+  delete goodDex[`bid_depth_${band}bps_usd`];
+  delete goodDex[`ask_depth_${band}bps_usd`];
+}
+const flaggedDex = {
+  ...goodDex,
+  market_id: "dex:test:flagged:GOOD",
+  price_difference_bps: 200,
+  is_primary: true,
+};
+assert.match(
+  liquidityRelevantFlags(flaggedDex).map((flag) => flag.code).join(","),
+  /off_market_pool_state_price/,
+);
+assert.equal(
+  preferredCatalogMarket([flaggedDex, goodDex], "dex", null).market_id,
+  goodDex.market_id,
+);
+const badOnlyCex = depthFixture();
+badOnlyCex.token_symbol = "BAD";
+assert.equal(
+  preferredLiquidityToken({
+    tokens: ["BAD", "GOOD"],
+    markets: [badOnlyCex, goodCex, goodDex],
+  }),
+  "GOOD",
+);
+"""
+        completed = subprocess.run(
+            ["node", "-"],
+            input=f"{app_js}\n{behavior_checks}",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"Node behavior checks failed:\n{completed.stderr}",
+        )
 
     def test_sqlite_runtime_matches_csv_facts(self):
         data_dir = self.cex_path.parent
