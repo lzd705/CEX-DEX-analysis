@@ -127,6 +127,20 @@ console.log(JSON.stringify(qualityFlagObjects({
         self.assertIn('id="workspace-market-body"', index)
         self.assertIn('id="route-announcer"', index)
 
+    def test_deep_link_view_is_revealed_before_cached_or_network_data(self):
+        app_js = APP_PATH.read_text(encoding="utf-8")
+        initializer = app_js[
+            app_js.index("async function initialize()"):
+            app_js.index('if (typeof document !== "undefined") initialize();')
+        ]
+        self.assertIn("function primeInitialRouteView(route)", app_js)
+        self.assertIn('setActiveAppView("workspace")', app_js)
+        self.assertIn("setActiveWorkspacePage(route.page)", app_js)
+        self.assertLess(
+            initializer.index("primeInitialRouteView(initialRoute)"),
+            initializer.index("readDefaultMarketCache()"),
+        )
+
     def test_compare_window_preset_resolves_to_explicit_utc_dates(self):
         result = run_app_javascript(
             """

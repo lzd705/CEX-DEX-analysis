@@ -3516,6 +3516,20 @@ function bindEvents() {
   window.addEventListener("popstate", applyRouteFromLocation);
 }
 
+function primeInitialRouteView(route) {
+  if (route.kind === "workspace") {
+    setActiveAppView("workspace");
+    setActiveWorkspacePage(route.page);
+    return;
+  }
+  if (route.kind === "methodology") {
+    applyMethodologyRoute(route);
+    return;
+  }
+  setActiveAppView("screener");
+  byId("time-toolbar").hidden = false;
+}
+
 async function initialize() {
   app.pairSelections = readPairSelections();
   bindEvents();
@@ -3523,7 +3537,7 @@ async function initialize() {
     ? navigation.parseRoute(window.location.pathname, window.location.search)
     : { kind: "unknown" };
   if (initialRoute.kind !== "unknown") app.route = initialRoute;
-  if (initialRoute.kind === "methodology") applyRouteFromLocation();
+  primeInitialRouteView(initialRoute);
   const initialStart = initialRoute.kind === "screener"
     ? initialRoute.filters?.start || ""
     : initialRoute.kind === "workspace" && initialRoute.page === "compare"
