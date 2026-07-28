@@ -1165,6 +1165,10 @@ def _v2_execution_rows(
             sell_quote_raw = v2_exact_input_quote(
                 reserve0, reserve1, fee_bps, target_raw
             )
+            if sell_quote_raw <= 0:
+                raise ValueError(
+                    "V2 exact-input execution produced zero quote output"
+                )
             sell_ending_ratio = _human_token1_per_token0(
                 reserve0 + target_raw,
                 reserve1 - sell_quote_raw,
@@ -1188,6 +1192,10 @@ def _v2_execution_rows(
             sell_quote_raw = v2_exact_input_quote(
                 reserve1, reserve0, fee_bps, target_raw
             )
+            if sell_quote_raw <= 0:
+                raise ValueError(
+                    "V2 exact-input execution produced zero quote output"
+                )
             sell_ending_ratio = _human_token1_per_token0(
                 reserve0 - sell_quote_raw,
                 reserve1 + target_raw,

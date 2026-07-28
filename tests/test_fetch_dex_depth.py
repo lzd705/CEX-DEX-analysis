@@ -39,6 +39,7 @@ from scripts.fetch_dex_depth import (
     v2_band_amounts,
     v2_exact_input_quote,
     v2_exact_output_quote,
+    v2_execution_rows,
     v3_move_to_price,
 )
 from scripts.execution_cost import (
@@ -337,6 +338,21 @@ class DexDepthMathTest(unittest.TestCase):
                 Decimal(100),
             )
         )
+
+    def test_v2_zero_exact_input_output_is_not_published_as_observed(self):
+        with self.assertRaisesRegex(ValueError, "zero quote output"):
+            v2_execution_rows(
+                {},
+                common={},
+                target_position_index=0,
+                token0_decimals=1,
+                token1_decimals=0,
+                token0_price=Decimal(2000),
+                token1_price=Decimal(2000),
+                reserve0=Decimal(10_000),
+                reserve1=Decimal(1_000),
+                fee_bps=Decimal(30),
+            )
 
     def test_v3_no_tick_move_returns_complete_monotonic_amounts(self):
         liquidity = 10**24

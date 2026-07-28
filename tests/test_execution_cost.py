@@ -140,6 +140,35 @@ class ExecutionCostContractTest(unittest.TestCase):
         self.assertEqual(buy["quoted_execution_cost_bps"], "1")
         self.assertEqual(buy["fill_ratio"], "1")
 
+    def test_observed_execution_rejects_zero_quote_output(self):
+        with self.assertRaisesRegex(ValueError, "positive quote amount"):
+            execution_fact_row(
+                common=common_fields(),
+                direction="sell_token",
+                requested_notional_usd=1000,
+                status="observed",
+                status_reason="target_filled",
+                reference_price_quote_per_token=100,
+                quote_to_usd=1,
+                target_token_quantity=10,
+                filled_token_quantity=10,
+                quote_amount=0,
+            )
+
+        rows = complete_rows()
+        rows[0].update(
+            {
+                "quote_amount": "0",
+                "quote_amount_usd": "0",
+                "filled_vwap_quote_per_token": "0",
+                "filled_vwap_usd_per_token": "0",
+                "quoted_execution_cost_usd": "1000",
+                "quoted_execution_cost_bps": "10000",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "positive quote amount"):
+            validate_execution_snapshot(["cex:test:UNI/USDT"], rows)
+
     def test_quantized_reference_notional_is_not_counted_as_slippage(self):
         row = execution_fact_row(
             common=common_fields(),

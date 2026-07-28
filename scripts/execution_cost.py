@@ -294,6 +294,8 @@ def execution_fact_row(
     if normalized_status == "observed":
         if filled is None or quote is None:
             raise ValueError("Observed execution requires fill and quote facts")
+        if quote <= 0:
+            raise ValueError("Observed execution requires a positive quote amount")
         tolerance = max(Decimal("1e-24"), target * Decimal("1e-18"))
         if abs(filled - target) > tolerance:
             raise ValueError("Observed execution did not fill requested quantity")
@@ -762,6 +764,10 @@ def _validate_execution_snapshot(
                     )
                 if fill_ratio != Decimal(1) or filled is None or quote is None:
                     raise ValueError("Observed execution is not fully filled")
+                if quote <= 0:
+                    raise ValueError(
+                        "Observed execution requires a positive quote amount"
+                    )
                 vwap_quote = optional_decimal(
                     row.get("filled_vwap_quote_per_token")
                 )
