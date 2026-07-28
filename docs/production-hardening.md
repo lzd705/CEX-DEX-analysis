@@ -46,6 +46,26 @@ Use `journalctl --vacuum-time=30d` for an immediate cleanup. The optional
 1 GiB host-wide policy; it affects every journald service and therefore needs a
 host-level review.
 
+### Unprivileged supervisor fallback
+
+If the operator cannot install a system service yet, render
+`deploy/systemd/cex-dex-dashboard-user.service.in` with the absolute project
+root and reviewed bind address. Install it as
+`~/.config/systemd/user/cex-dex-dashboard.service`, then run:
+
+```bash
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now cex-dex-dashboard.service
+systemctl --user is-active cex-dex-dashboard.service
+```
+
+This fallback explicitly keeps `ADMIN_ENABLED=false`, restarts the process
+after failure, and survives logout only when linger is enabled. Prefer
+`@BIND_HOST@=127.0.0.1` with the HTTPS proxy below. A non-loopback bind is a
+temporary compatibility choice, not a substitute for TLS, rate limiting, or
+closing port 8765.
+
 ## Configure HTTPS
 
 Render `deploy/nginx/cex-dex-dashboard.conf.in` with the real domain, install it

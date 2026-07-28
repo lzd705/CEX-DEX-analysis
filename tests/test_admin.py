@@ -460,6 +460,9 @@ class AdminServiceTest(unittest.TestCase):
         service = (
             project_root / "deploy/systemd/cex-dex-dashboard.service.in"
         ).read_text(encoding="utf-8")
+        user_service = (
+            project_root / "deploy/systemd/cex-dex-dashboard-user.service.in"
+        ).read_text(encoding="utf-8")
         nginx = (
             project_root / "deploy/nginx/cex-dex-dashboard.conf.in"
         ).read_text(encoding="utf-8")
@@ -473,6 +476,10 @@ class AdminServiceTest(unittest.TestCase):
         self.assertIn("--host 127.0.0.1", service)
         self.assertIn("Restart=on-failure", service)
         self.assertIn("EnvironmentFile=-/etc/cex-dex/dashboard.env", service)
+        self.assertIn("Environment=ADMIN_ENABLED=false", user_service)
+        self.assertIn("--host @BIND_HOST@", user_service)
+        self.assertIn("Restart=on-failure", user_service)
+        self.assertIn("WantedBy=default.target", user_service)
         self.assertIn("listen 443 ssl", nginx)
         self.assertIn("return 301 https://@DOMAIN@$request_uri;", nginx)
         self.assertNotIn("https://$host$request_uri", nginx)
@@ -481,6 +488,7 @@ class AdminServiceTest(unittest.TestCase):
         self.assertIn("retain_cex_depth_raw.py", retention)
         self.assertIn("--apply", retention)
         self.assertIn("non-destructive unless `--apply`", runbook)
+        self.assertIn("systemctl --user enable --now", runbook)
 
 
 if __name__ == "__main__":
