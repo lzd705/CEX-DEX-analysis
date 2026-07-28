@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 from math import ceil
+import re
 from typing import Any, Iterable
 
 
@@ -255,11 +256,31 @@ def usd_price_timing(
     if not state_observed_at or not usd_price_observed_at:
         return result
 
-    def parse_timestamp(value: str) -> datetime:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    def parse_timestamp(value: str) -> Decimal:
+        matched = re.fullmatch(
+            r"(?P<prefix>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"
+            r"(?:\.(?P<fraction>\d+))?"
+            r"(?P<offset>Z|[+-]\d{2}:\d{2})",
+            value.strip(),
+        )
+        if matched is None:
+            raise ValueError("timestamp must be RFC 3339 with a timezone")
+        offset = (
+            "+00:00"
+            if matched.group("offset") == "Z"
+            else matched.group("offset")
+        )
+        parsed = datetime.fromisoformat(f"{matched.group('prefix')}{offset}")
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ValueError("timestamp must include a timezone")
-        return parsed.astimezone(timezone.utc)
+        utc_value = parsed.astimezone(timezone.utc)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        delta = utc_value - epoch
+        whole_seconds = Decimal(delta.days * 86400 + delta.seconds)
+        fraction = matched.group("fraction")
+        if fraction:
+            whole_seconds += Decimal(f"0.{fraction}")
+        return whole_seconds
 
     try:
         state_time = parse_timestamp(state_observed_at)
@@ -268,7 +289,7 @@ def usd_price_timing(
         result["reason"] = "usd_price_timestamp_invalid"
         return result
 
-    skew_seconds = int(ceil(abs((state_time - price_time).total_seconds())))
+    skew_seconds = int(ceil(abs(state_time - price_time)))
     result["skew_seconds"] = skew_seconds
     if skew_seconds <= warning_seconds:
         result.update(

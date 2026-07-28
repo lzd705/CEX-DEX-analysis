@@ -126,6 +126,12 @@ class ExecutionCostContractTest(unittest.TestCase):
             usd_price_timing(state, "2026-07-28T00:15:00.1+00:00")["status"],
             "warning",
         )
+        submicrosecond_boundary = usd_price_timing(
+            state,
+            "2026-07-28T00:15:00.0000001+00:00",
+        )
+        self.assertEqual(submicrosecond_boundary["skew_seconds"], 901)
+        self.assertEqual(submicrosecond_boundary["status"], "warning")
         self.assertTrue(
             usd_price_timing(state, "2026-07-28T02:00:00+00:00")["usable"]
         )
