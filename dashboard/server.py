@@ -26,7 +26,7 @@ from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 try:
@@ -90,7 +90,7 @@ API_FRESHNESS_CACHE_SECONDS = 60
 LARGE_PAYLOAD_CACHE_SIZE = 8
 SERIALIZED_RESPONSE_CACHE_SIZE = 64
 CATALOG_SUMMARY_VERSION = 1
-SourceSignature = tuple[tuple[Any, ...], ...]
+SourceSignature = Tuple[Tuple[Any, ...], ...]
 PUBLIC_API_CACHE_LOCK = threading.RLock()
 SOURCE_CACHE_GENERATION_LOCK = threading.RLock()
 _SOURCE_CACHE_GENERATION: SourceSignature | None = None

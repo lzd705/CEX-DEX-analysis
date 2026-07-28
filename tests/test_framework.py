@@ -60,6 +60,18 @@ class FrameworkStructureTest(unittest.TestCase):
 
         self.assertIn('host="${HOST:-127.0.0.1}"', runner)
 
+    def test_production_runbook_requires_python38_import_preflight(self):
+        runbook = (
+            PROJECT_ROOT / "docs/production-hardening.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("supported production baseline is Python 3.8.10", runbook)
+        self.assertIn(
+            'python3 -c "import dashboard.server; import dashboard.market_facts"',
+            runbook,
+        )
+        self.assertIn("Keep the old process running during this preflight", runbook)
+
     def test_market_monitor_has_no_factor_or_admin_surface(self):
         html = (PROJECT_ROOT / "dashboard/static/index.html").read_text(encoding="utf-8")
         javascript = (PROJECT_ROOT / "dashboard/static/app.js").read_text(encoding="utf-8")

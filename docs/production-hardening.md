@@ -107,6 +107,23 @@ Deploy immutable application directories by commit and point
 under a separate versioned directory and point `/srv/cex-dex/current` at the
 reviewed snapshot.
 
+Before restarting the service, run a compatibility preflight from the
+prospective release with the exact Python interpreter used by `ExecStart`:
+
+```bash
+python3 --version
+python3 -m py_compile dashboard/server.py dashboard/market_facts.py \
+  scripts/check_dashboard_release.py
+python3 -c "import dashboard.server; import dashboard.market_facts"
+```
+
+The supported production baseline is Python 3.8.10. The import check is
+required in addition to compilation because some newer typing expressions are
+syntactically valid on Python 3.8 but still fail while a module is imported.
+Keep the old process running during this preflight. If any command fails,
+restore the previous application target without restarting, so the failed
+release never becomes the serving process.
+
 After switching either symlink:
 
 ```bash
