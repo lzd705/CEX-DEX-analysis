@@ -75,3 +75,14 @@ CSVs and a validated SQLite database back into `data/local/`.
   and midpoint-relative bps.
 - `/api/markets/catalog` is the audit entrypoint; `/api/markets/compare` accepts
   only cataloged market IDs for the requested Token.
+
+Catalog version 2 distinguishes a stable DEX `pool_id` from a globally unique
+token-price-series `market_id`. This prevents one pool observed from both token
+perspectives, or a pool whose displayed fee label changes, from producing
+ambiguous selectors.
+
+Public fact responses use a signature-aware, one-minute in-process cache. The
+cache key includes every published daily, TVL, CEX-depth, and DEX-depth source,
+so a changed snapshot invalidates both the assembled payload and compressed
+JSON response. Concurrent cold misses are single-flight to avoid duplicate
+catalog builds and gzip work.

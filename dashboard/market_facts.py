@@ -6,7 +6,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2
 DAILY_GRAIN = "1 day, UTC"
 PRICE_QUOTE_ASSET = "USD"
 MISSING_VALUE_RULE = (
@@ -52,8 +52,26 @@ def cex_market_id(exchange: str, instrument: str) -> str:
     return f"cex:{exchange}:{instrument}"
 
 
-def dex_market_id(chain: str, dex: str, pool_address: str) -> str:
-    return f"dex:{chain}:{dex}:{pool_address}"
+def dex_pool_id(chain: str, dex: str, pool_address: str) -> str:
+    """Return the stable identity of one on-chain liquidity pool."""
+    return (
+        f"dex:{chain.strip().lower()}:{dex.strip().lower()}:"
+        f"{pool_address.strip().lower()}"
+    )
+
+
+def dex_market_id(
+    chain: str,
+    dex: str,
+    pool_address: str,
+    token_symbol: str,
+) -> str:
+    """Identify one token-price series observed from a DEX pool.
+
+    A pool can appear from both token perspectives, so the pool address alone is
+    not a globally unique identifier for the cataloged price series.
+    """
+    return f"{dex_pool_id(chain, dex, pool_address)}:{token_symbol.upper()}"
 
 
 def source_quote_asset(instrument: str) -> str | None:
@@ -79,6 +97,11 @@ def catalog_contract() -> dict[str, Any]:
                 "((price_a_usd + price_b_usd) / 2) * 10000"
             ),
         },
+        "market_id_semantics": (
+            "CEX IDs identify one venue instrument. DEX market IDs identify one "
+            "token-price series within a stable pool_id, because one pool can be "
+            "observed from either token perspective."
+        ),
         "semantic_boundary": (
             "Daily OHLCV fields are not order-book depth, quoted bid/ask spread, "
             "executable price, or measured slippage. CEX order-book depth and DEX "
@@ -138,6 +161,12 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     row["venue"].split(" / ", 1)[0],
                     row["venue"].split(" / ", 1)[1],
                     row["pool_address"],
+                    row["token_symbol"],
+                ),
+                "pool_id": dex_pool_id(
+                    row["venue"].split(" / ", 1)[0],
+                    row["venue"].split(" / ", 1)[1],
+                    row["pool_address"],
                 ),
                 "token_symbol": row["token_symbol"],
                 "market_type": "dex",
@@ -185,6 +214,21 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "observation_days": row["observation_days"],
             }
         )
+    market_id_counts: dict[str, int] = {}
+    for market in markets:
+        market_id = market["market_id"]
+        market_id_counts[market_id] = market_id_counts.get(market_id, 0) + 1
+    duplicate_ids = sorted(
+        market_id
+        for market_id, count in market_id_counts.items()
+        if count > 1
+    )
+    if duplicate_ids:
+        raise ValueError(
+            "Catalog market_id values must be globally unique: "
+            + ", ".join(duplicate_ids)
+        )
+
     metadata = {
         **catalog_contract(),
         "available_start": payload["metadata"]["available_start"],

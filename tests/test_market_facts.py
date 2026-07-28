@@ -5,6 +5,7 @@ from pathlib import Path
 
 from dashboard.market_facts import (
     absolute_price_spread,
+    catalog_from_market_payload,
     compare_daily_rows,
     decimal_adjust,
 )
@@ -67,6 +68,30 @@ class MarketFactKnownAnswerTests(unittest.TestCase):
         self.assertIsNone(result[0]["spread_bps"])
         self.assertEqual(result[1]["absolute_spread_usd"], 3.0)
         self.assertEqual(result[2]["missing_reason"], "market_a_missing")
+
+    def test_catalog_rejects_duplicate_global_market_ids(self):
+        market = {
+            "token_symbol": "BTC",
+            "market": "cex",
+            "venue": "binance",
+            "instrument": "BTC/USDT",
+            "price_points": [{"date": "2026-01-01", "price_usd": 100}],
+            "latest_date": "2026-01-01",
+            "observation_days": 1,
+        }
+        payload = {
+            "metadata": {
+                "available_start": "2026-01-01",
+                "available_end": "2026-01-01",
+                "sources": [],
+                "storage": {"engine": "test"},
+            },
+            "cex_markets": [market, dict(market)],
+            "dex_pools": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "globally unique"):
+            catalog_from_market_payload(payload)
 
 
 if __name__ == "__main__":

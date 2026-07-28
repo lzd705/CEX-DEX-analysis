@@ -14,6 +14,8 @@ import os
 import re
 import sqlite3
 import statistics
+import threading
+import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
@@ -56,7 +58,14 @@ TVL_FILENAME = "dex_pool_tvl_latest.csv"
 CEX_DEPTH_FILENAME = "cex_depth_latest.csv"
 DEX_DEPTH_FILENAME = "dex_depth_latest.csv"
 VENDOR_FILES = {
-    "/vendor/lucide.js": DASHBOARD_ROOT / "node_modules/lucide/dist/umd/lucide.min.js",
+    "/vendor/lucide.js": STATIC_ROOT / "vendor/lucide.min.js",
+}
+API_FRESHNESS_CACHE_SECONDS = 60
+PUBLIC_API_CACHE_LOCK = threading.RLock()
+PUBLIC_API_QUERY_FIELDS = {
+    "catalog": (),
+    "market": ("start", "end"),
+    "compare": ("token", "market_a", "market_b", "start", "end"),
 }
 
 
@@ -336,7 +345,7 @@ def summarize_cex(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
 
 
 def summarize_dex(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, str, str, str, str], list[dict[str, str]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         groups[
             (
@@ -344,12 +353,16 @@ def summarize_dex(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 row["chain"],
                 row["dex"],
                 row["pool_address"],
-                row["pool_name"],
             )
         ].append(row)
 
     summaries = []
-    for (token, chain, dex, address, pool_name), pool_rows in groups.items():
+    for (token, chain, dex, address), pool_rows in groups.items():
+        latest_row = max(
+            pool_rows,
+            key=lambda row: (row["date"], row.get("pool_name", "")),
+        )
+        pool_name = latest_row.get("pool_name") or address
         price, window_return, volatility = price_statistics(pool_rows)
         volumes = [parse_number(row.get("dex_volume_usd")) for row in pool_rows]
         summaries.append(
@@ -1090,8 +1103,12 @@ def _build_database_payload_cached(
 
 
 def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
-    """Attach dynamic source-specific freshness without caching wall-clock age."""
-    metadata = payload["metadata"]
+    """Attach dynamic freshness without mutating the cached fact payload."""
+    result = {
+        **payload,
+        "metadata": {**payload["metadata"]},
+    }
+    metadata = result["metadata"]
     metadata["freshness"] = build_source_freshness(
         metadata.get("source_date_ranges", {}),
         tvl_observed_at=(
@@ -1110,40 +1127,116 @@ def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
     )
-    return payload
+    return result
 
 
-def build_market_payload(start: str | None = None, end: str | None = None) -> dict[str, Any]:
+def _optional_signature(path: Path | None) -> tuple[tuple[str, int, int], ...]:
+    return data_signature([path]) if path is not None else ()
+
+
+def market_payload_cache_key(
+    start: str | None,
+    end: str | None,
+) -> tuple[Any, ...]:
+    """Resolve every fact source into a hashable, invalidation-aware cache key."""
     tvl_path = resolve_tvl_path()
     depth_path = resolve_cex_depth_path()
     dex_depth_path = resolve_dex_depth_path()
     database_path = resolve_database_path()
     if database_path is not None:
-        signature = data_signature([database_path])
-        payload = _build_database_payload_cached(start, end, str(database_path), signature)
-        payload = overlay_tvl_snapshot(payload, tvl_path)
-        payload = overlay_cex_depth_snapshot(payload, depth_path)
-        payload = overlay_dex_depth_snapshot(payload, dex_depth_path)
-        return attach_freshness_metadata(payload)
+        cex_path = None
+        dex_path = None
+        daily_signature = data_signature([database_path])
+    else:
+        cex_path, dex_path = resolve_data_paths()
+        daily_signature = data_signature([cex_path, dex_path])
+    return (
+        start,
+        end,
+        str(database_path) if database_path is not None else "",
+        str(cex_path) if cex_path is not None else "",
+        str(dex_path) if dex_path is not None else "",
+        daily_signature,
+        str(tvl_path) if tvl_path is not None else "",
+        _optional_signature(tvl_path),
+        str(depth_path) if depth_path is not None else "",
+        _optional_signature(depth_path),
+        str(dex_depth_path) if dex_depth_path is not None else "",
+        _optional_signature(dex_depth_path),
+    )
 
-    cex_path, dex_path = resolve_data_paths()
-    signature = data_signature([cex_path, dex_path])
-    payload = _build_market_payload_cached(start, end, str(cex_path), str(dex_path), signature)
-    payload = overlay_tvl_snapshot(payload, tvl_path)
-    payload = overlay_cex_depth_snapshot(payload, depth_path)
-    payload = overlay_dex_depth_snapshot(payload, dex_depth_path)
-    return attach_freshness_metadata(payload)
+
+@lru_cache(maxsize=32)
+def _build_enriched_payload_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]:
+    (
+        start,
+        end,
+        database_path_text,
+        cex_path_text,
+        dex_path_text,
+        daily_signature,
+        tvl_path_text,
+        _tvl_signature,
+        depth_path_text,
+        _depth_signature,
+        dex_depth_path_text,
+        _dex_depth_signature,
+    ) = cache_key
+    if database_path_text:
+        payload = _build_database_payload_cached(
+            start,
+            end,
+            database_path_text,
+            daily_signature,
+        )
+    else:
+        payload = _build_market_payload_cached(
+            start,
+            end,
+            cex_path_text,
+            dex_path_text,
+            daily_signature,
+        )
+    payload = overlay_tvl_snapshot(payload, Path(tvl_path_text) if tvl_path_text else None)
+    payload = overlay_cex_depth_snapshot(
+        payload,
+        Path(depth_path_text) if depth_path_text else None,
+    )
+    return overlay_dex_depth_snapshot(
+        payload,
+        Path(dex_depth_path_text) if dex_depth_path_text else None,
+    )
+
+
+def build_market_payload(
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, Any]:
+    cache_key = market_payload_cache_key(start, end)
+    return attach_freshness_metadata(_build_enriched_payload_cached(cache_key))
+
+
+@lru_cache(maxsize=8)
+def _build_market_catalog_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]:
+    return catalog_from_market_payload(_build_enriched_payload_cached(cache_key))
 
 
 def build_market_catalog() -> dict[str, Any]:
     """Return every observed market plus the versioned fact contract."""
     default_payload = build_market_payload()
     metadata = default_payload["metadata"]
-    full_payload = build_market_payload(
+    cache_key = market_payload_cache_key(
         metadata["available_start"],
         metadata["available_end"],
     )
-    return catalog_from_market_payload(full_payload)
+    catalog = _build_market_catalog_cached(cache_key)
+    return {
+        **catalog,
+        "metadata": {
+            **catalog["metadata"],
+            "freshness": metadata.get("freshness"),
+        },
+    }
 
 
 def validate_fact_window(
@@ -1322,6 +1415,97 @@ def encode_json_payload(payload: Any, accept_encoding: str = "") -> tuple[bytes,
     return raw, False
 
 
+def api_source_signature() -> tuple[tuple[str, int, int], ...]:
+    """Return one signature covering every source that can change public facts."""
+    database_path = resolve_database_path()
+    paths: list[Path] = []
+    if database_path is not None:
+        paths.append(database_path)
+    else:
+        paths.extend(resolve_data_paths())
+    for optional_path in (
+        resolve_tvl_path(),
+        resolve_cex_depth_path(),
+        resolve_dex_depth_path(),
+    ):
+        if optional_path is not None:
+            paths.append(optional_path)
+    return data_signature(paths)
+
+
+def api_freshness_bucket() -> int:
+    """Refresh wall-clock freshness while retaining short-lived response reuse."""
+    return int(time.time() // API_FRESHNESS_CACHE_SECONDS)
+
+
+def _build_public_api_payload(
+    route: str,
+    query_items: tuple[tuple[str, str], ...],
+) -> dict[str, Any]:
+    query = dict(query_items)
+    if route == "catalog":
+        return build_market_catalog()
+    if route == "market":
+        return build_market_payload(query.get("start"), query.get("end"))
+    if route == "compare":
+        return build_market_comparison(
+            token_symbol=query.get("token"),
+            market_a_id=query.get("market_a"),
+            market_b_id=query.get("market_b"),
+            start=query.get("start"),
+            end=query.get("end"),
+        )
+    raise ValueError(f"Unknown public API route: {route}")
+
+
+@lru_cache(maxsize=256)
+def _build_public_api_response_cached(
+    route: str,
+    query_items: tuple[tuple[str, str], ...],
+    _source_signature: tuple[tuple[str, int, int], ...],
+    _freshness_bucket: int,
+) -> tuple[bytes, bool]:
+    return encode_json_payload(
+        _build_public_api_payload(route, query_items),
+        "gzip",
+    )
+
+
+def build_public_api_response(
+    route: str,
+    query_items: tuple[tuple[str, str], ...],
+    accepts_gzip: bool,
+) -> tuple[bytes, bool]:
+    """Use one cold-cache builder so concurrent misses do not duplicate work."""
+    with PUBLIC_API_CACHE_LOCK:
+        if not accepts_gzip:
+            return encode_json_payload(
+                _build_public_api_payload(route, query_items),
+                "",
+            )
+        return _build_public_api_response_cached(
+            route,
+            query_items,
+            api_source_signature(),
+            api_freshness_bucket(),
+        )
+
+
+def public_api_query_items(
+    route: str,
+    query: dict[str, list[str]],
+) -> tuple[tuple[str, str], ...]:
+    """Normalize only supported fields so irrelevant query keys cannot fill the cache."""
+    fields = PUBLIC_API_QUERY_FIELDS.get(route)
+    if fields is None:
+        raise ValueError(f"Unknown public API route: {route}")
+    return tuple(
+        (name, query[name][0])
+        for name in fields
+        if query.get(name) and query[name][0] is not None
+    )
+
+
 class MarketMonitorHandler(SimpleHTTPRequestHandler):
     server_version = "CexDexMarketMonitor"
     sys_version = ""
@@ -1350,6 +1534,26 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def send_encoded_json(self, body: bytes, compressed: bool) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_public_api(self, route: str, query: dict[str, list[str]]) -> None:
+        query_items = public_api_query_items(route, query)
+        body, compressed = build_public_api_response(
+            route,
+            query_items,
+            "gzip" in self.headers.get("Accept-Encoding", "").lower(),
+        )
+        self.send_encoded_json(body, compressed)
 
     def read_json(self) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -1428,34 +1632,21 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/markets/catalog":
             try:
-                self.send_json(build_market_catalog())
+                self.send_public_api("catalog", {})
             except (FileNotFoundError, ValueError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/markets/compare":
             query = parse_qs(parsed.query)
             try:
-                self.send_json(
-                    build_market_comparison(
-                        token_symbol=query.get("token", [None])[0],
-                        market_a_id=query.get("market_a", [None])[0],
-                        market_b_id=query.get("market_b", [None])[0],
-                        start=query.get("start", [None])[0],
-                        end=query.get("end", [None])[0],
-                    )
-                )
+                self.send_public_api("compare", query)
             except (FileNotFoundError, ValueError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/market":
             query = parse_qs(parsed.query)
             try:
-                self.send_json(
-                    build_market_payload(
-                        start=query.get("start", [None])[0],
-                        end=query.get("end", [None])[0],
-                    )
-                )
+                self.send_public_api("market", query)
             except (FileNotFoundError, ValueError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return

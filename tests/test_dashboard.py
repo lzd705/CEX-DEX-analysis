@@ -2,7 +2,9 @@ import csv
 import gzip
 import json
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -97,7 +99,7 @@ class MarketMonitorServerTest(unittest.TestCase):
                     "chain": "eth",
                     "dex": "uniswap",
                     "pool_address": "0xpool",
-                    "pool_name": "WBTC / USDC",
+                    "pool_name": "WBTC / USDC 0.30%",
                     "close": "101",
                     "dex_volume_usd": "300",
                     "pool_tvl_usd": "",
@@ -108,7 +110,7 @@ class MarketMonitorServerTest(unittest.TestCase):
                     "chain": "eth",
                     "dex": "uniswap",
                     "pool_address": "0xpool",
-                    "pool_name": "WBTC / USDC",
+                    "pool_name": "WBTC / USDC 0.25%",
                     "close": "105",
                     "dex_volume_usd": "400",
                     "pool_tvl_usd": "5000",
@@ -139,6 +141,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(payload["metadata"]["token_count"], 1)
         self.assertEqual(len(payload["cex_markets"]), 2)
         self.assertEqual(len(payload["dex_pools"]), 1)
+        self.assertEqual(payload["dex_pools"][0]["instrument"], "WBTC / USDC 0.25%")
         self.assertNotIn("factor_results", payload)
         self.assertAlmostEqual(payload["tokens"][0]["price_spread"], 105 / 102 - 1)
         self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)
@@ -336,7 +339,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         with patch.dict(server.os.environ, self.environment, clear=True):
             catalog = server.build_market_catalog()
 
-        self.assertEqual(catalog["metadata"]["catalog_version"], 1)
+        self.assertEqual(catalog["metadata"]["catalog_version"], 2)
         self.assertEqual(catalog["metadata"]["time_grain"], "1 day, UTC")
         self.assertEqual(catalog["metadata"]["price_quote_asset"], "USD")
         self.assertIn("not order-book depth", catalog["metadata"]["semantic_boundary"])
@@ -347,7 +350,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             {
                 "cex:binance:BTC/USDT",
                 "cex:okx:BTC/USDT",
-                "dex:eth:uniswap:0xpool",
+                "dex:eth:uniswap:0xpool:BTC",
             },
         )
 
@@ -356,7 +359,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             result = server.build_market_comparison(
                 "BTC",
                 "cex:binance:BTC/USDT",
-                "dex:eth:uniswap:0xpool",
+                "dex:eth:uniswap:0xpool:BTC",
                 "2026-01-01",
                 "2026-01-02",
             )
@@ -385,8 +388,52 @@ class MarketMonitorServerTest(unittest.TestCase):
                 server.build_market_comparison(
                     "ETH",
                     "cex:binance:BTC/USDT",
-                    "dex:eth:uniswap:0xpool",
+                    "dex:eth:uniswap:0xpool:BTC",
                 )
+
+    def test_same_dex_pool_has_unique_token_series_ids(self):
+        with self.dex_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(
+                [
+                    "2026-01-02",
+                    "ETH",
+                    "eth",
+                    "uniswap",
+                    "0xpool",
+                    "WBTC / USDC 0.25%",
+                    "",
+                    "",
+                    "",
+                    "2000",
+                    "50",
+                    "5000",
+                ]
+            )
+
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            catalog = server.build_market_catalog()
+
+        pools = [
+            market
+            for market in catalog["markets"]
+            if market["market_type"] == "dex"
+        ]
+        self.assertEqual(
+            {market["market_id"] for market in pools},
+            {
+                "dex:eth:uniswap:0xpool:BTC",
+                "dex:eth:uniswap:0xpool:ETH",
+            },
+        )
+        self.assertEqual(
+            {market["pool_id"] for market in pools},
+            {"dex:eth:uniswap:0xpool"},
+        )
+        self.assertEqual(
+            len({market["market_id"] for market in catalog["markets"]}),
+            len(catalog["markets"]),
+        )
 
     def test_date_window_limits_volume_and_coverage(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
@@ -439,6 +486,89 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertFalse(plain_compressed)
         self.assertLess(len(body), len(plain_body))
         self.assertEqual(json.loads(gzip.decompress(body)), payload)
+
+    def test_public_api_response_cache_reuses_serialized_payload_and_invalidates(self):
+        server._build_public_api_response_cached.cache_clear()
+        signature = (("facts.sqlite3", 1, 100),)
+        with patch.object(
+            server,
+            "build_market_catalog",
+            return_value={"metadata": {}, "markets": []},
+        ) as build_catalog:
+            first = server._build_public_api_response_cached(
+                "catalog",
+                (),
+                signature,
+                100,
+            )
+            second = server._build_public_api_response_cached(
+                "catalog",
+                (),
+                signature,
+                100,
+            )
+            invalidated = server._build_public_api_response_cached(
+                "catalog",
+                (),
+                (("facts.sqlite3", 2, 100),),
+                100,
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, invalidated)
+        self.assertEqual(build_catalog.call_count, 2)
+
+    def test_public_api_cache_key_ignores_unsupported_query_fields(self):
+        query = {
+            "start": ["2026-01-01"],
+            "end": ["2026-01-02"],
+            "cache_buster": ["unbounded-user-value"],
+        }
+
+        self.assertEqual(
+            server.public_api_query_items("market", query),
+            (
+                ("start", "2026-01-01"),
+                ("end", "2026-01-02"),
+            ),
+        )
+
+    def test_public_api_cold_miss_is_single_flight(self):
+        server._build_public_api_response_cached.cache_clear()
+        payload = {"metadata": {}, "markets": []}
+
+        def slow_catalog():
+            time.sleep(0.02)
+            return payload
+
+        with (
+            patch.object(
+                server,
+                "api_source_signature",
+                return_value=(("facts.sqlite3", 1, 100),),
+            ),
+            patch.object(server, "api_freshness_bucket", return_value=100),
+            patch.object(server, "build_market_catalog", side_effect=slow_catalog) as build_catalog,
+            ThreadPoolExecutor(max_workers=8) as executor,
+        ):
+            responses = list(
+                executor.map(
+                    lambda _: server.build_public_api_response("catalog", (), True),
+                    range(8),
+                )
+            )
+
+        self.assertEqual(build_catalog.call_count, 1)
+        self.assertTrue(all(response == responses[0] for response in responses))
+
+    def test_vendored_lucide_resource_is_packaged(self):
+        lucide_path = server.VENDOR_FILES["/vendor/lucide.js"]
+
+        self.assertTrue(lucide_path.is_file())
+        self.assertIn(
+            "@license lucide v0.468.0",
+            lucide_path.read_text(encoding="utf-8")[:200],
+        )
 
     def test_sqlite_runtime_matches_csv_facts(self):
         data_dir = self.cex_path.parent
