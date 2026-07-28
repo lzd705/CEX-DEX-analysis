@@ -48,6 +48,21 @@ quantity and is deliberately not used.
 The DEX inventory's external Token USD price is retained for off-market
 quality checks.  It does not replace the pool-state reference price.
 
+For DEX, the USD reference is reconstructed as:
+
+```text
+pool quote per Token x quote-token USD price
+```
+
+The fixed-block state time and the time this project received the external USD
+price response are independent inputs. Their absolute observation skew must be
+no more than two hours. A missing, invalid, or older price input fails the
+publication gate. The public API also applies the same rule defensively to an
+older snapshot: scenario lineage remains visible, but fill, VWAP, and cost are
+withheld as `null`/N/A rather than shown as zero. USD and USDT identity/proxy
+conversions do not have an independent price timestamp and are labeled not
+applicable instead of pretending their skew is zero.
+
 ## Calculation
 
 For a complete `sell_token` request:
@@ -172,6 +187,8 @@ claimed.
 - measured DEX rows retain one coherent block number/timestamp plus target and
   quote Token identities and decimals, the exact pool fee, and the external
   Token-price snapshot lineage used to define the USD target;
+- measured DEX USD-price response time is no more than two hours from the fixed
+  block time;
 - observed fill ratio equals one; partial fill ratio is below one;
 - partial filled quantity and quote amount are either both present and
   recomputable or both absent;

@@ -54,6 +54,7 @@ try:
         EXECUTION_NOTIONALS_USD,
         execution_fact_row,
         status_counts as execution_status_counts,
+        usd_price_timing,
         validate_execution_snapshot,
     )
 except ModuleNotFoundError:
@@ -63,6 +64,7 @@ except ModuleNotFoundError:
         EXECUTION_NOTIONALS_USD,
         execution_fact_row,
         status_counts as execution_status_counts,
+        usd_price_timing,
         validate_execution_snapshot,
     )
 
@@ -157,6 +159,7 @@ BASE_COLUMNS = [
     "pool_name",
     "protocol_model",
     "block_number",
+    "block_timestamp",
     "target_token_address",
     "target_token_position",
     "token0_address",
@@ -171,6 +174,13 @@ BASE_COLUMNS = [
     "pool_state_price_usd",
     "source_target_price_usd",
     "price_difference_bps",
+    "usd_price_source_snapshot_id",
+    "usd_price_observed_at",
+    "usd_price_skew_seconds",
+    "usd_price_freshness_status",
+    "usd_price_source",
+    "usd_price_source_endpoint",
+    "usd_price_raw_response_sha256",
 ]
 DEPTH_COLUMNS = [
     field
@@ -329,6 +339,38 @@ def load_pool_inventory(path: Path = DEFAULT_TVL_CSV) -> list[dict[str, str]]:
             row["pool_address"].lower(),
         ),
     )
+
+
+def pool_usd_price_timing(
+    pool: dict[str, str],
+    block_timestamp: str,
+) -> dict[str, Any]:
+    """Return the observable timing relationship for one pool's USD inputs."""
+    return usd_price_timing(
+        block_timestamp,
+        pool.get("response_received_at") or pool.get("observed_at") or "",
+    )
+
+
+def require_usable_pool_usd_price(
+    pool: dict[str, str],
+    block_timestamp: str,
+) -> dict[str, Any]:
+    """Fail closed before publishing USD depth or execution from stale inputs."""
+    if pool.get("status") != "observed":
+        raise ValueError(
+            "usd_price_conversion_unavailable:"
+            f"tvl_inventory_status_{pool.get('status') or 'missing'}"
+        )
+    finite_decimal(pool.get("base_token_price_usd"), positive=True)
+    finite_decimal(pool.get("quote_token_price_usd"), positive=True)
+    timing = pool_usd_price_timing(pool, block_timestamp)
+    if not timing["usable"]:
+        raise ValueError(
+            "usd_price_conversion_unavailable:"
+            f"{timing['reason']}"
+        )
+    return timing
 
 
 def http_json_rpc(url: str, payload: Any) -> tuple[Any, bytes]:
@@ -819,6 +861,18 @@ def base_row(
             "pool_name": pool.get("pool_name", ""),
             "depth_method": DEX_DEPTH_METHOD,
             "source": "fixed-block EVM JSON-RPC eth_call",
+            "usd_price_source_snapshot_id": pool.get("snapshot_id", ""),
+            "usd_price_observed_at": (
+                pool.get("response_received_at")
+                or pool.get("observed_at")
+                or ""
+            ),
+            "usd_price_source": pool.get("source", ""),
+            "usd_price_source_endpoint": pool.get("source_endpoint", ""),
+            "usd_price_raw_response_sha256": pool.get(
+                "raw_response_sha256",
+                "",
+            ),
         }
     )
     return row
@@ -1298,6 +1352,10 @@ def observed_pool_row(
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     block_tag = hex(block_number)
     pool_address = pool["pool_address"].lower()
+    price_timing = require_usable_pool_usd_price(
+        pool,
+        block_timestamp,
+    )
     price_map = price_map_from_inventory(pool)
     if len(price_map) < 2:
         raise ValueError("TVL inventory is missing one or both token USD prices")
@@ -1469,6 +1527,7 @@ def observed_pool_row(
         {
             "protocol_model": protocol,
             "block_number": str(block_number),
+            "block_timestamp": block_timestamp,
             "target_token_address": token0 if target_index == 0 else token1,
             "target_token_position": f"token{target_index}",
             "token0_address": token0,
@@ -1483,6 +1542,8 @@ def observed_pool_row(
             "pool_state_price_usd": decimal_text(state_price),
             "source_target_price_usd": decimal_text(source_target_price),
             "price_difference_bps": decimal_text(price_difference_bps),
+            "usd_price_skew_seconds": str(price_timing["skew_seconds"]),
+            "usd_price_freshness_status": str(price_timing["status"]),
             "source_endpoint": client.endpoint,
             "raw_response_sha256": raw_response_sha256,
         }
@@ -1750,17 +1811,30 @@ def collect_dex_depth_with_execution(
                 request_started_at=request_started_at,
                 response_received_at=response_received_at,
             )
+            price_timing = pool_usd_price_timing(pool, block_timestamp)
             row.update(
                 {
                     "protocol_model": protocol,
                     "block_number": (
                         str(block_number) if block_number is not None else ""
                     ),
+                    "block_timestamp": block_timestamp,
+                    "usd_price_skew_seconds": (
+                        str(price_timing["skew_seconds"])
+                        if price_timing["skew_seconds"] is not None
+                        else ""
+                    ),
+                    "usd_price_freshness_status": price_timing["status"],
                     "source_endpoint": client.endpoint,
                     "raw_response_sha256": raw_hash,
                     "status": "failed",
                     "error": f"{type(error).__name__}: {error}",
                 }
+            )
+            status_reason = (
+                "usd_price_conversion_stale_or_unavailable"
+                if str(error).startswith("usd_price_conversion_unavailable:")
+                else "pool_state_collection_failed"
             )
             pool_execution_rows = terminal_execution_rows(
                 pool,
@@ -1769,7 +1843,7 @@ def collect_dex_depth_with_execution(
                 response_received_at=response_received_at,
                 protocol=protocol,
                 status="failed",
-                status_reason="pool_state_collection_failed",
+                status_reason=status_reason,
                 error=f"{type(error).__name__}: {error}",
                 block_number=block_number,
                 block_timestamp=block_timestamp,
@@ -1810,6 +1884,7 @@ def collect_dex_depth_with_execution(
     validate_execution_snapshot(
         [dex_market_id(pool) for pool in pools],
         execution_rows,
+        enforce_usd_price_timing=True,
     )
     return snapshot_id, rows, execution_rows
 
@@ -1979,7 +2054,11 @@ def publish_execution_snapshot(
 ) -> dict[str, Any]:
     # Publication is the hard boundary: a caller cannot write a superficially
     # valid subset that omits one inventory market or one of its ten scenarios.
-    validate_execution_snapshot(expected_market_ids, rows)
+    validate_execution_snapshot(
+        expected_market_ids,
+        rows,
+        enforce_usd_price_timing=True,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     current_path = output_dir / EXECUTION_CURRENT_FILENAME
     atomic_write_execution_csv(current_path, rows)

@@ -10,12 +10,12 @@ python3 scripts/run_collection_cycle.py --profile PROFILE --publish-local
 
 | Profile | Ordered steps | Intended cadence |
 | --- | --- | --- |
-| `full` | incremental daily OHLCV, TVL, CEX/DEX depth and fixed-notional cost | manual catch-up and release validation |
+| `full` | incremental daily OHLCV, CEX depth/cost, published TVL, then DEX depth/cost | manual catch-up and release validation |
 | `daily` | incremental daily OHLCV, TVL | daily at 00:30 UTC |
 | `tvl` | TVL only | manual retry/recovery |
-| `depth` | CEX depth/cost, then DEX depth/cost | hourly at minute 05 UTC |
+| `depth` | CEX depth/cost, temporary DEX USD-price refresh, then DEX depth/cost | hourly at minute 05 UTC |
 | `cex_depth` | CEX depth and fixed-notional cost from one book snapshot | manual retry/recovery |
-| `dex_depth` | DEX depth and fixed-notional cost from one fixed block | manual retry/recovery |
+| `dex_depth` | temporary DEX USD-price refresh, then DEX depth/cost from one fixed block | manual retry/recovery |
 
 The daily step reads the current CEX and DEX end dates, starts from the older
 source with a three-day overlap, and ends at the latest completed UTC day. It
@@ -56,6 +56,13 @@ The separate fact lifecycles remain explicit:
   latest views reuse the same raw response/fixed-block lineage. Retained raw
   responses and manifests are the execution audit history for this release.
 
+The hourly DEX USD-price refresh reuses the TVL collector's GeckoTerminal
+multi-pool response but writes only
+`data/processed/dex_pool_tvl_snapshot.csv`. It does not publish a new TVL fact
+or append the TVL history. The following DEX collector explicitly reads that
+file. If the refresh step fails, DEX depth is recorded as
+`skipped_dependency` and the prior published DEX snapshot remains untouched.
+
 A full collection manifest coordinates these publications but does not claim
 that the CSVs, histories, latest snapshots, and SQLite database form one
 multi-file transaction, or that all source APIs were observed at one instant.
@@ -69,6 +76,13 @@ multi-file transaction, or that all source APIs were observed at one instant.
 | DEX TVL | age no more than 26 hours | matches the initial daily schedule |
 | CEX depth | age no more than 2 hours | allows one missed hourly run |
 | DEX depth | age no more than 2 hours | keeps CEX/DEX capacity snapshots comparable |
+
+DEX USD conversion has a stricter dependency-level contract. The fixed-block
+pool-state time is compared with the time this project received the
+GeckoTerminal price response. A difference of at most 15 minutes is current;
+more than 15 minutes and at most 2 hours is an explicit warning; more than
+2 hours, a missing timestamp, or an invalid timestamp is unusable. Unusable
+inputs cannot publish measured USD depth or execution cost.
 
 The API reports `cex_daily`, `dex_daily`, `common_comparable_end`, `dex_tvl`,
 `cex_depth`, and `dex_depth` separately. A global maximum date must not hide a
@@ -109,9 +123,11 @@ log, fix the source/configuration issue, then rerun the relevant profile.
 The daily service is intentionally not fail-fast: TVL is still attempted when
 the independent daily OHLCV step fails, while the final service status remains
 failed and auditable.
-The hourly depth service is also not fail-fast: DEX depth is still attempted
-when an independent CEX venue fails, and vice versa. The final cycle remains
-failed when either supported collection step fails its freshness gate.
+The hourly depth service is also not fail-fast across independent CEX and DEX
+sources: the DEX price refresh is still attempted when a CEX venue fails.
+Within the DEX chain, however, the price refresh is a hard dependency. DEX
+depth is skipped when that refresh fails. The final cycle remains failed when
+either supported collection step fails its freshness or dependency gate.
 
 ## Raw CEX depth retention
 

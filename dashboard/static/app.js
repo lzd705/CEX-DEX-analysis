@@ -1741,6 +1741,36 @@ function qualityFactMarkup(name, fact) {
     fact?.observed_at ? formatUtcTimestamp(fact.observed_at) : "",
     fact?.message || fact?.reason,
   ].filter(Boolean);
+  const temporal = fact?.temporal_alignment;
+  if (temporal && name === "execution") {
+    details.push(
+      `State time: ${formatUtcTimestamp(temporal.state_observed_at)}`,
+      temporal.status === "not_applicable"
+        ? "USD price time: N/A — USD/USDT identity or proxy"
+        : `USD price time: ${formatUtcTimestamp(temporal.usd_price_observed_at)}`,
+      temporal.usd_price_state_skew_seconds === null
+        || temporal.usd_price_state_skew_seconds === undefined
+        ? `Price/state skew: N/A · ${temporal.status || "unavailable"}`
+        : `Price/state skew: ${formatDurationSeconds(
+          temporal.usd_price_state_skew_seconds,
+        )} · maximum ${formatDurationSeconds(
+          temporal.max_usd_price_state_skew_seconds,
+        )}`,
+    );
+  } else if (temporal && name === "depth" && temporal.status !== "not_applicable") {
+    details.push(
+      `Pool state time: ${formatUtcTimestamp(temporal.state_observed_at)}`,
+      `USD price time: ${formatUtcTimestamp(temporal.usd_price_observed_at)}`,
+      temporal.usd_price_state_skew_seconds === null
+        || temporal.usd_price_state_skew_seconds === undefined
+        ? `Price/state skew: N/A · ${temporal.status || "unavailable"}`
+        : `Price/state skew: ${formatDurationSeconds(
+          temporal.usd_price_state_skew_seconds,
+        )} · maximum ${formatDurationSeconds(
+          temporal.max_usd_price_state_skew_seconds,
+        )}`,
+    );
+  }
   const lineage = [
     fact?.source ? `Source: ${fact.source}` : "",
     fact?.method ? `Method: ${fact.method}` : "",
@@ -1865,6 +1895,48 @@ function executionFeeScope(rows) {
   return statuses.map((status) => labels[status] || status.replaceAll("_", " ")).join(" · ");
 }
 
+function renderExecutionTiming(slot, result) {
+  const normalized = slot.toLowerCase();
+  const timing = result?.timing;
+  const card = byId(`execution-${normalized}-timing-card`);
+  const status = timing?.status || "unavailable";
+  const labels = {
+    current: "Current",
+    warning: "Usable · timing warning",
+    stale: "Withheld · stale",
+    unavailable: "Withheld · unavailable",
+    not_applicable: "N/A · identity/proxy",
+    not_evaluated: "Not evaluated",
+  };
+  card.dataset.state = status;
+  byId(`execution-${normalized}-timing-status`).textContent = (
+    result?.publication_status === "withheld"
+      ? labels[status] || "Withheld"
+      : labels[status] || status.replaceAll("_", " ")
+  );
+  byId(`execution-${normalized}-state-time`).textContent = (
+    `State time ${formatUtcTimestamp(timing?.state_observed_at)}`
+  );
+  byId(`execution-${normalized}-price-time`).textContent = (
+    status === "not_applicable"
+      ? "USD price time N/A — USD/USDT identity or proxy"
+      : `USD price time ${formatUtcTimestamp(timing?.usd_price_observed_at)}`
+  );
+  const skew = formatDurationSeconds(timing?.usd_price_state_skew_seconds);
+  const maximum = formatDurationSeconds(
+    timing?.max_usd_price_state_skew_seconds,
+  );
+  byId(`execution-${normalized}-price-skew`).textContent = (
+    status === "not_applicable" || status === "not_evaluated"
+      ? `Price/state skew N/A${timing?.reason ? ` · ${timing.reason}` : ""}`
+      : `Price/state skew ${skew} · max ${maximum}${
+        result?.publication_status === "withheld"
+          ? " · costs withheld; N/A is not zero"
+          : ""
+      }`
+  );
+}
+
 function setExecutionLoading(message) {
   hideError(byId("execution-error"));
   showStatus(byId("execution-status"), message);
@@ -1872,6 +1944,7 @@ function setExecutionLoading(message) {
     .forEach((id) => {
       byId(id).textContent = "—";
     });
+  ["a", "b"].forEach((slot) => renderExecutionTiming(slot, null));
   byId("execution-a-fill").textContent = "—";
   byId("execution-b-fill").textContent = "—";
   byId("execution-table-body").innerHTML = (
@@ -1896,6 +1969,7 @@ function clearExecutionResult(message = "") {
     .forEach((id) => {
       byId(id).textContent = "—";
     });
+  ["a", "b"].forEach((slot) => renderExecutionTiming(slot, null));
   byId("execution-a-fill").textContent = "—";
   byId("execution-b-fill").textContent = "—";
   byId("execution-table-body").innerHTML = (
@@ -1919,6 +1993,8 @@ function renderExecution(payload) {
   const notionals = payload.metadata?.notionals_usd || [1000, 5000, 10000, 50000, 100000];
   const resultA = payload.market_a;
   const resultB = payload.market_b;
+  renderExecutionTiming("a", resultA);
+  renderExecutionTiming("b", resultB);
   const rowsA = notionals.map((notional) => executionScenario(
     resultA,
     app.executionDirection,
@@ -1979,6 +2055,10 @@ function renderExecution(payload) {
   const partial = statuses.filter((status) => status === "partial").length;
   const unsupported = statuses.filter((status) => status === "unsupported").length;
   const observed = statuses.filter((status) => status === "observed").length;
+  const withheldResults = [
+    ["A", resultA],
+    ["B", resultB],
+  ].filter(([, result]) => result?.publication_status === "withheld");
   const state = failed
     ? "critical"
     : partial || unsupported || unavailableResults.length
@@ -1991,8 +2071,11 @@ function renderExecution(payload) {
     byId("execution-status"),
     `${payload.token_symbol} · ${direction} · ${observed} observed, ${partial} partial, `
       + `${unsupported} unsupported scenarios shown. `
+      + (withheldResults.length
+        ? `${withheldResults.map(([slot]) => `Market ${slot}`).join(" and ")} costs withheld because USD price timing failed the 2h gate. `
+        : "")
       + "Null cost means the full request was not measured; it is not zero.",
-    state,
+    withheldResults.length ? "critical" : state,
   );
   hideError(byId("execution-error"));
 }
@@ -2895,6 +2978,8 @@ function liquidityRelevantFlags(market) {
     "off_market_pool_state_price",
     "off_market_price",
     "wide_quoted_spread",
+    "depth_usd_price_time_mismatch",
+    "depth_usd_price_time_warning",
   ]);
   return qualityFlagObjects(market, market?.market_type)
     .filter((flag) => relevantCodes.has(flag.code));
@@ -2917,6 +3002,18 @@ function renderLiquidityMarketMeta(slot, market, issues) {
   const status = market.depth_status || "unavailable";
   const relevantFlags = liquidityRelevantFlags(market);
   const hasCriticalFlag = relevantFlags.some((flag) => flag.severity === "critical");
+  const usdTiming = market.market_type === "dex"
+    ? `<span>Pool state ${escapeHtml(formatUtcTimestamp(
+      market.depth_block_timestamp,
+    ))}</span>
+       <span>USD price response ${escapeHtml(formatUtcTimestamp(
+         market.depth_usd_price_observed_at,
+       ))} · skew ${escapeHtml(formatDurationSeconds(
+         market.depth_usd_price_skew_seconds,
+       ))} · ${escapeHtml(
+         market.depth_usd_price_freshness_status || "unavailable",
+       )}</span>`
+    : '<span>USD conversion uses the order-book quote basis; independent price time may be N/A.</span>';
   element.dataset.state = issues.length || status === "failed" || hasCriticalFlag
     ? "critical"
     : status === "observed" || status === "complete"
@@ -2929,6 +3026,7 @@ function renderLiquidityMarketMeta(slot, market, issues) {
       <strong>${escapeHtml(liquidityMarketLabel(slot, market))}</strong>
       <span>${escapeHtml(status)} · ${escapeHtml(formatUtcTimestamp(market.depth_observed_at))}</span>
       <span>${escapeHtml(model)}${escapeHtml(block)}</span>
+      ${usdTiming}
       ${issueMarkup}
     </div>
     <div class="quality-badges">${renderQualityBadges(relevantFlags)}</div>

@@ -41,13 +41,14 @@ DEFAULT_RUN_ROOT = DEFAULT_DATA_DIR / "collection/runs"
 DEFAULT_LATEST_STATUS = DEFAULT_DATA_DIR / "collection/latest.json"
 DEFAULT_LOCK_FILE = DEFAULT_DATA_DIR / "collection/collection.lock"
 TOKEN_CONFIG = PROJECT_ROOT / "config/tokens.csv"
+DEX_PRICE_INPUT = PROJECT_ROOT / "data/processed/dex_pool_tvl_snapshot.csv"
 PROFILE_STEPS = {
-    "full": ("daily", "tvl", "depth", "dex_depth"),
+    "full": ("daily", "depth", "tvl", "dex_depth"),
     "daily": ("daily", "tvl"),
     "tvl": ("tvl",),
-    "depth": ("depth", "dex_depth"),
+    "depth": ("depth", "dex_price", "dex_depth"),
     "cex_depth": ("depth",),
-    "dex_depth": ("dex_depth",),
+    "dex_depth": ("dex_price", "dex_depth"),
 }
 DAILY_FILENAMES = {
     "cex_daily": "cex_exchange_volume_daily.csv",
@@ -282,12 +283,12 @@ def build_step_commands(
                 command.extend(["--start", start, "--end", end])
             if publish_local:
                 command.append("--publish-local")
-        elif step == "tvl":
+        elif step in {"tvl", "dex_price"}:
             command = [
                 python_executable,
                 str(PROJECT_ROOT / "scripts/fetch_tvl.py"),
             ]
-            if publish_local:
+            if step == "tvl" and publish_local:
                 command.append("--publish-local")
         elif step == "depth":
             command = [
@@ -300,6 +301,8 @@ def build_step_commands(
             command = [
                 python_executable,
                 str(PROJECT_ROOT / "scripts/fetch_dex_depth.py"),
+                "--tvl-csv",
+                str(DEX_PRICE_INPUT),
             ]
             if publish_local:
                 command.append("--publish-local")
@@ -464,6 +467,48 @@ def run_collection_cycle(
         for name, command in commands:
             step_started = utc_now()
             log_path = run_dir / f"{name}.log"
+            price_dependency = (
+                step_results[-1]
+                if (
+                    name == "dex_depth"
+                    and step_results
+                    and step_results[-1]["name"] in {"tvl", "dex_price"}
+                )
+                else None
+            )
+            if (
+                price_dependency is not None
+                and price_dependency["exit_code"] != 0
+            ):
+                step_error = (
+                    "Skipped because the required fresh DEX USD-price input "
+                    f"step {price_dependency['name']} failed"
+                )
+                log_path.write_text(step_error + "\n", encoding="utf-8")
+                step_finished = utc_now()
+                step_results.append(
+                    {
+                        "name": name,
+                        "command": command,
+                        "started_at": utc_text(step_started),
+                        "finished_at": utc_text(step_finished),
+                        "duration_seconds": round(
+                            (step_finished - step_started).total_seconds(),
+                            3,
+                        ),
+                        "exit_code": 4,
+                        "status": "skipped_dependency",
+                        "log_path": str(log_path),
+                        "log_sha256": sha256_file(log_path),
+                        "log_tail": log_tail(log_path),
+                        "error": step_error,
+                        "validation": {
+                            "checked": False,
+                            "reason": "failed_price_dependency",
+                        },
+                    }
+                )
+                continue
             print(f"[collection] starting {name}: {' '.join(command)}", flush=True)
             step_error = None
             try:
@@ -479,7 +524,7 @@ def run_collection_cycle(
                 with log_path.open("a", encoding="utf-8") as log:
                     log.write(step_error + "\n")
             validation = None
-            should_validate = publish_local and (
+            should_validate = publish_local and name != "dex_price" and (
                 name != "daily" or (tokens is None and start is None and end is None)
             )
             if exit_code == 0 and should_validate:
@@ -565,6 +610,14 @@ def run_collection_cycle(
             ),
             "steps": step_results,
             "facts": build_collection_status(data_dir),
+            "dependency_files": (
+                {"dex_price_input": file_record(DEX_PRICE_INPUT)}
+                if any(
+                    name in {"dex_price", "dex_depth"}
+                    for name, _command in commands
+                )
+                else {}
+            ),
         }
         manifest_path = run_dir / "manifest.json"
         atomic_write_json(manifest_path, manifest)

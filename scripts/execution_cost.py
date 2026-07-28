@@ -14,8 +14,10 @@ cost from the 10/25/50/100 bps depth bands.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
+from math import ceil
 from typing import Any, Iterable
 
 
@@ -29,6 +31,8 @@ EXECUTION_NOTIONALS_USD = (
 )
 EXECUTION_DIRECTIONS = ("sell_token", "buy_token")
 EXECUTION_STATUSES = {"observed", "partial", "unsupported", "failed"}
+USD_PRICE_SKEW_WARNING_SECONDS = 15 * 60
+USD_PRICE_SKEW_MAX_SECONDS = 2 * 60 * 60
 NOTIONAL_DEFINITION = (
     "target Token quantity valued at the snapshot pre-trade reference price"
 )
@@ -216,6 +220,80 @@ def decimal_text(value: Decimal | int | str | None) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text
+
+
+def usd_price_timing(
+    state_observed_at: str | None,
+    usd_price_observed_at: str | None,
+    *,
+    warning_seconds: int = USD_PRICE_SKEW_WARNING_SECONDS,
+    max_seconds: int = USD_PRICE_SKEW_MAX_SECONDS,
+) -> dict[str, Any]:
+    """Classify the observable skew between market state and a USD-price response.
+
+    GeckoTerminal exposes the time at which this project received the pool
+    response, not the provider's internal price-event time.  The result is
+    therefore an observation-skew contract, not a claim about tick-level price
+    age.
+    """
+    result: dict[str, Any] = {
+        "state_observed_at": state_observed_at or None,
+        "usd_price_observed_at": usd_price_observed_at or None,
+        "skew_seconds": None,
+        "status": "unavailable",
+        "usable": False,
+        "warning_seconds": warning_seconds,
+        "max_seconds": max_seconds,
+        "reason": "usd_price_timing_unavailable",
+    }
+    if (
+        warning_seconds < 0
+        or max_seconds <= 0
+        or warning_seconds > max_seconds
+    ):
+        raise ValueError("USD price timing thresholds are invalid")
+    if not state_observed_at or not usd_price_observed_at:
+        return result
+
+    def parse_timestamp(value: str) -> datetime:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("timestamp must include a timezone")
+        return parsed.astimezone(timezone.utc)
+
+    try:
+        state_time = parse_timestamp(state_observed_at)
+        price_time = parse_timestamp(usd_price_observed_at)
+    except (TypeError, ValueError):
+        result["reason"] = "usd_price_timestamp_invalid"
+        return result
+
+    skew_seconds = int(ceil(abs((state_time - price_time).total_seconds())))
+    result["skew_seconds"] = skew_seconds
+    if skew_seconds <= warning_seconds:
+        result.update(
+            {
+                "status": "current",
+                "usable": True,
+                "reason": None,
+            }
+        )
+    elif skew_seconds <= max_seconds:
+        result.update(
+            {
+                "status": "warning",
+                "usable": True,
+                "reason": "usd_price_observation_skew_warning",
+            }
+        )
+    else:
+        result.update(
+            {
+                "status": "stale",
+                "reason": "usd_price_observation_skew_exceeds_maximum",
+            }
+        )
+    return result
 
 
 def blank_execution_row() -> dict[str, str]:
@@ -460,16 +538,24 @@ def _expected_market_id(row: dict[str, Any]) -> str:
 def validate_execution_snapshot(
     expected_market_ids: Iterable[str],
     rows: list[dict[str, Any]],
+    *,
+    enforce_usd_price_timing: bool = False,
 ) -> None:
     """Apply the hard gates under a precision independent of process defaults."""
     with localcontext() as context:
         context.prec = 100
-        _validate_execution_snapshot(expected_market_ids, rows)
+        _validate_execution_snapshot(
+            expected_market_ids,
+            rows,
+            enforce_usd_price_timing=enforce_usd_price_timing,
+        )
 
 
 def _validate_execution_snapshot(
     expected_market_ids: Iterable[str],
     rows: list[dict[str, Any]],
+    *,
+    enforce_usd_price_timing: bool = False,
 ) -> None:
     """Implementation for coverage, formula, state, and monotonicity gates."""
     expected = set(expected_market_ids)
@@ -583,6 +669,16 @@ def _validate_execution_snapshot(
                     raise ValueError(
                         "Measured DEX source_sequence does not match block_number"
                     )
+                if enforce_usd_price_timing:
+                    timing = usd_price_timing(
+                        str(row.get("state_observed_at") or ""),
+                        str(row.get("usd_price_observed_at") or ""),
+                    )
+                    if not timing["usable"]:
+                        raise ValueError(
+                            "Measured DEX execution uses an unavailable or stale "
+                            f"USD price observation: {timing['reason']}"
+                        )
                 fee_rate = optional_decimal(row.get("fee_rate_bps"))
                 if (
                     fee_rate is None

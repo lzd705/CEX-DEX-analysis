@@ -15,9 +15,9 @@ study, or public data-edit controls.
 2. Put the global start and end date controls at the top of the page.
 3. Display price, selected-window return, daily realized volatility, USD
    volume, DEX TVL snapshot, CEX and supported-pool DEX 10/25/50/100 bps depth
-   snapshots, and CEX-DEX price spread. Collect and expose fixed-notional
-   quoted execution-cost facts through the independent API; their dashboard
-   visualization is the next product phase.
+   snapshots, CEX-DEX price spread, and fixed-notional quoted execution-cost
+   facts. Display execution price-source timing and withhold values whose
+   required USD-price observation fails the two-hour temporal gate.
 4. Keep spread at Token comparison level, not duplicated as a CEX or DEX
    property.
 5. Sort Tokens by aggregate volume across all cataloged markets, while keeping
@@ -41,7 +41,7 @@ python3 scripts/run_collection_cycle.py --profile full --publish-local
 # Daily schedule profile: incremental CEX/DEX OHLCV plus point-in-time TVL.
 python3 scripts/run_collection_cycle.py --profile daily --publish-local
 
-# Hourly profile: depth plus fixed-notional costs from the same captured states.
+# Hourly profile: CEX depth/cost, private DEX price refresh, then DEX depth/cost.
 python3 scripts/run_collection_cycle.py --profile depth --publish-local
 
 # Manual recovery profile: retry only the point-in-time TVL snapshot.

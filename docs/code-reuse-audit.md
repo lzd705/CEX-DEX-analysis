@@ -35,6 +35,10 @@ Source reviewed: original repository branch `feature/data-pipeline`, commit
 - DEX TVL is a latest-fetch snapshot. The current collector does not provide
   historical daily TVL.
 - CEX order-book depth is a separate latest-fetch snapshot with explicit
-  truncation flags; it is not reconstructed tick history or measured slippage.
-- Slippage, fee, gas, and event facts are not present in the current Market
-  Monitor contract.
+  truncation flags; it is not reconstructed tick history.
+- Fixed-notional quoted execution cost is present for CEX books and supported
+  DEX V2 pools. Supported DEX pool fees are included in pool mechanics; CEX
+  account fees, gas, router fees, latency, token taxes, and MEV remain outside
+  the quoted-cost scope. DEX V3 execution is explicitly unsupported.
+- Funding-rate and event facts are not present in the current Market Monitor
+  contract.

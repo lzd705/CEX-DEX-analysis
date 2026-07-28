@@ -939,7 +939,7 @@ main { min-width: 0; padding: 14px 18px 30px; }
 }
 .execution-summary {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 1px;
   margin-top: 10px;
   border: 1px solid var(--line);
@@ -949,6 +949,17 @@ main { min-width: 0; padding: 14px 18px 30px; }
   min-width: 0;
   padding: 11px 13px;
   background: var(--surface-2);
+}
+.execution-summary > div[data-state="current"],
+.execution-summary > div[data-state="not_applicable"] {
+  box-shadow: inset 3px 0 0 var(--positive);
+}
+.execution-summary > div[data-state="warning"] {
+  box-shadow: inset 3px 0 0 var(--amber);
+}
+.execution-summary > div[data-state="stale"],
+.execution-summary > div[data-state="unavailable"] {
+  box-shadow: inset 3px 0 0 var(--negative);
 }
 .execution-summary span,
 .execution-summary small {
@@ -1340,15 +1351,20 @@ footer {
   }
   main { padding: 8px; }
   .date-fields { width: 100%; }
-  .date-fields label { flex: 1; }
-  .date-fields input { width: 100%; }
+  .date-fields label { flex: 1; min-width: 0; }
+  .date-fields input { width: 100%; min-width: 0; }
   .preset-group { width: 100%; }
   .preset-group button { flex: 1; }
   .icon-command { width: 100%; justify-content: center; }
   .facts-workbench { padding: 14px 10px; }
   .facts-heading { display: block; }
   .workspace-heading-meta { justify-content: flex-start; margin-top: 8px; }
-  .workspace-tabs a { min-width: 132px; }
+  .workspace-tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: visible;
+  }
+  .workspace-tabs a { min-width: 0; }
   .view-heading { display: block; padding: 14px 11px; }
   .view-heading .contract-badge { margin-top: 9px; }
   .contract-badge { display: inline-block; margin-top: 10px; }

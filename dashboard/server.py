@@ -64,7 +64,11 @@ from scripts.execution_cost import (
     EXECUTION_DIRECTIONS,
     EXECUTION_NOTIONALS_USD,
     NOTIONAL_DEFINITION,
+    RESULT_NUMERIC_COLUMNS,
+    USD_PRICE_SKEW_MAX_SECONDS,
+    USD_PRICE_SKEW_WARNING_SECONDS,
     execution_api_rows,
+    usd_price_timing,
     validate_execution_snapshot,
 )
 
@@ -983,6 +987,11 @@ def overlay_dex_depth_snapshot(
             pool["dex_depth_source_endpoint"] = None
             pool["dex_depth_raw_response_sha256"] = None
             pool["dex_depth_error"] = None
+            pool["dex_depth_block_timestamp"] = None
+            pool["dex_depth_usd_price_source_snapshot_id"] = None
+            pool["dex_depth_usd_price_observed_at"] = None
+            pool["dex_depth_usd_price_skew_seconds"] = None
+            pool["dex_depth_usd_price_freshness_status"] = "unavailable"
         result["metadata"]["dex_depth_note"] = (
             "DEX pool-state depth snapshot is unavailable. TVL and daily volume "
             "are not used as depth proxies."
@@ -1026,6 +1035,11 @@ def overlay_dex_depth_snapshot(
             pool["dex_depth_source_endpoint"] = None
             pool["dex_depth_raw_response_sha256"] = None
             pool["dex_depth_error"] = None
+            pool["dex_depth_block_timestamp"] = None
+            pool["dex_depth_usd_price_source_snapshot_id"] = None
+            pool["dex_depth_usd_price_observed_at"] = None
+            pool["dex_depth_usd_price_skew_seconds"] = None
+            pool["dex_depth_usd_price_freshness_status"] = "unavailable"
             for field in numeric_fields:
                 pool[field] = None
             for field in completeness_fields:
@@ -1046,6 +1060,25 @@ def overlay_dex_depth_snapshot(
             if depth_row.get("block_number")
             else None
         )
+        pool["dex_depth_block_timestamp"] = (
+            depth_row.get("block_timestamp") or None
+        )
+        pool["dex_depth_usd_price_source_snapshot_id"] = (
+            depth_row.get("usd_price_source_snapshot_id") or None
+        )
+        pool["dex_depth_usd_price_observed_at"] = (
+            depth_row.get("usd_price_observed_at") or None
+        )
+        price_timing = usd_price_timing(
+            pool["dex_depth_block_timestamp"],
+            pool["dex_depth_usd_price_observed_at"],
+        )
+        pool["dex_depth_usd_price_skew_seconds"] = price_timing[
+            "skew_seconds"
+        ]
+        pool["dex_depth_usd_price_freshness_status"] = price_timing[
+            "status"
+        ]
         pool["dex_depth_source_endpoint"] = (
             depth_row.get("source_endpoint") or None
         )
@@ -1053,7 +1086,17 @@ def overlay_dex_depth_snapshot(
             depth_row.get("raw_response_sha256") or None
         )
         pool["dex_depth_error"] = depth_row.get("error") or None
-        measured = depth_row.get("status") in {"observed", "partial"}
+        source_status = depth_row.get("status")
+        measured = (
+            source_status in {"observed", "partial"}
+            and price_timing["usable"]
+        )
+        pool["dex_depth_source_status"] = source_status
+        if source_status in {"observed", "partial"} and not price_timing[
+            "usable"
+        ]:
+            pool["dex_depth_status"] = "failed"
+            pool["dex_depth_error"] = price_timing["reason"]
         for field in numeric_fields:
             pool[field] = (
                 parse_number(depth_row.get(field)) if measured else None
@@ -2167,6 +2210,99 @@ def _timestamp_seconds(value: str | None) -> float | None:
     return parsed.astimezone(timezone.utc).timestamp()
 
 
+def _execution_temporal_alignment(
+    rows: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Summarize whether measured execution can use its USD conversion input."""
+    measured = [
+        row
+        for row in rows
+        if row.get("status") in {"observed", "partial"}
+    ]
+
+    def one_value(field: str) -> str | None:
+        values = {
+            str(row.get(field))
+            for row in rows
+            if row.get(field) not in (None, "")
+        }
+        return next(iter(values)) if len(values) == 1 else None
+
+    base = {
+        "state_observed_at": one_value("state_observed_at"),
+        "usd_price_observed_at": one_value("usd_price_observed_at"),
+        "usd_price_source_snapshot_id": one_value(
+            "usd_price_source_snapshot_id"
+        ),
+        "usd_conversion_status": one_value("usd_conversion_status"),
+        "source_quote_asset": one_value("source_quote_asset"),
+        "usd_price_state_skew_seconds": None,
+        "warning_usd_price_state_skew_seconds": (
+            USD_PRICE_SKEW_WARNING_SECONDS
+        ),
+        "max_usd_price_state_skew_seconds": USD_PRICE_SKEW_MAX_SECONDS,
+        "status": "not_evaluated",
+        "usable": True,
+        "reason": None,
+    }
+    if not measured:
+        return base
+
+    conversion_status = base["usd_conversion_status"]
+    if (
+        conversion_status in {"identity_usd", "proxy_usdt_equals_usd"}
+        or (
+            one_value("market_type") == "cex"
+            and base["source_quote_asset"] in {"USD", "USDT"}
+        )
+    ):
+        base["status"] = "not_applicable"
+        base["reason"] = "USD conversion has no independent price response"
+        return base
+
+    timing = usd_price_timing(
+        base["state_observed_at"],
+        base["usd_price_observed_at"],
+    )
+    base.update(
+        {
+            "usd_price_state_skew_seconds": timing["skew_seconds"],
+            "status": timing["status"],
+            "usable": timing["usable"],
+            "reason": timing["reason"],
+        }
+    )
+    return base
+
+
+def _execution_public_rows(
+    rows: list[dict[str, str]],
+    timing: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Fail closed in the public API while retaining the original lineage."""
+    public_rows = execution_api_rows(rows, number_parser=parse_number)
+    measured = any(
+        row.get("status") in {"observed", "partial"}
+        for row in rows
+    )
+    if not measured or timing["usable"]:
+        return public_rows
+    for source_row, public_row in zip(rows, public_rows):
+        if source_row.get("status") not in {"observed", "partial"}:
+            continue
+        public_row["source_status"] = source_row.get("status")
+        public_row["source_status_reason"] = source_row.get("status_reason")
+        public_row["status"] = "failed"
+        public_row["status_reason"] = str(timing["reason"])
+        public_row["error"] = (
+            "Execution values withheld because the required USD-price "
+            "observation is unavailable or more than two hours from market state."
+        )
+        for field in RESULT_NUMERIC_COLUMNS:
+            public_row[field] = None
+    return public_rows
+
+
 def _execution_snapshot_metadata(
     snapshot: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -2228,6 +2364,8 @@ def build_execution_cost_comparison(
                 "market": market,
                 "status": "unavailable",
                 "rows": [],
+                "timing": None,
+                "publication_status": "unavailable",
             }
         rows = snapshot["by_market"].get(market["market_id"])
         if rows is None:
@@ -2235,11 +2373,24 @@ def build_execution_cost_comparison(
                 "market": market,
                 "status": "not_cataloged_in_snapshot",
                 "rows": [],
+                "timing": None,
+                "publication_status": "unavailable",
             }
+        timing = _execution_temporal_alignment(rows)
+        measured = any(
+            row.get("status") in {"observed", "partial"}
+            for row in rows
+        )
         return {
             "market": market,
             "status": "available",
-            "rows": execution_api_rows(rows, number_parser=parse_number),
+            "rows": _execution_public_rows(rows, timing),
+            "timing": timing,
+            "publication_status": (
+                "withheld"
+                if measured and not timing["usable"]
+                else "published"
+            ),
         }
 
     result_a = market_result(market_a)
@@ -2297,6 +2448,18 @@ def build_execution_cost_comparison(
                 "Partial, unsupported, failed, unavailable, and not-cataloged "
                 "full-request cost fields remain null; they are never zero-filled "
                 "or interpolated from depth bands."
+            ),
+            "temporal_contract_version": 1,
+            "warning_usd_price_state_skew_seconds": (
+                USD_PRICE_SKEW_WARNING_SECONDS
+            ),
+            "max_usd_price_state_skew_seconds": USD_PRICE_SKEW_MAX_SECONDS,
+            "temporal_rule": (
+                "A measured execution that needs an observed USD conversion is "
+                "published only when the conversion response is no more than "
+                "two hours from market state. Missing or older inputs are "
+                "withheld as N/A, never zero. USD and USDT identity/proxy "
+                "conversions have no independent price timestamp."
             ),
             "snapshot_skew_seconds": skew,
             "snapshots": {
@@ -2467,6 +2630,69 @@ def _tvl_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
 def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
     market_type = market["market_type"]
     status = market.get("depth_status") or "unavailable"
+    temporal_alignment = {
+        "state_observed_at": (
+            market.get("depth_block_timestamp")
+            if market_type == "dex"
+            else market.get("depth_observed_at")
+        ),
+        "usd_price_observed_at": (
+            market.get("depth_usd_price_observed_at")
+            if market_type == "dex"
+            else None
+        ),
+        "usd_price_source_snapshot_id": (
+            market.get("depth_usd_price_source_snapshot_id")
+            if market_type == "dex"
+            else None
+        ),
+        "usd_price_state_skew_seconds": (
+            market.get("depth_usd_price_skew_seconds")
+            if market_type == "dex"
+            else None
+        ),
+        "warning_usd_price_state_skew_seconds": (
+            USD_PRICE_SKEW_WARNING_SECONDS
+        ),
+        "max_usd_price_state_skew_seconds": USD_PRICE_SKEW_MAX_SECONDS,
+        "status": (
+            market.get("depth_usd_price_freshness_status")
+            if market_type == "dex"
+            else "not_applicable"
+        ),
+    }
+    quality_flags = list(_quality_flags_for_fact(market, "depth"))
+    timing_status = temporal_alignment["status"]
+    if market_type == "dex" and timing_status in {"stale", "unavailable"}:
+        quality_flags.append(
+            {
+                "code": "depth_usd_price_time_mismatch",
+                "severity": "critical",
+                "message": (
+                    "USD depth is withheld because its price response is "
+                    "unavailable or more than two hours from pool state."
+                ),
+                "observed_value": temporal_alignment[
+                    "usd_price_state_skew_seconds"
+                ],
+                "threshold": USD_PRICE_SKEW_MAX_SECONDS,
+            }
+        )
+    elif market_type == "dex" and timing_status == "warning":
+        quality_flags.append(
+            {
+                "code": "depth_usd_price_time_warning",
+                "severity": "warning",
+                "message": (
+                    "The USD price response is more than 15 minutes, but no "
+                    "more than two hours, from pool state."
+                ),
+                "observed_value": temporal_alignment[
+                    "usd_price_state_skew_seconds"
+                ],
+                "threshold": USD_PRICE_SKEW_WARNING_SECONDS,
+            }
+        )
     bands = {}
     for band in (10, 25, 50, 100):
         sell_prefix = "bid" if market_type == "cex" else "sell"
@@ -2495,9 +2721,11 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             ),
         ),
         "block_number": market.get("depth_block_number"),
+        "state_observed_at": temporal_alignment["state_observed_at"],
+        "temporal_alignment": temporal_alignment,
         "protocol_model": market.get("depth_protocol_model"),
         "bands_bps": bands,
-        "quality_flags": _quality_flags_for_fact(market, "depth"),
+        "quality_flags": quality_flags,
     }
 
 
@@ -2573,6 +2801,7 @@ def _execution_quality_fact(
             "scenario_count": 0,
         }
 
+    temporal_alignment = _execution_temporal_alignment(rows)
     status_counts = Counter(
         row.get("status") or "failed"
         for row in rows
@@ -2583,6 +2812,42 @@ def _execution_quality_fact(
         for candidate in status_priority
         if status_counts.get(candidate)
     )
+    measured = bool(
+        status_counts.get("observed") or status_counts.get("partial")
+    )
+    temporal_flags = []
+    if measured and not temporal_alignment["usable"]:
+        status = "failed"
+        temporal_flags.append(
+            {
+                "code": "execution_usd_price_time_mismatch",
+                "severity": "critical",
+                "message": (
+                    "Execution values are withheld because the required USD "
+                    "price response is unavailable or more than two hours from "
+                    "market state."
+                ),
+                "observed_value": temporal_alignment[
+                    "usd_price_state_skew_seconds"
+                ],
+                "threshold": USD_PRICE_SKEW_MAX_SECONDS,
+            }
+        )
+    elif measured and temporal_alignment["status"] == "warning":
+        temporal_flags.append(
+            {
+                "code": "execution_usd_price_time_warning",
+                "severity": "warning",
+                "message": (
+                    "The USD price response is more than 15 minutes, but no "
+                    "more than two hours, from execution market state."
+                ),
+                "observed_value": temporal_alignment[
+                    "usd_price_state_skew_seconds"
+                ],
+                "threshold": USD_PRICE_SKEW_WARNING_SECONDS,
+            }
+        )
     reason_counts = Counter(
         row.get("status_reason") or "missing_status_reason"
         for row in rows
@@ -2619,9 +2884,13 @@ def _execution_quality_fact(
             ),
             method=_one_execution_value(rows, "calculation_method"),
             reason=(
-                sorted(reason_counts)[0]
-                if len(reason_counts) == 1
-                else "mixed_execution_status_reasons"
+                temporal_alignment["reason"]
+                if measured and not temporal_alignment["usable"]
+                else (
+                    sorted(reason_counts)[0]
+                    if len(reason_counts) == 1
+                    else "mixed_execution_status_reasons"
+                )
             ),
             snapshot_id=_one_execution_value(rows, "snapshot_id"),
             raw_response_sha256=_one_execution_value(
@@ -2633,6 +2902,8 @@ def _execution_quality_fact(
             rows,
             "source_snapshot_id",
         ),
+        "temporal_alignment": temporal_alignment,
+        "quality_flags": temporal_flags,
         "published_at": published_times[-1] if published_times else None,
         "status_counts": dict(sorted(status_counts.items())),
         "status_reason_counts": dict(sorted(reason_counts.items())),
@@ -2699,6 +2970,39 @@ def build_market_quality(
     }
     quality_markets = []
     for market in token_markets:
+        facts = {
+            "daily": _daily_quality_fact(
+                market,
+                catalog["metadata"],
+            ),
+            "tvl": _tvl_quality_fact(market),
+            "depth": _depth_quality_fact(market),
+            "execution": _execution_quality_fact(
+                market,
+                execution_sources[market["market_type"]],
+            ),
+        }
+        quality_flags = list(market.get("quality_flag_details") or [])
+        known_codes = {
+            flag.get("code")
+            for flag in quality_flags
+            if flag.get("code")
+        }
+        for fact in facts.values():
+            for flag in fact.get("quality_flags", []):
+                if flag.get("code") in known_codes:
+                    continue
+                quality_flags.append(flag)
+                if flag.get("code"):
+                    known_codes.add(flag["code"])
+        quality_status = market.get("quality_status")
+        if any(
+            flag.get("severity") == "critical"
+            for flag in quality_flags
+        ):
+            quality_status = "critical"
+        elif quality_flags and quality_status not in {"critical", "warning"}:
+            quality_status = "warning"
         quality_markets.append(
             {
                 "market_id": market["market_id"],
@@ -2708,20 +3012,9 @@ def build_market_quality(
                 "instrument": market["instrument"],
                 "chain": market.get("chain"),
                 "pool_address": market.get("pool_address"),
-                "quality_status": market.get("quality_status"),
-                "quality_flags": market.get("quality_flag_details") or [],
-                "facts": {
-                    "daily": _daily_quality_fact(
-                        market,
-                        catalog["metadata"],
-                    ),
-                    "tvl": _tvl_quality_fact(market),
-                    "depth": _depth_quality_fact(market),
-                    "execution": _execution_quality_fact(
-                        market,
-                        execution_sources[market["market_type"]],
-                    ),
-                },
+                "quality_status": quality_status,
+                "quality_flags": quality_flags,
+                "facts": facts,
             }
         )
     return {

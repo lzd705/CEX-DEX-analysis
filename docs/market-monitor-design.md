@@ -2,15 +2,19 @@
 
 ## Page structure
 
-1. Global time window: start, end, 7D, 30D, 90D, and All.
-2. Sorting controls: `综合`, `CEX`, `DEX`; default USD volume descending.
-3. Token table: one comparison row followed by one selected CEX row and one
-   selected DEX row.
-4. Source footer: file fingerprints, freshness, formula, and data limitations.
+1. `Screener` is the cross-Token entry point. The global start/end, 7D, 30D,
+   90D, and All controls apply only to daily facts.
+2. Selecting a Token opens one persistent workspace with four pages:
+   `Markets`, `Compare`, `Liquidity & Execution`, and `Data Quality`.
+3. Market A and Market B are exact market IDs for the selected Token and remain
+   in the URL while the user moves between those pages.
+4. `Methodology` is the shared definition layer; Data Quality reports the
+   current status and lineage of one Token's actual markets.
 
-The dense table follows the market-terminal reference. It avoids card-heavy
-research-report composition and keeps repeated comparison work visible in one
-scan.
+The workspace separates discovery, comparison, executable-liquidity analysis,
+and evidence without losing the selected Token or market pair. TVL, depth, and
+execution remain independently timestamped latest snapshots rather than
+pretending to follow the daily date selector.
 
 ## Spread placement
 

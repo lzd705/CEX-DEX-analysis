@@ -121,8 +121,22 @@ TVL, daily volume, or a generic constant-product approximation.
 ## USD conversion
 
 Pool math is performed in integer token base units. Token decimals come from the
-contracts. The quote-side token is converted to USD using the latest
-GeckoTerminal base/quote token prices retained in the TVL inventory.
+contracts. Immediately before an hourly DEX run, the pipeline refreshes
+GeckoTerminal base/quote token prices into a temporary, non-published inventory.
+The quote-side token is converted to USD using that response.
+
+The two time inputs remain separate and auditable:
+
+- `block_timestamp` is the fixed EVM pool-state time;
+- `usd_price_observed_at` is when this project received the GeckoTerminal
+  response containing the token USD prices.
+
+Their absolute difference is the USD-price observation skew. Up to 15 minutes
+is current; more than 15 minutes and no more than 2 hours is published with a
+warning; more than 2 hours, a missing timestamp, or an invalid timestamp is
+unusable. Unusable input produces no measured USD depth or execution value.
+This is an observation-skew rule; GeckoTerminal does not expose the internal
+event time of the price itself.
 
 The collector also compares the pool-state implied target-token price with that
 source price and stores midpoint-relative `price_difference_bps`. A large
@@ -133,6 +147,7 @@ off-market pool. The actual pool-state depth remains visible with its lineage.
 
 | File | Meaning |
 | --- | --- |
+| `data/processed/dex_pool_tvl_snapshot.csv` | Temporary current-run GeckoTerminal USD-price input; not a published TVL fact |
 | `data/processed/dex_depth_snapshot.csv` | Current collection awaiting publication |
 | `data/local/dex_depth_latest.csv` | Latest published complete inventory |
 | `data/local/dex_depth_history.csv` | Append-only normalized history |

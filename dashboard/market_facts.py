@@ -894,6 +894,22 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "depth_error": row.get("dex_depth_error"),
                 "depth_protocol_model": row.get("dex_depth_protocol_model"),
                 "depth_block_number": row.get("dex_depth_block_number"),
+                "depth_block_timestamp": row.get(
+                    "dex_depth_block_timestamp"
+                ),
+                "depth_source_status": row.get("dex_depth_source_status"),
+                "depth_usd_price_source_snapshot_id": row.get(
+                    "dex_depth_usd_price_source_snapshot_id"
+                ),
+                "depth_usd_price_observed_at": row.get(
+                    "dex_depth_usd_price_observed_at"
+                ),
+                "depth_usd_price_skew_seconds": row.get(
+                    "dex_depth_usd_price_skew_seconds"
+                ),
+                "depth_usd_price_freshness_status": row.get(
+                    "dex_depth_usd_price_freshness_status"
+                ),
                 "fee_bps": row.get("fee_bps"),
                 "pool_state_price_usd": row.get("pool_state_price_usd"),
                 "source_target_price_usd": row.get("source_target_price_usd"),

@@ -16,6 +16,7 @@ from scripts.fetch_dex_depth import DEX_DEPTH_COLUMNS
 from scripts.execution_cost import (
     EXECUTION_COST_COLUMNS,
     EXECUTION_NOTIONALS_USD,
+    RESULT_NUMERIC_COLUMNS,
     execution_fact_row,
 )
 from scripts.market_database import build_database
@@ -153,6 +154,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         cex_symbol="BTC/USDT",
         source_instrument="BTCUSDT",
         zero_cost=False,
+        usd_price_observed_at=None,
     ):
         if market_type == "cex":
             identity = {
@@ -183,7 +185,9 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "fee_status": "included_protocol_fee",
                 "fee_rate_bps": "30",
                 "usd_price_source_snapshot_id": "tvl-1",
-                "usd_price_observed_at": state_observed_at,
+                "usd_price_observed_at": (
+                    usd_price_observed_at or state_observed_at
+                ),
                 "usd_conversion_status": "tvl_inventory_token_price",
                 "excluded_costs": "gas,router_fee,transfer_tax,MEV",
             }
@@ -506,6 +510,11 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "pool_address": "0xpool",
                 "protocol_model": "concentrated_liquidity_v3",
                 "block_number": "123456",
+                "block_timestamp": "2026-07-28T01:02:03+00:00",
+                "usd_price_source_snapshot_id": "tvl-1",
+                "usd_price_observed_at": "2026-07-28T01:01:03+00:00",
+                "usd_price_skew_seconds": "60",
+                "usd_price_freshness_status": "current",
                 "fee_bps": "30",
                 "pool_state_price_usd": "104.8",
                 "source_target_price_usd": "105",
@@ -914,6 +923,14 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(len(payload["market_a"]["rows"]), 10)
         self.assertEqual(len(payload["market_b"]["rows"]), 10)
         self.assertEqual(payload["metadata"]["snapshot_skew_seconds"], 60)
+        self.assertEqual(payload["market_a"]["timing"]["status"], "not_applicable")
+        self.assertEqual(payload["market_b"]["timing"]["status"], "current")
+        self.assertEqual(
+            payload["market_b"]["timing"][
+                "usd_price_state_skew_seconds"
+            ],
+            0,
+        )
         self.assertEqual(
             payload["market_a"]["rows"][0]["fee_status"],
             "excluded_unknown_account_tier",
@@ -925,6 +942,71 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(
             payload["market_a"]["rows"][0]["quoted_execution_cost_bps"],
             "1",
+        )
+
+    def test_stale_dex_price_time_withholds_public_execution_and_flags_quality(self):
+        cex_id = "cex:binance:BTC/USDT"
+        dex_id = "dex:eth:uniswap:0xpool:BTC"
+        write_csv(
+            self.cex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            self.execution_rows(
+                cex_id,
+                "cex",
+                state_observed_at="2026-01-02T00:00:00+00:00",
+            ),
+        )
+        write_csv(
+            self.dex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            self.execution_rows(
+                dex_id,
+                "dex",
+                state_observed_at="2026-01-02T00:00:00+00:00",
+                usd_price_observed_at="2026-01-01T05:59:59+00:00",
+            ),
+        )
+        environment = {
+            **self.environment,
+            "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
+            "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
+        }
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, environment, clear=True):
+                execution = server.build_execution_cost_comparison(
+                    "BTC",
+                    cex_id,
+                    dex_id,
+                )
+                quality = server.build_market_quality("BTC")
+        finally:
+            server.clear_runtime_caches()
+
+        dex_result = execution["market_b"]
+        self.assertEqual(dex_result["publication_status"], "withheld")
+        self.assertEqual(dex_result["timing"]["status"], "stale")
+        self.assertEqual(
+            dex_result["timing"]["usd_price_state_skew_seconds"],
+            64801,
+        )
+        first = dex_result["rows"][0]
+        self.assertEqual(first["source_status"], "observed")
+        self.assertEqual(first["status"], "failed")
+        for field in RESULT_NUMERIC_COLUMNS:
+            self.assertIsNone(first[field], field)
+        dex_quality = next(
+            market["facts"]["execution"]
+            for market in quality["markets"]
+            if market["market_id"] == dex_id
+        )
+        self.assertEqual(dex_quality["status"], "failed")
+        self.assertIn(
+            "execution_usd_price_time_mismatch",
+            {
+                flag["code"]
+                for flag in dex_quality["quality_flags"]
+            },
         )
 
     def test_execution_cost_api_requires_two_exact_token_market_ids(self):

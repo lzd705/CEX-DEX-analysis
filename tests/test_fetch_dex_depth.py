@@ -458,8 +458,8 @@ class DexDepthCollectionTest(unittest.TestCase):
         self.quote = "0x2222222222222222222222222222222222222222"
         self.pool = {
             "snapshot_id": "tvl-1",
-            "observed_at": "2026-07-28T00:00:00+00:00",
-            "response_received_at": "2026-07-28T00:00:01+00:00",
+            "observed_at": "2024-01-01T00:00:00+00:00",
+            "response_received_at": "2024-01-01T00:00:01+00:00",
             "token_symbol": "AAVE",
             "chain": "eth",
             "dex": "uniswap_v2",
@@ -486,8 +486,8 @@ class DexDepthCollectionTest(unittest.TestCase):
                 {
                     **self.pool,
                     "snapshot_id": "tvl-2",
-                    "observed_at": "2026-07-28T01:00:00+00:00",
-                    "response_received_at": "2026-07-28T01:00:01+00:00",
+                    "observed_at": "2024-01-01T01:00:00+00:00",
+                    "response_received_at": "2024-01-01T01:00:01+00:00",
                     "base_token_price_usd": "101",
                 }
             )
@@ -512,6 +512,14 @@ class DexDepthCollectionTest(unittest.TestCase):
         self.assertEqual(row["status"], "observed")
         self.assertEqual(row["block_number"], "123")
         self.assertEqual(row["target_token_position"], "token0")
+        self.assertEqual(row["block_timestamp"], "2024-01-01T00:00:00+00:00")
+        self.assertEqual(row["usd_price_source_snapshot_id"], "tvl-1")
+        self.assertEqual(
+            row["usd_price_observed_at"],
+            "2024-01-01T00:00:01+00:00",
+        )
+        self.assertEqual(row["usd_price_skew_seconds"], "1")
+        self.assertEqual(row["usd_price_freshness_status"], "current")
         self.assertGreater(Decimal(row["total_depth_100bps_usd"]), 0)
         self.assertEqual(row["depth_100bps_complete"], "1")
         self.assertEqual(len(row["raw_response_sha256"]), 64)
@@ -580,6 +588,53 @@ class DexDepthCollectionTest(unittest.TestCase):
             {"eth": "2024-01-01T00:00:00+00:00"},
         )
         self.assertEqual(manifest["execution_row_count"], 10)
+
+    def test_stale_usd_price_fails_only_affected_pool_without_numeric_facts(self):
+        stale_pool = {
+            **self.pool,
+            "pool_address": "0x5555555555555555555555555555555555555555",
+            "response_received_at": "2023-12-31T21:59:59+00:00",
+        }
+        _snapshot_id, depth_rows, execution_rows = (
+            collect_dex_depth_with_execution(
+                [self.pool, stale_pool],
+                raw_root=self.root / "raw",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+
+        stale_depth = next(
+            row
+            for row in depth_rows
+            if row["pool_address"] == stale_pool["pool_address"]
+        )
+        self.assertEqual(stale_depth["status"], "failed")
+        self.assertEqual(stale_depth["usd_price_freshness_status"], "stale")
+        self.assertEqual(stale_depth["total_depth_100bps_usd"], "")
+        stale_execution = [
+            row
+            for row in execution_rows
+            if row["pool_address"] == stale_pool["pool_address"]
+        ]
+        self.assertEqual(len(stale_execution), 10)
+        self.assertTrue(
+            all(row["status"] == "failed" for row in stale_execution)
+        )
+        self.assertTrue(
+            all(
+                row["status_reason"]
+                == "usd_price_conversion_stale_or_unavailable"
+                for row in stale_execution
+            )
+        )
+        self.assertTrue(
+            all(
+                row[field] == ""
+                for row in stale_execution
+                for field in RESULT_NUMERIC_COLUMNS
+            )
+        )
 
     def test_v3_depth_succeeds_but_execution_is_explicitly_unsupported(self):
         v3_pool = {

@@ -378,14 +378,28 @@
                 <small id="execution-b-fill">—</small>
               </div>
               <div>
-                <span>Execution snapshot skew</span>
+                <span>A/B state-time skew</span>
                 <strong id="execution-skew">—</strong>
-                <small>Different from depth snapshot skew</small>
+                <small>Difference between the two selected market states</small>
               </div>
               <div>
                 <span>Fee scope</span>
                 <strong id="execution-fee-scope">—</strong>
                 <small>CEX account fees may be excluded</small>
+              </div>
+              <div id="execution-a-timing-card">
+                <span>Market A source timing</span>
+                <strong id="execution-a-timing-status">—</strong>
+                <small id="execution-a-state-time">State time —</small>
+                <small id="execution-a-price-time">USD price time —</small>
+                <small id="execution-a-price-skew">Price/state skew —</small>
+              </div>
+              <div id="execution-b-timing-card">
+                <span>Market B source timing</span>
+                <strong id="execution-b-timing-status">—</strong>
+                <small id="execution-b-state-time">State time —</small>
+                <small id="execution-b-price-time">USD price time —</small>
+                <small id="execution-b-price-skew">Price/state skew —</small>
               </div>
             </div>
             <div class="liquidity-table-scroll" role="region" aria-label="Fixed-notional execution cost values" tabindex="0">
@@ -641,7 +655,7 @@
           <article id="execution-cost" class="methodology-card">
             <i data-lucide="route"></i>
             <h3>Fixed-notional Execution Cost</h3>
-            <p>CEX scenarios walk visible order-book levels. Supported DEX V2 scenarios use exact integer constant-product mechanics. DEX pool fees are included where supported; CEX account fees, gas, latency, router costs, transfer taxes, and MEV are excluded.</p>
+            <p>CEX scenarios walk visible order-book levels. Supported DEX V2 scenarios use exact integer constant-product mechanics. For DEX, target quantity = requested USD ÷ (pool quote per Token × quote-token USD price). Pool state and the USD-price response have independent timestamps: if either is missing or they differ by more than two hours, cost and fill are withheld as N/A, not zero. The A/B state-time skew is a separate comparison. DEX pool fees are included where supported; CEX account fees, gas, latency, router costs, transfer taxes, and MEV are excluded.</p>
           </article>
           <article id="quality-states" class="methodology-card">
             <i data-lucide="shield-check"></i>

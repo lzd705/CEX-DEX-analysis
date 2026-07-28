@@ -7,6 +7,7 @@ from scripts.execution_cost import (
     decimal_text,
     execution_api_rows,
     execution_fact_row,
+    usd_price_timing,
     validate_execution_snapshot,
 )
 
@@ -65,6 +66,9 @@ def common_fields(market_id="cex:test:UNI/USDT", *, measured=True):
                 "usd_price_observed_at": (
                     "2026-07-28T00:00:00+00:00" if measured else ""
                 ),
+                "usd_conversion_status": (
+                    "observed_inventory_token_price" if measured else ""
+                ),
             }
         )
     return common
@@ -112,6 +116,53 @@ def complete_rows(market_id="cex:test:UNI/USDT"):
 
 
 class ExecutionCostContractTest(unittest.TestCase):
+    def test_usd_price_timing_boundaries_and_timezone_inputs(self):
+        state = "2026-07-28T00:00:00Z"
+        self.assertEqual(
+            usd_price_timing(state, "2026-07-28T00:15:00+00:00")["status"],
+            "current",
+        )
+        self.assertEqual(
+            usd_price_timing(state, "2026-07-28T00:15:00.1+00:00")["status"],
+            "warning",
+        )
+        self.assertTrue(
+            usd_price_timing(state, "2026-07-28T02:00:00+00:00")["usable"]
+        )
+        stale = usd_price_timing(
+            state,
+            "2026-07-28T10:00:01+08:00",
+        )
+        self.assertEqual(stale["skew_seconds"], 7201)
+        self.assertEqual(stale["status"], "stale")
+        self.assertFalse(stale["usable"])
+        self.assertEqual(
+            usd_price_timing(state, "2026-07-28T00:00:00")["status"],
+            "unavailable",
+        )
+
+    def test_publication_gate_rejects_stale_measured_dex_price(self):
+        market_id = "dex:eth:test:0xpool:UNI"
+        current = [
+            {**row, "usd_price_observed_at": "2026-07-28T02:00:00+00:00"}
+            for row in complete_rows(market_id)
+        ]
+        validate_execution_snapshot(
+            [market_id],
+            current,
+            enforce_usd_price_timing=True,
+        )
+        stale = [
+            {**row, "usd_price_observed_at": "2026-07-28T02:00:01+00:00"}
+            for row in complete_rows(market_id)
+        ]
+        with self.assertRaisesRegex(ValueError, "stale USD price"):
+            validate_execution_snapshot(
+                [market_id],
+                stale,
+                enforce_usd_price_timing=True,
+            )
+
     def test_decimal_text_preserves_more_than_default_context_precision(self):
         huge = Decimal("11351911656616966530148279426555390")
         small = Decimal("0.123456789012345678901234567890123456789")

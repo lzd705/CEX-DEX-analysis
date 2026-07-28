@@ -119,7 +119,7 @@ class CollectionCycleTest(unittest.TestCase):
 
         self.assertEqual(
             [name for name, _ in commands],
-            ["daily", "tvl", "depth", "dex_depth"],
+            ["daily", "depth", "tvl", "dex_depth"],
         )
         daily = commands[0][1]
         self.assertIn("--append", daily)
@@ -133,6 +133,7 @@ class CollectionCycleTest(unittest.TestCase):
                 for item in commands[-1][1]
             )
         )
+        self.assertIn("--tvl-csv", commands[-1][1])
 
     def test_tvl_profile_builds_manual_recovery_command(self):
         commands = build_step_commands(
@@ -146,6 +147,30 @@ class CollectionCycleTest(unittest.TestCase):
         self.assertEqual([name for name, _ in commands], ["tvl"])
         self.assertIn("scripts/fetch_tvl.py", commands[0][1][1])
         self.assertIn("--publish-local", commands[0][1])
+
+    def test_hourly_depth_refreshes_private_price_input_before_dex(self):
+        commands = build_step_commands(
+            "depth",
+            publish_local=True,
+            python_executable="python3",
+            data_dir=self.data_dir,
+            now=NOW,
+        )
+
+        self.assertEqual(
+            [name for name, _ in commands],
+            ["depth", "dex_price", "dex_depth"],
+        )
+        price_command = commands[1][1]
+        self.assertIn("scripts/fetch_tvl.py", price_command[1])
+        self.assertNotIn("--publish-local", price_command)
+        dex_command = commands[2][1]
+        self.assertIn("--tvl-csv", dex_command)
+        self.assertTrue(
+            dex_command[dex_command.index("--tvl-csv") + 1].endswith(
+                "data/processed/dex_pool_tvl_snapshot.csv"
+            )
+        )
 
     def test_collection_status_keeps_source_specific_ranges(self):
         status = build_collection_status(self.data_dir, now=NOW)
@@ -208,6 +233,36 @@ class CollectionCycleTest(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(len(result["steps"]), 1)
         self.assertEqual(result["steps"][0]["exit_code"], 2)
+
+    def test_failed_price_refresh_skips_dependent_dex_collection(self):
+        calls = []
+
+        def runner(command, log_path):
+            calls.append(command)
+            log_path.write_text("fixture\n", encoding="utf-8")
+            return 2 if "fetch_tvl.py" in command[1] else 0
+
+        result = run_collection_cycle(
+            "depth",
+            publish_local=True,
+            data_dir=self.data_dir,
+            run_root=self.root / "runs",
+            latest_status_path=self.root / "latest.json",
+            lock_path=self.root / "collection.lock",
+            now=NOW,
+            step_runner=runner,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            [step["status"] for step in result["steps"]],
+            ["succeeded", "failed", "skipped_dependency"],
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertIn(
+            "required fresh DEX USD-price input",
+            result["steps"][-1]["error"],
+        )
 
     def test_scheduled_daily_step_fails_when_published_sources_remain_stale(self):
         def runner(command, log_path):

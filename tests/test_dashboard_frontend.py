@@ -22,6 +22,19 @@ def run_app_javascript(source: str):
 
 
 class DashboardFrontendContractTest(unittest.TestCase):
+    def test_execution_timing_is_visible_and_distinct_from_market_state_skew(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        app_js = APP_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("A/B state-time skew", index)
+        self.assertIn('id="execution-a-state-time"', index)
+        self.assertIn('id="execution-a-price-time"', index)
+        self.assertIn('id="execution-a-price-skew"', index)
+        self.assertIn('id="execution-b-state-time"', index)
+        self.assertIn("function renderExecutionTiming(slot, result)", app_js)
+        self.assertIn("costs withheld; N/A is not zero", app_js)
+        self.assertIn("maximum ${formatDurationSeconds(", app_js)
+
     def test_screener_payload_contract_rejects_legacy_full_market_shape(self):
         result = run_app_javascript(
             """
