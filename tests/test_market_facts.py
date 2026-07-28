@@ -378,6 +378,39 @@ class MarketFactKnownAnswerTests(unittest.TestCase):
         self.assertEqual(result["cex_volume_usd"], 1_500)
         self.assertEqual(result["observed_dex_share"], 0.25)
 
+    def test_token_summary_does_not_convert_all_missing_volume_to_zero(self):
+        def row(market, volume):
+            result = {
+                "market": market,
+                "token_symbol": "UNI",
+                "venue": "binance" if market == "cex" else "eth / uniswap",
+                "instrument": "UNI/USDT" if market == "cex" else "UNI/USDC",
+                "pool_address": None if market == "cex" else "0xpool",
+                "price_usd": 10,
+                "volume_usd": volume,
+                "coverage_ratio": 1,
+                "price_points": [{"date": "2026-01-01", "price_usd": 10}],
+            }
+            return result
+
+        missing = build_token_summaries(
+            [row("cex", None)],
+            [row("dex", None)],
+        )[0]
+        measured_zero = build_token_summaries(
+            [row("cex", 0)],
+            [row("dex", 0)],
+        )[0]
+
+        self.assertIsNone(missing["aggregate_cex_volume_usd"])
+        self.assertIsNone(missing["aggregate_dex_volume_usd"])
+        self.assertIsNone(missing["aggregate_volume_usd"])
+        self.assertIsNone(missing["aggregate_dex_volume_share"])
+        self.assertEqual(measured_zero["aggregate_cex_volume_usd"], 0)
+        self.assertEqual(measured_zero["aggregate_dex_volume_usd"], 0)
+        self.assertEqual(measured_zero["aggregate_volume_usd"], 0)
+        self.assertIsNone(measured_zero["aggregate_dex_volume_share"])
+
     def test_catalog_distinguishes_market_series_from_physical_pools(self):
         def pool(token):
             return {

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260728-token-workspace-v7">
+    <link rel="stylesheet" href="/styles.css?v=20260729-catalog-split-v1">
   </head>
   <body>
     <header class="app-header">
@@ -42,6 +42,7 @@
           <div>
             <strong>Time window</strong>
             <span id="available-range">Checking available dates</span>
+            <span class="metric-note">Daily metrics only; TVL, depth, and execution remain latest independent snapshots.</span>
           </div>
         </div>
         <div class="date-fields">
@@ -500,6 +501,7 @@
               <span class="eyebrow">Fact × Market audit</span>
               <h3>Data Quality</h3>
               <p>Separate observed values, partial lower bounds, unsupported methods, collection failures, and genuinely missing facts for this Token.</p>
+              <p class="metric-note">The selected window controls window-derived price and volume context. Daily quality and coverage audit the full catalog history; TVL, depth, and execution use their independently timestamped latest snapshots.</p>
             </div>
             <div class="segmented-control" role="group" aria-label="Data quality scope">
               <button type="button" data-quality-scope="all" class="active" aria-pressed="true">All markets</button>
@@ -566,7 +568,7 @@
             <i data-lucide="search"></i>
           </button>
         </div>
-        <button id="export-csv" class="secondary-command" type="button" title="Export visible facts as CSV">
+        <button id="export-csv" class="secondary-command" type="button" title="Export visible facts as CSV" disabled>
           <i data-lucide="download"></i>
           <span>Export CSV</span>
         </button>
@@ -688,7 +690,7 @@
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/navigation.js?v=20260728-token-workspace-v7"></script>
-    <script src="/app.js?v=20260728-token-workspace-v7"></script>
+    <script src="/navigation.js?v=20260729-catalog-split-v1"></script>
+    <script src="/app.js?v=20260729-catalog-split-v1"></script>
   </body>
 </html>

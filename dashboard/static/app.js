@@ -3,6 +3,9 @@ const app = {
   defaultPayload: null,
   defaultPayloadIsCached: false,
   catalog: null,
+  catalogsByToken: new Map(),
+  activeCatalogToken: "",
+  activeCatalogKey: "",
   comparison: null,
   execution: null,
   quality: null,
@@ -24,10 +27,12 @@ const app = {
   searchQuery: "",
   visibleTokens: [],
   marketRequestId: 0,
+  routeRequestId: 0,
   comparisonRequestId: 0,
   executionRequestId: 0,
   qualityRequestId: 0,
   marketController: null,
+  catalogController: null,
   marketRequestWindowKey: "",
   comparisonController: null,
   executionController: null,
@@ -37,7 +42,7 @@ const app = {
   liquidityResizeObserver: null,
 };
 
-const DEFAULT_MARKET_CACHE_KEY = "market-monitor:default-payload:v2";
+const DEFAULT_MARKET_CACHE_KEY = "market-monitor:screener-summary:v1";
 const TOKEN_PAIR_CACHE_KEY = "market-monitor:token-pairs:v1";
 const navigation = globalThis.MarketMonitorNavigation;
 const DEPTH_BANDS = [10, 25, 50, 100];
@@ -204,7 +209,9 @@ function grouped(rows) {
 }
 
 function marketId(row) {
-  return row.market === "cex" ? `${row.venue}|${row.instrument}` : row.pool_address;
+  return row.market === "cex" || row.market_type === "cex"
+    ? `${row.venue}|${row.instrument}`
+    : row.pool_address;
 }
 
 function readPairSelections() {
@@ -232,7 +239,22 @@ function selectedPairState() {
 }
 
 function selectedWorkspaceToken() {
-  return byId("facts-token")?.value || app.catalog?.tokens?.[0] || "";
+  return byId("facts-token")?.value
+    || app.payload?.metadata?.default_workspace_token
+    || app.payload?.tokens?.[0]?.token_symbol
+    || "";
+}
+
+function tokenCatalogCacheKey(token, start, end, generation) {
+  return [token, start || "", end || "", generation || ""].join("|");
+}
+
+function cachedTokenCatalog(cacheKey) {
+  const catalog = app.catalogsByToken.get(cacheKey);
+  if (!catalog) return null;
+  app.catalogsByToken.delete(cacheKey);
+  app.catalogsByToken.set(cacheKey, catalog);
+  return catalog;
 }
 
 function currentScreenerFilters() {
@@ -260,11 +282,22 @@ function currentScreenerFilters() {
 
 function currentWorkspaceRouteState(page) {
   const state = selectedPairState();
+  if (app.route?.kind === "workspace" && !app.catalog) {
+    state.marketA ||= app.route.state?.marketA || "";
+    state.marketB ||= app.route.state?.marketB || "";
+  }
   if (!state.marketA || !state.marketB) state.pairMode = "manual";
-  if (page === "compare") {
-    state.start = byId("date-start")?.value || "";
-    state.end = byId("date-end")?.value || "";
-  } else if (page === "liquidity") {
+  state.start = (
+    byId("date-start")?.value
+    || (app.route?.kind === "workspace" ? app.route.state?.start : "")
+    || ""
+  );
+  state.end = (
+    byId("date-end")?.value
+    || (app.route?.kind === "workspace" ? app.route.state?.end : "")
+    || ""
+  );
+  if (page === "liquidity") {
     state.side = app.executionDirection === "sell_token" ? "sell" : "buy";
     state.notionalUsd = app.executionNotionalUsd;
     state.view = app.liquidityView;
@@ -284,11 +317,26 @@ function currentWorkspacePath(page = app.route?.page || "markets") {
   );
 }
 
+function currentSummaryWindowRouteState() {
+  return {
+    start: app.payload?.metadata?.start_date || "",
+    end: app.payload?.metadata?.end_date || "",
+  };
+}
+
 function updateRouteLinks() {
-  const token = selectedWorkspaceToken() || "AAVE";
+  const token = (
+    app.route?.kind === "workspace"
+      ? String(app.route.token || "").toUpperCase()
+      : selectedWorkspaceToken()
+  ) || "AAVE";
   const primaryWorkspace = document.querySelector('[data-app-route="workspace"]');
   if (primaryWorkspace && navigation) {
-    primaryWorkspace.href = navigation.buildWorkspacePath(token, app.route?.page || "markets");
+    const page = app.route?.kind === "workspace" ? app.route.page : "markets";
+    const state = app.route?.kind === "workspace"
+      ? currentWorkspaceRouteState(page)
+      : currentSummaryWindowRouteState();
+    primaryWorkspace.href = navigation.buildWorkspacePath(token, page, state);
   }
   document.querySelectorAll("[data-workspace-page]").forEach((link) => {
     const page = link.dataset.workspacePage;
@@ -363,7 +411,7 @@ function setActiveWorkspacePage(page) {
   const compareVisible = page === "compare";
   byId("comparison-status").hidden = !compareVisible;
   if (!compareVisible) byId("comparison-error").hidden = true;
-  byId("time-toolbar").hidden = !compareVisible;
+  byId("time-toolbar").hidden = false;
 }
 
 function syncSegmentedControls() {
@@ -500,6 +548,7 @@ function syncMarketPayloadForWindow(start, end) {
     hideStatus(byId("market-loading"));
     byId("market-panel").setAttribute("aria-busy", "false");
     byId("apply-window").disabled = false;
+    byId("export-csv").disabled = !app.payload;
   }
   if (marketPayloadMatchesWindow(app.payload, normalized.start, normalized.end)) return;
 
@@ -508,7 +557,13 @@ function syncMarketPayloadForWindow(start, end) {
     normalized.start === defaultWindow.start
     && normalized.end === defaultWindow.end
   );
-  if (wantsDefault && app.defaultPayload) {
+  const currentGeneration = app.payload?.metadata?.data_generation;
+  const defaultGeneration = app.defaultPayload?.metadata?.data_generation;
+  if (
+    wantsDefault
+    && app.defaultPayload
+    && (!currentGeneration || defaultGeneration === currentGeneration)
+  ) {
     const cached = app.defaultPayloadIsCached;
     displayMarket(app.defaultPayload, { cached });
     if (!cached) return;
@@ -567,9 +622,9 @@ function applyScreenerRoute(route) {
 }
 
 function applyWorkspaceRoute(route) {
-  const exactToken = app.catalog.tokens.find(
-    (token) => token === String(route.token || "").toUpperCase(),
-  );
+  const exactToken = app.payload.tokens
+    .map((token) => token.token_symbol)
+    .find((token) => token === String(route.token || "").toUpperCase());
   if (!exactToken) {
     const fallbackPath = navigation.buildScreenerPath(currentScreenerFilters());
     window.history.replaceState({}, "", fallbackPath);
@@ -628,13 +683,13 @@ function applyWorkspaceRoute(route) {
     );
   }
 
-  if (route.page === "compare") {
-    const window = compareRouteWindow(route);
-    byId("date-start").value = window.start;
-    byId("date-end").value = window.end;
-    syncTimePresetButtons();
-    syncMarketPayloadForWindow(window.start, window.end);
-  } else if (route.page === "liquidity") {
+  const window = compareRouteWindow(route);
+  byId("date-start").value = window.start;
+  byId("date-end").value = window.end;
+  syncTimePresetButtons();
+  syncMarketPayloadForWindow(window.start, window.end);
+
+  if (route.page === "liquidity") {
     app.executionDirection = route.state?.side === "sell" ? "sell_token" : "buy_token";
     app.executionNotionalUsd = route.state?.notionalUsd || 10000;
     app.liquidityView = route.state?.view || "total";
@@ -645,15 +700,13 @@ function applyWorkspaceRoute(route) {
     app.qualityScope = route.state?.scope || "all";
     syncSegmentedControls();
   }
-  if (route.page !== "compare") {
-    const window = normalizedMarketWindow("", "");
-    syncMarketPayloadForWindow(window.start, window.end);
-  }
   setActiveAppView("workspace");
   setActiveWorkspacePage(route.page);
   renderWorkspaceContext();
   renderWorkspaceMarkets();
   renderQualityFromCatalog();
+  updateFactsContract();
+  byId("facts-workbench").setAttribute("aria-busy", "false");
   if (route.page === "compare") loadComparison();
   if (route.page === "liquidity") {
     renderLiquidityCurve();
@@ -673,16 +726,342 @@ function applyMethodologyRoute(route) {
   }
 }
 
-function applyRouteFromLocation() {
+function invalidateRouteRequest() {
+  if (app.catalogController) app.catalogController.abort();
+  app.catalogController = null;
+  app.routeRequestId += 1;
+  return app.routeRequestId;
+}
+
+function setWorkspaceCatalogLoading(token, page, catalogKey = "") {
+  if (app.activeCatalogKey === catalogKey && app.catalog) return;
+  app.catalog = null;
+  app.activeCatalogToken = "";
+  app.activeCatalogKey = "";
+  invalidateComparisonRequest();
+  invalidateExecutionRequest();
+  invalidateQualityRequest();
+  app.comparison = null;
+  app.execution = null;
+  app.quality = null;
+  hideError(byId("global-error"));
+  hideLiquidityTooltip();
+  closeFactsMarketWarnings();
+  renderFactsMarketWarning("a", null);
+  renderFactsMarketWarning("b", null);
+  byId("facts-title").textContent = `${token} Token Research`;
+  byId("workspace-description").textContent = (
+    `Loading ${token} market identities, liquidity, and quality facts.`
+  );
+  byId("facts-token").value = token;
+  byId("facts-market-a").innerHTML = '<option value="">Loading markets…</option>';
+  byId("facts-market-b").innerHTML = '<option value="">Loading markets…</option>';
+  byId("workspace-market-body").innerHTML = (
+    `<tr><td colspan="9" class="missing">Loading ${escapeHtml(token)} market catalog…</td></tr>`
+  );
+  byId("quality-body").innerHTML = (
+    `<tr><td colspan="6" class="missing">Loading ${escapeHtml(token)} quality facts…</td></tr>`
+  );
+  byId("liquidity-chart").innerHTML = "";
+  byId("liquidity-empty").textContent = `Loading ${token} liquidity facts…`;
+  byId("liquidity-empty").hidden = false;
+  byId("liquidity-table-body").innerHTML = (
+    '<tr><td colspan="9" class="missing">Loading Token liquidity facts…</td></tr>'
+  );
+  byId("liquidity-legend").innerHTML = "";
+  byId("liquidity-a-label").textContent = "Market A at ±100 bps";
+  byId("liquidity-b-label").textContent = "Market B at ±100 bps";
+  ["liquidity-a-100", "liquidity-b-100", "liquidity-skew", "liquidity-paired-bands"]
+    .forEach((id) => {
+      byId(id).textContent = "—";
+    });
+  byId("liquidity-market-a-meta").innerHTML = "<strong>Market A · loading</strong>";
+  byId("liquidity-market-b-meta").innerHTML = "<strong>Market B · loading</strong>";
+  byId("liquidity-status").textContent = `Loading ${token} point-in-time depth facts.`;
+  byId("liquidity-status").dataset.state = "warning";
+  byId("liquidity-chart-description").textContent = `${token} liquidity facts are loading.`;
+  byId("quality-status").textContent = `Loading ${token} quality facts.`;
+  byId("quality-status").dataset.state = "warning";
+  hideError(byId("quality-error"));
+  byId("facts-contract-copy").textContent = "Loading the market fact contract…";
+  byId("facts-source-copy").textContent = "Loading source lineage…";
+  byId("workspace-market-count").textContent = "Loading markets";
+  byId("workspace-as-of").textContent = "Checking timestamps";
+  byId("workspace-quality-status").textContent = "Checking quality";
+  clearComparisonResult();
+  clearExecutionResult();
+  showStatus(
+    byId("workspace-context-notice"),
+    `Loading the source-backed ${token} catalog for ${page}.`,
+  );
+  byId("facts-workbench").setAttribute("aria-busy", "true");
+  announceRoute(app.route);
+  updateRouteLinks();
+}
+
+function setWorkspaceDataUnavailable(token, message) {
+  const exactToken = String(token || "Selected Token").toUpperCase();
+  app.catalog = null;
+  app.activeCatalogToken = "";
+  app.activeCatalogKey = "";
+  app.comparison = null;
+  app.execution = null;
+  app.quality = null;
+  hideLiquidityTooltip();
+  closeFactsMarketWarnings();
+  renderFactsMarketWarning("a", null);
+  renderFactsMarketWarning("b", null);
+  byId("facts-title").textContent = `${exactToken} Token Research`;
+  byId("workspace-description").textContent = (
+    "Source-backed Token facts are unavailable. No previous Token catalog is retained on screen."
+  );
+  if (app.payload?.tokens?.some((row) => row.token_symbol === exactToken)) {
+    byId("facts-token").value = exactToken;
+  } else {
+    byId("facts-token").innerHTML = (
+      `<option value="">${escapeHtml(exactToken)} unavailable</option>`
+    );
+    byId("facts-token").value = "";
+  }
+  byId("facts-market-a").innerHTML = '<option value="">Markets unavailable</option>';
+  byId("facts-market-b").innerHTML = '<option value="">Markets unavailable</option>';
+  byId("workspace-market-body").innerHTML = (
+    `<tr><td colspan="9" class="missing">No ${escapeHtml(exactToken)} market catalog is available.</td></tr>`
+  );
+  byId("quality-body").innerHTML = (
+    `<tr><td colspan="6" class="missing">No ${escapeHtml(exactToken)} quality facts are available.</td></tr>`
+  );
+  byId("liquidity-chart").innerHTML = "";
+  byId("liquidity-empty").textContent = (
+    `No ${exactToken} depth facts are available because the market catalog failed to load.`
+  );
+  byId("liquidity-empty").hidden = false;
+  byId("liquidity-table-body").innerHTML = (
+    '<tr><td colspan="9" class="missing">No current Token liquidity result.</td></tr>'
+  );
+  byId("liquidity-legend").innerHTML = "";
+  byId("liquidity-market-a-meta").innerHTML = "<strong>Market A · unavailable</strong>";
+  byId("liquidity-market-b-meta").innerHTML = "<strong>Market B · unavailable</strong>";
+  [
+    "liquidity-a-100",
+    "liquidity-b-100",
+    "liquidity-skew",
+    "liquidity-paired-bands",
+  ].forEach((id) => {
+    byId(id).textContent = "—";
+  });
+  showStatus(
+    byId("liquidity-status"),
+    `${exactToken} liquidity facts are unavailable; missing values were not converted to zero.`,
+    "critical",
+  );
+  showStatus(
+    byId("quality-status"),
+    `${exactToken} quality facts are unavailable.`,
+    "critical",
+  );
+  showError(byId("quality-error"), message);
+  byId("facts-contract-copy").textContent = "Market fact contract unavailable for this response.";
+  byId("facts-source-copy").textContent = "Source lineage unavailable for this response.";
+  byId("workspace-market-count").textContent = "Markets unavailable";
+  byId("workspace-as-of").textContent = "Snapshot unavailable";
+  byId("workspace-quality-status").textContent = "Quality unavailable";
+  byId("workspace-quality-status").dataset.state = "critical";
+  clearComparisonResult(message);
+  clearExecutionResult(message);
+  showStatus(
+    byId("workspace-context-notice"),
+    `${exactToken} facts are unavailable; no previous Token data is shown.`,
+    "critical",
+  );
+  byId("facts-workbench").setAttribute("aria-busy", "false");
+  updateRouteLinks();
+}
+
+async function applyRouteFromLocation() {
   if (!navigation) return;
-  const route = navigation.parseRoute(window.location.pathname, window.location.search);
+  if (app.marketController) {
+    invalidateMarketRequest();
+    hideStatus(byId("market-loading"));
+    byId("market-panel").setAttribute("aria-busy", "false");
+    byId("apply-window").disabled = false;
+    byId("export-csv").disabled = !app.payload;
+  }
+  const requestId = invalidateRouteRequest();
+  let route = navigation.parseRoute(window.location.pathname, window.location.search);
+  if (route.kind !== "unknown") app.route = route;
   if (route.kind === "methodology") {
+    hideError(byId("global-error"));
     applyMethodologyRoute(route);
-  } else if (!app.catalog || !app.payload) {
-    return;
-  } else if (route.kind === "workspace") applyWorkspaceRoute(route);
-  else if (route.kind === "screener") applyScreenerRoute(route);
-  else navigateTo("/screener", { replace: true });
+  } else {
+    if (route.kind === "workspace") {
+      const provisionalToken = String(route.token || "").toUpperCase();
+      const provisionalWindow = app.payload
+        ? compareRouteWindow(route)
+        : { start: "", end: "" };
+      const provisionalKey = tokenCatalogCacheKey(
+        provisionalToken,
+        provisionalWindow.start,
+        provisionalWindow.end,
+        app.payload?.metadata?.data_generation,
+      );
+      setActiveAppView("workspace");
+      setActiveWorkspacePage(route.page);
+      setWorkspaceCatalogLoading(provisionalToken, route.page, provisionalKey);
+    } else {
+      setActiveAppView("screener");
+      byId("time-toolbar").hidden = false;
+    }
+    if (!app.payload) {
+      const start = route.kind === "screener"
+        ? route.filters?.start || ""
+        : route.kind === "workspace"
+          ? route.state?.start || ""
+          : "";
+      const end = route.kind === "screener"
+        ? route.filters?.end || ""
+        : route.kind === "workspace"
+          ? route.state?.end || ""
+          : "";
+      const loaded = await loadMarket(start, end);
+      if (requestId !== app.routeRequestId) return;
+      if (!loaded || !app.payload) {
+        if (route.kind === "workspace") {
+          setWorkspaceDataUnavailable(
+            String(route.token || "").toUpperCase(),
+            "The Screener summary required for this Token could not be loaded.",
+          );
+        }
+        return;
+      }
+    }
+    if (route.kind === "workspace") {
+      const requestedWindow = compareRouteWindow(route);
+      if (
+        !marketPayloadMatchesWindow(
+          app.payload,
+          requestedWindow.start,
+          requestedWindow.end,
+        )
+      ) {
+        const loaded = await loadMarket(
+          requestedWindow.start,
+          requestedWindow.end,
+          { preserve: true },
+        );
+        if (requestId !== app.routeRequestId) return;
+        if (
+          !loaded
+          || !app.payload
+          || !marketPayloadMatchesWindow(
+            app.payload,
+            requestedWindow.start,
+            requestedWindow.end,
+          )
+        ) {
+          setWorkspaceDataUnavailable(
+            String(route.token || "").toUpperCase(),
+            "The requested daily window could not be loaded, so no mismatched Token catalog is shown.",
+          );
+          return;
+        }
+      }
+      const exactToken = app.payload.tokens
+        .map((token) => token.token_symbol)
+        .find((token) => token === String(route.token || "").toUpperCase());
+      if (!exactToken) {
+        const fallbackPath = navigation.buildScreenerPath(currentScreenerFilters());
+        window.history.replaceState({}, "", fallbackPath);
+        applyScreenerRoute(navigation.parseRoute(
+          window.location.pathname,
+          window.location.search,
+        ));
+        showError(byId("error-banner"), `Unknown Token in URL: ${route.token}.`);
+      } else {
+        const exactRoute = { ...route, token: exactToken };
+        app.route = exactRoute;
+        const catalogWindow = {
+          start: app.payload.metadata.start_date,
+          end: app.payload.metadata.end_date,
+        };
+        let catalogKey = tokenCatalogCacheKey(
+          exactToken,
+          catalogWindow.start,
+          catalogWindow.end,
+          app.payload.metadata.data_generation,
+        );
+        setActiveAppView("workspace");
+        setActiveWorkspacePage(exactRoute.page);
+        setWorkspaceCatalogLoading(exactToken, exactRoute.page, catalogKey);
+        try {
+          let catalog = cachedTokenCatalog(catalogKey);
+          for (let attempt = 0; !catalog && attempt < 2; attempt += 1) {
+            const controller = new AbortController();
+            app.catalogController = controller;
+            try {
+              catalog = await loadTokenCatalog(
+                exactToken,
+                catalogWindow.start,
+                catalogWindow.end,
+                controller.signal,
+                catalogKey,
+              );
+            } catch (error) {
+              if (error.code !== "data_generation_mismatch" || attempt > 0) throw error;
+              await loadMarket(
+                catalogWindow.start,
+                catalogWindow.end,
+                { preserve: true },
+              );
+              if (requestId !== app.routeRequestId || !app.payload) return;
+              catalogKey = tokenCatalogCacheKey(
+                exactToken,
+                catalogWindow.start,
+                catalogWindow.end,
+                app.payload.metadata.data_generation,
+              );
+            }
+          }
+          const latestRoute = navigation.parseRoute(
+            window.location.pathname,
+            window.location.search,
+          );
+          if (
+            requestId !== app.routeRequestId
+            || latestRoute.kind !== "workspace"
+            || String(latestRoute.token || "").toUpperCase() !== exactToken
+          ) {
+            return;
+          }
+          if (!catalog) throw new Error(`The ${exactToken} catalog is unavailable.`);
+          app.catalogController = null;
+          app.catalog = catalog;
+          app.activeCatalogToken = exactToken;
+          app.activeCatalogKey = catalogKey;
+          route = { ...latestRoute, token: exactToken };
+          applyWorkspaceRoute(route);
+        } catch (error) {
+          if (error.name === "AbortError" || requestId !== app.routeRequestId) return;
+          app.catalogController = null;
+          const message = (
+            `The ${exactToken} market catalog failed to load: ${error.message || String(error)}`
+          );
+          setWorkspaceDataUnavailable(exactToken, message);
+          showError(
+            byId("global-error"),
+            message,
+          );
+          return;
+        }
+      }
+    } else if (route.kind === "screener") {
+      applyScreenerRoute(route);
+    } else {
+      window.history.replaceState({}, "", "/screener");
+      applyScreenerRoute(navigation.parseRoute("/screener", ""));
+    }
+  }
+  if (requestId !== app.routeRequestId) return;
   app.routeReady = true;
   announceRoute(app.route);
   updateRouteLinks();
@@ -723,14 +1102,12 @@ function hideError(element) {
 }
 
 function ensureSelections() {
-  const cexByToken = grouped(app.payload.cex_markets);
-  const dexByToken = grouped(app.payload.dex_pools);
   app.payload.tokens.forEach((token) => {
     const symbol = token.token_symbol;
     if (!app.selections[symbol]) app.selections[symbol] = {};
     if (!app.selectionOverrides[symbol]) app.selectionOverrides[symbol] = {};
-    const cexIds = (cexByToken[symbol] || []).map(marketId);
-    const dexIds = (dexByToken[symbol] || []).map(marketId);
+    const cexIds = token.primary_cex ? [marketId(token.primary_cex)] : [];
+    const dexIds = token.primary_dex ? [marketId(token.primary_dex)] : [];
     if (
       !app.selectionOverrides[symbol].cex
       || !cexIds.includes(app.selections[symbol].cex)
@@ -749,60 +1126,57 @@ function ensureSelections() {
 }
 
 function selectedMarket(token, market) {
-  const rows = market === "cex" ? app.payload.cex_markets : app.payload.dex_pools;
+  const tokenSummary = app.payload.tokens.find((row) => row.token_symbol === token);
+  const row = market === "cex" ? tokenSummary?.primary_cex : tokenSummary?.primary_dex;
   const selectedId = app.selections[token]?.[market];
-  return rows.find((row) => row.token_symbol === token && marketId(row) === selectedId) || null;
+  return row && marketId(row) === selectedId ? row : null;
 }
 
 function comparison(tokenSummary) {
   const token = tokenSummary.token_symbol;
   const cex = selectedMarket(token, "cex");
   const dex = selectedMarket(token, "dex");
-  const cexPrices = new Map((cex?.price_points || []).map((point) => [point.date, point.price_usd]));
-  const dexPrices = new Map((dex?.price_points || []).map((point) => [point.date, point.price_usd]));
-  const commonDates = [...cexPrices.keys()].filter((date) => dexPrices.has(date)).sort();
-  const spreadDate = commonDates.at(-1) || null;
-  const cexSpreadPrice = spreadDate ? cexPrices.get(spreadDate) : null;
-  const dexSpreadPrice = spreadDate ? dexPrices.get(spreadDate) : null;
-  const spread = cexSpreadPrice && finite(dexSpreadPrice)
-    ? dexSpreadPrice / cexSpreadPrice - 1
-    : null;
+  const spreadDate = tokenSummary.spread_date || null;
+  const cexSpreadPrice = null;
+  const dexSpreadPrice = null;
+  const spread = finite(tokenSummary.price_spread) ? tokenSummary.price_spread : null;
   return { cex, dex, spread, spreadDate, cexSpreadPrice, dexSpreadPrice };
 }
 
 function aggregateFacts(tokenSummary, cexOptions, dexOptions) {
+  const cexFallback = cexOptions.length ? sumFinite(cexOptions, "volume_usd") : null;
+  const dexFallback = dexOptions.length ? sumFinite(dexOptions, "volume_usd") : null;
   const aggregateCex = firstFinite(
     tokenSummary.aggregate_cex_volume_usd,
     tokenSummary.cex_volume_usd,
-    sumFinite(cexOptions, "volume_usd"),
-  ) ?? 0;
+    cexFallback,
+  ) ?? null;
   const aggregateDex = firstFinite(
     tokenSummary.aggregate_dex_volume_usd,
     tokenSummary.dex_volume_usd,
-    sumFinite(dexOptions, "volume_usd"),
-  ) ?? 0;
+    dexFallback,
+  ) ?? null;
+  const summedTotal = finite(aggregateCex) && finite(aggregateDex)
+    ? aggregateCex + aggregateDex
+    : null;
   const aggregateTotal = firstFinite(
     tokenSummary.aggregate_volume_usd,
     tokenSummary.total_volume_usd,
-    aggregateCex + aggregateDex,
-  ) ?? 0;
+    summedTotal,
+  ) ?? null;
   const aggregateDexShare = firstFinite(
     tokenSummary.aggregate_dex_volume_share,
     tokenSummary.aggregate_dex_share,
     tokenSummary.observed_dex_share,
-    aggregateTotal ? aggregateDex / aggregateTotal : null,
-  );
+    finite(aggregateTotal) && aggregateTotal !== 0 && finite(aggregateDex)
+      ? aggregateDex / aggregateTotal
+      : null,
+  ) ?? null;
   return { aggregateCex, aggregateDex, aggregateTotal, aggregateDexShare };
 }
 
 function sortValue(tokenSummary) {
-  const cexOptions = app.payload.cex_markets.filter(
-    (row) => row.token_symbol === tokenSummary.token_symbol,
-  );
-  const dexOptions = app.payload.dex_pools.filter(
-    (row) => row.token_symbol === tokenSummary.token_symbol,
-  );
-  const aggregates = aggregateFacts(tokenSummary, cexOptions, dexOptions);
+  const aggregates = aggregateFacts(tokenSummary, [], []);
   const { cex, dex, spread } = comparison(tokenSummary);
   const field = byId("sort-field").value;
   if (field === "spread") return finite(spread) ? Math.abs(spread) : -Infinity;
@@ -816,9 +1190,13 @@ function sortValue(tokenSummary) {
     if (app.scope === "dex") return dex?.daily_volatility ?? -Infinity;
     return Math.max(cex?.daily_volatility ?? -Infinity, dex?.daily_volatility ?? -Infinity);
   }
-  if (app.scope === "cex") return aggregates.aggregateCex;
-  if (app.scope === "dex") return aggregates.aggregateDex;
-  return aggregates.aggregateTotal;
+  if (app.scope === "cex") {
+    return finite(aggregates.aggregateCex) ? aggregates.aggregateCex : -Infinity;
+  }
+  if (app.scope === "dex") {
+    return finite(aggregates.aggregateDex) ? aggregates.aggregateDex : -Infinity;
+  }
+  return finite(aggregates.aggregateTotal) ? aggregates.aggregateTotal : -Infinity;
 }
 
 function metricClass(value) {
@@ -1075,34 +1453,52 @@ function renderQualityBadges(flags) {
   }).join("");
 }
 
-function screenerTokenRow(tokenSummary, cexOptions, dexOptions) {
+function screenerTokenRow(tokenSummary) {
   const token = tokenSummary.token_symbol;
   const { cex, dex, spread } = comparison(tokenSummary);
-  const aggregates = aggregateFacts(tokenSummary, cexOptions, dexOptions);
-  const tokenMarkets = app.catalog?.markets.filter((market) => market.token_symbol === token) || [];
-  const statusCounts = tokenMarkets.reduce((counts, market) => {
-    const status = market.quality_status || "ok";
-    counts[status] = (counts[status] || 0) + 1;
-    return counts;
-  }, {});
-  const qualityText = statusCounts.critical
+  const aggregates = aggregateFacts(tokenSummary, [], []);
+  const statusCounts = tokenSummary.quality_status_counts || null;
+  const catalogCount = tokenSummary.market_count;
+  const qualityCountTotal = statusCounts
+    ? Object.values(statusCounts).reduce((total, value) => (
+        total + (finite(value) ? value : 0)
+      ), 0)
+    : null;
+  const qualityCountsComplete = (
+    finite(catalogCount)
+    && catalogCount > 0
+    && qualityCountTotal === catalogCount
+  );
+  const qualityText = !qualityCountsComplete
+    ? "Unavailable"
+    : statusCounts?.critical
     ? `${statusCounts.critical} critical`
-    : statusCounts.warning
+    : statusCounts?.warning
       ? `${statusCounts.warning} warning`
-      : "Healthy";
-  const qualityState = statusCounts.critical
+      : statusCounts?.info
+        ? `${statusCounts.info} informational`
+        : "Healthy";
+  const qualityState = !qualityCountsComplete
+    ? "unavailable"
+    : statusCounts?.critical
     ? "critical"
-    : statusCounts.warning
+    : statusCounts?.warning
       ? "warning"
-      : "ok";
+      : statusCounts?.info
+        ? "unavailable"
+        : "ok";
   const researchPath = navigation
-    ? navigation.buildWorkspacePath(token, "markets")
+    ? navigation.buildWorkspacePath(
+      token,
+      "markets",
+      currentSummaryWindowRouteState(),
+    )
     : "#";
   return `<tr class="token-row screener-token-row">
     <td data-label="Token" class="sticky-token token-name">${escapeHtml(token)}</td>
     <td data-label="Covered markets">
-      ${cexOptions.length} CEX · ${dexOptions.length} DEX
-      <span class="metric-note">${tokenMarkets.length} catalog series</span>
+      ${tokenSummary.cex_market_count ?? "—"} CEX · ${tokenSummary.dex_market_count ?? "—"} DEX
+      <span class="metric-note">${finite(catalogCount) ? catalogCount : "Unavailable"} catalog series</span>
     </td>
     <td data-label="Aggregate USD volume">
       ${formatCurrency(aggregates.aggregateTotal)}
@@ -1133,38 +1529,20 @@ function renderTable() {
   if (!app.payload) return;
   ensureSelections();
   const query = app.searchQuery;
-  const cexByToken = grouped(app.payload.cex_markets);
-  const dexByToken = grouped(app.payload.dex_pools);
   const tokens = app.payload.tokens
     .filter((row) => !query || row.token_symbol.includes(query))
     .sort((a, b) => sortValue(b) - sortValue(a) || a.token_symbol.localeCompare(b.token_symbol));
   app.visibleTokens = tokens;
 
   byId("market-body").innerHTML = tokens.length
-    ? tokens.map((token) => screenerTokenRow(
-        token,
-        cexByToken[token.token_symbol] || [],
-        dexByToken[token.token_symbol] || [],
-      )).join("")
+    ? tokens.map((token) => screenerTokenRow(token)).join("")
     : `<tr><td data-label="Result" colspan="9" class="missing">No Token matches this search.</td></tr>`;
   byId("row-count").textContent = `${tokens.length} Tokens · one row per Token`;
 }
 
 function payloadMarketForCatalog(market) {
-  if (!app.payload || !market) return null;
-  const rows = market.market_type === "cex"
-    ? app.payload.cex_markets
-    : app.payload.dex_pools;
-  return rows.find((row) => {
-    if (row.token_symbol !== market.token_symbol) return false;
-    if (market.market_type === "cex") {
-      return row.venue === market.venue && row.instrument === market.instrument;
-    }
-    return (
-      row.pool_address === market.pool_address
-      && row.venue === market.venue
-    );
-  }) || null;
+  if (!market) return null;
+  return market.window_metrics || null;
 }
 
 function qualityStateMarkup(status, label = "") {
@@ -1203,11 +1581,7 @@ function renderWorkspaceContext() {
   byId("workspace-quality-status").textContent = qualityText;
   byId("workspace-quality-status").dataset.state = qualityState;
   if (tokenSummary) {
-    const aggregates = aggregateFacts(
-      tokenSummary,
-      app.payload.cex_markets.filter((row) => row.token_symbol === token),
-      app.payload.dex_pools.filter((row) => row.token_symbol === token),
-    );
+    const aggregates = aggregateFacts(tokenSummary, [], []);
     byId("workspace-description").textContent = (
       `${formatCurrency(aggregates.aggregateTotal)} aggregate window volume · `
       + `${formatShare(aggregates.aggregateDexShare)} DEX share. `
@@ -1255,7 +1629,7 @@ function renderWorkspaceMarkets() {
           <td>${formatCurrency(row?.volume_usd)}</td>
           <td>${tvl}</td>
           <td>${depth}<span class="metric-note">${escapeHtml(market.depth_status || "unavailable")}</span></td>
-          <td>${formatRatio(market.coverage_ratio)}</td>
+          <td>${formatRatio(row?.coverage_ratio)}</td>
           <td>
             ${qualityStateMarkup(market.quality_status || "ok")}
             <span class="metric-note">${flags.length} reason${flags.length === 1 ? "" : "s"}</span>
@@ -1514,6 +1888,10 @@ function invalidateExecutionRequest() {
 
 function clearExecutionResult(message = "") {
   app.execution = null;
+  byId("execution-a-label").textContent = "Market A cost";
+  byId("execution-b-label").textContent = "Market B cost";
+  byId("execution-a-cost-heading").textContent = "A Cost";
+  byId("execution-b-cost-heading").textContent = "B Cost";
   ["execution-a-cost", "execution-b-cost", "execution-skew", "execution-fee-scope"]
     .forEach((id) => {
       byId(id).textContent = "—";
@@ -2394,6 +2772,8 @@ function liquidityMarkerMarkup(series, point, x, y) {
 
 function renderLiquiditySvg(series) {
   const svg = byId("liquidity-chart");
+  const emptyState = byId("liquidity-empty");
+  emptyState.textContent = "No source-backed depth bands are available for the selected markets.";
   const dimensions = liquidityChartDimensions();
   app.liquidityLayoutMode = dimensions.layout;
   svg.setAttribute("viewBox", `0 0 ${dimensions.width} ${dimensions.height}`);
@@ -2405,10 +2785,10 @@ function renderLiquiditySvg(series) {
     svg.innerHTML = "";
     app.liquidityEffectiveScale = null;
     app.liquidityEffectiveScaleLabel = "";
-    byId("liquidity-empty").hidden = false;
+    emptyState.hidden = false;
     return false;
   }
-  byId("liquidity-empty").hidden = true;
+  emptyState.hidden = true;
   const axis = liquidityAxis(values, dimensions);
   app.liquidityEffectiveScale = axis.mode;
   app.liquidityEffectiveScaleLabel = axis.scaleLabel;
@@ -2990,20 +3370,44 @@ async function loadComparison() {
   }
 }
 
-async function loadCatalog() {
-  const response = await fetch("/api/markets/catalog");
+async function loadTokenCatalog(token, start, end, signal, cacheKey) {
+  const query = new URLSearchParams({ token });
+  if (start) query.set("start", start);
+  if (end) query.set("end", end);
+  const response = await fetch(`/api/markets/catalog?${query.toString()}`, { signal });
   const payload = await responseJson(response);
-  if (!response.ok) throw new Error(payload.error || "Market catalog failed to load.");
-  app.catalog = payload;
-  const currentToken = byId("facts-token").value;
-  byId("facts-token").innerHTML = payload.tokens
-    .map((token) => `<option value="${escapeHtml(token)}">${escapeHtml(token)}</option>`)
-    .join("");
-  byId("facts-token").value = payload.tokens.includes(currentToken)
-    ? currentToken
-    : preferredLiquidityToken(payload);
-  populateFactsMarkets();
-  updateFactsContract();
+  if (!response.ok) throw new Error(payload.error || `${token} market catalog failed to load.`);
+  if (
+    payload?.token_symbol !== token
+    || !Array.isArray(payload?.markets)
+    || payload.markets.some((market) => market.token_symbol !== token)
+  ) {
+    throw new Error(`The ${token} catalog response failed its Token-scope contract.`);
+  }
+  const summaryGeneration = app.payload?.metadata?.data_generation;
+  const catalogGeneration = payload.metadata?.data_generation;
+  if (!summaryGeneration || !catalogGeneration) {
+    throw new Error("The summary/catalog generation contract is missing.");
+  }
+  if (summaryGeneration !== catalogGeneration) {
+    app.catalogsByToken.clear();
+    const error = new Error(
+      "The data generation changed during navigation. Refreshing the summary.",
+    );
+    error.code = "data_generation_mismatch";
+    throw error;
+  }
+  if (
+    payload.metadata?.window_start !== start
+    || payload.metadata?.window_end !== end
+  ) {
+    throw new Error(`The ${token} catalog returned the wrong daily window.`);
+  }
+  if (app.catalogsByToken.has(cacheKey)) app.catalogsByToken.delete(cacheKey);
+  app.catalogsByToken.set(cacheKey, payload);
+  while (app.catalogsByToken.size > 8) {
+    app.catalogsByToken.delete(app.catalogsByToken.keys().next().value);
+  }
   return payload;
 }
 
@@ -3011,9 +3415,17 @@ function isMarketPayload(payload) {
   return Boolean(
     payload
     && payload.metadata
+    && payload.metadata.response_scope === "screener_summary"
+    && payload.metadata.summary_version === 1
+    && typeof payload.metadata.data_generation === "string"
+    && payload.metadata.data_generation.length > 0
     && Array.isArray(payload.tokens)
-    && Array.isArray(payload.cex_markets)
-    && Array.isArray(payload.dex_pools)
+    && payload.tokens.every((token) => (
+      token
+      && typeof token.token_symbol === "string"
+      && Object.hasOwn(token, "primary_cex")
+      && Object.hasOwn(token, "primary_dex")
+    ))
   );
 }
 
@@ -3034,7 +3446,36 @@ function writeDefaultMarketCache(payload) {
   }
 }
 
+function clearDefaultMarketCache() {
+  app.defaultPayload = null;
+  app.defaultPayloadIsCached = false;
+  try {
+    window.localStorage.removeItem(DEFAULT_MARKET_CACHE_KEY);
+  } catch {
+    // In-memory invalidation is authoritative when browser storage is unavailable.
+  }
+}
+
 function displayMarket(payload, { cached = false } = {}) {
+  const previousGeneration = app.payload?.metadata?.data_generation;
+  const nextGeneration = payload.metadata?.data_generation;
+  const generationChanged = Boolean(
+    previousGeneration
+    && nextGeneration
+    && previousGeneration !== nextGeneration
+  );
+  if (generationChanged) {
+    app.catalogsByToken.clear();
+    app.catalog = null;
+    app.activeCatalogToken = "";
+    app.activeCatalogKey = "";
+    if (
+      app.defaultPayload
+      && app.defaultPayload.metadata?.data_generation !== nextGeneration
+    ) {
+      clearDefaultMarketCache();
+    }
+  }
   app.payload = payload;
   if (isDefaultMarketPayload(payload)) {
     app.defaultPayload = payload;
@@ -3042,9 +3483,18 @@ function displayMarket(payload, { cached = false } = {}) {
   }
   hideError(byId("error-banner"));
   hideError(byId("global-error"));
+  const currentToken = byId("facts-token").value;
+  const tokens = payload.tokens.map((token) => token.token_symbol);
+  byId("facts-token").innerHTML = tokens
+    .map((token) => `<option value="${escapeHtml(token)}">${escapeHtml(token)}</option>`)
+    .join("");
+  byId("facts-token").value = tokens.includes(currentToken)
+    ? currentToken
+    : payload.metadata.default_workspace_token || tokens[0] || "";
   updateMetadata();
   renderTable();
   byId("market-panel").setAttribute("aria-busy", "false");
+  byId("export-csv").disabled = false;
   if (cached) {
     showStatus(
       byId("market-status"),
@@ -3059,15 +3509,28 @@ function displayMarket(payload, { cached = false } = {}) {
       "success",
     );
   }
-  if (app.catalog) populateFactsMarkets({ preserve: true });
+  if (
+    app.catalog
+    && app.activeCatalogToken === selectedWorkspaceToken()
+    && app.catalog.metadata?.window_start === payload.metadata.start_date
+    && app.catalog.metadata?.window_end === payload.metadata.end_date
+  ) {
+    populateFactsMarkets({ preserve: true });
+  }
+  if (generationChanged && app.routeReady && app.route?.kind === "workspace") {
+    void applyRouteFromLocation();
+  }
 }
 
 function setMarketLoading(message, preserve) {
   byId("apply-window").disabled = true;
+  byId("export-csv").disabled = true;
   byId("market-panel").setAttribute("aria-busy", "true");
   hideError(byId("error-banner"));
   showStatus(byId("market-loading"), message, preserve ? "stale" : "");
   if (!preserve) {
+    byId("freshness").textContent = "Loading fact summary on demand";
+    byId("freshness-cluster").dataset.status = "loading";
     app.payload = null;
     app.visibleTokens = [];
     hideStatus(byId("market-status"));
@@ -3095,6 +3558,7 @@ function clearMarketResult(message = "") {
   else hideError(byId("error-banner"));
   byId("market-panel").setAttribute("aria-busy", "false");
   byId("apply-window").disabled = false;
+  byId("export-csv").disabled = true;
 }
 
 async function loadMarket(start = "", end = "", { preserve = false } = {}) {
@@ -3118,11 +3582,14 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
     preserve,
   );
   try {
-    const response = await fetch(`/api/market?${query.toString()}`, {
+    const response = await fetch(`/api/markets/summary?${query.toString()}`, {
       signal: controller.signal,
     });
     const payload = await responseJson(response);
-    if (!response.ok) throw new Error(payload.error || "Market data failed to load.");
+    if (!response.ok) throw new Error(payload.error || "Screener summary failed to load.");
+    if (!isMarketPayload(payload)) {
+      throw new Error("Screener summary failed its compact response contract.");
+    }
     if (requestId !== app.marketRequestId) return false;
     displayMarket(payload);
     if (!start && !end) writeDefaultMarketCache(payload);
@@ -3136,6 +3603,10 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
       ? " The explicitly marked cached snapshot remains visible."
       : " No result is shown for the failed request.";
     if (preserve && app.payload) {
+      byId("date-start").value = app.payload.metadata.start_date;
+      byId("date-end").value = app.payload.metadata.end_date;
+      syncTimePresetButtons();
+      byId("export-csv").disabled = false;
       showStatus(
         byId("market-status"),
         "Cached facts remain visible; the fresh request failed.",
@@ -3177,19 +3648,22 @@ function setPreset(days) {
 async function applyWindow() {
   const start = byId("date-start").value;
   const end = byId("date-end").value;
-  if (validateDateRange(start, end)) {
-    if (app.route.kind === "workspace" && app.route.page === "compare") {
-      clearComparisonResult(validateDateRange(start, end));
+  const dateError = validateDateRange(start, end);
+  if (dateError) {
+    if (app.route.kind === "workspace") {
+      showError(byId("global-error"), dateError);
+      if (app.route.page === "compare") clearComparisonResult(dateError);
     } else {
-      showError(byId("error-banner"), validateDateRange(start, end));
+      showError(byId("error-banner"), dateError);
     }
     return;
   }
-  const tasks = [loadMarket(start, end, { preserve: Boolean(app.payload) })];
-  if (app.route.kind === "workspace" && app.route.page === "compare") {
-    tasks.push(loadComparison());
+  if (app.route.kind === "workspace") {
+    replaceCurrentRoute();
+    await applyRouteFromLocation();
+    return;
   }
-  await Promise.allSettled(tasks);
+  await loadMarket(start, end, { preserve: Boolean(app.payload) });
   replaceCurrentRoute();
 }
 
@@ -3255,8 +3729,6 @@ function csvEscape(value) {
 
 function exportVisibleCsv() {
   if (!app.payload || !app.visibleTokens.length) return;
-  const cexByToken = grouped(app.payload.cex_markets);
-  const dexByToken = grouped(app.payload.dex_pools);
   const headers = [
     "token",
     "row_type",
@@ -3282,9 +3754,7 @@ function exportVisibleCsv() {
   const lines = [headers.map(csvEscape).join(",")];
   app.visibleTokens.forEach((tokenSummary) => {
     const token = tokenSummary.token_symbol;
-    const cexOptions = cexByToken[token] || [];
-    const dexOptions = dexByToken[token] || [];
-    const aggregates = aggregateFacts(tokenSummary, cexOptions, dexOptions);
+    const aggregates = aggregateFacts(tokenSummary, [], []);
     const selected = comparison(tokenSummary);
     lines.push([
       token,
@@ -3329,7 +3799,7 @@ function exportVisibleCsv() {
         row.total_depth_25bps_usd,
         row.total_depth_50bps_usd,
         row.total_depth_100bps_usd,
-        market === "cex" ? row.depth_status : row.dex_depth_status,
+        row.depth_status,
         flags,
         selected.spread,
       ].map(csvEscape).join(","));
@@ -3518,8 +3988,12 @@ function bindEvents() {
 
 function primeInitialRouteView(route) {
   if (route.kind === "workspace") {
+    const window = compareRouteWindow(route);
+    byId("date-start").value = window.start;
+    byId("date-end").value = window.end;
     setActiveAppView("workspace");
     setActiveWorkspacePage(route.page);
+    updateRouteLinks();
     return;
   }
   if (route.kind === "methodology") {
@@ -3538,35 +4012,33 @@ async function initialize() {
     : { kind: "unknown" };
   if (initialRoute.kind !== "unknown") app.route = initialRoute;
   primeInitialRouteView(initialRoute);
+  if (initialRoute.kind === "methodology") {
+    byId("freshness").textContent = "Fact data loads on demand";
+    byId("freshness-cluster").dataset.status = "unavailable";
+    await applyRouteFromLocation();
+    if (window.lucide) window.lucide.createIcons();
+    return;
+  }
   const initialStart = initialRoute.kind === "screener"
     ? initialRoute.filters?.start || ""
-    : initialRoute.kind === "workspace" && initialRoute.page === "compare"
+    : initialRoute.kind === "workspace"
       ? initialRoute.state?.start || ""
       : "";
   const initialEnd = initialRoute.kind === "screener"
     ? initialRoute.filters?.end || ""
-    : initialRoute.kind === "workspace" && initialRoute.page === "compare"
+    : initialRoute.kind === "workspace"
       ? initialRoute.state?.end || ""
       : "";
   const cachedPayload = readDefaultMarketCache();
   if (cachedPayload) displayMarket(cachedPayload, { cached: true });
-  const [marketResult, catalogResult] = await Promise.allSettled([
-    loadMarket(initialStart, initialEnd, { preserve: Boolean(cachedPayload) }),
-    loadCatalog(),
-  ]);
-  if (marketResult.status === "rejected") {
-    showError(byId("error-banner"), marketResult.reason?.message || String(marketResult.reason));
-  }
-  if (catalogResult.status === "rejected") {
-    const message = catalogResult.reason?.message || String(catalogResult.reason);
-    showError(byId("comparison-error"), message);
-    showError(byId("global-error"), `Market catalog failed to load: ${message}`);
+  await loadMarket(initialStart, initialEnd, { preserve: Boolean(cachedPayload) });
+  if (!app.payload) {
     byId("facts-workbench").setAttribute("aria-busy", "false");
   } else {
     if (!navigation) {
       showError(byId("error-banner"), "Navigation module failed to load.");
     } else {
-      applyRouteFromLocation();
+      await applyRouteFromLocation();
     }
   }
   if (window.lucide) window.lucide.createIcons();

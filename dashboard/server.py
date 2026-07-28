@@ -88,20 +88,28 @@ VENDOR_FILES = {
 }
 API_FRESHNESS_CACHE_SECONDS = 60
 LARGE_PAYLOAD_CACHE_SIZE = 8
-SERIALIZED_RESPONSE_CACHE_SIZE = 32
+SERIALIZED_RESPONSE_CACHE_SIZE = 64
+CATALOG_SUMMARY_VERSION = 1
+SourceSignature = tuple[tuple[Any, ...], ...]
 PUBLIC_API_CACHE_LOCK = threading.RLock()
 SOURCE_CACHE_GENERATION_LOCK = threading.RLock()
-_SOURCE_CACHE_GENERATION: tuple[tuple[str, int, int], ...] | None = None
+_SOURCE_CACHE_GENERATION: SourceSignature | None = None
 _PUBLIC_RESPONSE_CACHE_GENERATION: (
-    tuple[tuple[tuple[str, int, int], ...], int] | None
+    tuple[SourceSignature, int] | None
 ) = None
 PUBLIC_API_QUERY_FIELDS = {
-    "catalog": (),
+    "catalog": ("token", "start", "end"),
+    "summary": ("start", "end"),
     "market": ("start", "end"),
     "compare": ("token", "market_a", "market_b", "start", "end"),
     "execution_cost": ("token", "market_a", "market_b"),
     "quality": ("token", "scope", "market_a", "market_b"),
 }
+
+
+class SourceGenerationChanged(FileNotFoundError):
+    """Signal temporary source unavailability across one response build."""
+
 ADMIN_STATIC_PATHS = {"/admin.html", "/admin.js"}
 SPA_TOKEN_PAGES = {"markets", "compare", "liquidity", "quality"}
 SPA_TOKEN_ROUTE = re.compile(
@@ -374,6 +382,16 @@ def latest_non_null(rows: list[dict[str, Any]], field: str) -> float | None:
     return None
 
 
+def sum_observed(rows: list[dict[str, Any]], field: str) -> float | None:
+    """Sum finite observations while preserving an all-missing series as null."""
+    values = [
+        value
+        for row in rows
+        if (value := parse_number(row.get(field))) is not None
+    ]
+    return sum(values) if values else None
+
+
 def price_observations(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
     """Return sorted finite, positive daily closes."""
     observations = [
@@ -413,7 +431,6 @@ def summarize_cex(
             requested_start=requested_start,
             requested_end=requested_end,
         )
-        volumes = [parse_number(row.get("quote_volume_usd")) for row in market_rows]
         summaries.append(
             {
                 "token_symbol": token,
@@ -421,14 +438,21 @@ def summarize_cex(
                 "venue": exchange,
                 "instrument": symbol,
                 **statistics_payload,
-                "volume_usd": sum(value for value in volumes if value is not None),
+                "volume_usd": sum_observed(market_rows, "quote_volume_usd"),
                 "tvl_usd": None,
                 "observation_days": statistics_payload["observation_count"],
                 "latest_date": statistics_payload["latest_observed_date"],
                 "price_points": [{"date": day, "price_usd": value} for day, value in price_observations(market_rows)],
             }
         )
-    return sorted(summaries, key=lambda row: (row["token_symbol"], -row["volume_usd"], row["venue"]))
+    return sorted(
+        summaries,
+        key=lambda row: (
+            row["token_symbol"],
+            -(row["volume_usd"] if row["volume_usd"] is not None else 0.0),
+            row["venue"],
+        ),
+    )
 
 
 def summarize_dex(
@@ -459,7 +483,6 @@ def summarize_dex(
             requested_start=requested_start,
             requested_end=requested_end,
         )
-        volumes = [parse_number(row.get("dex_volume_usd")) for row in pool_rows]
         summaries.append(
             {
                 "token_symbol": token,
@@ -468,14 +491,21 @@ def summarize_dex(
                 "instrument": pool_name,
                 "pool_address": address,
                 **statistics_payload,
-                "volume_usd": sum(value for value in volumes if value is not None),
+                "volume_usd": sum_observed(pool_rows, "dex_volume_usd"),
                 "tvl_usd": latest_non_null(pool_rows, "pool_tvl_usd"),
                 "observation_days": statistics_payload["observation_count"],
                 "latest_date": statistics_payload["latest_observed_date"],
                 "price_points": [{"date": day, "price_usd": value} for day, value in price_observations(pool_rows)],
             }
         )
-    return sorted(summaries, key=lambda row: (row["token_symbol"], -row["volume_usd"], row["venue"]))
+    return sorted(
+        summaries,
+        key=lambda row: (
+            row["token_symbol"],
+            -(row["volume_usd"] if row["volume_usd"] is not None else 0.0),
+            row["venue"],
+        ),
+    )
 
 
 def select_primary(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -527,19 +557,27 @@ def file_metadata(path: Path) -> dict[str, Any]:
     }
 
 
-def data_signature(paths: Iterable[Path]) -> tuple[tuple[str, int, int], ...]:
+def data_signature(paths: Iterable[Path]) -> SourceSignature:
     """Return a cache key that changes whenever a published data file changes."""
     signature = []
     for path in paths:
         stat = path.stat()
-        signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+        signature.append(
+            (
+                str(path),
+                stat.st_mtime_ns,
+                stat.st_size,
+                stat.st_ctime_ns,
+                stat.st_ino,
+            )
+        )
     return tuple(signature)
 
 
 @lru_cache(maxsize=8)
 def _load_tvl_snapshot_cached(
     path_text: str,
-    _signature: tuple[tuple[str, int, int], ...],
+    _signature: SourceSignature,
 ) -> dict[str, Any]:
     path = Path(path_text)
     with path.open("r", newline="", encoding="utf-8") as handle:
@@ -664,7 +702,7 @@ def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict
 @lru_cache(maxsize=8)
 def _load_cex_depth_snapshot_cached(
     path_text: str,
-    _signature: tuple[tuple[str, int, int], ...],
+    _signature: SourceSignature,
 ) -> dict[str, Any]:
     path = Path(path_text)
     with path.open("r", newline="", encoding="utf-8") as handle:
@@ -852,7 +890,7 @@ def overlay_cex_depth_snapshot(
 @lru_cache(maxsize=8)
 def _load_dex_depth_snapshot_cached(
     path_text: str,
-    _signature: tuple[tuple[str, int, int], ...],
+    _signature: SourceSignature,
 ) -> dict[str, Any]:
     path = Path(path_text)
     with path.open("r", newline="", encoding="utf-8") as handle:
@@ -1067,7 +1105,7 @@ def _build_market_payload_cached(
     end: str | None,
     cex_path_text: str,
     dex_path_text: str,
-    _signature: tuple[tuple[str, int, int], ...],
+    _signature: SourceSignature,
 ) -> dict[str, Any]:
     cex_path = Path(cex_path_text)
     dex_path = Path(dex_path_text)
@@ -1129,7 +1167,7 @@ def _build_database_payload_cached(
     start: str | None,
     end: str | None,
     database_path_text: str,
-    _signature: tuple[tuple[str, int, int], ...],
+    _signature: SourceSignature,
 ) -> dict[str, Any]:
     database_path = Path(database_path_text)
     connection = connect_database(database_path)
@@ -1293,7 +1331,7 @@ def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _optional_signature(path: Path | None) -> tuple[tuple[str, int, int], ...]:
+def _optional_signature(path: Path | None) -> SourceSignature:
     return data_signature([path]) if path is not None else ()
 
 
@@ -1407,6 +1445,465 @@ def build_market_catalog() -> dict[str, Any]:
                 "freshness": metadata.get("freshness"),
             },
         }
+
+
+def _catalog_default_workspace_token(
+    token_summaries: list[dict[str, Any]],
+) -> str:
+    """Choose a deterministic Token with the strongest comparable market coverage."""
+    if not token_summaries:
+        return ""
+    for summary in token_summaries:
+        measured = summary["measured_depth_market_counts"]
+        quality = summary["quality_status_counts"]
+        if (
+            measured["cex"] > 0
+            and measured["dex"] > 0
+            and quality.get("critical", 0) == 0
+        ):
+            return summary["token_symbol"]
+    for summary in token_summaries:
+        measured = summary["measured_depth_market_counts"]
+        if measured["cex"] > 0 and measured["dex"] > 0:
+            return summary["token_symbol"]
+    for summary in token_summaries:
+        market_types = summary["market_type_counts"]
+        if market_types["cex"] > 0 and market_types["dex"] > 0:
+            return summary["token_symbol"]
+    return token_summaries[0]["token_symbol"]
+
+
+def catalog_summary_from_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
+    """Project the audit catalog into a small all-Token screener contract."""
+    markets_by_token: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for market in catalog.get("markets", []):
+        token = market.get("token_symbol")
+        market_type = market.get("market_type")
+        quality_status = market.get("quality_status")
+        if not token or market_type not in {"cex", "dex"}:
+            raise ValueError("Catalog market is missing its Token or market type")
+        if quality_status not in {"ok", "info", "warning", "critical"}:
+            raise ValueError("Catalog market is missing a recognized quality status")
+        markets_by_token[token].append(market)
+
+    token_summaries: list[dict[str, Any]] = []
+    for token in catalog.get("tokens", []):
+        token_markets = markets_by_token.get(token, [])
+        if not token_markets:
+            raise ValueError(f"Catalog Token has no markets: {token}")
+        market_type_counts = Counter(
+            market.get("market_type") or "unknown" for market in token_markets
+        )
+        quality_status_counts = Counter(
+            market["quality_status"] for market in token_markets
+        )
+        measured_depth_market_counts = Counter(
+            market.get("market_type") or "unknown"
+            for market in token_markets
+            if market.get("depth_status") in {"observed", "complete", "partial"}
+        )
+        token_summaries.append(
+            {
+                "token_symbol": token,
+                "market_count": len(token_markets),
+                "market_type_counts": {
+                    "cex": market_type_counts.get("cex", 0),
+                    "dex": market_type_counts.get("dex", 0),
+                },
+                "measured_depth_market_counts": {
+                    "cex": measured_depth_market_counts.get("cex", 0),
+                    "dex": measured_depth_market_counts.get("dex", 0),
+                },
+                "quality_status_counts": dict(sorted(quality_status_counts.items())),
+            }
+        )
+
+    metadata = catalog.get("metadata", {})
+    default_workspace_token = _catalog_default_workspace_token(token_summaries)
+    return {
+        "metadata": {
+            "summary_version": CATALOG_SUMMARY_VERSION,
+            "catalog_version": metadata.get("catalog_version"),
+            "catalog_scope": "all_tokens_summary",
+            "token_count": len(token_summaries),
+            "market_count": sum(
+                summary["market_count"] for summary in token_summaries
+            ),
+            "default_workspace_token": default_workspace_token,
+            "freshness": metadata.get("freshness"),
+        },
+        "tokens": [summary["token_symbol"] for summary in token_summaries],
+        "token_summaries": token_summaries,
+    }
+
+
+def token_catalog_from_catalog(
+    catalog: dict[str, Any],
+    token_symbol: str | None,
+) -> dict[str, Any]:
+    """Return one exact Token's markets without pretending it is a global catalog."""
+    token = (token_symbol or "").strip().upper()
+    if not token:
+        raise ValueError("Token is required for a single-Token market catalog")
+    catalog_tokens = set(catalog.get("tokens", []))
+    if token not in catalog_tokens:
+        raise ValueError("Token is not cataloged")
+    markets = [
+        market
+        for market in catalog.get("markets", [])
+        if market.get("token_symbol") == token
+    ]
+    return {
+        "metadata": {
+            **catalog.get("metadata", {}),
+            "catalog_scope": "single_token",
+            "market_count": len(markets),
+            "snapshot_metadata_population_scope": "all_catalog_markets",
+        },
+        "token_symbol": token,
+        "markets": markets,
+    }
+
+
+def build_market_catalog_summary() -> dict[str, Any]:
+    """Return only the global fields needed before a Token workspace is opened."""
+    return catalog_summary_from_catalog(build_market_catalog())
+
+
+SCREENER_MARKET_FIELDS = (
+    "token_symbol",
+    "venue",
+    "instrument",
+    "pool_address",
+    "price_usd",
+    "volume_usd",
+    "window_return",
+    "daily_volatility",
+    "first_observed_date",
+    "latest_observed_date",
+    "observation_days",
+    "observation_count",
+    "coverage_ratio",
+    "total_depth_10bps_usd",
+    "total_depth_25bps_usd",
+    "total_depth_50bps_usd",
+    "total_depth_100bps_usd",
+    "depth_100bps_complete",
+    "tvl_usd",
+    "tvl_status",
+    "quality_status",
+    "quality_flags",
+    "quality_flag_details",
+)
+
+WINDOW_MARKET_FIELDS = (
+    "price_usd",
+    "volume_usd",
+    "window_return",
+    "daily_volatility",
+    "first_observed_date",
+    "latest_observed_date",
+    "observation_days",
+    "observation_count",
+    "coverage_ratio",
+    "tvl_usd",
+    "tvl_status",
+)
+
+
+def _payload_market_identity(
+    row: dict[str, Any],
+    market_type: str,
+) -> str | None:
+    if market_type == "cex":
+        venue = row.get("venue")
+        instrument = row.get("instrument")
+        return f"{venue}|{instrument}" if venue and instrument else None
+    return row.get("pool_address")
+
+
+def _compact_screener_market(
+    row: dict[str, Any] | None,
+    market_type: str,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    compact = {field: row.get(field) for field in SCREENER_MARKET_FIELDS}
+    compact["market_type"] = market_type
+    compact["market_id"] = _payload_market_identity(row, market_type)
+    compact["depth_status"] = (
+        row.get("depth_status")
+        if market_type == "cex"
+        else row.get("dex_depth_status", row.get("depth_status"))
+    )
+    return compact
+
+
+def _public_data_generation(
+    metadata: dict[str, Any],
+    source_signature: SourceSignature | None = None,
+) -> str:
+    """Return a path-free identifier for browser cache invalidation."""
+    if source_signature is None:
+        sources = [
+            {
+                "name": source.get("name"),
+                "sha256": source.get("sha256"),
+            }
+            for source in metadata.get("sources", [])
+        ]
+    else:
+        sources = []
+        for entry in source_signature:
+            path, modified_ns, size, *file_identity = entry
+            source = {
+                "name": Path(path).name,
+                "path_identity": hashlib.sha256(
+                    str(Path(path).resolve()).encode("utf-8")
+                ).hexdigest()[:16],
+                "modified_ns": modified_ns,
+                "size": size,
+            }
+            if file_identity:
+                source["changed_ns"] = file_identity[0]
+            if len(file_identity) > 1:
+                source["inode"] = file_identity[1]
+            sources.append(source)
+    material = {
+        "response_contract": "screener-summary-and-token-catalog",
+        "summary_version": CATALOG_SUMMARY_VERSION,
+        "catalog_version": metadata.get("catalog_version"),
+        "available_end": metadata.get("available_end"),
+        "sources": sources,
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def market_summary_from_payload(
+    payload: dict[str, Any],
+    catalog: dict[str, Any],
+    *,
+    data_generation: str | None = None,
+) -> dict[str, Any]:
+    """Project the full fact payload into the exact rows used by the Screener."""
+    catalog_summary = catalog_summary_from_catalog(catalog)
+    catalog_tokens = {
+        summary["token_symbol"]: summary
+        for summary in catalog_summary["token_summaries"]
+    }
+    cex_by_token: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    dex_by_token: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in payload.get("cex_markets", []):
+        cex_by_token[row["token_symbol"]].append(row)
+    for row in payload.get("dex_pools", []):
+        dex_by_token[row["token_symbol"]].append(row)
+
+    summaries = []
+    for token_summary in payload.get("tokens", []):
+        token = token_summary["token_symbol"]
+        primary_cex = next(
+            (
+                row
+                for row in cex_by_token.get(token, [])
+                if _payload_market_identity(row, "cex")
+                == token_summary.get("primary_cex_id")
+            ),
+            None,
+        )
+        primary_dex = next(
+            (
+                row
+                for row in dex_by_token.get(token, [])
+                if _payload_market_identity(row, "dex")
+                == token_summary.get("primary_dex_id")
+            ),
+            None,
+        )
+        if token_summary.get("primary_cex_id") and primary_cex is None:
+            raise ValueError(
+                f"Primary CEX market is missing from the Screener payload: {token}"
+            )
+        if token_summary.get("primary_dex_id") and primary_dex is None:
+            raise ValueError(
+                f"Primary DEX market is missing from the Screener payload: {token}"
+            )
+        catalog_token = catalog_tokens.get(token, {})
+        if not catalog_token:
+            raise ValueError(
+                f"Screener Token is missing from the market catalog: {token}"
+            )
+        market_types = catalog_token.get("market_type_counts", {})
+        quality_counts = catalog_token.get("quality_status_counts")
+        market_count = catalog_token.get("market_count")
+        if (
+            not isinstance(market_count, int)
+            or market_count <= 0
+            or market_types.get("cex", 0) + market_types.get("dex", 0)
+            != market_count
+            or not isinstance(quality_counts, dict)
+            or sum(quality_counts.values()) != market_count
+        ):
+            raise ValueError(f"Catalog counts are inconsistent for Token: {token}")
+        summaries.append(
+            {
+                "token_symbol": token,
+                "aggregate_cex_volume_usd": token_summary.get(
+                    "aggregate_cex_volume_usd"
+                ),
+                "aggregate_dex_volume_usd": token_summary.get(
+                    "aggregate_dex_volume_usd"
+                ),
+                "aggregate_volume_usd": token_summary.get("aggregate_volume_usd"),
+                "aggregate_dex_volume_share": token_summary.get(
+                    "aggregate_dex_volume_share"
+                ),
+                "volume_aggregation_method": token_summary.get(
+                    "volume_aggregation_method"
+                ),
+                "price_spread": token_summary.get("price_spread"),
+                "spread_date": token_summary.get("spread_date"),
+                "primary_cex_id": token_summary.get("primary_cex_id"),
+                "primary_dex_id": token_summary.get("primary_dex_id"),
+                "primary_cex": _compact_screener_market(primary_cex, "cex"),
+                "primary_dex": _compact_screener_market(primary_dex, "dex"),
+                "market_count": market_count,
+                "cex_market_count": market_types["cex"],
+                "dex_market_count": market_types["dex"],
+                "quality_status_counts": quality_counts,
+            }
+        )
+
+    summary_tokens = [summary["token_symbol"] for summary in summaries]
+    default_workspace_token = catalog_summary["metadata"]["default_workspace_token"]
+    if default_workspace_token not in summary_tokens:
+        default_workspace_token = summary_tokens[0] if summary_tokens else ""
+    metadata = {
+        **payload.get("metadata", {}),
+        "summary_version": CATALOG_SUMMARY_VERSION,
+        "response_scope": "screener_summary",
+        "catalog_version": catalog.get("metadata", {}).get("catalog_version"),
+        "catalog_market_count": catalog_summary["metadata"]["market_count"],
+        "default_workspace_token": default_workspace_token,
+        "fact_scopes": {
+            "daily_metrics": "requested_start_end_utc_window",
+            "catalog_counts": "full_available_daily_range_plus_latest_snapshots",
+            "tvl_depth_execution": "latest_independent_point_in_time_snapshots",
+        },
+    }
+    metadata["data_generation"] = (
+        data_generation or _public_data_generation(metadata)
+    )
+    return {
+        "metadata": metadata,
+        "tokens": summaries,
+    }
+
+
+def build_market_summary(
+    start: str | None = None,
+    end: str | None = None,
+    *,
+    source_signature: SourceSignature | None = None,
+) -> dict[str, Any]:
+    """Return one compact, window-aware response for the all-Token Screener."""
+    payload = build_market_payload(start, end)
+    catalog = build_market_catalog()
+    generation_signature = (
+        source_signature if source_signature is not None else api_source_signature()
+    )
+    generation = _public_data_generation(
+        {
+            **payload.get("metadata", {}),
+            "catalog_version": catalog.get("metadata", {}).get("catalog_version"),
+        },
+        generation_signature,
+    )
+    return market_summary_from_payload(
+        payload,
+        catalog,
+        data_generation=generation,
+    )
+
+
+def _payload_row_for_catalog_market(
+    payload: dict[str, Any],
+    market: dict[str, Any],
+) -> dict[str, Any] | None:
+    rows = (
+        payload.get("cex_markets", [])
+        if market.get("market_type") == "cex"
+        else payload.get("dex_pools", [])
+    )
+    for row in rows:
+        if row.get("token_symbol") != market.get("token_symbol"):
+            continue
+        if market.get("market_type") == "cex":
+            if (
+                row.get("venue") == market.get("venue")
+                and row.get("instrument") == market.get("instrument")
+            ):
+                return row
+        elif (
+            row.get("venue") == market.get("venue")
+            and row.get("pool_address") == market.get("pool_address")
+        ):
+            return row
+    return None
+
+
+def build_token_market_catalog(
+    token_symbol: str | None,
+    start: str | None = None,
+    end: str | None = None,
+    *,
+    source_signature: SourceSignature | None = None,
+) -> dict[str, Any]:
+    """Return complete catalog facts plus compact selected-window metrics for one Token."""
+    token_catalog = token_catalog_from_catalog(build_market_catalog(), token_symbol)
+    window_payload = build_market_payload(start, end)
+    markets = []
+    for market in token_catalog["markets"]:
+        row = _payload_row_for_catalog_market(window_payload, market)
+        markets.append(
+            {
+                **market,
+                "window_metrics": (
+                    {field: row.get(field) for field in WINDOW_MARKET_FIELDS}
+                    if row is not None
+                    else None
+                ),
+            }
+        )
+    token = token_catalog["token_symbol"]
+    generation_signature = (
+        source_signature if source_signature is not None else api_source_signature()
+    )
+    token_summary = next(
+        (
+            summary
+            for summary in window_payload.get("tokens", [])
+            if summary.get("token_symbol") == token
+        ),
+        None,
+    )
+    return {
+        **token_catalog,
+        "metadata": {
+            **token_catalog["metadata"],
+            "window_start": window_payload["metadata"].get("start_date"),
+            "window_end": window_payload["metadata"].get("end_date"),
+            "window_metric_scope": "selected_start_end_utc_window",
+            "snapshot_scope": "latest_independent_point_in_time_snapshots",
+            "data_generation": _public_data_generation(
+                token_catalog["metadata"],
+                generation_signature,
+            ),
+        },
+        "token_summary": token_summary,
+        "markets": markets,
+    }
 
 
 def validate_fact_window(
@@ -1594,7 +2091,7 @@ def build_market_comparison(
 @lru_cache(maxsize=8)
 def _load_execution_cost_snapshot_cached(
     path_text: str,
-    _signature: tuple[tuple[str, int, int], ...],
+    _signature: SourceSignature,
 ) -> dict[str, Any]:
     path = Path(path_text)
     with path.open("r", newline="", encoding="utf-8") as handle:
@@ -2255,7 +2752,7 @@ def encode_json_payload(payload: Any, accept_encoding: str = "") -> tuple[bytes,
     return raw, False
 
 
-def api_source_signature() -> tuple[tuple[str, int, int], ...]:
+def api_source_signature() -> SourceSignature:
     """Return one signature covering every source that can change public facts."""
     database_path = resolve_database_path()
     paths: list[Path] = []
@@ -2283,10 +2780,24 @@ def api_freshness_bucket() -> int:
 def _build_public_api_payload(
     route: str,
     query_items: tuple[tuple[str, str], ...],
+    source_signature: SourceSignature | None = None,
 ) -> dict[str, Any]:
     query = dict(query_items)
     if route == "catalog":
+        if "token" in query:
+            return build_token_market_catalog(
+                query["token"],
+                query.get("start"),
+                query.get("end"),
+                source_signature=source_signature,
+            )
         return build_market_catalog()
+    if route == "summary":
+        return build_market_summary(
+            query.get("start"),
+            query.get("end"),
+            source_signature=source_signature,
+        )
     if route == "market":
         return build_market_payload(query.get("start"), query.get("end"))
     if route == "compare":
@@ -2317,13 +2828,17 @@ def _build_public_api_payload(
 def _build_public_api_response_cached(
     route: str,
     query_items: tuple[tuple[str, str], ...],
-    _source_signature: tuple[tuple[str, int, int], ...],
+    _source_signature: SourceSignature,
     _freshness_bucket: int,
 ) -> tuple[bytes, bool]:
-    return encode_json_payload(
-        _build_public_api_payload(route, query_items),
-        "gzip",
+    payload = _build_public_api_payload(
+        route,
+        query_items,
+        source_signature=_source_signature,
     )
+    if api_source_signature() != _source_signature:
+        raise SourceGenerationChanged
+    return encode_json_payload(payload, "gzip")
 
 
 def clear_runtime_caches() -> None:
@@ -2347,7 +2862,7 @@ def clear_runtime_caches() -> None:
 
 
 def ensure_source_cache_generation(
-    source_signature: tuple[tuple[str, int, int], ...],
+    source_signature: SourceSignature,
 ) -> None:
     """Retain only one complete source generation instead of 32 large copies."""
     global _SOURCE_CACHE_GENERATION, _PUBLIC_RESPONSE_CACHE_GENERATION
@@ -2374,7 +2889,7 @@ def ensure_source_cache_generation(
 
 
 def ensure_public_response_cache_generation(
-    source_signature: tuple[tuple[str, int, int], ...],
+    source_signature: SourceSignature,
     freshness_bucket: int,
 ) -> None:
     """Bound serialized responses to the active source and freshness minute."""
@@ -2395,20 +2910,37 @@ def build_public_api_response(
     """Use one cold-cache builder so concurrent misses do not duplicate work."""
     with PUBLIC_API_CACHE_LOCK:
         with SOURCE_CACHE_GENERATION_LOCK:
-            if not accepts_gzip:
-                return encode_json_payload(
-                    _build_public_api_payload(route, query_items),
-                    "",
+            for _attempt in range(3):
+                source_signature = api_source_signature()
+                freshness_bucket = api_freshness_bucket()
+                ensure_source_cache_generation(source_signature)
+                ensure_public_response_cache_generation(
+                    source_signature,
+                    freshness_bucket,
                 )
-            source_signature = api_source_signature()
-            freshness_bucket = api_freshness_bucket()
-            ensure_source_cache_generation(source_signature)
-            ensure_public_response_cache_generation(source_signature, freshness_bucket)
-            return _build_public_api_response_cached(
-                route,
-                query_items,
-                source_signature,
-                freshness_bucket,
+                try:
+                    if accepts_gzip:
+                        response = _build_public_api_response_cached(
+                            route,
+                            query_items,
+                            source_signature,
+                            freshness_bucket,
+                        )
+                    else:
+                        payload = _build_public_api_payload(
+                            route,
+                            query_items,
+                            source_signature=source_signature,
+                        )
+                        if api_source_signature() != source_signature:
+                            raise SourceGenerationChanged
+                        response = encode_json_payload(payload, "")
+                except SourceGenerationChanged:
+                    continue
+                if api_source_signature() == source_signature:
+                    return response
+            raise SourceGenerationChanged(
+                "Published fact sources changed repeatedly during response assembly"
             )
 
 
@@ -2420,11 +2952,17 @@ def public_api_query_items(
     fields = PUBLIC_API_QUERY_FIELDS.get(route)
     if fields is None:
         raise ValueError(f"Unknown public API route: {route}")
-    return tuple(
-        (name, query[name][0])
-        for name in fields
-        if query.get(name) and query[name][0] is not None
-    )
+    if route == "catalog" and "token" not in query:
+        fields = ()
+    items = []
+    for name in fields:
+        if not query.get(name) or query[name][0] is None:
+            continue
+        value = query[name][0]
+        if route == "catalog" and name == "token":
+            value = value.strip().upper()
+        items.append((name, value))
+    return tuple(items)
 
 
 def is_loopback_host(host: str) -> bool:
@@ -2601,37 +3139,57 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 self.send_error(HTTPStatus.NOT_FOUND)
             return
         if parsed.path == "/api/markets/catalog":
+            query = parse_qs(parsed.query, keep_blank_values=True)
             try:
-                self.send_public_api("catalog", {})
-            except (FileNotFoundError, ValueError) as error:
+                self.send_public_api("catalog", query)
+            except FileNotFoundError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except ValueError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/markets/summary":
+            query = parse_qs(parsed.query)
+            try:
+                self.send_public_api("summary", query)
+            except FileNotFoundError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/markets/compare":
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("compare", query)
-            except (FileNotFoundError, ValueError) as error:
+            except FileNotFoundError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/markets/execution-cost":
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("execution_cost", query)
-            except (FileNotFoundError, ValueError) as error:
+            except FileNotFoundError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/markets/quality":
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("quality", query)
-            except (FileNotFoundError, ValueError) as error:
+            except FileNotFoundError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/market":
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("market", query)
-            except (FileNotFoundError, ValueError) as error:
+            except FileNotFoundError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/admin/session":

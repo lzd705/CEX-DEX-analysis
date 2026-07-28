@@ -107,16 +107,16 @@
     const marketA = firstParam(params, ["marketA", "a"]);
     const marketB = firstParam(params, ["marketB", "b"]);
     const pairMode = firstParam(params, ["pairMode", "pair"]);
+    const start = firstParam(params, ["start"]);
+    const end = firstParam(params, ["end"]);
     if (marketA !== null) state.marketA = marketA;
     if (marketB !== null) state.marketB = marketB;
     if (pairMode !== null && PAIR_MODES.has(pairMode)) state.pairMode = pairMode;
+    if (start !== null && ISO_DATE.test(start)) state.start = start;
+    if (end !== null && ISO_DATE.test(end)) state.end = end;
 
     if (page === "compare") {
-      const start = firstParam(params, ["start"]);
-      const end = firstParam(params, ["end"]);
       const window = firstParam(params, ["window"]);
-      if (start !== null && ISO_DATE.test(start)) state.start = start;
-      if (end !== null && ISO_DATE.test(end)) state.end = end;
       if (window !== null && COMPARE_WINDOWS.has(window)) state.window = window;
     } else if (page === "liquidity") {
       const side = firstParam(params, ["side"]);
@@ -199,10 +199,10 @@
     setString(params, "marketA", state.marketA);
     setString(params, "marketB", state.marketB);
     setEnum(params, "pairMode", state.pairMode, PAIR_MODES);
+    setDate(params, "start", state.start);
+    setDate(params, "end", state.end);
 
     if (page === "compare") {
-      setDate(params, "start", state.start);
-      setDate(params, "end", state.end);
       setEnum(params, "window", state.window, COMPARE_WINDOWS);
     } else if (page === "liquidity") {
       setEnum(params, "side", state.side, LIQUIDITY_SIDES);

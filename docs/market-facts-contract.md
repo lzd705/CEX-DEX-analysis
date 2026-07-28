@@ -1,10 +1,17 @@
-# Market catalog and two-venue comparison contract
+# Market summary, catalog, and two-market comparison contract
 
 ## Public endpoints
 
-- `GET /api/markets/catalog` returns the versioned catalog, dataset hashes,
-  available date range, market identities, source fields, quote assets, and
-  semantic limits.
+- `GET /api/markets/summary?start=...&end=...` returns the window-aware
+  Screener contract: one row per Token, aggregate CEX/DEX volume, DEX share,
+  primary price gap and date, compact primary CEX/DEX metrics, catalog market
+  counts, and quality-status counts.
+- `GET /api/markets/catalog?token=...&start=...&end=...` returns the complete
+  catalog entries and selected-window metrics for exactly one canonicalized
+  Token. Unknown or empty Token values are errors; a successful response never
+  contains another Token's market.
+- `GET /api/markets/catalog` without a query remains the versioned full audit
+  catalog for backward compatibility. The website does not load this response.
 - `GET /api/markets/compare?token=...&market_a=...&market_b=...&start=...&end=...`
   returns the union of the two selected markets' daily UTC observations.
 - `GET /api/markets/execution-cost?token=...&market_a=...&market_b=...`
@@ -13,6 +20,47 @@
 
 `market_a` and `market_b` are exact `market_id` values returned by the catalog.
 They must be different and both must belong to the requested Token.
+
+## Transfer and cache boundaries
+
+The Screener summary deliberately omits `markets`, `cex_markets`, `dex_pools`,
+and daily `price_points`. Its compact `primary_cex` and `primary_dex` objects
+carry only the values displayed or sorted by the Screener. Aggregate volume and
+the primary price gap are computed by the same server functions as the full
+fact payload; the frontend does not recompute them from a partial market list.
+
+The single-Token response includes canonical market IDs, source and quality
+lineage, TVL, and 10/25/50/100 bps depth. Its nested `window_metrics` omits
+daily `price_points` while retaining the price, volume, return, volatility, and
+coverage needed by the Token Markets page. `null`, measured zero, partial,
+unsupported, failed, unavailable, and not-cataloged states retain their
+original meanings.
+
+The response intentionally combines three labeled fact scopes:
+
+- daily prices, volumes, returns, volatility, and price gaps use the requested
+  UTC `start`/`end` window;
+- catalog market and quality counts cover the full available daily history plus
+  the latest published snapshot facts;
+- TVL and depth fields in the Token catalog are independent latest
+  point-in-time snapshots and do not change when the daily window changes.
+  Execution-cost sources participate in the same `data_generation`, but their
+  rows load only through the independent execution-cost endpoint.
+
+Both responses participate in the same source-signature and one-minute
+serialized-response generation as the full audit catalog. Token query values
+are stripped and uppercased before entering the cache key. A public,
+path-free `data_generation` hash lets the browser clear its bounded Token
+catalog cache whenever the published source generation changes.
+
+Single-Token `market_count` is Token-scoped. Nested TVL/depth/execution snapshot
+inventory counts retained in metadata describe all catalog markets and are
+marked `snapshot_metadata_population_scope=all_catalog_markets`.
+
+This split is a transfer and browser-memory boundary. A cold server build still
+uses the shared full catalog and fact builders before projecting the compact
+response; it is not a claim that every underlying SQLite query has already
+been rewritten as a Token-only query.
 
 ## Fact definitions
 

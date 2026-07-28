@@ -85,7 +85,7 @@ console.log(JSON.stringify(result));
         )
         self.assertEqual(
             set(result["markets"]["state"]),
-            {"marketA", "marketB"},
+            {"marketA", "marketB", "start", "end"},
         )
         self.assertEqual(
             set(result["compare"]["state"]),
@@ -93,11 +93,20 @@ console.log(JSON.stringify(result));
         )
         self.assertEqual(
             set(result["liquidity"]["state"]),
-            {"marketA", "marketB", "side", "notionalUsd", "view", "scale"},
+            {
+                "marketA",
+                "marketB",
+                "start",
+                "end",
+                "side",
+                "notionalUsd",
+                "view",
+                "scale",
+            },
         )
         self.assertEqual(
             set(result["quality"]["state"]),
-            {"marketA", "marketB", "scope"},
+            {"marketA", "marketB", "start", "end", "scope"},
         )
 
     def test_validate_pair_accepts_two_exact_catalog_ids(self):

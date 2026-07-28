@@ -68,11 +68,17 @@ CSVs and a validated SQLite database back into `data/local/`.
 - The global time window is the first control in the main content.
 - Tokens default to descending aggregate USD volume across all cataloged
   markets. Aggregate, CEX, and DEX change the token-level sorting scope.
-- Each token can select one CEX pair and one DEX pool.
-- Token-level aggregate CEX/DEX volume and DEX share do not change when a
-  different pair or pool is selected. Expanded rows show selected-market facts.
-- Spread is calculated from those two selected prices and appears only on the
-  token summary row.
+- Each Screener row uses the server-selected primary CEX and DEX market for its
+  compact price, depth, and TVL display. Aggregate CEX/DEX volume and DEX share
+  still cover every cataloged market in the selected daily window.
+- Primary Price Gap is primary DEX price / primary CEX price - 1 on their latest
+  common UTC date. It is independent of the workspace A/B pair.
+- Inside one Token workspace, Market A and B may be any two distinct cataloged
+  markets for that Token, including CEX/CEX or DEX/DEX.
+- The selected daily window is shared across Markets, Compare, Liquidity &
+  Execution, and Data Quality links. Liquidity/depth/execution values remain
+  independently timestamped latest snapshots; preserving the window keeps the
+  workspace header and window-derived market facts consistent across pages.
 - Window return uses first-to-last observed close. Daily realized volatility
   uses only adjacent UTC-day log returns; intervals across missing days are
   excluded and reported in coverage metadata.
@@ -105,8 +111,22 @@ CSVs and a validated SQLite database back into `data/local/`.
   audit.
 - The daily date controls do not change the latest depth snapshots, and the two
   selected snapshots are not claimed to be synchronized.
-- `/api/markets/catalog` is the audit entrypoint; `/api/markets/compare` accepts
-  only cataloged market IDs for the requested Token.
+- `/api/markets/summary?start=...&end=...` is the only fact payload loaded by
+  the Screener. It contains one compact row per Token, server-computed
+  aggregates and primary-market metrics, but no daily `price_points` or
+  all-market arrays.
+- `/api/markets/catalog?token=...&start=...&end=...` returns the complete market
+  identities, point-in-time facts, lineage, and compact metrics for the
+  requested daily window for exactly one Token. The frontend loads it only
+  after entering that Token's workspace and retains at most eight
+  Token-window-generation catalogs in an LRU cache.
+- `/api/markets/catalog` without a Token remains the backward-compatible full
+  audit entrypoint. The public frontend never downloads it. `/api/markets/compare`
+  accepts only cataloged market IDs for the requested Token.
+- Daily metrics follow the selected UTC window. Catalog/quality counts cover
+  the full available catalog, while TVL, depth, and execution cost remain the
+  latest independently observed snapshots. These scopes are declared in the
+  response metadata rather than implied by the date toolbar.
 - `/api/markets/execution-cost` accepts the same exact Token/A/B identities and
   returns the separate long-form $1k/$5k/$10k/$50k/$100k quoted-cost facts.
   It states CEX/DEX fee scope, exclusions, source snapshots, partial reasons,
@@ -119,11 +139,18 @@ token-price-series `market_id`. This prevents one pool observed from both token
 perspectives, or a pool whose displayed fee label changes, from producing
 ambiguous selectors.
 
-Public fact responses use a signature-aware, one-minute in-process cache. The
-cache key includes every published daily, TVL, CEX-depth, DEX-depth, and
-execution-cost source, so a changed snapshot invalidates both the assembled
-payload and compressed JSON response. Concurrent cold misses are single-flight
-to avoid duplicate catalog builds and gzip work.
+Public fact responses use a signature-aware, one-minute in-process cache with
+64 bounded serialized entries. The cache key includes every published daily,
+TVL, CEX-depth, DEX-depth, and execution-cost source, so a changed snapshot
+invalidates the Screener summary, every Token catalog, assembled payloads, and
+compressed JSON responses together. Concurrent cold misses are single-flight
+to avoid duplicate builds and gzip work. The summary exposes a path-free data
+generation hash so the browser can discard cached Token catalogs after a
+publication changes.
+
+The split primarily reduces network transfer and browser memory. Cold summary
+and Token-catalog construction still reuses the shared full fact/catalog
+builders, so backend query-level partitioning remains a separate optimization.
 
 ## Production boundary
 

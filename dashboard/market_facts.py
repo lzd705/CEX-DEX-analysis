@@ -531,15 +531,26 @@ def build_token_summaries(
         dex_rows = by_token_dex[token]
         primary_cex, cex_reason = select_primary_market(cex_rows)
         primary_dex, dex_reason = select_primary_market(dex_rows)
-        aggregate_cex = sum(
-            max(finite_number(row.get("volume_usd")) or 0.0, 0.0)
+        cex_volumes = [
+            max(value, 0.0)
             for row in cex_rows
-        )
-        aggregate_dex = sum(
-            max(finite_number(row.get("volume_usd")) or 0.0, 0.0)
+            if (value := finite_number(row.get("volume_usd"))) is not None
+        ]
+        dex_volumes = [
+            max(value, 0.0)
             for row in dex_rows
+            if (value := finite_number(row.get("volume_usd"))) is not None
+        ]
+        aggregate_cex = sum(cex_volumes) if cex_volumes else None
+        aggregate_dex = sum(dex_volumes) if dex_volumes else None
+        observed_aggregates = [
+            value
+            for value in (aggregate_cex, aggregate_dex)
+            if value is not None
+        ]
+        aggregate_volume = (
+            sum(observed_aggregates) if observed_aggregates else None
         )
-        aggregate_volume = aggregate_cex + aggregate_dex
         comparison_date, spread = _common_price_comparison(
             primary_cex,
             primary_dex,
@@ -561,7 +572,9 @@ def build_token_summaries(
             "aggregate_volume_usd": aggregate_volume,
             "aggregate_dex_volume_share": (
                 aggregate_dex / aggregate_volume
-                if aggregate_volume
+                if aggregate_cex is not None
+                and aggregate_dex is not None
+                and aggregate_volume
                 else None
             ),
             "volume_aggregation_method": (
@@ -588,7 +601,9 @@ def build_token_summaries(
             "total_volume_usd": aggregate_volume,
             "observed_dex_share": (
                 aggregate_dex / aggregate_volume
-                if aggregate_volume
+                if aggregate_cex is not None
+                and aggregate_dex is not None
+                and aggregate_volume
                 else None
             ),
         }

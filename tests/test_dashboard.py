@@ -586,6 +586,228 @@ class MarketMonitorServerTest(unittest.TestCase):
             },
         )
 
+    def test_screener_summary_is_compact_and_matches_full_fact_aggregates(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            full_payload = server.build_market_payload()
+            summary = server.build_market_summary()
+            token_catalog = server.build_token_market_catalog(
+                "BTC",
+                summary["metadata"]["start_date"],
+                summary["metadata"]["end_date"],
+            )
+
+        self.assertEqual(set(summary), {"metadata", "tokens"})
+        self.assertEqual(summary["metadata"]["response_scope"], "screener_summary")
+        self.assertEqual(summary["metadata"]["summary_version"], 1)
+        self.assertTrue(summary["metadata"]["data_generation"])
+        self.assertNotIn("markets", summary)
+        self.assertNotIn("cex_markets", summary)
+        self.assertNotIn("dex_pools", summary)
+        self.assertEqual(len(summary["tokens"]), 1)
+        self.assertEqual(
+            summary["metadata"]["data_generation"],
+            token_catalog["metadata"]["data_generation"],
+        )
+
+        compact = summary["tokens"][0]
+        original = full_payload["tokens"][0]
+        for field in (
+            "aggregate_cex_volume_usd",
+            "aggregate_dex_volume_usd",
+            "aggregate_volume_usd",
+            "aggregate_dex_volume_share",
+            "price_spread",
+            "spread_date",
+        ):
+            self.assertEqual(compact[field], original[field], field)
+        self.assertEqual(compact["market_count"], 3)
+        self.assertEqual(compact["cex_market_count"], 2)
+        self.assertEqual(compact["dex_market_count"], 1)
+        self.assertEqual(
+            sum(compact["quality_status_counts"].values()),
+            compact["market_count"],
+        )
+        self.assertEqual(compact["primary_cex"]["market_type"], "cex")
+        self.assertEqual(compact["primary_dex"]["market_type"], "dex")
+        self.assertNotIn("price_points", compact["primary_cex"])
+        self.assertNotIn("price_points", compact["primary_dex"])
+        for primary in (compact["primary_cex"], compact["primary_dex"]):
+            for field in (
+                "first_observed_date",
+                "latest_observed_date",
+                "coverage_ratio",
+                "total_depth_10bps_usd",
+                "total_depth_25bps_usd",
+                "total_depth_50bps_usd",
+                "total_depth_100bps_usd",
+                "depth_status",
+                "quality_flags",
+            ):
+                self.assertIn(field, primary)
+
+    def test_single_token_catalog_filters_and_preserves_window_metrics(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            token_catalog = server.build_token_market_catalog(" btc ")
+
+        self.assertEqual(token_catalog["token_symbol"], "BTC")
+        self.assertEqual(token_catalog["metadata"]["catalog_scope"], "single_token")
+        self.assertEqual(token_catalog["metadata"]["market_count"], 3)
+        self.assertTrue(token_catalog["metadata"]["data_generation"])
+        self.assertEqual(token_catalog["token_summary"]["token_symbol"], "BTC")
+        self.assertTrue(token_catalog["markets"])
+        self.assertTrue(
+            all(market["token_symbol"] == "BTC" for market in token_catalog["markets"])
+        )
+        self.assertTrue(
+            all("price_points" not in market for market in token_catalog["markets"])
+        )
+        binance = next(
+            market
+            for market in token_catalog["markets"]
+            if market["market_id"] == "cex:binance:BTC/USDT"
+        )
+        self.assertEqual(binance["window_metrics"]["price_usd"], 102)
+        self.assertEqual(binance["window_metrics"]["volume_usd"], 2200)
+
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            first_day_catalog = server.build_token_market_catalog(
+                "BTC",
+                "2026-01-01",
+                "2026-01-01",
+            )
+        first_day_binance = next(
+            market
+            for market in first_day_catalog["markets"]
+            if market["market_id"] == "cex:binance:BTC/USDT"
+        )
+        self.assertEqual(first_day_catalog["metadata"]["window_start"], "2026-01-01")
+        self.assertEqual(first_day_catalog["metadata"]["window_end"], "2026-01-01")
+        self.assertEqual(first_day_binance["window_metrics"]["price_usd"], 100)
+        self.assertEqual(first_day_binance["window_metrics"]["volume_usd"], 1000)
+
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "required"):
+                server.build_token_market_catalog("")
+            with self.assertRaisesRegex(ValueError, "not cataloged"):
+                server.build_token_market_catalog("ETH")
+
+    def test_screener_default_token_always_exists_in_selected_window(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            payload = server.build_market_payload()
+            catalog = server.build_market_catalog()
+        aave_markets = []
+        for market in catalog["markets"]:
+            aave_market = {
+                **market,
+                "token_symbol": "AAVE",
+                "market_id": market["market_id"].replace("BTC", "AAVE"),
+            }
+            aave_markets.append(aave_market)
+        catalog = {
+            **catalog,
+            "tokens": ["AAVE", *catalog["tokens"]],
+            "markets": [*aave_markets, *catalog["markets"]],
+        }
+
+        summary = server.market_summary_from_payload(payload, catalog)
+
+        response_tokens = {
+            token_summary["token_symbol"] for token_summary in summary["tokens"]
+        }
+        self.assertEqual(response_tokens, {"BTC"})
+        self.assertEqual(summary["metadata"]["default_workspace_token"], "BTC")
+        self.assertIn(
+            summary["metadata"]["default_workspace_token"],
+            response_tokens,
+        )
+
+    def test_public_generation_covers_sources_and_contract_but_not_query_window(self):
+        metadata = {
+            "available_end": "2026-01-02",
+            "catalog_version": 2,
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "sources": [],
+        }
+        first_signature = (
+            ("market_facts.sqlite3", 100, 1000),
+            ("cex_execution_cost_latest.csv", 200, 2000),
+        )
+        changed_execution_signature = (
+            ("market_facts.sqlite3", 100, 1000),
+            ("cex_execution_cost_latest.csv", 201, 2000),
+        )
+
+        first = server._public_data_generation(metadata, first_signature)
+        changed_execution = server._public_data_generation(
+            metadata,
+            changed_execution_signature,
+        )
+        changed_window = server._public_data_generation(
+            {**metadata, "start_date": "2025-12-01"},
+            first_signature,
+        )
+        with patch.object(server, "CATALOG_SUMMARY_VERSION", 2):
+            changed_contract = server._public_data_generation(
+                metadata,
+                first_signature,
+            )
+
+        self.assertNotEqual(first, changed_execution)
+        self.assertNotEqual(first, changed_contract)
+        self.assertEqual(first, changed_window)
+        same_stat_different_path = server._public_data_generation(
+            metadata,
+            (
+                ("/another-release/market_facts.sqlite3", 100, 1000),
+                ("cex_execution_cost_latest.csv", 200, 2000),
+            ),
+        )
+        self.assertNotEqual(first, same_stat_different_path)
+
+    def test_summary_rejects_missing_catalog_join_and_quality_status(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            payload = server.build_market_payload()
+            catalog = server.build_market_catalog()
+        missing_join_payload = {
+            **payload,
+            "tokens": [
+                *payload["tokens"],
+                {
+                    "token_symbol": "ETH",
+                    "primary_cex_id": None,
+                    "primary_dex_id": None,
+                },
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "missing from the market catalog"):
+            server.market_summary_from_payload(missing_join_payload, catalog)
+
+        for field, error in (
+            ("primary_cex_id", "Primary CEX market"),
+            ("primary_dex_id", "Primary DEX market"),
+        ):
+            broken_primary = {
+                **payload,
+                "tokens": [
+                    {
+                        **payload["tokens"][0],
+                        field: "missing-market-id",
+                    }
+                ],
+            }
+            with self.assertRaisesRegex(ValueError, error):
+                server.market_summary_from_payload(broken_primary, catalog)
+
+        invalid_market = {**catalog["markets"][0]}
+        invalid_market.pop("quality_status")
+        invalid_catalog = {
+            **catalog,
+            "markets": [invalid_market, *catalog["markets"][1:]],
+        }
+        with self.assertRaisesRegex(ValueError, "quality status"):
+            server.catalog_summary_from_catalog(invalid_catalog)
+
     def test_comparison_returns_raw_daily_facts_absolute_spread_and_bps(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
             result = server.build_market_comparison(
@@ -1218,11 +1440,16 @@ class MarketMonitorServerTest(unittest.TestCase):
     def test_public_api_response_cache_reuses_serialized_payload_and_invalidates(self):
         server._build_public_api_response_cached.cache_clear()
         signature = (("facts.sqlite3", 1, 100),)
+        next_signature = (("facts.sqlite3", 2, 100),)
         with patch.object(
             server,
             "build_market_catalog",
             return_value={"metadata": {}, "markets": []},
-        ) as build_catalog:
+        ) as build_catalog, patch.object(
+            server,
+            "api_source_signature",
+            side_effect=[signature, next_signature],
+        ):
             first = server._build_public_api_response_cached(
                 "catalog",
                 (),
@@ -1238,13 +1465,93 @@ class MarketMonitorServerTest(unittest.TestCase):
             invalidated = server._build_public_api_response_cached(
                 "catalog",
                 (),
-                (("facts.sqlite3", 2, 100),),
+                next_signature,
                 100,
             )
 
         self.assertEqual(first, second)
         self.assertEqual(first, invalidated)
         self.assertEqual(build_catalog.call_count, 2)
+
+    def test_public_response_discards_a_generation_that_changes_mid_build(self):
+        signature_a = (("/release-a/facts.sqlite3", 1, 100),)
+        signature_b = (("/release-b/facts.sqlite3", 1, 100),)
+        captured = []
+
+        def build_payload(route, query_items, source_signature=None):
+            captured.append(source_signature)
+            return {"metadata": {}, "markets": []}
+
+        server._build_public_api_response_cached.cache_clear()
+        with patch.object(
+            server,
+            "_build_public_api_payload",
+            side_effect=build_payload,
+        ), patch.object(
+            server,
+            "api_source_signature",
+            return_value=signature_b,
+        ):
+            with self.assertRaises(server.SourceGenerationChanged):
+                server._build_public_api_response_cached(
+                    "catalog",
+                    (),
+                    signature_a,
+                    100,
+                )
+
+        self.assertEqual(captured, [signature_a])
+
+    def test_all_missing_market_volume_remains_null_but_true_zero_is_zero(self):
+        cex_missing = server.summarize_cex(
+            [
+                {
+                    "date": "2026-01-01",
+                    "token_symbol": "BTC",
+                    "exchange": "binance",
+                    "cex_symbol": "BTC/USDT",
+                    "close": "100",
+                    "quote_volume_usd": "",
+                }
+            ],
+            "2026-01-01",
+            "2026-01-01",
+        )
+        dex_missing = server.summarize_dex(
+            [
+                {
+                    "date": "2026-01-01",
+                    "token_symbol": "BTC",
+                    "chain": "eth",
+                    "dex": "uniswap",
+                    "pool_address": "0xpool",
+                    "pool_name": "WBTC/USDC",
+                    "close": "100",
+                    "dex_volume_usd": "",
+                    "pool_tvl_usd": "",
+                }
+            ],
+            "2026-01-01",
+            "2026-01-01",
+        )
+        cex_zero = server.summarize_cex(
+            [
+                {
+                    "date": "2026-01-01",
+                    "token_symbol": "BTC",
+                    "exchange": "binance",
+                    "cex_symbol": "BTC/USDT",
+                    "close": "100",
+                    "quote_volume_usd": "0",
+                }
+            ],
+            "2026-01-01",
+            "2026-01-01",
+        )
+
+        self.assertIsNone(cex_missing[0]["volume_usd"])
+        self.assertIsNone(dex_missing[0]["volume_usd"])
+        self.assertEqual(cex_zero[0]["volume_usd"], 0)
 
     def test_public_api_cache_key_ignores_unsupported_query_fields(self):
         query = {
@@ -1255,6 +1562,47 @@ class MarketMonitorServerTest(unittest.TestCase):
 
         self.assertEqual(
             server.public_api_query_items("market", query),
+            (
+                ("start", "2026-01-01"),
+                ("end", "2026-01-02"),
+            ),
+        )
+        self.assertEqual(
+            server.public_api_query_items(
+                "catalog",
+                {
+                    "token": [" btc "],
+                    "start": ["2026-01-01"],
+                    "end": ["2026-01-02"],
+                    "unbounded": ["ignored"],
+                },
+            ),
+            (
+                ("token", "BTC"),
+                ("start", "2026-01-01"),
+                ("end", "2026-01-02"),
+            ),
+        )
+        self.assertEqual(
+            server.public_api_query_items(
+                "catalog",
+                {
+                    "start": ["2026-01-01"],
+                    "end": ["2026-01-02"],
+                    "unbounded": ["ignored"],
+                },
+            ),
+            (),
+        )
+        self.assertEqual(
+            server.public_api_query_items(
+                "summary",
+                {
+                    "start": ["2026-01-01"],
+                    "end": ["2026-01-02"],
+                    "token": ["ignored"],
+                },
+            ),
             (
                 ("start", "2026-01-01"),
                 ("end", "2026-01-02"),
@@ -1366,9 +1714,16 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn("new AbortController()", app_js)
         self.assertIn("comparisonController.abort()", app_js)
         self.assertIn("marketController.abort()", app_js)
+        self.assertIn("catalogController.abort()", app_js)
+        self.assertIn("fetch(`/api/markets/summary?", app_js)
+        self.assertIn("fetch(`/api/markets/catalog?", app_js)
+        self.assertNotIn('fetch("/api/markets/catalog")', app_js)
+        self.assertNotIn("fetch(`/api/market?", app_js)
+        self.assertIn("requestId !== app.routeRequestId", app_js)
+        self.assertIn("app.catalogsByToken.size > 8", app_js)
         comparison_loader = app_js[
             app_js.index("async function loadComparison()"):
-            app_js.index("async function loadCatalog()")
+            app_js.index("async function loadTokenCatalog(")
         ]
         market_loader = app_js[
             app_js.index("async function loadMarket("):

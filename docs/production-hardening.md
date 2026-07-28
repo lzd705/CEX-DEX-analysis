@@ -112,12 +112,28 @@ After switching either symlink:
 ```bash
 sudo systemctl restart cex-dex-dashboard.service
 python3 scripts/check_dashboard_health.py
+python3 scripts/check_dashboard_release.py --base-url http://127.0.0.1:8765
 ```
 
-If the health check fails, atomically switch the relevant symlink back to the
-previous known-good release or data snapshot, restart the service, and rerun
-the check. Do not delete the previous release or data snapshot until the new
-version has passed `/health`, catalog, compare, and browser smoke tests.
+For an unprivileged user service, use the same checks but restart with:
+
+```bash
+systemctl --user restart cex-dex-dashboard.service
+systemctl --user is-active cex-dex-dashboard.service
+python3 scripts/check_dashboard_health.py
+python3 scripts/check_dashboard_release.py --base-url http://127.0.0.1:8765
+```
+
+If `/health`, the executable release smoke, or browser smoke fails, atomically
+switch the relevant symlink back to the previous known-good release or data
+snapshot. Restart with either `sudo systemctl restart
+cex-dex-dashboard.service` or `systemctl --user restart
+cex-dex-dashboard.service`, matching the active supervisor, then rerun the full
+check set. Do not delete the previous release or data snapshot until the new
+version has passed `/health`, the Screener summary, one single-Token catalog,
+the full audit catalog, compare, quality, execution-cost, and browser smoke
+tests. The summary and Token catalog checks must also confirm a matching
+non-empty `data_generation`.
 
 ## CEX depth raw-response retention
 
@@ -151,10 +167,17 @@ or research reproducibility requirements demand longer retention.
 ## Cache generation behavior
 
 The process retains only the active published source generation. When SQLite,
-TVL, CEX depth, or DEX depth signatures change, all assembled payload,
-catalog, and encoded-response caches from the previous generation are cleared.
-The encoded response cache is also reset when its one-minute freshness bucket
-changes. Within one generation, large assembled payload caches retain at most
-eight date-window variants and the serialized-response cache retains at most
-32 variants. This prevents repeated publications or abnormal custom-window
-traffic from retaining hundreds of complete payloads in process memory.
+TVL, CEX depth, DEX depth, CEX execution cost, or DEX execution cost signatures
+change, all assembled payload, catalog, and encoded-response caches from the
+previous generation are cleared. The public generation identifier also
+includes the summary/catalog contract versions, so a schema deployment cannot
+reuse a browser catalog from an older contract. Source signatures include
+modification/change time, size, inode, and a path identity that is exposed only
+as a hash. If a publication crosses a cold response build, that response is
+discarded and retried instead of labeling old facts with a new generation. The
+encoded response cache is reset when its one-minute freshness bucket changes.
+Within one generation,
+large assembled payload caches retain at most eight date-window variants and
+the serialized-response cache retains at most 64 variants. This prevents
+repeated publications or abnormal custom-window traffic from retaining
+hundreds of complete payloads in process memory.
