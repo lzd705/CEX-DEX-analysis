@@ -20,6 +20,8 @@ class FrameworkStructureTest(unittest.TestCase):
             "scripts/run_dashboard.sh",
             "deploy/systemd/cex-dex-daily.timer",
             "deploy/systemd/cex-dex-depth.timer",
+            "deploy/systemd/cex-dex-daily-user.service.in",
+            "deploy/systemd/cex-dex-depth-user.service.in",
         ]
 
         for relative_path in required_paths:
@@ -48,9 +50,17 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertIn("--profile daily --publish-local", daily_service)
         self.assertNotIn("--fail-fast", daily_service)
         self.assertIn("TimeoutStartSec=75min", daily_service)
+        self.assertIn("User=@SERVICE_USER@", daily_service)
+        self.assertIn("--data-dir @MARKET_DATA_DIR@", daily_service)
+        self.assertIn("ReadWritePaths=@MARKET_DATA_DIR@", daily_service)
+        self.assertIn("ReadWritePaths=@MARKET_WORK_DIR@", daily_service)
         self.assertIn("--profile depth --publish-local", depth_service)
         self.assertNotIn("--fail-fast", depth_service)
         self.assertIn("TimeoutStartSec=30min", depth_service)
+        self.assertIn("User=@SERVICE_USER@", depth_service)
+        self.assertIn("--data-dir @MARKET_DATA_DIR@", depth_service)
+        self.assertIn("ReadWritePaths=@MARKET_DATA_DIR@", depth_service)
+        self.assertIn("ReadWritePaths=@MARKET_WORK_DIR@", depth_service)
 
     def test_framework_is_not_bound_to_render(self):
         self.assertFalse((PROJECT_ROOT / "render.yaml").exists())
@@ -95,7 +105,9 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertIn('class="token-row screener-token-row"', javascript)
         self.assertIn(".workspace-market-table", styles)
         self.assertNotIn("factor", (html + javascript).lower())
-        self.assertNotIn("admin", (html + javascript).lower())
+        self.assertNotIn('href="/admin', html.lower())
+        self.assertNotIn('data-app-view="admin"', html.lower())
+        self.assertNotIn("/api/admin/", javascript.lower())
 
     def test_administrator_is_a_separate_server_controlled_page(self):
         admin_html = (PROJECT_ROOT / "dashboard/static/admin.html").read_text(encoding="utf-8")
@@ -106,6 +118,10 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertIn('id="login-form"', admin_html)
         self.assertIn('id="refresh-form"', admin_html)
         self.assertIn("/api/admin/login", admin_javascript)
+        self.assertIn("/api/admin/quality/manual-review", admin_javascript)
+        self.assertIn('id="manual-review-body"', admin_html)
+        self.assertIn("Manual primary-source check", admin_javascript)
+        self.assertIn("queue_type: window.queue_type", admin_javascript)
         self.assertIn("require_admin(csrf=True)", server)
         self.assertIn("ADMIN_LOGIN_REQUIRED", admin_backend)
         self.assertNotIn("ADMIN_PASSWORD_HASH=", admin_html + admin_javascript)

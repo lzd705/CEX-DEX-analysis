@@ -594,6 +594,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT)
     parser.add_argument("--publish-local", action="store_true")
+    parser.add_argument(
+        "--publish-dir",
+        type=Path,
+        help="Explicit runtime directory for an atomic publication",
+    )
     parser.add_argument("--sleep-seconds", type=float, default=REQUEST_SLEEP_SECONDS)
     return parser.parse_args()
 
@@ -609,7 +614,11 @@ def main() -> None:
     result = publish_snapshot(
         rows,
         output_dir=args.output_dir,
-        publish_dir=DEFAULT_PUBLISH_DIR if args.publish_local else None,
+        publish_dir=(
+            args.publish_dir
+            if args.publish_dir is not None
+            else DEFAULT_PUBLISH_DIR if args.publish_local else None
+        ),
     )
     result.update(
         {

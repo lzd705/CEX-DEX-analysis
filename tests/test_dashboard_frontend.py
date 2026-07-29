@@ -8,6 +8,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = PROJECT_ROOT / "dashboard" / "static" / "app.js"
 INDEX_PATH = PROJECT_ROOT / "dashboard" / "static" / "index.html"
+STYLES_PATH = PROJECT_ROOT / "dashboard" / "static" / "styles.css"
 
 
 def run_app_javascript(source: str):
@@ -243,6 +244,11 @@ app.payload = {
   metadata: { response_scope: "screener_summary" },
   tokens: [],
 };
+global.document = {
+  getElementById(id) {
+    return id === "sort-field" ? { value: "volume" } : null;
+  },
+};
 app.selections = { AAVE: { cex: null, dex: null } };
 const html = screenerTokenRow({
   token_symbol: "AAVE",
@@ -325,6 +331,159 @@ console.log(JSON.stringify({
         self.assertEqual(result["spread"], 0.01)
         self.assertEqual(result["zeroReturn"], 0)
         self.assertIsNone(result["noCommonDateSpread"])
+
+    def test_screener_sort_keeps_missing_last_and_preserves_numeric_order(self):
+        result = run_app_javascript(
+            """
+const sortField = { value: "return" };
+global.document = {
+  getElementById(id) {
+    return id === "sort-field" ? sortField : null;
+  },
+};
+function token(symbol, windowReturn) {
+  const instrument = `${symbol}/USDT`;
+  return {
+    token_symbol: symbol,
+    primary_cex_id: `binance|${instrument}`,
+    primary_cex: {
+      market_type: "cex",
+      token_symbol: symbol,
+      venue: "binance",
+      instrument,
+      window_return: windowReturn,
+    },
+    primary_dex: null,
+  };
+}
+const rows = [
+  token("NEG_B", -0.2),
+  token("MISSING", null),
+  token("POS", 0.1),
+  token("ZERO", 0),
+  token("NEG_A", -0.2),
+];
+app.payload = {
+  metadata: { response_scope: "screener_summary" },
+  tokens: rows,
+};
+app.selections = {};
+app.selectionOverrides = {};
+app.scope = "cex";
+ensureSelections();
+app.sortDirection = "asc";
+const ascending = [...rows]
+  .sort(compareScreenerTokens)
+  .map((row) => row.token_symbol);
+app.sortDirection = "desc";
+const descending = [...rows]
+  .sort(compareScreenerTokens)
+  .map((row) => row.token_symbol);
+console.log(JSON.stringify({
+  ascending,
+  descending,
+  zeroValue: sortValue(rows.find((row) => row.token_symbol === "ZERO")),
+  missingValue: sortValue(rows.find((row) => row.token_symbol === "MISSING")),
+}));
+"""
+        )
+        self.assertEqual(
+            result["ascending"],
+            ["NEG_A", "NEG_B", "ZERO", "POS", "MISSING"],
+        )
+        self.assertEqual(
+            result["descending"],
+            ["POS", "ZERO", "NEG_A", "NEG_B", "MISSING"],
+        )
+        self.assertEqual(result["zeroValue"], 0)
+        self.assertEqual(result["missingValue"], None)
+
+    def test_sort_registry_forces_cross_spread_and_forbids_combined_returns(self):
+        result = run_app_javascript(
+            """
+console.log(JSON.stringify({
+  spread: SCREENER_SORT_DEFINITIONS.spread,
+  returns: SCREENER_SORT_DEFINITIONS.return,
+  volatility: SCREENER_SORT_DEFINITIONS.volatility,
+  tvl: SCREENER_SORT_DEFINITIONS.dex_tvl,
+}));
+"""
+        )
+        self.assertEqual(result["spread"]["allowedScopes"], ["cross"])
+        self.assertEqual(result["spread"]["defaultScope"], "cross")
+        self.assertNotIn("combined", result["returns"]["allowedScopes"])
+        self.assertEqual(result["returns"]["defaultScope"], "cex")
+        self.assertNotIn("combined", result["volatility"]["allowedScopes"])
+        self.assertEqual(result["volatility"]["defaultScope"], "cex")
+        self.assertEqual(result["tvl"]["allowedScopes"], ["dex"])
+
+    def test_rank_value_is_rendered_and_csv_carries_sort_contract(self):
+        result = run_app_javascript(
+            """
+const sortField = { value: "return" };
+global.document = {
+  getElementById(id) {
+    return id === "sort-field" ? sortField : null;
+  },
+};
+const tokenSummary = {
+  token_symbol: "AAVE",
+  primary_cex_id: "binance|AAVE/USDT",
+  primary_cex: {
+    market_type: "cex",
+    token_symbol: "AAVE",
+    venue: "binance",
+    instrument: "AAVE/USDT",
+    window_return: -0.02,
+  },
+  primary_dex: null,
+  market_count: 1,
+  cex_market_count: 1,
+  dex_market_count: 0,
+  quality_status_counts: { ok: 1 },
+  aggregate_cex_volume_usd: 10,
+  aggregate_dex_volume_usd: null,
+  aggregate_volume_usd: 10,
+  aggregate_dex_volume_share: null,
+  price_spread: null,
+};
+app.payload = {
+  metadata: {
+    response_scope: "screener_summary",
+    start_date: "2026-07-01",
+    end_date: "2026-07-28",
+  },
+  tokens: [tokenSummary],
+};
+app.selections = {};
+app.selectionOverrides = {};
+app.scope = "cex";
+app.sortDirection = "desc";
+ensureSelections();
+console.log(JSON.stringify({
+  html: screenerTokenRow(tokenSummary),
+  rankValue: formatRankValue(tokenSummary),
+}));
+"""
+        )
+        self.assertIn('data-label="Rank value"', result["html"])
+        self.assertIn("-2%", result["html"])
+        self.assertEqual(result["rankValue"], "-2%")
+
+        app_js = APP_PATH.read_text(encoding="utf-8")
+        export_source = app_js[
+            app_js.index("function exportVisibleCsv()"):
+            app_js.index("function bindEvents()")
+        ]
+        for field in (
+            "rank_metric",
+            "rank_scope",
+            "rank_direction",
+            "rank_value",
+            "rank_eligible",
+        ):
+            self.assertIn(f'"{field}"', export_source)
+        self.assertIn("const rankValue = sortValue(tokenSummary);", export_source)
 
     def test_execution_helpers_preserve_zero_and_distinguish_missing(self):
         result = run_app_javascript(
@@ -419,19 +578,24 @@ console.log(JSON.stringify(qualityFlagObjects({
         self.assertEqual(by_code["depth_unsupported"], "warning")
         self.assertEqual(by_code["depth_failed"], "critical")
 
-    def test_html_declares_all_three_views_and_core_workspace_controls(self):
+    def test_html_declares_two_views_and_core_workspace_controls(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
-        for view in ("screener", "workspace", "methodology"):
+        for view in ("screener", "workspace"):
             self.assertIn(f'data-app-view="{view}"', index)
+        self.assertNotIn('data-app-view="methodology"', index)
+        self.assertNotIn('data-app-route="methodology"', index)
         for page in ("markets", "compare", "liquidity", "quality"):
             self.assertIn(f'data-workspace-view="{page}"', index)
         self.assertIn('id="execution-notional"', index)
         self.assertIn('data-execution-direction="buy_token"', index)
         self.assertIn('data-quality-scope="selected"', index)
+        self.assertIn('id="sort-field"', index)
+        self.assertIn('id="sort-direction"', index)
+        self.assertIn('id="rank-value-heading"', index)
         self.assertIn('id="workspace-market-body"', index)
         self.assertIn('id="route-announcer"', index)
         self.assertIn(
-            "Daily quality and coverage audit the full catalog history",
+            "Daily quality and coverage use the selected date window",
             index,
         )
 
@@ -451,32 +615,229 @@ console.log(JSON.stringify(qualityFlagObjects({
             initializer.index("readDefaultMarketCache()"),
         )
 
-    def test_methodology_starts_without_facts_but_navigation_lazily_loads_summary(self):
+    def test_screener_deep_link_controls_are_hydrated_before_data_load(self):
+        result = run_app_javascript(
+            """
+const elements = {
+  "token-search": { value: "" },
+  "sort-field": { value: "volume" },
+  "sort-direction": { value: "desc" },
+  "date-start": { value: "" },
+  "date-end": { value: "" },
+  "rank-value-heading": { textContent: "", title: "" },
+  "time-toolbar": { hidden: true },
+};
+const scopeButtons = ["combined", "cross", "cex", "dex"].map((scope) => ({
+  dataset: { scope },
+  textContent: scope,
+  disabled: false,
+  active: false,
+  attributes: {},
+  classList: {
+    toggle(name, active) {
+      if (name === "active") this.owner.active = active;
+    },
+    owner: null,
+  },
+  setAttribute(name, value) {
+    this.attributes[name] = value;
+  },
+}));
+scopeButtons.forEach((button) => {
+  button.classList.owner = button;
+});
+const appViews = [
+  { dataset: { appView: "screener" }, hidden: true },
+  { dataset: { appView: "workspace" }, hidden: false },
+];
+global.document = {
+  getElementById(id) {
+    return elements[id] || null;
+  },
+  querySelectorAll(selector) {
+    if (selector === "[data-scope]") return scopeButtons;
+    if (selector === "[data-app-view]") return appViews;
+    return [];
+  },
+};
+primeInitialRouteView({
+  kind: "screener",
+  filters: {
+    q: "aave",
+    sort: "return",
+    scope: "dex",
+    dir: "asc",
+    start: "2026-07-01",
+    end: "2026-07-28",
+  },
+});
+console.log(JSON.stringify({
+  searchQuery: app.searchQuery,
+  tokenSearch: elements["token-search"].value,
+  sort: elements["sort-field"].value,
+  scope: app.scope,
+  direction: app.sortDirection,
+  directionControl: elements["sort-direction"].value,
+  start: elements["date-start"].value,
+  end: elements["date-end"].value,
+  activeScope: scopeButtons.find((button) => button.active)?.dataset.scope,
+  screenerVisible: !appViews[0].hidden,
+  workspaceHidden: appViews[1].hidden,
+  toolbarVisible: !elements["time-toolbar"].hidden,
+}));
+"""
+        )
+        self.assertEqual(result["searchQuery"], "AAVE")
+        self.assertEqual(result["tokenSearch"], "aave")
+        self.assertEqual(result["sort"], "return")
+        self.assertEqual(result["scope"], "dex")
+        self.assertEqual(result["direction"], "asc")
+        self.assertEqual(result["directionControl"], "asc")
+        self.assertEqual(result["start"], "2026-07-01")
+        self.assertEqual(result["end"], "2026-07-28")
+        self.assertEqual(result["activeScope"], "dex")
+        self.assertTrue(result["screenerVisible"])
+        self.assertTrue(result["workspaceHidden"])
+        self.assertTrue(result["toolbarVisible"])
+
+    def test_removed_methodology_has_no_frontend_view_or_dead_route_branches(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
         app_js = APP_PATH.read_text(encoding="utf-8")
-        router = app_js[
-            app_js.index("async function applyRouteFromLocation()"):
-            app_js.index("function validateDateRange(")
+        self.assertNotIn("Methodology", index)
+        self.assertNotIn('setActiveAppView("methodology")', app_js)
+        self.assertNotIn('route.kind === "methodology"', app_js)
+        self.assertNotIn('initialRoute.kind === "methodology"', app_js)
+        for source_id in (
+            "facts-contract-copy",
+            "facts-source-copy",
+            "source-list",
+            "daily-source-status",
+            "tvl-source-status",
+            "depth-source-status",
+            "dex-depth-source-status",
+            "execution-source-status",
+        ):
+            self.assertIn(f'id="{source_id}"', index)
+
+    def test_date_apply_button_is_inside_the_date_range_form(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        self.assertIn('<form id="date-window-form"', index)
+        form_start = index.index('<form id="date-window-form"')
+        form_end = index.index("</form>", form_start)
+        form = index[form_start:form_end]
+        self.assertIn('id="date-start"', form)
+        self.assertIn('id="date-end"', form)
+        self.assertIn('id="apply-window"', form)
+        self.assertIn('type="submit"', form)
+
+    def test_date_error_is_inline_only_and_updates_input_accessibility_state(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        form_start = index.index('<form id="date-window-form"')
+        form_end = index.index("</form>", form_start)
+        form = index[form_start:form_end]
+        self.assertEqual(form.count('aria-describedby="date-window-error"'), 2)
+        self.assertEqual(form.count('aria-invalid="false"'), 2)
+
+        app_js = APP_PATH.read_text(encoding="utf-8")
+        apply_window = app_js[
+            app_js.index("async function applyWindow()"):
+            app_js.index("function persistSelectedPair()")
         ]
-        initializer = app_js[
-            app_js.index("async function initialize()"):
-            app_js.index('if (typeof document !== "undefined") initialize();')
+        invalid_branch = apply_window[
+            apply_window.index("if (dateError)"):
+            apply_window.index('showDateWindowError("");')
         ]
-        self.assertIn('if (route.kind === "methodology")', router)
-        self.assertIn("if (!app.payload)", router)
-        self.assertIn("await loadMarket(start, end);", router)
-        self.assertIn('if (initialRoute.kind === "methodology")', initializer)
-        self.assertNotIn(
-            'initialRoute.kind === "workspace" && initialRoute.page === "compare"',
-            initializer,
+        self.assertIn("showDateWindowError(dateError);", invalid_branch)
+        self.assertNotIn("showError(", invalid_branch)
+        self.assertNotIn("clearComparisonResult(", invalid_branch)
+
+        result = run_app_javascript(
+            """
+function inputControl() {
+  return {
+    attributes: {},
+    setAttribute(name, value) {
+      this.attributes[name] = value;
+    },
+  };
+}
+const start = inputControl();
+const end = inputControl();
+const error = { hidden: true, textContent: "" };
+global.document = {
+  getElementById(id) {
+    return {
+      "date-start": start,
+      "date-end": end,
+      "date-window-error": error,
+    }[id] || null;
+  },
+};
+showDateWindowError("Choose both dates.");
+const invalid = {
+  start: start.attributes["aria-invalid"],
+  end: end.attributes["aria-invalid"],
+  hidden: error.hidden,
+  message: error.textContent,
+};
+showDateWindowError("");
+console.log(JSON.stringify({
+  invalid,
+  cleared: {
+    start: start.attributes["aria-invalid"],
+    end: end.attributes["aria-invalid"],
+    hidden: error.hidden,
+    message: error.textContent,
+  },
+}));
+"""
         )
-        self.assertLess(
-            initializer.index('if (initialRoute.kind === "methodology")'),
-            initializer.index("readDefaultMarketCache()"),
+        self.assertEqual(result["invalid"]["start"], "true")
+        self.assertEqual(result["invalid"]["end"], "true")
+        self.assertFalse(result["invalid"]["hidden"])
+        self.assertEqual(result["invalid"]["message"], "Choose both dates.")
+        self.assertEqual(result["cleared"]["start"], "false")
+        self.assertEqual(result["cleared"]["end"], "false")
+        self.assertTrue(result["cleared"]["hidden"])
+        self.assertEqual(result["cleared"]["message"], "")
+
+    def test_monitor_toolbar_wraps_before_the_observed_overflow_width(self):
+        styles = STYLES_PATH.read_text(encoding="utf-8")
+        breakpoint_start = styles.index("@media (max-width: 1320px)")
+        breakpoint_end = styles.index("@media (max-width: 1100px)", breakpoint_start)
+        breakpoint_rule = styles[breakpoint_start:breakpoint_end]
+        self.assertIn(".monitor-toolbar { flex-wrap: wrap; }", breakpoint_rule)
+
+    def test_public_error_message_hides_server_checked_paths(self):
+        result = run_app_javascript(
+            """
+console.log(JSON.stringify({
+  hidden: publicErrorMessage(
+    new Error(
+      "No detailed market snapshot found. Checked: "
+      + "/home/service/data/cex_markets.csv, /private/tmp/dex_pools.csv",
+    ),
+    "Market data is unavailable.",
+  ),
+  ordinary: publicErrorMessage(
+    new Error("The selected date window is unavailable."),
+    "Market data is unavailable.",
+  ),
+  fallback: publicErrorMessage(new Error(""), "Market data is unavailable."),
+}));
+"""
         )
-        self.assertNotIn("locationKey", router)
-        self.assertIn("const latestRoute = navigation.parseRoute(", router)
-        self.assertIn("route = { ...latestRoute, token: exactToken };", router)
-        self.assertIn("setWorkspaceCatalogLoading(provisionalToken", router)
+        self.assertEqual(
+            result["hidden"],
+            "No detailed market snapshot found.",
+        )
+        self.assertNotIn("/home/", result["hidden"])
+        self.assertNotIn("/private/", result["hidden"])
+        self.assertEqual(
+            result["ordinary"],
+            "The selected date window is unavailable.",
+        )
+        self.assertEqual(result["fallback"], "Market data is unavailable.")
 
     def test_workspace_window_change_reloads_matching_summary_and_catalog_in_order(self):
         app_js = APP_PATH.read_text(encoding="utf-8")

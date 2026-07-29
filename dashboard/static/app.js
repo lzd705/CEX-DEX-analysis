@@ -11,6 +11,7 @@ const app = {
   eventFacts: null,
   quality: null,
   scope: "combined",
+  sortDirection: "desc",
   workspaceMarketType: "all",
   qualityScope: "all",
   liquidityView: "total",
@@ -89,26 +90,85 @@ const QUALITY_FLAG_LABELS = {
   wide_quoted_spread: "Wide quoted spread",
   low_daily_coverage: "Low daily coverage",
   stale_snapshot: "Stale snapshot",
+  daily_collection_failed: "Daily collection failed",
+  daily_needs_review: "Daily source outcome needs review",
+  daily_backfill_pending: "Daily backfill pending",
+  daily_source_no_observation: "Daily source returned no candle",
 };
 const QUALITY_FLAG_DEFAULT_SEVERITIES = {
   depth_unavailable: "info",
-  depth_unsupported: "warning",
-  unsupported_depth: "warning",
-  depth_partial: "warning",
-  partial_depth: "warning",
+  depth_unsupported: "info",
+  unsupported_depth: "info",
+  depth_partial: "info",
+  partial_depth: "info",
   depth_failed: "critical",
   failed_depth: "critical",
   depth_not_cataloged: "info",
-  zero_depth_10bps: "warning",
-  zero_depth_inside_spread: "warning",
-  tiny_pool: "warning",
+  zero_depth_10bps: "info",
+  zero_depth_inside_spread: "info",
+  tiny_pool: "info",
   off_market_pool_state_price: "warning",
   off_market_price: "warning",
-  wide_quoted_spread: "warning",
+  wide_quoted_spread: "info",
   low_daily_coverage: "warning",
   stale_snapshot: "warning",
+  daily_collection_failed: "critical",
+  daily_needs_review: "warning",
+  daily_backfill_pending: "warning",
+  daily_source_no_observation: "info",
+};
+const DAILY_QUALITY_REASON_LABELS = {
+  network: "Network request failed",
+  rate_limit: "Source rate limit",
+  source_unavailable: "Source unavailable",
+  parse: "Response parsing failed",
+  validation: "Response validation failed",
+  no_candles: "Source returned no candle",
+  not_listed: "Instrument not listed",
+  source_range_unavailable: "Requested source history unavailable",
+  stale_market_lifecycle_unknown: "Market lifecycle needs review",
+  missing_unexplained: "No matching collection attempt",
+  daily_audit_no_matching_issue: "No exact published audit issue",
 };
 const QUALITY_SEVERITY_RANK = { info: 1, warning: 2, critical: 3 };
+const SCREENER_SORT_DEFINITIONS = Object.freeze({
+  volume: Object.freeze({
+    label: "USD Volume",
+    allowedScopes: Object.freeze(["combined", "cex", "dex"]),
+    defaultScope: "combined",
+    snapshot: false,
+  }),
+  spread: Object.freeze({
+    label: "Absolute Primary Price Gap",
+    allowedScopes: Object.freeze(["cross"]),
+    defaultScope: "cross",
+    snapshot: false,
+  }),
+  return: Object.freeze({
+    label: "Window Return",
+    allowedScopes: Object.freeze(["cex", "dex"]),
+    defaultScope: "cex",
+    snapshot: false,
+  }),
+  volatility: Object.freeze({
+    label: "Daily Volatility",
+    allowedScopes: Object.freeze(["cex", "dex"]),
+    defaultScope: "cex",
+    snapshot: false,
+  }),
+  depth_100bps: Object.freeze({
+    label: "Primary ±100 bps Depth",
+    allowedScopes: Object.freeze(["cex", "dex"]),
+    defaultScope: "cex",
+    snapshot: true,
+  }),
+  dex_tvl: Object.freeze({
+    label: "Primary DEX TVL",
+    allowedScopes: Object.freeze(["dex"]),
+    defaultScope: "dex",
+    snapshot: true,
+  }),
+});
 
 const byId = (id) => document.getElementById(id);
 const compactCurrency = new Intl.NumberFormat("en-US", {
@@ -279,11 +339,13 @@ function currentScreenerFilters() {
     q: byId("token-search")?.value.trim() || "",
     scope: app.scope,
     sort: byId("sort-field")?.value || "volume",
+    dir: app.sortDirection,
     start: byId("date-start")?.value || "",
     end: byId("date-end")?.value || "",
   };
   if (filters.scope === "combined") delete filters.scope;
   if (filters.sort === "volume") delete filters.sort;
+  if (filters.dir === "desc") delete filters.dir;
   const metadata = app.payload?.metadata || app.defaultPayload?.metadata;
   const defaultWindow = normalizedMarketWindow("", "");
   if (
@@ -384,8 +446,6 @@ function replaceCurrentRoute() {
   let path;
   if (app.route.kind === "workspace") {
     path = currentWorkspacePath(app.route.page);
-  } else if (app.route.kind === "methodology") {
-    path = navigation.buildMethodologyPath(app.route.anchor);
   } else {
     path = navigation.buildScreenerPath(currentScreenerFilters());
   }
@@ -406,8 +466,6 @@ function canonicalizeCurrentRoute() {
   let path;
   if (app.route.kind === "workspace") {
     path = currentWorkspacePath(app.route.page);
-  } else if (app.route.kind === "methodology") {
-    path = navigation.buildMethodologyPath(app.route.anchor);
   } else {
     path = navigation.buildScreenerPath(currentScreenerFilters());
   }
@@ -576,7 +634,7 @@ function syncMarketPayloadForWindow(start, end) {
     invalidateMarketRequest();
     hideStatus(byId("market-loading"));
     byId("market-panel").setAttribute("aria-busy", "false");
-    byId("apply-window").disabled = false;
+    setDateWindowDisabled(false);
     byId("export-csv").disabled = !app.payload;
   }
   if (marketPayloadMatchesWindow(app.payload, normalized.start, normalized.end)) return;
@@ -614,7 +672,6 @@ function routeTitle(route) {
     };
     return `${route.token} ${labels[route.page]} · CEX / DEX Market Monitor`;
   }
-  if (route.kind === "methodology") return "Methodology · CEX / DEX Market Monitor";
   return "Market Screener · CEX / DEX Market Monitor";
 }
 
@@ -622,28 +679,40 @@ function announceRoute(route) {
   document.title = routeTitle(route);
   const label = route.kind === "workspace"
     ? `${route.token} ${route.page} page`
-    : route.kind === "methodology"
-      ? "Methodology page"
-      : "Market Screener page";
+    : "Market Screener page";
   byId("route-announcer").textContent = `Showing ${label}.`;
+}
+
+function hydrateScreenerControls(route, { normalizeWindow = true } = {}) {
+  app.searchQuery = (route.filters?.q || "").toUpperCase();
+  byId("token-search").value = route.filters?.q || "";
+  const sortKey = SCREENER_SORT_DEFINITIONS[route.filters?.sort]
+    ? route.filters.sort
+    : "volume";
+  byId("sort-field").value = sortKey;
+  const definition = SCREENER_SORT_DEFINITIONS[sortKey];
+  app.scope = definition.allowedScopes.includes(route.filters?.scope)
+    ? route.filters.scope
+    : definition.defaultScope;
+  app.sortDirection = ["asc", "desc"].includes(route.filters?.dir)
+    ? route.filters.dir
+    : "desc";
+  byId("sort-direction").value = app.sortDirection;
+  syncScreenerSortControls();
+  const window = normalizeWindow
+    ? normalizedMarketWindow(route.filters?.start, route.filters?.end)
+    : {
+        start: route.filters?.start || "",
+        end: route.filters?.end || "",
+      };
+  byId("date-start").value = window.start;
+  byId("date-end").value = window.end;
+  return window;
 }
 
 function applyScreenerRoute(route) {
   app.route = route;
-  app.searchQuery = (route.filters?.q || "").toUpperCase();
-  byId("token-search").value = route.filters?.q || "";
-  app.scope = ["combined", "cex", "dex"].includes(route.filters?.scope)
-    ? route.filters.scope
-    : "combined";
-  document.querySelectorAll("[data-scope]").forEach((button) => {
-    const active = button.dataset.scope === app.scope;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
-  byId("sort-field").value = route.filters?.sort || "volume";
-  const window = normalizedMarketWindow(route.filters?.start, route.filters?.end);
-  byId("date-start").value = window.start;
-  byId("date-end").value = window.end;
+  const window = hydrateScreenerControls(route);
   syncTimePresetButtons();
   setActiveAppView("screener");
   byId("time-toolbar").hidden = false;
@@ -747,17 +816,6 @@ function applyWorkspaceRoute(route) {
   }
   if (route.page === "quality") loadQuality();
   if (route.page === "events") loadEvents();
-}
-
-function applyMethodologyRoute(route) {
-  app.route = route;
-  setActiveAppView("methodology");
-  byId("time-toolbar").hidden = true;
-  if (route.anchor) {
-    window.requestAnimationFrame(() => {
-      byId(route.anchor)?.scrollIntoView({ block: "start" });
-    });
-  }
 }
 
 function invalidateRouteRequest() {
@@ -945,58 +1003,54 @@ async function applyRouteFromLocation() {
     invalidateMarketRequest();
     hideStatus(byId("market-loading"));
     byId("market-panel").setAttribute("aria-busy", "false");
-    byId("apply-window").disabled = false;
+    setDateWindowDisabled(false);
     byId("export-csv").disabled = !app.payload;
   }
   const requestId = invalidateRouteRequest();
   let route = navigation.parseRoute(window.location.pathname, window.location.search);
   if (route.kind !== "unknown") app.route = route;
-  if (route.kind === "methodology") {
-    hideError(byId("global-error"));
-    applyMethodologyRoute(route);
+  if (route.kind === "workspace") {
+    const provisionalToken = String(route.token || "").toUpperCase();
+    const provisionalWindow = app.payload
+      ? compareRouteWindow(route)
+      : { start: "", end: "" };
+    const provisionalKey = tokenCatalogCacheKey(
+      provisionalToken,
+      provisionalWindow.start,
+      provisionalWindow.end,
+      app.payload?.metadata?.data_generation,
+    );
+    setActiveAppView("workspace");
+    setActiveWorkspacePage(route.page);
+    setWorkspaceCatalogLoading(provisionalToken, route.page, provisionalKey);
   } else {
-    if (route.kind === "workspace") {
-      const provisionalToken = String(route.token || "").toUpperCase();
-      const provisionalWindow = app.payload
-        ? compareRouteWindow(route)
-        : { start: "", end: "" };
-      const provisionalKey = tokenCatalogCacheKey(
-        provisionalToken,
-        provisionalWindow.start,
-        provisionalWindow.end,
-        app.payload?.metadata?.data_generation,
-      );
-      setActiveAppView("workspace");
-      setActiveWorkspacePage(route.page);
-      setWorkspaceCatalogLoading(provisionalToken, route.page, provisionalKey);
-    } else {
-      setActiveAppView("screener");
-      byId("time-toolbar").hidden = false;
-    }
-    if (!app.payload) {
-      const start = route.kind === "screener"
-        ? route.filters?.start || ""
-        : route.kind === "workspace"
-          ? route.state?.start || ""
-          : "";
-      const end = route.kind === "screener"
-        ? route.filters?.end || ""
-        : route.kind === "workspace"
-          ? route.state?.end || ""
-          : "";
-      const loaded = await loadMarket(start, end);
-      if (requestId !== app.routeRequestId) return;
-      if (!loaded || !app.payload) {
-        if (route.kind === "workspace") {
-          setWorkspaceDataUnavailable(
-            String(route.token || "").toUpperCase(),
-            "The Screener summary required for this Token could not be loaded.",
-          );
-        }
-        return;
+    setActiveAppView("screener");
+    byId("time-toolbar").hidden = false;
+  }
+  if (!app.payload) {
+    const start = route.kind === "screener"
+      ? route.filters?.start || ""
+      : route.kind === "workspace"
+        ? route.state?.start || ""
+        : "";
+    const end = route.kind === "screener"
+      ? route.filters?.end || ""
+      : route.kind === "workspace"
+        ? route.state?.end || ""
+        : "";
+    const loaded = await loadMarket(start, end);
+    if (requestId !== app.routeRequestId) return;
+    if (!loaded || !app.payload) {
+      if (route.kind === "workspace") {
+        setWorkspaceDataUnavailable(
+          String(route.token || "").toUpperCase(),
+          "The Screener summary required for this Token could not be loaded.",
+        );
       }
+      return;
     }
-    if (route.kind === "workspace") {
+  }
+  if (route.kind === "workspace") {
       const requestedWindow = compareRouteWindow(route);
       if (
         !marketPayloadMatchesWindow(
@@ -1105,7 +1159,8 @@ async function applyRouteFromLocation() {
           if (error.name === "AbortError" || requestId !== app.routeRequestId) return;
           app.catalogController = null;
           const message = (
-            `The ${exactToken} market catalog failed to load: ${error.message || String(error)}`
+            `The ${exactToken} market catalog failed to load: `
+            + publicErrorMessage(error, "Market catalog is unavailable.")
           );
           setWorkspaceDataUnavailable(exactToken, message);
           showError(
@@ -1115,12 +1170,11 @@ async function applyRouteFromLocation() {
           return;
         }
       }
-    } else if (route.kind === "screener") {
-      applyScreenerRoute(route);
-    } else {
-      window.history.replaceState({}, "", "/screener");
-      applyScreenerRoute(navigation.parseRoute("/screener", ""));
-    }
+  } else if (route.kind === "screener") {
+    applyScreenerRoute(route);
+  } else {
+    window.history.replaceState({}, "", "/screener");
+    applyScreenerRoute(navigation.parseRoute("/screener", ""));
   }
   if (requestId !== app.routeRequestId) return;
   app.routeReady = true;
@@ -1133,11 +1187,50 @@ async function applyRouteFromLocation() {
 function validateDateRange(
   start = byId("date-start").value,
   end = byId("date-end").value,
+  { required = false } = {},
 ) {
+  if (required && (!start || !end)) {
+    return "Choose both a start date and an end date.";
+  }
+  const isoDate = /^\d{4}-\d{2}-\d{2}$/;
+  const validIsoDate = (value) => {
+    if (!isoDate.test(value)) return false;
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+  };
+  if ((start && !validIsoDate(start)) || (end && !validIsoDate(end))) {
+    return "Dates must use the YYYY-MM-DD format.";
+  }
   if (start && end && start > end) {
     return "Start date must not be after end date.";
   }
+  const availableStart = app.payload?.metadata?.available_start || "";
+  const availableEnd = app.payload?.metadata?.available_end || "";
+  if (availableStart && start && start < availableStart) {
+    return `Start date must be on or after ${availableStart}.`;
+  }
+  if (availableEnd && end && end > availableEnd) {
+    return `End date must be on or before ${availableEnd}.`;
+  }
   return "";
+}
+
+function showDateWindowError(message) {
+  const invalid = Boolean(message);
+  ["date-start", "date-end"].forEach((id) => {
+    byId(id)?.setAttribute("aria-invalid", String(invalid));
+  });
+  const element = byId("date-window-error");
+  if (!element) return;
+  if (message) showError(element, message);
+  else hideError(element);
+}
+
+function setDateWindowDisabled(disabled) {
+  document.querySelectorAll("#date-window-form input, #date-window-form button")
+    .forEach((control) => {
+      control.disabled = disabled;
+    });
 }
 
 function showStatus(element, message, state = "") {
@@ -1236,20 +1329,69 @@ function aggregateFacts(tokenSummary, cexOptions, dexOptions) {
   return { aggregateCex, aggregateDex, aggregateTotal, aggregateDexShare };
 }
 
+function currentScreenerSortDefinition() {
+  return SCREENER_SORT_DEFINITIONS[byId("sort-field")?.value]
+    || SCREENER_SORT_DEFINITIONS.volume;
+}
+
+function syncScreenerSortControls() {
+  const definition = currentScreenerSortDefinition();
+  if (!definition.allowedScopes.includes(app.scope)) {
+    app.scope = definition.defaultScope;
+  }
+  document.querySelectorAll("[data-scope]").forEach((button) => {
+    const allowed = definition.allowedScopes.includes(button.dataset.scope);
+    const active = allowed && button.dataset.scope === app.scope;
+    button.disabled = !allowed;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+    button.setAttribute(
+      "aria-label",
+      allowed
+        ? `${button.textContent.trim()} ranking scope`
+        : `${button.textContent.trim()} is not available for ${definition.label}`,
+    );
+  });
+  const scopeLabel = {
+    combined: "Aggregate",
+    cross: "Cross-venue",
+    cex: "Primary CEX",
+    dex: "Primary DEX",
+  }[app.scope] || app.scope;
+  const directionLabel = app.sortDirection === "asc"
+    ? "Lowest first"
+    : "Highest first";
+  const rankHeading = byId("rank-value-heading");
+  if (rankHeading) {
+    rankHeading.textContent = `${definition.label} · ${scopeLabel}`;
+    rankHeading.title = (
+      `${directionLabel}. Missing, failed, and unsupported values stay last.`
+      + (definition.snapshot ? " This Fact is a latest snapshot." : "")
+    );
+  }
+}
+
 function sortValue(tokenSummary) {
   const aggregates = aggregateFacts(tokenSummary, [], []);
   const { cex, dex, spread } = comparison(tokenSummary);
   const field = byId("sort-field").value;
   if (field === "spread") return finite(spread) ? Math.abs(spread) : -Infinity;
   if (field === "return") {
-    if (app.scope === "cex") return cex?.window_return ?? -Infinity;
-    if (app.scope === "dex") return dex?.window_return ?? -Infinity;
-    return Math.max(cex?.window_return ?? -Infinity, dex?.window_return ?? -Infinity);
+    const value = app.scope === "dex" ? dex?.window_return : cex?.window_return;
+    return finite(value) ? value : -Infinity;
   }
   if (field === "volatility") {
-    if (app.scope === "cex") return cex?.daily_volatility ?? -Infinity;
-    if (app.scope === "dex") return dex?.daily_volatility ?? -Infinity;
-    return Math.max(cex?.daily_volatility ?? -Infinity, dex?.daily_volatility ?? -Infinity);
+    const value = app.scope === "dex" ? dex?.daily_volatility : cex?.daily_volatility;
+    return finite(value) ? value : -Infinity;
+  }
+  if (field === "depth_100bps") {
+    const value = app.scope === "dex"
+      ? dex?.total_depth_100bps_usd
+      : cex?.total_depth_100bps_usd;
+    return finite(value) ? value : -Infinity;
+  }
+  if (field === "dex_tvl") {
+    return finite(dex?.tvl_usd) ? dex.tvl_usd : -Infinity;
   }
   if (app.scope === "cex") {
     return finite(aggregates.aggregateCex) ? aggregates.aggregateCex : -Infinity;
@@ -1260,6 +1402,31 @@ function sortValue(tokenSummary) {
   return finite(aggregates.aggregateTotal) ? aggregates.aggregateTotal : -Infinity;
 }
 
+function compareScreenerTokens(a, b) {
+  const valueA = sortValue(a);
+  const valueB = sortValue(b);
+  const missingA = !finite(valueA);
+  const missingB = !finite(valueB);
+  if (missingA && missingB) {
+    return a.token_symbol.localeCompare(b.token_symbol);
+  }
+  if (missingA) return 1;
+  if (missingB) return -1;
+  const compared = app.sortDirection === "asc"
+    ? valueA - valueB
+    : valueB - valueA;
+  return compared || a.token_symbol.localeCompare(b.token_symbol);
+}
+
+function formatRankValue(tokenSummary) {
+  const value = sortValue(tokenSummary);
+  if (!finite(value)) return "N/A";
+  const field = byId("sort-field").value;
+  if (field === "spread") return `${bpsFormat.format(value * 10_000)} bps`;
+  if (field === "return" || field === "volatility") return formatPercent(value);
+  return formatCurrency(value);
+}
+
 function metricClass(value) {
   if (!finite(value) || value === 0) return "";
   return value > 0 ? "positive" : "negative";
@@ -1268,9 +1435,10 @@ function metricClass(value) {
 function qualityFlagObjects(row, market) {
   if (!row) return [];
   const suppliedDetails = Array.isArray(row?.quality_flag_details)
-    ? row.quality_flag_details.map((flag) => ({
+      ? row.quality_flag_details.map((flag) => ({
         code: flag.code,
         severity: flag.severity || "warning",
+        category: flag.category || "data_health",
         explanation: flag.explanation || flag.message || "",
         observedValue: flag.observed_value ?? flag.observedValue ?? null,
         threshold: flag.threshold ?? null,
@@ -1282,6 +1450,7 @@ function qualityFlagObjects(row, market) {
           ? {
               code: flag,
               severity: QUALITY_FLAG_DEFAULT_SEVERITIES[flag] || "warning",
+              category: "data_health",
               explanation: "",
               observedValue: null,
               threshold: null,
@@ -1289,6 +1458,7 @@ function qualityFlagObjects(row, market) {
           : {
               code: flag.code,
               severity: flag.severity || "warning",
+              category: flag.category || "data_health",
               explanation: flag.explanation || flag.message || "",
               observedValue: flag.observed_value ?? flag.observedValue ?? null,
               threshold: flag.threshold ?? null,
@@ -1308,6 +1478,7 @@ function qualityFlagObjects(row, market) {
       flags.push({
         code,
         severity,
+        category: "data_health",
         explanation,
         observedValue,
         threshold,
@@ -1557,6 +1728,10 @@ function screenerTokenRow(tokenSummary) {
     : "#";
   return `<tr class="token-row screener-token-row">
     <td data-label="Token" class="sticky-token token-name">${escapeHtml(token)}</td>
+    <td data-label="Rank value" class="rank-value">
+      ${escapeHtml(formatRankValue(tokenSummary))}
+      <span class="metric-note">${app.sortDirection === "asc" ? "Lowest first" : "Highest first"}</span>
+    </td>
     <td data-label="Covered markets">
       ${tokenSummary.cex_market_count ?? "—"} CEX · ${tokenSummary.dex_market_count ?? "—"} DEX
       <span class="metric-note">${finite(catalogCount) ? catalogCount : "Unavailable"} catalog series</span>
@@ -1592,12 +1767,12 @@ function renderTable() {
   const query = app.searchQuery;
   const tokens = app.payload.tokens
     .filter((row) => !query || row.token_symbol.includes(query))
-    .sort((a, b) => sortValue(b) - sortValue(a) || a.token_symbol.localeCompare(b.token_symbol));
+    .sort(compareScreenerTokens);
   app.visibleTokens = tokens;
 
   byId("market-body").innerHTML = tokens.length
     ? tokens.map((token) => screenerTokenRow(token)).join("")
-    : `<tr><td data-label="Result" colspan="9" class="missing">No Token matches this search.</td></tr>`;
+    : `<tr><td data-label="Result" colspan="10" class="missing">No Token matches this search.</td></tr>`;
   byId("row-count").textContent = `${tokens.length} Tokens · one row per Token`;
 }
 
@@ -1606,10 +1781,11 @@ function payloadMarketForCatalog(market) {
   return market.window_metrics || null;
 }
 
-function qualityStateMarkup(status, label = "") {
+function qualityStateMarkup(status, label = "", tooltip = "") {
   const normalized = String(status || "unavailable").toLowerCase();
   const display = label || normalized.replaceAll("_", " ");
-  return `<span class="quality-state" data-state="${escapeHtml(normalized)}">${escapeHtml(display)}</span>`;
+  const title = tooltip ? ` title="${escapeHtml(tooltip)}"` : "";
+  return `<span class="quality-state" data-state="${escapeHtml(normalized)}"${title}>${escapeHtml(display)}</span>`;
 }
 
 function renderWorkspaceContext() {
@@ -1802,6 +1978,60 @@ function qualityFactMarkup(name, fact) {
     fact?.observed_at ? formatUtcTimestamp(fact.observed_at) : "",
     fact?.message || fact?.reason,
   ].filter(Boolean);
+  if (name === "daily") {
+    if (fact?.coverage_expected_start && fact?.coverage_expected_end) {
+      details.push(
+        `Expected window: ${fact.coverage_expected_start} → ${fact.coverage_expected_end}`,
+      );
+    }
+    if (finite(fact?.missing_calendar_days) && fact.missing_calendar_days > 0) {
+      details.push(`${fact.missing_calendar_days} expected day(s) missing`);
+    }
+    const reasonCounts = fact?.reason_code_counts;
+    if (reasonCounts && typeof reasonCounts === "object") {
+      const causeText = Object.entries(reasonCounts)
+        .filter(([, count]) => finite(count) && count > 0)
+        .map(([reason, count]) => (
+          `${DAILY_QUALITY_REASON_LABELS[reason] || reason.replaceAll("_", " ")} (${count})`
+        ))
+        .join("; ");
+      if (causeText) {
+        const evidenceLabel = fact?.daily_evidence_mode === "published_daily_audit"
+          ? "Published daily-audit causes"
+          : "Catalog/audit reconciliation";
+        details.push(`${evidenceLabel}: ${causeText}`);
+      }
+    }
+    const affectedDates = Array.isArray(fact?.affected_dates)
+      ? fact.affected_dates
+      : [];
+    if (affectedDates.length) {
+      const visibleDates = affectedDates.slice(0, 8);
+      const remaining = affectedDates.length - visibleDates.length;
+      details.push(
+        `Affected UTC dates: ${visibleDates.join(", ")}${remaining > 0 ? `, +${remaining} more` : ""}`,
+      );
+    }
+  }
+  if (fact?.retryable) {
+    details.push(
+      fact?.action === "operator_review_retry_and_manual_queues"
+        ? "Operator actions: inspect both the protected Admin retry queue and "
+          + "manual-review queue. This public page is read-only."
+        : "Operator action: inspect the protected Admin retry queue. "
+          + "This public page is read-only.",
+    );
+  } else if (fact?.action === "operator_manual_review") {
+    details.push(
+      "Operator action: verify the source listing or history range in the "
+        + "protected manual-review queue.",
+    );
+  } else if (fact?.action === "operator_review_source_outcome") {
+    details.push(
+      "Operator action: review the confirmed source outcome; no automatic "
+        + "retry is scheduled.",
+    );
+  }
   const temporal = fact?.temporal_alignment;
   if (temporal && name === "execution") {
     details.push(
@@ -1839,8 +2069,16 @@ function qualityFactMarkup(name, fact) {
     fact?.dataset_sha256 ? `Dataset SHA-256: ${fact.dataset_sha256}` : "",
     fact?.raw_response_sha256 ? `Raw-response SHA-256: ${fact.raw_response_sha256}` : "",
   ].filter(Boolean);
+  const statusTooltip = name === "daily"
+    ? [
+        fact?.reason || "",
+        ...(Array.isArray(fact?.affected_dates)
+          ? fact.affected_dates.map((day) => `${day} UTC`)
+          : []),
+      ].filter(Boolean).join(" · ")
+    : fact?.reason || "";
   return `<div class="quality-fact">
-    ${qualityStateMarkup(status)}
+    ${qualityStateMarkup(status, "", statusTooltip)}
     ${details.map((detail) => `<small>${escapeHtml(detail)}</small>`).join("")}
     ${lineage.length
       ? `<details><summary>Lineage</summary>${lineage.map((detail) => `<small>${escapeHtml(detail)}</small>`).join("")}</details>`
@@ -1859,19 +2097,29 @@ function renderQualityPayload(payload) {
           ? item.quality_flags.map((flag) => ({
               code: flag.code,
               severity: flag.severity || "warning",
+              category: flag.category || "data_health",
               explanation: flag.message || flag.explanation || "",
               observedValue: flag.observed_value ?? flag.observedValue ?? null,
               threshold: flag.threshold ?? null,
             }))
           : factsMarketWarningFlags(market);
+        const reasonGroups = flags.reduce((groups, flag) => {
+          const category = flag.category || "data_health";
+          if (!groups[category]) groups[category] = [];
+          groups[category].push(flag);
+          return groups;
+        }, {});
         const reasons = flags.length
           ? `<details class="quality-reasons">
               <summary>${flags.length} current reason${flags.length === 1 ? "" : "s"}</summary>
-              <ul>${flags.map((flag) => `<li data-severity="${escapeHtml(flag.severity)}">
-                <strong>${escapeHtml(qualityFlagLabel(flag))}</strong>
-                ${escapeHtml(flag.explanation || "No additional explanation supplied.")}
-                ${qualityFlagMeasurement(flag) ? `<small>${escapeHtml(qualityFlagMeasurement(flag))}</small>` : ""}
-              </li>`).join("")}</ul>
+              ${Object.entries(reasonGroups).map(([category, categoryFlags]) => `
+                <strong class="quality-reason-category">${escapeHtml(category.replaceAll("_", " "))}</strong>
+                <ul>${categoryFlags.map((flag) => `<li data-severity="${escapeHtml(flag.severity)}">
+                  <strong>${escapeHtml(qualityFlagLabel(flag))}</strong>
+                  ${escapeHtml(flag.explanation || "No additional explanation supplied.")}
+                  ${qualityFlagMeasurement(flag) ? `<small>${escapeHtml(qualityFlagMeasurement(flag))}</small>` : ""}
+                </li>`).join("")}</ul>
+              `).join("")}
             </details>`
           : '<span class="missing">No current quality flags</span>';
         return `<tr>
@@ -2168,7 +2416,7 @@ async function loadExecutionCost() {
     return true;
   } catch (error) {
     if (error.name === "AbortError" || requestId !== app.executionRequestId) return false;
-    clearExecutionResult(error.message || String(error));
+    clearExecutionResult(publicErrorMessage(error, "Execution facts failed to load."));
     return false;
   } finally {
     if (requestId === app.executionRequestId) app.executionController = null;
@@ -2214,6 +2462,8 @@ async function loadQuality() {
   const controller = new AbortController();
   app.qualityController = controller;
   const query = new URLSearchParams({ token, scope: app.qualityScope });
+  if (byId("date-start").value) query.set("start", byId("date-start").value);
+  if (byId("date-end").value) query.set("end", byId("date-end").value);
   if (app.qualityScope === "selected") {
     query.set("market_a", marketA);
     query.set("market_b", marketB);
@@ -2229,20 +2479,35 @@ async function loadQuality() {
     if (requestId !== app.qualityRequestId) return false;
     renderQualityPayload(payload);
     const counts = qualityStatusCounts(payload);
-    const critical = (counts.failed || 0);
-    const warnings = (
-      (counts.partial || 0)
-      + (counts.unsupported || 0)
-      + (counts.unavailable || 0)
-      + (counts.not_cataloged_in_snapshot || 0)
+    const critical = (
+      (counts.failed || 0)
+      + (counts.collection_failed || 0)
+      + (counts.invalid || 0)
     );
-    const state = critical ? "critical" : warnings ? "warning" : "success";
+    const pending = (
+      (counts.backfill_pending || 0)
+      + (counts.missing_unexplained || 0)
+      + (counts.stale || 0)
+      + (counts.needs_review || 0)
+      + (counts.source_no_observation || 0)
+    );
+    const structural = (
+      (counts.unsupported || 0)
+      + (counts.not_applicable || 0)
+    );
+    const state = critical ? "critical" : pending ? "warning" : "success";
+    const dailyAudit = payload.metadata.daily_quality_report || {};
+    const dailyAuditText = dailyAudit.status === "matched"
+      ? `${dailyAudit.selected_window_issue_count || 0} published daily-audit issue(s)`
+      : `daily audit ${dailyAudit.status || "unavailable"}; catalog-window inference shown`;
     showStatus(
       byId("quality-status"),
       `${payload.token_symbol} · ${payload.metadata.scope} scope · `
-        + `${payload.markets.length} markets · ${counts.observed || 0} observed, `
-        + `${counts.partial || 0} partial, ${counts.unsupported || 0} unsupported, `
-        + `${counts.failed || 0} failed, ${counts.unavailable || 0} unavailable facts.`,
+        + `${payload.metadata.window_start || "—"} → ${payload.metadata.window_end || "—"} · `
+        + `${payload.markets.length} markets · ${counts.observed || 0} observed · `
+        + `${pending} attention/limits · ${critical} failed/invalid · `
+        + `${structural} structural · ${counts.partial || 0} partial · `
+        + `${dailyAuditText}.`,
       state,
     );
     hideError(byId("quality-error"));
@@ -2255,7 +2520,10 @@ async function loadQuality() {
       "Catalog-level quality remains visible; detailed lineage could not be loaded.",
       "stale",
     );
-    showError(byId("quality-error"), error.message || String(error));
+    showError(
+      byId("quality-error"),
+      publicErrorMessage(error, "Quality facts failed to load."),
+    );
     return false;
   } finally {
     if (requestId === app.qualityRequestId) app.qualityController = null;
@@ -2471,7 +2739,10 @@ async function loadEvents() {
       "Event Fact publication is unavailable; market facts remain usable.",
       "critical",
     );
-    showError(byId("events-error"), error.message || String(error));
+    showError(
+      byId("events-error"),
+      publicErrorMessage(error, "Event Facts failed to load."),
+    );
     return false;
   } finally {
     if (requestId === app.eventRequestId) app.eventController = null;
@@ -4300,6 +4571,19 @@ async function responseJson(response) {
   }
 }
 
+function publicErrorMessage(error, fallback = "Request failed.") {
+  const rawMessage = typeof error === "string"
+    ? error
+    : error?.message || "";
+  const normalized = String(rawMessage).trim();
+  if (!normalized) return fallback;
+  const checkedSuffix = normalized.search(/\bChecked:\s*/i);
+  const message = checkedSuffix >= 0
+    ? normalized.slice(0, checkedSuffix).trim()
+    : normalized;
+  return message || fallback;
+}
+
 async function loadComparison() {
   const requestId = invalidateComparisonRequest();
   if (!app.catalog) {
@@ -4349,7 +4633,7 @@ async function loadComparison() {
     return true;
   } catch (error) {
     if (error.name === "AbortError" || requestId !== app.comparisonRequestId) return false;
-    clearComparisonResult(error.message || String(error));
+    clearComparisonResult(publicErrorMessage(error, "Comparison failed to load."));
     return false;
   } finally {
     if (requestId === app.comparisonRequestId) {
@@ -4512,7 +4796,7 @@ function displayMarket(payload, { cached = false } = {}) {
 }
 
 function setMarketLoading(message, preserve) {
-  byId("apply-window").disabled = true;
+  setDateWindowDisabled(true);
   byId("export-csv").disabled = true;
   byId("market-panel").setAttribute("aria-busy", "true");
   hideError(byId("error-banner"));
@@ -4523,7 +4807,7 @@ function setMarketLoading(message, preserve) {
     app.payload = null;
     app.visibleTokens = [];
     hideStatus(byId("market-status"));
-    byId("market-body").innerHTML = '<tr><td data-label="Status" colspan="9" class="missing">Loading the requested time window…</td></tr>';
+    byId("market-body").innerHTML = '<tr><td data-label="Status" colspan="10" class="missing">Loading the requested time window…</td></tr>';
     byId("row-count").textContent = "Loading…";
   }
 }
@@ -4539,14 +4823,14 @@ function invalidateMarketRequest() {
 function clearMarketResult(message = "") {
   app.payload = null;
   app.visibleTokens = [];
-  byId("market-body").innerHTML = '<tr><td data-label="Status" colspan="9" class="missing">No current market result.</td></tr>';
+  byId("market-body").innerHTML = '<tr><td data-label="Status" colspan="10" class="missing">No current market result.</td></tr>';
   byId("row-count").textContent = "No current result";
   hideStatus(byId("market-loading"));
   hideStatus(byId("market-status"));
   if (message) showError(byId("error-banner"), message);
   else hideError(byId("error-banner"));
   byId("market-panel").setAttribute("aria-busy", "false");
-  byId("apply-window").disabled = false;
+  setDateWindowDisabled(false);
   byId("export-csv").disabled = true;
 }
 
@@ -4588,6 +4872,7 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
     if (error.name === "AbortError" || requestId !== app.marketRequestId) return false;
     hideStatus(byId("market-loading"));
     byId("market-panel").setAttribute("aria-busy", "false");
+    const failure = publicErrorMessage(error, "Screener summary failed to load.");
     const retained = preserve && app.payload
       ? " The explicitly marked cached snapshot remains visible."
       : " No result is shown for the failed request.";
@@ -4601,19 +4886,19 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
         "Cached facts remain visible; the fresh request failed.",
         "stale",
       );
-      showError(byId("error-banner"), `${error.message || String(error)}${retained}`);
+      showError(byId("error-banner"), `${failure}${retained}`);
     } else {
-      clearMarketResult(`${error.message || String(error)}${retained}`);
+      clearMarketResult(`${failure}${retained}`);
     }
     if (app.route?.kind !== "screener") {
-      showError(byId("global-error"), `${error.message || String(error)}${retained}`);
+      showError(byId("global-error"), `${failure}${retained}`);
     }
     return false;
   } finally {
     if (requestId === app.marketRequestId) {
       app.marketController = null;
       app.marketRequestWindowKey = "";
-      byId("apply-window").disabled = false;
+      setDateWindowDisabled(false);
     }
   }
 }
@@ -4637,16 +4922,12 @@ function setPreset(days) {
 async function applyWindow() {
   const start = byId("date-start").value;
   const end = byId("date-end").value;
-  const dateError = validateDateRange(start, end);
+  const dateError = validateDateRange(start, end, { required: true });
   if (dateError) {
-    if (app.route.kind === "workspace") {
-      showError(byId("global-error"), dateError);
-      if (app.route.page === "compare") clearComparisonResult(dateError);
-    } else {
-      showError(byId("error-banner"), dateError);
-    }
+    showDateWindowError(dateError);
     return;
   }
+  showDateWindowError("");
   if (app.route.kind === "workspace") {
     replaceCurrentRoute();
     await applyRouteFromLocation();
@@ -4721,6 +5002,11 @@ function exportVisibleCsv() {
   if (!app.payload || !app.visibleTokens.length) return;
   const headers = [
     "token",
+    "rank_metric",
+    "rank_scope",
+    "rank_direction",
+    "rank_value",
+    "rank_eligible",
     "row_type",
     "venue",
     "instrument",
@@ -4746,8 +5032,17 @@ function exportVisibleCsv() {
     const token = tokenSummary.token_symbol;
     const aggregates = aggregateFacts(tokenSummary, [], []);
     const selected = comparison(tokenSummary);
+    const rankValue = sortValue(tokenSummary);
+    const rankFields = [
+      byId("sort-field").value,
+      app.scope,
+      app.sortDirection,
+      finite(rankValue) ? rankValue : "",
+      finite(rankValue) ? "true" : "false",
+    ];
     lines.push([
       token,
+      ...rankFields,
       "aggregate",
       "all",
       "all cataloged markets",
@@ -4773,6 +5068,7 @@ function exportVisibleCsv() {
       const flags = qualityFlagObjects(row, market).map((flag) => flag.code).join("|");
       lines.push([
         token,
+        ...rankFields,
         `selected_${market}`,
         row.venue,
         row.instrument,
@@ -4813,7 +5109,13 @@ function bindEvents() {
     renderTable();
     replaceCurrentRoute();
   };
-  byId("apply-window").addEventListener("click", applyWindow);
+  byId("date-window-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    void applyWindow();
+  });
+  ["date-start", "date-end"].forEach((id) => {
+    byId(id).addEventListener("input", () => showDateWindowError(""));
+  });
   document.querySelectorAll("[data-days]").forEach((button) => {
     button.addEventListener("click", () => {
       document.querySelectorAll("[data-days]").forEach((item) => {
@@ -4827,17 +5129,21 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-scope]").forEach((button) => {
     button.addEventListener("click", () => {
+      if (button.disabled) return;
       app.scope = button.dataset.scope;
-      document.querySelectorAll("[data-scope]").forEach((item) => {
-        const active = item === button;
-        item.classList.toggle("active", active);
-        item.setAttribute("aria-pressed", String(active));
-      });
+      syncScreenerSortControls();
       renderTable();
       replaceCurrentRoute();
     });
   });
   byId("sort-field").addEventListener("change", () => {
+    syncScreenerSortControls();
+    renderTable();
+    replaceCurrentRoute();
+  });
+  byId("sort-direction").addEventListener("change", () => {
+    app.sortDirection = byId("sort-direction").value === "asc" ? "asc" : "desc";
+    syncScreenerSortControls();
     renderTable();
     replaceCurrentRoute();
   });
@@ -5031,9 +5337,8 @@ function primeInitialRouteView(route) {
     updateRouteLinks();
     return;
   }
-  if (route.kind === "methodology") {
-    applyMethodologyRoute(route);
-    return;
+  if (route.kind === "screener") {
+    hydrateScreenerControls(route, { normalizeWindow: false });
   }
   setActiveAppView("screener");
   byId("time-toolbar").hidden = false;
@@ -5047,13 +5352,6 @@ async function initialize() {
     : { kind: "unknown" };
   if (initialRoute.kind !== "unknown") app.route = initialRoute;
   primeInitialRouteView(initialRoute);
-  if (initialRoute.kind === "methodology") {
-    byId("freshness").textContent = "Fact data loads on demand";
-    byId("freshness-cluster").dataset.status = "unavailable";
-    await applyRouteFromLocation();
-    if (window.lucide) window.lucide.createIcons();
-    return;
-  }
   const initialStart = initialRoute.kind === "screener"
     ? initialRoute.filters?.start || ""
     : initialRoute.kind === "workspace"

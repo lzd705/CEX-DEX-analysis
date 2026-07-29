@@ -236,6 +236,11 @@ def validate_quality(
     require(payload.get("token_symbol") == token, "Quality returned wrong Token")
     require(metadata.get("scope") == "selected", "Quality did not honor selected scope")
     require(
+        isinstance(metadata.get("contract_version"), int)
+        and metadata["contract_version"] >= 3,
+        "Quality contract does not include published daily-audit evidence",
+    )
+    require(
         set(metadata.get("selected_market_ids") or []) == expected_ids,
         "Quality metadata returned the wrong selected markets",
     )
@@ -257,6 +262,82 @@ def validate_quality(
         ),
         "Quality returned an empty or wrong-Token fact set",
     )
+    report = metadata.get("daily_quality_report")
+    require(
+        isinstance(report, dict)
+        and report.get("status")
+        in {
+            "matched",
+            "unavailable",
+            "ignored_invalid",
+            "ignored_identity_unavailable",
+            "ignored_identity_mismatch",
+        },
+        "Quality daily-audit status is invalid",
+    )
+    require(
+        report.get("evidence_mode")
+        in {"published_daily_audit", "catalog_window_inference"},
+        "Quality daily-audit evidence mode is invalid",
+    )
+    if report.get("status") == "matched":
+        require(
+            report.get("schema") == "fact_quality_report/v1"
+            and report.get("identity_status") == "matched_current_import",
+            "Quality daily audit lacks a verified current publication identity",
+        )
+    else:
+        require(
+            report.get("identity_status")
+            in {"not_verified", "unavailable", "mismatch"},
+            "Quality fallback has an invalid publication identity status",
+        )
+    issue_count = report.get("selected_window_issue_count")
+    reason_counts = report.get("reason_code_counts")
+    status_counts = report.get("status_counts")
+    affected_dates = report.get("affected_dates")
+    require(
+        isinstance(issue_count, int)
+        and issue_count >= 0
+        and isinstance(reason_counts, dict)
+        and all(
+            isinstance(key, str)
+            and key
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+            for key, value in reason_counts.items()
+        )
+        and sum(reason_counts.values()) == issue_count
+        and isinstance(status_counts, dict)
+        and all(
+            isinstance(key, str)
+            and key
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+            for key, value in status_counts.items()
+        )
+        and sum(status_counts.values()) == issue_count,
+        "Quality daily-audit reason/status counts are inconsistent",
+    )
+    require(
+        isinstance(affected_dates, list)
+        and affected_dates == sorted(set(affected_dates))
+        and report.get("affected_date_count") == len(affected_dates),
+        "Quality daily-audit affected dates are inconsistent",
+    )
+    for market in markets:
+        daily = market["facts"].get("daily") or {}
+        if daily.get("retryable"):
+            require(
+                daily.get("action")
+                in {
+                    "operator_review_retry_queue",
+                    "operator_review_retry_and_manual_queues",
+                },
+                "Public quality retryable daily fact lacks an operator-only action",
+            )
 
 
 def _execution_scenario_key(row: dict[str, Any]) -> tuple[str, int] | None:

@@ -17,6 +17,13 @@
 - `GET /api/markets/execution-cost?token=...&market_a=...&market_b=...`
   returns independent point-in-time $1k/$5k/$10k/$50k/$100k quoted execution
   facts for the same exact market identities.
+- `GET /api/markets/quality?token=...&scope=...&start=...&end=...` returns
+  selected-window daily quality plus independently timestamped TVL, depth, and
+  execution status for each exact market. Quality contract v3 overlays only a
+  bounded `fact_quality_report/v1` whose `publication.import_run_id` matches
+  the catalog's current SQLite import identity. The public projection exposes
+  allowlisted reason/status counts and affected UTC dates, never raw collector
+  errors, source paths, or protected review details.
 
 `market_a` and `market_b` are exact `market_id` values returned by the catalog.
 They must be different and both must belong to the requested Token.
@@ -52,6 +59,23 @@ serialized-response generation as the full audit catalog. Token query values
 are stripped and uppercased before entering the cache key. A public,
 path-free `data_generation` hash lets the browser clear its bounded Token
 catalog cache whenever the published source generation changes.
+
+The optional `quality/daily-latest.json` also participates in that source
+signature. A missing, malformed, oversized, path-unsafe, wrong-schema, or
+identity-mismatched report is ignored and the API labels its fallback as
+`catalog_window_inference`; a trusted overlay reports
+`identity_status=matched_current_import` without exposing the private file
+path. A matched report distinguishes retryable technical
+failures (`network`, `rate_limit`, `source_unavailable`, `parse`,
+`validation`), confirmed no-candle outcomes, non-retryable listing/range
+review, and unexplained missing rows. Public actions always point to protected
+operator review; the public endpoint cannot start a retry.
+
+The browser's Screener ranking is explicit URL state: `sort`, `scope`, and
+`dir`. Each metric has an allowlisted scope. Missing, failed, unsupported, and
+non-finite rank values always remain at the bottom in either direction; zero
+is a measured value. The table and CSV expose the numeric rank value used by
+the comparator.
 
 Single-Token `market_count` is Token-scoped. Nested TVL/depth/execution snapshot
 inventory counts retained in metadata describe all catalog markets and are
@@ -111,6 +135,20 @@ dates and does not forward-fill:
 
 Absolute spread and bps are `null` unless both prices are comparable on the
 same UTC date. Volume is never replaced with zero.
+
+Daily quality uses the intersection of the selected window and a market's
+observed lifecycle. A window wholly before the first or after the last
+observed date is `not_applicable`, not a failed collection. A missing date
+inside the first/last observed lifecycle is `backfill_pending` with
+`missing_unexplained` unless a CSV-hash-matched collector attempt proves a more
+specific cause. Such evidence distinguishes retryable `collection_failed`,
+non-retryable `source_no_observation` (the source answered successfully but
+returned no target candle), and non-retryable `needs_review`; absence alone
+never becomes `collection_failed`.
+The separate daily quality publication decides whether a D-1 gap satisfies
+the active-market retry rule. Capability limits (`unsupported`), partial
+measurements, observed market conditions, and data-health failures are not
+collapsed into one warning state.
 
 ## Explicit non-claims
 

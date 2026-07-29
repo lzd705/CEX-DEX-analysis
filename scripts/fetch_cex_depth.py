@@ -1562,6 +1562,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokens", help="Comma-separated token symbols")
     parser.add_argument("--exchanges", help="Comma-separated exchange names")
     parser.add_argument("--publish-local", action="store_true")
+    parser.add_argument(
+        "--publish-dir",
+        type=Path,
+        help="Explicit runtime directory for an atomic publication",
+    )
     parser.add_argument("--sleep-seconds", type=float, default=REQUEST_SLEEP_SECONDS)
     return parser.parse_args()
 
@@ -1581,7 +1586,12 @@ def main() -> None:
     markets = load_cataloged_markets(args.database, args.cex_csv)
     tokens = set(parse_list(args.tokens, upper=True) or [])
     exchanges = set(parse_list(args.exchanges, upper=False) or [])
-    ensure_full_publish_scope(args.publish_local, tokens, exchanges)
+    publish_dir = (
+        args.publish_dir
+        if args.publish_dir is not None
+        else DEFAULT_PUBLISH_DIR if args.publish_local else None
+    )
+    ensure_full_publish_scope(publish_dir is not None, tokens, exchanges)
     if tokens:
         markets = [row for row in markets if row["token_symbol"] in tokens]
     if exchanges:
@@ -1594,7 +1604,6 @@ def main() -> None:
         raw_root=args.raw_root,
         sleep_seconds=max(0.0, args.sleep_seconds),
     )
-    publish_dir = DEFAULT_PUBLISH_DIR if args.publish_local else None
     publication_gates = (
         preflight_publication_bundle(rows, execution_rows, publish_dir)
         if publish_dir is not None

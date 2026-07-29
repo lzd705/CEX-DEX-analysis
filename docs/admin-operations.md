@@ -46,27 +46,208 @@ job at a time. Do not use it behind a reverse proxy.
 
 ## Refresh contract
 
-The administrator selects one of the 30 configured Tokens and an inclusive UTC
-date range. Current exchange adapters support a rolling refresh only:
+The administrator selects an active Token and an inclusive UTC date range.
+Current exchange adapters support a rolling refresh only:
 
 - `end_date` must be the latest completed UTC day;
 - the window must contain 1 to 180 days;
-- adding a new Token is not supported by this form.
+- a runtime Token whose CEX identity has not been manually approved is
+  refreshed DEX-only.
 
 The server queues one job at a time. A job:
 
-1. seeds `data/processed/` from the currently published `data/local/` snapshot;
+1. seeds an isolated collector staging directory from the selected runtime
+   snapshot directory (`data/local/` by default);
 2. refreshes the selected Token from CEX and DEX sources;
 3. upserts rows by venue/pool/date without deleting other Tokens or older dates;
 4. validates both detailed CSV schemas;
-5. builds an indexed SQLite database with source hashes and an import record;
-6. validates database integrity and row counts;
-7. publishes the reviewed CSV copies and atomically replaces
-   `market_facts.sqlite3` as the runtime commit point under `data/local/`.
+5. audits daily facts for duplicate keys, invalid OHLC/volume values,
+   historical gaps, and active-market D-1 gaps;
+6. rejects the candidate before publication if any hard-invalid row is found;
+7. builds an indexed SQLite database with source hashes and an import record;
+8. validates database integrity and row counts;
+9. publishes the reviewed CSV copies, atomically replaces
+   `market_facts.sqlite3` as the runtime commit point under `data/local/`, and
+   atomically replaces the daily quality report.
 
-Job state and server-only logs live under `data/local/admin/jobs/`.
+Job state and server-only logs live under the selected runtime data directory
+at `admin/jobs/`.
 The public server opens `market_facts.sqlite3` read-only. Existing requests
 continue using the previous complete file until replacement finishes.
+
+## Daily quality publication
+
+Every successful `import_local_snapshot.py` run writes:
+
+```text
+data/local/quality/daily-latest.json
+```
+
+The report is built against the staged candidate, linked to the resulting
+dataset snapshot and import run, then published by a single-file atomic rename.
+`market_facts.sqlite3` remains the runtime data commit point; the CSV files,
+database, and quality report are prepared in the same private staging directory
+before any published file is replaced.
+
+The report keeps data-quality states separate:
+
+- `hard_invalid`: duplicate primary keys; missing/invalid identities or dates;
+  non-finite, zero, or negative OHLC values; inconsistent daily high/low bounds;
+  or non-finite/negative volume. Any such issue blocks publication, so the
+  previously published CSVs, database, and `daily-latest.json` remain unchanged.
+- `backfill_pending`: a missing date strictly between a market's first and last
+  observed dates. These issues appear in `backfill_pending` and
+  `backfill_windows_by_token`; they do not enter the daily retry queue.
+- `d1_active_gap`: the latest completed UTC day is absent for a market with at
+  least three valid observations in the inclusive prior seven-day window.
+  Recent trailing missing days appear in `retry_queue` and
+  `retry_windows_by_token`.
+- `stale_market_unknown`: a formerly active market has aged out of the
+  evidence-backed retry window without explicit inactive/delisted metadata.
+  It is retained as a non-retryable `needs_review` item rather than silently
+  disappearing or creating an endless automatic retry queue. An operator must
+  verify current source inventory or lifecycle before disposition.
+
+Dates before the first observed row are never inferred to be failures or
+historical gaps. A newly listed or otherwise sparse market also does not enter
+the D-1 retry queue until it meets the activity threshold.
+
+Missing-row causes are evidence-based, not inferred from absence alone:
+
+- no matching accepted attempt: `status=backfill_pending`,
+  `reason_code=missing_unexplained`;
+- request/network evidence: `status=collection_failed`, with one of
+  `network`, `rate_limit`, `source_unavailable`, `parse`, or `validation`;
+- a successful source response without the target candle:
+  `status=source_no_observation`, `reason_code=no_candles`, with no automatic
+  retry because repeating the same successful empty response creates a loop;
+- source says the market is unavailable, or its documented recent-only range
+  cannot reach the audited day: `status=needs_review`, with `not_listed` or
+  `source_range_unavailable`, and no automatic retry.
+
+Only a ledger whose recorded CSV SHA-256 matches the staged candidate can
+change a missing issue from `missing_unexplained`. Accepted attempts and their
+ledger hashes are embedded in `daily-latest.json`; untrusted raw exception
+strings, URLs, secrets, and local paths are not published.
+
+A Token-scoped append preserves an unselected Token's prior source outcome
+only when the existing report, SQLite commit identifiers, published CSVs, and
+source hashes all agree. The old attempt must still explain a gap in the new
+candidate. A new attempt replaces only the overlapping part of the same market
+window; retained pieces are normalized, deduplicated, and rebound to the new
+candidate hash. Any existing lineage or attempt-contract mismatch blocks the
+append rather than silently converting a known cause back to
+`missing_unexplained`.
+
+The top-level `status` describes quality completeness. Publication outcome is
+reported separately at `publication.status`:
+
+- `published`
+- `published_with_backfill`
+- `published_with_retry_queue`
+
+Every retry/backfill item includes a reason code, Token, market identity, date,
+and primary-source URL hints. Windows are contiguous, Token-scoped, and limited
+to 180 days. The Admin page exposes two explicitly labelled audited queues:
+
+- `latest_completed_day` for recent active-market D-1 gaps;
+- `historical_gap` for historical `backfill_pending` windows.
+
+An authenticated operator may queue either exact window through
+`job_type=retry_failed`. The request also carries its queue type; arbitrary
+dates and windows not present in the current report are rejected. A completed
+collector process is not enough. The quality report and SQLite database must
+carry the same new import identity. Each exact expected market/date pair must
+then be either present in SQLite or identified by the new report as a specific,
+non-retryable source outcome such as `not_listed`,
+`source_no_observation`, or `source_range_unavailable`. Retryable gaps,
+`collection_failed`, and `missing_unexplained` remain unresolved. The job
+result reports `observed_count`, `confirmed_absence_count`, and
+`unresolved_count`, so a confirmed source absence cannot be mistaken for a
+successfully collected candle.
+
+`hard_invalid`, `stale_market_unknown`, and lineage-matched `needs_review`
+findings such as `not_listed` or `source_range_unavailable` are different.
+The Admin page reads their sanitized entries from `manual_review_queue` and
+shows the Token, market, date, reason, and primary-source URL hints in a
+separate, read-only table. Those items never receive a retry button. The
+operator must record primary-source evidence and a disposition outside the
+automatic collection queue before changing their lifecycle.
+
+Hard-invalid candidates never overwrite the last good daily publication. They
+are persisted below `quality/rejected/<rejection-id>/`, and
+`quality/rejected/latest.json` points at the newest evidence bundle. Admin
+accepts that pointer only when it remains below the rejected directory, its
+SHA-256 matches `report.json`, and both pointer and rejection schemas match.
+The rejected candidate's hard-invalid items are merged into manual review with
+`candidate_rejected=true` and their `rejection_id`; a malformed, traversing, or
+tampered pointer is ignored rather than trusted.
+
+## Refresh completion contract
+
+An ordinary `refresh` is publication-aware. Before collection, Admin records
+the current quality-report and database import identities. Exit status zero
+from the collector is not success by itself. After collection:
+
+1. `daily-latest.json` must be readable and expose a new import identity;
+2. SQLite must be readable and expose that same identity;
+3. the requested Token/date window must contain at least one successful row;
+4. the same window must have no remaining `collection_failed`, retryable gap,
+   or `hard_invalid` issue.
+
+If a new publication is valid but still incomplete, the job is `partial` with
+`publication_committed=true`. If identity is unchanged, unreadable, or
+inconsistent, the job is `partial` and the publication is not certified.
+Explicit structural outcomes such as unsupported markets, `not_listed`, or
+`no_candles` are shown in the result's reason counts and are not relabelled as
+successful rows.
+
+## Add Token by contract
+
+The Admin page supports DEX-first runtime onboarding:
+
+1. choose one allowlisted chain and enter the smart-contract address;
+2. validate the address and resolve Token identity through GeckoTerminal;
+3. review the returned symbol, name, exact address, and strictly validated
+   pools;
+4. confirm `Add & collect`;
+5. wait for DEX daily publication, post-publication SQLite verification, TVL,
+   and protocol-dependent DEX depth collection.
+
+The runtime identity is stored in:
+
+```text
+data/local/admin/token_registry.json
+```
+
+The registry is locked, validated, fsynced, and atomically replaced. The
+version-controlled `config/tokens.csv` and `config/token_chains.csv` files are
+not edited by the website. A Token remains `pending` until
+`market_facts.sqlite3` contains at least one DEX daily row for its symbol. A
+daily failure marks the record `failed`; daily success activates it. If TVL or
+DEX depth then fails, the job is `partial` because the already-published daily
+facts are not rolled back.
+
+An on-chain address does not prove a centralized-exchange instrument.
+Therefore a runtime Token starts with:
+
+```text
+CEX mapping = requires_manual_review
+```
+
+No `SYMBOL/USDT` pair is guessed and no CEX request is made until an operator
+adds a separately reviewed mapping. Duplicate chain/address submissions are
+idempotent; the same symbol on another contract is blocked for manual review.
+
+For an isolated audit without publishing, run:
+
+```bash
+python3 scripts/fact_quality.py \
+  --cex-csv data/processed/cex_exchange_volume_daily.csv \
+  --dex-csv data/processed/dex_pool_volume_daily.csv \
+  --output /tmp/fact-quality.json \
+  --fail-on-hard
+```
 
 ## Security boundary
 
@@ -88,6 +269,8 @@ administrator surface. Operate it through an SSH tunnel, VPN-restricted
 hostname, or a separately reviewed proxy policy rather than exposing it on the
 public dashboard hostname.
 
-The administrator page does not make the collector capable of arbitrary
-historical backfills. Supporting an older `end_date` requires source-specific
-pagination changes and separate tests.
+The administrator page does not accept arbitrary historical date input.
+Historical collection is available only for an exact, bounded window emitted
+under `backfill_windows_by_token` by the currently published quality report.
+Any broader source-specific backfill still requires a separately tested
+collector change rather than bypassing this allowlist.

@@ -1,7 +1,16 @@
+import json
 import unittest
+import urllib.error
+import urllib.parse
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock
+from unittest.mock import patch
 
+from scripts import fetch_cex
 from scripts.fetch_cex import convert_binance_kline
 from scripts.fetch_cex import convert_bybit_kline
 from scripts.fetch_cex import convert_bitget_kline
@@ -33,9 +42,345 @@ from scripts.fetch_cex import build_coverage_rows
 from scripts.fetch_cex import select_stable_exchanges
 from scripts.fetch_cex import write_exchange_rows
 from scripts.fetch_cex import merge_exchange_rows
+from scripts.fetch_cex import build_rows
+from scripts.fetch_cex import cex_attempt_record
+from scripts.fetch_cex import classify_attempt_error
+from scripts.fetch_cex import write_attempt_ledger
 
 
 class FetchCexTests(unittest.TestCase):
+    def test_thirty_day_old_single_day_binance_request_returns_target_row(self):
+        target_date = (
+            datetime.now(timezone.utc).date() - timedelta(days=30)
+        ).isoformat()
+        target_time = datetime.strptime(target_date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        )
+        target_ms = int(target_time.timestamp() * 1000)
+        kline = [
+            target_ms,
+            "7.10",
+            "7.50",
+            "7.00",
+            "7.30",
+            "1000",
+            target_ms + 86_399_999,
+            "7300",
+            1,
+            "0",
+            "0",
+            "0",
+        ]
+        response = MagicMock()
+        response.read.return_value = json.dumps([kline]).encode("utf-8")
+        context = MagicMock()
+        context.__enter__.return_value = response
+        with (
+            patch.object(fetch_cex, "BINANCE_BASE_URLS", ["https://binance.test"]),
+            patch("scripts.fetch_cex.urllib.request.urlopen", return_value=context) as request,
+        ):
+            rows = fetch_cex.fetch_exchange_rows(
+                "UNI",
+                "UNI/USDT",
+                "binance",
+                target_date,
+                target_date,
+            )
+
+        requested_url = request.call_args.args[0]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(requested_url).query)
+        self.assertEqual(query["startTime"], [str(target_ms)])
+        self.assertEqual(
+            query["endTime"],
+            [str(target_ms + 86_400_000 - 1)],
+        )
+        self.assertEqual(rows[0]["date"], target_date)
+
+    def test_recent_binance_request_keeps_recent_endpoint_shape(self):
+        response = MagicMock()
+        response.read.return_value = b"[]"
+        context = MagicMock()
+        context.__enter__.return_value = response
+        with (
+            patch.object(fetch_cex, "BINANCE_BASE_URLS", ["https://binance.test"]),
+            patch("scripts.fetch_cex.urllib.request.urlopen", return_value=context) as request,
+        ):
+            fetch_cex.fetch_binance_klines("UNIUSDT", 4)
+
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(request.call_args.args[0]).query
+        )
+        self.assertNotIn("startTime", query)
+        self.assertNotIn("endTime", query)
+
+    def test_historical_window_is_sent_to_all_other_cex_adapters(self):
+        target_date = (
+            datetime.now(timezone.utc).date() - timedelta(days=30)
+        ).isoformat()
+        start_time = datetime.strptime(target_date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        )
+        start_seconds = int(start_time.timestamp())
+        end_seconds = start_seconds + 86_400
+        cases = [
+            (
+                fetch_cex.fetch_okx_klines,
+                ("UNI-USDT", 4, target_date, target_date),
+                {"code": "0", "data": []},
+                {"after": str(end_seconds * 1000)},
+                "/api/v5/market/history-candles",
+            ),
+            (
+                fetch_cex.fetch_bybit_klines,
+                ("UNIUSDT", 4, target_date, target_date),
+                {"retCode": 0, "result": {"list": []}},
+                {
+                    "start": str(start_seconds * 1000),
+                    "end": str(end_seconds * 1000 - 1),
+                },
+                "/v5/market/kline",
+            ),
+            (
+                fetch_cex.fetch_kucoin_klines,
+                ("UNI-USDT", 4, target_date, target_date),
+                {"code": "200000", "data": []},
+                {"startAt": str(start_seconds), "endAt": str(end_seconds)},
+                "/api/v1/market/candles",
+            ),
+            (
+                fetch_cex.fetch_gate_klines,
+                ("UNI_USDT", 4, target_date, target_date),
+                [],
+                {"from": str(start_seconds), "to": str(end_seconds - 1)},
+                "/api/v4/spot/candlesticks",
+            ),
+            (
+                fetch_cex.fetch_bitget_klines,
+                ("UNIUSDT", 4, target_date, target_date),
+                {"code": "00000", "data": []},
+                {
+                    "startTime": str(start_seconds * 1000),
+                    "endTime": str(end_seconds * 1000 - 1),
+                },
+                "/api/v2/spot/market/candles",
+            ),
+            (
+                fetch_cex.fetch_mexc_klines,
+                ("UNIUSDT", 4, target_date, target_date),
+                [],
+                {
+                    "startTime": str(start_seconds * 1000),
+                    "endTime": str(end_seconds * 1000 - 1),
+                },
+                "/api/v3/klines",
+            ),
+            (
+                fetch_cex.fetch_coinbase_candles,
+                ("UNI-USD", 4, target_date, target_date),
+                [],
+                {"start": start_time.isoformat()},
+                "/products/UNI-USD/candles",
+            ),
+            (
+                fetch_cex.fetch_kraken_klines,
+                ("UNIUSD", 4, target_date, target_date),
+                {"error": [], "result": {"UNIUSD": [], "last": "0"}},
+                {"since": str(start_seconds)},
+                "/0/public/OHLC",
+            ),
+            (
+                fetch_cex.fetch_crypto_com_candles,
+                ("UNI_USDT", 4, target_date, target_date),
+                {"code": 0, "result": {"data": []}},
+                {
+                    "start_ts": str(start_seconds * 1000),
+                    "end_ts": str(end_seconds * 1000 - 1),
+                },
+                "/exchange/v1/public/get-candlestick",
+            ),
+            (
+                fetch_cex.fetch_upbit_candles,
+                ("KRW-UNI", 4, target_date),
+                [],
+                {"to": datetime.fromtimestamp(end_seconds, timezone.utc).isoformat().replace("+00:00", "Z")},
+                "/v1/candles/days",
+            ),
+        ]
+        for function, arguments, response, expected, path in cases:
+            with self.subTest(adapter=function.__name__):
+                with patch(
+                    "scripts.fetch_cex.request_json",
+                    return_value=response,
+                ) as request:
+                    function(*arguments)
+                requested_url = request.call_args.args[0]
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlsplit(requested_url).query
+                )
+                self.assertIn(path, requested_url)
+                for key, value in expected.items():
+                    self.assertEqual(query[key], [value])
+
+    def test_recent_only_adapters_reach_historical_window_or_fail_explicitly(self):
+        target_date = (
+            datetime.now(timezone.utc).date() - timedelta(days=30)
+        ).isoformat()
+        target_timestamp = int(
+            datetime.strptime(target_date, "%Y-%m-%d")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+        with patch(
+            "scripts.fetch_cex.request_json",
+            return_value={
+                "status": "ok",
+                "data": [{"id": target_timestamp}],
+            },
+        ) as request:
+            fetch_cex.fetch_htx_klines(
+                "uniusdt", 4, target_date, target_date
+            )
+        htx_query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(request.call_args.args[0]).query
+        )
+        self.assertGreater(int(htx_query["size"][0]), 30)
+        self.assertLessEqual(
+            int(htx_query["size"][0]), fetch_cex.HTX_RECENT_BAR_CAP
+        )
+
+        recent_timestamp = int(datetime.now(timezone.utc).timestamp())
+        with patch(
+            "scripts.fetch_cex.request_json",
+            return_value={
+                "status": "ok",
+                "data": [{"id": recent_timestamp}],
+            },
+        ):
+            with self.assertRaisesRegex(
+                fetch_cex.SourceRangeUnavailable,
+                "source_range_unavailable",
+            ):
+                fetch_cex.fetch_htx_klines(
+                    "uniusdt", 4, "2010-01-01", "2010-01-01"
+                )
+
+    def test_kraken_historical_response_does_not_drop_requested_first_row(self):
+        target_date = (
+            datetime.now(timezone.utc).date() - timedelta(days=30)
+        ).isoformat()
+        target_timestamp = int(
+            datetime.strptime(target_date, "%Y-%m-%d")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+        rows = [
+            [target_timestamp + offset * 86_400, "1", "2", "0.5", "1.5", "1", "1", 1]
+            for offset in range(20)
+        ]
+        with patch(
+            "scripts.fetch_cex.request_json",
+            return_value={"error": [], "result": {"UNIUSD": rows, "last": "0"}},
+        ):
+            result = fetch_cex.fetch_kraken_klines(
+                "UNIUSD",
+                4,
+                target_date,
+                target_date,
+            )
+
+        self.assertEqual(result[0][0], target_timestamp)
+        self.assertEqual(len(result), 20)
+
+    def test_attempt_error_is_classified_without_raw_url_or_secret(self):
+        error = urllib.error.HTTPError(
+            "https://source.example/candles?api_key=secret",
+            429,
+            "Too Many Requests",
+            None,
+            None,
+        )
+
+        classified = classify_attempt_error(error)
+
+        self.assertEqual(classified["reason_code"], "rate_limit")
+        self.assertEqual(classified["http_status"], 429)
+        self.assertNotIn("secret", classified["error"])
+        self.assertNotIn("http", classified["error"])
+
+    def test_build_rows_records_failed_adapter_attempt(self):
+        attempts = []
+        error = urllib.error.HTTPError(
+            "https://source.example/candles?api_key=secret",
+            503,
+            "Unavailable",
+            None,
+            None,
+        )
+        with patch(
+            "scripts.fetch_cex.fetch_exchange_rows",
+            side_effect=error,
+        ):
+            rows = build_rows(
+                [{"token_symbol": "UNI", "cex_symbol": "UNI/USDT"}],
+                ["binance"],
+                attempt_records=attempts,
+                start_date="2026-07-28",
+                end_date="2026-07-28",
+            )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["status"], "failed")
+        self.assertEqual(attempts[0]["reason_code"], "source_unavailable")
+        self.assertEqual(attempts[0]["http_status"], 503)
+
+    def test_source_range_attempt_is_unsupported_not_network_failed(self):
+        attempt = cex_attempt_record(
+            "UNI",
+            "htx",
+            "UNI/USDT",
+            error=fetch_cex.SourceRangeUnavailable(
+                "source_range_unavailable: capped endpoint"
+            ),
+            start_date="2010-01-01",
+            end_date="2010-01-01",
+        )
+
+        self.assertEqual(attempt["status"], "unsupported")
+        self.assertEqual(attempt["outcome"], "range_unavailable")
+        self.assertEqual(
+            attempt["reason_code"],
+            "source_range_unavailable",
+        )
+
+    def test_attempt_ledger_is_bound_to_exact_published_csv(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_csv = root / "cex_exchange_volume_daily.csv"
+            source_csv.write_text("date,token_symbol\n", encoding="utf-8")
+            ledger_path = root / "attempts.json"
+            attempt = cex_attempt_record(
+                "UNI",
+                "binance",
+                "UNI/USDT",
+                rows=[],
+                start_date="2026-07-28",
+                end_date="2026-07-28",
+            )
+
+            payload = write_attempt_ledger(
+                ledger_path,
+                [attempt],
+                source_csv=source_csv,
+                start_date="2026-07-28",
+                end_date="2026-07-28",
+            )
+
+            persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted, payload)
+            self.assertEqual(payload["attempt_count"], 1)
+            self.assertEqual(len(payload["source_csv_sha256"]), 64)
+
     def test_https_requests_use_a_verified_tls_context(self):
         self.assertEqual(TLS_CONTEXT.verify_mode, 2)
         self.assertTrue(TLS_CONTEXT.check_hostname)

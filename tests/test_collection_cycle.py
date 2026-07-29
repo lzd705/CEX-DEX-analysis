@@ -1,13 +1,17 @@
 import csv
+import fcntl
 import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.run_collection_cycle import (
     build_collection_status,
     build_step_commands,
+    configured_data_dir,
+    processed_dir_for,
     publication_gates_from_log,
     resolve_incremental_window,
     run_collection_cycle,
@@ -108,6 +112,37 @@ class CollectionCycleTest(unittest.TestCase):
             ("2026-07-20", "2026-07-26"),
         )
 
+    def test_market_data_environment_and_default_cycle_artifacts_share_one_root(self):
+        with patch.dict(
+            "os.environ",
+            {"MARKET_DATA_DIR": str(self.data_dir)},
+            clear=True,
+        ):
+            self.assertEqual(
+                configured_data_dir(),
+                self.data_dir.resolve(),
+            )
+
+        def runner(_command, log_path):
+            log_path.write_text("ok\n", encoding="utf-8")
+            return 0
+
+        result = run_collection_cycle(
+            "tvl",
+            publish_local=False,
+            data_dir=self.data_dir,
+            now=NOW,
+            step_runner=runner,
+        )
+
+        self.assertIn(
+            self.data_dir.resolve() / "collection/runs",
+            Path(result["manifest_path"]).parents,
+        )
+        self.assertTrue(
+            (self.data_dir / "collection/latest.json").exists()
+        )
+
     def test_full_profile_builds_incremental_daily_tvl_and_depth_commands(self):
         commands = build_step_commands(
             "full",
@@ -127,7 +162,26 @@ class CollectionCycleTest(unittest.TestCase):
         self.assertEqual(daily[daily.index("--tokens") + 1], "UNI,AAVE")
         self.assertEqual(daily[daily.index("--start") + 1], "2026-07-20")
         self.assertEqual(daily[daily.index("--end") + 1], "2026-07-26")
-        self.assertTrue(all("--publish-local" in command for _, command in commands))
+        self.assertEqual(
+            daily[daily.index("--data-dir") + 1],
+            str(self.data_dir.resolve()),
+        )
+        self.assertIn("--publish-local", daily)
+        for _name, command in commands[1:]:
+            self.assertEqual(
+                command[command.index("--publish-dir") + 1],
+                str(self.data_dir.resolve()),
+            )
+        expected_raw_roots = {
+            "depth": "cex-depth",
+            "tvl": "tvl",
+            "dex_depth": "dex-depth",
+        }
+        for name, command in commands[1:]:
+            self.assertEqual(
+                command[command.index("--raw-root") + 1],
+                str(self.data_dir.resolve() / "raw" / expected_raw_roots[name]),
+            )
         self.assertTrue(
             any(
                 item.endswith("scripts/fetch_dex_depth.py")
@@ -135,6 +189,32 @@ class CollectionCycleTest(unittest.TestCase):
             )
         )
         self.assertIn("--tvl-csv", commands[-1][1])
+
+    def test_scheduled_daily_profile_includes_only_active_runtime_tokens(self):
+        runtime_records = [
+            {"token_symbol": "ACTIVE_RUNTIME", "status": "active"},
+            {"token_symbol": "PENDING_RUNTIME", "status": "pending"},
+            {"token_symbol": "FAILED_RUNTIME", "status": "failed"},
+        ]
+        with patch(
+            "scripts.run_collection_cycle.TokenRegistry.list_records",
+            return_value=runtime_records,
+        ) as list_records:
+            commands = build_step_commands(
+                "daily",
+                publish_local=False,
+                python_executable="python3",
+                data_dir=self.data_dir,
+                now=NOW,
+            )
+
+        list_records.assert_called_once_with(statuses={"active"})
+        daily_tokens = set(
+            commands[0][1][commands[0][1].index("--tokens") + 1].split(",")
+        )
+        self.assertIn("ACTIVE_RUNTIME", daily_tokens)
+        self.assertNotIn("PENDING_RUNTIME", daily_tokens)
+        self.assertNotIn("FAILED_RUNTIME", daily_tokens)
 
     def test_tvl_profile_builds_manual_recovery_command(self):
         commands = build_step_commands(
@@ -147,7 +227,14 @@ class CollectionCycleTest(unittest.TestCase):
 
         self.assertEqual([name for name, _ in commands], ["tvl"])
         self.assertIn("scripts/fetch_tvl.py", commands[0][1][1])
-        self.assertIn("--publish-local", commands[0][1])
+        self.assertEqual(
+            commands[0][1][commands[0][1].index("--publish-dir") + 1],
+            str(self.data_dir.resolve()),
+        )
+        self.assertEqual(
+            commands[0][1][commands[0][1].index("--raw-root") + 1],
+            str(self.data_dir.resolve() / "raw/tvl"),
+        )
 
     def test_hourly_depth_refreshes_private_price_input_before_dex(self):
         commands = build_step_commands(
@@ -165,12 +252,26 @@ class CollectionCycleTest(unittest.TestCase):
         price_command = commands[1][1]
         self.assertIn("scripts/fetch_tvl.py", price_command[1])
         self.assertNotIn("--publish-local", price_command)
+        self.assertEqual(
+            price_command[price_command.index("--raw-root") + 1],
+            str(self.data_dir.resolve() / "raw/tvl"),
+        )
         dex_command = commands[2][1]
         self.assertIn("--tvl-csv", dex_command)
-        self.assertTrue(
-            dex_command[dex_command.index("--tvl-csv") + 1].endswith(
-                "data/processed/dex_pool_tvl_snapshot.csv"
-            )
+        self.assertEqual(
+            commands[0][1][commands[0][1].index("--raw-root") + 1],
+            str(self.data_dir.resolve() / "raw/cex-depth"),
+        )
+        self.assertEqual(
+            dex_command[dex_command.index("--raw-root") + 1],
+            str(self.data_dir.resolve() / "raw/dex-depth"),
+        )
+        self.assertEqual(
+            dex_command[dex_command.index("--tvl-csv") + 1],
+            str(
+                processed_dir_for(self.data_dir)
+                / "dex_pool_tvl_snapshot.csv"
+            ),
         )
 
     def test_collection_status_keeps_source_specific_ranges(self):
@@ -213,6 +314,28 @@ class CollectionCycleTest(unittest.TestCase):
         self.assertEqual(result["steps"][0]["log_tail"], ["ok"])
         self.assertTrue(Path(result["manifest_path"]).exists())
         self.assertEqual(json.loads(latest.read_text())["status"], "succeeded")
+
+    def test_locked_cycle_does_not_leave_an_empty_run_directory(self):
+        lock_path = self.root / "collection.lock"
+        run_root = self.root / "locked-runs"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = run_collection_cycle(
+                "tvl",
+                publish_local=False,
+                data_dir=self.data_dir,
+                run_root=run_root,
+                latest_status_path=self.root / "locked-latest.json",
+                lock_path=lock_path,
+                now=NOW,
+                step_runner=lambda _command, _log_path: self.fail(
+                    "locked cycle must not run a collector"
+                ),
+            )
+
+        self.assertEqual(result["status"], "skipped_locked")
+        self.assertFalse(run_root.exists())
 
     def test_cycle_manifest_keeps_structured_publication_gate_evidence(self):
         gate = {

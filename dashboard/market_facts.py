@@ -29,6 +29,17 @@ MARKET_QUALITY_THRESHOLDS = {
     "wide_cex_quoted_spread_bps": 100.0,
     "minimum_primary_coverage_ratio": 0.80,
 }
+QUALITY_FLAG_CATEGORIES = {
+    "depth_unsupported": "capability",
+    "depth_partial": "measurement_limit",
+    "depth_failed": "data_health",
+    "depth_unavailable": "availability",
+    "zero_depth_10bps": "market_condition",
+    "tiny_pool": "market_condition",
+    "off_market_pool_state_price": "data_health",
+    "wide_quoted_spread": "market_condition",
+    "low_daily_coverage": "data_health",
+}
 PRIMARY_SELECTION_WEIGHTS = {
     "window_volume_share": 40.0,
     "coverage_ratio": 25.0,
@@ -66,6 +77,8 @@ def market_series_statistics(
     price_field: str = "close",
     requested_start: str | None = None,
     requested_end: str | None = None,
+    source_available_start: str | None = None,
+    coverage_from_first_observation: bool = False,
 ) -> dict[str, Any]:
     """Calculate auditable price-series statistics without filling missing days.
 
@@ -83,8 +96,22 @@ def market_series_statistics(
         by_day[day.isoformat()] = price
     observations = sorted(by_day.items())
 
-    requested_start_day = _iso_day(requested_start)
+    query_start_day = _iso_day(requested_start)
     requested_end_day = _iso_day(requested_end)
+    source_start_day = _iso_day(source_available_start)
+    requested_start_day = query_start_day
+    if requested_start_day is not None and source_start_day is not None:
+        requested_start_day = max(requested_start_day, source_start_day)
+    elif source_start_day is not None:
+        requested_start_day = source_start_day
+    if coverage_from_first_observation and observations:
+        first_observed_day = _iso_day(observations[0][0])
+        if first_observed_day is not None:
+            requested_start_day = (
+                max(requested_start_day, first_observed_day)
+                if requested_start_day is not None
+                else first_observed_day
+            )
     requested_window_days = (
         (requested_end_day - requested_start_day).days + 1
         if requested_start_day is not None
@@ -101,6 +128,21 @@ def market_series_statistics(
             "latest_observed_date": None,
             "calendar_span_days": 0,
             "requested_window_days": requested_window_days,
+            "coverage_expected_start": (
+                requested_start_day.isoformat()
+                if requested_start_day is not None
+                else None
+            ),
+            "coverage_expected_end": (
+                requested_end_day.isoformat()
+                if requested_end_day is not None
+                else None
+            ),
+            "coverage_start_method": (
+                "max_query_source_market_observed_start"
+                if coverage_from_first_observation
+                else "max_query_source_start"
+            ),
             "observation_count": 0,
             "coverage_ratio": 0.0 if requested_window_days else None,
             "missing_calendar_days": requested_window_days,
@@ -150,6 +192,21 @@ def market_series_statistics(
         "latest_observed_date": latest_date.isoformat(),
         "calendar_span_days": calendar_span_days,
         "requested_window_days": requested_window_days,
+        "coverage_expected_start": (
+            requested_start_day.isoformat()
+            if requested_start_day is not None
+            else first_date.isoformat()
+        ),
+        "coverage_expected_end": (
+            requested_end_day.isoformat()
+            if requested_end_day is not None
+            else latest_date.isoformat()
+        ),
+        "coverage_start_method": (
+            "max_query_source_market_observed_start"
+            if coverage_from_first_observation
+            else "max_query_source_start"
+        ),
         "observation_count": observation_count,
         "coverage_ratio": (
             observation_count / coverage_denominator
@@ -172,10 +229,12 @@ def _quality_flag(
     *,
     observed_value: Any = None,
     threshold: Any = None,
+    category: str | None = None,
 ) -> dict[str, Any]:
     return {
         "code": code,
         "severity": severity,
+        "category": category or QUALITY_FLAG_CATEGORIES.get(code, "data_health"),
         "message": message,
         "observed_value": observed_value,
         "threshold": threshold,
@@ -199,7 +258,7 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
         flags.append(
             _quality_flag(
                 "depth_unsupported",
-                "warning",
+                "info",
                 "Executable depth is unsupported for this market.",
                 observed_value=depth_status,
             )
@@ -208,7 +267,7 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
         flags.append(
             _quality_flag(
                 "depth_partial",
-                "warning",
+                "info",
                 "Depth is a measured lower bound because one or more bands are incomplete.",
                 observed_value=depth_status,
             )
@@ -240,7 +299,7 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
         flags.append(
             _quality_flag(
                 "zero_depth_10bps",
-                "warning",
+                "info",
                 (
                     "No executable notional was observed inside the ±10 bps band; "
                     "the band may lie inside the quoted spread."
@@ -257,7 +316,7 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
             flags.append(
                 _quality_flag(
                     "tiny_pool",
-                    "warning",
+                    "info",
                     "The point-in-time pool TVL is below the declared quality threshold.",
                     observed_value=tvl,
                     threshold=tiny_threshold,
@@ -315,7 +374,7 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
             flags.append(
                 _quality_flag(
                     "wide_quoted_spread",
-                    "warning",
+                    "info",
                     "Quoted CEX spread exceeds the declared quality threshold.",
                     observed_value=spread_bps,
                     threshold=spread_threshold,
@@ -338,13 +397,33 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
         )
 
     severity_rank = {"info": 1, "warning": 2, "critical": 3}
-    worst_rank = max((severity_rank[flag["severity"]] for flag in flags), default=0)
+    health_flags = [
+        flag for flag in flags if flag["category"] == "data_health"
+    ]
+    worst_rank = max(
+        (severity_rank[flag["severity"]] for flag in health_flags),
+        default=0,
+    )
     quality_status = {0: "ok", 1: "info", 2: "warning", 3: "critical"}[worst_rank]
     return {
         "quality_status": quality_status,
         "quality_flags": [flag["code"] for flag in flags],
         "quality_flag_details": flags,
-        "quality_thresholds_version": "market_quality_v1",
+        "quality_flag_groups": {
+            category: [
+                flag["code"]
+                for flag in flags
+                if flag["category"] == category
+            ]
+            for category in (
+                "data_health",
+                "availability",
+                "capability",
+                "measurement_limit",
+                "market_condition",
+            )
+        },
+        "quality_thresholds_version": "market_quality_v2",
     }
 
 
@@ -749,7 +828,9 @@ def catalog_contract() -> dict[str, Any]:
             "window_return": "first-to-last observed close in the selected window",
             "daily_volatility": SERIES_STATISTICS_METHOD,
             "coverage_ratio": (
-                "finite positive close observations / requested UTC calendar days"
+                "finite positive close observations / expected UTC calendar days; "
+                "the expected start is no earlier than the source range and, for "
+                "the full catalog, no earlier than the market's first observation"
             ),
             "no_fill": True,
         },
@@ -829,6 +910,15 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "calendar_span_days": row.get("calendar_span_days"),
                 "requested_window_days": row.get("requested_window_days"),
+                "coverage_expected_start": row.get(
+                    "coverage_expected_start"
+                ),
+                "coverage_expected_end": row.get(
+                    "coverage_expected_end"
+                ),
+                "coverage_start_method": row.get(
+                    "coverage_start_method"
+                ),
                 "coverage_ratio": row.get("coverage_ratio"),
                 "missing_calendar_days": row.get("missing_calendar_days"),
                 "return_interval_count": row.get("return_interval_count"),
@@ -944,6 +1034,15 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "calendar_span_days": row.get("calendar_span_days"),
                 "requested_window_days": row.get("requested_window_days"),
+                "coverage_expected_start": row.get(
+                    "coverage_expected_start"
+                ),
+                "coverage_expected_end": row.get(
+                    "coverage_expected_end"
+                ),
+                "coverage_start_method": row.get(
+                    "coverage_start_method"
+                ),
                 "coverage_ratio": row.get("coverage_ratio"),
                 "missing_calendar_days": row.get("missing_calendar_days"),
                 "return_interval_count": row.get("return_interval_count"),

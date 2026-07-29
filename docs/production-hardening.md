@@ -13,31 +13,88 @@ Before deployment, choose:
   the runtime data directories;
 - `@PROJECT_ROOT@`: preferably a stable symlink such as
   `/srv/cex-dex/app/current`;
+- `MARKET_DATA_DIR`: an absolute directory containing the published SQLite,
+  CSV, quality, registry, collection-lock, and raw-response files;
+- `ADMIN_JOB_DIR`: an absolute directory for administrator job records. It may
+  live under `MARKET_DATA_DIR`, but it does not have to;
 - TLS certificates for `@DOMAIN@`, normally issued and renewed by Certbot or the
   host's certificate manager.
 
 Do not use the raw IP address as a substitute for the missing HTTPS domain.
+The runtime paths are not restricted to `/srv`; `/var/lib`, a mounted data
+volume, or another reviewed absolute path is supported. Do not use `/` itself,
+relative paths, or paths containing whitespace.
 
 ## Install the process supervisor
 
-Render `deploy/systemd/cex-dex-dashboard.service.in` by replacing the three
-placeholders, install it as
-`/etc/systemd/system/cex-dex-dashboard.service`, and install a reviewed copy of
-`deploy/dashboard.env.example` as `/etc/cex-dex/dashboard.env`:
+Render the environment file and systemd services together so the values loaded
+as `MARKET_DATA_DIR` and `ADMIN_JOB_DIR` exactly match the paths granted by
+`ReadWritePaths`. systemd does not expand environment-file variables inside
+filesystem-hardening directives, so manually copying the example without
+rendering is invalid.
+
+The collector uses a staging directory beside `MARKET_DATA_DIR`. For example,
+`/data/market/published` uses `/data/market/.published-processed`. Create all
+three writable directories before service startup, render the templates, and
+install the generated files:
 
 ```bash
+sudo install -d -o market-monitor -g market-monitor -m 0750 \
+  /data/market/published \
+  /data/market/.published-processed \
+  /data/market/admin/jobs
+python3 deploy/render_runtime_templates.py \
+  --output-dir /tmp/cex-dex-rendered \
+  --project-root /opt/cex-dex/app/current \
+  --service-user market-monitor \
+  --service-group market-monitor \
+  --market-data-dir /data/market/published \
+  --admin-job-dir /data/market/admin/jobs
 sudo install -d -m 0750 /etc/cex-dex
-sudo install -m 0600 deploy/dashboard.env.example /etc/cex-dex/dashboard.env
+sudo install -m 0600 /tmp/cex-dex-rendered/dashboard.env \
+  /etc/cex-dex/dashboard.env
+sudo install -m 0644 /tmp/cex-dex-rendered/cex-dex-dashboard.service \
+  /etc/systemd/system/cex-dex-dashboard.service
+sudo install -m 0644 /tmp/cex-dex-rendered/cex-dex-daily.service \
+  /etc/systemd/system/cex-dex-daily.service
+sudo install -m 0644 /tmp/cex-dex-rendered/cex-dex-depth.service \
+  /etc/systemd/system/cex-dex-depth.service
+sudo install -m 0644 deploy/systemd/cex-dex-daily.timer \
+  /etc/systemd/system/cex-dex-daily.timer
+sudo install -m 0644 deploy/systemd/cex-dex-depth.timer \
+  /etc/systemd/system/cex-dex-depth.timer
 sudo systemctl daemon-reload
-sudo systemctl enable --now cex-dex-dashboard.service
+sudo systemctl enable --now \
+  cex-dex-dashboard.service \
+  cex-dex-daily.timer \
+  cex-dex-depth.timer
 ```
 
-The service binds only to `127.0.0.1:8765`, restarts after failures, runs
-without Linux capabilities, and writes logs to journald. Verify:
+The dashboard service binds only to `127.0.0.1:8765` and restarts after
+failures. The dashboard and both collectors run as the same explicitly rendered
+unprivileged account, without Linux capabilities, and write logs to journald.
+`ProtectSystem=strict` keeps the rest of the filesystem read-only. Their
+explicit write allowlists cover:
+
+- `MARKET_DATA_DIR`, including publication files, `admin/token_registry.json`,
+  `collection/collection.lock`, quality evidence, and raw snapshots;
+- the derived collector staging directory beside `MARKET_DATA_DIR`;
+- `ADMIN_JOB_DIR`, even when operator jobs are stored outside the market-data
+  tree.
+
+Verify the rendered contract before starting the service:
 
 ```bash
+grep -F "MARKET_DATA_DIR=/data/market/published" \
+  /etc/cex-dex/dashboard.env
+grep -F "ReadWritePaths=/data/market/published" \
+  /etc/systemd/system/cex-dex-dashboard.service
+systemd-analyze verify /etc/systemd/system/cex-dex-dashboard.service
+systemd-analyze verify /etc/systemd/system/cex-dex-daily.service
+systemd-analyze verify /etc/systemd/system/cex-dex-depth.service
 python3 scripts/check_dashboard_health.py
 systemctl is-active cex-dex-dashboard.service
+systemctl list-timers cex-dex-daily.timer cex-dex-depth.timer
 journalctl -u cex-dex-dashboard.service --since today
 ```
 
@@ -65,6 +122,12 @@ after failure, and survives logout only when linger is enabled. Prefer
 `@BIND_HOST@=127.0.0.1` with the HTTPS proxy below. A non-loopback bind is a
 temporary compatibility choice, not a substitute for TLS, rate limiting, or
 closing port 8765.
+
+For user-level collection timers, use `scripts/install_collection_timers.sh`
+with an absolute `MARKET_DATA_DIR`. It renders the dedicated
+`cex-dex-daily-user.service.in` and `cex-dex-depth-user.service.in` templates,
+embedding that path rather than attempting to read the system-only
+`/etc/cex-dex/dashboard.env`.
 
 ## Configure HTTPS
 
@@ -180,6 +243,10 @@ For automation, render and install
 output has been reviewed. Enabling the timer is the explicit authorization for
 daily `--apply`. Adjust the 7/30-day values in the rendered unit if regulatory
 or research reproducibility requirements demand longer retention.
+The rendered retention unit passes
+`--root MARKET_DATA_DIR/raw/cex-depth` explicitly and grants write access only
+to that external directory; it no longer assumes raw snapshots live under the
+application checkout.
 
 ## Cache generation behavior
 

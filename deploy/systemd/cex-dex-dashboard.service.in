@@ -27,9 +27,11 @@ PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadOnlyPaths=@PROJECT_ROOT@
-ReadWritePaths=-@PROJECT_ROOT@/data/local
-ReadWritePaths=-@PROJECT_ROOT@/data/processed
-ReadWritePaths=-@PROJECT_ROOT@/data/raw
+# systemd does not expand MARKET_DATA_DIR or ADMIN_JOB_DIR from EnvironmentFile
+# in path-hardening directives. These absolute paths must therefore be rendered.
+ReadWritePaths=@MARKET_DATA_DIR@
+ReadWritePaths=@MARKET_WORK_DIR@
+ReadWritePaths=@ADMIN_JOB_DIR@
 CapabilityBoundingSet=
 AmbientCapabilities=
 LockPersonality=true
@@ -40,6 +42,7 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

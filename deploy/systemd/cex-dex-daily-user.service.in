@@ -1,33 +1,20 @@
 [Unit]
-Description=CEX/DEX daily OHLCV and TVL collection
+Description=CEX/DEX daily OHLCV and TVL collection (unprivileged)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=@SERVICE_USER@
-Group=@SERVICE_GROUP@
 WorkingDirectory=@PROJECT_ROOT@
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-EnvironmentFile=-/etc/cex-dex/dashboard.env
+Environment=MARKET_DATA_DIR=@MARKET_DATA_DIR@
 ExecStart=/usr/bin/python3 scripts/run_collection_cycle.py --profile daily --publish-local --data-dir @MARKET_DATA_DIR@
 TimeoutStartSec=75min
 Nice=10
 NoNewPrivileges=true
 PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadOnlyPaths=@PROJECT_ROOT@
-ReadWritePaths=@MARKET_DATA_DIR@
-ReadWritePaths=@MARKET_WORK_DIR@
-CapabilityBoundingSet=
-AmbientCapabilities=
 LockPersonality=true
-ProtectControlGroups=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

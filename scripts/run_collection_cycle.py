@@ -35,12 +35,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dashboard.freshness import build_source_freshness
 from scripts.publication_gate import COVERAGE_GATE_LOG_MARKER
+from scripts.token_registry import TokenRegistry
 
 
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data/local"
-DEFAULT_RUN_ROOT = DEFAULT_DATA_DIR / "collection/runs"
-DEFAULT_LATEST_STATUS = DEFAULT_DATA_DIR / "collection/latest.json"
-DEFAULT_LOCK_FILE = DEFAULT_DATA_DIR / "collection/collection.lock"
 TOKEN_CONFIG = PROJECT_ROOT / "config/tokens.csv"
 DEX_PRICE_INPUT = PROJECT_ROOT / "data/processed/dex_pool_tvl_snapshot.csv"
 PROFILE_STEPS = {
@@ -200,13 +198,50 @@ def build_collection_status(
     }
 
 
-def configured_tokens(path: Path = TOKEN_CONFIG) -> list[str]:
+def configured_data_dir() -> Path:
+    configured = os.environ.get("MARKET_DATA_DIR")
+    return (
+        Path(configured).expanduser().resolve()
+        if configured
+        else DEFAULT_DATA_DIR.resolve()
+    )
+
+
+def processed_dir_for(data_dir: Path) -> Path:
+    resolved = data_dir.expanduser().resolve()
+    if resolved == DEFAULT_DATA_DIR.resolve():
+        return (PROJECT_ROOT / "data/processed").resolve()
+    return (resolved.parent / f".{resolved.name}-processed").resolve()
+
+
+def runtime_registry_path(data_dir: Path = DEFAULT_DATA_DIR) -> Path:
+    configured = os.environ.get("TOKEN_REGISTRY_PATH")
+    return (
+        Path(configured).expanduser().resolve()
+        if configured
+        else data_dir.expanduser().resolve() / "admin/token_registry.json"
+    )
+
+
+def configured_tokens(
+    path: Path = TOKEN_CONFIG,
+    *,
+    data_dir: Path = DEFAULT_DATA_DIR,
+) -> list[str]:
+    """Return reviewed static symbols plus active runtime Tokens."""
     with path.open("r", newline="", encoding="utf-8") as handle:
         tokens = [
             row["token_symbol"].strip().upper()
             for row in csv.DictReader(handle)
             if row.get("token_symbol")
         ]
+    tokens.extend(
+        record["token_symbol"]
+        for record in TokenRegistry(runtime_registry_path(data_dir)).list_records(
+            statuses={"active"},
+        )
+        if record.get("status") == "active"
+    )
     if not tokens or len(tokens) != len(set(tokens)):
         raise ValueError("Token configuration must contain unique non-empty symbols")
     return tokens
@@ -255,6 +290,10 @@ def build_step_commands(
         raise ValueError(f"Unknown collection profile: {profile}")
     if bool(start) != bool(end):
         raise ValueError("--start and --end must be provided together")
+    data_dir = data_dir.expanduser().resolve()
+    processed_dir = processed_dir_for(data_dir)
+    dex_price_input = processed_dir / DEX_PRICE_INPUT.name
+    raw_root = data_dir / "raw"
     commands: list[tuple[str, list[str]]] = []
     for step in PROFILE_STEPS[profile]:
         if step == "daily":
@@ -268,7 +307,9 @@ def build_step_commands(
                     now=now,
                 )
                 if window is not None:
-                    selected_tokens = tokens or configured_tokens()
+                    selected_tokens = tokens or configured_tokens(
+                        data_dir=data_dir
+                    )
                     command.extend(
                         [
                             "--append",
@@ -282,31 +323,52 @@ def build_step_commands(
                     )
             elif start and end:
                 command.extend(["--start", start, "--end", end])
+            command.extend(["--data-dir", str(data_dir)])
             if publish_local:
                 command.append("--publish-local")
         elif step in {"tvl", "dex_price"}:
             command = [
                 python_executable,
                 str(PROJECT_ROOT / "scripts/fetch_tvl.py"),
+                "--database",
+                str(data_dir / "market_facts.sqlite3"),
+                "--dex-csv",
+                str(data_dir / DAILY_FILENAMES["dex_daily"]),
+                "--output-dir",
+                str(processed_dir),
+                "--raw-root",
+                str(raw_root / "tvl"),
             ]
             if step == "tvl" and publish_local:
-                command.append("--publish-local")
+                command.extend(["--publish-dir", str(data_dir)])
         elif step == "depth":
             command = [
                 python_executable,
                 str(PROJECT_ROOT / "scripts/fetch_cex_depth.py"),
+                "--database",
+                str(data_dir / "market_facts.sqlite3"),
+                "--cex-csv",
+                str(data_dir / DAILY_FILENAMES["cex_daily"]),
+                "--output-dir",
+                str(processed_dir),
+                "--raw-root",
+                str(raw_root / "cex-depth"),
             ]
             if publish_local:
-                command.append("--publish-local")
+                command.extend(["--publish-dir", str(data_dir)])
         else:
             command = [
                 python_executable,
                 str(PROJECT_ROOT / "scripts/fetch_dex_depth.py"),
                 "--tvl-csv",
-                str(DEX_PRICE_INPUT),
+                str(dex_price_input),
+                "--output-dir",
+                str(processed_dir),
+                "--raw-root",
+                str(raw_root / "dex-depth"),
             ]
             if publish_local:
-                command.append("--publish-local")
+                command.extend(["--publish-dir", str(data_dir)])
         commands.append((step, command))
     return commands
 
@@ -468,9 +530,9 @@ def run_collection_cycle(
     *,
     publish_local: bool,
     data_dir: Path = DEFAULT_DATA_DIR,
-    run_root: Path = DEFAULT_RUN_ROOT,
-    latest_status_path: Path = DEFAULT_LATEST_STATUS,
-    lock_path: Path = DEFAULT_LOCK_FILE,
+    run_root: Path | None = None,
+    latest_status_path: Path | None = None,
+    lock_path: Path | None = None,
     now: datetime | None = None,
     start: str | None = None,
     end: str | None = None,
@@ -480,6 +542,11 @@ def run_collection_cycle(
     dry_run: bool = False,
     step_runner: Callable[[list[str], Path], int] = default_step_runner,
 ) -> dict[str, Any]:
+    data_dir = data_dir.expanduser().resolve()
+    run_root = run_root or data_dir / "collection/runs"
+    latest_status_path = latest_status_path or data_dir / "collection/latest.json"
+    lock_path = lock_path or data_dir / "collection/collection.lock"
+    dex_price_input = processed_dir_for(data_dir) / DEX_PRICE_INPUT.name
     started = (now or utc_now()).astimezone(timezone.utc)
     run_id = started.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     commands = build_step_commands(
@@ -504,8 +571,6 @@ def run_collection_cycle(
             ],
         }
 
-    run_dir = run_root / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         try:
@@ -518,6 +583,8 @@ def run_collection_cycle(
                 "publish_local": publish_local,
             }
 
+        run_dir = run_root / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
         step_results = []
         for name, command in commands:
             step_started = utc_now()
@@ -679,7 +746,7 @@ def run_collection_cycle(
             "steps": step_results,
             "facts": build_collection_status(data_dir),
             "dependency_files": (
-                {"dex_price_input": file_record(DEX_PRICE_INPUT)}
+                {"dex_price_input": file_record(dex_price_input)}
                 if any(
                     name in {"dex_price", "dex_depth"}
                     for name, _command in commands
@@ -705,6 +772,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a coordinated fact collection cycle")
     parser.add_argument("--profile", choices=sorted(PROFILE_STEPS), default="full")
     parser.add_argument("--publish-local", action="store_true")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=configured_data_dir(),
+        help="Runtime snapshot directory (defaults to MARKET_DATA_DIR)",
+    )
     parser.add_argument("--start", help="Inclusive UTC date override for daily facts")
     parser.add_argument("--end", help="Inclusive UTC date override for daily facts")
     parser.add_argument("--tokens", help="Comma-separated daily Token override")
@@ -723,6 +796,7 @@ def main() -> None:
     result = run_collection_cycle(
         args.profile,
         publish_local=args.publish_local,
+        data_dir=args.data_dir,
         start=args.start,
         end=args.end,
         tokens=parse_list(args.tokens),

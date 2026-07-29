@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260729-events-v3">
+    <link rel="stylesheet" href="/styles.css?v=20260729-critical-round-v1">
   </head>
   <body>
     <header class="app-header">
@@ -19,7 +19,6 @@
       <nav class="primary-navigation" aria-label="Primary navigation">
         <a href="/screener" data-app-route="screener">Screener</a>
         <a href="/tokens/AAVE/markets" data-app-route="workspace">Token Research</a>
-        <a href="/methodology" data-app-route="methodology">Methodology</a>
       </nav>
       <div
         id="freshness-cluster"
@@ -45,27 +44,42 @@
             <span class="metric-note">Daily metrics only; TVL, depth, and execution remain latest independent snapshots.</span>
           </div>
         </div>
-        <div class="date-fields">
-          <label>
-            <span>Start</span>
-            <input id="date-start" type="date">
-          </label>
-          <span class="date-arrow">to</span>
-          <label>
-            <span>End</span>
-            <input id="date-end" type="date">
-          </label>
-        </div>
+        <form id="date-window-form" class="date-apply-group" novalidate>
+          <div class="date-fields">
+            <label>
+              <span>Start</span>
+              <input
+                id="date-start"
+                type="date"
+                required
+                aria-invalid="false"
+                aria-describedby="date-window-error"
+              >
+            </label>
+            <span class="date-arrow" aria-hidden="true">to</span>
+            <label>
+              <span>End</span>
+              <input
+                id="date-end"
+                type="date"
+                required
+                aria-invalid="false"
+                aria-describedby="date-window-error"
+              >
+            </label>
+          </div>
+          <button id="apply-window" class="icon-command" type="submit" title="Apply time window">
+            <i data-lucide="refresh-cw"></i>
+            <span>Apply</span>
+          </button>
+          <div id="date-window-error" class="date-window-error" role="alert" aria-live="assertive" hidden></div>
+        </form>
         <div class="preset-group" role="group" aria-label="Time presets">
           <button type="button" data-days="7" aria-pressed="false">7D</button>
           <button type="button" data-days="30" class="active" aria-pressed="true">30D</button>
           <button type="button" data-days="90" aria-pressed="false">90D</button>
           <button type="button" data-days="all" aria-pressed="false">All</button>
         </div>
-        <button id="apply-window" class="icon-command" type="button" title="Apply time window">
-          <i data-lucide="refresh-cw"></i>
-          <span>Apply</span>
-        </button>
       </section>
 
       <div id="market-loading" class="status-banner" role="status" aria-live="polite" hidden></div>
@@ -424,7 +438,6 @@
             </div>
             <p id="execution-method-note" class="method-note">
               CEX values include visible-book spread and impact but exclude account-specific taker fees. Supported DEX V2 values include the pool swap fee; gas, router fees, token taxes, latency, and MEV are excluded.
-              <a href="/methodology/execution-cost" data-methodology-link="execution-cost">How execution cost is calculated</a>
             </p>
           </section>
         </section>
@@ -662,7 +675,8 @@
               <span class="eyebrow">Fact × Market audit</span>
               <h3>Data Quality</h3>
               <p>Separate observed values, partial lower bounds, unsupported methods, collection failures, and genuinely missing facts for this Token.</p>
-              <p class="metric-note">The selected window controls window-derived price and volume context. Daily quality and coverage audit the full catalog history; TVL, depth, and execution use their independently timestamped latest snapshots.</p>
+              <p class="metric-note">Daily quality and coverage use the selected date window. TVL, depth, and execution use their independently timestamped latest snapshots.</p>
+              <p class="metric-note">Hover a daily status to see its cause and affected UTC dates. This public page is read-only: retryable gaps go to the protected operator queue, while confirmed no-candle, listing, and source-history outcomes require operator review rather than a public retry.</p>
             </div>
             <div class="segmented-control" role="group" aria-label="Data quality scope">
               <button type="button" data-quality-scope="all" class="active" aria-pressed="true">All markets</button>
@@ -691,6 +705,19 @@
               </tbody>
             </table>
           </div>
+          <details class="facts-contract quality-source-details">
+            <summary>Source, contract, and snapshot details</summary>
+            <div id="facts-contract-copy"></div>
+            <div id="facts-source-copy"></div>
+            <div class="quality-source-list">
+              <div id="source-list"></div>
+              <div id="daily-source-status">Daily source freshness loading</div>
+              <div id="tvl-source-status">TVL snapshot status loading</div>
+              <div id="depth-source-status">CEX depth snapshot status loading</div>
+              <div id="dex-depth-source-status">DEX depth snapshot status loading</div>
+              <div id="execution-source-status">Execution snapshot status loading</div>
+            </div>
+          </details>
         </section>
       </section>
 
@@ -711,6 +738,7 @@
       <section class="monitor-toolbar">
         <div class="segmented-control" role="group" aria-label="Sort market scope">
           <button type="button" data-scope="combined" class="active" aria-pressed="true">Aggregate</button>
+          <button type="button" data-scope="cross" aria-pressed="false">Cross-venue</button>
           <button type="button" data-scope="cex" aria-pressed="false">CEX</button>
           <button type="button" data-scope="dex" aria-pressed="false">DEX</button>
         </div>
@@ -721,6 +749,15 @@
             <option value="spread">Absolute Spread</option>
             <option value="return">Window Return</option>
             <option value="volatility">Daily Volatility</option>
+            <option value="depth_100bps">Primary ±100 bps Depth</option>
+            <option value="dex_tvl">Primary DEX TVL</option>
+          </select>
+        </label>
+        <label class="sort-control">
+          <span>Direction</span>
+          <select id="sort-direction">
+            <option value="desc">Highest first</option>
+            <option value="asc">Lowest first</option>
           </select>
         </label>
         <div class="search-control">
@@ -751,6 +788,7 @@
             <thead>
               <tr>
                 <th scope="col" class="sticky-token">Token</th>
+                <th id="rank-value-heading" scope="col">USD Volume · Aggregate</th>
                 <th scope="col">Covered Markets</th>
                 <th scope="col">Aggregate USD Volume</th>
                 <th scope="col">DEX Share</th>
@@ -767,91 +805,10 @@
       </section>
       </section>
 
-      <section
-        id="methodology-view"
-        class="app-view methodology-view"
-        data-app-view="methodology"
-        aria-labelledby="methodology-title"
-        hidden
-      >
-        <div class="view-heading">
-          <div>
-            <span class="eyebrow">Definitions, formulas, and boundaries</span>
-            <h2 id="methodology-title">Methodology</h2>
-            <p>Use this page for the general meaning of each fact. Use a Token’s Data Quality page for the current status of a specific market.</p>
-          </div>
-          <span class="contract-badge">Versioned fact contracts</span>
-        </div>
-
-        <div class="methodology-grid">
-          <article id="daily-facts" class="methodology-card">
-            <i data-lucide="chart-no-axes-combined"></i>
-            <h3>Daily Price, Volume, Return &amp; Volatility</h3>
-            <p>Prices are USD-normalized daily closes. Window return uses the first and last observed close. Daily volatility uses only adjacent UTC-day log returns; gaps are excluded and values are never forward-filled.</p>
-          </article>
-          <article id="tvl" class="methodology-card">
-            <i data-lucide="landmark"></i>
-            <h3>DEX TVL</h3>
-            <p>TVL is the latest source-reported pool reserve in USD. It is a point-in-time pool-size fact, not historical TVL, active concentrated liquidity, or executable depth.</p>
-          </article>
-          <article id="depth" class="methodology-card">
-            <i data-lucide="waves"></i>
-            <h3>10/25/50/100 bps Depth</h3>
-            <p>CEX depth sums visible order-book notional inside midpoint-relative bands. Supported DEX depth scans fixed-block pool state. Partial values are lower bounds and use ≥; unsupported protocols remain N/A.</p>
-          </article>
-          <article id="execution-cost" class="methodology-card">
-            <i data-lucide="route"></i>
-            <h3>Fixed-notional Execution Cost</h3>
-            <p>CEX scenarios walk visible order-book levels. Supported DEX V2 scenarios use exact integer constant-product mechanics. For DEX, target quantity = requested USD ÷ (pool quote per Token × quote-token USD price). Pool state and the USD-price response have independent timestamps: if either is missing or they differ by more than two hours, cost and fill are withheld as N/A, not zero. The A/B state-time skew is a separate comparison. DEX pool swap fees are included where supported; CEX account fees, gas, latency, router costs, transfer taxes, and MEV are excluded.</p>
-          </article>
-          <article id="quality-states" class="methodology-card">
-            <i data-lucide="shield-check"></i>
-            <h3>Quality States</h3>
-            <p><strong>Observed</strong> is measured. <strong>Partial</strong> is usable with a stated boundary. <strong>Unsupported</strong> means no protocol-specific, project-validated method exists. <strong>Failed</strong> is a collection error. <strong>N/A</strong> means the fact does not apply. A measured zero remains zero.</p>
-          </article>
-          <article id="scope-boundaries" class="methodology-card">
-            <i data-lucide="circle-off"></i>
-            <h3>Current Fact Boundary</h3>
-            <p>Funding rates are not collected and therefore do not appear. Trading-fee treatment is reported inside execution facts: supported DEX pool swap fees can be included, while account-specific CEX fees remain excluded.</p>
-          </article>
-        </div>
-
-        <details class="quality-legend" open>
-          <summary>Quality flags and metric definitions</summary>
-          <div class="quality-legend-grid">
-            <span><strong>Aggregate</strong> sums every cataloged market in the selected daily window.</span>
-            <span><strong>Selected</strong> refers only to Market A and Market B for one Token.</span>
-            <span><strong>Partial</strong> depth is a lower bound and uses the ≥ prefix.</span>
-            <span><strong>Unsupported</strong> stays N/A; TVL and volume never substitute for depth.</span>
-            <span><strong>Off-market</strong> flags a pool-state price that diverges materially from its source price.</span>
-            <span><strong>Tiny pool</strong> warns that a valid pool may not be economically representative.</span>
-          </div>
-        </details>
-
-        <details class="facts-contract" open>
-          <summary>Current data contract and audit trail</summary>
-          <div id="facts-contract-copy"></div>
-          <div id="facts-source-copy"></div>
-        </details>
-
-      <footer>
-        <div id="source-list"></div>
-        <div id="daily-source-status">Daily source freshness loading</div>
-        <div id="tvl-source-status">TVL snapshot status loading</div>
-        <div id="depth-source-status">CEX depth snapshot status loading</div>
-        <div id="dex-depth-source-status">DEX depth snapshot status loading</div>
-        <div id="execution-source-status">Execution snapshot status loading</div>
-        <div>Primary-market price gap = primary DEX price / primary CEX price - 1 on their latest common date. It appears only on the Token row.</div>
-        <div>The comparison workbench separately reports midpoint-relative spread in bps. Neither measure is a bid/ask spread or executable slippage estimate.</div>
-        <div>TVL is the latest fetch snapshot and is not presented as historical daily TVL.</div>
-        <div>CEX depth is a real point-in-time order-book snapshot. A ≥ prefix means the returned levels did not prove complete ±100 bps coverage.</div>
-        <div>DEX depth is calculated from one fixed blockchain block for supported V2/V3 pools. Unsupported pool types stay N/A; TVL is never used as a substitute.</div>
-      </footer>
-      </section>
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/navigation.js?v=20260729-events-v3"></script>
-    <script src="/app.js?v=20260729-events-v3"></script>
+    <script src="/navigation.js?v=20260729-critical-round-v1"></script>
+    <script src="/app.js?v=20260729-critical-round-v1"></script>
   </body>
 </html>

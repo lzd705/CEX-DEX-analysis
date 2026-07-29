@@ -23,6 +23,49 @@ passes every configured Token to `run_fact_pipeline.py --append`, so the upsert
 preserves older history. `--full-rebuild` is an explicit exception and must not
 be used by timers.
 
+Each daily collector also writes one run-scoped attempt ledger beside its
+staging CSV:
+
+```text
+data/processed/cex_daily_collection_attempts.json
+data/processed/dex_daily_collection_attempts.json
+```
+
+The pipeline deletes both arbitrary staging ledgers before starting. Every
+attempt records a Token and adapter or exact pool, requested date window,
+observed dates, `status`, `outcome`, normalized `reason_code`, optional HTTP
+status, and a bounded safe error. Raw URLs, query strings, response payloads,
+credentials, and local paths are not retained in this field. The ledger is
+bound to the candidate daily CSV by SHA-256.
+
+An append also preserves applicable evidence from the currently published
+`quality/daily-latest.json`. Before doing any network work, it verifies the
+report schema, its `import_run_id` and snapshot ID against SQLite
+`dataset_state`, and both report/CSV hashes against the SQLite snapshot
+lineage. An existing but malformed or mismatched report fails closed: the
+collectors and publication do not run. Only normalized non-success attempts
+that still explain a gap in the new complete candidate are carried. A current
+attempt replaces the overlapping part of an older market window; any
+non-overlapping dates are retained as bounded split records. Succeeded or
+orphaned attempts are not carried. The merged ledger is deduplicated and
+rebound to the new full CSV hash. A full rebuild never carries prior evidence.
+
+During report construction, a missing, malformed, or hash-mismatched standalone
+ledger is ignored as failure evidence rather than being allowed to explain a
+snapshot. During append merging, however, a malformed ledger just written by a
+selected collector aborts the run before publication.
+
+Accepted normalized attempts are embedded in the staged daily quality report;
+the standalone staging ledgers are not a second public commit point. The same
+evidence therefore survives both a successful quality publication and a
+hard-invalid rejection report.
+
+Only transport, rate-limit, source-availability, parse, validation, and
+unexplained missing-row outcomes enter automatic retry windows. A successful
+source response with no target candle is retained as non-retryable
+`source_no_observation/no_candles`. `not_listed` and
+`source_range_unavailable` are also non-retryable and enter manual review.
+
 ## Manually reviewed Event Fact publication
 
 Event Facts do not run in the daily or hourly collection profiles. An operator
@@ -188,13 +231,23 @@ slower than the CEX phase.
 ## Timer installation
 
 The repository includes user-level systemd timer templates. On the production
-host, from the deployed checkout:
+host, from the deployed checkout, set the same absolute runtime-data path used
+by the dashboard and run:
 
 ```bash
 chmod +x scripts/install_collection_timers.sh
+export MARKET_DATA_DIR=/data/market/published
+export ADMIN_JOB_DIR=/data/market/admin/jobs
 ./scripts/install_collection_timers.sh
 systemctl --user list-timers cex-dex-daily.timer cex-dex-depth.timer
 ```
+
+The installer validates the absolute paths and renders dedicated user-service
+units. Each unit embeds `MARKET_DATA_DIR`; it does not depend on the root-only
+`/etc/cex-dex/dashboard.env`. Raw evidence is written below that same runtime
+root at `raw/tvl`, `raw/cex-depth`, and `raw/dex-depth`. Collector staging is
+the reviewed sibling `.<data-directory-name>-processed`, except that the
+checkout default `data/local` uses `data/processed`.
 
 Logs are available through:
 
@@ -206,6 +259,8 @@ journalctl --user -u cex-dex-depth.service
 The timers use the same lock. A failed collector leaves previously published
 facts in place and records a failed run manifest. Diagnose the retained step
 log, fix the source/configuration issue, then rerun the relevant profile.
+A lock-contention skip does not create an empty run directory or overwrite the
+latest completed run manifest.
 The daily service is intentionally not fail-fast: TVL is still attempted when
 the independent daily OHLCV step fails, while the final service status remains
 failed and auditable.

@@ -9,11 +9,15 @@ This version is intentionally simple:
 
 import csv
 import argparse
+import hashlib
 import json
+import os
 import ssl
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -30,7 +34,14 @@ TOKEN_CONFIG_PATH = PROJECT_ROOT / "config/tokens.csv"
 EXCHANGE_OUTPUT_PATH = PROJECT_ROOT / "data/processed/cex_exchange_volume_daily.csv"
 COVERAGE_OUTPUT_PATH = PROJECT_ROOT / "data/processed/cex_exchange_coverage.csv"
 OUTPUT_PATH = PROJECT_ROOT / "data/processed/cex_volume_daily.csv"
+ATTEMPT_OUTPUT_PATH = (
+    PROJECT_ROOT / "data/processed/cex_daily_collection_attempts.json"
+)
+ATTEMPT_SCHEMA = "daily_collection_attempts/v1"
 LIMIT_DAYS = 180
+MAX_REFRESH_WINDOW_DAYS = 180
+HTX_RECENT_BAR_CAP = 2000
+KRAKEN_RESPONSE_CAP = 720
 MIN_HISTORY_DAYS = 120
 MIN_EXCHANGE_COUNT = 3
 PRICE_EXCHANGE = "binance"
@@ -55,6 +66,292 @@ EXCHANGES = [
     "crypto_com",
     "upbit",
 ]
+
+ATTEMPT_ERROR_MESSAGES = {
+    "network": "The source request could not reach the remote service.",
+    "rate_limit": "The source rejected the request because its rate limit was reached.",
+    "source_unavailable": "The remote source was temporarily unavailable.",
+    "not_listed": "The source reported that the requested market was unavailable.",
+    "parse": "The source response could not be decoded into the expected format.",
+    "validation": "The source response did not satisfy the collector contract.",
+    "source_range_unavailable": "The source endpoint cannot reach the requested date window.",
+}
+
+
+class SourceRangeUnavailable(RuntimeError):
+    """The source endpoint cannot position its response over the requested range."""
+
+
+def get_request_window(limit_days: int, start_date=None, end_date=None):
+    """Return UTC [start, end) datetimes for a daily request."""
+    if start_date is not None or end_date is not None:
+        if start_date is None or end_date is None:
+            raise ValueError("start_date and end_date must be provided together")
+        start_time = datetime.strptime(start_date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        )
+        end_time = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        ) + timedelta(days=1)
+        window_days = (end_time - start_time).days
+        if window_days < 1 or window_days > MAX_REFRESH_WINDOW_DAYS:
+            raise ValueError("Refresh window must contain between 1 and 180 days")
+        return start_time, end_time
+
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=limit_days + 5)
+    return start_time, end_time
+
+
+def get_recent_bar_count(limit_days: int, start_date, cap: int):
+    """Size a recent-only endpoint so a historical start can still be reached."""
+    if start_date is None:
+        return min(limit_days, cap)
+    start_time, _ = get_request_window(1, start_date, start_date)
+    distance_days = (datetime.now(timezone.utc).date() - start_time.date()).days
+    return min(cap, max(limit_days, distance_days + 3))
+
+
+def require_recent_response_covers_end(
+    rows,
+    *,
+    end_date,
+    timestamp_getter,
+    source,
+    cap,
+):
+    """Reject a recent-only response whose oldest bar is newer than target end."""
+    if end_date is None or not rows:
+        return
+    target_start, _ = get_request_window(1, end_date, end_date)
+    oldest_timestamp = min(int(timestamp_getter(row)) for row in rows)
+    if oldest_timestamp > int(target_start.timestamp()):
+        raise SourceRangeUnavailable(
+            "source_range_unavailable: %s recent-bar cap %s does not reach %s"
+            % (source, cap, end_date)
+        )
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _exception_chain(error):
+    current = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def classify_attempt_error(error):
+    """Return a bounded reason without persisting raw URLs, payloads, or paths."""
+    chain = list(_exception_chain(error))
+    http_status = next(
+        (
+            int(candidate.code)
+            for candidate in chain
+            if isinstance(getattr(candidate, "code", None), int)
+            and 100 <= int(candidate.code) <= 599
+        ),
+        None,
+    )
+    lowered = " ".join(str(candidate).lower() for candidate in chain)
+    if "source_range_unavailable" in lowered:
+        reason = "source_range_unavailable"
+    elif http_status == 429 or "rate limit" in lowered or "too many requests" in lowered:
+        reason = "rate_limit"
+    elif http_status is not None and http_status >= 500:
+        reason = "source_unavailable"
+    elif http_status == 404 or any(
+        marker in lowered
+        for marker in (
+            "invalid symbol",
+            "unknown symbol",
+            "not listed",
+            "market not found",
+            "instrument not found",
+            "does not exist",
+        )
+    ):
+        reason = "not_listed"
+    elif any(
+        isinstance(candidate, (urllib.error.URLError, TimeoutError))
+        for candidate in chain
+    ):
+        reason = "network"
+    elif any(
+        isinstance(candidate, (json.JSONDecodeError, UnicodeDecodeError))
+        for candidate in chain
+    ):
+        reason = "parse"
+    elif http_status in {400, 409, 422} or any(
+        isinstance(candidate, (KeyError, IndexError, TypeError, ValueError))
+        for candidate in chain
+    ):
+        reason = "validation"
+    else:
+        reason = "source_unavailable"
+    return {
+        "reason_code": reason,
+        "http_status": http_status,
+        "error": ATTEMPT_ERROR_MESSAGES[reason],
+    }
+
+
+def _window_dates(start_date, end_date):
+    if not start_date or not end_date:
+        return None
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    if end < start:
+        raise ValueError("end_date must not precede start_date")
+    return {
+        (start + timedelta(days=offset)).isoformat()
+        for offset in range((end - start).days + 1)
+    }
+
+
+def cex_attempt_record(
+    token_symbol,
+    exchange,
+    instrument,
+    *,
+    rows=None,
+    error=None,
+    start_date=None,
+    end_date=None,
+):
+    observed_dates = sorted(
+        {
+            str(row.get("date") or "")
+            for row in (rows or [])
+            if row.get("date")
+            and (start_date is None or row["date"] >= start_date)
+            and (end_date is None or row["date"] <= end_date)
+        }
+    )
+    expected_dates = _window_dates(start_date, end_date)
+    if error is not None:
+        classified = classify_attempt_error(error)
+        if classified["reason_code"] == "source_range_unavailable":
+            status = "unsupported"
+            outcome = "range_unavailable"
+        else:
+            status = "failed"
+            outcome = "request_failed"
+    elif not observed_dates:
+        classified = {
+            "reason_code": "no_candles",
+            "http_status": None,
+            "error": (
+                "The source returned no daily candles inside the requested window."
+            ),
+        }
+        status = "no_data"
+        outcome = "no_candles"
+    elif expected_dates is not None and not expected_dates.issubset(
+        set(observed_dates)
+    ):
+        classified = {
+            "reason_code": "no_candles",
+            "http_status": None,
+            "error": (
+                "The source returned only part of the requested daily-candle window."
+            ),
+        }
+        status = "partial"
+        outcome = "partial_observation"
+    else:
+        classified = {
+            "reason_code": "observed",
+            "http_status": None,
+            "error": None,
+        }
+        status = "succeeded"
+        outcome = "observed"
+    identity = {
+        "market_type": "cex",
+        "token_symbol": str(token_symbol).strip().upper(),
+        "exchange": str(exchange).strip().lower(),
+        "instrument": str(instrument).strip().upper(),
+        "chain": None,
+        "dex": None,
+        "pool_address": None,
+    }
+    id_material = {
+        **identity,
+        "requested_start_date": start_date,
+        "requested_end_date": end_date,
+        "status": status,
+        "reason_code": classified["reason_code"],
+    }
+    return {
+        "attempt_id": hashlib.sha256(
+            json.dumps(
+                id_material,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20],
+        **identity,
+        "requested_start_date": start_date,
+        "requested_end_date": end_date,
+        "observed_dates": observed_dates,
+        "observed_day_count": len(observed_dates),
+        "status": status,
+        "outcome": outcome,
+        **classified,
+        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def write_attempt_ledger(
+    path: Path,
+    attempts,
+    *,
+    source_csv: Path,
+    start_date=None,
+    end_date=None,
+):
+    payload = {
+        "schema": ATTEMPT_SCHEMA,
+        "collector": "cex",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "requested_window": {
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+        "source_csv": source_csv.name,
+        "source_csv_sha256": sha256_file(source_csv),
+        "attempt_count": len(attempts),
+        "attempts": sorted(
+            attempts,
+            key=lambda item: (
+                item["token_symbol"],
+                item["exchange"],
+                item["instrument"],
+                item["attempt_id"],
+            ),
+        ),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(".{}.tmp".format(path.name))
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(str(temporary), str(path))
+    finally:
+        temporary.unlink(missing_ok=True)
+    return payload
 
 
 def make_binance_symbol(cex_symbol: str) -> str:
@@ -433,13 +730,24 @@ def filter_token_rows(rows, token_symbols):
     return [row for row in rows if row["token_symbol"].upper() in requested]
 
 
-def fetch_binance_klines(binance_symbol: str, limit_days: int):
+def fetch_binance_klines(
+    binance_symbol: str,
+    limit_days: int,
+    start_date=None,
+    end_date=None,
+):
     """Fetch daily klines from Binance."""
     query = {
         "symbol": binance_symbol,
         "interval": "1d",
-        "limit": str(limit_days),
+        "limit": str(min(limit_days, 1000)),
     }
+    if start_date is not None:
+        start_time, end_time = get_request_window(
+            limit_days, start_date, end_date
+        )
+        query["startTime"] = str(int(start_time.timestamp() * 1000))
+        query["endTime"] = str(int(end_time.timestamp() * 1000) - 1)
 
     encoded_query = urllib.parse.urlencode(query)
     last_error = None
@@ -455,7 +763,7 @@ def fetch_binance_klines(binance_symbol: str, limit_days: int):
         except Exception as error:
             last_error = error
 
-    raise RuntimeError("Failed to fetch %s: %s" % (binance_symbol, last_error))
+    raise RuntimeError("Failed to fetch %s" % binance_symbol) from last_error
 
 
 def request_json(url: str):
@@ -471,21 +779,24 @@ def request_json(url: str):
 
 def get_time_window(limit_days: int):
     """Return UTC start and end times for daily candle requests."""
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=limit_days + 5)
-    return start_time, end_time
+    return get_request_window(limit_days)
 
 
-def fetch_okx_klines(inst_id: str, limit_days: int):
+def fetch_okx_klines(inst_id: str, limit_days: int, start_date=None, end_date=None):
     """Fetch daily klines from OKX."""
     query = {
         "instId": inst_id,
         "bar": "1Dutc",
-        "limit": str(limit_days),
+        "limit": str(min(limit_days, 300)),
     }
+    endpoint = "/api/v5/market/candles"
+    if start_date is not None:
+        _, end_time = get_request_window(limit_days, start_date, end_date)
+        query["after"] = str(int(end_time.timestamp() * 1000))
+        endpoint = "/api/v5/market/history-candles"
 
     encoded_query = urllib.parse.urlencode(query)
-    url = "https://www.okx.com/api/v5/market/candles?" + encoded_query
+    url = "https://www.okx.com" + endpoint + "?" + encoded_query
 
     data = request_json(url)
 
@@ -495,14 +806,20 @@ def fetch_okx_klines(inst_id: str, limit_days: int):
     return data.get("data", [])
 
 
-def fetch_bybit_klines(symbol: str, limit_days: int):
+def fetch_bybit_klines(symbol: str, limit_days: int, start_date=None, end_date=None):
     """Fetch daily klines from Bybit."""
     query = {
         "category": "spot",
         "symbol": symbol,
         "interval": "D",
-        "limit": str(limit_days),
+        "limit": str(min(limit_days, 1000)),
     }
+    if start_date is not None:
+        start_time, end_time = get_request_window(
+            limit_days, start_date, end_date
+        )
+        query["start"] = str(int(start_time.timestamp() * 1000))
+        query["end"] = str(int(end_time.timestamp() * 1000) - 1)
 
     encoded_query = urllib.parse.urlencode(query)
     url = "https://api.bybit.com/v5/market/kline?" + encoded_query
@@ -516,9 +833,9 @@ def fetch_bybit_klines(symbol: str, limit_days: int):
     return result.get("list", [])
 
 
-def fetch_kucoin_klines(symbol: str, limit_days: int):
+def fetch_kucoin_klines(symbol: str, limit_days: int, start_date=None, end_date=None):
     """Fetch daily klines from KuCoin."""
-    start_time, end_time = get_time_window(limit_days)
+    start_time, end_time = get_request_window(limit_days, start_date, end_date)
     query = {
         "type": "1day",
         "symbol": symbol,
@@ -537,13 +854,25 @@ def fetch_kucoin_klines(symbol: str, limit_days: int):
     return data.get("data", [])[:limit_days]
 
 
-def fetch_gate_klines(currency_pair: str, limit_days: int):
+def fetch_gate_klines(
+    currency_pair: str,
+    limit_days: int,
+    start_date=None,
+    end_date=None,
+):
     """Fetch daily klines from Gate."""
     query = {
         "currency_pair": currency_pair,
         "interval": "1d",
-        "limit": str(limit_days),
     }
+    if start_date is None:
+        query["limit"] = str(min(limit_days, 1000))
+    else:
+        start_time, end_time = get_request_window(
+            limit_days, start_date, end_date
+        )
+        query["from"] = str(int(start_time.timestamp()))
+        query["to"] = str(int(end_time.timestamp()) - 1)
 
     encoded_query = urllib.parse.urlencode(query)
     url = "https://api.gateio.ws/api/v4/spot/candlesticks?" + encoded_query
@@ -551,13 +880,19 @@ def fetch_gate_klines(currency_pair: str, limit_days: int):
     return request_json(url)
 
 
-def fetch_bitget_klines(symbol: str, limit_days: int):
+def fetch_bitget_klines(symbol: str, limit_days: int, start_date=None, end_date=None):
     """Fetch daily klines from Bitget."""
     query = {
         "symbol": symbol,
         "granularity": "1day",
-        "limit": str(limit_days),
+        "limit": str(min(limit_days, 1000)),
     }
+    if start_date is not None:
+        start_time, end_time = get_request_window(
+            limit_days, start_date, end_date
+        )
+        query["startTime"] = str(int(start_time.timestamp() * 1000))
+        query["endTime"] = str(int(end_time.timestamp() * 1000) - 1)
 
     encoded_query = urllib.parse.urlencode(query)
     url = "https://api.bitget.com/api/v2/spot/market/candles?" + encoded_query
@@ -570,13 +905,19 @@ def fetch_bitget_klines(symbol: str, limit_days: int):
     return data.get("data", [])
 
 
-def fetch_mexc_klines(symbol: str, limit_days: int):
+def fetch_mexc_klines(symbol: str, limit_days: int, start_date=None, end_date=None):
     """Fetch daily klines from MEXC."""
     query = {
         "symbol": symbol,
         "interval": "1d",
-        "limit": str(limit_days),
+        "limit": str(min(limit_days, 1000)),
     }
+    if start_date is not None:
+        start_time, end_time = get_request_window(
+            limit_days, start_date, end_date
+        )
+        query["startTime"] = str(int(start_time.timestamp() * 1000))
+        query["endTime"] = str(int(end_time.timestamp() * 1000) - 1)
 
     encoded_query = urllib.parse.urlencode(query)
     url = "https://api.mexc.com/api/v3/klines?" + encoded_query
@@ -584,12 +925,14 @@ def fetch_mexc_klines(symbol: str, limit_days: int):
     return request_json(url)
 
 
-def fetch_htx_klines(symbol: str, limit_days: int):
+def fetch_htx_klines(symbol: str, limit_days: int, start_date=None, end_date=None):
     """Fetch daily klines from HTX."""
     query = {
         "symbol": symbol,
         "period": "1day",
-        "size": str(limit_days),
+        "size": str(
+            get_recent_bar_count(limit_days, start_date, HTX_RECENT_BAR_CAP)
+        ),
     }
 
     encoded_query = urllib.parse.urlencode(query)
@@ -600,12 +943,25 @@ def fetch_htx_klines(symbol: str, limit_days: int):
     if data.get("status") != "ok":
         raise RuntimeError("HTX error for %s: %s" % (symbol, data))
 
-    return data.get("data", [])
+    rows = data.get("data", [])
+    require_recent_response_covers_end(
+        rows,
+        end_date=end_date,
+        timestamp_getter=lambda row: row["id"],
+        source="HTX",
+        cap=HTX_RECENT_BAR_CAP,
+    )
+    return rows
 
 
-def fetch_coinbase_candles(product_id: str, limit_days: int):
+def fetch_coinbase_candles(
+    product_id: str,
+    limit_days: int,
+    start_date=None,
+    end_date=None,
+):
     """Fetch daily candles from Coinbase."""
-    start_time, end_time = get_time_window(limit_days)
+    start_time, end_time = get_request_window(limit_days, start_date, end_date)
     query = {
         "granularity": "86400",
         "start": start_time.isoformat(),
@@ -621,9 +977,9 @@ def fetch_coinbase_candles(product_id: str, limit_days: int):
     return request_json(url)[:limit_days]
 
 
-def fetch_kraken_klines(pair: str, limit_days: int):
+def fetch_kraken_klines(pair: str, limit_days: int, start_date=None, end_date=None):
     """Fetch daily klines from Kraken."""
-    start_time, _ = get_time_window(limit_days)
+    start_time, _ = get_request_window(limit_days, start_date, end_date)
     query = {
         "pair": pair,
         "interval": "1440",
@@ -647,16 +1003,36 @@ def fetch_kraken_klines(pair: str, limit_days: int):
         rows = value
         break
 
+    if start_date is not None:
+        require_recent_response_covers_end(
+            rows,
+            end_date=end_date,
+            timestamp_getter=lambda row: row[0],
+            source="Kraken",
+            cap=KRAKEN_RESPONSE_CAP,
+        )
+        return rows
     return rows[-limit_days:]
 
 
-def fetch_crypto_com_candles(instrument_name: str, limit_days: int):
+def fetch_crypto_com_candles(
+    instrument_name: str,
+    limit_days: int,
+    start_date=None,
+    end_date=None,
+):
     """Fetch daily candles from Crypto.com."""
     query = {
         "instrument_name": instrument_name,
         "timeframe": "1D",
         "count": str(limit_days),
     }
+    if start_date is not None:
+        start_time, end_time = get_request_window(
+            limit_days, start_date, end_date
+        )
+        query["start_ts"] = str(int(start_time.timestamp() * 1000))
+        query["end_ts"] = str(int(end_time.timestamp() * 1000) - 1)
 
     encoded_query = urllib.parse.urlencode(query)
     url = "https://api.crypto.com/exchange/v1/public/get-candlestick?" + encoded_query
@@ -667,15 +1043,18 @@ def fetch_crypto_com_candles(instrument_name: str, limit_days: int):
         raise RuntimeError("Crypto.com error for %s: %s" % (instrument_name, data))
 
     result = data.get("result", {})
-    return result.get("data", [])[-limit_days:]
+    return result.get("data", [])
 
 
-def fetch_upbit_candles(market: str, limit_days: int):
+def fetch_upbit_candles(market: str, limit_days: int, end_date=None):
     """Fetch daily candles from Upbit Korea."""
     query = {
         "market": market,
-        "count": str(limit_days),
+        "count": str(min(limit_days, 200)),
     }
+    if end_date is not None:
+        _, end_time = get_request_window(1, end_date, end_date)
+        query["to"] = end_time.isoformat().replace("+00:00", "Z")
 
     encoded_query = urllib.parse.urlencode(query)
     url = "https://api.upbit.com/v1/candles/days?" + encoded_query
@@ -687,13 +1066,19 @@ def fetch_upbit_candles(market: str, limit_days: int):
     return data[:limit_days]
 
 
-def build_upbit_rows(token_symbol: str, cex_symbol: str, limit_days: int):
+def build_upbit_rows(
+    token_symbol: str,
+    cex_symbol: str,
+    limit_days: int,
+    start_date=None,
+    end_date=None,
+):
     """Fetch the preferred available Upbit market and convert volume to USD."""
     last_error = None
 
     for market in make_upbit_market_candidates(cex_symbol):
         try:
-            candles = fetch_upbit_candles(market, limit_days)
+            candles = fetch_upbit_candles(market, limit_days, end_date=end_date)
         except Exception as error:
             last_error = error
             continue
@@ -709,7 +1094,9 @@ def build_upbit_rows(token_symbol: str, cex_symbol: str, limit_days: int):
                 date = candle["candle_date_time_utc"][:10]
                 quote_to_usd_by_date[date] = 1.0
         elif quote_asset == "KRW":
-            reference_candles = fetch_upbit_candles("KRW-USDT", limit_days)
+            reference_candles = fetch_upbit_candles(
+                "KRW-USDT", limit_days, end_date=end_date
+            )
 
             for reference in reference_candles:
                 date = reference["candle_date_time_utc"][:10]
@@ -735,14 +1122,22 @@ def build_upbit_rows(token_symbol: str, cex_symbol: str, limit_days: int):
         if rows:
             return rows
 
-    raise RuntimeError("Failed to fetch %s on Upbit: %s" % (token_symbol, last_error))
+    raise RuntimeError("Failed to fetch %s on Upbit" % token_symbol) from last_error
 
 
-def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
+def fetch_exchange_rows(
+    token_symbol: str,
+    cex_symbol: str,
+    exchange: str,
+    start_date=None,
+    end_date=None,
+):
     """Fetch rows for one token on one exchange."""
     if exchange == "binance":
         binance_symbol = make_binance_symbol(cex_symbol)
-        klines = fetch_binance_klines(binance_symbol, LIMIT_DAYS)
+        klines = fetch_binance_klines(
+            binance_symbol, LIMIT_DAYS, start_date, end_date
+        )
         rows = []
 
         for kline in klines:
@@ -753,7 +1148,7 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "okx":
         inst_id = make_okx_inst_id(cex_symbol)
-        klines = fetch_okx_klines(inst_id, LIMIT_DAYS)
+        klines = fetch_okx_klines(inst_id, LIMIT_DAYS, start_date, end_date)
         rows = []
 
         for kline in klines:
@@ -764,7 +1159,7 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "bybit":
         symbol = make_bybit_symbol(cex_symbol)
-        klines = fetch_bybit_klines(symbol, LIMIT_DAYS)
+        klines = fetch_bybit_klines(symbol, LIMIT_DAYS, start_date, end_date)
         rows = []
 
         for kline in klines:
@@ -775,7 +1170,7 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "kucoin":
         symbol = make_kucoin_symbol(cex_symbol)
-        klines = fetch_kucoin_klines(symbol, LIMIT_DAYS)
+        klines = fetch_kucoin_klines(symbol, LIMIT_DAYS, start_date, end_date)
         rows = []
 
         for kline in klines:
@@ -786,7 +1181,9 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "gate":
         currency_pair = make_gate_currency_pair(cex_symbol)
-        klines = fetch_gate_klines(currency_pair, LIMIT_DAYS)
+        klines = fetch_gate_klines(
+            currency_pair, LIMIT_DAYS, start_date, end_date
+        )
         rows = []
 
         for kline in klines:
@@ -797,7 +1194,7 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "bitget":
         symbol = make_bitget_symbol(cex_symbol)
-        klines = fetch_bitget_klines(symbol, LIMIT_DAYS)
+        klines = fetch_bitget_klines(symbol, LIMIT_DAYS, start_date, end_date)
         rows = []
 
         for kline in klines:
@@ -808,7 +1205,7 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "mexc":
         symbol = make_mexc_symbol(cex_symbol)
-        klines = fetch_mexc_klines(symbol, LIMIT_DAYS)
+        klines = fetch_mexc_klines(symbol, LIMIT_DAYS, start_date, end_date)
         rows = []
 
         for kline in klines:
@@ -819,7 +1216,7 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "htx":
         symbol = make_htx_symbol(cex_symbol)
-        klines = fetch_htx_klines(symbol, LIMIT_DAYS)
+        klines = fetch_htx_klines(symbol, LIMIT_DAYS, start_date, end_date)
         rows = []
 
         for kline in klines:
@@ -830,7 +1227,9 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "coinbase":
         product_id = make_coinbase_product_id(cex_symbol)
-        candles = fetch_coinbase_candles(product_id, LIMIT_DAYS)
+        candles = fetch_coinbase_candles(
+            product_id, LIMIT_DAYS, start_date, end_date
+        )
         rows = []
 
         for candle in candles:
@@ -841,7 +1240,7 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "kraken":
         pair = make_kraken_pair(cex_symbol)
-        klines = fetch_kraken_klines(pair, LIMIT_DAYS)
+        klines = fetch_kraken_klines(pair, LIMIT_DAYS, start_date, end_date)
         rows = []
 
         for kline in klines:
@@ -852,7 +1251,9 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
 
     if exchange == "crypto_com":
         instrument_name = make_crypto_com_instrument(cex_symbol)
-        candles = fetch_crypto_com_candles(instrument_name, LIMIT_DAYS)
+        candles = fetch_crypto_com_candles(
+            instrument_name, LIMIT_DAYS, start_date, end_date
+        )
         rows = []
 
         for candle in candles:
@@ -862,12 +1263,25 @@ def fetch_exchange_rows(token_symbol: str, cex_symbol: str, exchange: str):
         return rows
 
     if exchange == "upbit":
-        return build_upbit_rows(token_symbol, cex_symbol, LIMIT_DAYS)
+        return build_upbit_rows(
+            token_symbol,
+            cex_symbol,
+            LIMIT_DAYS,
+            start_date,
+            end_date,
+        )
 
     raise ValueError("Unsupported exchange: %s" % exchange)
 
 
-def build_rows(token_rows, exchanges=None):
+def build_rows(
+    token_rows,
+    exchanges=None,
+    *,
+    attempt_records=None,
+    start_date=None,
+    end_date=None,
+):
     """Fetch all CEX rows for configured tokens."""
     all_rows = []
     selected_exchanges = exchanges or EXCHANGES
@@ -878,12 +1292,40 @@ def build_rows(token_rows, exchanges=None):
 
         for exchange in selected_exchanges:
             try:
-                rows = fetch_exchange_rows(token_symbol, cex_symbol, exchange)
+                rows = fetch_exchange_rows(
+                    token_symbol,
+                    cex_symbol,
+                    exchange,
+                    start_date,
+                    end_date,
+                )
             except Exception as error:
                 print("Failed %s on %s: %s" % (token_symbol, exchange, error))
+                if attempt_records is not None:
+                    attempt_records.append(
+                        cex_attempt_record(
+                            token_symbol,
+                            exchange,
+                            cex_symbol,
+                            error=error,
+                            start_date=start_date,
+                            end_date=end_date,
+                        )
+                    )
                 continue
 
             all_rows.extend(rows)
+            if attempt_records is not None:
+                attempt_records.append(
+                    cex_attempt_record(
+                        token_symbol,
+                        exchange,
+                        cex_symbol,
+                        rows=rows,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
 
             print("Fetched %s on %s: %s rows" % (token_symbol, exchange, len(rows)))
             time.sleep(0.2)
@@ -1127,16 +1569,34 @@ def main(
     start_date=None,
     end_date=None,
     limit_days=LIMIT_DAYS,
+    output_dir=None,
 ) -> None:
     """Fetch CEX data into processed CSV files."""
     global LIMIT_DAYS
     LIMIT_DAYS = limit_days
+    resolved_output_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else EXCHANGE_OUTPUT_PATH.parent
+    )
+    exchange_output_path = resolved_output_dir / EXCHANGE_OUTPUT_PATH.name
+    coverage_output_path = resolved_output_dir / COVERAGE_OUTPUT_PATH.name
+    output_path = resolved_output_dir / OUTPUT_PATH.name
+    attempt_output_path = resolved_output_dir / ATTEMPT_OUTPUT_PATH.name
     token_rows = filter_token_rows(read_token_config(TOKEN_CONFIG_PATH), token_symbols)
     selected_exchanges = exchanges or EXCHANGES
     unknown_exchanges = sorted(set(selected_exchanges) - set(EXCHANGES))
     if unknown_exchanges:
         raise ValueError("Unsupported exchanges: %s" % ", ".join(unknown_exchanges))
-    rows = build_rows(token_rows, selected_exchanges)
+    get_request_window(limit_days, start_date, end_date)
+    attempt_records = []
+    rows = build_rows(
+        token_rows,
+        selected_exchanges,
+        attempt_records=attempt_records,
+        start_date=start_date,
+        end_date=end_date,
+    )
     rows = [
         row
         for row in rows
@@ -1146,7 +1606,7 @@ def main(
     if append:
         if token_symbols is None:
             raise ValueError("--append requires --tokens")
-        rows = merge_exchange_rows(read_exchange_rows(EXCHANGE_OUTPUT_PATH), rows)
+        rows = merge_exchange_rows(read_exchange_rows(exchange_output_path), rows)
     stable_exchanges = select_stable_exchanges(
         rows,
         minimum_exchange_count=min(MIN_EXCHANGE_COUNT, len(selected_exchanges)),
@@ -1167,13 +1627,24 @@ def main(
         stable_exchanges_by_token=stable_exchanges,
     )
 
-    write_exchange_rows(rows, EXCHANGE_OUTPUT_PATH)
-    write_coverage_rows(coverage_rows, COVERAGE_OUTPUT_PATH)
-    write_aggregated_rows(aggregated_rows, OUTPUT_PATH)
+    write_exchange_rows(rows, exchange_output_path)
+    write_coverage_rows(coverage_rows, coverage_output_path)
+    write_aggregated_rows(aggregated_rows, output_path)
+    write_attempt_ledger(
+        attempt_output_path,
+        attempt_records,
+        source_csv=exchange_output_path,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
-    print("Wrote %s rows to %s" % (len(rows), EXCHANGE_OUTPUT_PATH))
-    print("Wrote %s rows to %s" % (len(coverage_rows), COVERAGE_OUTPUT_PATH))
-    print("Wrote %s rows to %s" % (len(aggregated_rows), OUTPUT_PATH))
+    print("Wrote %s rows to %s" % (len(rows), exchange_output_path))
+    print("Wrote %s rows to %s" % (len(coverage_rows), coverage_output_path))
+    print("Wrote %s rows to %s" % (len(aggregated_rows), output_path))
+    print(
+        "Wrote %s collection attempts to %s"
+        % (len(attempt_records), attempt_output_path)
+    )
 
 
 def parse_args():
@@ -1185,13 +1656,38 @@ def parse_args():
     parser.add_argument("--start", help="Inclusive UTC date")
     parser.add_argument("--end", help="Inclusive UTC date")
     parser.add_argument("--limit-days", type=int, default=LIMIT_DAYS)
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
 
     tokens = [item.strip().upper() for item in (args.tokens or "").split(",") if item.strip()] or None
     exchanges = [item.strip().lower() for item in (args.exchanges or "").split(",") if item.strip()] or None
-    return tokens, exchanges, args.append, args.start, args.end, args.limit_days
+    return (
+        tokens,
+        exchanges,
+        args.append,
+        args.start,
+        args.end,
+        args.limit_days,
+        args.output_dir,
+    )
 
 
 if __name__ == "__main__":
-    selected_tokens, selected_exchanges, append_rows, start_date, end_date, limit_days = parse_args()
-    main(selected_tokens, selected_exchanges, append_rows, start_date, end_date, limit_days)
+    (
+        selected_tokens,
+        selected_exchanges,
+        append_rows,
+        start_date,
+        end_date,
+        limit_days,
+        selected_output_dir,
+    ) = parse_args()
+    main(
+        selected_tokens,
+        selected_exchanges,
+        append_rows,
+        start_date,
+        end_date,
+        limit_days,
+        selected_output_dir,
+    )

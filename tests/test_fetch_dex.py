@@ -1,9 +1,16 @@
 import csv
+import os
 import unittest
+import urllib.parse
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
+import urllib.error
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from scripts import fetch_dex
 from scripts.fetch_dex import choose_main_pool
 from scripts.fetch_dex import choose_top_pools
 from scripts.fetch_dex import convert_ohlcv_row
@@ -31,9 +38,82 @@ from scripts.fetch_dex import merge_pool_volume_rows
 from scripts.fetch_dex import load_existing_pool_inventory
 from scripts.fetch_dex import remove_pool_rows
 from scripts.fetch_dex import fetch_existing_pools
+from scripts.fetch_dex import merge_runtime_token_config
+from scripts.fetch_dex import runtime_registry_path
+from scripts.fetch_dex import classify_attempt_error
 
 
 class FetchDexTests(unittest.TestCase):
+    def test_thirty_day_old_single_day_uses_gecko_before_timestamp(self):
+        target_date = (
+            datetime.now(timezone.utc).date() - timedelta(days=30)
+        ).isoformat()
+        target_time = datetime.strptime(target_date, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        )
+        target_timestamp = int(target_time.timestamp())
+        pool = {
+            "chain": "eth",
+            "pool_address": "0xpool",
+            "ohlcv_token": "quote",
+        }
+        payload = {
+            "data": {
+                "attributes": {
+                    "ohlcv_list": [
+                        [target_timestamp, 1, 2, 0.5, 1.5, 100]
+                    ]
+                }
+            }
+        }
+        with patch(
+            "scripts.fetch_dex.request_json",
+            return_value=payload,
+        ) as request:
+            rows = fetch_dex.fetch_pool_ohlcv(
+                pool,
+                target_date,
+                target_date,
+            )
+
+        requested_url = request.call_args.args[0]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(requested_url).query)
+        self.assertEqual(
+            query["before_timestamp"],
+            [str(target_timestamp + 86_400)],
+        )
+        self.assertEqual(rows[0][0], target_timestamp)
+
+    def test_recent_gecko_request_does_not_add_historical_cursor(self):
+        with patch(
+            "scripts.fetch_dex.request_json",
+            return_value={"data": {"attributes": {"ohlcv_list": []}}},
+        ) as request:
+            fetch_dex.fetch_pool_ohlcv(
+                {
+                    "chain": "eth",
+                    "pool_address": "0xpool",
+                    "ohlcv_token": "base",
+                }
+            )
+
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(request.call_args.args[0]).query
+        )
+        self.assertNotIn("before_timestamp", query)
+
+    def test_runtime_registry_follows_market_data_dir_without_explicit_override(self):
+        with TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {"MARKET_DATA_DIR": directory},
+                clear=True,
+            ):
+                self.assertEqual(
+                    runtime_registry_path(),
+                    Path(directory).resolve() / "admin/token_registry.json",
+                )
+
     def test_https_requests_use_a_verified_tls_context(self):
         self.assertEqual(TLS_CONTEXT.verify_mode, 2)
         self.assertTrue(TLS_CONTEXT.check_hostname)
@@ -56,6 +136,9 @@ class FetchDexTests(unittest.TestCase):
         self.assertEqual(by_key[("AAVE", "2026-01-01")]["close"], "2")
 
     def test_existing_pool_inventory_uses_exact_quote_side_and_rejects_invalid_pool(self):
+        target_address = "0x" + "11" * 20
+        weth_address = "0x" + "22" * 20
+        usd_address = "0x" + "33" * 20
         with TemporaryDirectory() as temp_dir:
             pool_path = Path(temp_dir) / "pools.csv"
             tvl_path = Path(temp_dir) / "tvl.csv"
@@ -116,8 +199,8 @@ class FetchDexTests(unittest.TestCase):
                             "pool_address": "0xvalid",
                             "source_dex": "uniswap_v3",
                             "source_pool_name": "WETH / CRV",
-                            "base_token_id": "eth_0xweth",
-                            "quote_token_id": "eth_0xcrv",
+                            "base_token_id": "eth_" + weth_address,
+                            "quote_token_id": "eth_" + target_address,
                             "tvl_usd": "100",
                             "volume_24h_usd": "50",
                         },
@@ -127,8 +210,8 @@ class FetchDexTests(unittest.TestCase):
                             "pool_address": "0xinvalid",
                             "source_dex": "curve",
                             "source_pool_name": "USD / WETH / CRV",
-                            "base_token_id": "eth_0xusd",
-                            "quote_token_id": "eth_0xweth",
+                            "base_token_id": "eth_" + usd_address,
+                            "quote_token_id": "eth_" + weth_address,
                             "tvl_usd": "200",
                             "volume_24h_usd": "60",
                         },
@@ -138,7 +221,7 @@ class FetchDexTests(unittest.TestCase):
             pools, unresolved, resolved, invalid = load_existing_pool_inventory(
                 pool_path,
                 tvl_path,
-                {"CRV": [{"chain": "eth", "contract_address": "0xcrv"}]},
+                {"CRV": [{"chain": "eth", "contract_address": target_address}]},
                 ["CRV"],
             )
 
@@ -192,13 +275,68 @@ class FetchDexTests(unittest.TestCase):
             },
         ]
         observed = [[1704067200, 1, 2, 0.5, 1.5, 100]]
+        attempts = []
 
         with patch(
             "scripts.fetch_dex.fetch_pool_ohlcv",
             side_effect=[observed, []],
         ), patch("scripts.fetch_dex.time.sleep"):
             with self.assertRaisesRegex(RuntimeError, "incomplete for 1 pools"):
-                fetch_existing_pools(pools)
+                fetch_existing_pools(
+                    pools,
+                    attempt_records=attempts,
+                    start_date="2024-01-01",
+                    end_date="2024-01-01",
+                )
+
+        self.assertEqual(
+            [(item["pool_address"], item["status"]) for item in attempts],
+            [("0xone", "succeeded"), ("0xtwo", "no_data")],
+        )
+        self.assertEqual(attempts[1]["reason_code"], "no_candles")
+
+    def test_managed_append_can_publish_attempt_evidence_for_missing_pool(self):
+        pools = [
+            {
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "pool_address": "0xone",
+                "dex": "uniswap",
+                "pool_name": "UNI / USD",
+                "pool_tvl_usd": None,
+            }
+        ]
+        attempts = []
+        with patch(
+            "scripts.fetch_dex.fetch_pool_ohlcv",
+            return_value=[],
+        ), patch("scripts.fetch_dex.time.sleep"):
+            rows = fetch_existing_pools(
+                pools,
+                attempt_records=attempts,
+                start_date="2026-07-28",
+                end_date="2026-07-28",
+                fail_on_incomplete=False,
+            )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(attempts[0]["status"], "no_data")
+        self.assertEqual(attempts[0]["reason_code"], "no_candles")
+
+    def test_dex_attempt_error_is_classified_without_raw_url(self):
+        error = urllib.error.HTTPError(
+            "https://api.example/pool?token=secret",
+            404,
+            "Not Found",
+            None,
+            None,
+        )
+
+        classified = classify_attempt_error(error)
+
+        self.assertEqual(classified["reason_code"], "not_listed")
+        self.assertEqual(classified["http_status"], 404)
+        self.assertNotIn("secret", classified["error"])
 
     def test_every_configured_token_has_chain_config(self):
         token_rows = read_token_config(TOKEN_CONFIG_PATH)
@@ -210,6 +348,123 @@ class FetchDexTests(unittest.TestCase):
             configured_tokens.add(token["token_symbol"])
 
         self.assertEqual(configured_tokens, set(grouped_rows.keys()))
+
+    def test_runtime_registry_adds_dex_identity_without_cex_guess(self):
+        record = {
+            "token_symbol": "XYZ",
+            "chain": "base",
+            "contract_address": "0x" + "12" * 20,
+            "coingecko_id": None,
+            "status": "active",
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            with patch(
+                "scripts.fetch_dex.TokenRegistry.list_records",
+                return_value=[record],
+            ) as list_records:
+                tokens, chains = merge_runtime_token_config(
+                    [{"token_symbol": "AAVE"}],
+                    [
+                        {
+                            "token_symbol": "AAVE",
+                            "chain": "eth",
+                            "contract_address": "0x" + "34" * 20,
+                        }
+                    ],
+                )
+
+        runtime_token = next(row for row in tokens if row["token_symbol"] == "XYZ")
+        runtime_chain = next(row for row in chains if row["token_symbol"] == "XYZ")
+        list_records.assert_called_once_with(statuses={"active"})
+        self.assertEqual(runtime_token["cex_symbol"], "")
+        self.assertEqual(runtime_token["primary_cex"], "")
+        self.assertEqual(runtime_chain["chain"], "base")
+        self.assertEqual(runtime_chain["contract_address"], record["contract_address"])
+
+    def test_runtime_registry_excludes_pending_without_explicit_job_override(self):
+        pending = {
+            "token_symbol": "PEND",
+            "chain": "base",
+            "contract_address": "0x" + "56" * 20,
+            "coingecko_id": None,
+            "status": "pending",
+            "last_job_id": "job-pending",
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            with patch(
+                "scripts.fetch_dex.TokenRegistry.list_records",
+                return_value=[pending],
+            ):
+                tokens, chains = merge_runtime_token_config([], [])
+
+        self.assertEqual(tokens, [])
+        self.assertEqual(chains, [])
+
+    def test_pending_runtime_token_requires_exact_single_token_job_override(self):
+        pending = {
+            "token_symbol": "PEND",
+            "chain": "base",
+            "contract_address": "0x" + "56" * 20,
+            "coingecko_id": None,
+            "status": "pending",
+            "last_job_id": "job-pending",
+        }
+        with patch.dict(
+            os.environ,
+            {"TOKEN_ONBOARDING_JOB_ID": "job-pending"},
+            clear=True,
+        ):
+            with patch(
+                "scripts.fetch_dex.TokenRegistry.list_records",
+                return_value=[pending],
+            ) as list_records:
+                tokens, chains = merge_runtime_token_config(
+                    [],
+                    [],
+                    token_symbols=["PEND"],
+                )
+
+        list_records.assert_called_once_with(statuses={"active", "pending"})
+        self.assertEqual([row["token_symbol"] for row in tokens], ["PEND"])
+        self.assertEqual([row["token_symbol"] for row in chains], ["PEND"])
+
+    def test_pending_runtime_token_rejects_wrong_job_override(self):
+        pending = {
+            "token_symbol": "PEND",
+            "chain": "base",
+            "contract_address": "0x" + "56" * 20,
+            "coingecko_id": None,
+            "status": "pending",
+            "last_job_id": "job-pending",
+        }
+        with patch.dict(
+            os.environ,
+            {"TOKEN_ONBOARDING_JOB_ID": "wrong-job"},
+            clear=True,
+        ):
+            with patch(
+                "scripts.fetch_dex.TokenRegistry.list_records",
+                return_value=[pending],
+            ):
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    merge_runtime_token_config(
+                        [],
+                        [],
+                        token_symbols=["PEND"],
+                    )
+
+    def test_pending_runtime_token_override_rejects_multiple_requested_tokens(self):
+        with patch.dict(
+            os.environ,
+            {"TOKEN_ONBOARDING_JOB_ID": "job-pending"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                merge_runtime_token_config(
+                    [],
+                    [],
+                    token_symbols=["PEND", "OTHER"],
+                )
 
     def test_request_sleep_matches_public_rate_limit(self):
         self.assertEqual(REQUEST_SLEEP_SECONDS, 15.0)
@@ -439,14 +694,45 @@ class FetchDexTests(unittest.TestCase):
         self.assertEqual(len(result["AAVE"]), 1)
 
     def test_get_token_side_detects_quote_token(self):
+        base_address = "0x" + "11" * 20
+        target_address = "0x" + "ab" * 20
         pool = {
-            "base_token_id": "eth_0xbase",
-            "quote_token_id": "eth_0xtarget",
+            "base_token_id": "eth_" + base_address,
+            "quote_token_id": "eth_0x" + "AB" * 20,
         }
 
-        result = get_token_side(pool, "eth", "0xtarget")
+        result = get_token_side(pool, "eth", target_address)
 
         self.assertEqual(result, "quote")
+
+    def test_get_token_side_rejects_pool_without_target_token(self):
+        pool = {
+            "base_token_id": "eth_0x" + "11" * 20,
+            "quote_token_id": "eth_0x" + "22" * 20,
+        }
+
+        with self.assertRaisesRegex(ValueError, "pool_token_mismatch"):
+            get_token_side(pool, "eth", "0x" + "33" * 20)
+
+    def test_get_token_side_preserves_solana_address_case(self):
+        target_address = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+        case_changed_address = "jUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+        exact_pool = {
+            "base_token_id": "solana_" + target_address,
+            "quote_token_id": (
+                "solana_4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
+            ),
+        }
+        pool = {
+            "base_token_id": "solana_" + case_changed_address,
+            "quote_token_id": (
+                "solana_4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
+            ),
+        }
+
+        self.assertEqual(get_token_side(exact_pool, "solana", target_address), "base")
+        with self.assertRaisesRegex(ValueError, "pool_token_mismatch"):
+            get_token_side(pool, "solana", target_address)
 
     def test_sort_pools_by_volume_descending(self):
         pools = [

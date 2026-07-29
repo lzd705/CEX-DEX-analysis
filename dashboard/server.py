@@ -33,6 +33,7 @@ try:
     from dashboard.admin import AdminService
     from dashboard.freshness import build_source_freshness
     from dashboard.market_facts import (
+        MARKET_QUALITY_THRESHOLDS,
         attach_explicit_dex_counts,
         build_token_summaries as build_fact_token_summaries,
         catalog_contract,
@@ -45,6 +46,7 @@ except ModuleNotFoundError:
     from admin import AdminService
     from freshness import build_source_freshness
     from market_facts import (
+        MARKET_QUALITY_THRESHOLDS,
         attach_explicit_dex_counts,
         build_token_summaries as build_fact_token_summaries,
         catalog_contract,
@@ -92,9 +94,16 @@ CEX_DEPTH_FILENAME = "cex_depth_latest.csv"
 DEX_DEPTH_FILENAME = "dex_depth_latest.csv"
 CEX_EXECUTION_COST_FILENAME = "cex_execution_cost_latest.csv"
 DEX_EXECUTION_COST_FILENAME = "dex_execution_cost_latest.csv"
+DAILY_QUALITY_REPORT_RELATIVE_PATH = Path("quality") / "daily-latest.json"
+DAILY_QUALITY_REPORT_SCHEMA = "fact_quality_report/v1"
+MAX_DAILY_QUALITY_REPORT_BYTES = 8 * 1024 * 1024
+MAX_DAILY_QUALITY_REPORT_ISSUES = 50_000
 VENDOR_FILES = {
     "/vendor/lucide.js": STATIC_ROOT / "vendor/lucide.min.js",
 }
+PUBLIC_DATA_UNAVAILABLE_MESSAGE = (
+    "Market fact data is temporarily unavailable. Retry after the next refresh."
+)
 API_FRESHNESS_CACHE_SECONDS = 60
 LARGE_PAYLOAD_CACHE_SIZE = 8
 SERIALIZED_RESPONSE_CACHE_SIZE = 64
@@ -112,7 +121,14 @@ PUBLIC_API_QUERY_FIELDS = {
     "market": ("start", "end"),
     "compare": ("token", "market_a", "market_b", "start", "end"),
     "execution_cost": ("token", "market_a", "market_b"),
-    "quality": ("token", "scope", "market_a", "market_b"),
+    "quality": (
+        "token",
+        "scope",
+        "market_a",
+        "market_b",
+        "start",
+        "end",
+    ),
     "events": ("token", "start", "end", "lifecycle"),
 }
 
@@ -120,7 +136,7 @@ PUBLIC_API_QUERY_FIELDS = {
 class SourceGenerationChanged(FileNotFoundError):
     """Signal temporary source unavailability across one response build."""
 
-ADMIN_STATIC_PATHS = {"/admin.html", "/admin.js"}
+ADMIN_STATIC_PATHS = {"/admin.html", "/admin.js", "/admin.css"}
 SPA_TOKEN_PAGES = {"markets", "compare", "liquidity", "events", "quality"}
 SPA_TOKEN_ROUTE = re.compile(
     r"/tokens/[A-Za-z0-9][A-Za-z0-9._-]*/"
@@ -216,6 +232,36 @@ def resolve_database_path() -> Path | None:
         if database_path.exists():
             return database_path
     return None
+
+
+def resolve_daily_quality_report_path() -> Path | None:
+    """Resolve the quality report beside the exact published daily dataset.
+
+    The report is optional.  It is deliberately derived from the selected
+    database/CSV root instead of accepting a request-controlled path, and a
+    symlink that leaves that root is ignored.
+    """
+
+    database_path = resolve_database_path()
+    if database_path is not None:
+        data_root = database_path.parent.resolve()
+    else:
+        cex_path, dex_path = resolve_data_paths()
+        cex_parent = cex_path.parent.resolve()
+        dex_parent = dex_path.parent.resolve()
+        if cex_parent != dex_parent:
+            return None
+        data_root = cex_parent
+
+    candidate = data_root / DAILY_QUALITY_REPORT_RELATIVE_PATH
+    try:
+        if candidate.is_symlink():
+            return None
+        resolved_candidate = candidate.resolve()
+        resolved_candidate.relative_to(data_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return candidate
 
 
 def resolve_event_data_root() -> Path:
@@ -446,6 +492,8 @@ def summarize_cex(
     rows: list[dict[str, str]],
     requested_start: str | None = None,
     requested_end: str | None = None,
+    source_available_start: str | None = None,
+    coverage_from_first_observation: bool = False,
 ) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
@@ -457,6 +505,8 @@ def summarize_cex(
             market_rows,
             requested_start=requested_start,
             requested_end=requested_end,
+            source_available_start=source_available_start,
+            coverage_from_first_observation=coverage_from_first_observation,
         )
         summaries.append(
             {
@@ -486,6 +536,8 @@ def summarize_dex(
     rows: list[dict[str, str]],
     requested_start: str | None = None,
     requested_end: str | None = None,
+    source_available_start: str | None = None,
+    coverage_from_first_observation: bool = False,
 ) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
@@ -509,6 +561,8 @@ def summarize_dex(
             pool_rows,
             requested_start=requested_start,
             requested_end=requested_end,
+            source_available_start=source_available_start,
+            coverage_from_first_observation=coverage_from_first_observation,
         )
         summaries.append(
             {
@@ -1193,15 +1247,23 @@ def _build_market_payload_cached(
     if effective_start < available_start or effective_end > available_end:
         raise ValueError(f"date window must be within {available_start} and {available_end}")
 
+    full_catalog_window = (
+        effective_start == available_start
+        and effective_end == available_end
+    )
     cex_markets = summarize_cex(
         rows_in_window(cex_path, effective_start, effective_end),
         effective_start,
         effective_end,
+        cex_bounds["available_start"],
+        full_catalog_window,
     )
     dex_pools = summarize_dex(
         rows_in_window(dex_path, effective_start, effective_end),
         effective_start,
         effective_end,
+        dex_bounds["available_start"],
+        full_catalog_window,
     )
     if not cex_markets and not dex_pools:
         raise ValueError("No market observations exist in the selected time window")
@@ -1305,8 +1367,24 @@ def _build_database_payload_cached(
     finally:
         connection.close()
 
-    cex_markets = summarize_cex(cex_rows, effective_start, effective_end)
-    dex_pools = summarize_dex(dex_rows, effective_start, effective_end)
+    full_catalog_window = (
+        effective_start == available_start
+        and effective_end == available_end
+    )
+    cex_markets = summarize_cex(
+        cex_rows,
+        effective_start,
+        effective_end,
+        cex_bounds["available_start"],
+        full_catalog_window,
+    )
+    dex_pools = summarize_dex(
+        dex_rows,
+        effective_start,
+        effective_end,
+        dex_bounds["available_start"],
+        full_catalog_window,
+    )
     if not cex_markets and not dex_pools:
         raise ValueError("No market observations exist in the selected time window")
 
@@ -1671,7 +1749,12 @@ WINDOW_MARKET_FIELDS = (
     "latest_observed_date",
     "observation_days",
     "observation_count",
+    "requested_window_days",
+    "missing_calendar_days",
     "coverage_ratio",
+    "coverage_expected_start",
+    "coverage_expected_end",
+    "coverage_start_method",
     "tvl_usd",
     "tvl_status",
 )
@@ -1925,10 +2008,35 @@ def build_token_market_catalog(
     end: str | None = None,
     *,
     source_signature: SourceSignature | None = None,
+    allow_empty_window: bool = False,
 ) -> dict[str, Any]:
     """Return complete catalog facts plus compact selected-window metrics for one Token."""
     token_catalog = token_catalog_from_catalog(build_market_catalog(), token_symbol)
-    window_payload = build_market_payload(start, end)
+    try:
+        window_payload = build_market_payload(start, end)
+    except ValueError as error:
+        if not allow_empty_window or str(error) != (
+            "No market observations exist in the selected time window"
+        ):
+            raise
+        default_payload = build_market_payload()
+        metadata = default_payload["metadata"]
+        effective_start, effective_end = validate_fact_window(
+            start,
+            end,
+            metadata["available_start"],
+            metadata["available_end"],
+        )
+        window_payload = {
+            "metadata": {
+                **metadata,
+                "start_date": effective_start,
+                "end_date": effective_end,
+            },
+            "cex_markets": [],
+            "dex_pools": [],
+            "tokens": [],
+        }
     markets = []
     for market in token_catalog["markets"]:
         row = _payload_row_for_catalog_market(window_payload, market)
@@ -2496,13 +2604,30 @@ def build_execution_cost_comparison(
     }
 
 
-QUALITY_CONTRACT_VERSION = 1
+QUALITY_CONTRACT_VERSION = 3
 QUALITY_STATUS_SEMANTICS = {
     "observed": "A source-backed fact is present.",
+    "provisional": "The current UTC day is not finalized.",
     "partial": "Only part of the requested execution or depth is proved.",
     "unsupported": (
         "No protocol-specific, project-validated adapter exists for this "
         "market model."
+    ),
+    "source_no_observation": (
+        "The source responded successfully but supplied no observation."
+    ),
+    "collection_failed": "A supported source request failed.",
+    "needs_review": (
+        "The source outcome needs protected operator review and is not an "
+        "automatic retry."
+    ),
+    "backfill_pending": (
+        "One or more expected historical observations are missing and can be retried."
+    ),
+    "invalid": "A source value was received but failed the fact contract.",
+    "stale": "The latest source-backed observation is outside its freshness limit.",
+    "missing_unexplained": (
+        "No observation is present and the pipeline has not yet proved why."
     ),
     "failed": "A supported collection or calculation failed.",
     "unavailable": "No current snapshot is configured or published.",
@@ -2511,6 +2636,428 @@ QUALITY_STATUS_SEMANTICS = {
     ),
     "not_applicable": "This fact is not defined for this market type.",
 }
+DAILY_QUALITY_REASON_RULES = {
+    "network": ("collection_failed", True),
+    "rate_limit": ("collection_failed", True),
+    "source_unavailable": ("collection_failed", True),
+    "parse": ("collection_failed", True),
+    "validation": ("collection_failed", True),
+    "no_candles": ("source_no_observation", False),
+    "not_listed": ("needs_review", False),
+    "source_range_unavailable": ("needs_review", False),
+    "stale_market_lifecycle_unknown": ("needs_review", False),
+    "missing_unexplained": ("backfill_pending", True),
+}
+DAILY_QUALITY_STATUS_PRIORITY = {
+    "collection_failed": 0,
+    "needs_review": 1,
+    "backfill_pending": 2,
+    "source_no_observation": 3,
+}
+DAILY_QUALITY_CATEGORIES = {
+    "historical_gap",
+    "d1_active_gap",
+    "stale_market_unknown",
+}
+DAILY_QUALITY_PUBLICATION_STATUSES = {
+    "published",
+    "published_with_backfill",
+    "published_with_retry_queue",
+}
+
+
+def _parse_quality_timestamp(value: Any) -> str:
+    text = str(value or "")
+    if len(text) > 64:
+        raise ValueError("Daily quality timestamp is invalid")
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        raise ValueError("Daily quality timestamp must include a timezone")
+    return text
+
+
+def _parse_quality_day(value: Any) -> str:
+    text = str(value or "")
+    if len(text) != 10 or date.fromisoformat(text).isoformat() != text:
+        raise ValueError("Daily quality date is invalid")
+    return text
+
+
+def _daily_quality_path_is_safe(path: Path) -> bool:
+    if path.is_symlink():
+        return False
+    try:
+        expected_path = resolve_daily_quality_report_path()
+        if expected_path is None or expected_path != path:
+            return False
+        data_root = path.parent.parent.resolve()
+        path.resolve().relative_to(data_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+@lru_cache(maxsize=8)
+def _load_daily_quality_report_cached(
+    path_text: str,
+    _signature: SourceSignature,
+) -> dict[str, Any]:
+    """Read and normalize only the bounded fields used by the public API."""
+
+    path = Path(path_text)
+    if not _daily_quality_path_is_safe(path):
+        raise ValueError("Daily quality report path is invalid")
+    stat = path.stat()
+    if not path.is_file() or stat.st_size > MAX_DAILY_QUALITY_REPORT_BYTES:
+        raise ValueError("Daily quality report is not a bounded regular file")
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_DAILY_QUALITY_REPORT_BYTES + 1)
+    if not _daily_quality_path_is_safe(path):
+        raise ValueError("Daily quality report path changed during read")
+    if len(raw) > MAX_DAILY_QUALITY_REPORT_BYTES:
+        raise ValueError("Daily quality report exceeds the size limit")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Daily quality report is not valid JSON") from error
+    if not isinstance(payload, dict):
+        raise ValueError("Daily quality report root must be an object")
+    if payload.get("schema") != DAILY_QUALITY_REPORT_SCHEMA:
+        raise ValueError("Daily quality report schema is unsupported")
+
+    publication = payload.get("publication")
+    if not isinstance(publication, dict):
+        raise ValueError("Daily quality report publication is missing")
+    publication_status = str(publication.get("status") or "")
+    if publication_status not in DAILY_QUALITY_PUBLICATION_STATUSES:
+        raise ValueError("Daily quality report is not a published snapshot")
+    import_run_id = str(publication.get("import_run_id") or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", import_run_id):
+        raise ValueError("Daily quality report import identity is invalid")
+
+    generated_at = _parse_quality_timestamp(payload.get("generated_at_utc"))
+    audit_day = _parse_quality_day(payload.get("audit_date"))
+    latest_completed_day = _parse_quality_day(
+        payload.get("latest_completed_utc_day")
+    )
+    issues = payload.get("issues")
+    if (
+        not isinstance(issues, list)
+        or len(issues) > MAX_DAILY_QUALITY_REPORT_ISSUES
+    ):
+        raise ValueError("Daily quality report issues are invalid")
+    summary = payload.get("summary")
+    if (
+        not isinstance(summary, dict)
+        or summary.get("issue_count") != len(issues)
+    ):
+        raise ValueError("Daily quality report issue count is inconsistent")
+
+    normalized_issues = []
+    seen = set()
+    for issue in issues:
+        if not isinstance(issue, dict):
+            raise ValueError("Daily quality issue is not an object")
+        category = str(issue.get("category") or "")
+        reason_code = str(issue.get("reason_code") or "")
+        status = str(issue.get("status") or "")
+        retryable = issue.get("retryable")
+        market = issue.get("market")
+        day_value = issue.get("date")
+        if (
+            len(category) > 64
+            or len(reason_code) > 64
+            or len(status) > 64
+            or not isinstance(retryable, bool)
+            or not isinstance(market, dict)
+        ):
+            raise ValueError("Daily quality issue fields are invalid")
+        market_id = market.get("market_id")
+        if market_id is not None and (
+            not isinstance(market_id, str)
+            or not market_id
+            or len(market_id) > 512
+        ):
+            raise ValueError("Daily quality market identity is invalid")
+        if day_value is not None:
+            day_value = _parse_quality_day(day_value)
+
+        rule = DAILY_QUALITY_REASON_RULES.get(reason_code)
+        if (
+            category not in DAILY_QUALITY_CATEGORIES
+            or rule is None
+            or market_id is None
+            or day_value is None
+        ):
+            # Hard-invalid details and other non-daily evidence remain in the
+            # protected operator report, never in the public projection.
+            continue
+        expected_status, expected_retryable = rule
+        if status != expected_status or retryable is not expected_retryable:
+            raise ValueError("Daily quality issue outcome is inconsistent")
+        key = (market_id, day_value, reason_code)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_issues.append(
+            {
+                "market_id": market_id,
+                "date": day_value,
+                "category": category,
+                "status": expected_status,
+                "reason_code": reason_code,
+                "retryable": expected_retryable,
+            }
+        )
+
+    return {
+        "schema": DAILY_QUALITY_REPORT_SCHEMA,
+        "generated_at_utc": generated_at,
+        "audit_date": audit_day,
+        "latest_completed_utc_day": latest_completed_day,
+        "publication_status": publication_status,
+        "import_run_id": import_run_id,
+        "issues": normalized_issues,
+    }
+
+
+def _daily_quality_report_state(
+    metadata: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Return safe public state plus normalized issues, or inference fallback."""
+
+    try:
+        path = resolve_daily_quality_report_path()
+    except (OSError, RuntimeError, FileNotFoundError, ValueError):
+        path = None
+    if path is None or not path.exists():
+        return (
+            {
+                "status": "unavailable",
+                "reason_code": "daily_quality_report_unavailable",
+                "evidence_mode": "catalog_window_inference",
+                "identity_status": "not_verified",
+            },
+            [],
+        )
+    try:
+        report = _load_daily_quality_report_cached(
+            str(path),
+            _safe_path_signature(path),
+        )
+    except (OSError, RuntimeError, ValueError):
+        return (
+            {
+                "status": "ignored_invalid",
+                "reason_code": "daily_quality_report_invalid",
+                "evidence_mode": "catalog_window_inference",
+                "identity_status": "not_verified",
+            },
+            [],
+        )
+
+    current_import_run_id = (
+        metadata.get("storage", {}).get("import_run_id")
+        if isinstance(metadata.get("storage"), dict)
+        else None
+    )
+    if not isinstance(current_import_run_id, str) or not current_import_run_id:
+        return (
+            {
+                "status": "ignored_identity_unavailable",
+                "reason_code": "published_import_identity_unavailable",
+                "evidence_mode": "catalog_window_inference",
+                "identity_status": "unavailable",
+            },
+            [],
+        )
+    if report["import_run_id"] != current_import_run_id:
+        return (
+            {
+                "status": "ignored_identity_mismatch",
+                "reason_code": "publication_import_identity_mismatch",
+                "evidence_mode": "catalog_window_inference",
+                "identity_status": "mismatch",
+            },
+            [],
+        )
+    return (
+        {
+            "status": "matched",
+            "reason_code": None,
+            "evidence_mode": "published_daily_audit",
+            "identity_status": "matched_current_import",
+            "schema": report["schema"],
+            "generated_at_utc": report["generated_at_utc"],
+            "audit_date": report["audit_date"],
+            "latest_completed_utc_day": report[
+                "latest_completed_utc_day"
+            ],
+            "publication_status": report["publication_status"],
+        },
+        report["issues"],
+    )
+
+
+def _daily_quality_issues_for_window(
+    issues: Iterable[dict[str, Any]],
+    *,
+    market_ids: set[str],
+    window_start: str,
+    window_end: str,
+) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            issue
+            for issue in issues
+            if issue["market_id"] in market_ids
+            and window_start <= issue["date"] <= window_end
+        ),
+        key=lambda issue: (
+            issue["market_id"],
+            issue["date"],
+            issue["reason_code"],
+        ),
+    )
+
+
+def _overlay_daily_quality_report(
+    fact: dict[str, Any],
+    issues: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    issues = list(issues)
+    if not issues:
+        return fact
+    status_counts = Counter(issue["status"] for issue in issues)
+    reason_counts = Counter(issue["reason_code"] for issue in issues)
+    affected_dates = sorted({issue["date"] for issue in issues})
+    status = min(
+        status_counts,
+        key=lambda candidate: DAILY_QUALITY_STATUS_PRIORITY[candidate],
+    )
+    retryable = any(issue["retryable"] for issue in issues)
+    has_manual_review = bool(status_counts.get("needs_review"))
+    if retryable and has_manual_review:
+        action = "operator_review_retry_and_manual_queues"
+    elif retryable:
+        action = "operator_review_retry_queue"
+    elif status == "needs_review":
+        action = "operator_manual_review"
+    else:
+        action = "operator_review_source_outcome"
+    reason_code = (
+        next(iter(reason_counts))
+        if len(reason_counts) == 1
+        else "multiple_daily_quality_reasons"
+    )
+    fixed_reasons = {
+        "collection_failed": (
+            "A published collection attempt failed for one or more affected "
+            "dates. An operator must review the protected retry queue."
+        ),
+        "source_no_observation": (
+            "The source responded but supplied no candle for one or more "
+            "affected dates. This is not an automatic retry."
+        ),
+        "needs_review": (
+            "The source reported a listing or history-range condition that "
+            "requires protected operator review."
+        ),
+        "backfill_pending": (
+            "One or more expected dates are absent without a matching "
+            "collection-attempt explanation."
+        ),
+    }
+    flags = list(fact.get("quality_flags") or [])
+    known_flag_codes = {flag.get("code") for flag in flags}
+    for issue_status in sorted(
+        status_counts,
+        key=lambda candidate: DAILY_QUALITY_STATUS_PRIORITY[candidate],
+    ):
+        report_flag = {
+            "code": "daily_{}".format(issue_status),
+            "severity": (
+                "critical"
+                if issue_status == "collection_failed"
+                else "warning"
+                if issue_status in {"needs_review", "backfill_pending"}
+                else "info"
+            ),
+            "category": "data_health",
+            "message": fixed_reasons[issue_status],
+            "observed_value": len(
+                {
+                    issue["date"]
+                    for issue in issues
+                    if issue["status"] == issue_status
+                }
+            ),
+            "threshold": 0,
+        }
+        if report_flag["code"] not in known_flag_codes:
+            flags.append(report_flag)
+            known_flag_codes.add(report_flag["code"])
+    return {
+        **fact,
+        "status": status,
+        "reason": fixed_reasons[status],
+        "reason_code": reason_code,
+        "retryable": retryable,
+        "action": action,
+        "reason_code_counts": dict(sorted(reason_counts.items())),
+        "issue_status_counts": dict(sorted(status_counts.items())),
+        "affected_dates": affected_dates,
+        "affected_date_count": len(affected_dates),
+        "daily_evidence_mode": "published_daily_audit",
+        "quality_flags": flags,
+    }
+
+
+def _reconcile_daily_fact_without_report_issue(
+    fact: dict[str, Any],
+) -> dict[str, Any]:
+    """Do not advertise a retry outside the published report's exact queue."""
+
+    if fact.get("status") not in {
+        "backfill_pending",
+        "missing_unexplained",
+    }:
+        return fact
+    flags = list(fact.get("quality_flags") or [])
+    code = "daily_needs_review"
+    message = (
+        "The selected window has an inferred daily gap, but the matching "
+        "published audit contains no exact issue for this market/date window. "
+        "An operator must reconcile it before any retry."
+    )
+    if not any(flag.get("code") == code for flag in flags):
+        flags.append(
+            {
+                "code": code,
+                "severity": "warning",
+                "category": "data_health",
+                "message": message,
+                "observed_value": fact.get("missing_calendar_days"),
+                "threshold": 0,
+            }
+        )
+    return {
+        **fact,
+        "status": "needs_review",
+        "reason": message,
+        "reason_code": "daily_audit_no_matching_issue",
+        "retryable": False,
+        "action": "operator_manual_review",
+        "reason_code_counts": {
+            "daily_audit_no_matching_issue": 1,
+        },
+        "issue_status_counts": {},
+        "affected_dates": [],
+        "affected_date_count": 0,
+        "daily_evidence_mode": "catalog_report_reconciliation",
+        "quality_flags": flags,
+    }
 
 
 def _quality_lineage(
@@ -2524,6 +3071,9 @@ def _quality_lineage(
     snapshot_id: str | None = None,
     dataset_sha256: str | None = None,
     raw_response_sha256: str | None = None,
+    reason_code: str | None = None,
+    retryable: bool = False,
+    action: str | None = None,
 ) -> dict[str, Any]:
     """Return one stable set of fields shared by every quality fact."""
     return {
@@ -2533,6 +3083,9 @@ def _quality_lineage(
         "source_endpoint": source_endpoint,
         "method": method,
         "reason": reason,
+        "reason_code": reason_code or reason,
+        "retryable": bool(retryable),
+        "action": action,
         "snapshot_id": snapshot_id,
         "dataset_sha256": dataset_sha256,
         "raw_response_sha256": raw_response_sha256,
@@ -2595,33 +3148,162 @@ def _daily_quality_fact(
     market: dict[str, Any],
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    observation_days = market.get("observation_days")
+    window_metrics = market.get("window_metrics")
+    metrics = window_metrics if isinstance(window_metrics, dict) else {}
+    observation_days = metrics.get(
+        "observation_count",
+        metrics.get("observation_days"),
+    )
+    requested_window_days = metrics.get("requested_window_days")
+    missing_calendar_days = metrics.get("missing_calendar_days")
+    expected_start = metrics.get("coverage_expected_start")
+    expected_end = metrics.get("coverage_expected_end")
+    try:
+        window_start_day = date.fromisoformat(metadata.get("window_start", ""))
+        window_end_day = date.fromisoformat(metadata.get("window_end", ""))
+        market_start_day = date.fromisoformat(
+            market.get("observed_start")
+            or market.get("first_observed_date", "")
+        )
+        market_latest_day = date.fromisoformat(
+            market.get("observed_end")
+            or market.get("latest_observed_date", "")
+        )
+    except (TypeError, ValueError):
+        lifecycle_overlap = None
+    else:
+        expected_start_day = max(window_start_day, market_start_day)
+        expected_end_day = window_end_day
+        lifecycle_overlap = expected_start_day <= expected_end_day
+        if lifecycle_overlap:
+            expected_start = expected_start_day.isoformat()
+            expected_end = expected_end_day.isoformat()
+            requested_window_days = (
+                expected_end_day - expected_start_day
+            ).days + 1
+            numeric_observations = (
+                int(observation_days)
+                if isinstance(observation_days, (int, float))
+                and not isinstance(observation_days, bool)
+                else 0
+            )
+            missing_calendar_days = max(
+                requested_window_days - numeric_observations,
+                0,
+            )
+        else:
+            requested_window_days = 0
+            missing_calendar_days = 0
+            expected_start = None
+            expected_end = None
     observed = (
         isinstance(observation_days, (int, float))
         and not isinstance(observation_days, bool)
         and observation_days > 0
     )
+    has_gap = (
+        isinstance(missing_calendar_days, (int, float))
+        and not isinstance(missing_calendar_days, bool)
+        and missing_calendar_days > 0
+    )
+    if lifecycle_overlap is False:
+        status = "not_applicable"
+        reason = "selected_window_before_first_market_observation"
+    elif (
+        not observed
+        and lifecycle_overlap is True
+        and window_start_day > market_latest_day
+    ):
+        status = "missing_unexplained"
+        reason = "no_daily_observations_after_latest_observed_market_date"
+    elif not observed and lifecycle_overlap is True:
+        status = "backfill_pending"
+        reason = "missing_daily_observations_inside_observed_market_lifecycle"
+    elif not observed:
+        status = "missing_unexplained"
+        reason = "no_daily_observations_in_selected_window"
+    elif has_gap:
+        status = "backfill_pending"
+        reason = "missing_daily_observations_in_selected_window"
+    else:
+        status = "observed"
+        reason = None
     dataset_source = _dataset_source_for_market(
         metadata,
         market["market_type"],
     )
+    coverage_ratio = (
+        observation_days / requested_window_days
+        if isinstance(observation_days, (int, float))
+        and not isinstance(observation_days, bool)
+        and requested_window_days
+        else metrics.get("coverage_ratio")
+        if lifecycle_overlap is None
+        else None
+    )
+    daily_flags = []
+    threshold = MARKET_QUALITY_THRESHOLDS[
+        "minimum_primary_coverage_ratio"
+    ]
+    if (
+        isinstance(coverage_ratio, (int, float))
+        and not isinstance(coverage_ratio, bool)
+        and coverage_ratio < threshold
+    ):
+        daily_flags.append(
+            {
+                "code": "low_daily_coverage",
+                "severity": "warning",
+                "category": "data_health",
+                "message": (
+                    "Selected-window daily coverage is below the declared threshold."
+                ),
+                "observed_value": coverage_ratio,
+                "threshold": threshold,
+            }
+        )
     return {
         **_quality_lineage(
-            status="observed" if observed else "unavailable",
-            observed_at=market.get("observed_end"),
+            status=status,
+            observed_at=metrics.get(
+                "latest_observed_date",
+                metrics.get("observed_end")
+                or market.get("observed_end")
+                or market.get("latest_observed_date"),
+            ),
             source=market.get("source"),
             method="daily_close_no_fill",
-            reason=None if observed else "no_daily_observations",
+            reason=reason,
+            reason_code=reason,
+            retryable=status in {"backfill_pending", "missing_unexplained"},
+            action=(
+                "operator_review_retry_queue"
+                if status in {"backfill_pending", "missing_unexplained"}
+                else None
+            ),
             dataset_sha256=(
                 dataset_source.get("sha256") if dataset_source else None
             ),
         ),
-        "observed_start": market.get("observed_start"),
-        "observed_end": market.get("observed_end"),
+        "observed_start": metrics.get(
+            "first_observed_date",
+            metrics.get("observed_start")
+            or market.get("observed_start")
+            or market.get("first_observed_date"),
+        ),
+        "observed_end": metrics.get(
+            "latest_observed_date",
+            metrics.get("observed_end")
+            or market.get("observed_end")
+            or market.get("latest_observed_date"),
+        ),
         "observation_days": observation_days,
-        "requested_window_days": market.get("requested_window_days"),
-        "coverage_ratio": market.get("coverage_ratio"),
-        "quality_flags": _quality_flags_for_fact(market, "daily"),
+        "requested_window_days": requested_window_days,
+        "missing_calendar_days": missing_calendar_days,
+        "coverage_expected_start": expected_start,
+        "coverage_expected_end": expected_end,
+        "coverage_ratio": coverage_ratio,
+        "quality_flags": daily_flags,
     }
 
 
@@ -2631,11 +3313,17 @@ def _tvl_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             **_quality_lineage(
                 status="not_applicable",
                 reason="cex_markets_do_not_have_pool_tvl",
+                reason_code="cex_markets_do_not_have_pool_tvl",
             ),
             "value_usd": None,
             "quality_flags": [],
         }
     status = market.get("tvl_status") or "unavailable"
+    retryable = status in {
+        "failed",
+        "collection_failed",
+        "not_cataloged_in_snapshot",
+    }
     return {
         **_quality_lineage(
             status=status,
@@ -2644,6 +3332,9 @@ def _tvl_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             source_endpoint=market.get("tvl_source_endpoint"),
             method=market.get("tvl_method"),
             reason=market.get("tvl_error"),
+            reason_code=market.get("tvl_error"),
+            retryable=retryable,
+            action="retry_tvl_collection" if retryable else None,
             snapshot_id=market.get("tvl_snapshot_id"),
             raw_response_sha256=market.get("tvl_raw_response_sha256"),
         ),
@@ -2656,6 +3347,12 @@ def _tvl_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
 def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
     market_type = market["market_type"]
     status = market.get("depth_status") or "unavailable"
+    retryable = status in {
+        "failed",
+        "error",
+        "collection_failed",
+        "not_cataloged_in_snapshot",
+    }
     temporal_alignment = {
         "state_observed_at": (
             market.get("depth_block_timestamp")
@@ -2694,6 +3391,7 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             {
                 "code": "depth_usd_price_time_mismatch",
                 "severity": "critical",
+                "category": "data_health",
                 "message": (
                     "USD depth is withheld because its price response is "
                     "unavailable or more than two hours from pool state."
@@ -2709,6 +3407,7 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             {
                 "code": "depth_usd_price_time_warning",
                 "severity": "warning",
+                "category": "data_health",
                 "message": (
                     "The USD price response is more than 15 minutes, but no "
                     "more than two hours, from pool state."
@@ -2741,6 +3440,9 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             source_endpoint=market.get("depth_source_endpoint"),
             method=market.get("depth_method"),
             reason=market.get("depth_error"),
+            reason_code=market.get("depth_error"),
+            retryable=retryable,
+            action="retry_depth_collection" if retryable else None,
             snapshot_id=market.get("depth_snapshot_id"),
             raw_response_sha256=market.get(
                 "depth_raw_response_sha256"
@@ -2760,14 +3462,23 @@ def _execution_quality_source(
 ) -> dict[str, Any]:
     try:
         path = resolver()
-    except FileNotFoundError as error:
-        return {"snapshot": None, "error": str(error)}
+    except OSError:
+        return {
+            "snapshot": None,
+            "error_code": "execution_snapshot_invalid",
+        }
     if path is None:
-        return {"snapshot": None, "error": None}
+        return {"snapshot": None, "error_code": None}
     try:
-        return {"snapshot": load_execution_cost_snapshot(path), "error": None}
-    except (OSError, ValueError) as error:
-        return {"snapshot": None, "error": str(error)}
+        return {
+            "snapshot": load_execution_cost_snapshot(path),
+            "error_code": None,
+        }
+    except (OSError, ValueError):
+        return {
+            "snapshot": None,
+            "error_code": "execution_snapshot_invalid",
+        }
 
 
 def _one_execution_value(
@@ -2789,12 +3500,18 @@ def _execution_quality_fact(
     source_state: dict[str, Any],
 ) -> dict[str, Any]:
     snapshot = source_state["snapshot"]
-    load_error = source_state["error"]
-    if load_error is not None:
+    load_error_code = source_state["error_code"]
+    if load_error_code is not None:
         return {
             **_quality_lineage(
                 status="failed",
-                reason=f"execution_snapshot_invalid: {load_error}",
+                reason=(
+                    "The execution snapshot could not be loaded or validated. "
+                    "An operator must inspect the protected service logs."
+                ),
+                reason_code=load_error_code,
+                retryable=True,
+                action="retry_execution_collection",
             ),
             "published_at": None,
             "status_counts": {"failed": 1},
@@ -2808,6 +3525,7 @@ def _execution_quality_fact(
             **_quality_lineage(
                 status="unavailable",
                 reason="execution_snapshot_unavailable",
+                reason_code="execution_snapshot_unavailable",
             ),
             "published_at": None,
             "status_counts": {},
@@ -2820,6 +3538,9 @@ def _execution_quality_fact(
             **_quality_lineage(
                 status="not_cataloged_in_snapshot",
                 reason="execution_market_not_cataloged_in_snapshot",
+                reason_code="execution_market_not_cataloged_in_snapshot",
+                retryable=True,
+                action="retry_execution_collection",
             ),
             "published_at": snapshot.get("observed_at"),
             "status_counts": {},
@@ -2848,6 +3569,7 @@ def _execution_quality_fact(
             {
                 "code": "execution_usd_price_time_mismatch",
                 "severity": "critical",
+                "category": "data_health",
                 "message": (
                     "Execution values are withheld because the required USD "
                     "price response is unavailable or more than two hours from "
@@ -2864,6 +3586,7 @@ def _execution_quality_fact(
             {
                 "code": "execution_usd_price_time_warning",
                 "severity": "warning",
+                "category": "data_health",
                 "message": (
                     "The USD price response is more than 15 minutes, but no "
                     "more than two hours, from execution market state."
@@ -2918,6 +3641,12 @@ def _execution_quality_fact(
                     else "mixed_execution_status_reasons"
                 )
             ),
+            retryable=status == "failed",
+            action=(
+                "retry_execution_collection"
+                if status == "failed"
+                else None
+            ),
             snapshot_id=_one_execution_value(rows, "snapshot_id"),
             raw_response_sha256=_one_execution_value(
                 rows,
@@ -2953,6 +3682,8 @@ def build_market_quality(
     scope: str | None = None,
     market_a_id: str | None = None,
     market_b_id: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
 ) -> dict[str, Any]:
     """Return a fact-by-market quality inventory for one exact Token."""
     if not token_symbol:
@@ -2962,7 +3693,12 @@ def build_market_quality(
     if normalized_scope not in {"all", "selected"}:
         raise ValueError("scope must be all or selected")
 
-    catalog = build_market_catalog()
+    catalog = build_token_market_catalog(
+        token,
+        start,
+        end,
+        allow_empty_window=True,
+    )
     token_markets = [
         market
         for market in catalog["markets"]
@@ -2986,6 +3722,21 @@ def build_market_quality(
         selected_ids = [market_a_id, market_b_id]
         token_markets = [by_id[market_id] for market_id in selected_ids]
 
+    quality_report_state, report_issues = _daily_quality_report_state(
+        catalog["metadata"]
+    )
+    selected_report_issues = _daily_quality_issues_for_window(
+        report_issues,
+        market_ids={market["market_id"] for market in token_markets},
+        window_start=catalog["metadata"]["window_start"],
+        window_end=catalog["metadata"]["window_end"],
+    )
+    report_issues_by_market: dict[str, list[dict[str, Any]]] = defaultdict(
+        list
+    )
+    for issue in selected_report_issues:
+        report_issues_by_market[issue["market_id"]].append(issue)
+
     execution_sources = {
         "cex": _execution_quality_source(
             resolve_cex_execution_cost_path
@@ -2996,11 +3747,25 @@ def build_market_quality(
     }
     quality_markets = []
     for market in token_markets:
+        daily_fact = _daily_quality_fact(
+            market,
+            catalog["metadata"],
+        )
+        if quality_report_state["status"] == "matched":
+            market_report_issues = report_issues_by_market.get(
+                market["market_id"],
+                [],
+            )
+            daily_fact = (
+                _overlay_daily_quality_report(
+                    daily_fact,
+                    market_report_issues,
+                )
+                if market_report_issues
+                else _reconcile_daily_fact_without_report_issue(daily_fact)
+            )
         facts = {
-            "daily": _daily_quality_fact(
-                market,
-                catalog["metadata"],
-            ),
+            "daily": daily_fact,
             "tvl": _tvl_quality_fact(market),
             "depth": _depth_quality_fact(market),
             "execution": _execution_quality_fact(
@@ -3008,7 +3773,11 @@ def build_market_quality(
                 execution_sources[market["market_type"]],
             ),
         }
-        quality_flags = list(market.get("quality_flag_details") or [])
+        quality_flags = [
+            flag
+            for flag in (market.get("quality_flag_details") or [])
+            if flag.get("code") != "low_daily_coverage"
+        ]
         known_codes = {
             flag.get("code")
             for flag in quality_flags
@@ -3021,14 +3790,45 @@ def build_market_quality(
                 quality_flags.append(flag)
                 if flag.get("code"):
                     known_codes.add(flag["code"])
-        quality_status = market.get("quality_status")
+        data_health_flags = [
+            flag
+            for flag in quality_flags
+            if flag.get("category", "data_health") == "data_health"
+        ]
+        quality_status = "ok"
         if any(
             flag.get("severity") == "critical"
-            for flag in quality_flags
+            for flag in data_health_flags
         ):
             quality_status = "critical"
-        elif quality_flags and quality_status not in {"critical", "warning"}:
+        elif any(
+            flag.get("severity") == "warning"
+            for flag in data_health_flags
+        ):
             quality_status = "warning"
+        elif data_health_flags:
+            quality_status = "info"
+        retryable_facts = sorted(
+            name
+            for name, fact in facts.items()
+            if fact.get("retryable")
+        )
+        structural_facts = sorted(
+            name
+            for name, fact in facts.items()
+            if fact.get("status") in {"unsupported", "not_applicable"}
+        )
+        pending_facts = sorted(
+            name
+            for name, fact in facts.items()
+            if fact.get("status") in {
+                "backfill_pending",
+                "missing_unexplained",
+                "partial",
+                "needs_review",
+                "source_no_observation",
+            }
+        )
         quality_markets.append(
             {
                 "market_id": market["market_id"],
@@ -3040,21 +3840,92 @@ def build_market_quality(
                 "pool_address": market.get("pool_address"),
                 "quality_status": quality_status,
                 "quality_flags": quality_flags,
+                "market_conditions": [
+                    flag
+                    for flag in quality_flags
+                    if flag.get("category") == "market_condition"
+                ],
+                "capability_flags": [
+                    flag
+                    for flag in quality_flags
+                    if flag.get("category") == "capability"
+                ],
+                "retryable_facts": retryable_facts,
+                "structural_facts": structural_facts,
+                "pending_facts": pending_facts,
+                "usability_status": (
+                    "blocked"
+                    if quality_status == "critical"
+                    else "needs_recovery"
+                    if retryable_facts
+                    else "usable_with_limits"
+                    if structural_facts or pending_facts
+                    else "usable"
+                ),
                 "facts": facts,
             }
         )
+    fact_status_counts = Counter(
+        fact.get("status") or "unavailable"
+        for market in quality_markets
+        for fact in market["facts"].values()
+    )
+    retryable_count = sum(
+        1
+        for market in quality_markets
+        for fact in market["facts"].values()
+        if fact.get("retryable")
+    )
+    report_reason_counts = Counter(
+        issue["reason_code"] for issue in selected_report_issues
+    )
+    report_status_counts = Counter(
+        issue["status"] for issue in selected_report_issues
+    )
+    report_affected_dates = sorted(
+        {issue["date"] for issue in selected_report_issues}
+    )
     return {
         "metadata": {
             "contract_version": QUALITY_CONTRACT_VERSION,
             "scope": normalized_scope,
             "selected_market_ids": selected_ids,
             "facts": ["daily", "tvl", "depth", "execution"],
+            "window_start": catalog["metadata"].get("window_start"),
+            "window_end": catalog["metadata"].get("window_end"),
             "status_semantics": QUALITY_STATUS_SEMANTICS,
+            "quality_dimensions": {
+                "data_health": (
+                    "Unexpected missing, failed, invalid, stale, or inconsistent facts."
+                ),
+                "capability": "Whether a validated adapter exists.",
+                "measurement_limit": "Measured facts with an explicit lower bound.",
+                "market_condition": (
+                    "Observed liquidity conditions; not collection failures."
+                ),
+            },
+            "fact_status_counts": dict(sorted(fact_status_counts.items())),
+            "retryable_fact_count": retryable_count,
+            "daily_quality_report": {
+                **quality_report_state,
+                "selected_window_issue_count": len(
+                    selected_report_issues
+                ),
+                "reason_code_counts": dict(
+                    sorted(report_reason_counts.items())
+                ),
+                "status_counts": dict(
+                    sorted(report_status_counts.items())
+                ),
+                "affected_date_count": len(report_affected_dates),
+                "affected_dates": report_affected_dates,
+            },
             "freshness": catalog["metadata"].get("freshness"),
             "sources": catalog["metadata"].get("sources", []),
             "missing_value_rule": (
                 "Measured zero remains zero. Missing, unavailable, failed, "
-                "unsupported, not-cataloged, and not-applicable facts remain "
+                "backfill-pending, unsupported, not-cataloged, and "
+                "not-applicable facts remain "
                 "distinct and are never zero-filled."
             ),
         },
@@ -3216,7 +4087,17 @@ def api_source_signature() -> SourceSignature:
     ):
         if optional_path is not None:
             paths.append(optional_path)
-    return data_signature(paths) + event_source_signature()
+    quality_report_path = resolve_daily_quality_report_path()
+    quality_signature = (
+        _safe_path_signature(quality_report_path)
+        if quality_report_path is not None
+        else ()
+    )
+    return (
+        data_signature(paths)
+        + quality_signature
+        + event_source_signature()
+    )
 
 
 def api_freshness_bucket() -> int:
@@ -3267,6 +4148,8 @@ def _build_public_api_payload(
             scope=query.get("scope"),
             market_a_id=query.get("market_a"),
             market_b_id=query.get("market_b"),
+            start=query.get("start"),
+            end=query.get("end"),
         )
     if route == "events":
         return build_event_facts(
@@ -3304,6 +4187,7 @@ def clear_runtime_caches() -> None:
             _load_cex_depth_snapshot_cached,
             _load_dex_depth_snapshot_cached,
             _load_execution_cost_snapshot_cached,
+            _load_daily_quality_report_cached,
             _build_market_payload_cached,
             _build_database_payload_cached,
             _build_enriched_payload_cached,
@@ -3600,8 +4484,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query, keep_blank_values=True)
             try:
                 self.send_public_api("catalog", query)
-            except FileNotFoundError as error:
-                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except FileNotFoundError:
+                self.send_json(
+                    {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
@@ -3609,8 +4496,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("summary", query)
-            except FileNotFoundError as error:
-                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except FileNotFoundError:
+                self.send_json(
+                    {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
@@ -3618,8 +4508,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("compare", query)
-            except FileNotFoundError as error:
-                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except FileNotFoundError:
+                self.send_json(
+                    {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
@@ -3627,8 +4520,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("execution_cost", query)
-            except FileNotFoundError as error:
-                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except FileNotFoundError:
+                self.send_json(
+                    {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
@@ -3636,8 +4532,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("quality", query)
-            except FileNotFoundError as error:
-                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except FileNotFoundError:
+                self.send_json(
+                    {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
@@ -3653,8 +4552,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     },
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            except FileNotFoundError as error:
-                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except FileNotFoundError:
+                self.send_json(
+                    {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
@@ -3662,8 +4564,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("market", query)
-            except FileNotFoundError as error:
-                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except FileNotFoundError:
+                self.send_json(
+                    {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except ValueError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
@@ -3674,7 +4579,49 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/admin/tokens":
             authenticated = self.require_admin()
             if authenticated:
-                self.send_json({"tokens": ADMIN_SERVICE.configured_tokens()})
+                self.send_json(
+                    {
+                        "tokens": ADMIN_SERVICE.configured_tokens(),
+                        "records": ADMIN_SERVICE.configured_token_records(),
+                    }
+                )
+            return
+        if parsed.path == "/api/admin/quality/retryable":
+            authenticated = self.require_admin()
+            if authenticated:
+                try:
+                    windows = ADMIN_SERVICE.retryable_windows()
+                except ValueError as error:
+                    self.send_json(
+                        {"error": str(error)},
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                self.send_json(
+                    {
+                        "windows": windows,
+                        "count": len(windows),
+                    }
+                )
+            return
+        if parsed.path == "/api/admin/quality/manual-review":
+            authenticated = self.require_admin()
+            if authenticated:
+                try:
+                    review_items = ADMIN_SERVICE.manual_review_items()
+                except ValueError as error:
+                    self.send_json(
+                        {"error": str(error)},
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                self.send_json(
+                    {
+                        "review_items": review_items,
+                        "review_count": len(review_items),
+                        "retryable": False,
+                    }
+                )
             return
         if parsed.path == "/api/admin/jobs":
             authenticated = self.require_admin()
@@ -3694,8 +4641,15 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                         "freshness": metadata["freshness"],
                     }
                 )
-            except (FileNotFoundError, ValueError) as error:
-                self.send_json({"status": "degraded", "data_ready": False, "error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except (FileNotFoundError, ValueError):
+                self.send_json(
+                    {
+                        "status": "degraded",
+                        "data_ready": False,
+                        "error": PUBLIC_DATA_UNAVAILABLE_MESSAGE,
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             return
         super().do_GET()
 
@@ -3763,6 +4717,108 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             self.send_json(job, HTTPStatus.ACCEPTED)
             return
 
+        if path == "/api/admin/tokens/resolve":
+            authenticated = self.require_admin(csrf=True)
+            if not authenticated:
+                return
+            try:
+                candidate = ADMIN_SERVICE.resolve_token(
+                    payload.get("chain"),
+                    payload.get("contract_address"),
+                )
+            except ValueError as error:
+                error_code = getattr(error, "code", "invalid_token_request")
+                response = {
+                    "error": str(error),
+                    "error_code": error_code,
+                    "retryable": bool(getattr(error, "retryable", False)),
+                }
+                details = getattr(error, "details", None)
+                if details:
+                    response["details"] = details
+                status = (
+                    HTTPStatus.NOT_FOUND
+                    if error_code == "token_not_found"
+                    else HTTPStatus.CONFLICT
+                    if error_code in {
+                        "symbol_collision",
+                        "identity_conflict",
+                    }
+                    else HTTPStatus.SERVICE_UNAVAILABLE
+                    if error_code in {
+                        "source_rate_limited",
+                        "source_unavailable",
+                        "source_invalid_response",
+                    }
+                    else HTTPStatus.UNPROCESSABLE_ENTITY
+                    if error_code in {
+                        "no_usable_pool",
+                        "pool_token_mismatch",
+                        "identity_mismatch",
+                    }
+                    else HTTPStatus.BAD_REQUEST
+                )
+                self.send_json(response, status)
+                return
+            self.send_json(candidate)
+            return
+
+        if path == "/api/admin/tokens":
+            authenticated = self.require_admin(csrf=True)
+            if not authenticated:
+                return
+            _, session = authenticated
+            try:
+                job = ADMIN_SERVICE.create_onboarding_job(
+                    payload,
+                    session["username"],
+                )
+            except RuntimeError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.CONFLICT)
+                return
+            except (ValueError, OSError) as error:
+                error_code = getattr(error, "code", "invalid_token_request")
+                response = {
+                    "error": str(error),
+                    "error_code": error_code,
+                    "retryable": bool(getattr(error, "retryable", False)),
+                }
+                details = getattr(error, "details", None)
+                if details:
+                    response["details"] = details
+                status = (
+                    HTTPStatus.CONFLICT
+                    if error_code in {
+                        "symbol_collision",
+                        "identity_conflict",
+                    }
+                    else HTTPStatus.SERVICE_UNAVAILABLE
+                    if error_code in {
+                        "source_rate_limited",
+                        "source_unavailable",
+                        "source_invalid_response",
+                    }
+                    else HTTPStatus.UNPROCESSABLE_ENTITY
+                    if error_code in {
+                        "no_usable_pool",
+                        "pool_token_mismatch",
+                        "identity_mismatch",
+                        "identity_changed",
+                    }
+                    else HTTPStatus.BAD_REQUEST
+                )
+                self.send_json(response, status)
+                return
+            self.send_json(
+                job,
+                (
+                    HTTPStatus.OK
+                    if job.get("status") == "succeeded"
+                    else HTTPStatus.ACCEPTED
+                ),
+            )
+            return
+
         self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
 
@@ -3775,9 +4831,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global ADMIN_SERVICE
     args = parse_args()
     if args.data_dir:
         os.environ["MARKET_DATA_DIR"] = str(Path(args.data_dir).expanduser().resolve())
+        ADMIN_SERVICE = AdminService()
     if ADMIN_SERVICE.available and not is_loopback_host(args.host):
         raise SystemExit(
             "Administrator surface requires a loopback bind. "

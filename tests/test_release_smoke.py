@@ -148,8 +148,20 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         quality = {
             "token_symbol": "AAVE",
             "metadata": {
+                "contract_version": 3,
                 "scope": "selected",
                 "selected_market_ids": [market_a, market_b],
+                "daily_quality_report": {
+                    "status": "matched",
+                    "evidence_mode": "published_daily_audit",
+                    "identity_status": "matched_current_import",
+                    "schema": "fact_quality_report/v1",
+                    "selected_window_issue_count": 0,
+                    "reason_code_counts": {},
+                    "status_counts": {},
+                    "affected_date_count": 0,
+                    "affected_dates": [],
+                },
             },
             "markets": quality_markets,
         }

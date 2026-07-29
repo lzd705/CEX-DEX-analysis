@@ -19,8 +19,42 @@
     "quality",
   ]);
   const WORKSPACE_PAGE_SET = new Set(WORKSPACE_PAGES);
-  const SCREENER_SCOPES = new Set(["combined", "cex", "dex"]);
-  const SCREENER_SORTS = new Set(["volume", "spread", "return", "volatility"]);
+  const SCREENER_SCOPES = new Set(["combined", "cross", "cex", "dex"]);
+  const SCREENER_SORTS = new Set([
+    "volume",
+    "spread",
+    "return",
+    "volatility",
+    "depth_100bps",
+    "dex_tvl",
+  ]);
+  const SCREENER_DIRECTIONS = new Set(["asc", "desc"]);
+  const SCREENER_SORT_RULES = Object.freeze({
+    volume: Object.freeze({
+      scopes: new Set(["combined", "cex", "dex"]),
+      defaultScope: "combined",
+    }),
+    spread: Object.freeze({
+      scopes: new Set(["cross"]),
+      defaultScope: "cross",
+    }),
+    return: Object.freeze({
+      scopes: new Set(["cex", "dex"]),
+      defaultScope: "cex",
+    }),
+    volatility: Object.freeze({
+      scopes: new Set(["cex", "dex"]),
+      defaultScope: "cex",
+    }),
+    depth_100bps: Object.freeze({
+      scopes: new Set(["cex", "dex"]),
+      defaultScope: "cex",
+    }),
+    dex_tvl: Object.freeze({
+      scopes: new Set(["dex"]),
+      defaultScope: "dex",
+    }),
+  });
   const COMPARE_WINDOWS = new Set(["7d", "30d", "90d", "all"]);
   const LIQUIDITY_SIDES = new Set(["buy", "sell"]);
   const LIQUIDITY_VIEWS = new Set(["total", "directional"]);
@@ -74,8 +108,17 @@
     }
   }
 
+  function isIsoDate(value) {
+    if (typeof value !== "string" || !ISO_DATE.test(value)) return false;
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return (
+      !Number.isNaN(parsed.getTime())
+      && parsed.toISOString().slice(0, 10) === value
+    );
+  }
+
   function setDate(params, name, value) {
-    if (typeof value === "string" && ISO_DATE.test(value)) {
+    if (isIsoDate(value)) {
       params.set(name, value);
     }
   }
@@ -101,13 +144,28 @@
     const query = firstParam(params, ["q"]);
     const scope = firstParam(params, ["scope"]);
     const sort = firstParam(params, ["sort"]);
+    const direction = firstParam(params, ["dir"]);
     const start = firstParam(params, ["start"]);
     const end = firstParam(params, ["end"]);
     if (query !== null) filters.q = query;
-    if (scope !== null && SCREENER_SCOPES.has(scope)) filters.scope = scope;
-    if (sort !== null && SCREENER_SORTS.has(sort)) filters.sort = sort;
-    if (start !== null && ISO_DATE.test(start)) filters.start = start;
-    if (end !== null && ISO_DATE.test(end)) filters.end = end;
+    const validSort = sort !== null && SCREENER_SORTS.has(sort) ? sort : null;
+    const validScope = scope !== null && SCREENER_SCOPES.has(scope) ? scope : null;
+    const effectiveSort = validSort || "volume";
+    const rule = SCREENER_SORT_RULES[effectiveSort];
+    if (validSort !== null) filters.sort = validSort;
+    if (validScope !== null && rule.scopes.has(validScope)) {
+      filters.scope = validScope;
+    } else if (validSort !== null && rule.defaultScope !== "combined") {
+      filters.scope = rule.defaultScope;
+    }
+    if (
+      direction !== null
+      && SCREENER_DIRECTIONS.has(direction)
+    ) {
+      filters.dir = direction;
+    }
+    if (isIsoDate(start)) filters.start = start;
+    if (isIsoDate(end)) filters.end = end;
     return { kind: "screener", filters };
   }
 
@@ -121,8 +179,8 @@
     if (marketA !== null) state.marketA = marketA;
     if (marketB !== null) state.marketB = marketB;
     if (pairMode !== null && PAIR_MODES.has(pairMode)) state.pairMode = pairMode;
-    if (start !== null && ISO_DATE.test(start)) state.start = start;
-    if (end !== null && ISO_DATE.test(end)) state.end = end;
+    if (isIsoDate(start)) state.start = start;
+    if (isIsoDate(end)) state.end = end;
 
     if (page === "compare") {
       const window = firstParam(params, ["window"]);
@@ -167,14 +225,11 @@
       return { kind: "unknown", pathname: rawPath };
     }
 
-    if (segments.length === 2 && segments[0] === "methodology") {
-      return {
-        kind: "methodology",
-        anchor: segments[1],
-      };
-    }
-    if (segments.length === 1 && segments[0] === "methodology") {
-      return { kind: "methodology", anchor: null };
+    if (
+      (segments.length === 1 || segments.length === 2)
+      && segments[0] === "methodology"
+    ) {
+      return { kind: "screener", filters: {}, legacyMethodologyPath: true };
     }
 
     if (
@@ -197,8 +252,20 @@
   function buildScreenerPath(filters = {}) {
     const params = new URLSearchParams();
     setString(params, "q", filters.q);
-    setEnum(params, "scope", filters.scope, SCREENER_SCOPES);
-    setEnum(params, "sort", filters.sort, SCREENER_SORTS);
+    const validSort = SCREENER_SORTS.has(filters.sort) ? filters.sort : null;
+    const effectiveSort = validSort || "volume";
+    const rule = SCREENER_SORT_RULES[effectiveSort];
+    const validScope = SCREENER_SCOPES.has(filters.scope) ? filters.scope : null;
+    const normalizedScope = validScope && rule.scopes.has(validScope)
+      ? validScope
+      : validSort
+        ? rule.defaultScope
+        : null;
+    if (normalizedScope !== null && normalizedScope !== "combined") {
+      params.set("scope", normalizedScope);
+    }
+    if (validSort !== null && validSort !== "volume") params.set("sort", validSort);
+    setEnum(params, "dir", filters.dir, SCREENER_DIRECTIONS);
     setDate(params, "start", filters.start);
     setDate(params, "end", filters.end);
     return withQuery("/screener", params);
@@ -240,13 +307,6 @@
       `/tokens/${encodeURIComponent(normalizedToken)}/${page}`,
       params,
     );
-  }
-
-  function buildMethodologyPath(anchor) {
-    const normalizedAnchor = stringValue(anchor);
-    return normalizedAnchor === null
-      ? "/methodology"
-      : `/methodology/${encodeURIComponent(normalizedAnchor)}`;
   }
 
   function marketIdentifier(market) {
@@ -314,7 +374,6 @@
     parseRoute,
     buildScreenerPath,
     buildWorkspacePath,
-    buildMethodologyPath,
     validatePair,
   });
 });

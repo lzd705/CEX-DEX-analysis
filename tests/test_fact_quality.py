@@ -1,0 +1,752 @@
+import csv
+import hashlib
+import io
+import json
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from datetime import date, timedelta
+from pathlib import Path
+
+from scripts.fact_quality import (
+    CEX_REQUIRED_COLUMNS,
+    DEX_REQUIRED_COLUMNS,
+    build_report,
+    main,
+)
+
+
+CEX_COLUMNS = [
+    "date",
+    "token_symbol",
+    "exchange",
+    "cex_symbol",
+    "open",
+    "high",
+    "low",
+    "close",
+    "base_volume",
+    "quote_volume_usd",
+]
+DEX_COLUMNS = [
+    "date",
+    "token_symbol",
+    "chain",
+    "dex",
+    "pool_address",
+    "pool_name",
+    "open",
+    "high",
+    "low",
+    "close",
+    "dex_volume_usd",
+    "pool_tvl_usd",
+]
+
+
+def cex_row(day, **overrides):
+    row = {
+        "date": day,
+        "token_symbol": "AAVE",
+        "exchange": "binance",
+        "cex_symbol": "AAVE/USDT",
+        "open": "100",
+        "high": "105",
+        "low": "95",
+        "close": "102",
+        "base_volume": "10",
+        "quote_volume_usd": "1020",
+    }
+    row.update(overrides)
+    return row
+
+
+def dex_row(day, **overrides):
+    row = {
+        "date": day,
+        "token_symbol": "AAVE",
+        "chain": "eth",
+        "dex": "uniswap_v3",
+        "pool_address": "0xAAVEPOOL",
+        "pool_name": "AAVE / WETH",
+        "open": "100",
+        "high": "105",
+        "low": "95",
+        "close": "101",
+        "dex_volume_usd": "500",
+        "pool_tvl_usd": "1000000",
+    }
+    row.update(overrides)
+    return row
+
+
+def write_csv(path, columns, rows):
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_attempt_ledger(
+    path,
+    *,
+    market_type,
+    source_csv,
+    attempts,
+    source_sha256=None,
+):
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "daily_collection_attempts/v1",
+                "collector": market_type,
+                "generated_at_utc": "2026-07-20T01:00:00+00:00",
+                "requested_window": {
+                    "start_date": attempts[0]["requested_start_date"],
+                    "end_date": attempts[0]["requested_end_date"],
+                },
+                "source_csv": source_csv.name,
+                "source_csv_sha256": (
+                    source_sha256
+                    if source_sha256 is not None
+                    else hashlib.sha256(source_csv.read_bytes()).hexdigest()
+                ),
+                "attempt_count": len(attempts),
+                "attempts": attempts,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def cex_attempt(day, **overrides):
+    row = {
+        "attempt_id": "attempt-cex",
+        "market_type": "cex",
+        "token_symbol": "AAVE",
+        "exchange": "binance",
+        "instrument": "AAVE/USDT",
+        "chain": None,
+        "dex": None,
+        "pool_address": None,
+        "requested_start_date": day,
+        "requested_end_date": day,
+        "observed_dates": [],
+        "observed_day_count": 0,
+        "status": "failed",
+        "outcome": "request_failed",
+        "reason_code": "rate_limit",
+        "http_status": 429,
+        "error": "The source rejected the request because its rate limit was reached.",
+        "finished_at_utc": "2026-07-20T00:30:00+00:00",
+    }
+    row.update(overrides)
+    return row
+
+
+def dex_attempt(day, **overrides):
+    row = {
+        "attempt_id": "attempt-dex",
+        "market_type": "dex",
+        "token_symbol": "AAVE",
+        "exchange": None,
+        "instrument": None,
+        "chain": "eth",
+        "dex": "uniswap_v3",
+        "pool_address": "0xaavepool",
+        "requested_start_date": day,
+        "requested_end_date": day,
+        "observed_dates": [],
+        "observed_day_count": 0,
+        "status": "no_data",
+        "outcome": "no_candles",
+        "reason_code": "no_candles",
+        "http_status": None,
+        "error": "The source returned no daily candles inside the requested window.",
+        "finished_at_utc": "2026-07-20T00:30:00+00:00",
+    }
+    row.update(overrides)
+    return row
+
+
+class FactQualityTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.cex_path = self.root / "cex.csv"
+        self.dex_path = self.root / "dex.csv"
+        write_csv(self.cex_path, CEX_COLUMNS, [])
+        write_csv(self.dex_path, DEX_COLUMNS, [])
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def report(self, *, today=date(2026, 7, 20)):
+        return build_report(self.cex_path, self.dex_path, today=today)
+
+    def test_required_column_sets_match_daily_contracts(self):
+        self.assertEqual(CEX_REQUIRED_COLUMNS, set(CEX_COLUMNS))
+        self.assertEqual(DEX_REQUIRED_COLUMNS, set(DEX_COLUMNS))
+
+    def test_lineage_matched_rate_limit_attempt_explains_d1_gap(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-16"),
+                cex_row("2026-07-17"),
+                cex_row("2026-07-18"),
+            ],
+        )
+        attempts_path = self.root / "cex-attempts.json"
+        write_attempt_ledger(
+            attempts_path,
+            market_type="cex",
+            source_csv=self.cex_path,
+            attempts=[cex_attempt("2026-07-19")],
+        )
+
+        report = build_report(
+            self.cex_path,
+            self.dex_path,
+            cex_attempts=attempts_path,
+            today=date(2026, 7, 20),
+        )
+
+        issue = next(
+            item
+            for item in report["issues"]
+            if item["category"] == "d1_active_gap"
+        )
+        self.assertEqual(issue["status"], "collection_failed")
+        self.assertEqual(issue["reason_code"], "rate_limit")
+        self.assertTrue(issue["retryable"])
+        self.assertEqual(
+            issue["details"]["collection_attempt"]["http_status"],
+            429,
+        )
+        self.assertEqual(report["attempt_sources"][0]["status"], "accepted")
+        self.assertEqual(
+            report["collection_attempt_summary"]["reason_code_counts"],
+            {"rate_limit": 1},
+        )
+
+    def test_stale_attempt_ledger_cannot_explain_a_gap(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-16"),
+                cex_row("2026-07-17"),
+                cex_row("2026-07-18"),
+            ],
+        )
+        attempts_path = self.root / "cex-attempts.json"
+        write_attempt_ledger(
+            attempts_path,
+            market_type="cex",
+            source_csv=self.cex_path,
+            source_sha256="0" * 64,
+            attempts=[cex_attempt("2026-07-19")],
+        )
+
+        report = build_report(
+            self.cex_path,
+            self.dex_path,
+            cex_attempts=attempts_path,
+            today=date(2026, 7, 20),
+        )
+
+        issue = next(
+            item
+            for item in report["issues"]
+            if item["category"] == "d1_active_gap"
+        )
+        self.assertEqual(issue["reason_code"], "missing_unexplained")
+        self.assertEqual(
+            report["attempt_sources"][0]["status"],
+            "ignored_stale",
+        )
+
+    def test_not_listed_attempt_is_non_retryable_manual_review(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-16"),
+                cex_row("2026-07-17"),
+                cex_row("2026-07-18"),
+            ],
+        )
+        attempts_path = self.root / "cex-attempts.json"
+        write_attempt_ledger(
+            attempts_path,
+            market_type="cex",
+            source_csv=self.cex_path,
+            attempts=[
+                cex_attempt(
+                    "2026-07-19",
+                    status="failed",
+                    reason_code="not_listed",
+                    http_status=404,
+                    error=(
+                        "The source reported that the requested market was unavailable."
+                    ),
+                )
+            ],
+        )
+
+        report = build_report(
+            self.cex_path,
+            self.dex_path,
+            cex_attempts=attempts_path,
+            today=date(2026, 7, 20),
+        )
+
+        issue = next(
+            item
+            for item in report["issues"]
+            if item["category"] == "d1_active_gap"
+        )
+        self.assertEqual(issue["status"], "needs_review")
+        self.assertFalse(issue["retryable"])
+        self.assertEqual(report["retry_windows_by_token"], {})
+        self.assertEqual(report["summary"]["manual_review_count"], 1)
+
+    def test_source_range_unavailable_is_not_a_network_failure(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-16"),
+                cex_row("2026-07-17"),
+                cex_row("2026-07-18"),
+            ],
+        )
+        attempts_path = self.root / "cex-attempts.json"
+        write_attempt_ledger(
+            attempts_path,
+            market_type="cex",
+            source_csv=self.cex_path,
+            attempts=[
+                cex_attempt(
+                    "2026-07-19",
+                    status="unsupported",
+                    outcome="range_unavailable",
+                    reason_code="source_range_unavailable",
+                    http_status=None,
+                    error=(
+                        "The source endpoint cannot reach the requested date window."
+                    ),
+                )
+            ],
+        )
+
+        report = build_report(
+            self.cex_path,
+            self.dex_path,
+            cex_attempts=attempts_path,
+            today=date(2026, 7, 20),
+        )
+
+        issue = next(
+            item
+            for item in report["issues"]
+            if item["category"] == "d1_active_gap"
+        )
+        self.assertEqual(issue["status"], "needs_review")
+        self.assertEqual(
+            issue["reason_code"],
+            "source_range_unavailable",
+        )
+        self.assertFalse(issue["retryable"])
+        self.assertEqual(report["retry_windows_by_token"], {})
+
+    def test_dex_no_candles_attempt_explains_historical_gap(self):
+        write_csv(
+            self.dex_path,
+            DEX_COLUMNS,
+            [
+                dex_row("2026-07-06"),
+                dex_row("2026-07-08"),
+            ],
+        )
+        attempts_path = self.root / "dex-attempts.json"
+        write_attempt_ledger(
+            attempts_path,
+            market_type="dex",
+            source_csv=self.dex_path,
+            attempts=[dex_attempt("2026-07-07")],
+        )
+
+        report = build_report(
+            self.cex_path,
+            self.dex_path,
+            dex_attempts=attempts_path,
+            today=date(2026, 7, 20),
+        )
+
+        issue = next(
+            item
+            for item in report["issues"]
+            if item["category"] == "historical_gap"
+        )
+        self.assertEqual(issue["status"], "source_no_observation")
+        self.assertEqual(issue["reason_code"], "no_candles")
+        self.assertFalse(issue["retryable"])
+        self.assertEqual(report["retry_windows_by_token"], {})
+
+    def test_aave_three_day_historical_gap_is_explicit_and_retryable(self):
+        rows = [
+            dex_row("2026-07-06"),
+            dex_row("2026-07-07"),
+            dex_row("2026-07-11"),
+            dex_row("2026-07-12"),
+        ]
+        write_csv(self.dex_path, DEX_COLUMNS, rows)
+
+        report = self.report()
+        gaps = [
+            issue
+            for issue in report["issues"]
+            if issue["category"] == "historical_gap"
+        ]
+
+        self.assertEqual(
+            [issue["date"] for issue in gaps],
+            ["2026-07-08", "2026-07-09", "2026-07-10"],
+        )
+        self.assertTrue(all(issue["status"] == "backfill_pending" for issue in gaps))
+        self.assertTrue(all(issue["retryable"] is True for issue in gaps))
+        self.assertEqual(report["summary"]["historical_gap_count"], 3)
+        self.assertIn("api.geckoterminal.com", gaps[0]["source_url_hints"][0])
+
+    def test_dates_before_first_observation_are_not_prelisting_gaps(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-05"),
+                cex_row("2026-07-06"),
+                cex_row("2026-07-07"),
+            ],
+        )
+
+        report = self.report()
+
+        self.assertEqual(report["summary"]["historical_gap_count"], 0)
+        market = report["markets"][0]
+        self.assertEqual(market["first_observed_date"], "2026-07-05")
+        self.assertEqual(market["historical_gap_count"], 0)
+
+    def test_current_and_future_dates_are_hard_invalid_and_excluded_from_gap_range(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-19"),
+                cex_row("2026-07-20"),
+                cex_row("9999-12-31"),
+            ],
+        )
+
+        report = self.report(today=date(2026, 7, 20))
+        future_issues = [
+            issue
+            for issue in report["issues"]
+            if issue["reason_code"] == "incomplete_or_future_date"
+        ]
+
+        self.assertEqual(
+            [issue["date"] for issue in future_issues],
+            ["2026-07-20", "9999-12-31"],
+        )
+        self.assertTrue(
+            all(
+                issue["category"] == "hard_invalid"
+                and issue["retryable"] is False
+                for issue in future_issues
+            )
+        )
+        self.assertEqual(report["summary"]["historical_gap_count"], 0)
+        self.assertEqual(report["markets"][0]["first_observed_date"], "2026-07-19")
+        self.assertEqual(report["markets"][0]["last_observed_date"], "2026-07-19")
+
+    def test_negative_and_non_finite_pool_tvl_are_hard_invalid(self):
+        write_csv(
+            self.dex_path,
+            DEX_COLUMNS,
+            [
+                dex_row("2026-07-18", pool_tvl_usd="-1"),
+                dex_row("2026-07-19", pool_tvl_usd="NaN"),
+            ],
+        )
+
+        report = self.report(today=date(2026, 7, 20))
+        tvl_issues = [
+            issue
+            for issue in report["issues"]
+            if issue["reason_code"] == "invalid_non_negative_pool_tvl"
+        ]
+
+        self.assertEqual(len(tvl_issues), 2)
+        self.assertEqual(
+            [
+                issue["details"]["observed_values"]["pool_tvl_usd"]
+                for issue in tvl_issues
+            ],
+            ["-1", "NaN"],
+        )
+        self.assertTrue(
+            all(
+                issue["category"] == "hard_invalid"
+                and issue["retryable"] is False
+                for issue in tvl_issues
+            )
+        )
+
+    def test_hard_invalid_values_and_duplicate_keys_enter_manual_review(self):
+        invalid = cex_row(
+            "2026-07-05",
+            open="-1",
+            high="90",
+            low="110",
+            close="100",
+            quote_volume_usd="-5",
+        )
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [invalid, dict(invalid)],
+        )
+
+        report = self.report()
+        reason_codes = {
+            issue["reason_code"]
+            for issue in report["issues"]
+            if issue["category"] == "hard_invalid"
+        }
+
+        self.assertIn("invalid_positive_ohlc", reason_codes)
+        self.assertIn("invalid_non_negative_volume", reason_codes)
+        self.assertIn("duplicate_primary_key", reason_codes)
+        self.assertGreaterEqual(report["summary"]["hard_invalid_count"], 3)
+        self.assertEqual(
+            report["summary"]["manual_review_count"],
+            report["summary"]["hard_invalid_count"],
+        )
+        self.assertTrue(
+            all(
+                item["review_status"] == "pending"
+                for item in report["manual_review_queue"]
+            )
+        )
+        self.assertTrue(
+            all(
+                item["source_url_hints"]
+                for item in report["manual_review_queue"]
+            )
+        )
+
+    def test_inconsistent_high_low_is_a_separate_hard_error(self):
+        write_csv(
+            self.dex_path,
+            DEX_COLUMNS,
+            [
+                dex_row(
+                    "2026-07-05",
+                    open="100",
+                    high="99",
+                    low="101",
+                    close="100",
+                )
+            ],
+        )
+
+        report = self.report()
+
+        issue = next(
+            issue
+            for issue in report["issues"]
+            if issue["reason_code"] == "inconsistent_ohlc_bounds"
+        )
+        self.assertEqual(issue["status"], "invalid")
+        self.assertFalse(issue["retryable"])
+
+    def test_d1_gap_requires_an_active_market_and_is_separate(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-03"),
+                cex_row("2026-07-04"),
+                cex_row("2026-07-05"),
+                cex_row("2026-07-06"),
+                cex_row("2026-07-07"),
+                cex_row("2026-07-08"),
+            ],
+        )
+
+        report = self.report(today=date(2026, 7, 10))
+        d1 = [
+            issue
+            for issue in report["issues"]
+            if issue["category"] == "d1_active_gap"
+        ]
+
+        self.assertEqual(len(d1), 1)
+        self.assertEqual(d1[0]["date"], "2026-07-09")
+        self.assertEqual(d1[0]["reason_code"], "missing_unexplained")
+        self.assertTrue(d1[0]["retryable"])
+        self.assertEqual(report["summary"]["d1_active_gap_count"], 1)
+
+        still_unresolved = self.report(today=date(2026, 8, 10))
+        stale = [
+            issue
+            for issue in still_unresolved["issues"]
+            if issue["category"] == "stale_market_unknown"
+        ]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0]["date"], "2026-08-09")
+        self.assertEqual(
+            stale[0]["reason_code"],
+            "stale_market_lifecycle_unknown",
+        )
+        self.assertFalse(stale[0]["retryable"])
+        self.assertEqual(
+            still_unresolved["markets"][0]["stale_market_unknown"],
+            True,
+        )
+
+    def test_stale_market_moves_to_manual_review_instead_of_disappearing(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-21"),
+                cex_row("2026-07-22"),
+                cex_row("2026-07-23"),
+            ],
+        )
+
+        report = self.report(today=date(2026, 7, 29))
+        stale = next(
+            issue
+            for issue in report["issues"]
+            if issue["category"] == "stale_market_unknown"
+        )
+
+        self.assertFalse(stale["retryable"])
+        self.assertEqual(report["retry_windows_by_token"], {})
+        self.assertEqual(
+            report["manual_review_queue"][0]["reason_code"],
+            "stale_market_lifecycle_unknown",
+        )
+
+    def test_recently_active_trailing_days_remain_one_retry_window(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-23"),
+                cex_row("2026-07-24"),
+                cex_row("2026-07-25"),
+            ],
+        )
+
+        report = self.report(today=date(2026, 7, 29))
+        window = report["retry_windows_by_token"]["AAVE"][0]
+
+        self.assertEqual(window["start_date"], "2026-07-26")
+        self.assertEqual(window["end_date"], "2026-07-28")
+        self.assertEqual(window["day_count"], 3)
+        self.assertEqual(window["reason_codes"], ["missing_unexplained"])
+
+    def test_retry_windows_are_per_token_contiguous_and_never_exceed_180_days(self):
+        start = date(2025, 1, 1)
+        end = date(2026, 1, 1)
+        write_csv(
+            self.dex_path,
+            DEX_COLUMNS,
+            [
+                dex_row(start.isoformat()),
+                dex_row(end.isoformat()),
+            ],
+        )
+
+        report = self.report(today=date(2026, 2, 1))
+        windows = report["retry_windows_by_token"]["AAVE"]
+
+        self.assertGreaterEqual(len(windows), 2)
+        self.assertTrue(all(window["day_count"] <= 180 for window in windows))
+        self.assertEqual(windows[0]["start_date"], (start + timedelta(days=1)).isoformat())
+        self.assertEqual(windows[-1]["end_date"], (end - timedelta(days=1)).isoformat())
+        self.assertTrue(
+            all(window["reason_codes"] == ["missing_unexplained"] for window in windows)
+        )
+
+    def test_cli_emits_json_and_optional_failure_gates(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-05", close="NaN"),
+            ],
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--cex-csv",
+                    str(self.cex_path),
+                    "--dex-csv",
+                    str(self.dex_path),
+                    "--today",
+                    "2026-07-20",
+                    "--fail-on-hard",
+                ]
+            )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["schema"], "fact_quality_report/v1")
+        self.assertGreater(payload["summary"]["hard_invalid_count"], 0)
+
+    def test_cli_can_fail_specifically_on_d1_active_gap(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-03"),
+                cex_row("2026-07-04"),
+                cex_row("2026-07-05"),
+                cex_row("2026-07-06"),
+                cex_row("2026-07-07"),
+                cex_row("2026-07-08"),
+            ],
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--cex-csv",
+                    str(self.cex_path),
+                    "--dex-csv",
+                    str(self.dex_path),
+                    "--today",
+                    "2026-07-10",
+                    "--fail-on-d1",
+                ]
+            )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["summary"]["hard_invalid_count"], 0)
+        self.assertEqual(payload["summary"]["d1_active_gap_count"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

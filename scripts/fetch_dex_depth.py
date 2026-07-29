@@ -2297,6 +2297,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT)
     parser.add_argument("--publish-local", action="store_true")
+    parser.add_argument(
+        "--publish-dir",
+        type=Path,
+        help="Explicit runtime directory for an atomic publication",
+    )
     parser.add_argument("--sleep-seconds", type=float, default=REQUEST_SLEEP_SECONDS)
     parser.add_argument("--tokens", help="Comma-separated token symbols")
     parser.add_argument("--chains", help="Comma-separated chain names")
@@ -2325,7 +2330,12 @@ def main() -> None:
     pools = load_pool_inventory(args.tvl_csv)
     tokens = parse_filter(args.tokens, upper=True)
     chains = parse_filter(args.chains, upper=False)
-    ensure_full_publish_scope(args.publish_local, tokens, chains)
+    publish_dir = (
+        args.publish_dir
+        if args.publish_dir is not None
+        else DEFAULT_PUBLISH_DIR if args.publish_local else None
+    )
+    ensure_full_publish_scope(publish_dir is not None, tokens, chains)
     if tokens:
         pools = [row for row in pools if row["token_symbol"].upper() in tokens]
     if chains:
@@ -2338,7 +2348,6 @@ def main() -> None:
         raw_root=args.raw_root,
         sleep_seconds=max(0.0, args.sleep_seconds),
     )
-    publish_dir = DEFAULT_PUBLISH_DIR if args.publish_local else None
     publication_gates = (
         preflight_publication_bundle(rows, execution_rows, publish_dir)
         if publish_dir is not None

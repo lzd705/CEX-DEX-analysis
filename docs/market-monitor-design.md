@@ -8,8 +8,9 @@
    `Markets`, `Compare`, `Liquidity & Execution`, `Events`, and `Data Quality`.
 3. Market A and Market B are exact market IDs for the selected Token and remain
    in the URL while the user moves between those pages.
-4. `Methodology` is the shared definition layer; Data Quality reports the
-   current status and lineage of one Token's actual markets.
+4. Shared definitions, source lineage, and snapshot timing live in the
+   `Data Quality` page as a compact disclosure; there is no separate
+   Methodology page.
 
 The workspace separates discovery, comparison, executable-liquidity analysis,
 event timing, and evidence without losing the selected Token or market pair.
@@ -29,7 +30,9 @@ collection cadence.
 - `Events` lists the latest verified revision of matching Event Facts,
   lifecycle, timing precision, size/market identity, evidence, and source.
 - `Data Quality` explains coverage, freshness, missing/unsupported facts,
-  warnings, and lineage for the current Token and A/B pair.
+  warnings, recovery eligibility, and lineage for the current Token and A/B
+  pair. Capability limits and observed market conditions are kept separate
+  from collection or validation failures.
 
 ## Spread placement
 

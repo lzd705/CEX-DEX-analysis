@@ -181,42 +181,133 @@ console.log(JSON.stringify(navigation.validatePair(
             [error["code"] for error in result["errors"]],
         )
 
-    def test_screener_and_methodology_routes_round_trip(self):
+    def test_screener_sort_scope_direction_and_dates_round_trip(self):
         result = run_navigation_javascript(
             """
 const screenerPath = navigation.buildScreenerPath({
   q: "AAVE/ETH",
   scope: "dex",
-  sort: "spread",
+  sort: "return",
+  dir: "asc",
   status: "warning",
   start: "2026-07-01",
   end: "2026-07-28",
 });
 const screenerUrl = new URL(screenerPath, "https://example.test");
-const methodologyPath = navigation.buildMethodologyPath("execution/cost:v1");
-const methodologyUrl = new URL(methodologyPath, "https://example.test");
 console.log(JSON.stringify({
   screenerPath,
   screener: navigation.parseRoute(screenerUrl.pathname, screenerUrl.search),
-  methodologyPath,
-  methodology: navigation.parseRoute(
-    methodologyUrl.pathname,
-    methodologyUrl.search,
-  ),
 }));
 """
         )
         self.assertEqual(result["screener"]["filters"]["q"], "AAVE/ETH")
         self.assertEqual(result["screener"]["filters"]["scope"], "dex")
-        self.assertEqual(result["screener"]["filters"]["sort"], "spread")
+        self.assertEqual(result["screener"]["filters"]["sort"], "return")
+        self.assertEqual(result["screener"]["filters"]["dir"], "asc")
         self.assertNotIn("status", result["screener"]["filters"])
         self.assertNotIn("status=", result["screenerPath"])
         self.assertEqual(result["screener"]["filters"]["start"], "2026-07-01")
         self.assertEqual(result["screener"]["filters"]["end"], "2026-07-28")
-        self.assertEqual(
-            result["methodology"]["anchor"],
-            "execution/cost:v1",
+
+    def test_screener_rejects_unknown_sort_scope_direction_and_malformed_dates(self):
+        result = run_navigation_javascript(
+            """
+const parsed = navigation.parseRoute(
+  "/screener",
+  "?sort=profit&scope=all-venues&dir=sideways"
+    + "&start=2026-7-01&end=not-a-date&unknown=retained",
+);
+const built = navigation.buildScreenerPath({
+  sort: "profit",
+  scope: "all-venues",
+  dir: "sideways",
+  start: "2026-7-01",
+  end: "not-a-date",
+});
+console.log(JSON.stringify({ parsed, built }));
+"""
         )
+        self.assertEqual(result["parsed"], {"kind": "screener", "filters": {}})
+        self.assertEqual(result["built"], "/screener")
+
+    def test_routes_reject_impossible_calendar_dates_and_keep_real_leap_days(self):
+        result = run_navigation_javascript(
+            """
+const invalidScreener = navigation.parseRoute(
+  "/screener",
+  "?start=2026-02-29&end=2026-04-31",
+);
+const invalidWorkspace = navigation.parseRoute(
+  "/tokens/AAVE/markets",
+  "?start=2026-02-31&end=2026-13-01",
+);
+const invalidBuilt = navigation.buildWorkspacePath("AAVE", "markets", {
+  start: "2026-02-29",
+  end: "2026-04-31",
+});
+const leapBuilt = navigation.buildScreenerPath({
+  start: "2024-02-29",
+  end: "2024-03-01",
+});
+const leapUrl = new URL(leapBuilt, "https://example.test");
+console.log(JSON.stringify({
+  invalidScreener,
+  invalidWorkspace,
+  invalidBuilt,
+  leapBuilt,
+  leapParsed: navigation.parseRoute(leapUrl.pathname, leapUrl.search),
+}));
+"""
+        )
+        self.assertEqual(result["invalidScreener"]["filters"], {})
+        self.assertEqual(result["invalidWorkspace"]["state"], {})
+        self.assertEqual(result["invalidBuilt"], "/tokens/AAVE/markets")
+        self.assertIn("start=2024-02-29", result["leapBuilt"])
+        self.assertEqual(
+            result["leapParsed"]["filters"],
+            {"start": "2024-02-29", "end": "2024-03-01"},
+        )
+
+    def test_screener_normalizes_metric_scope_combinations(self):
+        result = run_navigation_javascript(
+            """
+const cases = {
+  spread: navigation.parseRoute("/screener", "?sort=spread&scope=cex"),
+  return: navigation.parseRoute("/screener", "?sort=return&scope=combined"),
+  volatility: navigation.parseRoute(
+    "/screener",
+    "?sort=volatility&scope=combined",
+  ),
+  dexTvl: navigation.parseRoute("/screener", "?sort=dex_tvl&scope=cex"),
+};
+console.log(JSON.stringify(cases));
+"""
+        )
+        self.assertEqual(result["spread"]["filters"]["sort"], "spread")
+        self.assertEqual(result["spread"]["filters"]["scope"], "cross")
+        self.assertEqual(result["return"]["filters"]["scope"], "cex")
+        self.assertEqual(result["volatility"]["filters"]["scope"], "cex")
+        self.assertEqual(result["dexTvl"]["filters"]["scope"], "dex")
+
+    def test_removed_methodology_urls_soft_route_to_screener(self):
+        result = run_navigation_javascript(
+            """
+const root = navigation.parseRoute("/methodology", "");
+const anchored = navigation.parseRoute("/methodology/execution-cost", "");
+console.log(JSON.stringify({
+  root,
+  anchored,
+  rootCanonical: navigation.buildScreenerPath(root.filters),
+  anchoredCanonical: navigation.buildScreenerPath(anchored.filters),
+  methodologyBuilderType: typeof navigation.buildMethodologyPath,
+}));
+"""
+        )
+        for route_name in ("root", "anchored"):
+            self.assertEqual(result[route_name]["kind"], "screener")
+            self.assertTrue(result[route_name]["legacyMethodologyPath"])
+            self.assertEqual(result[f"{route_name}Canonical"], "/screener")
+        self.assertEqual(result["methodologyBuilderType"], "undefined")
 
     def test_unknown_token_is_parsed_but_unknown_routes_are_rejected(self):
         result = run_navigation_javascript(

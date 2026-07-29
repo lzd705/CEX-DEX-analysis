@@ -12,13 +12,17 @@ This first version is intentionally simple:
 
 import argparse
 import csv
+import hashlib
 import json
 import ssl
 import time
 import urllib.parse
 import urllib.request
 import urllib.error
+import os
+from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 
@@ -27,6 +31,23 @@ try:
 except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
+try:
+    from scripts.token_registry import (
+        DEFAULT_REGISTRY_PATH,
+        TokenRegistry,
+        TokenRegistryError,
+        normalize_chain,
+        normalize_contract_address,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from token_registry import (
+        DEFAULT_REGISTRY_PATH,
+        TokenRegistry,
+        TokenRegistryError,
+        normalize_chain,
+        normalize_contract_address,
+    )
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TOKEN_CONFIG_PATH = PROJECT_ROOT / "config/tokens.csv"
@@ -34,10 +55,15 @@ TOKEN_CHAIN_CONFIG_PATH = PROJECT_ROOT / "config/token_chains.csv"
 DEX_POOLS_OUTPUT_PATH = PROJECT_ROOT / "data/processed/dex_pools.csv"
 DEX_POOL_VOLUME_OUTPUT_PATH = PROJECT_ROOT / "data/processed/dex_pool_volume_daily.csv"
 DEX_VOLUME_OUTPUT_PATH = PROJECT_ROOT / "data/processed/dex_volume_daily.csv"
+ATTEMPT_OUTPUT_PATH = (
+    PROJECT_ROOT / "data/processed/dex_daily_collection_attempts.json"
+)
+ATTEMPT_SCHEMA = "daily_collection_attempts/v1"
 TVL_LATEST_PATH = PROJECT_ROOT / "data/local/dex_pool_tvl_latest.csv"
 
 GECKOTERMINAL_BASE_URL = "https://api.geckoterminal.com/api/v2"
 LIMIT_DAYS = 180
+MAX_REFRESH_WINDOW_DAYS = 180
 REQUEST_SLEEP_SECONDS = 15.0
 INCREMENTAL_POOL_SLEEP_SECONDS = 13.0
 MAX_RETRIES = 3
@@ -45,6 +71,233 @@ MIN_HISTORY_DAYS = 120
 MAX_POOL_CANDIDATES = 8
 TOP_POOL_COUNT = 5
 TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where()) if certifi else ssl.create_default_context()
+
+ATTEMPT_ERROR_MESSAGES = {
+    "network": "The source request could not reach the remote service.",
+    "rate_limit": "The source rejected the request because its rate limit was reached.",
+    "source_unavailable": "The remote source was temporarily unavailable.",
+    "not_listed": "The source reported that the requested Token or pool was unavailable.",
+    "parse": "The source response could not be decoded into the expected format.",
+    "validation": "The source response did not satisfy the collector contract.",
+}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _exception_chain(error):
+    current = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def classify_attempt_error(error):
+    """Return a bounded reason without retaining URLs, payloads, or local paths."""
+    chain = list(_exception_chain(error))
+    http_status = next(
+        (
+            int(candidate.code)
+            for candidate in chain
+            if isinstance(getattr(candidate, "code", None), int)
+            and 100 <= int(candidate.code) <= 599
+        ),
+        None,
+    )
+    lowered = " ".join(str(candidate).lower() for candidate in chain)
+    if http_status == 429 or "rate limit" in lowered or "too many requests" in lowered:
+        reason = "rate_limit"
+    elif http_status is not None and http_status >= 500:
+        reason = "source_unavailable"
+    elif http_status == 404 or any(
+        marker in lowered
+        for marker in (
+            "not found",
+            "invalid token",
+            "invalid pool",
+            "does not exist",
+        )
+    ):
+        reason = "not_listed"
+    elif any(
+        isinstance(candidate, (urllib.error.URLError, TimeoutError))
+        for candidate in chain
+    ):
+        reason = "network"
+    elif any(
+        isinstance(candidate, (json.JSONDecodeError, UnicodeDecodeError))
+        for candidate in chain
+    ):
+        reason = "parse"
+    elif http_status in {400, 409, 422} or any(
+        isinstance(candidate, (KeyError, IndexError, TypeError, ValueError))
+        for candidate in chain
+    ):
+        reason = "validation"
+    else:
+        reason = "source_unavailable"
+    return {
+        "reason_code": reason,
+        "http_status": http_status,
+        "error": ATTEMPT_ERROR_MESSAGES[reason],
+    }
+
+
+def _window_dates(start_date, end_date):
+    if not start_date or not end_date:
+        return None
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    if end < start:
+        raise ValueError("end_date must not precede start_date")
+    return {
+        (start + timedelta(days=offset)).isoformat()
+        for offset in range((end - start).days + 1)
+    }
+
+
+def dex_attempt_record(
+    token_symbol,
+    chain,
+    dex,
+    pool_address,
+    *,
+    rows=None,
+    error=None,
+    start_date=None,
+    end_date=None,
+):
+    observed_dates = sorted(
+        {
+            str(row.get("date") or "")
+            for row in (rows or [])
+            if row.get("date")
+            and (start_date is None or row["date"] >= start_date)
+            and (end_date is None or row["date"] <= end_date)
+        }
+    )
+    expected_dates = _window_dates(start_date, end_date)
+    if error is not None:
+        classified = classify_attempt_error(error)
+        status = "failed"
+        outcome = "request_failed"
+    elif not observed_dates:
+        classified = {
+            "reason_code": "no_candles",
+            "http_status": None,
+            "error": (
+                "The source returned no daily candles inside the requested window."
+            ),
+        }
+        status = "no_data"
+        outcome = "no_candles"
+    elif expected_dates is not None and not expected_dates.issubset(
+        set(observed_dates)
+    ):
+        classified = {
+            "reason_code": "no_candles",
+            "http_status": None,
+            "error": (
+                "The source returned only part of the requested daily-candle window."
+            ),
+        }
+        status = "partial"
+        outcome = "partial_observation"
+    else:
+        classified = {
+            "reason_code": "observed",
+            "http_status": None,
+            "error": None,
+        }
+        status = "succeeded"
+        outcome = "observed"
+    address = str(pool_address or "").strip()
+    if address.startswith("0x"):
+        address = address.lower()
+    identity = {
+        "market_type": "dex",
+        "token_symbol": str(token_symbol).strip().upper(),
+        "exchange": None,
+        "instrument": None,
+        "chain": str(chain or "").strip().lower() or None,
+        "dex": str(dex or "").strip().lower() or None,
+        "pool_address": address or None,
+    }
+    id_material = {
+        **identity,
+        "requested_start_date": start_date,
+        "requested_end_date": end_date,
+        "status": status,
+        "reason_code": classified["reason_code"],
+    }
+    return {
+        "attempt_id": hashlib.sha256(
+            json.dumps(
+                id_material,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20],
+        **identity,
+        "requested_start_date": start_date,
+        "requested_end_date": end_date,
+        "observed_dates": observed_dates,
+        "observed_day_count": len(observed_dates),
+        "status": status,
+        "outcome": outcome,
+        **classified,
+        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def write_attempt_ledger(
+    path: Path,
+    attempts,
+    *,
+    source_csv: Path,
+    start_date=None,
+    end_date=None,
+):
+    payload = {
+        "schema": ATTEMPT_SCHEMA,
+        "collector": "dex",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "requested_window": {
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+        "source_csv": source_csv.name,
+        "source_csv_sha256": sha256_file(source_csv),
+        "attempt_count": len(attempts),
+        "attempts": sorted(
+            attempts,
+            key=lambda item: (
+                item["token_symbol"],
+                item.get("chain") or "",
+                item.get("pool_address") or "",
+                item["attempt_id"],
+            ),
+        ),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(".{}.tmp".format(path.name))
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(str(temporary), str(path))
+    finally:
+        temporary.unlink(missing_ok=True)
+    return payload
 
 
 def safe_float(value) -> float:
@@ -91,17 +344,40 @@ def get_status_code(error):
     return None
 
 
-def get_token_side(pool, chain: str, contract_address: str) -> str:
-    """Return base or quote, depending on where the target token is in the pool."""
-    target_id = (chain + "_" + contract_address).lower()
+def normalized_address_identity(chain: str, contract_address: str):
+    """Return a chain-aware address identity used for exact comparisons."""
+    normalized_chain = normalize_chain(chain)
+    return (
+        normalized_chain,
+        normalize_contract_address(normalized_chain, contract_address),
+    )
 
-    if pool.get("base_token_id", "").lower() == target_id:
+
+def token_id_identity(token_id):
+    """Parse and normalize a GeckoTerminal Token id for safe comparison."""
+    source_chain, separator, source_address = str(token_id or "").partition("_")
+    if not separator:
+        return None
+    try:
+        return normalized_address_identity(source_chain, source_address)
+    except TokenRegistryError:
+        return None
+
+
+def get_token_side(pool, chain: str, contract_address: str) -> str:
+    """Return the exact base/quote side for one chain-aware Token identity."""
+    target_identity = normalized_address_identity(chain, contract_address)
+
+    if token_id_identity(pool.get("base_token_id")) == target_identity:
         return "base"
 
-    if pool.get("quote_token_id", "").lower() == target_id:
+    if token_id_identity(pool.get("quote_token_id")) == target_identity:
         return "quote"
 
-    return "base"
+    raise ValueError(
+        "pool_token_mismatch: target %s is neither base_token_id nor quote_token_id"
+        % ("%s_%s" % target_identity)
+    )
 
 
 def sort_pools_by_volume(pools):
@@ -153,6 +429,115 @@ def read_token_config(path: Path):
         rows = list(reader)
 
     return rows
+
+
+def runtime_registry_path() -> Path:
+    """Return the runtime registry path without modifying reviewed CSV config."""
+    configured = os.environ.get("TOKEN_REGISTRY_PATH")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    data_dir = os.environ.get("MARKET_DATA_DIR")
+    if data_dir:
+        return (
+            Path(data_dir).expanduser().resolve()
+            / "admin/token_registry.json"
+        )
+    return DEFAULT_REGISTRY_PATH
+
+
+def merge_runtime_token_config(token_rows, chain_rows, token_symbols=None):
+    """Append active runtime identities plus one explicitly authorized pending job."""
+    onboarding_job_id = os.environ.get("TOKEN_ONBOARDING_JOB_ID", "").strip()
+    requested_symbol_list = [
+        str(token_symbol or "").strip().upper()
+        for token_symbol in (token_symbols or [])
+        if str(token_symbol or "").strip()
+    ]
+    requested_symbols = set(requested_symbol_list)
+    if onboarding_job_id and len(requested_symbol_list) != 1:
+        raise ValueError(
+            "TOKEN_ONBOARDING_JOB_ID requires exactly one requested Token"
+        )
+
+    statuses = {"active", "pending"} if onboarding_job_id else {"active"}
+    records = TokenRegistry(runtime_registry_path()).list_records(statuses=statuses)
+    if onboarding_job_id:
+        pending_matches = [
+            record
+            for record in records
+            if record.get("status") == "pending"
+            and record.get("token_symbol") in requested_symbols
+            and record.get("last_job_id") == onboarding_job_id
+        ]
+        if len(pending_matches) != 1:
+            raise ValueError(
+                "TOKEN_ONBOARDING_JOB_ID does not match the requested pending Token"
+            )
+        records = [
+            record
+            for record in records
+            if record.get("status") == "active"
+        ] + pending_matches
+    else:
+        records = [
+            record
+            for record in records
+            if record.get("status") == "active"
+        ]
+
+    merged_tokens = list(token_rows)
+    merged_chains = list(chain_rows)
+    existing_symbols = {
+        row.get("token_symbol", "").strip().upper()
+        for row in token_rows
+    }
+    existing_identities = {
+        (
+            row.get("token_symbol", "").strip().upper(),
+            *normalized_address_identity(
+                row.get("chain", ""),
+                row.get("contract_address", ""),
+            ),
+        )
+        for row in chain_rows
+    }
+    for record in records:
+        symbol = record["token_symbol"]
+        if symbol not in existing_symbols:
+            merged_tokens.append(
+                {
+                    "token_symbol": symbol,
+                    "coingecko_id": record.get("coingecko_id") or "",
+                    "chain": record["chain"],
+                    "contract_address": record["contract_address"],
+                    "cex_symbol": "",
+                    "primary_cex": "",
+                    "secondary_cex": "",
+                    "dex_source": "geckoterminal",
+                    "primary_dex": "",
+                    "pool_address": "",
+                    "notes": "runtime registry DEX-only Token",
+                }
+            )
+            existing_symbols.add(symbol)
+        identity = (
+            symbol,
+            *normalized_address_identity(
+                record["chain"],
+                record["contract_address"],
+            ),
+        )
+        if identity not in existing_identities:
+            merged_chains.append(
+                {
+                    "token_symbol": symbol,
+                    "chain": record["chain"],
+                    "contract_address": record["contract_address"],
+                    "notes": "runtime registry canonical identity",
+                }
+            )
+            existing_identities.add(identity)
+    return merged_tokens, merged_chains
 
 
 def filter_token_rows(rows, token_symbols):
@@ -294,11 +679,18 @@ def load_existing_pool_inventory(
             unresolved_tokens.add(token_symbol)
             continue
 
-        target_id = ("%s_%s" % (chain, contract_address)).lower()
         base_token_id = tvl.get("base_token_id", "")
         quote_token_id = tvl.get("quote_token_id", "")
-        token_ids = {base_token_id.lower(), quote_token_id.lower()}
-        if target_id not in token_ids:
+        try:
+            ohlcv_token = get_token_side(
+                {
+                    "base_token_id": base_token_id,
+                    "quote_token_id": quote_token_id,
+                },
+                chain,
+                contract_address,
+            )
+        except ValueError:
             invalid_pool_keys.add(key)
             continue
 
@@ -312,7 +704,7 @@ def load_existing_pool_inventory(
             "pool_name": tvl.get("source_pool_name") or daily.get("pool_name", ""),
             "pool_tvl_usd": optional_float(tvl.get("tvl_usd")),
             "volume_24h_usd": optional_float(tvl.get("volume_24h_usd")),
-            "ohlcv_token": "base" if base_token_id.lower() == target_id else "quote",
+            "ohlcv_token": ohlcv_token,
             "base_token_id": base_token_id,
             "quote_token_id": quote_token_id,
         }
@@ -483,7 +875,7 @@ def find_main_pool(token):
     return pool
 
 
-def find_pool_with_ohlcv(token):
+def find_pool_with_ohlcv(token, start_date=None, end_date=None):
     """Find a pool with enough daily OHLCV history."""
     chain = token["chain"]
     contract_address = token["contract_address"]
@@ -509,7 +901,7 @@ def find_pool_with_ohlcv(token):
         pool["ohlcv_token"] = get_token_side(pool, chain, contract_address)
 
         try:
-            ohlcv_list = fetch_pool_ohlcv(pool)
+            ohlcv_list = fetch_pool_ohlcv(pool, start_date, end_date)
         except Exception as error:
             print("Candidate failed %s: %s" % (pool["pool_name"], error))
             time.sleep(REQUEST_SLEEP_SECONDS)
@@ -537,7 +929,13 @@ def find_pool_with_ohlcv(token):
     return fallback_pool, fallback_ohlcv_list
 
 
-def find_top_pools_with_ohlcv(token, chain_rows):
+def find_top_pools_with_ohlcv(
+    token,
+    chain_rows,
+    attempt_errors=None,
+    start_date=None,
+    end_date=None,
+):
     """Find global top pools with enough daily OHLCV history for one token."""
     candidates = []
 
@@ -545,6 +943,8 @@ def find_top_pools_with_ohlcv(token, chain_rows):
         try:
             chain_candidates = fetch_pool_candidates_for_chain(chain_row)
         except Exception as error:
+            if attempt_errors is not None:
+                attempt_errors.append(error)
             print(
                 "Failed candidate list for %s on %s: %s"
                 % (token["token_symbol"], chain_row["chain"], error)
@@ -565,8 +965,10 @@ def find_top_pools_with_ohlcv(token, chain_rows):
         pool["pool_rank"] = pool_rank
 
         try:
-            ohlcv_list = fetch_pool_ohlcv(pool)
+            ohlcv_list = fetch_pool_ohlcv(pool, start_date, end_date)
         except Exception as error:
+            if attempt_errors is not None:
+                attempt_errors.append(error)
             print("Candidate failed %s: %s" % (pool["pool_name"], error))
             time.sleep(REQUEST_SLEEP_SECONDS)
             continue
@@ -695,17 +1097,38 @@ def filter_complete_dates(rows, expected_token_count):
     return sorted(result, key=lambda row: (row["token_symbol"], row["date"]))
 
 
-def fetch_pool_ohlcv(pool):
+def get_ohlcv_before_timestamp(start_date=None, end_date=None):
+    """Return GeckoTerminal's exclusive historical cursor for an inclusive date."""
+    if start_date is None and end_date is None:
+        return None
+    if start_date is None or end_date is None:
+        raise ValueError("start_date and end_date must be provided together")
+    start_time = datetime.strptime(start_date, "%Y-%m-%d").replace(
+        tzinfo=timezone.utc
+    )
+    end_time = datetime.strptime(end_date, "%Y-%m-%d").replace(
+        tzinfo=timezone.utc
+    ) + timedelta(days=1)
+    window_days = (end_time - start_time).days
+    if window_days < 1 or window_days > MAX_REFRESH_WINDOW_DAYS:
+        raise ValueError("Refresh window must contain between 1 and 180 days")
+    return int(end_time.timestamp())
+
+
+def fetch_pool_ohlcv(pool, start_date=None, end_date=None):
     """Fetch daily OHLCV for one pool."""
     chain = pool["chain"]
     pool_address = pool["pool_address"]
 
     query = {
         "aggregate": "1",
-        "limit": str(LIMIT_DAYS),
+        "limit": str(min(LIMIT_DAYS, 1000)),
         "currency": "usd",
         "token": pool.get("ohlcv_token", "base"),
     }
+    before_timestamp = get_ohlcv_before_timestamp(start_date, end_date)
+    if before_timestamp is not None:
+        query["before_timestamp"] = str(before_timestamp)
 
     encoded_query = urllib.parse.urlencode(query)
     path = "/networks/%s/pools/%s/ohlcv/day" % (chain, pool_address)
@@ -793,7 +1216,14 @@ def write_volume_rows(rows, output_path: Path):
         writer.writerows(rows)
 
 
-def fetch_selected_tokens(token_rows, chain_rows_by_token):
+def fetch_selected_tokens(
+    token_rows,
+    chain_rows_by_token,
+    *,
+    attempt_records=None,
+    start_date=None,
+    end_date=None,
+):
     """Fetch selected pools and pool-level rows for configured tokens."""
     selected_pools = []
     pool_volume_rows = []
@@ -804,16 +1234,59 @@ def fetch_selected_tokens(token_rows, chain_rows_by_token):
 
         if len(token_chain_rows) == 0:
             print("No token-chain config found for %s" % token_symbol)
+            if attempt_records is not None:
+                attempt_records.append(
+                    dex_attempt_record(
+                        token_symbol,
+                        None,
+                        None,
+                        None,
+                        error=ValueError("Token chain configuration is missing"),
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
             continue
 
+        discovery_errors = []
         try:
-            pool_results = find_top_pools_with_ohlcv(token, token_chain_rows)
+            pool_results = find_top_pools_with_ohlcv(
+                token,
+                token_chain_rows,
+                discovery_errors,
+                start_date,
+                end_date,
+            )
         except Exception as error:
             print("Failed %s: %s" % (token_symbol, error))
+            if attempt_records is not None:
+                attempt_records.append(
+                    dex_attempt_record(
+                        token_symbol,
+                        None,
+                        None,
+                        None,
+                        error=error,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
             continue
 
         if len(pool_results) == 0:
             print("No usable pool found for %s" % token_symbol)
+            if attempt_records is not None:
+                attempt_records.append(
+                    dex_attempt_record(
+                        token_symbol,
+                        None,
+                        None,
+                        None,
+                        error=discovery_errors[-1] if discovery_errors else None,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
             continue
 
         for pool_result in pool_results:
@@ -834,6 +1307,25 @@ def fetch_selected_tokens(token_rows, chain_rows_by_token):
                     include_tvl_snapshot=int(ohlcv[0]) == latest_timestamp,
                 )
                 pool_volume_rows.append(row)
+            if attempt_records is not None:
+                attempt_records.append(
+                    dex_attempt_record(
+                        token_symbol,
+                        pool.get("chain"),
+                        pool.get("dex"),
+                        pool.get("pool_address"),
+                        rows=[
+                            convert_ohlcv_row(
+                                ohlcv,
+                                pool,
+                                include_tvl_snapshot=False,
+                            )
+                            for ohlcv in ohlcv_list
+                        ],
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
 
         print("Fetched %s DEX pools: %s" % (token_symbol, len(pool_results)))
         time.sleep(REQUEST_SLEEP_SECONDS)
@@ -841,7 +1333,14 @@ def fetch_selected_tokens(token_rows, chain_rows_by_token):
     return selected_pools, pool_volume_rows
 
 
-def fetch_existing_pools(pools):
+def fetch_existing_pools(
+    pools,
+    *,
+    attempt_records=None,
+    start_date=None,
+    end_date=None,
+    fail_on_incomplete=True,
+):
     """Fetch OHLCV directly for a validated published pool inventory."""
     pool_volume_rows = []
     failed_pools = []
@@ -849,7 +1348,7 @@ def fetch_existing_pools(pools):
 
     for index, pool in enumerate(pools, start=1):
         try:
-            ohlcv_list = fetch_pool_ohlcv(pool)
+            ohlcv_list = fetch_pool_ohlcv(pool, start_date, end_date)
         except Exception as error:
             print(
                 "Existing pool failed %s/%s %s %s: %s"
@@ -862,15 +1361,66 @@ def fetch_existing_pools(pools):
                 )
             )
             ohlcv_list = []
+            if attempt_records is not None:
+                attempt_records.append(
+                    dex_attempt_record(
+                        pool.get("token_symbol"),
+                        pool.get("chain"),
+                        pool.get("dex"),
+                        pool.get("pool_address"),
+                        error=error,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
         if not ohlcv_list:
             failed_pools.append(
                 "%s:%s:%s"
                 % (pool["token_symbol"], pool["chain"], pool["pool_address"])
             )
+            if attempt_records is not None and not any(
+                item["token_symbol"] == pool.get("token_symbol")
+                and item.get("chain") == pool.get("chain")
+                and item.get("pool_address")
+                == (
+                    pool.get("pool_address", "").lower()
+                    if str(pool.get("pool_address", "")).startswith("0x")
+                    else pool.get("pool_address")
+                )
+                for item in attempt_records
+            ):
+                attempt_records.append(
+                    dex_attempt_record(
+                        pool.get("token_symbol"),
+                        pool.get("chain"),
+                        pool.get("dex"),
+                        pool.get("pool_address"),
+                        rows=[],
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
 
+        converted_rows = []
         for ohlcv in ohlcv_list:
-            pool_volume_rows.append(
-                convert_ohlcv_row(ohlcv, pool, include_tvl_snapshot=False)
+            converted = convert_ohlcv_row(
+                ohlcv,
+                pool,
+                include_tvl_snapshot=False,
+            )
+            converted_rows.append(converted)
+            pool_volume_rows.append(converted)
+        if ohlcv_list and attempt_records is not None:
+            attempt_records.append(
+                dex_attempt_record(
+                    pool.get("token_symbol"),
+                    pool.get("chain"),
+                    pool.get("dex"),
+                    pool.get("pool_address"),
+                    rows=converted_rows,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
             )
 
         print(
@@ -886,7 +1436,7 @@ def fetch_existing_pools(pools):
         if index < pool_count:
             time.sleep(INCREMENTAL_POOL_SLEEP_SECONDS)
 
-    if failed_pools:
+    if failed_pools and fail_on_incomplete:
         raise RuntimeError(
             "Incremental DEX refresh is incomplete for %s pools: %s"
             % (len(failed_pools), ",".join(failed_pools))
@@ -901,17 +1451,63 @@ def main(
     start_date=None,
     end_date=None,
     limit_days=LIMIT_DAYS,
+    output_dir=None,
+    local_dir=None,
 ) -> None:
     """Fetch DEX data into processed CSV files."""
     global LIMIT_DAYS
     LIMIT_DAYS = limit_days
+    get_ohlcv_before_timestamp(start_date, end_date)
+    resolved_output_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else DEX_POOL_VOLUME_OUTPUT_PATH.parent
+    )
+    resolved_local_dir = (
+        Path(local_dir)
+        if local_dir is not None
+        else TVL_LATEST_PATH.parent
+    )
+    dex_pools_output_path = resolved_output_dir / DEX_POOLS_OUTPUT_PATH.name
+    dex_pool_volume_output_path = (
+        resolved_output_dir / DEX_POOL_VOLUME_OUTPUT_PATH.name
+    )
+    dex_volume_output_path = resolved_output_dir / DEX_VOLUME_OUTPUT_PATH.name
+    attempt_output_path = resolved_output_dir / ATTEMPT_OUTPUT_PATH.name
+    tvl_latest_path = resolved_local_dir / TVL_LATEST_PATH.name
     all_token_rows = read_token_config(TOKEN_CONFIG_PATH)
+    static_chain_rows = read_token_chain_config(
+        TOKEN_CHAIN_CONFIG_PATH,
+        all_token_rows,
+    )
+    all_token_rows, chain_rows = merge_runtime_token_config(
+        all_token_rows,
+        static_chain_rows,
+        token_symbols=token_symbols,
+    )
     token_rows = filter_token_rows(all_token_rows, token_symbols)
-    chain_rows = read_token_chain_config(TOKEN_CHAIN_CONFIG_PATH, all_token_rows)
+    if token_symbols is not None:
+        configured_symbols = {
+            row["token_symbol"].upper()
+            for row in token_rows
+        }
+        missing_tokens = sorted(
+            {
+                token_symbol.upper()
+                for token_symbol in token_symbols
+            }
+            - configured_symbols
+        )
+        if missing_tokens:
+            raise ValueError(
+                "Requested Tokens are not configured: %s"
+                % ",".join(missing_tokens)
+            )
     chain_rows_by_token = group_chain_rows_by_token(chain_rows)
 
     selected_pools = []
     pool_volume_rows = []
+    attempt_records = []
     discovery_token_rows = token_rows
     invalid_pool_keys = []
     if append:
@@ -923,8 +1519,8 @@ def main(
             resolved_tokens,
             invalid_pool_keys,
         ) = load_existing_pool_inventory(
-            DEX_POOL_VOLUME_OUTPUT_PATH,
-            TVL_LATEST_PATH,
+            dex_pool_volume_output_path,
+            tvl_latest_path,
             chain_rows_by_token,
             token_symbols,
         )
@@ -938,7 +1534,26 @@ def main(
                 "Reusing %s published pools for %s tokens"
                 % (len(selected_pools), len(resolved_tokens))
             )
-            pool_volume_rows.extend(fetch_existing_pools(selected_pools))
+            try:
+                pool_volume_rows.extend(
+                    fetch_existing_pools(
+                        selected_pools,
+                        attempt_records=attempt_records,
+                        start_date=start_date,
+                        end_date=end_date,
+                        fail_on_incomplete=False,
+                    )
+                )
+            except Exception:
+                if dex_pool_volume_output_path.exists():
+                    write_attempt_ledger(
+                        attempt_output_path,
+                        attempt_records,
+                        source_csv=dex_pool_volume_output_path,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                raise
         discovery_token_rows = filter_token_rows(token_rows, unresolved_tokens)
         if unresolved_tokens:
             print(
@@ -950,6 +1565,9 @@ def main(
         discovered_pools, discovered_rows = fetch_selected_tokens(
             discovery_token_rows,
             chain_rows_by_token,
+            attempt_records=attempt_records,
+            start_date=start_date,
+            end_date=end_date,
         )
         selected_pools.extend(discovered_pools)
         pool_volume_rows.extend(discovered_rows)
@@ -959,12 +1577,29 @@ def main(
         if (start_date is None or row["date"] >= start_date)
         and (end_date is None or row["date"] <= end_date)
     ]
+    if token_symbols is not None and not append:
+        observed_tokens = {
+            row["token_symbol"].upper()
+            for row in pool_volume_rows
+        }
+        missing_observations = sorted(
+            {
+                token_symbol.upper()
+                for token_symbol in token_symbols
+            }
+            - observed_tokens
+        )
+        if missing_observations:
+            raise RuntimeError(
+                "No DEX daily rows were collected for requested Tokens: %s"
+                % ",".join(missing_observations)
+            )
 
     expected_token_count = len(token_rows)
 
     if append:
-        existing_pools = read_csv_rows(DEX_POOLS_OUTPUT_PATH)
-        existing_pool_volume_rows = read_csv_rows(DEX_POOL_VOLUME_OUTPUT_PATH)
+        existing_pools = read_csv_rows(dex_pools_output_path)
+        existing_pool_volume_rows = read_csv_rows(dex_pool_volume_output_path)
         existing_pool_volume_rows = remove_pool_rows(
             existing_pool_volume_rows,
             invalid_pool_keys,
@@ -976,18 +1611,50 @@ def main(
         )
         pool_volume_rows = merge_pool_volume_rows(existing_pool_volume_rows, pool_volume_rows)
         expected_token_count = len(all_token_rows)
+        if token_symbols is not None:
+            observed_tokens = {
+                row["token_symbol"].upper()
+                for row in pool_volume_rows
+            }
+            missing_observations = sorted(
+                {
+                    token_symbol.upper()
+                    for token_symbol in token_symbols
+                }
+                - observed_tokens
+            )
+            if missing_observations:
+                raise RuntimeError(
+                    "No DEX daily rows were collected or previously published "
+                    "for requested Tokens: %s"
+                    % ",".join(missing_observations)
+                )
 
     pool_volume_rows = deduplicate_pool_volume_rows(pool_volume_rows)
     volume_rows = aggregate_dex_pool_rows(pool_volume_rows)
     volume_rows = filter_complete_dates(volume_rows, expected_token_count)
 
-    write_pool_rows(selected_pools, DEX_POOLS_OUTPUT_PATH)
-    write_pool_volume_rows(pool_volume_rows, DEX_POOL_VOLUME_OUTPUT_PATH)
-    write_volume_rows(volume_rows, DEX_VOLUME_OUTPUT_PATH)
+    write_pool_rows(selected_pools, dex_pools_output_path)
+    write_pool_volume_rows(pool_volume_rows, dex_pool_volume_output_path)
+    write_volume_rows(volume_rows, dex_volume_output_path)
+    write_attempt_ledger(
+        attempt_output_path,
+        attempt_records,
+        source_csv=dex_pool_volume_output_path,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
-    print("Wrote %s pools to %s" % (len(selected_pools), DEX_POOLS_OUTPUT_PATH))
-    print("Wrote %s pool rows to %s" % (len(pool_volume_rows), DEX_POOL_VOLUME_OUTPUT_PATH))
-    print("Wrote %s rows to %s" % (len(volume_rows), DEX_VOLUME_OUTPUT_PATH))
+    print("Wrote %s pools to %s" % (len(selected_pools), dex_pools_output_path))
+    print(
+        "Wrote %s pool rows to %s"
+        % (len(pool_volume_rows), dex_pool_volume_output_path)
+    )
+    print("Wrote %s rows to %s" % (len(volume_rows), dex_volume_output_path))
+    print(
+        "Wrote %s collection attempts to %s"
+        % (len(attempt_records), attempt_output_path)
+    )
 
 
 def parse_args():
@@ -1005,6 +1672,8 @@ def parse_args():
     parser.add_argument("--start", help="Inclusive UTC date")
     parser.add_argument("--end", help="Inclusive UTC date")
     parser.add_argument("--limit-days", type=int, default=LIMIT_DAYS)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--local-dir", type=Path)
     args = parser.parse_args()
 
     token_symbols = None
@@ -1015,9 +1684,33 @@ def parse_args():
             if cleaned:
                 token_symbols.append(cleaned)
 
-    return token_symbols, args.append, args.start, args.end, args.limit_days
+    return (
+        token_symbols,
+        args.append,
+        args.start,
+        args.end,
+        args.limit_days,
+        args.output_dir,
+        args.local_dir,
+    )
 
 
 if __name__ == "__main__":
-    selected_tokens, append_rows, start_date, end_date, limit_days = parse_args()
-    main(selected_tokens, append_rows, start_date, end_date, limit_days)
+    (
+        selected_tokens,
+        append_rows,
+        start_date,
+        end_date,
+        limit_days,
+        selected_output_dir,
+        selected_local_dir,
+    ) = parse_args()
+    main(
+        selected_tokens,
+        append_rows,
+        start_date,
+        end_date,
+        limit_days,
+        selected_output_dir,
+        selected_local_dir,
+    )

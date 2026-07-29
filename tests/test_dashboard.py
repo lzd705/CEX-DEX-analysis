@@ -1090,6 +1090,185 @@ class MarketMonitorServerTest(unittest.TestCase):
             payload["metadata"]["missing_value_rule"],
         )
 
+    def test_quality_window_separates_prelisting_from_retryable_historical_gap(self):
+        with self.cex_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(
+                [
+                    "2026-01-01",
+                    "BTC",
+                    "kraken",
+                    "BTC/USD",
+                    "",
+                    "",
+                    "",
+                    "100",
+                    "",
+                    "50",
+                ]
+            )
+            writer.writerow(
+                [
+                    "2026-01-03",
+                    "BTC",
+                    "kraken",
+                    "BTC/USD",
+                    "",
+                    "",
+                    "",
+                    "103",
+                    "",
+                    "60",
+                ]
+            )
+            writer.writerow(
+                [
+                    "2026-01-02",
+                    "BTC",
+                    "coinbase",
+                    "BTC/USD",
+                    "",
+                    "",
+                    "",
+                    "103",
+                    "",
+                    "70",
+                ]
+            )
+
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            before_listing = server.build_market_quality(
+                "BTC",
+                start="2026-01-01",
+                end="2026-01-01",
+            )
+            internal_gap = server.build_market_quality(
+                "BTC",
+                start="2026-01-02",
+                end="2026-01-02",
+            )
+            after_last_observation = server.build_market_quality(
+                "BTC",
+                start="2026-01-03",
+                end="2026-01-03",
+            )
+
+        coinbase = next(
+            market
+            for market in before_listing["markets"]
+            if market["market_id"] == "cex:coinbase:BTC/USD"
+        )
+        kraken = next(
+            market
+            for market in internal_gap["markets"]
+            if market["market_id"] == "cex:kraken:BTC/USD"
+        )
+        self.assertEqual(coinbase["facts"]["daily"]["status"], "not_applicable")
+        self.assertFalse(coinbase["facts"]["daily"]["retryable"])
+        self.assertEqual(
+            coinbase["facts"]["daily"]["reason_code"],
+            "selected_window_before_first_market_observation",
+        )
+        self.assertEqual(kraken["facts"]["daily"]["status"], "backfill_pending")
+        self.assertTrue(kraken["facts"]["daily"]["retryable"])
+        self.assertEqual(kraken["facts"]["daily"]["missing_calendar_days"], 1)
+        trailing_gap = next(
+            market
+            for market in after_last_observation["markets"]
+            if market["market_id"] == "cex:coinbase:BTC/USD"
+        )
+        self.assertEqual(
+            trailing_gap["facts"]["daily"]["status"],
+            "missing_unexplained",
+        )
+        self.assertTrue(trailing_gap["facts"]["daily"]["retryable"])
+        self.assertEqual(
+            trailing_gap["facts"]["daily"]["reason_code"],
+            "no_daily_observations_after_latest_observed_market_date",
+        )
+
+    def test_quality_window_reports_a_global_internal_gap_instead_of_failing(self):
+        write_csv(
+            self.cex_path,
+            [
+                "date",
+                "token_symbol",
+                "exchange",
+                "cex_symbol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "base_volume",
+                "quote_volume_usd",
+            ],
+            [
+                {
+                    "date": day,
+                    "token_symbol": "BTC",
+                    "exchange": "binance",
+                    "cex_symbol": "BTC/USDT",
+                    "close": close,
+                    "quote_volume_usd": "1000",
+                }
+                for day, close in (
+                    ("2026-01-01", "100"),
+                    ("2026-01-03", "103"),
+                )
+            ],
+        )
+        write_csv(
+            self.dex_path,
+            [
+                "date",
+                "token_symbol",
+                "chain",
+                "dex",
+                "pool_address",
+                "pool_name",
+                "open",
+                "high",
+                "low",
+                "close",
+                "dex_volume_usd",
+                "pool_tvl_usd",
+            ],
+            [
+                {
+                    "date": day,
+                    "token_symbol": "BTC",
+                    "chain": "eth",
+                    "dex": "uniswap",
+                    "pool_address": "0xpool",
+                    "pool_name": "WBTC / USDC 0.30%",
+                    "close": close,
+                    "dex_volume_usd": "300",
+                    "pool_tvl_usd": "5000",
+                }
+                for day, close in (
+                    ("2026-01-01", "101"),
+                    ("2026-01-03", "104"),
+                )
+            ],
+        )
+
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            payload = server.build_market_quality(
+                "BTC",
+                start="2026-01-02",
+                end="2026-01-02",
+            )
+
+        self.assertEqual(payload["metadata"]["window_start"], "2026-01-02")
+        self.assertEqual(payload["metadata"]["window_end"], "2026-01-02")
+        self.assertEqual(len(payload["markets"]), 2)
+        for market in payload["markets"]:
+            self.assertEqual(
+                market["facts"]["daily"]["status"],
+                "backfill_pending",
+            )
+            self.assertTrue(market["facts"]["daily"]["retryable"])
+
     def test_quality_api_selected_scope_validates_exact_token_market_ids(self):
         cex_id = "cex:binance:BTC/USDT"
         dex_id = "dex:eth:uniswap:0xpool:BTC"
@@ -1248,6 +1427,43 @@ class MarketMonitorServerTest(unittest.TestCase):
             ],
             "2026-01-02T00:01:00+00:00",
         )
+
+    def test_execution_quality_load_errors_do_not_expose_private_paths(self):
+        private_path = Path("/srv/private-market-data/execution-secret.csv")
+        missing_message = f"No execution snapshot exists at {private_path}"
+        unreadable_message = f"[Errno 13] Permission denied: '{private_path}'"
+
+        def missing_resolver():
+            raise FileNotFoundError(missing_message)
+
+        missing_state = server._execution_quality_source(missing_resolver)
+        with patch.object(
+            server,
+            "load_execution_cost_snapshot",
+            side_effect=PermissionError(unreadable_message),
+        ):
+            unreadable_state = server._execution_quality_source(
+                lambda: private_path
+            )
+
+        for source_state in (missing_state, unreadable_state):
+            fact = server._execution_quality_fact({}, source_state)
+            serialized = json.dumps(fact)
+            self.assertEqual(fact["status"], "failed")
+            self.assertEqual(
+                fact["reason_code"],
+                "execution_snapshot_invalid",
+            )
+            self.assertEqual(
+                fact["reason"],
+                (
+                    "The execution snapshot could not be loaded or validated. "
+                    "An operator must inspect the protected service logs."
+                ),
+            )
+            self.assertNotIn(str(private_path), serialized)
+            self.assertNotIn("Permission denied", serialized)
+            self.assertNotIn(missing_message, serialized)
 
     def test_quality_api_reports_partial_execution_without_cost_claim(self):
         binance_id = "cex:binance:BTC/USDT"
@@ -1708,6 +1924,7 @@ class MarketMonitorServerTest(unittest.TestCase):
                 ("scope", "selected"),
                 ("market_a", "cex:binance:BTC/USDT"),
                 ("market_b", "dex:eth:uniswap:0xpool:BTC"),
+                ("start", "2026-01-01"),
             ),
         )
 

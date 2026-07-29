@@ -65,7 +65,7 @@ SHA 与 Event bundle ID。
   44 latest Event Facts、30/30 Token presence coverage、Event bundle
   `236accecf312dc79ca6f8630`；release checker 逐个请求 30 个 Token，均返回至少一条记录。
 - Desktop browser：Screener、Markets、Compare、Liquidity & Execution、
-  Events、Data Quality、Methodology 七条公开路由均可加载；没有可见 error state，
+  Events、Data Quality 六条公开路由均可加载；没有可见 error state，
   捕获到的 page/console/unhandled-rejection errors 为 0，页面横向溢出为 0。
 - Interaction smoke：warning 原因悬停、Price/Spread/Volume 切换、
   Event tooltip、SPA workspace 跳转和 lifecycle URL 持久化均通过；本次 release
@@ -164,7 +164,8 @@ latest snapshot 都采用验证后替换。
 ### 0:00–1:15：Screener
 
 1. 展示全市场入口和 UTC daily window。
-2. 切换 Aggregate / CEX / DEX 排序，说明排序口径。
+2. 选择排名 Fact、Aggregate / CEX / DEX scope 及升降序，说明缺失值固定排在最后，
+   每行同时展示真正参与排序的数值。
 3. 搜索 Token，指出 Token 行是汇总，primary CEX/DEX 是明确市场，而不是把全部市场平均成一条虚构记录。
 4. 指出 Warning/Critical 只是 fact quality，不是 Token 风险评级。
 
@@ -211,11 +212,16 @@ latest snapshot 都采用验证后替换。
 3. 对比 `observed`、`partial`、`unsupported`、`failed`、`N/A` 和真实 `0`。
 4. 说明 selected-window quality 与 full-history quality 必须分开解释。
 
-### 7:40–8:35：Methodology
+### 7:40–8:35：受保护的数据运维
 
-1. 打开 price spread、depth 或 execution-cost 方法条目。
-2. 展示公式和 non-claims。
-3. 指出 funding rate 没采集，CEX account fee 没有被假设为零。
+1. 在仅管理员可访问的页面展示“近期缺口重拉”“历史缺口重拉”和“必须人工复核”
+   三类队列；公开看板仍然只读。
+2. 对可重拉项，只允许提交当前质量报告列出的 Token、market、日期窗口，不能手填
+   任意目标绕过审计。
+3. 展示采集原因：网络/限流/来源无数据/来源不支持/解析或校验失败，与结构性
+   `unsupported`、测量限制和市场状态分开。
+4. 输入 chain 和智能合约地址预览 Token 身份，再确认 DEX-first onboarding；
+   不从链上地址猜 CEX pair。
 
 ### 8:35–9:25：架构与更新
 
@@ -294,9 +300,20 @@ latest snapshot 都采用验证后替换。
 - 查看 raw hash、fixed block、endpoint、fee scope 和 excluded cost。
 - Warning 是可审计 heuristic；它不等于 exchange insolvency、smart-contract safety 或 Token fundamental risk。
 
-### Methodology：确认定义
+指标定义、来源限制和 non-claims 已合并进相关工作页与 Data Quality；独立
+Methodology 页面已删除。旧 `/methodology` URL 只做兼容跳转，不再形成第七套页面。
 
-Methodology 回答“这个指标一般怎么算”；Data Quality 回答“当前这个 market 的这条事实现在是否可用”。两者不能混成同一个页面。
+### Admin：处理缺口和加入 Token
+
+- Admin 默认关闭；只有在 HTTPS、访问控制和管理员凭据都已配置时才启用。
+- “Retryable missing facts” 只显示当前已发布质量报告批准的精确窗口。近期 D-1
+  缺口与历史内部缺口分别标识，刷新完成后还要验证新的 publication identity 和
+  精确 market/date 行，不能只凭采集进程退出码报成功。
+- “Manual review required” 展示硬异常和 market lifecycle 不明等不可自动处理项，
+  并给出 primary-source URL hints；它们没有重拉按钮。
+- “Add Token” 先输入 chain 与 smart-contract address，解析并确认 Token 身份和
+  pool，再启动 DEX daily、TVL 和支持协议的 DEX depth 采集。CEX mapping 保持
+  `requires_manual_review`，不会自动猜测。
 
 ## 系统架构
 

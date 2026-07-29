@@ -6,8 +6,10 @@ The first product is a fact-only Market Monitor. A user selects a time window
 and a Token, then keeps two exact cataloged markets as Market A and Market B
 while moving through `Markets`, `Compare`, `Liquidity & Execution`, `Events`,
 and `Data Quality`. The A/B markets may be CEX/CEX, CEX/DEX, or DEX/DEX. A
-separate authenticated administrator page can refresh configured Tokens when
-explicitly enabled; the entire administrator surface is absent by default.
+separate authenticated administrator page can refresh configured Tokens,
+retry audit-approved missing windows, and onboard a DEX Token from a validated
+smart-contract address when explicitly enabled; the entire administrator
+surface is absent by default.
 This release does not include factors, future-return research, an event study,
 or public data-edit controls.
 
@@ -22,9 +24,9 @@ or public data-edit controls.
    required USD-price observation fails the two-hour temporal gate.
 4. Keep spread at Token comparison level, not duplicated as a CEX or DEX
    property.
-5. Sort Tokens by aggregate volume across all cataloged markets, while keeping
-   the selected CEX pair and DEX pool facts explicit. Aggregate, CEX, and DEX
-   sorting scopes do not redefine the selected-market rows.
+5. Let users rank Tokens by an explicit Fact, valid scope, and ascending or
+   descending direction. Missing, failed, and unsupported values always sort
+   last; the actual rank value is displayed and exported.
 6. Show data coverage, latest date, source file versions, missing values, and
    metric limitations.
 7. Preserve missing values as null. Never replace unavailable facts with zero.
@@ -41,6 +43,9 @@ or public data-edit controls.
     timing precision, lifecycle, and revision lineage. Event markers are a
     temporal overlay on Compare only; they do not claim return impact or
     causality.
+12. Separate data-health failures, recoverable gaps, structural unsupported
+    methods, measurement limits, and observed market conditions. Publish a
+    daily quality audit before accepting a new snapshot.
 
 ## Local workflow
 
@@ -147,7 +152,7 @@ are `deploy/systemd/cex-dex-dashboard.service.in`,
 Funding rates, numeric CEX account fees, gas/MEV-aware quotes, DEX V3
 fixed-notional execution, event-study returns/impact, additional DEX protocol
 adapters, anomaly rules, historical TVL backfills, historical depth
-reconstruction, and adding previously unconfigured Tokens require separate
+reconstruction, and automatic CEX mapping for runtime Tokens require separate
 data contracts and acceptance tests. Unsupported facts remain null or
 explicitly `unsupported`; the dashboard does not estimate them from adjacent
 facts.

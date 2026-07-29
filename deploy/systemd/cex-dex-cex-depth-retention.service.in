@@ -1,6 +1,6 @@
 [Unit]
 Description=Compress and expire CEX depth raw-response snapshots
-ConditionPathIsDirectory=@PROJECT_ROOT@/data/raw/cex-depth
+ConditionPathIsDirectory=@MARKET_DATA_DIR@/raw/cex-depth
 
 [Service]
 Type=oneshot
@@ -8,11 +8,12 @@ User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@PROJECT_ROOT@
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/bin/python3 scripts/retain_cex_depth_raw.py --keep-raw-days 7 --keep-archive-days 30 --apply
+EnvironmentFile=-/etc/cex-dex/dashboard.env
+ExecStart=/usr/bin/python3 scripts/retain_cex_depth_raw.py --root @MARKET_DATA_DIR@/raw/cex-depth --keep-raw-days 7 --keep-archive-days 30 --apply
 Nice=10
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadOnlyPaths=@PROJECT_ROOT@
-ReadWritePaths=@PROJECT_ROOT@/data/raw/cex-depth
+ReadWritePaths=@MARKET_DATA_DIR@/raw/cex-depth
