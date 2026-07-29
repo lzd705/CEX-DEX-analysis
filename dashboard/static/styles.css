@@ -1639,7 +1639,7 @@ footer {
     min-width: 0;
     padding-inline: 6px;
   }
-  .primary-navigation a:last-child { grid-column: 1 / -1; }
+  .primary-navigation a[data-app-route="methodology"] { grid-column: 1 / -1; }
   .status-cluster {
     width: 100%;
     min-width: 0;

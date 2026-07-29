@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import subprocess
 import unittest
@@ -47,13 +48,35 @@ class EventFrontendTest(unittest.TestCase):
         self.assertNotIn("four research pages", app)
 
     def test_mobile_header_keeps_all_navigation_and_freshness_visible(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
         styles = STYLES_PATH.read_text(encoding="utf-8")
 
         mobile = styles.split("@media (max-width: 700px)", 1)[1]
-        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", mobile)
-        self.assertIn(".primary-navigation a:last-child { grid-column: 1 / -1; }", mobile)
-        self.assertIn("white-space: normal", mobile)
+        navigation_rule = re.search(r"\.primary-navigation\s*\{([^}]*)\}", mobile)
+        navigation_link_rule = re.search(r"\.primary-navigation a\s*\{([^}]*)\}", mobile)
+        freshness_rule = re.search(r"\.status-cluster\s*\{([^}]*)\}", mobile)
+
+        self.assertIsNotNone(navigation_rule)
+        self.assertIsNotNone(navigation_link_rule)
+        self.assertIsNotNone(freshness_rule)
+        self.assertIn("display: grid", navigation_rule.group(1))
+        self.assertIn(
+            "grid-template-columns: repeat(2, minmax(0, 1fr))",
+            navigation_rule.group(1),
+        )
+        self.assertIn("overflow: visible", navigation_rule.group(1))
+        self.assertNotIn("overflow-x: auto", navigation_rule.group(1))
+        self.assertIn("min-width: 0", navigation_link_rule.group(1))
+        self.assertIn(
+            '.primary-navigation a[data-app-route="methodology"] { grid-column: 1 / -1; }',
+            mobile,
+        )
+        self.assertIn("min-width: 0", freshness_rule.group(1))
+        self.assertIn("overflow: visible", freshness_rule.group(1))
+        self.assertIn("white-space: normal", freshness_rule.group(1))
         self.assertIn("#freshness { min-width: 0; overflow-wrap: anywhere; }", mobile)
+        self.assertIn("/styles.css?v=20260729-events-v2", index)
+        self.assertIn("/app.js?v=20260729-events-v2", index)
 
     def test_event_route_round_trips_lifecycle_filter(self):
         node = shutil.which("node")
