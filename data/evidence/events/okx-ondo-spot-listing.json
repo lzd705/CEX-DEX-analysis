@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/en-us/help/okx-to-list-ondo-ondo-for-spot-trading",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "OKX to list Ondo (ONDO) for spot trading",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX announced that ONDO/USDT spot trading was scheduled to open at 08:00 UTC on 2024-07-29.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Listing schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "Deposit and withdrawal times are excluded."
+  ]
+}

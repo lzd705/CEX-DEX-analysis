@@ -399,6 +399,46 @@ def validate_events(
         query.get("lifecycle") == lifecycle,
         "Event lifecycle scope was not honored",
     )
+    coverage = payload.get("coverage") or {}
+    configured_token_count = coverage.get("configured_token_count")
+    covered_token_count = coverage.get("covered_token_count")
+    covered_tokens = coverage.get("covered_tokens")
+    uncovered_tokens = coverage.get("uncovered_tokens")
+    require(
+        isinstance(configured_token_count, int)
+        and configured_token_count > 0,
+        "Event configured-Token count is invalid",
+    )
+    require(
+        isinstance(covered_token_count, int)
+        and covered_token_count > 0,
+        "Event covered-Token count is invalid",
+    )
+    require(
+        isinstance(covered_tokens, list)
+        and all(isinstance(item, str) and item for item in covered_tokens)
+        and covered_tokens == sorted(set(covered_tokens)),
+        "Event covered-Token inventory is invalid",
+    )
+    require(
+        isinstance(uncovered_tokens, list)
+        and all(isinstance(item, str) and item for item in uncovered_tokens)
+        and uncovered_tokens == sorted(set(uncovered_tokens)),
+        "Event uncovered-Token inventory is invalid",
+    )
+    require(
+        covered_token_count == len(covered_tokens)
+        and configured_token_count
+        == len(covered_tokens) + len(uncovered_tokens)
+        and not set(covered_tokens).intersection(uncovered_tokens),
+        "Event Token coverage counts are inconsistent",
+    )
+    expected_query_coverage = token in set(covered_tokens) if token else None
+    require(
+        coverage.get("query_token_has_published_fact")
+        is expected_query_coverage,
+        "Event query-Token coverage flag is inconsistent",
+    )
 
     events = payload.get("events")
     require(isinstance(events, list), "Event response has no events array")
@@ -612,6 +652,31 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
     )
     metrics.append(events_metrics)
     event_rows = validate_events(all_events)
+    event_coverage = all_events["coverage"]
+    summary_tokens = sorted(
+        row["token_symbol"]
+        for row in summary["tokens"]
+        if isinstance(row, dict) and row.get("token_symbol")
+    )
+    require(
+        event_coverage["covered_tokens"] == summary_tokens,
+        "Event coverage does not match the current Token catalog",
+    )
+    require(
+        event_coverage["uncovered_tokens"] == [],
+        "Event publication leaves configured Tokens uncovered",
+    )
+    for covered_token in event_coverage["covered_tokens"]:
+        token_events_path = "/api/markets/events?" + urlencode(
+            {"token": covered_token}
+        )
+        token_events, token_events_metrics = fetch_json(
+            args.base_url,
+            token_events_path,
+            timeout=args.timeout,
+        )
+        metrics.append(token_events_metrics)
+        validate_events(token_events, token=covered_token)
     seed_event = event_rows[0]
     event_token = seed_event["token_symbol"]
     event_start = seed_event["time"]["effective_date_start"]
@@ -745,6 +810,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "token_count": len(summary["tokens"]),
         "catalog_market_count": len(full_markets),
         "event_count": len(event_rows),
+        "event_covered_token_count": event_coverage["covered_token_count"],
         "event_bundle_id": all_events["bundle_id"],
         "requests": [
             {

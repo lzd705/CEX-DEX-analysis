@@ -1,0 +1,20 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/en-gb/help/okx-will-list-raydium-ray-token-for-spot-trading",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "OKX will list Raydium’s RAY token for spot trading",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX's listing announcement states that RAY/USDT spot trading was scheduled to open at 10:00 UTC on 2021-12-17.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Trading schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The current OKX instruments API reports an earlier listTime, which is not substituted for the announcement's explicit spot-opening time.",
+    "The API and announcement are surfaces of the same exchange, so evidence_status remains primary_confirmed rather than cross_checked."
+  ]
+}

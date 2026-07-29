@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.binance.com/en/support/announcement/detail/ac34042b96d04b5e8464613f27567353",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "Binance Lists Sushi (SUSHI) and DFI.Money (YFII)",
+  "publisher": "Binance",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "Binance announced that SUSHI/USDT spot trading was scheduled to open at 11:00 UTC on 2020-09-01.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Announcement body"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The displayed publication clock has no stated timezone, so only its calendar date is stored."
+  ]
+}

@@ -2335,6 +2335,15 @@ function renderEventFacts(payload) {
   byId("events-source-count").textContent = availability === "available"
     ? String(sources.size)
     : "N/A";
+  const configuredTokenCount = Number(payload?.coverage?.configured_token_count);
+  const coveredTokenCount = Number(payload?.coverage?.covered_token_count);
+  byId("events-token-coverage").textContent = (
+    availability === "available"
+    && Number.isFinite(configuredTokenCount)
+    && Number.isFinite(coveredTokenCount)
+  )
+    ? `${coveredTokenCount} / ${configuredTokenCount}`
+    : "N/A";
 
   if (availability !== "available") {
     byId("events-body").innerHTML = (
@@ -2447,7 +2456,13 @@ async function loadEvents() {
     byId("events-body").innerHTML = (
       '<tr><td colspan="7" class="missing">Verified Event Facts could not be loaded. No zero-event claim is made.</td></tr>'
     );
-    ["events-count", "events-occurred", "events-scheduled", "events-source-count"]
+    [
+      "events-count",
+      "events-occurred",
+      "events-scheduled",
+      "events-source-count",
+      "events-token-coverage",
+    ]
       .forEach((id) => {
         byId(id).textContent = "N/A";
       });

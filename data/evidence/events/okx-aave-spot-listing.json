@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/en-us/help/okx-completed-the-token-migration-from-lend-to-aave",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "OKX completed the token migration from LEND to AAVE",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX states that AAVE/USDT spot trading started at 06:00 UTC on 2020-10-22.",
+      "supported_lifecycle": "occurred",
+      "time_precision": "minute",
+      "source_section": "AAVE go-live schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The LEND-to-AAVE migration and deposit time are context, not separate Event Facts in this row."
+  ]
+}

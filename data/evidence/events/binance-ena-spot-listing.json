@@ -1,0 +1,20 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.binance.com/en/support/announcement/detail/6c216f219f0e42adb1849759dee3fbd9",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "Introducing Ethena (ENA) on Binance Launchpool! Farm ENA by Staking BNB and FDUSD",
+  "publisher": "Binance",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "Binance announced that ENA/USDT spot trading was scheduled to open at 08:00 UTC on 2024-04-02.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Listing"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "Launchpool farming dates and reward amounts are separate facts and are excluded.",
+    "The displayed publication clock has no stated timezone, so only its calendar date is stored."
+  ]
+}

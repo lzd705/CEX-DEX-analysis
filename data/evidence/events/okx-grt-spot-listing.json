@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/en-gb/help/the-graph-grt-now-available",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "The Graph (GRT) Now Available",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX states that GRT/USDT spot trading started at 06:00 UTC on 2020-12-18.",
+      "supported_lifecycle": "occurred",
+      "time_precision": "minute",
+      "source_section": "Go-live schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "GRT/BTC and GRT/ETH opened later and are excluded."
+  ]
+}

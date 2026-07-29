@@ -138,6 +138,32 @@ def load_latest_event_rows(event_root: Path) -> tuple[list[dict[str, Any]], dict
         raise EventBundleError(
             "Event Fact database row count does not match its manifest"
         )
+    covered_tokens = sorted({str(row["token_symbol"]) for row in rows})
+    manifest_covered = bundle["manifest"].get("covered_tokens")
+    manifest_uncovered = bundle["manifest"].get("uncovered_tokens")
+    configured_count = bundle["manifest"].get("configured_token_count")
+    if manifest_covered is not None:
+        if manifest_covered != covered_tokens:
+            raise EventBundleError(
+                "Event Fact covered-token inventory does not match its rows"
+            )
+        valid_uncovered = (
+            isinstance(manifest_uncovered, list)
+            and all(
+                isinstance(token, str) and token
+                for token in manifest_uncovered
+            )
+            and manifest_uncovered == sorted(set(manifest_uncovered))
+        )
+        if (
+            not valid_uncovered
+            or not isinstance(configured_count, int)
+            or set(manifest_covered) & set(manifest_uncovered)
+            or configured_count != len(manifest_covered) + len(manifest_uncovered)
+        ):
+            raise EventBundleError(
+                "Event Fact configured-token coverage is internally inconsistent"
+            )
     return rows, bundle["manifest"]
 
 
@@ -217,6 +243,7 @@ def build_event_payload(
 ) -> dict[str, Any]:
     """Filter latest facts by overlapping effective-date interval."""
 
+    source_rows = list(rows)
     normalized_token = token.strip().upper() if token else None
     start_date = date.fromisoformat(start).isoformat() if start else None
     end_date = date.fromisoformat(end).isoformat() if end else None
@@ -229,7 +256,7 @@ def build_event_payload(
         )
 
     events = []
-    for raw_row in rows:
+    for raw_row in source_rows:
         if normalized_token and raw_row.get("token_symbol") != normalized_token:
             continue
         if normalized_lifecycle and raw_row.get("lifecycle") != normalized_lifecycle:
@@ -252,6 +279,11 @@ def build_event_payload(
             event["event_id"],
         )
     )
+    covered_tokens = list(manifest.get("covered_tokens") or sorted({
+        str(row["token_symbol"])
+        for row in source_rows
+    }))
+    uncovered_tokens = list(manifest.get("uncovered_tokens") or [])
     return {
         "schema": EVENT_API_SCHEMA,
         "fact_schema": EVENT_FACT_SCHEMA,
@@ -261,6 +293,17 @@ def build_event_payload(
         ),
         "bundle_id": manifest.get("bundle_id"),
         "built_at_utc": manifest.get("built_at_utc"),
+        "coverage": {
+            "configured_token_count": manifest.get("configured_token_count"),
+            "covered_token_count": len(covered_tokens),
+            "covered_tokens": covered_tokens,
+            "uncovered_tokens": uncovered_tokens,
+            "query_token_has_published_fact": (
+                normalized_token in set(covered_tokens)
+                if normalized_token
+                else None
+            ),
+        },
         "query": {
             "token": normalized_token,
             "start": start_date,

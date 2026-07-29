@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/en-us/help/okx-will-list-gmx-gmx-for-spot-trading",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "OKX will list GMX (GMX) for spot trading",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX announced that GMX/USDT spot trading was scheduled to open at 11:00 UTC on 2023-01-05.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Trading schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "GMX/USDC, deposit, and withdrawal times are excluded."
+  ]
+}

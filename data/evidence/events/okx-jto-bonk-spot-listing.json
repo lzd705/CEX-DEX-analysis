@@ -1,0 +1,25 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/help/okx-to-list-jito-jto-and-bonk-bonk-for-spot-trading",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "OKX to list Jito (JTO) and Bonk (BONK) for spot trading",
+  "publisher": "OKX",
+  "facts": {
+    "jto_spot_trading_start": {
+      "statement": "OKX announced that JTO/USDT spot trading was scheduled to open at 06:00 UTC on 2024-01-08.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Listing schedule"
+    },
+    "bonk_spot_trading_start": {
+      "statement": "OKX announced that BONK/USDT spot trading was scheduled to open at 06:00 UTC on 2024-01-08.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Listing schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The shared official announcement directly names both market pairs; deposit and withdrawal times are excluded."
+  ]
+}

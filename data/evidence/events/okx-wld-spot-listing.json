@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/en-gb/help/okx-will-launch-wld-usdt-at-09-20am-july-24-2023-utc",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "OKX will launch WLD/USDT at 09:20am July 24, 2023 (UTC)",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX's exact-time follow-up announced that WLD/USDT spot trading was scheduled to open at 09:20 UTC on 2023-07-24.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Listing schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "This exact-time follow-up is used instead of the earlier conditional notice that did not state a trading clock time."
+  ]
+}

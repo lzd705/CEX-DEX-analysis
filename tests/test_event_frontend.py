@@ -75,8 +75,8 @@ class EventFrontendTest(unittest.TestCase):
         self.assertIn("overflow: visible", freshness_rule.group(1))
         self.assertIn("white-space: normal", freshness_rule.group(1))
         self.assertIn("#freshness { min-width: 0; overflow-wrap: anywhere; }", mobile)
-        self.assertIn("/styles.css?v=20260729-events-v2", index)
-        self.assertIn("/app.js?v=20260729-events-v2", index)
+        self.assertIn("/styles.css?v=20260729-events-v3", index)
+        self.assertIn("/app.js?v=20260729-events-v3", index)
 
     def test_event_route_round_trips_lifecycle_filter(self):
         node = shutil.which("node")
@@ -110,7 +110,8 @@ console.log(JSON.stringify({{ parsed, built }}));
             r"""
 const ids = [
   "events-count", "events-occurred", "events-scheduled",
-  "events-source-count", "events-body", "events-status", "events-error",
+  "events-source-count", "events-token-coverage",
+  "events-body", "events-status", "events-error",
 ];
 const elements = Object.fromEntries(ids.map((id) => [id, {
   textContent: "",
@@ -128,6 +129,12 @@ const available = {
   query: { token: "STRK", lifecycle: null },
   event_count: 1,
   lifecycle_counts: { occurred: 1 },
+  coverage: {
+    configured_token_count: 30,
+    covered_token_count: 30,
+    uncovered_tokens: [],
+    query_token_has_published_fact: true,
+  },
   events: [{
     revision: 1,
     token_symbol: "STRK",
@@ -159,6 +166,7 @@ const available = {
 renderEventFacts(available);
 const availableState = {
   count: elements["events-count"].textContent,
+  tokenCoverage: elements["events-token-coverage"].textContent,
   html: elements["events-body"].innerHTML,
   status: elements["events-status"].textContent,
 };
@@ -187,6 +195,7 @@ console.log(JSON.stringify({ availableState, emptyState, unavailableState }));
         )
 
         self.assertEqual(result["availableState"]["count"], "1")
+        self.assertEqual(result["availableState"]["tokenCoverage"], "30 / 30")
         self.assertIn("&lt;verified unlock&gt;", result["availableState"]["html"])
         self.assertNotIn("<verified unlock>", result["availableState"]["html"])
         self.assertIn("docs.example.test", result["availableState"]["html"])

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260729-events-v2">
+    <link rel="stylesheet" href="/styles.css?v=20260729-events-v3">
   </head>
   <body>
     <header class="app-header">
@@ -590,6 +590,7 @@
               <p>Officially sourced unlock, airdrop claim-start, and CEX spot-listing facts for this Token, with explicit date precision, lifecycle, evidence status, and revision lineage.</p>
               <p class="metric-note">An event marker shows temporal overlap only. This page does not estimate return, market impact, sentiment, importance, or causality.</p>
               <p class="metric-note">This timeline loads the latest verified revision for each Event Fact in the current release; full revision history remains in the auditable bundle. The daily market window applies only when events are overlaid on Compare.</p>
+              <p class="metric-note"><strong>Scheduled</strong> means an official source announced the exact time but this fact set has no separate confirmation that the event occurred. A past timestamp is never promoted to occurred merely because time passed.</p>
             </div>
             <div class="segmented-control events-lifecycle-control" role="group" aria-label="Event lifecycle filter">
               <button type="button" data-event-lifecycle="all" class="active" aria-pressed="true">All</button>
@@ -622,6 +623,10 @@
             <div>
               <span>Official sources</span>
               <strong id="events-source-count">—</strong>
+            </div>
+            <div>
+              <span>Token coverage</span>
+              <strong id="events-token-coverage">—</strong>
             </div>
           </div>
 
@@ -846,7 +851,7 @@
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/navigation.js?v=20260729-events-v2"></script>
-    <script src="/app.js?v=20260729-events-v2"></script>
+    <script src="/navigation.js?v=20260729-events-v3"></script>
+    <script src="/app.js?v=20260729-events-v3"></script>
   </body>
 </html>

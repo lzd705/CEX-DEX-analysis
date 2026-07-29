@@ -126,6 +126,10 @@ class EventApiIntegrationTest(unittest.TestCase):
             },
         )
         self.assertEqual(payload["event_count"], 1)
+        self.assertEqual(payload["coverage"]["configured_token_count"], 30)
+        self.assertEqual(payload["coverage"]["covered_token_count"], 30)
+        self.assertEqual(payload["coverage"]["uncovered_tokens"], [])
+        self.assertTrue(payload["coverage"]["query_token_has_published_fact"])
         event = payload["events"][0]
         self.assertEqual(event["token_symbol"], "STRK")
         self.assertEqual(event["lifecycle"], "scheduled")
@@ -138,12 +142,19 @@ class EventApiIntegrationTest(unittest.TestCase):
 
     def test_available_empty_scope_is_distinct_from_missing_publication(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
-            no_matching_event = server.build_event_facts(token="AAVE")
+            no_matching_event = server.build_event_facts(
+                token="AAVE",
+                start="1900-01-01",
+                end="1900-01-01",
+            )
         self.assertEqual(
             no_matching_event["availability"]["status"],
             "available",
         )
         self.assertEqual(no_matching_event["event_count"], 0)
+        self.assertTrue(
+            no_matching_event["coverage"]["query_token_has_published_fact"]
+        )
 
         missing_environment = {
             **self.environment,

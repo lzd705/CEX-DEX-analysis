@@ -1,0 +1,20 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/en-gb/help/synthetix-snx-now-available",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "Synthetix (SNX) Now Available",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX states that SNX/USDT spot trading started at 07:00 UTC on 2020-07-24.",
+      "supported_lifecycle": "occurred",
+      "time_precision": "minute",
+      "source_section": "Go-live schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The canonical locale page intermittently returned a cache miss to automated fetches; the official indexed page and an official alternate locale exposed the same complete schedule.",
+    "SNX/ETH, deposit, and withdrawal times are excluded."
+  ]
+}

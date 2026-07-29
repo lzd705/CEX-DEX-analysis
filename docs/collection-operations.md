@@ -47,9 +47,10 @@ The command writes an immutable bundle under
 `data/local/events/bundles/<bundle_id>/` and atomically replaces
 `data/local/events/latest.json` only after validation. The website reads the
 selected bundle through `/api/markets/events`; it does not read the curated CSV
-directly. The committed curated input contains 17 initial reviewed records,
-but production count and coverage are whatever the currently selected bundle
-actually contains.
+directly. The committed curated input contains 44 latest reviewed facts and
+30/30 configured-Token presence coverage, but production count and coverage
+are whatever the currently selected bundle actually contains. Presence
+coverage is not a complete-history claim.
 
 This workflow records official-source timing, precision, lifecycle, evidence
 status, and revision lineage. It does not calculate event returns, impact, or
@@ -261,6 +262,9 @@ retention requirement before applying or enabling
   states.
 - When Event Facts are published, the selected bundle passes source-record,
   revision-lineage, SQLite-integrity, manifest-count, and file-hash checks.
+  The release checker requires the Event covered-token inventory to equal the
+  current Screener Token inventory, requires `uncovered_tokens=[]`, and
+  requests a non-empty scoped Event response for every covered Token.
   An unavailable Event bundle is not reported as a verified zero-event result.
 
 Funding rates, numeric account-specific CEX fees, gas, DEX V3 fixed-notional

@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dashboard.event_facts import (
     EventBundleError,
@@ -19,10 +20,12 @@ from scripts.event_facts import (
     build_event_bundle,
     effective_date_bounds,
     latest_event_rows,
+    load_allowed_cex_market_ids,
     load_allowed_tokens,
     normalize_event_rows,
     normalize_precise_time,
     read_curated_rows,
+    sha256_file,
 )
 
 
@@ -90,6 +93,16 @@ class EventFactsTest(unittest.TestCase):
         return normalize_event_rows(
             rows,
             allowed_tokens={"ARB", "MORPHO"},
+            allowed_cex_market_ids={
+                "ARB": {
+                    "cex:binance:ARB/USDT",
+                    "cex:okx:ARB/USDT",
+                },
+                "MORPHO": {
+                    "cex:binance:MORPHO/USDT",
+                    "cex:okx:MORPHO/USDT",
+                },
+            },
             record_root=self.record_root,
         )
 
@@ -185,6 +198,22 @@ class EventFactsTest(unittest.TestCase):
         ):
             self.normalize([row])
 
+    def test_source_record_can_bind_the_supported_lifecycle(self):
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        record["facts"]["schedule"]["supported_lifecycle"] = "occurred"
+        self.record_path.write_text(json.dumps(record), encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            EventFactValidationError,
+            "supported_lifecycle does not match",
+        ):
+            self.normalize([self.candidate()])
+
+        row = self.candidate()
+        row["lifecycle"] = "occurred"
+        rows = self.normalize([row])
+        self.assertEqual(rows[0]["lifecycle"], "occurred")
+
     def test_cex_listing_requires_official_market_identity_and_no_size(self):
         row = self.candidate()
         row.update(
@@ -210,6 +239,14 @@ class EventFactsTest(unittest.TestCase):
 
         row["market_id"] = "cex:okx:MORPHO"
         with self.assertRaisesRegex(EventFactValidationError, "must equal"):
+            self.normalize([row])
+
+        row["venue"] = "kraken"
+        row["market_id"] = "cex:kraken:MORPHO/USDT"
+        with self.assertRaisesRegex(
+            EventFactValidationError,
+            "not catalog-compatible",
+        ):
             self.normalize([row])
 
     def test_revision_history_is_contiguous_ordered_and_material(self):
@@ -325,6 +362,42 @@ class EventFactsTest(unittest.TestCase):
             )
         self.assertEqual(manifest["event_count"], 1)
 
+    def test_bundle_coverage_inventory_must_match_latest_rows(self):
+        input_path = self.root / "event_facts.csv"
+        output_root = self.root / "published"
+        write_csv(input_path, [self.candidate()])
+        build_event_bundle(
+            input_path,
+            record_root=self.record_root,
+            output_root=output_root,
+            token_config=DEFAULT_TOKEN_CONFIG,
+        )
+        pointer_path = output_root / "latest.json"
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        manifest_path = (
+            output_root
+            / "bundles"
+            / pointer["bundle_id"]
+            / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["covered_tokens"] = ["AAVE"]
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        pointer["manifest_sha256"] = sha256_file(manifest_path)
+        pointer_path.write_text(
+            json.dumps(pointer, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            EventBundleError,
+            "covered-token inventory",
+        ):
+            load_latest_event_rows(output_root)
+
     def test_published_revision_history_is_append_only(self):
         input_path = self.root / "event_facts.csv"
         output_root = self.root / "published"
@@ -394,32 +467,67 @@ class EventFactsTest(unittest.TestCase):
             )
             rows, _ = load_latest_event_rows(Path(output_name))
 
-        self.assertEqual(manifest["event_count"], 17)
-        self.assertEqual(manifest["revision_count"], 17)
+        self.assertEqual(manifest["event_count"], 44)
+        self.assertEqual(manifest["revision_count"], 45)
+        self.assertEqual(manifest["configured_token_count"], 30)
+        self.assertEqual(
+            manifest["covered_tokens"],
+            sorted(load_allowed_tokens(DEFAULT_TOKEN_CONFIG)),
+        )
+        self.assertEqual(manifest["uncovered_tokens"], [])
         self.assertEqual(manifest["event_type_counts"], {
-            "airdrop": 1,
-            "cex_listing": 1,
+            "airdrop": 2,
+            "cex_listing": 27,
             "unlock": 15,
         })
         self.assertEqual(manifest["lifecycle_counts"], {
-            "occurred": 9,
-            "scheduled": 8,
+            "occurred": 15,
+            "scheduled": 29,
         })
         self.assertEqual(
             manifest["evidence_status_counts"],
-            {"primary_confirmed": 17},
+            {"primary_confirmed": 44},
         )
+        source_urls = {row["source_url"] for row in rows}
+        self.assertEqual(len(source_urls), 29)
         self.assertEqual(
+            {urlsplit(url).hostname for url in source_urls},
             {
-                row["source_url"]
-                for row in rows
-            },
-            {
-                "https://docs.starknet.io/learn/protocol/strk",
-                "https://blog.eigenfoundation.org/claims-s1-p1/",
-                "https://www.okx.com/help/okx-to-list-morpho-morpho-for-spot-trading",
+                "blog.eigenfoundation.org",
+                "docs.starknet.io",
+                "optimism.io",
+                "www.binance.com",
+                "www.okx.com",
             },
         )
+        self.assertTrue(
+            {
+                "https://optimism.io/blog/let-the-claims-begin",
+                "https://www.binance.com/en/support/announcement/detail/87531c3b2e994f27a8640e903cf0443b",
+                "https://www.okx.com/en-gb/help/okx-will-list-raydium-ray-token-for-spot-trading",
+            }
+            <= source_urls,
+        )
+        lifecycle_bound_rows = [
+            row
+            for row in rows
+            if row["source_checked_at_utc"] >= "2026-07-29T09:37:30Z"
+        ]
+        self.assertEqual(len(lifecycle_bound_rows), 28)
+        for row in lifecycle_bound_rows:
+            record = json.loads(
+                (
+                    DEFAULT_RECORD_ROOT / row["source_record_file"]
+                ).read_text(encoding="utf-8")
+            )
+            located = record
+            for part in row["record_locator"].split("."):
+                located = located[part]
+            self.assertEqual(
+                located["supported_lifecycle"],
+                row["lifecycle"],
+                row["event_id"],
+            )
 
     def test_header_template_matches_builder_schema(self):
         template = (
@@ -429,8 +537,15 @@ class EventFactsTest(unittest.TestCase):
         with template.open(newline="", encoding="utf-8") as handle:
             template_columns = list(csv.DictReader(handle).fieldnames)
         self.assertEqual(template_columns, CURATED_COLUMNS)
-        self.assertEqual(len(read_curated_rows(DEFAULT_INPUT)), 17)
+        self.assertEqual(len(read_curated_rows(DEFAULT_INPUT)), 45)
         self.assertIn("STRK", load_allowed_tokens(DEFAULT_TOKEN_CONFIG))
+        self.assertEqual(
+            load_allowed_cex_market_ids(DEFAULT_TOKEN_CONFIG)["CAKE"],
+            {
+                "cex:binance:CAKE/USDT",
+                "cex:bybit:CAKE/USDT",
+            },
+        )
 
 
 if __name__ == "__main__":

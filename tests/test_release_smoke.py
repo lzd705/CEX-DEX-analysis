@@ -268,6 +268,13 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "bundle_id": "a" * 24,
             "built_at_utc": "2026-07-29T08:30:00Z",
             "availability": {"status": "available", "reason": None},
+            "coverage": {
+                "configured_token_count": 1,
+                "covered_token_count": 1,
+                "covered_tokens": ["STRK"],
+                "uncovered_tokens": [],
+                "query_token_has_published_fact": True,
+            },
             "query": {
                 "token": "STRK",
                 "start": "2026-08-15",
@@ -331,6 +338,20 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseCheckError, "does not match"):
             validate_events(
                 wrong_counts,
+                token="STRK",
+                start="2026-08-15",
+                end="2026-08-15",
+                lifecycle="scheduled",
+            )
+
+        wrong_coverage = self.event_payload()
+        wrong_coverage["coverage"]["uncovered_tokens"] = ["AAVE"]
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "coverage counts are inconsistent",
+        ):
+            validate_events(
+                wrong_coverage,
                 token="STRK",
                 start="2026-08-15",
                 end="2026-08-15",

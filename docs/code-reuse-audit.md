@@ -44,10 +44,11 @@ Source reviewed: original repository branch `feature/data-pipeline`, commit
   token taxes, and MEV remain outside the quoted-cost scope. DEX V3 execution
   is explicitly unsupported.
 - Event Facts are present as a separate manually reviewed, official-source,
-  append-only bundle and website page. The committed first set has 17 records,
-  but the runtime count comes from the latest validated bundle. These records
-  are event timing/status facts only; the old research event table and event
-  study were not reused.
+  append-only bundle and website page. The committed set has 44 latest facts
+  and at least one fact for all 30 configured Tokens, but runtime count and
+  coverage come from the latest validated bundle. These records are event
+  timing/status facts only; 30/30 presence does not imply complete event
+  history, and the old research event table and event study were not reused.
 - Funding rates, numeric account-specific CEX fees, gas facts, DEX V3
   fixed-notional execution, and event-study returns or impact are not present
   in the current Market Monitor contract.

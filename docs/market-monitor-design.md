@@ -60,9 +60,10 @@ answer “what did the event cause?” and does not calculate pre/post return,
 abnormal return, volume impact, sentiment, or importance.
 
 Event Facts are curated from official sources and published as append-only
-revisions. The repository starts with 17 reviewed records, while production
-coverage and counts are always read from the latest validated bundle selected
-by `latest.json`.
+revisions. The repository contains 44 latest facts with at least one verified
+fact for each of the 30 configured Tokens. This is presence coverage, not a
+claim of complete event history; production coverage and counts are always
+read from the latest validated bundle selected by `latest.json`.
 
 ## Data contract
 

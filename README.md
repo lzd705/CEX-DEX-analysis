@@ -74,9 +74,11 @@ live in the ignored `data/local/` directory, or an external directory selected
 by `MARKET_DATA_DIR`. The website queries SQLite; it does not rescan all market
 CSV rows on each request. Event Facts use a separate immutable bundle under
 `data/local/events/`, selected by an atomically replaced `latest.json` pointer.
-The committed curated file currently contains 17 initial reviewed records, but
-that number is not a runtime contract: the website reports the count in the
-latest validated bundle. See `data/README.md` for the market-data lifecycle and
+The committed curated file currently contains 44 reviewed facts with at least
+one official-source fact for each of the 30 configured Tokens. This is
+Token-presence coverage, not complete historical event coverage. The website
+reports the count and covered/uncovered inventory from the latest validated
+bundle. See `data/README.md` for the market-data lifecycle and
 `docs/event-facts-contract.md` for the Event Fact lifecycle.
 The public catalog and comparison contract is documented in
 `docs/market-facts-contract.md`.

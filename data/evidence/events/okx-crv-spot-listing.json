@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/en-us/help/curve-crv-global-initial-listing-on-okx",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "Curve (CRV) Global Initial Listing on OKX",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX states that CRV/USDT spot trading started at 04:00 UTC on 2020-08-14.",
+      "supported_lifecycle": "occurred",
+      "time_precision": "minute",
+      "source_section": "Go-live schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "CRV/BTC and CRV/ETH opened one hour later and are not represented by this market-specific fact."
+  ]
+}

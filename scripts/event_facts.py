@@ -368,6 +368,43 @@ def load_allowed_tokens(path: Path = DEFAULT_TOKEN_CONFIG) -> set[str]:
     return tokens
 
 
+def load_allowed_cex_market_ids(
+    path: Path = DEFAULT_TOKEN_CONFIG,
+) -> dict[str, set[str]]:
+    """Return the exact primary/secondary CEX markets configured per token."""
+
+    required_columns = {
+        "token_symbol",
+        "cex_symbol",
+        "primary_cex",
+        "secondary_cex",
+    }
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        missing = sorted(required_columns - set(reader.fieldnames or []))
+        if missing:
+            raise EventFactValidationError(
+                f"{path.name} is missing CEX catalog columns: "
+                + ", ".join(missing)
+            )
+        markets: dict[str, set[str]] = {}
+        for row in reader:
+            token_symbol = (row.get("token_symbol") or "").strip().upper()
+            market_symbol = (row.get("cex_symbol") or "").strip()
+            if not token_symbol:
+                continue
+            configured = markets.setdefault(token_symbol, set())
+            if not market_symbol:
+                continue
+            for venue_column in ("primary_cex", "secondary_cex"):
+                venue = (row.get(venue_column) or "").strip().lower()
+                if venue:
+                    configured.add(f"cex:{venue}:{market_symbol}")
+    if not markets:
+        raise EventFactValidationError("Token configuration contains no tokens")
+    return markets
+
+
 def read_curated_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
@@ -391,6 +428,7 @@ def normalize_event_row(
     *,
     row_number: int,
     allowed_tokens: set[str],
+    allowed_cex_market_ids: Mapping[str, set[str]] | None = None,
     record_root: Path,
 ) -> dict[str, str]:
     try:
@@ -555,6 +593,19 @@ def normalize_event_row(
                 raise EventFactValidationError(
                     f"cex_listing market_id must equal {expected_market_id}"
                 )
+            if (
+                allowed_cex_market_ids is not None
+                and market_id
+                not in allowed_cex_market_ids.get(token_symbol, set())
+            ):
+                allowed = sorted(
+                    allowed_cex_market_ids.get(token_symbol, set())
+                )
+                detail = ", ".join(allowed) if allowed else "none"
+                raise EventFactValidationError(
+                    "cex_listing market_id is not catalog-compatible for "
+                    f"{token_symbol}; configured markets: {detail}"
+                )
             if amount_token or amount_usd or percent_of_supply:
                 raise EventFactValidationError(
                     "cex_listing amount fields must remain blank"
@@ -650,6 +701,21 @@ def normalize_event_row(
             raise EventFactValidationError(
                 "record_locator must resolve to a fact object with a statement"
             )
+        supported_lifecycle = _clean_text(
+            located_fact.get("supported_lifecycle"),
+            field="source_record fact supported_lifecycle",
+        ).lower()
+        if supported_lifecycle:
+            if supported_lifecycle not in LIFECYCLES:
+                raise EventFactValidationError(
+                    "source_record fact supported_lifecycle must be one of "
+                    + ", ".join(sorted(LIFECYCLES))
+                )
+            if supported_lifecycle != lifecycle:
+                raise EventFactValidationError(
+                    "source_record fact supported_lifecycle does not match "
+                    "the curated lifecycle"
+                )
         recorded_at, recorded_time = _parse_utc_second(
             candidate.get("recorded_at_utc"),
             field="recorded_at_utc",
@@ -793,6 +859,7 @@ def normalize_event_rows(
     candidates: Iterable[Mapping[str, Any]],
     *,
     allowed_tokens: set[str],
+    allowed_cex_market_ids: Mapping[str, set[str]] | None = None,
     record_root: Path,
     allow_empty: bool = False,
 ) -> list[dict[str, str]]:
@@ -801,6 +868,7 @@ def normalize_event_rows(
             candidate,
             row_number=row_number,
             allowed_tokens=allowed_tokens,
+            allowed_cex_market_ids=allowed_cex_market_ids,
             record_root=record_root,
         )
         for row_number, candidate in enumerate(candidates, start=2)
@@ -1055,9 +1123,12 @@ def build_event_bundle(
     record_root = record_root.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
     candidates = read_curated_rows(input_path)
+    allowed_tokens = load_allowed_tokens(token_config)
+    allowed_cex_market_ids = load_allowed_cex_market_ids(token_config)
     rows = normalize_event_rows(
         candidates,
-        allowed_tokens=load_allowed_tokens(token_config),
+        allowed_tokens=allowed_tokens,
+        allowed_cex_market_ids=allowed_cex_market_ids,
         record_root=record_root,
     )
     enforce_append_only_revisions(
@@ -1065,6 +1136,8 @@ def build_event_bundle(
         rows,
     )
     latest = latest_event_rows(rows)
+    covered_tokens = sorted({row["token_symbol"] for row in latest})
+    uncovered_tokens = sorted(allowed_tokens - set(covered_tokens))
     bundle_id = _bundle_identity(rows)
     bundles_root = output_root / "bundles"
     bundle_path = bundles_root / bundle_id
@@ -1093,7 +1166,10 @@ def build_event_bundle(
                 },
                 "revision_count": len(rows),
                 "event_count": len(latest),
-                "token_count": len({row["token_symbol"] for row in latest}),
+                "token_count": len(covered_tokens),
+                "configured_token_count": len(allowed_tokens),
+                "covered_tokens": covered_tokens,
+                "uncovered_tokens": uncovered_tokens,
                 "event_type_counts": dict(
                     sorted(Counter(row["event_type"] for row in latest).items())
                 ),

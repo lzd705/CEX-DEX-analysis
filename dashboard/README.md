@@ -51,9 +51,10 @@ python3 scripts/event_facts.py --publish-local
 
 The command validates the curated revisions and evidence records, writes an
 immutable bundle under `data/local/events/bundles/`, and atomically advances
-`data/local/events/latest.json`. The committed curated input has 17 initial
-records; the page and API always report the count from the selected bundle
-rather than assuming that fixed number.
+`data/local/events/latest.json`. The committed curated input has 44 latest
+facts and 30/30 configured-Token presence coverage; this does not claim a
+complete event history. The page and API always report count and coverage from
+the selected bundle rather than assuming fixed runtime values.
 
 The Docker image uses the same contract and expects an external data volume at
 `/app/data/local`. Use a read-only mount when administrator refresh is disabled

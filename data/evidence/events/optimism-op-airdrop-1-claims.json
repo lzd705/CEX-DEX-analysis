@@ -1,0 +1,20 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://optimism.io/blog/let-the-claims-begin",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "Let the Claims Begin",
+  "publisher": "Optimism",
+  "facts": {
+    "claim_start": {
+      "statement": "Optimism states on 2022-05-31 that OP Airdrop #1 is live and eligible recipients can claim.",
+      "supported_lifecycle": "occurred",
+      "time_precision": "day",
+      "source_section": "Ready, set, claim!"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The page's broader incentive-program amount is not assigned to this claim-opening fact.",
+    "Day precision is retained because the official page does not publish a UTC claim-opening clock time."
+  ]
+}

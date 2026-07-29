@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/en-gb/help/okx-to-list-zksync-zk-for-spot-trading",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "OKX to list ZKsync (ZK) for spot trading",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX announced that ZKsync's ZK/USDT spot trading was scheduled to open at 08:00 UTC on 2024-06-18.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Listing schedule"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The source's ZKsync name and contract address distinguish this asset from other tokens that have used the ZK ticker."
+  ]
+}
