@@ -15,15 +15,18 @@ SHA 与 Event bundle ID。
 ### Release identity
 
 - Remote：`https://github.com/lzd705/CEX-DEX-analysis.git`
-- Branch：`codex/event-source-coverage`
+- Branch：`codex/critical-quality-sorting-token-refresh`
 - Deployed application SHA：
-  `3524528b5160f441d0312c66504706377230ff1f`
-- Deployed application commit：
-  `feat(events): cover all configured tokens with official facts`
+  `ba428b92f298433a18d871e1f9c68d886460cbe7`
+- Feature commit：
+  `349fa849a4a239de2748c45a33fcd21a11d8856f`
+  (`feat(dashboard): add configurable ranking and recoverable data quality`)
+- Runtime compatibility commit：
+  `ba428b92f298433a18d871e1f9c68d886460cbe7`
+  (`test(runtime): enforce Python 3.8 grammar across test suite`)
 - Server checkout SHA：
-  `3524528b5160f441d0312c66504706377230ff1f`
-- Report evidence commit message：
-  `docs(report): record 30-token Event coverage deployment`
+  `ba428b92f298433a18d871e1f9c68d886460cbe7`
+- Report evidence commit message：`docs(report): record critical quality release evidence`
 - Report evidence SHA：不在文件内部自指；以本分支的 `git log -1` 和最终交接记录为准。
 - PR：none；当前交付是远端新分支，不是已合并主分支。
 
@@ -31,53 +34,70 @@ SHA 与 Event bundle ID。
 
 | Commit | Message | Push comment |
 | --- | --- | --- |
-| `bccdbd1af00c86d6ce4fe537d4b37d0fe265fa15` | `feat(dashboard): add Compare charts and source-backed Event Facts` | Publish the verified Compare charts, five-page Events workflow, Event bundle/API gates, and CEX fee fail-closed rules for production validation. |
-| `5317ecb5fda3c8487bea58e5a5f0380fd6227cda` | `test(runtime): skip JavaScript checks when Node is unavailable` | Make deployment-host test results truthful: run all Python 3.8 checks and explicitly skip only Node-dependent frontend tests; browser smoke remains mandatory. |
-| `c102a78ce50370707c6996aaa164390a4ac39a6c` | `test(events): honor missing Node in route regression` | Close the last deployment-host Node availability gap so Python 3.8 release tests finish with explicit frontend skips, followed by mandatory live-browser QA. |
-| `de175084c4c763182730a2222025f2e498f18759` | `fix(mobile): keep primary navigation and workspace count readable` | Publish the 320px navigation/readability fix found during live browser QA and correct the five-page workspace copy. |
-| `38cedaa034fa7bfbed02ef962e8d4d8332ab98d8` | `test(mobile): scope responsive header assertions` | Publish selector-safe mobile navigation behavior and rule-scoped regression checks before production deployment. |
-| `3524528b5160f441d0312c66504706377230ff1f` | `feat(events): cover all configured tokens with official facts` | Publish verified 30-token Event coverage, lifecycle safeguards, and catalog-wide release checks. |
+| `349fa849a4a239de2748c45a33fcd21a11d8856f` | `feat(dashboard): add configurable ranking and recoverable data quality` | Publish configurable fact ranking, contract-address DEX onboarding, reason-coded daily quality gates, exact retry windows, and hardened collection/deployment paths for production verification. |
+| `ba428b92f298433a18d871e1f9c68d886460cbe7` | `test(runtime): enforce Python 3.8 grammar across test suite` | Publish the Python 3.8-compatible test rewrite and repository-wide grammar gate discovered by deployment-host validation. |
 
 ### Deployment environment
 
 - Public demo URL：`http://43.156.102.166:8765`
-- 部署完成：2026-07-29 10:10:02 UTC / 18:10:02 HKT
-- 最终服务器证据检查：2026-07-29 10:20:51 UTC / 18:20:51 HKT
+- 应用重启完成：2026-07-29 16:50:01 UTC / 2026-07-30 00:50:01 HKT
+- 最终服务器证据检查：2026-07-29 16:55:42 UTC / 2026-07-30 00:55:42 HKT
 - Runtime：Python 3.8.10
 - Supervisor：systemd user service `cex-dex-dashboard.service`
 - ExecStart：
   `/usr/bin/python3 dashboard/server.py --host 10.3.0.6 --port 8765`
 - 环境定位：demo/staging；当前是裸 HTTP/IP，没有 reverse proxy 或 HTTPS。
-- Public admin：`/admin.html -> 404`；`/api/admin/status -> 404`。
+- Public admin：`/admin.html -> 404`；`/api/admin/session -> 404`。
 
 ### Tests and live checks
 
 - Local complete suite，Python 3.13.5：
-  `python3 -m unittest discover -s tests -p 'test_*.py'`
-  → 运行 340 项，0 skipped，0 failed，0 errors。
-- Server suite，Python 3.8.10：同一命令运行 340 项；
-  29 个 Node-dependent frontend tests 明确 skipped，
+  `python3 -m unittest discover -s tests`
+  → 运行 464 项，0 skipped，0 failed，0 errors。
+- Local dashboard suite：45/45 passed；三个 JavaScript 文件 `node --check`
+  和 `git diff --check` 均通过。
+- Server suite，Python 3.8.10：同一命令运行 464 项；
+  40 个 Node-dependent frontend tests 明确 skipped，
   0 failed，0 errors。服务器没有 Node，因此真实浏览器 smoke 是必须的补充，
   不能把 skipped 写成“全部通过”。
+- 所有 `dashboard/`、`deploy/`、`scripts/` 和 `tests/` Python 文件都进入
+  Python 3.8 grammar regression gate；这条 gate 是部署服务器发现测试语法问题后
+  新增的，而不是事先假定兼容。
 - `/health`：`status=ok`、`data_ready=true`、`data_status=current`。
 - Release checker：passed；30 Token、493 catalog markets、
-  `data_generation=f0408687aa056557e3711f9383755c82c85f92799081c35d514ef6a6a2c26345`、
+  `data_generation=7cb55378bd9bfed5f8238d5be1f9c997c5d9729bb10741341aa3789b7728a05d`、
   44 latest Event Facts、30/30 Token presence coverage、Event bundle
   `236accecf312dc79ca6f8630`；release checker 逐个请求 30 个 Token，均返回至少一条记录。
 - Desktop browser：Screener、Markets、Compare、Liquidity & Execution、
-  Events、Data Quality 六条公开路由均可加载；没有可见 error state，
+  Events、Data Quality 六条公开路由和新的排序/质量状态均可加载；没有可见 error state，
   捕获到的 page/console/unhandled-rejection errors 为 0，页面横向溢出为 0。
-- Interaction smoke：warning 原因悬停、Price/Spread/Volume 切换、
-  Event tooltip、SPA workspace 跳转和 lifecycle URL 持久化均通过；本次 release
-  另行检查 LINK、MORPHO revision 2、OP、JTO、UNI、STRK 的 Events 页面和 Token 切换。
-- 320 px browser：document/body 横向溢出为 0；三个顶部导航完整位于 viewport；
-  freshness 完整换行；五个 workspace tabs 可用；Event 五张覆盖卡单列显示，
-  `TOKEN COVERAGE 30 / 30` 可读。STRK 默认 30 日 Compare 窗口实测 1 个 Event
-  overlay；overlay 数量取决于 Token 和窗口，不能写成全局固定值。
-- 官方页面 browser spot-check：UNI/OKX、LINK/Binance、OP/Optimism、
-  RAY/OKX 四页均公开加载，页面标题与正文包含对应事实。
-- 本次 Event coverage release 未关闭 P0：none。
-- 本次 Event coverage release 未关闭 P1：none。
+- Interaction smoke：自定义 metric/scope/direction 排序、URL 状态、非法日期阻止、
+  旧 Methodology 跳转、Market B warning 原因浮层和 Data Quality deep link 均通过。
+- 320 px browser：document/body 横向溢出为 0；顶部导航、日期+Apply、排序 toolbar
+  和 30 行 Token 表均落在 viewport 内。
+- Admin 在 loopback 测试环境中读取到精确 retry/backfill 队列和 manual-review
+  队列；真实 AAVE 合约地址解析为 8 个通过 identity 检查的 pools。真实 API
+  测试发现并修复了 Uniswap v4 32-byte pool key 被误判为 20-byte EVM contract
+  address 的问题。
+- 公网 Admin 仍关闭：`/admin.html -> 404`、`/api/admin/session -> 404`。
+- 本次 critical-quality release 未关闭 P0：none；未关闭 P1：none。
+
+### Daily quality publication
+
+- `schema=fact_quality_report/v1`；
+  `publication.import_run_id=e6ee5e1fd0f0485a829fbb909479bb66`，与当前 SQLite
+  storage identity 一致。
+- audit date：2026-07-29；latest completed UTC day：2026-07-28。
+- hard invalid：0；最新 D-1 gap：0。
+- historical missing：803 个 market-date；合并为 158 个精确 backfill 窗口，
+  涉及 21 个 Token。这批旧历史数据没有对应 collection-attempt ledger，因此原因是
+  `missing_unexplained`，只能称为待回填，不能假装已证明是网络失败或来源无数据。
+- manual review：2 条，分别是 GRT Arbitrum pool lifecycle 不明和 Upbit LDO
+  market lifecycle 不明。两者只进入人工 primary-source 复核队列，不进入自动重拉。
+- 对排序里最显眼的两个 `$0` CEX ±100 bps depth 做了人工 snapshot 检查：
+  HTX 1INCH 与 RAY 的 quoted spread 分别约 328.62 bps 与 292.46 bps，
+  两边最佳报价都在 ±100 bps band 之外，因此 `$0` 是可解释的当时市场状态，
+  不是缺失值或解析成零。
 
 ### 当前运行数据快照
 
@@ -87,10 +107,10 @@ SHA 与 Event bundle ID。
 | CEX daily | 66,015 rows；30 Token；12 exchanges | 2026-01-16 至 2026-07-28 |
 | DEX daily | 28,763 rows；30 Token；147 physical pools | 2025-05-14 至 2026-07-28 |
 | TVL latest | 148 rows：148 observed；147 physical pools | 2026-07-29 01:06:20–01:09:09 UTC |
-| CEX depth latest | 344 rows：339 observed、3 partial、2 failed | 2026-07-29 10:05:43–10:07:36 UTC |
-| DEX depth latest | 148 rows：84 observed、64 unsupported；147 physical pools | 2026-07-29 10:09:24–10:10:54 UTC |
-| CEX execution latest | 3,440 rows：2,887 observed、533 partial、20 failed | 2026-07-29 10:05:43–10:07:36 UTC |
-| DEX execution latest | 1,480 rows：159 observed、31 partial、1,290 unsupported | 2026-07-29 10:09:24–10:10:54 UTC |
+| CEX depth latest | 344 rows：338 observed、4 partial、2 failed | 2026-07-29 16:05:43–16:07:37 UTC |
+| DEX depth latest | 148 rows：84 observed、64 unsupported；147 physical pools | 2026-07-29 16:09:26–16:11:01 UTC |
+| CEX execution latest | 3,440 rows：2,873 observed、547 partial、20 failed | 2026-07-29 16:05:43–16:07:37 UTC |
+| DEX execution latest | 1,480 rows：159 observed、31 partial、1,290 unsupported | 2026-07-29 16:09:26–16:10:57 UTC |
 | Event latest | 44 facts / 45 revisions；30/30 Token presence；15 occurred、29 scheduled；44 primary_confirmed | bundle `236accecf312dc79ca6f8630` |
 
 148 条 DEX market series 对应 147 个 physical pools，因为 catalog/API 使用
@@ -539,10 +559,10 @@ CEX depth/execution → 临时 GeckoTerminal DEX USD-price refresh
                     → DEX depth/execution
 ```
 
-截至 2026-07-29 10:20:51 UTC，两个 systemd user timers 均为 active：
+截至 2026-07-29 16:55:42 UTC，两个 systemd user timers 均为 active：
 
-- `cex-dex-depth.timer`：上次 2026-07-29 10:05:43 UTC；
-  下次 2026-07-29 11:05:00 UTC。
+- `cex-dex-depth.timer`：上次 2026-07-29 16:05:43 UTC；
+  下次 2026-07-29 17:05:00 UTC。
 - `cex-dex-daily.timer`：上次 2026-07-29 00:30:43 UTC；
   下次 2026-07-30 00:30:00 UTC。
 
@@ -617,41 +637,42 @@ Event Fact 没有伪装成 hourly feed。它的 freshness 是 source-check fresh
 ### 本次发布证据摘要
 
 ```text
-Deployed app SHA:   3524528b5160f441d0312c66504706377230ff1f
-Server checkout:    3524528b5160f441d0312c66504706377230ff1f
-Test command:       python3 -m unittest discover -s tests -p 'test_*.py'
-Local tests:        340 run / 0 skipped / 0 failed / 0 errors
-Server tests:       340 run / 29 Node-dependent skipped / 0 failed / 0 errors
+Deployed app SHA:   ba428b92f298433a18d871e1f9c68d886460cbe7
+Server checkout:    ba428b92f298433a18d871e1f9c68d886460cbe7
+Test command:       python3 -m unittest discover -s tests
+Local tests:        464 run / 0 skipped / 0 failed / 0 errors
+Server tests:       464 run / 40 Node-dependent skipped / 0 failed / 0 errors
+Local frontend:     45 run / 0 failed / 0 errors
 Health:             ok / data_ready=true / current
 Release checker:    passed / 30 Token / 493 markets / 44 Event facts / 30 covered
-Browser smoke:      representative Event routes + lifecycle + Token switch + 320 px passed
+Browser smoke:      ranking + date validation + quality reasons + tooltip + 320 px passed
 Public demo URL:    http://43.156.102.166:8765
-Data generation:    f0408687aa056557e3711f9383755c82c85f92799081c35d514ef6a6a2c26345
+Data generation:    7cb55378bd9bfed5f8238d5be1f9c997c5d9729bb10741341aa3789b7728a05d
 Event bundle ID:    236accecf312dc79ca6f8630
-Public admin:       /admin.html 404 / /api/admin/status 404
+Daily quality:      0 hard invalid / 0 D-1 gaps / 803 historical gaps / 2 manual
+Public admin:       /admin.html 404 / /api/admin/session 404
 ```
 
 测试结果对应 deployed application SHA；汇报材料本身随后以 docs-only commit
 进入同一分支，因此 branch HEAD 可以晚于服务器 application SHA。
 
-### 单次 release-checker 延迟样本
+### Release-checker 冷启动与预热延迟样本
 
-| Endpoint | 单次 elapsed |
-| --- | ---: |
-| `/health` | 306.20 ms |
-| summary | 1,248.93 ms |
-| token catalog | 1,913.67 ms |
-| full catalog | 1,942.64 ms |
-| all events | 312.79 ms |
-| scoped Event endpoints | 多数约 280–320 ms；本轮最慢 1,303.11 ms |
-| compare | 482.25 ms |
-| quality | 303.10 ms |
-| execution | 327.58 ms |
+| Endpoint | 服务重启后首次 | 预热后 |
+| --- | ---: | ---: |
+| `/health` | 1,361.06 ms | 5.09 ms |
+| summary | 3,002.44 ms | 11.79 ms |
+| AAVE token catalog | 628.92 ms | 8.45 ms |
+| full catalog | 57.49 ms | 62.82 ms |
+| all events | 8.77 ms | 8.71 ms |
+| compare | 8.07 ms | 7.71 ms |
+| quality | 55.68 ms | 7.80 ms |
+| execution | 27.51 ms | 26.55 ms |
 
-这只是一次公开入口 release-checker latency sample，不是 load test，也不能证明并发
-吞吐。部署后第一次完整 catalog 请求曾观察到约 12.65 秒；后续本轮样本为
-1.94 秒，payload 仍约 1.45 MB raw / 170 KB gzip。它说明单进程 cold-build、
-catalog 体积和公网路径仍是性能瓶颈；缓存后的单次结果不能被包装成低延迟能力。
+这两组是服务器内部单次 release-checker latency sample，不是并发 load test。
+首次 `/health`、summary 和 Token catalog 包含单进程 cache build；预热后明显下降。
+Full catalog 仍约 1.48 MB raw / 176 KB gzip，是当前最大的公开 payload；
+其 57–63 ms 服务器内样本不能外推为公网或高并发 SLA。
 
 ## 明确边界
 
@@ -683,8 +704,12 @@ catalog 体积和公网路径仍是性能瓶颈；缓存后的单次结果不能
 22. DEX execution CSV 的历史 machine enum `included_protocol_fee` 实际语义是
     pool swap fee；网站已经只显示 “pool swap fee”。这个 legacy schema label
     应在独立兼容迁移中清理，不能解释成协议金库收取的 protocol fee。
-23. 完整 catalog 首次公开请求曾约 12.65 秒，后续样本约 1.94 秒；当前没有并发
-    load-test 证据。
+23. 当前只有单请求冷/热延迟样本，没有并发 load-test 或容量 SLA 证据；
+    最大 full catalog payload 仍约 1.48 MB raw / 176 KB gzip。
+24. Daily quality 的 803 个历史缺失点来自旧数据且没有对应 attempt ledger，
+    当前只能归类为 `missing_unexplained/backfill_pending`，不能反推为来源无数据。
+25. Manual Review 当前是只读队列；reviewer、evidence、disposition 和 checked time
+    仍需按 runbook 在系统外记录，尚未形成站内审核闭环。
 
 ## 下一阶段
 
@@ -744,7 +769,7 @@ catalog 体积和公网路径仍是性能瓶颈；缓存后的单次结果不能
 
 ### Q11：数据多久更新一次？
 
-截至 2026-07-29 10:20:51 UTC，demo/staging 部署服务器上的
+截至 2026-07-29 16:55:42 UTC，demo/staging 部署服务器上的
 `cex-dex-daily.timer`
 和 `cex-dex-depth.timer` 都是 active：daily OHLCV 与 TVL 每日 00:30 UTC，
 depth/execution 每小时第 05 分更新。timer 状态会变化，所以每次正式展示仍要用
@@ -785,6 +810,6 @@ CSV 是人工审阅和跨工具审计格式；SQLite 是网站的索引查询层
 checkout SHA、服务器 Python preflight、local/server 两套测试、`/health`、
 release checker、运行 `data_generation`、Event `bundle_id` 和浏览器 smoke。
 本次 application SHA 与 server checkout 都是
-`3524528b5160f441d0312c66504706377230ff1f`。汇报文档是随后单独提交的
+`ba428b92f298433a18d871e1f9c68d886460cbe7`。汇报文档是随后单独提交的
 docs-only commit，所以 branch HEAD 晚于服务器 application SHA 是有意设计，
 不是版本不一致。
