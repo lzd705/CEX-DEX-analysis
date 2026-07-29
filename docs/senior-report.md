@@ -15,15 +15,15 @@ SHA 与 Event bundle ID。
 ### Release identity
 
 - Remote：`https://github.com/lzd705/CEX-DEX-analysis.git`
-- Branch：`codex/compare-events-report-ready`
+- Branch：`codex/event-source-coverage`
 - Deployed application SHA：
-  `38cedaa034fa7bfbed02ef962e8d4d8332ab98d8`
+  `3524528b5160f441d0312c66504706377230ff1f`
 - Deployed application commit：
-  `test(mobile): scope responsive header assertions`
+  `feat(events): cover all configured tokens with official facts`
 - Server checkout SHA：
-  `38cedaa034fa7bfbed02ef962e8d4d8332ab98d8`
+  `3524528b5160f441d0312c66504706377230ff1f`
 - Report evidence commit message：
-  `docs(report): record verified Compare and Event release`
+  `docs(report): record 30-token Event coverage deployment`
 - Report evidence SHA：不在文件内部自指；以本分支的 `git log -1` 和最终交接记录为准。
 - PR：none；当前交付是远端新分支，不是已合并主分支。
 
@@ -36,12 +36,13 @@ SHA 与 Event bundle ID。
 | `c102a78ce50370707c6996aaa164390a4ac39a6c` | `test(events): honor missing Node in route regression` | Close the last deployment-host Node availability gap so Python 3.8 release tests finish with explicit frontend skips, followed by mandatory live-browser QA. |
 | `de175084c4c763182730a2222025f2e498f18759` | `fix(mobile): keep primary navigation and workspace count readable` | Publish the 320px navigation/readability fix found during live browser QA and correct the five-page workspace copy. |
 | `38cedaa034fa7bfbed02ef962e8d4d8332ab98d8` | `test(mobile): scope responsive header assertions` | Publish selector-safe mobile navigation behavior and rule-scoped regression checks before production deployment. |
+| `3524528b5160f441d0312c66504706377230ff1f` | `feat(events): cover all configured tokens with official facts` | Publish verified 30-token Event coverage, lifecycle safeguards, and catalog-wide release checks. |
 
 ### Deployment environment
 
 - Public demo URL：`http://43.156.102.166:8765`
-- 部署完成：2026-07-29 08:42 UTC / 16:42 HKT
-- 最终证据检查：2026-07-29 08:48:24 UTC / 16:48:24 HKT
+- 部署完成：2026-07-29 10:10:02 UTC / 18:10:02 HKT
+- 最终服务器证据检查：2026-07-29 10:20:51 UTC / 18:20:51 HKT
 - Runtime：Python 3.8.10
 - Supervisor：systemd user service `cex-dex-dashboard.service`
 - ExecStart：
@@ -53,25 +54,30 @@ SHA 与 Event bundle ID。
 
 - Local complete suite，Python 3.13.5：
   `python3 -m unittest discover -s tests -p 'test_*.py'`
-  → 338 passed，0 skipped，0 failed，0 errors。
-- Server suite，Python 3.8.10：同一命令发现 338 项；
-  309 passed，29 个 Node-dependent frontend tests 明确 skipped，
+  → 运行 340 项，0 skipped，0 failed，0 errors。
+- Server suite，Python 3.8.10：同一命令运行 340 项；
+  29 个 Node-dependent frontend tests 明确 skipped，
   0 failed，0 errors。服务器没有 Node，因此真实浏览器 smoke 是必须的补充，
   不能把 skipped 写成“全部通过”。
 - `/health`：`status=ok`、`data_ready=true`、`data_status=current`。
 - Release checker：passed；30 Token、493 catalog markets、
-  `data_generation=a442b2cc017372afde91325bb653d2b2eb474d836046c30276a4cbe91a3723c4`、
-  17 Event Facts、Event bundle `489fd1494dc8f699096a34f6`。
+  `data_generation=f0408687aa056557e3711f9383755c82c85f92799081c35d514ef6a6a2c26345`、
+  44 latest Event Facts、30/30 Token presence coverage、Event bundle
+  `236accecf312dc79ca6f8630`；release checker 逐个请求 30 个 Token，均返回至少一条记录。
 - Desktop browser：Screener、Markets、Compare、Liquidity & Execution、
   Events、Data Quality、Methodology 七条公开路由均可加载；没有可见 error state，
   捕获到的 page/console/unhandled-rejection errors 为 0，页面横向溢出为 0。
 - Interaction smoke：warning 原因悬停、Price/Spread/Volume 切换、
-  Event tooltip、SPA workspace 跳转和 lifecycle URL 持久化均通过。
+  Event tooltip、SPA workspace 跳转和 lifecycle URL 持久化均通过；本次 release
+  另行检查 LINK、MORPHO revision 2、OP、JTO、UNI、STRK 的 Events 页面和 Token 切换。
 - 320 px browser：document/body 横向溢出为 0；三个顶部导航完整位于 viewport；
-  freshness 完整换行；五个 workspace tabs 可用；Compare 90 个非重叠日期命中区和
-  3 个当前窗口 Event overlays 正常。
-- 未关闭 P0：none。
-- 未关闭 P1：none。
+  freshness 完整换行；五个 workspace tabs 可用；Event 五张覆盖卡单列显示，
+  `TOKEN COVERAGE 30 / 30` 可读。STRK 默认 30 日 Compare 窗口实测 1 个 Event
+  overlay；overlay 数量取决于 Token 和窗口，不能写成全局固定值。
+- 官方页面 browser spot-check：UNI/OKX、LINK/Binance、OP/Optimism、
+  RAY/OKX 四页均公开加载，页面标题与正文包含对应事实。
+- 本次 Event coverage release 未关闭 P0：none。
+- 本次 Event coverage release 未关闭 P1：none。
 
 ### 当前运行数据快照
 
@@ -81,11 +87,11 @@ SHA 与 Event bundle ID。
 | CEX daily | 66,015 rows；30 Token；12 exchanges | 2026-01-16 至 2026-07-28 |
 | DEX daily | 28,763 rows；30 Token；147 physical pools | 2025-05-14 至 2026-07-28 |
 | TVL latest | 148 rows：148 observed；147 physical pools | 2026-07-29 01:06:20–01:09:09 UTC |
-| CEX depth latest | 344 rows：338 observed、4 partial、2 failed | 2026-07-29 08:05:43–08:07:33 UTC |
-| DEX depth latest | 148 rows：84 observed、64 unsupported；147 physical pools | 2026-07-29 08:09:23–08:12:02 UTC |
-| CEX execution latest | 3,440 rows：2,886 observed、534 partial、20 failed | 2026-07-29 08:05:43–08:07:33 UTC |
-| DEX execution latest | 1,480 rows：159 observed、31 partial、1,290 unsupported | 2026-07-29 08:09:23–08:12:02 UTC |
-| Event latest | 17 facts：STRK 15、EIGEN 1、MORPHO 1；9 occurred、8 scheduled；17 primary_confirmed | bundle `489fd1494dc8f699096a34f6` |
+| CEX depth latest | 344 rows：339 observed、3 partial、2 failed | 2026-07-29 10:05:43–10:07:36 UTC |
+| DEX depth latest | 148 rows：84 observed、64 unsupported；147 physical pools | 2026-07-29 10:09:24–10:10:54 UTC |
+| CEX execution latest | 3,440 rows：2,887 observed、533 partial、20 failed | 2026-07-29 10:05:43–10:07:36 UTC |
+| DEX execution latest | 1,480 rows：159 observed、31 partial、1,290 unsupported | 2026-07-29 10:09:24–10:10:54 UTC |
+| Event latest | 44 facts / 45 revisions；30/30 Token presence；15 occurred、29 scheduled；44 primary_confirmed | bundle `236accecf312dc79ca6f8630` |
 
 148 条 DEX market series 对应 147 个 physical pools，因为 catalog/API 使用
 Token-perspective market identity；同一个物理 pool 可能承载两个目标 Token 视角。
@@ -150,7 +156,8 @@ latest snapshot 都采用验证后替换。
 演示前准备：
 
 - 选择一个同时有 CEX、DEX、有效深度和 Compare 日线的 Token。
-- Event Fact 演示选择事件时间落在可用 daily window 内的 Token；当前 curated 初始集包含 STRK、EIGEN 和 MORPHO，最终以当前部署 API 返回为准。
+- Event Fact 演示可先用 STRK：它在默认 daily window 有时间标记，并同时包含
+  occurred 与 scheduled；再切到 LINK 或 MORPHO，演示单记录、lifecycle 和 revision。
 - 预先确认 A/B 都属于该 Token，并确认 event marker、warning tooltip 和 Data Quality 链接可用。
 - 不使用 stale、failed 或 unsupported 结果作为“最佳市场”的结论。
 
@@ -436,26 +443,41 @@ GeckoTerminal quote-token USD observation；页面显示 price/state skew，超�
 | `airdrop` | `claim_start` | 用户第一次可以 claim 的时间 |
 | `cex_listing` | `spot_trading_start` | 现货交易开放时间，不是充值、call auction 或提币时间 |
 
-### 当前 curated 初始集
+### 当前 curated release
 
-当前 contract 中的初始验证集为 17 条 latest facts：
+当前运行 bundle `236accecf312dc79ca6f8630` 包含 44 条 latest facts、
+45 条 immutable revisions、29 个不同的官方 source URL，并覆盖 catalog 配置的
+30/30 Token：
 
 - 15 条 STRK monthly scheduled-release dates；
-- 1 条 EIGEN Season 1 Phase 1 claim start；
-- 1 条 OKX MORPHO/USDT spot trading start。
+- 其余 29 个 Token 各至少 1 条官方来源事实；
+- taxonomy 分布为 27 条 `cex_listing`、15 条 `unlock`、2 条 `airdrop`；
+- lifecycle 分布为 15 条 `occurred`、29 条 `scheduled`；
+- 44 条 latest facts 全部为 `primary_confirmed`。
 
-当前 lifecycle 为 9 条 `occurred`、8 条 `scheduled`，全部为
-`primary_confirmed`，已与运行 bundle `489fd1494dc8f699096a34f6` 核对。
-STRK 单 Token 页面是 7 条 occurred + 8 条 scheduled；全局多出的 2 条 occurred
-来自 EIGEN 和 MORPHO。STRK 条目是官方 schedule wording 支持的 schedule fact，
-不等同于 onchain transfer confirmation；EIGEN 和 MORPHO 两条发生在 2024 年，
-若 Compare 只展示当前 2026 窗口，它们不会出现。
+这里的 30/30 只表示“每个配置 Token 至少有一条已验证时间轴事实”，不表示已完整
+收录每个 Token 的所有历史 unlock、airdrop 和 listing。27 条 listing 中，只有
+6 条官方页面明确说明交易已经开始或当前可用，因而标为 `occurred`；其余 21 条是
+开盘前公告，保持 `scheduled`。即使公告时间已经过去，也不会只根据时钟自动改成
+`occurred`。
 
-当前三份 source-check record 均在 2026-07-29 07:33:00 UTC 检查：
+STRK 单 Token 页面仍是 7 条 occurred + 8 条 scheduled。其中 7 条 STRK
+`occurred` 由官方页面“have been and will be unlocked”的措辞支持，
+不是因为日期已经过去；这些仍是 schedule facts，并不等同于 onchain transfer
+confirmation。MORPHO 的 revision 1
+保留在 bundle 中；revision 2 将此前过度推断的 `occurred` 修正为
+`scheduled`，并写明 revision reason。未知金额、USD value 或 supply percentage
+保持空值，不从二级日历、搜索摘要或市场首个观测反推。
 
-- STRK：[Starknet Documentation](https://docs.starknet.io/learn/protocol/strk)
-- EIGEN：[Eigen Foundation](https://blog.eigenfoundation.org/claims-s1-p1/)
-- MORPHO：[OKX spot-listing announcement](https://www.okx.com/help/okx-to-list-morpho-morpho-for-spot-trading)
+官方来源由交易所和项目方页面组成，包括 Binance、OKX、Optimism、Eigen
+Foundation 和 Starknet。新增来源记录主要在 2026-07-29 09:37:30 UTC 检查，
+MORPHO 修订证据在 09:54:30 UTC 检查；既有 STRK/EIGEN 记录保留
+07:33:00 UTC 的检查时间。浏览器另外现场打开并核对：
+
+- UNI：[OKX listing page](https://www.okx.com/en-us/help/uniswap-uni-now-available)
+- LINK：[Binance listing page](https://www.binance.com/en/support/announcement/detail/360021982271)
+- OP：[Optimism claim page](https://optimism.io/blog/let-the-claims-begin)
+- RAY：[OKX listing page](https://www.okx.com/en-gb/help/okx-will-list-raydium-ray-token-for-spot-trading)
 
 ### 时间、来源和修订
 
@@ -500,10 +522,10 @@ CEX depth/execution → 临时 GeckoTerminal DEX USD-price refresh
                     → DEX depth/execution
 ```
 
-截至 2026-07-29 08:48:24 UTC，两个 systemd user timers 均为 active：
+截至 2026-07-29 10:20:51 UTC，两个 systemd user timers 均为 active：
 
-- `cex-dex-depth.timer`：上次 2026-07-29 08:05:43 UTC；
-  下次 2026-07-29 09:05:00 UTC。
+- `cex-dex-depth.timer`：上次 2026-07-29 10:05:43 UTC；
+  下次 2026-07-29 11:05:00 UTC。
 - `cex-dex-daily.timer`：上次 2026-07-29 00:30:43 UTC；
   下次 2026-07-30 00:30:00 UTC。
 
@@ -578,17 +600,17 @@ Event Fact 没有伪装成 hourly feed。它的 freshness 是 source-check fresh
 ### 本次发布证据摘要
 
 ```text
-Deployed app SHA:   38cedaa034fa7bfbed02ef962e8d4d8332ab98d8
-Server checkout:    38cedaa034fa7bfbed02ef962e8d4d8332ab98d8
+Deployed app SHA:   3524528b5160f441d0312c66504706377230ff1f
+Server checkout:    3524528b5160f441d0312c66504706377230ff1f
 Test command:       python3 -m unittest discover -s tests -p 'test_*.py'
-Local tests:        338 passed / 0 skipped / 0 failed / 0 errors
-Server tests:       309 passed / 29 Node-dependent skipped / 0 failed / 0 errors
+Local tests:        340 run / 0 skipped / 0 failed / 0 errors
+Server tests:       340 run / 29 Node-dependent skipped / 0 failed / 0 errors
 Health:             ok / data_ready=true / current
-Release checker:    passed
-Browser smoke:      seven public routes + interactions + 320 px passed
+Release checker:    passed / 30 Token / 493 markets / 44 Event facts / 30 covered
+Browser smoke:      representative Event routes + lifecycle + Token switch + 320 px passed
 Public demo URL:    http://43.156.102.166:8765
-Data generation:    a442b2cc017372afde91325bb653d2b2eb474d836046c30276a4cbe91a3723c4
-Event bundle ID:    489fd1494dc8f699096a34f6
+Data generation:    f0408687aa056557e3711f9383755c82c85f92799081c35d514ef6a6a2c26345
+Event bundle ID:    236accecf312dc79ca6f8630
 Public admin:       /admin.html 404 / /api/admin/status 404
 ```
 
@@ -599,19 +621,20 @@ Public admin:       /admin.html 404 / /api/admin/status 404
 
 | Endpoint | 单次 elapsed |
 | --- | ---: |
-| `/health` | 5.68 ms |
-| summary cold path | 2,848.49 ms |
-| token catalog | 607.20 ms |
-| full catalog，已受 cache 影响 | 55.78 ms |
-| events | 10.07 ms |
-| scoped events | 7.51 ms |
-| compare | 10.69 ms |
-| quality | 4.51 ms |
-| execution | 26.18 ms |
+| `/health` | 306.20 ms |
+| summary | 1,248.93 ms |
+| token catalog | 1,913.67 ms |
+| full catalog | 1,942.64 ms |
+| all events | 312.79 ms |
+| scoped Event endpoints | 多数约 280–320 ms；本轮最慢 1,303.11 ms |
+| compare | 482.25 ms |
+| quality | 303.10 ms |
+| execution | 327.58 ms |
 
-这只是一次 release-checker latency sample，不是 load test，也不能证明并发吞吐。
-summary cold path 约 2.85 秒，是当前已知性能瓶颈；缓存后的单次结果不能被包装成
-低延迟或高并发能力。
+这只是一次公开入口 release-checker latency sample，不是 load test，也不能证明并发
+吞吐。部署后第一次完整 catalog 请求曾观察到约 12.65 秒；后续本轮样本为
+1.94 秒，payload 仍约 1.45 MB raw / 170 KB gzip。它说明单进程 cold-build、
+catalog 体积和公网路径仍是性能瓶颈；缓存后的单次结果不能被包装成低延迟能力。
 
 ## 明确边界
 
@@ -630,7 +653,9 @@ summary cold path 约 2.85 秒，是当前已知性能瓶颈；缓存后的单�
 13. Funding rate 当前未采集。
 14. TVL/depth/execution 在看板上主要是 latest snapshot，不应声称已有完整历史回测面板。
 15. TVL/depth/execution 跟随已发布 catalog；full DEX OHLCV rebuild 可以重新 discovery/选择 leading pools，但仍不等于全链 pool inventory。
-16. 事件初始集覆盖有限，只能说“已收录这些官方来源事实”，不能说覆盖所有 unlock、airdrop 和 listing。
+16. Event 已完成 30/30 Token presence coverage，但每个 Token 的历史深度仍有限；
+    只能说“每个配置 Token 至少一条已验证事实”，不能说覆盖所有 unlock、
+    airdrop 和 listing。
 17. `record_sha256` 证明本项目的 source-check record 完整，不是网页永久存证。
 18. 当前后端是单进程和进程内 cache，不是低延迟撮合或实时流系统。
 19. 裸 IP/8765 不等于生产安全；正式公开需要 HTTPS reverse proxy。
@@ -641,7 +666,8 @@ summary cold path 约 2.85 秒，是当前已知性能瓶颈；缓存后的单�
 22. DEX execution CSV 的历史 machine enum `included_protocol_fee` 实际语义是
     pool swap fee；网站已经只显示 “pool swap fee”。这个 legacy schema label
     应在独立兼容迁移中清理，不能解释成协议金库收取的 protocol fee。
-23. summary cold path 单次样本约 2.85 秒；当前没有并发 load-test 证据。
+23. 完整 catalog 首次公开请求曾约 12.65 秒，后续样本约 1.94 秒；当前没有并发
+    load-test 证据。
 
 ## 下一阶段
 
@@ -649,7 +675,8 @@ summary cold path 约 2.85 秒，是当前已知性能瓶颈；缓存后的单�
 
 1. 给当前 demo 加 HTTPS reverse proxy、访问日志、限流和部署监控，形成 hardened production 入口。
 2. 为 funding rate 建立 derivative market identity、contract type、interval、annualization、settlement 和 missing-value contract，再开始采集。
-3. 扩大 Event Fact 在当前 30 Token 配置内的官方来源覆盖，并建立定期 source re-check 操作清单。
+3. 30/30 Token presence coverage 已完成；下一步建立 29 个官方页面的定期
+   source re-check，并逐 Token 补深历史，而不是把 presence 误写成完整覆盖。
 4. 继续保持 Event Fact 和 event study 分离；只有在单独定义 estimation window、event window、benchmark、overlap、multiple testing 和 revision policy 后，才进入因果或异常收益研究。
 5. 为 DEX V3 fixed-notional execution 实现协议精确整数 SwapMath 或经过项目验证的 same-block Quoter，并进一步缩短独立 USD quote 与 pool block 的时间差。
 6. 如要比较 CEX fee，先建立公开费率、用户 tier、maker/taker、VIP、返佣和时间版本规则；不能使用一个统一假设费率。
@@ -700,7 +727,7 @@ summary cold path 约 2.85 秒，是当前已知性能瓶颈；缓存后的单�
 
 ### Q11：数据多久更新一次？
 
-截至 2026-07-29 08:48:24 UTC，demo/staging 部署服务器上的
+截至 2026-07-29 10:20:51 UTC，demo/staging 部署服务器上的
 `cex-dex-daily.timer`
 和 `cex-dex-depth.timer` 都是 active：daily OHLCV 与 TVL 每日 00:30 UTC，
 depth/execution 每小时第 05 分更新。timer 状态会变化，所以每次正式展示仍要用
@@ -741,6 +768,6 @@ CSV 是人工审阅和跨工具审计格式；SQLite 是网站的索引查询层
 checkout SHA、服务器 Python preflight、local/server 两套测试、`/health`、
 release checker、运行 `data_generation`、Event `bundle_id` 和浏览器 smoke。
 本次 application SHA 与 server checkout 都是
-`38cedaa034fa7bfbed02ef962e8d4d8332ab98d8`。汇报文档是随后单独提交的
+`3524528b5160f441d0312c66504706377230ff1f`。汇报文档是随后单独提交的
 docs-only commit，所以 branch HEAD 晚于服务器 application SHA 是有意设计，
 不是版本不一致。
