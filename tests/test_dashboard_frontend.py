@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -10,9 +11,12 @@ INDEX_PATH = PROJECT_ROOT / "dashboard" / "static" / "index.html"
 
 
 def run_app_javascript(source: str):
+    node = shutil.which("node")
+    if node is None:
+        raise unittest.SkipTest("Node.js is not installed in this runtime")
     script = APP_PATH.read_text(encoding="utf-8") + "\n" + source
     completed = subprocess.run(
-        ["node", "-e", script],
+        [node, "-e", script],
         cwd=PROJECT_ROOT,
         check=True,
         capture_output=True,

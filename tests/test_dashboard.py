@@ -1,6 +1,7 @@
 import csv
 import gzip
 import json
+import shutil
 import subprocess
 import tempfile
 import time
@@ -2328,8 +2329,11 @@ assert.equal(
   "GOOD",
 );
 """
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is not installed in this runtime")
         completed = subprocess.run(
-            ["node", "-"],
+            [node, "-"],
             input=f"{app_js}\n{behavior_checks}",
             text=True,
             capture_output=True,
