@@ -44,6 +44,9 @@ class EventFrontendTest(unittest.TestCase):
         self.assertIn('page === "events"', app)
 
     def test_event_route_round_trips_lifecycle_filter(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is not installed in this runtime")
         script = f"""
 const navigation = require({json.dumps(str(NAVIGATION_PATH))});
 const parsed = navigation.parseRoute(
@@ -52,9 +55,9 @@ const parsed = navigation.parseRoute(
 );
 const built = navigation.buildWorkspacePath("STRK", "events", parsed.state);
 console.log(JSON.stringify({{ parsed, built }}));
-"""
+        """
         completed = subprocess.run(
-            ["node", "-e", script],
+            [node, "-e", script],
             cwd=PROJECT_ROOT,
             check=True,
             capture_output=True,
