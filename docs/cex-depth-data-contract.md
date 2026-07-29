@@ -75,6 +75,10 @@ Failures remain missing; they are never replaced with zero.
    conservative completeness flags.
 7. Validate exact market inventory coverage and publish the latest snapshot
    plus append-only normalized history.
+8. Before the managed commit phase starts, preflight both depth and
+   execution-cost coverage: require at least 90% current usable coverage and
+   95% retention of comparable prior `observed`/`partial` identities,
+   including the exchange-cohort gate in `collection-operations.md`.
 
 ## Files
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from scripts.run_collection_cycle import (
     build_collection_status,
     build_step_commands,
+    publication_gates_from_log,
     resolve_incremental_window,
     run_collection_cycle,
     validate_step_freshness,
@@ -212,6 +213,142 @@ class CollectionCycleTest(unittest.TestCase):
         self.assertEqual(result["steps"][0]["log_tail"], ["ok"])
         self.assertTrue(Path(result["manifest_path"]).exists())
         self.assertEqual(json.loads(latest.read_text())["status"], "succeeded")
+
+    def test_cycle_manifest_keeps_structured_publication_gate_evidence(self):
+        gate = {
+            "gate": "coverage_regression",
+            "fact_family": "dex_tvl",
+            "status": "passed",
+        }
+
+        def runner(command, log_path):
+            log_path.write_text(
+                "[1/1] source: observed\n"
+                + json.dumps({"publication_gates": {"dex_tvl": gate}}),
+                encoding="utf-8",
+            )
+            return 0
+
+        result = run_collection_cycle(
+            "tvl",
+            publish_local=False,
+            data_dir=self.data_dir,
+            run_root=self.root / "runs",
+            latest_status_path=self.root / "latest.json",
+            lock_path=self.root / "collection.lock",
+            now=NOW,
+            step_runner=runner,
+        )
+
+        self.assertEqual(
+            result["steps"][0]["publication_gates"],
+            {"dex_tvl": gate},
+        )
+
+    def test_rejected_publication_gate_is_parsed_from_traceback_log(self):
+        gate = {
+            "gate": "coverage_regression",
+            "fact_family": "cex_depth",
+            "status": "rejected",
+        }
+        log_path = self.root / "rejected.log"
+        log_path.write_text(
+            "Traceback (most recent call last):\n"
+            "CoverageRegressionError: PUBLICATION_COVERAGE_GATE="
+            + json.dumps(gate, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            publication_gates_from_log(log_path),
+            {"cex_depth": gate},
+        )
+
+    def test_rejected_bundle_keeps_every_family_report(self):
+        gates = {
+            "cex_depth": {
+                "gate": "coverage_regression",
+                "fact_family": "cex_depth",
+                "status": "passed",
+            },
+            "cex_execution_cost": {
+                "gate": "coverage_regression",
+                "fact_family": "cex_execution_cost",
+                "status": "rejected",
+            },
+        }
+        bundle = {
+            "gate": "coverage_regression_bundle",
+            "bundle": "cex_depth_execution",
+            "status": "rejected",
+            "publication_gates": gates,
+        }
+        log_path = self.root / "rejected-bundle.log"
+        log_path.write_text(
+            "CoverageRegressionError: PUBLICATION_COVERAGE_GATE="
+            + json.dumps(bundle, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(publication_gates_from_log(log_path), gates)
+
+    def test_passing_gate_is_kept_when_freshness_text_follows_json(self):
+        gate = {
+            "gate": "coverage_regression",
+            "fact_family": "cex_depth",
+            "status": "passed",
+        }
+        log_path = self.root / "trailing-text.log"
+        log_path.write_text(
+            "[1/1] source: observed\n"
+            + json.dumps({"publication_gates": {"cex_depth": gate}}, indent=2)
+            + "\nFreshness validation failed for: cex_depth\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            publication_gates_from_log(log_path),
+            {"cex_depth": gate},
+        )
+
+    def test_rejected_gate_sets_structured_cycle_error(self):
+        gate = {
+            "gate": "coverage_regression",
+            "fact_family": "dex_tvl",
+            "status": "rejected",
+        }
+
+        def runner(command, log_path):
+            log_path.write_text(
+                "CoverageRegressionError: PUBLICATION_COVERAGE_GATE="
+                + json.dumps(gate, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            return 2
+
+        result = run_collection_cycle(
+            "tvl",
+            publish_local=False,
+            data_dir=self.data_dir,
+            run_root=self.root / "runs",
+            latest_status_path=self.root / "latest.json",
+            lock_path=self.root / "collection.lock",
+            now=NOW,
+            step_runner=runner,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            result["steps"][0]["error"],
+            "Publication coverage gate rejected: dex_tvl",
+        )
+        self.assertEqual(
+            result["steps"][0]["publication_gates"],
+            {"dex_tvl": gate},
+        )
 
     def test_fail_fast_records_failed_step(self):
         def runner(command, log_path):

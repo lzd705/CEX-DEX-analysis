@@ -169,6 +169,14 @@ The execution rows reuse the corresponding depth collector's raw order-book or
 fixed-block transcript and its SHA-256 lineage.  Publication requires exact
 ten-row coverage for every current source inventory market.
 
+Depth and execution coverage are preflighted as one publication bundle. A
+coverage regression in execution blocks the matching depth commit phase. CEX
+requires 90% current usable scenario coverage; supported DEX execution
+requires 80%; both retain at least 95% of comparable prior usable scenario
+identities. Expected DEX V3 `unsupported` scenarios are excluded. After
+preflight, each latest file is an atomic replacement, but the pair is not one
+cross-file transaction; see `collection-operations.md`.
+
 This release deliberately publishes current/latest execution snapshots only.
 It does not build one unbounded hourly history CSV: at the current inventory
 size that design would add more than one hundred thousand rows per day and

@@ -18,7 +18,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import sqlite3
 import ssl
 import time
@@ -35,6 +34,11 @@ try:
     import certifi
 except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
+
+try:
+    from scripts.publication_gate import enforce_publication_coverage
+except ModuleNotFoundError:
+    from publication_gate import enforce_publication_coverage
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +59,8 @@ TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where()) if certifi else
 CURRENT_FILENAME = "dex_pool_tvl_snapshot.csv"
 LATEST_FILENAME = "dex_pool_tvl_latest.csv"
 HISTORY_FILENAME = "dex_pool_tvl_history.csv"
+MINIMUM_PUBLISHABLE_COVERAGE_BPS = 8000
+MINIMUM_BASELINE_RETENTION_BPS = 9500
 
 TVL_COLUMNS = [
     "snapshot_id",
@@ -485,6 +491,31 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def publication_coverage_gate(
+    rows: list[dict[str, str]],
+    publish_dir: Path,
+) -> dict[str, Any]:
+    latest_path = publish_dir / LATEST_FILENAME
+    baseline_rows = read_csv_rows(latest_path) if latest_path.exists() else None
+    return enforce_publication_coverage(
+        rows,
+        baseline_rows,
+        fact_family="dex_tvl",
+        identity=lambda row: (
+            row.get("token_symbol", "").strip().upper(),
+            *pool_key(
+                row.get("chain", ""),
+                row.get("pool_address", ""),
+            ),
+        ),
+        cohort=lambda row: row.get("chain", "").strip().lower(),
+        usable_statuses={"observed"},
+        valid_statuses={"observed", "missing", "not_found", "failed"},
+        minimum_candidate_usable_bps=MINIMUM_PUBLISHABLE_COVERAGE_BPS,
+        minimum_baseline_retention_bps=MINIMUM_BASELINE_RETENTION_BPS,
+    )
+
+
 def atomic_write_csv(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -515,6 +546,7 @@ def publish_snapshot(
         return result
 
     publish_dir.mkdir(parents=True, exist_ok=True)
+    publication_gate = publication_coverage_gate(rows, publish_dir)
     existing_history = read_csv_rows(publish_dir / HISTORY_FILENAME)
     merged = {
         (
@@ -543,12 +575,13 @@ def publish_snapshot(
     )
     atomic_write_csv(publish_dir / HISTORY_FILENAME, history_rows)
     atomic_write_csv(publish_dir / LATEST_FILENAME, rows)
-    shutil.copyfile(current_path, publish_dir / CURRENT_FILENAME)
+    atomic_write_csv(publish_dir / CURRENT_FILENAME, rows)
     result.update(
         {
             "latest_path": str(publish_dir / LATEST_FILENAME),
             "history_path": str(publish_dir / HISTORY_FILENAME),
             "history_row_count": len(history_rows),
+            "publication_gate": publication_gate,
         }
     )
     return result
@@ -589,6 +622,9 @@ def main() -> None:
             "failed_count": sum(row["status"] == "failed" for row in rows),
         }
     )
+    publication_gate = result.pop("publication_gate", None)
+    if publication_gate is not None:
+        result["publication_gates"] = {"dex_tvl": publication_gate}
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

@@ -71,6 +71,9 @@ default, and honors 429 backoff before retrying.
 - Inventory contains the same Token/pool keys as the published market database.
 - Every current pool has exactly one status row.
 - At least one TVL fact is observed; a total source outage fails publication.
+- At least 80% of the current inventory is observed, and at least 95% of
+  comparable previously observed pools remain observed; chain-cohort regression
+  is also gated as documented in `collection-operations.md`.
 - Observed TVL is finite and non-negative.
 - Every successful batch has a retained raw response and SHA-256.
 - Repeated publication appends history and atomically replaces only the latest

@@ -158,6 +158,15 @@ Publishing requires exactly one explicit status row per TVL-inventory
 Token/chain/pool key and at least one measured pool. Latest replacement is
 atomic; history is append-only by snapshot and pool key.
 
+Before the managed commit phase starts, both depth and execution-cost coverage
+are preflighted. Supported rows must retain at least 80% current usable
+coverage and 95% of comparable prior usable identities. Structural
+`unsupported` rows do not enter the supported denominator. The adapter
+classifier is recomputed for this gate, so a V2/V3-capable pool mislabeled
+`unsupported` cannot hide an RPC or collector failure. Each destination file
+is replaced atomically, but the two files are not one cross-file transaction.
+The full bundle/cohort semantics are in `collection-operations.md`.
+
 ## RPC endpoints
 
 RPC URLs can be overridden with `DEX_DEPTH_RPC_<CHAIN>`. Defaults are:

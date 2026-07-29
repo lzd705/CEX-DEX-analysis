@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.fetch_cex_depth import (
+    CURRENT_FILENAME,
     DEPTH_BANDS_BPS,
     EXECUTION_LATEST_FILENAME,
     HISTORY_FILENAME,
@@ -23,11 +24,13 @@ from scripts.fetch_cex_depth import (
     load_markets_from_database,
     observed_row,
     parse_book,
+    preflight_publication_bundle,
     publish_execution_snapshot,
     publish_snapshot,
     source_request,
     validate_snapshot,
 )
+from scripts.publication_gate import CoverageRegressionError
 from scripts.execution_cost import (
     EXECUTION_DIRECTIONS,
     EXECUTION_NOTIONALS_USD,
@@ -562,6 +565,254 @@ class FetchCexDepthTest(unittest.TestCase):
 
         self.assertEqual([row["snapshot_id"] for row in history], ["depth-1", "depth-2"])
         self.assertEqual([row["snapshot_id"] for row in latest], ["depth-2"])
+
+    def test_execution_regression_preflight_preserves_depth_bundle(self):
+        markets = [
+            market(token=f"T{index}", symbol=f"T{index}/USDT")
+            for index in range(20)
+        ]
+        baseline_depth = [
+            observed_row(
+                item,
+                complete_book(),
+                snapshot_id="healthy",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+            for item in markets
+        ]
+        baseline_execution = [
+            row
+            for item in markets
+            for row in execution_rows_for_book(
+                item,
+                complete_book(),
+                snapshot_id="healthy",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+        ]
+        candidate_depth = [
+            {
+                **row,
+                "snapshot_id": "degraded",
+                "observed_at": "2026-07-27T01:00:01+00:00",
+            }
+            for row in baseline_depth
+        ]
+        candidate_execution = [
+            row
+            for item in markets[:18]
+            for row in execution_rows_for_book(
+                item,
+                complete_book(),
+                snapshot_id="degraded",
+                request_started_at="2026-07-27T01:00:00+00:00",
+                response_received_at="2026-07-27T01:00:01+00:00",
+            )
+        ] + [
+            row
+            for item in markets[18:]
+            for row in failed_execution_rows(
+                item,
+                snapshot_id="degraded",
+                request_started_at="2026-07-27T01:00:00+00:00",
+                response_received_at="2026-07-27T01:00:01+00:00",
+                error=RuntimeError("venue outage"),
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            output = root / "processed"
+            published = root / "local"
+            publish_snapshot(
+                baseline_depth,
+                output_dir=output,
+                publish_dir=published,
+            )
+            publish_execution_snapshot(
+                baseline_execution,
+                expected_market_ids=[
+                    f"cex:binance:T{index}/USDT"
+                    for index in range(20)
+                ],
+                output_dir=output,
+                publish_dir=published,
+            )
+            protected_paths = [
+                published / CURRENT_FILENAME,
+                published / LATEST_FILENAME,
+                published / HISTORY_FILENAME,
+                published / EXECUTION_LATEST_FILENAME,
+            ]
+            before = {path: path.read_bytes() for path in protected_paths}
+
+            with self.assertRaises(CoverageRegressionError) as raised:
+                preflight_publication_bundle(
+                    candidate_depth,
+                    candidate_execution,
+                    published,
+                )
+
+            self.assertEqual(
+                raised.exception.report["bundle"],
+                "cex_depth_execution",
+            )
+            self.assertTrue(
+                raised.exception.report["publication_gates"]["cex_depth"][
+                    "passed"
+                ]
+            )
+            self.assertFalse(
+                raised.exception.report["publication_gates"][
+                    "cex_execution_cost"
+                ]["passed"]
+            )
+            self.assertEqual(
+                {path: path.read_bytes() for path in protected_paths},
+                before,
+            )
+
+    def test_bundle_preflight_reports_are_reused_during_commit(self):
+        depth_rows = [
+            observed_row(
+                market(),
+                complete_book(),
+                snapshot_id="depth-1",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+        ]
+        execution_rows = execution_rows_for_book(
+            market(),
+            complete_book(),
+            snapshot_id="depth-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            reports = preflight_publication_bundle(
+                depth_rows,
+                execution_rows,
+                published,
+            )
+            with patch(
+                "scripts.fetch_cex_depth.depth_publication_coverage_gate",
+                side_effect=AssertionError("gate must not be re-evaluated"),
+            ), patch(
+                "scripts.fetch_cex_depth.execution_publication_coverage_gate",
+                side_effect=AssertionError("gate must not be re-evaluated"),
+            ):
+                depth_result = publish_snapshot(
+                    depth_rows,
+                    output_dir=root / "processed",
+                    publish_dir=published,
+                    preflight_report=reports["cex_depth"],
+                )
+                execution_result = publish_execution_snapshot(
+                    execution_rows,
+                    expected_market_ids=["cex:binance:UNI/USDT"],
+                    output_dir=root / "processed",
+                    publish_dir=published,
+                    preflight_report=reports["cex_execution_cost"],
+                )
+
+        self.assertEqual(
+            depth_result["publication_gate"],
+            reports["cex_depth"],
+        )
+        self.assertEqual(
+            execution_result["publication_gate"],
+            reports["cex_execution_cost"],
+        )
+
+    def test_preflight_report_rejects_wrong_rows_directory_and_stale_baseline(self):
+        first = observed_row(
+            market(),
+            complete_book(),
+            snapshot_id="first",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+        candidate = {
+            **first,
+            "snapshot_id": "candidate",
+            "observed_at": "2026-07-27T01:00:01+00:00",
+        }
+        execution_rows = execution_rows_for_book(
+            market(),
+            complete_book(),
+            snapshot_id="candidate",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            source_dir = root / "source"
+            reports = preflight_publication_bundle(
+                [candidate],
+                execution_rows,
+                source_dir,
+            )
+
+            with self.subTest("wrong candidate rows"):
+                failed = {**candidate, "status": "failed"}
+                with self.assertRaisesRegex(ValueError, "candidate rows"):
+                    publish_snapshot(
+                        [failed],
+                        output_dir=root / "processed-wrong-rows",
+                        publish_dir=source_dir,
+                        preflight_report=reports["cex_depth"],
+                    )
+                self.assertFalse((source_dir / LATEST_FILENAME).exists())
+
+            with self.subTest("wrong publication directory"):
+                with self.assertRaisesRegex(ValueError, "baseline"):
+                    publish_snapshot(
+                        [candidate],
+                        output_dir=root / "processed-wrong-dir",
+                        publish_dir=root / "other",
+                        preflight_report=reports["cex_depth"],
+                    )
+                self.assertFalse((root / "other" / LATEST_FILENAME).exists())
+
+            publish_snapshot(
+                [first],
+                output_dir=root / "processed",
+                publish_dir=source_dir,
+            )
+            current_reports = preflight_publication_bundle(
+                [candidate],
+                execution_rows,
+                source_dir,
+            )
+            newer = {
+                **first,
+                "snapshot_id": "newer",
+                "observed_at": "2026-07-27T02:00:01+00:00",
+            }
+            publish_snapshot(
+                [newer],
+                output_dir=root / "processed",
+                publish_dir=source_dir,
+            )
+
+            with self.subTest("baseline changed after preflight"):
+                before = (source_dir / LATEST_FILENAME).read_bytes()
+                with self.assertRaisesRegex(ValueError, "baseline"):
+                    publish_snapshot(
+                        [candidate],
+                        output_dir=root / "processed-stale",
+                        publish_dir=source_dir,
+                        preflight_report=current_reports["cex_depth"],
+                    )
+                self.assertEqual(
+                    (source_dir / LATEST_FILENAME).read_bytes(),
+                    before,
+                )
 
     def test_execution_publish_replaces_latest_without_unbounded_history(self):
         book = complete_book()

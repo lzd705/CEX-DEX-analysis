@@ -21,6 +21,7 @@ from scripts.fetch_tvl import (
     rows_from_payload,
     validate_snapshot,
 )
+from scripts.publication_gate import CoverageRegressionError
 
 
 def pool(token="UNI", chain="eth", address="0xPool", dex="uniswap_v3"):
@@ -246,6 +247,73 @@ class FetchTvlTest(unittest.TestCase):
         self.assertEqual(latest[0]["tvl_usd"], "200")
         self.assertEqual(current[0]["snapshot_id"], "snapshot-2")
         self.assertEqual(set(latest[0]), set(TVL_COLUMNS))
+
+    def test_coverage_regression_preserves_every_published_tvl_file(self):
+        pools = [
+            pool(token=f"T{index}", address=f"0xPool{index}")
+            for index in range(5)
+        ]
+        baseline = rows_from_payload(
+            pools,
+            {
+                "data": [
+                    source_item(address=item["pool_address"], reserve="100")
+                    for item in pools
+                ]
+            },
+            snapshot_id="healthy",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="healthy-hash",
+        )
+        degraded = [
+            {
+                **row,
+                "snapshot_id": "degraded",
+                "observed_at": "2026-07-27T01:00:01+00:00",
+                "status": "failed" if index >= 3 else "observed",
+                "tvl_usd": "" if index >= 3 else row["tvl_usd"],
+                "error": "source outage" if index >= 3 else "",
+            }
+            for index, row in enumerate(baseline)
+        ]
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            output = root / "processed"
+            published = root / "local"
+            publish_snapshot(
+                baseline,
+                output_dir=output,
+                publish_dir=published,
+            )
+            protected_paths = [
+                published / CURRENT_FILENAME,
+                published / LATEST_FILENAME,
+                published / HISTORY_FILENAME,
+            ]
+            before = {path: path.read_bytes() for path in protected_paths}
+
+            with self.assertRaises(CoverageRegressionError):
+                publish_snapshot(
+                    degraded,
+                    output_dir=output,
+                    publish_dir=published,
+                )
+
+            self.assertEqual(
+                {path: path.read_bytes() for path in protected_paths},
+                before,
+            )
+            with (output / CURRENT_FILENAME).open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                processed = list(csv.DictReader(handle))
+            self.assertEqual(
+                {row["snapshot_id"] for row in processed},
+                {"degraded"},
+            )
 
 
 if __name__ == "__main__":

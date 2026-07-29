@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dashboard.freshness import build_source_freshness
+from scripts.publication_gate import COVERAGE_GATE_LOG_MARKER
 
 
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data/local"
@@ -408,6 +409,60 @@ def log_tail(path: Path, lines: int = 20) -> list[str]:
     return path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
 
 
+def publication_gates_from_log(path: Path) -> dict[str, Any]:
+    """Extract collector publication-gate evidence for the run manifest."""
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    payload: Any = None
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        marker_index = text.rfind(COVERAGE_GATE_LOG_MARKER)
+        if marker_index >= 0:
+            encoded = text[
+                marker_index + len(COVERAGE_GATE_LOG_MARKER):
+            ].splitlines()[0]
+            try:
+                payload = json.loads(encoded)
+            except json.JSONDecodeError:
+                payload = None
+        else:
+            fallback_report = None
+            decoder = json.JSONDecoder()
+            object_index = text.rfind("{")
+            while object_index >= 0:
+                try:
+                    candidate, _end = decoder.raw_decode(text[object_index:])
+                except json.JSONDecodeError:
+                    candidate = None
+                if isinstance(candidate, dict):
+                    if isinstance(candidate.get("publication_gates"), dict):
+                        payload = candidate
+                        break
+                    if (
+                        fallback_report is None
+                        and candidate.get("fact_family")
+                        and candidate.get("gate")
+                    ):
+                        fallback_report = candidate
+                object_index = text.rfind("{", 0, object_index)
+            if payload is None:
+                payload = fallback_report
+    if not isinstance(payload, dict):
+        return {}
+    gates = payload.get("publication_gates")
+    if isinstance(gates, dict):
+        return {
+            str(name): gate
+            for name, gate in gates.items()
+            if isinstance(gate, dict)
+        }
+    if payload.get("fact_family") and payload.get("gate"):
+        return {str(payload["fact_family"]): payload}
+    return {}
+
+
 def run_collection_cycle(
     profile: str,
     *,
@@ -501,6 +556,7 @@ def run_collection_cycle(
                         "log_path": str(log_path),
                         "log_sha256": sha256_file(log_path),
                         "log_tail": log_tail(log_path),
+                        "publication_gates": publication_gates_from_log(log_path),
                         "error": step_error,
                         "validation": {
                             "checked": False,
@@ -566,6 +622,17 @@ def run_collection_cycle(
                     "reason": "non-publishing or bounded/manual refresh",
                 }
             step_finished = utc_now()
+            publication_gates = publication_gates_from_log(log_path)
+            rejected_gates = sorted(
+                name
+                for name, gate in publication_gates.items()
+                if gate.get("status") == "rejected"
+            )
+            if exit_code != 0 and rejected_gates and step_error is None:
+                step_error = (
+                    "Publication coverage gate rejected: "
+                    + ", ".join(rejected_gates)
+                )
             result = {
                 "name": name,
                 "command": command,
@@ -580,6 +647,7 @@ def run_collection_cycle(
                 "log_path": str(log_path),
                 "log_sha256": sha256_file(log_path),
                 "log_tail": log_tail(log_path),
+                "publication_gates": publication_gates,
                 "error": step_error,
                 "validation": validation,
             }

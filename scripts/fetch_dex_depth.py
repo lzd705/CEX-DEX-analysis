@@ -25,7 +25,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import ssl
 import time
 import urllib.error
@@ -57,6 +56,12 @@ try:
         usd_price_timing,
         validate_execution_snapshot,
     )
+    from scripts.publication_gate import (
+        bind_passing_coverage_report,
+        enforce_publication_coverage,
+        enforce_publication_coverage_bundle,
+        validate_passing_coverage_report,
+    )
 except ModuleNotFoundError:
     from execution_cost import (
         EXECUTION_COST_COLUMNS,
@@ -66,6 +71,12 @@ except ModuleNotFoundError:
         status_counts as execution_status_counts,
         usd_price_timing,
         validate_execution_snapshot,
+    )
+    from publication_gate import (
+        bind_passing_coverage_report,
+        enforce_publication_coverage,
+        enforce_publication_coverage_bundle,
+        validate_passing_coverage_report,
     )
 
 
@@ -80,6 +91,28 @@ LATEST_FILENAME = "dex_depth_latest.csv"
 HISTORY_FILENAME = "dex_depth_history.csv"
 EXECUTION_CURRENT_FILENAME = "dex_execution_cost_snapshot.csv"
 EXECUTION_LATEST_FILENAME = "dex_execution_cost_latest.csv"
+MINIMUM_PUBLISHABLE_COVERAGE_BPS = 8000
+MINIMUM_BASELINE_RETENTION_BPS = 9500
+DEPTH_COVERAGE_POLICY = {
+    "thresholds": {
+        "allow_no_eligible_candidate": False,
+        "minimum_candidate_usable_bps": MINIMUM_PUBLISHABLE_COVERAGE_BPS,
+        "minimum_baseline_retention_bps": MINIMUM_BASELINE_RETENTION_BPS,
+        "minimum_cohort_baseline_count": 5,
+        "minimum_cohort_lost_count": 2,
+        "minimum_cohort_retention_bps": 5000,
+    },
+    "usable_statuses": ["observed", "partial"],
+    "excluded_statuses": ["unsupported"],
+    "valid_statuses": ["failed", "observed", "partial", "unsupported"],
+}
+EXECUTION_COVERAGE_POLICY = {
+    **DEPTH_COVERAGE_POLICY,
+    "thresholds": {
+        **DEPTH_COVERAGE_POLICY["thresholds"],
+        "allow_no_eligible_candidate": True,
+    },
+}
 
 DEPTH_BANDS_BPS = (10, 25, 50, 100)
 DEX_DEPTH_METHOD = "fixed_block_pool_state_marginal_price_band"
@@ -1949,6 +1982,140 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def normalized_depth_gate_rows(
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Count only structurally unsupported pools outside the supported floor."""
+    normalized = []
+    for source_row in rows:
+        row = dict(source_row)
+        if row.get("status") == "unsupported":
+            model, _reason = protocol_model(
+                row.get("dex", ""),
+                row.get("chain", ""),
+                row.get("pool_address", ""),
+            )
+            if model != "unsupported":
+                row["status"] = "failed"
+        normalized.append(row)
+    return normalized
+
+
+def normalized_execution_gate_rows(
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Treat unsupported V2 execution as failure; V3 remains unsupported."""
+    normalized = []
+    for source_row in rows:
+        row = dict(source_row)
+        if row.get("status") == "unsupported":
+            model, _reason = protocol_model(
+                row.get("dex", ""),
+                row.get("chain", ""),
+                row.get("pool_address", ""),
+            )
+            if model == "constant_product_v2":
+                row["status"] = "failed"
+        normalized.append(row)
+    return normalized
+
+
+def depth_publication_coverage_gate(
+    rows: list[dict[str, str]],
+    publish_dir: Path,
+) -> dict[str, Any]:
+    latest_path = publish_dir / LATEST_FILENAME
+    baseline_rows = read_csv_rows(latest_path) if latest_path.exists() else None
+    report = enforce_publication_coverage(
+        normalized_depth_gate_rows(rows),
+        (
+            normalized_depth_gate_rows(baseline_rows)
+            if baseline_rows is not None
+            else None
+        ),
+        fact_family="dex_depth",
+        identity=lambda row: (
+            row.get("token_symbol", "").strip().upper(),
+            *pool_key(
+                row.get("chain", ""),
+                row.get("pool_address", ""),
+            ),
+        ),
+        cohort=lambda row: row.get("chain", "").strip().lower(),
+        usable_statuses={"observed", "partial"},
+        excluded_statuses={"unsupported"},
+        valid_statuses={"observed", "partial", "unsupported", "failed"},
+        minimum_candidate_usable_bps=MINIMUM_PUBLISHABLE_COVERAGE_BPS,
+        minimum_baseline_retention_bps=MINIMUM_BASELINE_RETENTION_BPS,
+    )
+    return bind_passing_coverage_report(
+        report,
+        fact_family="dex_depth",
+        baseline_path=latest_path,
+    )
+
+
+def execution_publication_coverage_gate(
+    rows: list[dict[str, str]],
+    publish_dir: Path,
+) -> dict[str, Any]:
+    latest_path = publish_dir / EXECUTION_LATEST_FILENAME
+    baseline_rows = read_csv_rows(latest_path) if latest_path.exists() else None
+    report = enforce_publication_coverage(
+        normalized_execution_gate_rows(rows),
+        (
+            normalized_execution_gate_rows(baseline_rows)
+            if baseline_rows is not None
+            else None
+        ),
+        fact_family="dex_execution_cost",
+        identity=lambda row: (
+            row.get("market_id", "").strip(),
+            row.get("direction", "").strip(),
+            row.get("requested_notional_usd", "").strip(),
+        ),
+        cohort=lambda row: row.get("chain", "").strip().lower(),
+        usable_statuses={"observed", "partial"},
+        excluded_statuses={"unsupported"},
+        valid_statuses={"observed", "partial", "unsupported", "failed"},
+        allow_no_eligible_candidate=True,
+        minimum_candidate_usable_bps=MINIMUM_PUBLISHABLE_COVERAGE_BPS,
+        minimum_baseline_retention_bps=MINIMUM_BASELINE_RETENTION_BPS,
+    )
+    return bind_passing_coverage_report(
+        report,
+        fact_family="dex_execution_cost",
+        baseline_path=latest_path,
+    )
+
+
+def preflight_publication_bundle(
+    depth_rows: list[dict[str, str]],
+    execution_rows: list[dict[str, str]],
+    publish_dir: Path,
+) -> dict[str, dict[str, Any]]:
+    """Reject either coverage regression before writing either latest view."""
+    return enforce_publication_coverage_bundle(
+        (
+            (
+                "dex_depth",
+                lambda: depth_publication_coverage_gate(
+                    depth_rows,
+                    publish_dir,
+                ),
+            ),
+            (
+                "dex_execution_cost",
+                lambda: execution_publication_coverage_gate(
+                    execution_rows,
+                    publish_dir,
+                ),
+            ),
+        ),
+        bundle="dex_depth_execution",
+    )
+
+
 def atomic_write_csv(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -1997,6 +2164,7 @@ def publish_snapshot(
     *,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     publish_dir: Path | None = None,
+    preflight_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     current_path = output_dir / CURRENT_FILENAME
@@ -2006,6 +2174,24 @@ def publish_snapshot(
         return result
 
     publish_dir.mkdir(parents=True, exist_ok=True)
+    publication_gate = (
+        validate_passing_coverage_report(
+            preflight_report,
+            fact_family="dex_depth",
+            candidate_rows=normalized_depth_gate_rows(rows),
+            identity=lambda row: (
+                row.get("token_symbol", "").strip().upper(),
+                *pool_key(
+                    row.get("chain", ""),
+                    row.get("pool_address", ""),
+                ),
+            ),
+            baseline_path=publish_dir / LATEST_FILENAME,
+            expected_policy=DEPTH_COVERAGE_POLICY,
+        )
+        if preflight_report is not None
+        else depth_publication_coverage_gate(rows, publish_dir)
+    )
     history_path = publish_dir / HISTORY_FILENAME
     merged = {
         (
@@ -2034,12 +2220,13 @@ def publish_snapshot(
     )
     atomic_write_csv(history_path, history_rows)
     atomic_write_csv(publish_dir / LATEST_FILENAME, rows)
-    shutil.copyfile(current_path, publish_dir / CURRENT_FILENAME)
+    atomic_write_csv(publish_dir / CURRENT_FILENAME, rows)
     result.update(
         {
             "latest_path": str(publish_dir / LATEST_FILENAME),
             "history_path": str(history_path),
             "history_row_count": len(history_rows),
+            "publication_gate": publication_gate,
         }
     )
     return result
@@ -2051,6 +2238,7 @@ def publish_execution_snapshot(
     expected_market_ids: Iterable[str],
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     publish_dir: Path | None = None,
+    preflight_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Publication is the hard boundary: a caller cannot write a superficially
     # valid subset that omits one inventory market or one of its ten scenarios.
@@ -2070,6 +2258,22 @@ def publish_execution_snapshot(
         return result
 
     publish_dir.mkdir(parents=True, exist_ok=True)
+    publication_gate = (
+        validate_passing_coverage_report(
+            preflight_report,
+            fact_family="dex_execution_cost",
+            candidate_rows=normalized_execution_gate_rows(rows),
+            identity=lambda row: (
+                row.get("market_id", "").strip(),
+                row.get("direction", "").strip(),
+                row.get("requested_notional_usd", "").strip(),
+            ),
+            baseline_path=publish_dir / EXECUTION_LATEST_FILENAME,
+            expected_policy=EXECUTION_COVERAGE_POLICY,
+        )
+        if preflight_report is not None
+        else execution_publication_coverage_gate(rows, publish_dir)
+    )
     atomic_write_execution_csv(
         publish_dir / EXECUTION_LATEST_FILENAME,
         rows,
@@ -2079,6 +2283,7 @@ def publish_execution_snapshot(
             "execution_latest_path": str(
                 publish_dir / EXECUTION_LATEST_FILENAME
             ),
+            "publication_gate": publication_gate,
         }
     )
     return result
@@ -2133,19 +2338,28 @@ def main() -> None:
         raw_root=args.raw_root,
         sleep_seconds=max(0.0, args.sleep_seconds),
     )
+    publish_dir = DEFAULT_PUBLISH_DIR if args.publish_local else None
+    publication_gates = (
+        preflight_publication_bundle(rows, execution_rows, publish_dir)
+        if publish_dir is not None
+        else {}
+    )
     result = publish_snapshot(
         rows,
         output_dir=args.output_dir,
-        publish_dir=DEFAULT_PUBLISH_DIR if args.publish_local else None,
+        publish_dir=publish_dir,
+        preflight_report=publication_gates.get("dex_depth"),
     )
-    result.update(
-        publish_execution_snapshot(
-            execution_rows,
-            expected_market_ids=[dex_market_id(pool) for pool in pools],
-            output_dir=args.output_dir,
-            publish_dir=DEFAULT_PUBLISH_DIR if args.publish_local else None,
-        )
+    execution_result = publish_execution_snapshot(
+        execution_rows,
+        expected_market_ids=[dex_market_id(pool) for pool in pools],
+        output_dir=args.output_dir,
+        publish_dir=publish_dir,
+        preflight_report=publication_gates.get("dex_execution_cost"),
     )
+    depth_gate = result.pop("publication_gate", None)
+    execution_gate = execution_result.pop("publication_gate", None)
+    result.update(execution_result)
     counts = Counter(row["status"] for row in rows)
     result.update(
         {
@@ -2158,6 +2372,16 @@ def main() -> None:
             ),
         }
     )
+    result_publication_gates = {
+        name: gate
+        for name, gate in (
+            ("dex_depth", depth_gate),
+            ("dex_execution_cost", execution_gate),
+        )
+        if gate is not None
+    }
+    if result_publication_gates:
+        result["publication_gates"] = result_publication_gates
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

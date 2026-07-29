@@ -45,6 +45,58 @@ exits zero while its expected source remains stale is recorded as failed. A
 rate-limited or empty response therefore cannot masquerade as a successful
 refresh.
 
+## Pre-publication coverage regression gate
+
+TVL, depth, and their matching execution snapshots also pass a collector-level
+gate **before any `data/local` latest/history file is changed**. The runner's
+post-step freshness check is intentionally not used as this boundary because it
+runs after the collector exits.
+
+The gate uses these stable identities:
+
+- TVL and DEX depth: Token, normalized chain, normalized pool address;
+- CEX depth: Token, exchange, canonical CEX symbol;
+- execution cost: market ID, direction, requested USD notional.
+
+`observed` is usable for TVL. `observed` and truthful `partial` lower bounds are
+usable for depth/execution. Structurally unsupported DEX adapters are excluded
+from the supported denominator; a pool classified as V2/V3 depth-capable but
+returned as `unsupported` counts as failed coverage. DEX V3 execution remains
+structurally unsupported until exact integer swap math is implemented.
+
+| Family | Minimum current usable coverage | Minimum retention of comparable prior usable identities |
+| --- | ---: | ---: |
+| DEX TVL | 80% of current inventory | 95% |
+| CEX depth and execution | 90% of current inventory/scenarios | 95% |
+| Supported DEX depth and execution | 80% of supported inventory/scenarios | 95% |
+
+Comparisons use only identities present in both the candidate and previous
+latest snapshot. Catalog additions enter the current absolute floor but do not
+weaken prior-retention math; catalog removals do not masquerade as collection
+failures. A source cohort (TVL/DEX chain or CEX exchange) with at least five
+previous usable identities is also rejected when at least two are lost and
+retention falls below 50%. All thresholds use integer basis-point comparisons.
+
+With no previous latest file, the absolute floor still applies and the passing
+snapshot establishes the baseline. An existing empty, duplicate, malformed, or
+identity-incomplete baseline fails closed. There is no silent override and no
+mixing of old successful rows into a rejected candidate.
+
+CEX and DEX preflight depth and execution together. If either coverage check
+rejects during that bundle preflight, neither corresponding latest view is
+changed. Both family reports remain available for diagnosis. The collector
+exits nonzero, and the previous latest naturally becomes stale rather than
+being replaced with broad failure rows. Passing and rejected structured
+reports are copied into `steps[].publication_gates` in the collection
+manifest.
+
+After a passing bundle preflight, depth/history and execution latest are still
+separate atomic file replacements, not one cross-file transaction. An I/O or
+process failure after the commit phase begins is not rolled back across those
+files. The production runner lock serializes managed profiles; concurrent
+direct collector invocations with `--publish-local` are unsupported. Retained
+raw lineage and the run manifest make any interrupted publication diagnosable.
+
 The separate fact lifecycles remain explicit:
 
 - daily source CSVs are replaced individually, while the server-visible SQLite

@@ -7,10 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.fetch_dex_depth import (
+    CURRENT_FILENAME,
     DEPTH_BANDS_BPS,
     DEX_DEPTH_COLUMNS,
     EXECUTION_CURRENT_FILENAME,
     EXECUTION_LATEST_FILENAME,
+    HISTORY_FILENAME,
+    LATEST_FILENAME,
     Q96,
     SELECTOR_DECIMALS,
     SELECTOR_FEE,
@@ -32,6 +35,7 @@ from scripts.fetch_dex_depth import (
     depth_fields,
     ensure_full_publish_scope,
     encode_signed_word,
+    execution_publication_coverage_gate,
     load_pool_inventory,
     protocol_model,
     publish_execution_snapshot,
@@ -42,6 +46,7 @@ from scripts.fetch_dex_depth import (
     v2_execution_rows,
     v3_move_to_price,
 )
+from scripts.publication_gate import CoverageRegressionError
 from scripts.execution_cost import (
     EXECUTION_DIRECTIONS,
     EXECUTION_NOTIONALS_USD,
@@ -693,6 +698,42 @@ class DexDepthCollectionTest(unittest.TestCase):
             execution_rows,
         )
 
+    def test_execution_gate_excludes_only_structural_v3_unsupported(self):
+        base = {
+            "market_id": "dex:eth:0x" + "1" * 40,
+            "direction": "sell_token",
+            "requested_notional_usd": "100",
+            "chain": "eth",
+            "pool_address": "0x" + "1" * 40,
+            "status": "unsupported",
+        }
+        with self.subTest("supported V2 failure cannot be excluded"):
+            with self.assertRaises(CoverageRegressionError) as raised:
+                execution_publication_coverage_gate(
+                    [{**base, "dex": "uniswap_v2"}],
+                    self.root / "v2-gate",
+                )
+            self.assertEqual(
+                raised.exception.report["candidate"]["eligible_count"],
+                1,
+            )
+            self.assertEqual(
+                raised.exception.report["candidate"]["usable_count"],
+                0,
+            )
+
+        with self.subTest("all V3 execution can be structurally unsupported"):
+            report = execution_publication_coverage_gate(
+                [{**base, "dex": "uniswap_v3"}],
+                self.root / "v3-gate",
+            )
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["candidate"]["eligible_count"], 0)
+            self.assertEqual(
+                report["candidate"]["absolute_check"],
+                "skipped",
+            )
+
     def test_execution_calculation_failure_does_not_erase_observed_depth(self):
         with patch(
             "scripts.fetch_dex_depth.v2_execution_rows",
@@ -867,6 +908,78 @@ class DexDepthCollectionTest(unittest.TestCase):
             latest = list(csv.DictReader(handle))
         self.assertEqual([row["snapshot_id"] for row in history], ["one", "two"])
         self.assertEqual([row["snapshot_id"] for row in latest], ["two"])
+
+    def test_supported_pools_marked_unsupported_cannot_replace_latest(self):
+        baseline = []
+        for index in range(10):
+            row = {column: "" for column in DEX_DEPTH_COLUMNS}
+            row.update(
+                {
+                    "snapshot_id": "healthy",
+                    "observed_at": "2026-07-28T00:00:00+00:00",
+                    "token_symbol": f"T{index}",
+                    "chain": "eth",
+                    "dex": "uniswap_v2",
+                    "pool_address": "0x{:040x}".format(index + 1),
+                    "protocol_model": "constant_product_v2",
+                    "status": "observed",
+                }
+            )
+            baseline.append(row)
+        degraded = [
+            {
+                **row,
+                "snapshot_id": "degraded",
+                "observed_at": "2026-07-28T01:00:00+00:00",
+                "protocol_model": (
+                    "unsupported" if index < 2 else row["protocol_model"]
+                ),
+                "status": "unsupported" if index < 2 else "observed",
+                "error": (
+                    "missing_rpc_endpoint:eth" if index < 2 else ""
+                ),
+            }
+            for index, row in enumerate(baseline)
+        ]
+        published = self.root / "coverage-local"
+        output = self.root / "coverage-processed"
+        publish_snapshot(
+            baseline,
+            output_dir=output,
+            publish_dir=published,
+        )
+        protected_paths = [
+            published / CURRENT_FILENAME,
+            published / LATEST_FILENAME,
+            published / HISTORY_FILENAME,
+        ]
+        before = {path: path.read_bytes() for path in protected_paths}
+
+        with self.assertRaises(CoverageRegressionError) as raised:
+            publish_snapshot(
+                degraded,
+                output_dir=output,
+                publish_dir=published,
+            )
+
+        self.assertEqual(raised.exception.report["fact_family"], "dex_depth")
+        self.assertEqual(
+            raised.exception.report["candidate"]["eligible_count"],
+            10,
+        )
+        self.assertEqual(
+            {path: path.read_bytes() for path in protected_paths},
+            before,
+        )
+        with (output / CURRENT_FILENAME).open(
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            processed = list(csv.DictReader(handle))
+        self.assertEqual(
+            {row["snapshot_id"] for row in processed},
+            {"degraded"},
+        )
 
     def test_execution_publication_writes_current_and_replaces_latest_only(self):
         _snapshot_id, _rows, execution_rows = collect_dex_depth_with_execution(
