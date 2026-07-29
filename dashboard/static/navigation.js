@@ -15,6 +15,7 @@
     "markets",
     "compare",
     "liquidity",
+    "events",
     "quality",
   ]);
   const WORKSPACE_PAGE_SET = new Set(WORKSPACE_PAGES);
@@ -25,6 +26,14 @@
   const LIQUIDITY_VIEWS = new Set(["total", "directional"]);
   const LIQUIDITY_SCALES = new Set(["linear", "log"]);
   const QUALITY_SCOPES = new Set(["all", "selected"]);
+  const EVENT_LIFECYCLES = new Set([
+    "all",
+    "occurred",
+    "scheduled",
+    "postponed",
+    "cancelled",
+    "superseded",
+  ]);
   const PAIR_MODES = new Set(["manual"]);
   const EXECUTION_NOTIONALS = new Set([1000, 5000, 10000, 50000, 100000]);
   const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -130,6 +139,15 @@
     } else if (page === "quality") {
       const scope = firstParam(params, ["scope"]);
       if (scope !== null && QUALITY_SCOPES.has(scope)) state.scope = scope;
+    } else if (page === "events") {
+      const lifecycle = firstParam(params, ["lifecycle"]);
+      if (
+        lifecycle !== null
+        && EVENT_LIFECYCLES.has(lifecycle)
+        && lifecycle !== "all"
+      ) {
+        state.lifecycle = lifecycle;
+      }
     }
     return state;
   }
@@ -212,6 +230,10 @@
       setEnum(params, "scale", state.scale, LIQUIDITY_SCALES);
     } else if (page === "quality") {
       setEnum(params, "scope", state.scope, QUALITY_SCOPES);
+    } else if (page === "events") {
+      if (state.lifecycle !== "all") {
+        setEnum(params, "lifecycle", state.lifecycle, EVENT_LIFECYCLES);
+      }
     }
 
     return withQuery(

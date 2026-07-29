@@ -80,7 +80,7 @@ slot0, liquidity, fee, tickSpacing, tickBitmap, ticks, token0, token1
 ```
 
 It scans initialized ticks covering at least ±100 bps, integrates input/output
-amounts through every active-liquidity segment, applies the pool fee to gross
+amounts through every active-liquidity segment, applies the pool swap fee to gross
 input, and changes active liquidity when crossing an initialized tick. The
 Uniswap V3 core contract defines those state fields and follows the same
 tick-by-tick swap sequence:
@@ -115,7 +115,7 @@ TVL, daily volume, or a generic constant-product approximation.
 | --- | --- |
 | `observed` | Both sides reached all four bands from fixed-block pool state |
 | `partial` | Some measured side ran out of active liquidity before a band |
-| `unsupported` | No audited adapter exists for this chain/protocol model |
+| `unsupported` | No protocol-specific, project-validated adapter exists for this chain/protocol model |
 | `failed` | A supported adapter encountered an RPC, ABI, token, or validation error |
 
 ## USD conversion

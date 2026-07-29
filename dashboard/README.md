@@ -42,6 +42,19 @@ read-only. `MARKET_DATABASE=/srv/cex-dex/current/market_facts.sqlite3` selects
 a database explicitly. CSV remains the auditable input and fallback, not the
 normal online query layer.
 
+Event Facts are published separately after a human reviews the cited official
+sources:
+
+```bash
+python3 scripts/event_facts.py --publish-local
+```
+
+The command validates the curated revisions and evidence records, writes an
+immutable bundle under `data/local/events/bundles/`, and atomically advances
+`data/local/events/latest.json`. The committed curated input has 17 initial
+records; the page and API always report the count from the selected bundle
+rather than assuming that fixed number.
+
 The Docker image uses the same contract and expects an external data volume at
 `/app/data/local`. Use a read-only mount when administrator refresh is disabled
 and a service-account-owned writable mount when it is enabled.
@@ -75,10 +88,13 @@ CSVs and a validated SQLite database back into `data/local/`.
   common UTC date. It is independent of the workspace A/B pair.
 - Inside one Token workspace, Market A and B may be any two distinct cataloged
   markets for that Token, including CEX/CEX or DEX/DEX.
-- The selected daily window is shared across Markets, Compare, Liquidity &
-  Execution, and Data Quality links. Liquidity/depth/execution values remain
-  independently timestamped latest snapshots; preserving the window keeps the
-  workspace header and window-derived market facts consistent across pages.
+- The Token workspace has five pages: Markets, Compare, Liquidity & Execution,
+  Events, and Data Quality. The selected daily window is shared across the
+  daily-fact pages. Liquidity/depth/execution values remain independently
+  timestamped latest snapshots; preserving the window keeps the workspace
+  header and window-derived market facts consistent across pages. Events has
+  its own lifecycle filter because it is a curated timeline, not a daily
+  market series.
 - Window return uses first-to-last observed close. Daily realized volatility
   uses only adjacent UTC-day log returns; intervals across missing days are
   excluded and reported in coverage metadata.
@@ -88,11 +104,22 @@ CSVs and a validated SQLite database back into `data/local/`.
 - The shared depth column displays point-in-time CEX order-book depth for CEX
   rows and fixed-block DEX pool-state depth for supported DEX rows at
   10/25/50/100 bps. TVL is never converted into depth.
-- DEX protocols without an audited adapter display `N/A`, not a TVL-based
+- DEX protocols without a protocol-specific, project-validated adapter display `N/A`, not a TVL-based
   estimate.
 - The comparison workbench selects one Token and any two cataloged markets,
   then displays both the latest point-in-time depth profile and the independent
   unfilled daily price/volume series.
+- Compare provides selectable Price, Spread, and Volume line charts. Price and
+  Volume show both markets; Spread is the derived absolute A/B price difference
+  divided by the A/B midpoint in basis points. Missing or invalid values and
+  nonconsecutive UTC dates break a path; the frontend never interpolates or
+  forward-fills them. Market A uses circle markers and Market B uses square
+  markers, with full type/venue/instrument labels, so meaning does not depend
+  on color alone.
+- A verified Event Fact inside the displayed date interval may appear as a
+  line or precision interval on Compare. It is only a temporal overlay. The
+  chart and tooltip do not attribute a price, spread, or volume move to the
+  event and do not calculate an event return.
 - Initial A/B choices prefer markets with integrity-valid measured depth and no
   depth-relevant quality flags. The daily comparison uses those same selected
   market IDs, so its default can differ from the quality-weighted primary
@@ -133,6 +160,15 @@ CSVs and a validated SQLite database back into `data/local/`.
   and snapshot skew; it never derives cost from the four depth markers.
   Requested notionals are JSON numbers, while measured Decimal facts are exact
   base-10 strings (or `null`) to avoid silent IEEE-754 precision loss.
+- Every CEX execution row labels the trading fee
+  `excluded_unknown_account_tier`; no numeric fee is guessed or zero-filled.
+  Supported DEX V2 execution includes the pool swap fee in the captured pool
+  mechanics. “Pool swap fee” does not mean protocol treasury or revenue fee.
+- `/api/markets/events?token=...&start=...&end=...&lifecycle=...` returns the
+  latest revision of matching source-backed events, explicit time bounds and
+  precision, lifecycle, evidence status, source-check lineage, and null-safe
+  size fields. An unavailable bundle is different from an available bundle
+  with no matching records.
 
 Catalog version 2 distinguishes a stable DEX `pool_id` from a globally unique
 token-price-series `market_id`. This prevents one pool observed from both token
@@ -148,9 +184,18 @@ to avoid duplicate builds and gzip work. The summary exposes a path-free data
 generation hash so the browser can discard cached Token catalogs after a
 publication changes.
 
+Event responses also include the selected bundle pointer, manifest, and file
+hashes in their source signature. Advancing the validated `latest.json`
+therefore invalidates cached Event Facts without changing daily market files.
+
 The split primarily reduces network transfer and browser memory. Cold summary
 and Token-catalog construction still reuses the shared full fact/catalog
 builders, so backend query-level partitioning remains a separate optimization.
+
+Funding rates, numeric account-specific CEX fees, gas costs, DEX V3
+fixed-notional execution, and event-study impact/return estimates are not
+supported by this dashboard. They remain null or explicitly `unsupported`
+rather than being inferred.
 
 ## Production boundary
 

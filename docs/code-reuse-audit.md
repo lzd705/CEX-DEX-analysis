@@ -22,7 +22,7 @@ Source reviewed: original repository branch `feature/data-pipeline`, commit
 | `build_research_panel.py` | Excluded | It belongs to the research/factor workflow. |
 | `build_factors.py` | Excluded | Factors are outside Market Monitor 1.0. |
 | `build_factor_return_panel.py` | Excluded | Future-return evaluation is outside the fact-only boundary. |
-| `build_event_table.py` | Deferred | Source-backed events are valid, but events are not part of the first Market Monitor. |
+| `build_event_table.py` | Not reused | Its research table does not meet the official-source evidence, timing-precision, append-only revision, and publication-bundle contract. The current Event Fact layer was implemented separately and does not import that table. |
 | old `run_pipeline.py` | Excluded | It automatically runs research, factors, forward returns, and events. |
 
 ## Known data limitations
@@ -37,8 +37,17 @@ Source reviewed: original repository branch `feature/data-pipeline`, commit
 - CEX order-book depth is a separate latest-fetch snapshot with explicit
   truncation flags; it is not reconstructed tick history.
 - Fixed-notional quoted execution cost is present for CEX books and supported
-  DEX V2 pools. Supported DEX pool fees are included in pool mechanics; CEX
-  account fees, gas, router fees, latency, token taxes, and MEV remain outside
-  the quoted-cost scope. DEX V3 execution is explicitly unsupported.
-- Funding-rate and event facts are not present in the current Market Monitor
-  contract.
+  DEX V2 pools. Every CEX execution row explicitly records
+  `excluded_unknown_account_tier`; a numeric account fee is null, not zero.
+  Supported DEX V2 pool swap fees are included in pool mechanics. That fee is
+  not labeled as protocol treasury or revenue. Gas, router fees, latency,
+  token taxes, and MEV remain outside the quoted-cost scope. DEX V3 execution
+  is explicitly unsupported.
+- Event Facts are present as a separate manually reviewed, official-source,
+  append-only bundle and website page. The committed first set has 17 records,
+  but the runtime count comes from the latest validated bundle. These records
+  are event timing/status facts only; the old research event table and event
+  study were not reused.
+- Funding rates, numeric account-specific CEX fees, gas facts, DEX V3
+  fixed-notional execution, and event-study returns or impact are not present
+  in the current Market Monitor contract.

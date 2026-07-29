@@ -95,7 +95,7 @@ block. DEX V3 fixed-notional execution is not published by this release.
 | Source | Included | Explicitly excluded |
 | --- | --- | --- |
 | CEX | quoted spread and visible-book price impact | account-specific taker fee, lot-size rejection, latency, hidden liquidity |
-| DEX | protocol pool fee and pool-state price impact | gas, router fee, Token transfer tax, MEV, state changes after the fixed block |
+| DEX | pool swap fee and pool-state price impact | gas, router fee, Token transfer tax, MEV, state changes after the fixed block |
 
 CEX account fee tiers are not public facts for an anonymous market-data
 request.  They remain excluded and null rather than being assumed to be zero.
@@ -124,7 +124,7 @@ fill facts, fee scope, exclusions, status, reason, and error.
 | --- | --- |
 | `observed` | The exact target Token quantity was completely filled in the captured state. |
 | `partial` | The source state was valid, but the request could not be completely filled or proved within the captured level/tick guard. |
-| `unsupported` | No audited adapter exists for the venue, chain, or pool model. |
+| `unsupported` | No protocol-specific, project-validated adapter exists for the venue, chain, or pool model. |
 | `failed` | A supported adapter encountered an API, RPC, ABI, normalization, conversion, or validation failure. |
 
 Partial rows may retain filled Token quantity, fill ratio, and observed quote
@@ -146,14 +146,14 @@ is not a lower bound and must never be displayed with `>=`.
 
 Constant-product V2 pools can calculate the configured targets directly,
 subject to reserve constraints. Concentrated-liquidity V3 depth remains
-available through the separately audited +/-100 bps depth scan, but this
+available through the separately validated +/-100 bps depth scan, but this
 release does not publish V3 fixed-notional execution cost. Decimal continuous
 segment formulas are not protocol-exact integer `SwapMath` or a same-block
 Quoter result, so all V3 execution scenarios are `unsupported` with
 `exact_integer_swap_math_not_implemented` and no numeric execution fields.
 
 A later V3 execution adapter must implement stepwise protocol integer rounding
-or validate against an audited same-block Quoter. It must also retain a bounded
+or validate against a project-validated same-block Quoter. It must also retain a bounded
 scan guard and explicit partial state when the target is still not proved.
 
 ## Files and publication
@@ -193,7 +193,7 @@ claimed.
 - the canonical notional definition and all measured source, endpoint,
   timestamp, fee/conversion scope, and 64-hex raw-response hash fields exist;
 - measured DEX rows retain one coherent block number/timestamp plus target and
-  quote Token identities and decimals, the exact pool fee, and the external
+  quote Token identities and decimals, the exact pool swap fee, and the external
   Token-price snapshot lineage used to define the USD target;
 - measured DEX USD-price response time is no more than two hours from the fixed
   block time;

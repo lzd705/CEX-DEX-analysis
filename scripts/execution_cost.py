@@ -647,6 +647,38 @@ def _validate_execution_snapshot(
             raise ValueError("Execution row has wrong notional definition")
         if not row.get("status_reason"):
             raise ValueError("Execution row lacks status_reason")
+        raw_market_type = str(row.get("market_type") or "")
+        market_type = raw_market_type.strip().lower()
+        if raw_market_type != market_type or market_type not in {"cex", "dex"}:
+            raise ValueError(
+                "Execution row market_type must use canonical lowercase "
+                "'cex' or 'dex'"
+            )
+        if market_type == "cex":
+            if str(row.get("fee_status") or "") != (
+                "excluded_unknown_account_tier"
+            ):
+                raise ValueError(
+                    "CEX execution row must explicitly exclude the unknown "
+                    "account fee tier"
+                )
+            if any(
+                row.get(field) not in (None, "")
+                for field in ("fee_rate_bps", "fee_amount_usd")
+            ):
+                raise ValueError(
+                    "CEX execution row cannot publish an uncollected fee rate "
+                    "or fee amount"
+                )
+            excluded_costs = {
+                value.strip()
+                for value in str(row.get("excluded_costs") or "").split(",")
+                if value.strip()
+            }
+            if "taker_fee" not in excluded_costs:
+                raise ValueError(
+                    "CEX execution row must retain taker_fee in excluded_costs"
+                )
         if status in {"observed", "partial"}:
             missing_provenance = [
                 column
@@ -666,7 +698,7 @@ def _validate_execution_snapshot(
                 raise ValueError(
                     "Measured execution row has invalid raw_response_sha256"
                 )
-            if str(row.get("market_type") or "") == "dex":
+            if market_type == "dex":
                 missing_dex_provenance = [
                     column
                     for column in DEX_MEASURED_PROVENANCE_COLUMNS

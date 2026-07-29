@@ -71,6 +71,11 @@ from scripts.execution_cost import (
     usd_price_timing,
     validate_execution_snapshot,
 )
+from dashboard.event_facts import (
+    EventBundleError,
+    build_event_payload,
+    load_latest_event_rows,
+)
 
 DASHBOARD_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = DASHBOARD_ROOT / "static"
@@ -108,6 +113,7 @@ PUBLIC_API_QUERY_FIELDS = {
     "compare": ("token", "market_a", "market_b", "start", "end"),
     "execution_cost": ("token", "market_a", "market_b"),
     "quality": ("token", "scope", "market_a", "market_b"),
+    "events": ("token", "start", "end", "lifecycle"),
 }
 
 
@@ -115,10 +121,10 @@ class SourceGenerationChanged(FileNotFoundError):
     """Signal temporary source unavailability across one response build."""
 
 ADMIN_STATIC_PATHS = {"/admin.html", "/admin.js"}
-SPA_TOKEN_PAGES = {"markets", "compare", "liquidity", "quality"}
+SPA_TOKEN_PAGES = {"markets", "compare", "liquidity", "events", "quality"}
 SPA_TOKEN_ROUTE = re.compile(
     r"/tokens/[A-Za-z0-9][A-Za-z0-9._-]*/"
-    r"(?:markets|compare|liquidity|quality)/?"
+    r"(?:markets|compare|liquidity|events|quality)/?"
 )
 SPA_METHODOLOGY_ROUTE = re.compile(
     r"/methodology/[a-z0-9]+(?:-[a-z0-9]+)*/?"
@@ -210,6 +216,23 @@ def resolve_database_path() -> Path | None:
         if database_path.exists():
             return database_path
     return None
+
+
+def resolve_event_data_root() -> Path:
+    """Resolve the optional Event Fact publication root.
+
+    Unlike point-in-time market snapshots, absence is a valid state for this
+    independently published, manually reviewed feed.
+    """
+
+    configured_root = os.environ.get("MARKET_EVENT_DATA_DIR")
+    if configured_root:
+        try:
+            return Path(configured_root).expanduser().resolve()
+        except (OSError, RuntimeError):
+            candidate = Path(configured_root)
+            return candidate if candidate.is_absolute() else Path.cwd() / candidate
+    return (PROJECT_ROOT / "data/local/events").resolve()
 
 
 def resolve_tvl_path() -> Path | None:
@@ -2440,7 +2463,7 @@ def build_execution_cost_comparison(
             "cost_scope": (
                 "Source-mechanics quoted cost, not realized or all-in cost. "
                 "CEX account taker fees are excluded. Supported DEX V2 quotes "
-                "include protocol pool fees while gas, router fees, transfer "
+                "include pool swap fees while gas, router fees, transfer "
                 "taxes, and MEV are excluded. DEX V3 execution is explicitly "
                 "unsupported in this release."
             ),
@@ -2477,7 +2500,10 @@ QUALITY_CONTRACT_VERSION = 1
 QUALITY_STATUS_SEMANTICS = {
     "observed": "A source-backed fact is present.",
     "partial": "Only part of the requested execution or depth is proved.",
-    "unsupported": "No audited adapter exists for this market model.",
+    "unsupported": (
+        "No protocol-specific, project-validated adapter exists for this "
+        "market model."
+    ),
     "failed": "A supported collection or calculation failed.",
     "unavailable": "No current snapshot is configured or published.",
     "not_cataloged_in_snapshot": (
@@ -3045,6 +3071,134 @@ def encode_json_payload(payload: Any, accept_encoding: str = "") -> tuple[bytes,
     return raw, False
 
 
+def _safe_path_signature(path: Path) -> SourceSignature:
+    """Describe one optional source path without making it an availability gate."""
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return (
+            (
+                str(path),
+                "missing_or_unreadable",
+                0,
+                "missing_or_unreadable",
+                0,
+            ),
+        )
+    return (
+        (
+            str(path),
+            stat.st_mtime_ns,
+            stat.st_size,
+            stat.st_ctime_ns,
+            stat.st_ino,
+        ),
+    )
+
+
+def event_source_signature() -> SourceSignature:
+    """Track the independently published Event bundle without validating it.
+
+    Validation belongs only to the Event endpoint.  Keeping signature discovery
+    non-throwing ensures a damaged optional Event bundle cannot make price,
+    depth, execution, or quality APIs unavailable.
+    """
+
+    event_root = resolve_event_data_root()
+    pointer_path = event_root / "latest.json"
+    signature = list(_safe_path_signature(pointer_path))
+    try:
+        pointer_stat = pointer_path.stat()
+        if not pointer_path.is_file() or pointer_stat.st_size > 65_536:
+            return tuple(signature)
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        bundle_id = (
+            str(pointer.get("bundle_id") or "")
+            if isinstance(pointer, dict)
+            else ""
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return tuple(signature)
+    if not re.fullmatch(r"[0-9a-f]{24}", bundle_id):
+        return tuple(signature)
+    bundle_path = event_root / "bundles" / bundle_id
+    for filename in (
+        "manifest.json",
+        "event_fact_revisions.csv",
+        "event_facts_latest.csv",
+        "event_facts.sqlite3",
+    ):
+        signature.extend(_safe_path_signature(bundle_path / filename))
+    return tuple(signature)
+
+
+def build_event_facts(
+    *,
+    token: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    lifecycle: str | None = None,
+) -> dict[str, Any]:
+    """Return a validated Event bundle projection or explicit unavailability."""
+
+    event_root = resolve_event_data_root()
+    pointer_path = event_root / "latest.json"
+    try:
+        pointer_exists = pointer_path.exists()
+        pointer_is_file = pointer_path.is_file() if pointer_exists else False
+    except OSError as error:
+        raise EventBundleError("Event Fact pointer cannot be inspected") from error
+    if pointer_exists and not pointer_is_file:
+        raise EventBundleError("Event Fact pointer is not a regular file")
+
+    if not pointer_exists:
+        payload = build_event_payload(
+            [],
+            manifest={"bundle_id": None, "built_at_utc": None},
+            token=token,
+            start=start,
+            end=end,
+            lifecycle=lifecycle,
+        )
+        payload["availability"] = {
+            "status": "unavailable",
+            "reason": "event_bundle_not_published",
+        }
+        return payload
+
+    try:
+        rows, manifest = load_latest_event_rows(event_root)
+    except FileNotFoundError:
+        # A missing pointer is an optional-feed state.  A manifest/file named by
+        # an existing pointer is converted to EventBundleError by the validator.
+        payload = build_event_payload(
+            [],
+            manifest={"bundle_id": None, "built_at_utc": None},
+            token=token,
+            start=start,
+            end=end,
+            lifecycle=lifecycle,
+        )
+        payload["availability"] = {
+            "status": "unavailable",
+            "reason": "event_bundle_not_published",
+        }
+        return payload
+    except (OSError, RuntimeError) as error:
+        raise EventBundleError("Event Fact publication cannot be resolved") from error
+    payload = build_event_payload(
+        rows,
+        manifest=manifest,
+        token=token,
+        start=start,
+        end=end,
+        lifecycle=lifecycle,
+    )
+    payload["availability"] = {"status": "available", "reason": None}
+    return payload
+
+
 def api_source_signature() -> SourceSignature:
     """Return one signature covering every source that can change public facts."""
     database_path = resolve_database_path()
@@ -3062,7 +3216,7 @@ def api_source_signature() -> SourceSignature:
     ):
         if optional_path is not None:
             paths.append(optional_path)
-    return data_signature(paths)
+    return data_signature(paths) + event_source_signature()
 
 
 def api_freshness_bucket() -> int:
@@ -3113,6 +3267,13 @@ def _build_public_api_payload(
             scope=query.get("scope"),
             market_a_id=query.get("market_a"),
             market_b_id=query.get("market_b"),
+        )
+    if route == "events":
+        return build_event_facts(
+            token=query.get("token"),
+            start=query.get("start"),
+            end=query.get("end"),
+            lifecycle=query.get("lifecycle"),
         )
     raise ValueError(f"Unknown public API route: {route}")
 
@@ -3252,8 +3413,12 @@ def public_api_query_items(
         if not query.get(name) or query[name][0] is None:
             continue
         value = query[name][0]
-        if route == "catalog" and name == "token":
+        if route in {"catalog", "events"} and name == "token":
             value = value.strip().upper()
+        elif route == "events" and name == "lifecycle":
+            value = value.strip().lower()
+        elif route == "events":
+            value = value.strip()
         items.append((name, value))
     return tuple(items)
 
@@ -3471,6 +3636,23 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 self.send_public_api("quality", query)
+            except FileNotFoundError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except ValueError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/markets/events":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            try:
+                self.send_public_api("events", query)
+            except EventBundleError:
+                self.send_json(
+                    {
+                        "error": "Event Fact bundle failed validation",
+                        "reason": "event_bundle_validation_failed",
+                    },
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except FileNotFoundError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
             except ValueError as error:

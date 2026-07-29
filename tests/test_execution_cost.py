@@ -319,7 +319,47 @@ class ExecutionCostContractTest(unittest.TestCase):
         ):
             with self.subTest(field=field, value=value):
                 rows = [{**row, field: value} for row in complete_rows()]
-                with self.assertRaisesRegex(ValueError, "provenance|sha256"):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "provenance|sha256|account fee tier|taker_fee",
+                ):
+                    validate_execution_snapshot(["cex:test:UNI/USDT"], rows)
+
+    def test_cex_rows_cannot_publish_uncollected_account_fee_facts(self):
+        cases = (
+            (
+                "fee_status",
+                "included_account_fee",
+                "unknown account fee tier",
+            ),
+            ("fee_rate_bps", "10", "uncollected fee"),
+            ("fee_rate_bps", "not-a-number", "uncollected fee"),
+            ("fee_amount_usd", "1.25", "uncollected fee"),
+            ("excluded_costs", "lot_size,latency", "taker_fee"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                rows = [{**row, field: value} for row in complete_rows()]
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_execution_snapshot(["cex:test:UNI/USDT"], rows)
+
+    def test_noncanonical_market_type_cannot_bypass_cex_fee_gate(self):
+        for market_type in ("CEX", " cex "):
+            with self.subTest(market_type=market_type):
+                rows = [
+                    {
+                        **row,
+                        "market_type": market_type,
+                        "fee_status": "included_account_fee",
+                        "fee_rate_bps": "10",
+                        "fee_amount_usd": "1",
+                    }
+                    for row in complete_rows()
+                ]
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "market_type must use canonical lowercase",
+                ):
                     validate_execution_snapshot(["cex:test:UNI/USDT"], rows)
 
     def test_measured_dex_rows_require_fixed_block_and_token_provenance(self):

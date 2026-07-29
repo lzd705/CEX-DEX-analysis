@@ -4,6 +4,7 @@ from scripts.check_dashboard_release import (
     ReleaseCheckError,
     ResponseMetrics,
     validate_comparison,
+    validate_events,
     validate_execution,
     validate_quality,
     validate_summary,
@@ -211,6 +212,152 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 token="AAVE",
                 market_a=market_a,
                 market_b=market_b,
+            )
+
+    def event_payload(self):
+        event = {
+            "event_id": "strk-unlock-2026-08-15",
+            "revision": 1,
+            "token_symbol": "STRK",
+            "event_type": "unlock",
+            "event_subtype": "scheduled_release",
+            "event_name": "Scheduled STRK unlock",
+            "lifecycle": "scheduled",
+            "evidence_status": "primary_confirmed",
+            "time": {
+                "effective_at": "2026-08-15",
+                "effective_at_precision": "day",
+                "effective_date_start": "2026-08-15",
+                "effective_date_end": "2026-08-15",
+            },
+            "size": {
+                "amount_token": "127000000",
+                "amount_usd": None,
+                "amount_usd_basis": None,
+                "percent_of_supply": "1.27",
+                "relation": "up_to",
+            },
+            "market": {"venue": None, "market_symbol": None, "market_id": None},
+            "onchain": {
+                "chain": "starknet",
+                "related_address": None,
+                "related_tx_hash": None,
+            },
+            "source": {
+                "kind": "official_project",
+                "url": "https://example.test/official",
+                "published_at": "2024-02-22",
+                "published_at_precision": "day",
+                "checked_at_utc": "2026-07-29T08:30:00Z",
+                "record_sha256": "a" * 64,
+                "record_locator": "facts.unlock_schedule",
+            },
+            "revision_lineage": {
+                "recorded_at_utc": "2026-07-29T08:30:00Z",
+                "reason": "initial",
+            },
+            "notes": None,
+        }
+        return {
+            "schema": "event_facts_api/v1",
+            "fact_schema": "event_facts/v1",
+            "fact_boundary": (
+                "Source-backed event facts only. No return, market-impact, "
+                "importance, sentiment, or causal result is included."
+            ),
+            "bundle_id": "a" * 24,
+            "built_at_utc": "2026-07-29T08:30:00Z",
+            "availability": {"status": "available", "reason": None},
+            "query": {
+                "token": "STRK",
+                "start": "2026-08-15",
+                "end": "2026-08-15",
+                "lifecycle": "scheduled",
+            },
+            "event_count": 1,
+            "event_type_counts": {"unlock": 1},
+            "lifecycle_counts": {"scheduled": 1},
+            "evidence_status_counts": {"primary_confirmed": 1},
+            "events": [event],
+        }
+
+    def test_event_validator_enforces_scope_lineage_and_fact_boundary(self):
+        payload = self.event_payload()
+        events = validate_events(
+            payload,
+            token="STRK",
+            start="2026-08-15",
+            end="2026-08-15",
+            lifecycle="scheduled",
+        )
+        self.assertEqual(events[0]["event_id"], "strk-unlock-2026-08-15")
+
+        unavailable = {
+            **payload,
+            "availability": {
+                "status": "unavailable",
+                "reason": "event_bundle_not_published",
+            },
+            "event_count": 0,
+            "events": [],
+        }
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "publication is unavailable",
+        ):
+            validate_events(
+                unavailable,
+                token="STRK",
+                start="2026-08-15",
+                end="2026-08-15",
+                lifecycle="scheduled",
+            )
+
+        leaked = self.event_payload()
+        leaked["events"][0]["future_return"] = 0.25
+        with self.assertRaisesRegex(ReleaseCheckError, "event-study result"):
+            validate_events(
+                leaked,
+                token="STRK",
+                start="2026-08-15",
+                end="2026-08-15",
+                lifecycle="scheduled",
+            )
+
+        wrong_counts = self.event_payload()
+        wrong_counts["event_type_counts"] = {"cex_listing": 1}
+        wrong_counts["lifecycle_counts"] = {"occurred": 1}
+        wrong_counts["evidence_status_counts"] = {"cross_checked": 1}
+        with self.assertRaisesRegex(ReleaseCheckError, "does not match"):
+            validate_events(
+                wrong_counts,
+                token="STRK",
+                start="2026-08-15",
+                end="2026-08-15",
+                lifecycle="scheduled",
+            )
+
+    def test_event_validator_rejects_cross_scope_and_missing_evidence(self):
+        wrong_token = self.event_payload()
+        wrong_token["events"][0]["token_symbol"] = "AAVE"
+        with self.assertRaisesRegex(ReleaseCheckError, "another Token"):
+            validate_events(
+                wrong_token,
+                token="STRK",
+                start="2026-08-15",
+                end="2026-08-15",
+                lifecycle="scheduled",
+            )
+
+        missing_source = self.event_payload()
+        missing_source["events"][0]["source"]["record_locator"] = ""
+        with self.assertRaisesRegex(ReleaseCheckError, "locator is missing"):
+            validate_events(
+                missing_source,
+                token="STRK",
+                start="2026-08-15",
+                end="2026-08-15",
+                lifecycle="scheduled",
             )
 
 

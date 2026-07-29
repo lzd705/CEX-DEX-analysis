@@ -8,12 +8,15 @@ const app = {
   activeCatalogKey: "",
   comparison: null,
   execution: null,
+  eventFacts: null,
   quality: null,
   scope: "combined",
   workspaceMarketType: "all",
   qualityScope: "all",
   liquidityView: "total",
   liquidityScale: "log",
+  comparisonMetric: "price",
+  eventLifecycle: "all",
   liquidityEffectiveScale: null,
   liquidityEffectiveScaleLabel: "",
   executionDirection: "buy_token",
@@ -31,15 +34,21 @@ const app = {
   comparisonRequestId: 0,
   executionRequestId: 0,
   qualityRequestId: 0,
+  eventRequestId: 0,
   marketController: null,
   catalogController: null,
   marketRequestWindowKey: "",
   comparisonController: null,
   executionController: null,
   qualityController: null,
+  eventController: null,
   liquidityLayoutMode: null,
   liquidityResizeScheduled: false,
   liquidityResizeObserver: null,
+  comparisonChartLayoutMode: null,
+  comparisonChartActiveIndex: 0,
+  comparisonChartResizeScheduled: false,
+  comparisonChartResizeObserver: null,
 };
 
 const DEFAULT_MARKET_CACHE_KEY = "market-monitor:screener-summary:v1";
@@ -53,6 +62,14 @@ const LIQUIDITY_CHART = {
   left: 78,
   right: 24,
   top: 24,
+  bottom: 302,
+};
+const COMPARISON_CHART = {
+  width: 900,
+  height: 360,
+  left: 82,
+  right: 24,
+  top: 30,
   bottom: 302,
 };
 const QUALITY_FLAG_LABELS = {
@@ -304,6 +321,8 @@ function currentWorkspaceRouteState(page) {
     state.scale = app.liquidityScale;
   } else if (page === "quality") {
     state.scope = app.qualityScope;
+  } else if (page === "events") {
+    state.lifecycle = app.eventLifecycle;
   }
   return state;
 }
@@ -411,7 +430,7 @@ function setActiveWorkspacePage(page) {
   const compareVisible = page === "compare";
   byId("comparison-status").hidden = !compareVisible;
   if (!compareVisible) byId("comparison-error").hidden = true;
-  byId("time-toolbar").hidden = false;
+  byId("time-toolbar").hidden = page === "events";
 }
 
 function syncSegmentedControls() {
@@ -419,13 +438,23 @@ function syncSegmentedControls() {
     ["[data-workspace-market-type]", "workspaceMarketType"],
     ["[data-liquidity-view]", "liquidityView"],
     ["[data-liquidity-scale]", "liquidityScale"],
+    ["[data-comparison-metric]", "comparisonMetric"],
+    ["[data-event-lifecycle]", "eventLifecycle"],
     ["[data-execution-direction]", "executionDirection"],
     ["[data-quality-scope]", "qualityScope"],
   ];
   groups.forEach(([selector, stateKey]) => {
     document.querySelectorAll(selector).forEach((button) => {
       const key = Object.keys(button.dataset).find((name) => (
-        ["workspaceMarketType", "liquidityView", "liquidityScale", "executionDirection", "qualityScope"]
+        [
+          "workspaceMarketType",
+          "liquidityView",
+          "liquidityScale",
+          "comparisonMetric",
+          "eventLifecycle",
+          "executionDirection",
+          "qualityScope",
+        ]
           .includes(name)
       ));
       const active = key ? button.dataset[key] === app[stateKey] : false;
@@ -580,6 +609,7 @@ function routeTitle(route) {
       markets: "Markets",
       compare: "Compare",
       liquidity: "Liquidity & Execution",
+      events: "Events",
       quality: "Data Quality",
     };
     return `${route.token} ${labels[route.page]} · CEX / DEX Market Monitor`;
@@ -699,6 +729,9 @@ function applyWorkspaceRoute(route) {
   } else if (route.page === "quality") {
     app.qualityScope = route.state?.scope || "all";
     syncSegmentedControls();
+  } else if (route.page === "events") {
+    app.eventLifecycle = route.state?.lifecycle || "all";
+    syncSegmentedControls();
   }
   setActiveAppView("workspace");
   setActiveWorkspacePage(route.page);
@@ -713,6 +746,7 @@ function applyWorkspaceRoute(route) {
     loadExecutionCost();
   }
   if (route.page === "quality") loadQuality();
+  if (route.page === "events") loadEvents();
 }
 
 function applyMethodologyRoute(route) {
@@ -741,8 +775,10 @@ function setWorkspaceCatalogLoading(token, page, catalogKey = "") {
   invalidateComparisonRequest();
   invalidateExecutionRequest();
   invalidateQualityRequest();
+  invalidateEventRequest();
   app.comparison = null;
   app.execution = null;
+  app.eventFacts = null;
   app.quality = null;
   hideError(byId("global-error"));
   hideLiquidityTooltip();
@@ -762,6 +798,13 @@ function setWorkspaceCatalogLoading(token, page, catalogKey = "") {
   byId("quality-body").innerHTML = (
     `<tr><td colspan="6" class="missing">Loading ${escapeHtml(token)} quality facts…</td></tr>`
   );
+  byId("events-body").innerHTML = (
+    `<tr><td colspan="7" class="missing">Loading ${escapeHtml(token)} verified Event Facts…</td></tr>`
+  );
+  ["events-count", "events-occurred", "events-scheduled", "events-source-count"]
+    .forEach((id) => {
+      byId(id).textContent = "—";
+    });
   byId("liquidity-chart").innerHTML = "";
   byId("liquidity-empty").textContent = `Loading ${token} liquidity facts…`;
   byId("liquidity-empty").hidden = false;
@@ -783,6 +826,11 @@ function setWorkspaceCatalogLoading(token, page, catalogKey = "") {
   byId("quality-status").textContent = `Loading ${token} quality facts.`;
   byId("quality-status").dataset.state = "warning";
   hideError(byId("quality-error"));
+  showStatus(
+    byId("events-status"),
+    `Loading ${token} verified Event Facts.`,
+  );
+  hideError(byId("events-error"));
   byId("facts-contract-copy").textContent = "Loading the market fact contract…";
   byId("facts-source-copy").textContent = "Loading source lineage…";
   byId("workspace-market-count").textContent = "Loading markets";
@@ -831,6 +879,13 @@ function setWorkspaceDataUnavailable(token, message) {
   byId("quality-body").innerHTML = (
     `<tr><td colspan="6" class="missing">No ${escapeHtml(exactToken)} quality facts are available.</td></tr>`
   );
+  byId("events-body").innerHTML = (
+    `<tr><td colspan="7" class="missing">No ${escapeHtml(exactToken)} Event Fact dataset is available.</td></tr>`
+  );
+  ["events-count", "events-occurred", "events-scheduled", "events-source-count"]
+    .forEach((id) => {
+      byId(id).textContent = "—";
+    });
   byId("liquidity-chart").innerHTML = "";
   byId("liquidity-empty").textContent = (
     `No ${exactToken} depth facts are available because the market catalog failed to load.`
@@ -861,6 +916,12 @@ function setWorkspaceDataUnavailable(token, message) {
     "critical",
   );
   showError(byId("quality-error"), message);
+  showStatus(
+    byId("events-status"),
+    `${exactToken} Event Facts cannot be scoped because the Token catalog is unavailable.`,
+    "critical",
+  );
+  showError(byId("events-error"), message);
   byId("facts-contract-copy").textContent = "Market fact contract unavailable for this response.";
   byId("facts-source-copy").textContent = "Source lineage unavailable for this response.";
   byId("workspace-market-count").textContent = "Markets unavailable";
@@ -1889,7 +1950,7 @@ function executionFeeScope(rows) {
   if (!statuses.length) return "N/A";
   const labels = {
     excluded_unknown_account_tier: "CEX account fee excluded",
-    included_protocol_fee: "DEX pool fee included",
+    included_protocol_fee: "DEX pool swap fee included",
     not_applicable: "No separate fee",
   };
   return statuses.map((status) => labels[status] || status.replaceAll("_", " ")).join(" · ");
@@ -2198,6 +2259,207 @@ async function loadQuality() {
     return false;
   } finally {
     if (requestId === app.qualityRequestId) app.qualityController = null;
+  }
+}
+
+function invalidateEventRequest() {
+  if (app.eventController) app.eventController.abort();
+  app.eventController = null;
+  app.eventRequestId += 1;
+  return app.eventRequestId;
+}
+
+function eventAvailabilityStatus(payload) {
+  if (typeof payload?.availability === "string") return payload.availability;
+  return payload?.availability?.status || "unavailable";
+}
+
+function eventLabel(value) {
+  return String(value || "unavailable")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function eventEffectiveTime(event) {
+  const time = event?.time || {};
+  const value = time.effective_at || time.effective_date_start || "Unavailable";
+  return `${value} (${time.effective_at_precision || "unknown"} precision)`;
+}
+
+function eventSizeOrMarket(event) {
+  const pieces = [];
+  const size = event?.size || {};
+  const relation = size.relation ? `${eventLabel(size.relation)} ` : "";
+  if (size.amount_token) {
+    pieces.push(
+      `${relation}${size.amount_token} ${event?.token_symbol || "tokens"}`,
+    );
+  }
+  if (size.percent_of_supply) {
+    pieces.push(`${relation}${size.percent_of_supply}% of supply`);
+  }
+  if (size.amount_usd) {
+    pieces.push(`${relation}$${size.amount_usd} source-reported`);
+  }
+  const market = event?.market || {};
+  if (market.market_id) pieces.push(market.market_id);
+  else if (market.venue || market.market_symbol) {
+    pieces.push([market.venue, market.market_symbol].filter(Boolean).join(" · "));
+  }
+  return pieces.length ? pieces.join(" · ") : "N/A · not reported or not applicable";
+}
+
+function eventSourceHostname(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "Official source";
+  }
+}
+
+function renderEventFacts(payload) {
+  app.eventFacts = payload;
+  const availability = eventAvailabilityStatus(payload);
+  const events = Array.isArray(payload?.events) ? payload.events : [];
+  const lifecycleCounts = payload?.lifecycle_counts || {};
+  const sources = new Set(events.map((event) => event?.source?.url).filter(Boolean));
+  byId("events-count").textContent = availability === "available"
+    ? String(payload?.event_count ?? events.length)
+    : "N/A";
+  byId("events-occurred").textContent = availability === "available"
+    ? String(lifecycleCounts.occurred || 0)
+    : "N/A";
+  byId("events-scheduled").textContent = availability === "available"
+    ? String(lifecycleCounts.scheduled || 0)
+    : "N/A";
+  byId("events-source-count").textContent = availability === "available"
+    ? String(sources.size)
+    : "N/A";
+
+  if (availability !== "available") {
+    byId("events-body").innerHTML = (
+      '<tr><td colspan="7" class="missing">'
+      + "The Event Fact dataset is unavailable. This is different from a verified zero-event result."
+      + "</td></tr>"
+    );
+    showStatus(
+      byId("events-status"),
+      payload?.availability?.reason
+        || "The Event Fact dataset is not published; market facts remain available.",
+      "warning",
+    );
+    hideError(byId("events-error"));
+    return;
+  }
+
+  byId("events-body").innerHTML = events.length
+    ? events.map((event) => {
+        const source = event.source || {};
+        const revision = event.revision_lineage || {};
+        const sourceLink = source.url
+          ? `<a class="event-source-link" href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(eventSourceHostname(source.url))}</a>`
+          : "Source unavailable";
+        return `<tr>
+          <td data-label="Effective time">
+            <strong>${escapeHtml(eventEffectiveTime(event))}</strong>
+            <span class="metric-note">Announced ${escapeHtml(event.time?.announced_at || "N/A")}</span>
+          </td>
+          <td data-label="Type">${escapeHtml(eventLabel(event.event_type))}
+            <span class="metric-note">${escapeHtml(eventLabel(event.event_subtype))}</span>
+          </td>
+          <td data-label="Event Fact">
+            <strong>${escapeHtml(event.event_name || "Unnamed event")}</strong>
+            <span class="metric-note">${escapeHtml(event.notes || "No additional source-backed note.")}</span>
+          </td>
+          <td data-label="Lifecycle"><span class="event-state" data-state="${escapeHtml(event.lifecycle || "unavailable")}">${escapeHtml(eventLabel(event.lifecycle))}</span></td>
+          <td data-label="Size / Market">${escapeHtml(eventSizeOrMarket(event))}</td>
+          <td data-label="Evidence">${escapeHtml(eventLabel(event.evidence_status))}
+            <span class="metric-note">${escapeHtml(eventLabel(source.kind))} · checked ${escapeHtml(source.checked_at_utc || "N/A")}</span>
+          </td>
+          <td data-label="Source & Revision">${sourceLink}
+            <span class="metric-note">Revision ${escapeHtml(event.revision)} · ${escapeHtml(revision.reason || "reason unavailable")}</span>
+          </td>
+        </tr>`;
+      }).join("")
+    : `<tr><td colspan="7" class="missing">No verified Event Facts for ${escapeHtml(
+        payload?.query?.token || selectedWorkspaceToken() || "this Token",
+      )} match this release and filter. This is not proof that no event exists.</td></tr>`;
+
+  const lifecycle = payload?.query?.lifecycle || "all lifecycles";
+  showStatus(
+    byId("events-status"),
+    events.length
+      ? `${payload.query?.token || "Token"} · ${events.length} latest verified Event Facts · ${eventLabel(lifecycle)} · bundle ${payload.bundle_id || "unavailable"}.`
+      : `No verified Event Facts match ${payload.query?.token || "this Token"} and ${eventLabel(lifecycle)} in this release; absence is not inferred.`,
+    events.length ? "success" : "warning",
+  );
+  hideError(byId("events-error"));
+}
+
+async function fetchEventFacts({
+  token,
+  start = "",
+  end = "",
+  lifecycle = "",
+  signal,
+}) {
+  const query = new URLSearchParams({ token });
+  if (start) query.set("start", start);
+  if (end) query.set("end", end);
+  if (lifecycle && lifecycle !== "all") query.set("lifecycle", lifecycle);
+  const response = await fetch(`/api/markets/events?${query.toString()}`, { signal });
+  const payload = await responseJson(response);
+  if (!response.ok) {
+    throw new Error(payload.error || "Event Facts failed to load.");
+  }
+  if (
+    payload?.query?.token
+    && String(payload.query.token).toUpperCase() !== String(token).toUpperCase()
+  ) {
+    throw new Error("The Event Fact response failed its Token-scope contract.");
+  }
+  return payload;
+}
+
+async function loadEvents() {
+  const requestId = invalidateEventRequest();
+  const token = selectedWorkspaceToken();
+  if (!app.catalog || !token) {
+    showError(byId("events-error"), "Token catalog is unavailable.");
+    return false;
+  }
+  const controller = new AbortController();
+  app.eventController = controller;
+  hideError(byId("events-error"));
+  showStatus(byId("events-status"), `Loading ${token} verified Event Facts…`);
+  try {
+    const payload = await fetchEventFacts({
+      token,
+      lifecycle: app.eventLifecycle,
+      signal: controller.signal,
+    });
+    if (requestId !== app.eventRequestId) return false;
+    renderEventFacts(payload);
+    return true;
+  } catch (error) {
+    if (error.name === "AbortError" || requestId !== app.eventRequestId) return false;
+    app.eventFacts = null;
+    byId("events-body").innerHTML = (
+      '<tr><td colspan="7" class="missing">Verified Event Facts could not be loaded. No zero-event claim is made.</td></tr>'
+    );
+    ["events-count", "events-occurred", "events-scheduled", "events-source-count"]
+      .forEach((id) => {
+        byId(id).textContent = "N/A";
+      });
+    showStatus(
+      byId("events-status"),
+      "Event Fact publication is unavailable; market facts remain usable.",
+      "critical",
+    );
+    showError(byId("events-error"), error.message || String(error));
+    return false;
+  } finally {
+    if (requestId === app.eventRequestId) app.eventController = null;
   }
 }
 
@@ -3306,7 +3568,608 @@ function updateFactsContract() {
   ].join(" ");
 }
 
+function comparisonDateMs(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ""))) return null;
+  const parsed = Date.parse(`${value}T00:00:00Z`);
+  if (!Number.isFinite(parsed)) return null;
+  return new Date(parsed).toISOString().slice(0, 10) === value ? parsed : null;
+}
+
+function comparisonMetricDefinition(metric) {
+  const definitions = {
+    price: {
+      key: "price",
+      title: "Daily price observations",
+      note: "Market A and B source observations in USD; missing dates break the line.",
+      axisTitle: "Daily source price (USD)",
+      scaleLabel: "Linear USD",
+    },
+    spread: {
+      key: "spread",
+      title: "Daily midpoint-relative price spread",
+      note: "Absolute A/B price difference divided by their midpoint; this is not a bid/ask spread.",
+      axisTitle: "Midpoint-relative spread (bps)",
+      scaleLabel: "Linear bps",
+    },
+    volume: {
+      key: "volume",
+      title: "Daily reported volume",
+      note: "Market A and B source-reported daily USD volume; missing values are never converted to zero.",
+      axisTitle: "Daily source-reported volume (USD)",
+      scaleLabel: "Linear USD",
+    },
+  };
+  return definitions[metric] || definitions.price;
+}
+
+function comparisonChartValue(row, metric, slot) {
+  let value;
+  if (metric === "spread") value = row?.spread_bps;
+  else value = row?.[`market_${slot.toLowerCase()}`]?.[`${metric}_usd`];
+  if (!finite(value)) return null;
+  if (metric === "price" && value <= 0) return null;
+  if ((metric === "volume" || metric === "spread") && value < 0) return null;
+  return value;
+}
+
+function comparisonSeriesSegments(points) {
+  const segments = [];
+  let active = [];
+  let previousDateMs = null;
+  const flush = () => {
+    if (active.length) segments.push(active);
+    active = [];
+    previousDateMs = null;
+  };
+  points.forEach((point) => {
+    if (!finite(point.value) || !finite(point.dateMs)) {
+      flush();
+      return;
+    }
+    if (active.length && point.dateMs - previousDateMs !== 86_400_000) flush();
+    active.push(point);
+    previousDateMs = point.dateMs;
+  });
+  flush();
+  return segments;
+}
+
+function comparisonMarketIdentity(slot, market) {
+  if (!market) return `${slot} · unavailable`;
+  const type = market.market_type ? market.market_type.toUpperCase() : "MARKET";
+  return [
+    slot,
+    type,
+    market.venue || "venue unavailable",
+    market.instrument || market.market_id || "instrument unavailable",
+  ].join(" · ");
+}
+
+function comparisonEventMarkers(eventPayload, rows) {
+  if (
+    eventAvailabilityStatus(eventPayload) !== "available"
+    || !rows.length
+    || !Array.isArray(eventPayload?.events)
+  ) {
+    return [];
+  }
+  const windowStart = rows[0].dateMs;
+  const windowEnd = rows.at(-1).dateMs;
+  const groupedMarkers = new Map();
+  eventPayload.events.forEach((event) => {
+    const start = comparisonDateMs(event?.time?.effective_date_start);
+    const end = comparisonDateMs(event?.time?.effective_date_end);
+    if (!finite(start) || !finite(end) || end < windowStart || start > windowEnd) return;
+    const clippedStart = Math.max(start, windowStart);
+    const clippedEnd = Math.min(end, windowEnd);
+    const key = `${clippedStart}|${clippedEnd}`;
+    if (!groupedMarkers.has(key)) {
+      groupedMarkers.set(key, {
+        startMs: clippedStart,
+        endMs: clippedEnd,
+        events: [],
+      });
+    }
+    groupedMarkers.get(key).events.push(event);
+  });
+  return [...groupedMarkers.values()].sort((left, right) => (
+    left.startMs - right.startMs || left.endMs - right.endMs
+  ));
+}
+
+function comparisonChartModel(payload, metric = "price", eventPayload = null) {
+  const definition = comparisonMetricDefinition(metric);
+  const rows = (Array.isArray(payload?.observations) ? payload.observations : [])
+    .map((row, sourceIndex) => ({
+      ...row,
+      sourceIndex,
+      dateMs: comparisonDateMs(row?.date),
+    }))
+    .filter((row) => finite(row.dateMs))
+    .sort((left, right) => (
+      left.dateMs - right.dateMs || left.sourceIndex - right.sourceIndex
+    ));
+  const configurations = definition.key === "spread"
+    ? [{
+        slot: "spread",
+        className: "series-spread",
+        label: "A ↔ B midpoint-relative spread",
+      }]
+    : [
+        {
+          slot: "A",
+          className: "series-a",
+          label: comparisonMarketIdentity("A", payload?.market_a),
+        },
+        {
+          slot: "B",
+          className: "series-b",
+          label: comparisonMarketIdentity("B", payload?.market_b),
+        },
+      ];
+  const series = configurations.map((configuration) => {
+    const points = rows.map((row) => ({
+      date: row.date,
+      dateMs: row.dateMs,
+      row,
+      value: comparisonChartValue(row, definition.key, configuration.slot),
+    }));
+    return {
+      ...configuration,
+      points,
+      segments: comparisonSeriesSegments(points),
+    };
+  });
+  return {
+    definition,
+    rows,
+    series,
+    marketA: payload?.market_a || null,
+    marketB: payload?.market_b || null,
+    eventMarkers: comparisonEventMarkers(eventPayload, rows),
+  };
+}
+
+function comparisonNiceMaximum(maximum) {
+  if (!finite(maximum) || maximum <= 0) return 1;
+  const exponent = 10 ** Math.floor(Math.log10(maximum));
+  const fraction = maximum / exponent;
+  const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+  return niceFraction * exponent;
+}
+
+function comparisonChartAxis(values, metric, dimensions) {
+  const { top, bottom } = dimensions;
+  let minimum;
+  let maximum;
+  if (metric === "price") {
+    minimum = Math.min(...values);
+    maximum = Math.max(...values);
+    const spread = maximum - minimum;
+    const padding = spread > 0
+      ? spread * 0.08
+      : Math.max(Math.abs(maximum) * 0.02, 1e-9);
+    minimum = Math.max(0, minimum - padding);
+    maximum += padding;
+  } else {
+    minimum = 0;
+    maximum = comparisonNiceMaximum(Math.max(...values));
+  }
+  if (!(maximum > minimum)) maximum = minimum + 1;
+  const span = maximum - minimum;
+  return {
+    minimum,
+    maximum,
+    ticks: Array.from({ length: 5 }, (_, index) => (
+      minimum + (span * index) / 4
+    )),
+    y(value) {
+      return bottom - ((value - minimum) / span) * (bottom - top);
+    },
+  };
+}
+
+function comparisonTickRows(rows, maximumTicks) {
+  if (rows.length <= maximumTicks) return rows;
+  const selected = new Set();
+  for (let index = 0; index < maximumTicks; index += 1) {
+    selected.add(Math.round((index * (rows.length - 1)) / (maximumTicks - 1)));
+  }
+  return [...selected].sort((left, right) => left - right).map((index) => rows[index]);
+}
+
+function formatComparisonChartValue(metric, value) {
+  if (!finite(value)) return "N/A · no fill";
+  if (metric === "spread") return `${bpsFormat.format(value)} bps`;
+  if (metric === "volume") return formatCurrency(value);
+  return formatPrice(value);
+}
+
+function comparisonEventsOnDate(model, dateMs) {
+  return model.eventMarkers.flatMap((marker) => (
+    dateMs >= marker.startMs && dateMs <= marker.endMs ? marker.events : []
+  ));
+}
+
+function comparisonChartTooltipText(model, point) {
+  const row = point.row;
+  const metric = model.definition.key;
+  const eventFacts = comparisonEventsOnDate(model, point.dateMs);
+  const eventText = eventFacts.length
+    ? `verified events: ${eventFacts.map((event) => [
+        event.event_name,
+        eventLabel(event.event_type),
+        eventLabel(event.lifecycle),
+        `${event.time?.effective_at || point.date} (${event.time?.effective_at_precision || "unknown"} precision)`,
+        eventSourceHostname(event.source?.url),
+        `revision ${event.revision || "N/A"}`,
+      ].join(" · ")).join("; ")} · temporal overlay only, not causality`
+    : "no verified event marker on this date in the current release";
+  if (metric === "spread") {
+    return [
+      `${point.date} UTC`,
+      `midpoint-relative spread ${formatComparisonChartValue("spread", point.value)}`,
+      `A price ${formatComparisonChartValue("price", comparisonChartValue(row, "price", "A"))}`,
+      `B price ${formatComparisonChartValue("price", comparisonChartValue(row, "price", "B"))}`,
+      `absolute difference ${formatComparisonChartValue("price", row.absolute_spread_usd)}`,
+      "not a bid/ask spread",
+      eventText,
+    ].join(" · ");
+  }
+  const label = metric === "price" ? "price" : "volume";
+  return [
+    `${point.date} UTC`,
+    `${model.series[0]?.label || "Market A"} ${label} ${formatComparisonChartValue(
+      metric,
+      comparisonChartValue(row, metric, "A"),
+    )}`,
+    `${model.series[1]?.label || "Market B"} ${label} ${formatComparisonChartValue(
+      metric,
+      comparisonChartValue(row, metric, "B"),
+    )}`,
+    "missing values are not filled",
+    eventText,
+  ].join(" · ");
+}
+
+function comparisonChartDimensions() {
+  const renderedWidth = byId("comparison-plot")?.clientWidth;
+  if (window.matchMedia("(max-width: 700px)").matches) {
+    return {
+      width: Math.max(300, Math.round(renderedWidth || 320)),
+      height: 300,
+      left: 68,
+      right: 12,
+      top: 28,
+      bottom: 248,
+      layout: "mobile",
+    };
+  }
+  return {
+    ...COMPARISON_CHART,
+    width: Math.max(680, Math.round(renderedWidth || COMPARISON_CHART.width)),
+    layout: "desktop",
+  };
+}
+
+function comparisonPathData(segment, x, y) {
+  return segment.map((point, index) => (
+    `${index ? "L" : "M"} ${x(point.dateMs).toFixed(2)} ${y(point.value).toFixed(2)}`
+  )).join(" ");
+}
+
+function comparisonPointMarkup(model, series, point, x, y) {
+  const tooltip = escapeHtml(comparisonChartTooltipText(model, point));
+  const offset = series.slot === "A" ? -2.5 : series.slot === "B" ? 2.5 : 0;
+  const xValue = Number((x(point.dateMs) + offset).toFixed(2));
+  const yValue = Number(y(point.value).toFixed(2));
+  if (series.slot === "B") {
+    return `<rect class="comparison-marker ${series.className}" x="${xValue - 3.5}" y="${yValue - 3.5}" width="7" height="7"><title>${tooltip}</title></rect>`;
+  }
+  if (series.slot === "spread") {
+    return `<path class="comparison-marker ${series.className}" d="M ${xValue} ${yValue - 4.5} L ${xValue + 4.5} ${yValue} L ${xValue} ${yValue + 4.5} L ${xValue - 4.5} ${yValue} Z"><title>${tooltip}</title></path>`;
+  }
+  return `<circle class="comparison-marker ${series.className}" cx="${xValue}" cy="${yValue}" r="3.7"><title>${tooltip}</title></circle>`;
+}
+
+function comparisonEventMarkerMarkup(marker, x, dimensions) {
+  const startX = Number(x(marker.startMs).toFixed(2));
+  const endX = Number(x(marker.endMs).toFixed(2));
+  const label = escapeHtml([
+    marker.events.map((event) => event.event_name).join("; "),
+    "verified source-backed event timing",
+    "no causal or return claim",
+  ].join(" · "));
+  if (Math.abs(endX - startX) < 1) {
+    return `<g class="comparison-event-overlay" aria-hidden="true">
+      <title>${label}</title>
+      <line class="comparison-event-line" x1="${startX}" y1="${dimensions.top}" x2="${startX}" y2="${dimensions.bottom}"></line>
+      <path class="comparison-event-pin" d="M ${startX - 5} ${dimensions.top} L ${startX + 5} ${dimensions.top} L ${startX} ${dimensions.top + 8} Z"></path>
+    </g>`;
+  }
+  return `<g class="comparison-event-overlay" aria-hidden="true">
+    <title>${label}</title>
+    <rect class="comparison-event-band" x="${startX}" y="${dimensions.top}" width="${Math.max(1, endX - startX)}" height="${dimensions.bottom - dimensions.top}"></rect>
+    <line class="comparison-event-line" x1="${startX}" y1="${dimensions.top}" x2="${startX}" y2="${dimensions.bottom}"></line>
+    <line class="comparison-event-line" x1="${endX}" y1="${dimensions.top}" x2="${endX}" y2="${dimensions.bottom}"></line>
+  </g>`;
+}
+
+function comparisonDateHitMarkup(model, row, index, x, dimensions) {
+  const currentX = x(row.dateMs);
+  const previousX = index > 0 ? x(model.rows[index - 1].dateMs) : dimensions.left;
+  const nextX = index + 1 < model.rows.length
+    ? x(model.rows[index + 1].dateMs)
+    : dimensions.width - dimensions.right;
+  const left = index > 0 ? (previousX + currentX) / 2 : dimensions.left;
+  const right = index + 1 < model.rows.length
+    ? (currentX + nextX) / 2
+    : dimensions.width - dimensions.right;
+  const tooltip = escapeHtml(comparisonChartTooltipText(model, {
+    date: row.date,
+    dateMs: row.dateMs,
+    row,
+  }));
+  return `<rect
+    id="comparison-date-${index}"
+    class="comparison-date-hit"
+    x="${Number(left.toFixed(2))}"
+    y="${dimensions.top}"
+    width="${Number(Math.max(1, right - left).toFixed(2))}"
+    height="${dimensions.bottom - dimensions.top}"
+    data-index="${index}"
+    data-date="${escapeHtml(row.date)}"
+    data-tooltip="${tooltip}"
+    aria-hidden="true"
+  ></rect>`;
+}
+
+function renderComparisonSvg(model) {
+  const svg = byId("comparison-chart");
+  const emptyState = byId("comparison-chart-empty");
+  const dimensions = comparisonChartDimensions();
+  app.comparisonChartLayoutMode = dimensions.layout;
+  svg.setAttribute("viewBox", `0 0 ${dimensions.width} ${dimensions.height}`);
+  const values = model.series.flatMap((series) => series.points)
+    .map((point) => point.value)
+    .filter(finite);
+  if (!model.rows.length || !values.length) {
+    svg.innerHTML = "";
+    emptyState.textContent = "No source-backed values are available for this metric and date window.";
+    emptyState.hidden = false;
+    return false;
+  }
+  emptyState.hidden = true;
+  const axis = comparisonChartAxis(values, model.definition.key, dimensions);
+  const firstDateMs = model.rows[0].dateMs;
+  const lastDateMs = model.rows.at(-1).dateMs;
+  const plotWidth = dimensions.width - dimensions.left - dimensions.right;
+  const x = firstDateMs === lastDateMs
+    ? () => dimensions.left + plotWidth / 2
+    : (dateMs) => dimensions.left + (
+      (dateMs - firstDateMs) / (lastDateMs - firstDateMs)
+    ) * plotWidth;
+  const yGrid = axis.ticks.map((tick) => {
+    const yValue = axis.y(tick);
+    return `<line class="comparison-grid-line" x1="${dimensions.left}" y1="${yValue}" x2="${dimensions.width - dimensions.right}" y2="${yValue}"></line>
+      <text class="comparison-axis-label" x="${dimensions.left - 9}" y="${yValue + 4}" text-anchor="end">${escapeHtml(
+        formatComparisonChartValue(model.definition.key, tick),
+      )}</text>`;
+  }).join("");
+  const xTicks = comparisonTickRows(
+    model.rows,
+    dimensions.layout === "mobile" ? 3 : 5,
+  ).map((row) => {
+    const xValue = x(row.dateMs);
+    return `<line class="comparison-x-guide" x1="${xValue}" y1="${dimensions.top}" x2="${xValue}" y2="${dimensions.bottom}"></line>
+      <text class="comparison-axis-label" x="${xValue}" y="${dimensions.bottom + 21}" text-anchor="middle">${escapeHtml(row.date)}</text>`;
+  }).join("");
+  const zeroLine = model.definition.key === "spread"
+    ? `<line class="comparison-zero-line" x1="${dimensions.left}" y1="${axis.y(0)}" x2="${dimensions.width - dimensions.right}" y2="${axis.y(0)}"></line>`
+    : "";
+  const eventOverlays = model.eventMarkers
+    .map((marker) => comparisonEventMarkerMarkup(marker, x, dimensions))
+    .join("");
+  const lines = model.series.map((series) => series.segments
+    .filter((segment) => segment.length >= 2)
+    .map((segment) => `<path
+      class="comparison-series-line ${series.className}"
+      d="${comparisonPathData(segment, x, axis.y)}"
+      data-segment-start="${escapeHtml(segment[0].date)}"
+      data-segment-end="${escapeHtml(segment.at(-1).date)}"
+      aria-hidden="true"
+    ></path>`).join("")).join("");
+  const points = model.series.map((series) => series.points
+    .filter((point) => finite(point.value))
+    .map((point) => comparisonPointMarkup(model, series, point, x, axis.y))
+    .join("")).join("");
+  const dateHits = model.rows
+    .map((row, index) => comparisonDateHitMarkup(model, row, index, x, dimensions))
+    .join("");
+  svg.innerHTML = `
+    <title id="comparison-svg-title">${escapeHtml(model.definition.title)}</title>
+    <desc id="comparison-svg-description">Straight-line source observations. Missing values and non-consecutive UTC dates split each series into separate path segments; no values are interpolated. Verified event overlays show timing only and do not assert causality.</desc>
+    ${yGrid}
+    ${xTicks}
+    ${zeroLine}
+    ${eventOverlays}
+    <line class="comparison-axis-line" x1="${dimensions.left}" y1="${dimensions.top}" x2="${dimensions.left}" y2="${dimensions.bottom}"></line>
+    <line class="comparison-axis-line" x1="${dimensions.left}" y1="${dimensions.bottom}" x2="${dimensions.width - dimensions.right}" y2="${dimensions.bottom}"></line>
+    <text class="comparison-axis-title" x="${(dimensions.left + dimensions.width - dimensions.right) / 2}" y="${dimensions.height - 11}" text-anchor="middle">Observation date (UTC)</text>
+    <text class="comparison-axis-title" transform="translate(16 ${(dimensions.top + dimensions.bottom) / 2}) rotate(-90)" text-anchor="middle">${escapeHtml(model.definition.axisTitle)}</text>
+    <text class="comparison-scale-label" x="${dimensions.width - dimensions.right}" y="${dimensions.top - 9}" text-anchor="end">${escapeHtml(model.definition.scaleLabel)}</text>
+    ${lines}
+    ${points}
+    ${dateHits}
+  `;
+  app.comparisonChartActiveIndex = Math.max(
+    0,
+    Math.min(app.comparisonChartActiveIndex, model.rows.length - 1),
+  );
+  return true;
+}
+
+function renderComparisonLegend(model) {
+  const identityItems = [
+    ["A", "series-a", model.marketA],
+    ["B", "series-b", model.marketB],
+  ].map(([slot, className, market]) => `<div class="comparison-legend-item">
+      <span class="comparison-legend-line ${className}" aria-hidden="true"></span>
+      <span>${escapeHtml(comparisonMarketIdentity(slot, market))}${model.definition.key === "spread" ? " · input" : ""}</span>
+    </div>`).join("");
+  const derived = model.definition.key === "spread"
+    ? `<div class="comparison-legend-item comparison-derived-key">
+        <span class="comparison-legend-line series-spread" aria-hidden="true"></span>
+        <span>Displayed series · |A price − B price| ÷ midpoint × 10,000</span>
+      </div>`
+    : "";
+  const events = model.eventMarkers.length
+    ? `<div class="comparison-legend-item comparison-event-key">
+        <span class="comparison-event-legend" aria-hidden="true"></span>
+        <span>${model.eventMarkers.reduce((count, marker) => count + marker.events.length, 0)} verified Event Facts · timing overlay only, not causality</span>
+      </div>`
+    : "";
+  byId("comparison-chart-legend").innerHTML = identityItems + derived + events;
+}
+
+function clearComparisonChart(message) {
+  const definition = comparisonMetricDefinition(app.comparisonMetric);
+  byId("comparison-chart-title").textContent = definition.title;
+  byId("comparison-chart-note").textContent = definition.note;
+  byId("comparison-chart").innerHTML = "";
+  byId("comparison-chart-empty").textContent = message;
+  byId("comparison-chart-empty").hidden = false;
+  byId("comparison-chart-legend").innerHTML = "";
+  byId("comparison-event-status").textContent = (
+    "Event overlay is unavailable without a current comparison."
+  );
+  byId("comparison-event-status").dataset.state = "unavailable";
+  byId("comparison-chart-description").textContent = `${definition.title}. ${message}`;
+  hideComparisonChartTooltip();
+}
+
+function renderComparisonChart(payload) {
+  const model = comparisonChartModel(
+    payload,
+    app.comparisonMetric,
+    app.eventFacts,
+  );
+  byId("comparison-chart-title").textContent = model.definition.title;
+  byId("comparison-chart-note").textContent = model.definition.note;
+  const plotted = renderComparisonSvg(model);
+  renderComparisonLegend(model);
+  const eventAvailability = eventAvailabilityStatus(app.eventFacts);
+  const eventCount = model.eventMarkers.reduce(
+    (count, marker) => count + marker.events.length,
+    0,
+  );
+  if (eventAvailability !== "available") {
+    byId("comparison-event-status").textContent = (
+      "Verified Event Fact overlay is unavailable for this request; this is not a zero-event result."
+    );
+    byId("comparison-event-status").dataset.state = "unavailable";
+  } else if (eventCount) {
+    byId("comparison-event-status").textContent = (
+      `${eventCount} verified Event Facts overlap this chart window. `
+      + "Markers show timing only; they do not claim return impact or causality."
+    );
+    byId("comparison-event-status").dataset.state = "available";
+  } else {
+    byId("comparison-event-status").textContent = (
+      "No verified Event Facts overlap this chart window in the current release; "
+      + "this does not prove no event exists."
+    );
+    byId("comparison-event-status").dataset.state = "empty";
+  }
+  const validPointCount = model.series.reduce((count, series) => (
+    count + series.points.filter((point) => finite(point.value)).length
+  ), 0);
+  const segmentCount = model.series.reduce((count, series) => (
+    count + series.segments.length
+  ), 0);
+  byId("comparison-chart-description").textContent = [
+    `${payload?.token_symbol || "Selected Token"} ${model.definition.title.toLowerCase()}.`,
+    `${validPointCount} source-backed plotted values across ${segmentCount} uninterrupted daily segments.`,
+    "Missing or invalid observations and non-consecutive UTC dates break lines; no interpolation or forward fill is used.",
+    model.eventMarkers.length
+      ? `${model.eventMarkers.reduce((count, marker) => count + marker.events.length, 0)} verified Event Facts are overlaid by effective date; timing does not imply causality.`
+      : "No verified Event Fact marker is available inside this chart window.",
+    plotted
+      ? "Use Left/Right, Home/End, pointer, or click on the chart to inspect one non-overlapping UTC date; exact observations remain in the table."
+      : "No values are drawable for this metric and window.",
+  ].join(" ");
+  hideComparisonChartTooltip();
+}
+
+function showComparisonChartTooltip(target) {
+  const tooltip = byId("comparison-chart-tooltip");
+  if (!target?.dataset.tooltip) return;
+  const parsedIndex = Number.parseInt(target.dataset.index, 10);
+  if (Number.isInteger(parsedIndex)) {
+    app.comparisonChartActiveIndex = parsedIndex;
+  }
+  tooltip.textContent = target.dataset.tooltip;
+  tooltip.hidden = false;
+}
+
+function hideComparisonChartTooltip() {
+  const tooltip = byId("comparison-chart-tooltip");
+  if (!tooltip) return;
+  tooltip.hidden = true;
+  tooltip.textContent = "";
+}
+
+function bindComparisonChartTooltipEvents() {
+  const svg = byId("comparison-chart");
+  const plot = byId("comparison-plot");
+  const zoneForIndex = (index) => {
+    const zones = [...svg.querySelectorAll?.(".comparison-date-hit") || []];
+    if (!zones.length) return null;
+    const bounded = Math.max(0, Math.min(index, zones.length - 1));
+    return zones[bounded];
+  };
+  svg.addEventListener("pointerover", (event) => {
+    showComparisonChartTooltip(event.target.closest?.(".comparison-date-hit"));
+  });
+  svg.addEventListener("pointerout", (event) => {
+    const zone = event.target.closest?.(".comparison-date-hit");
+    if (zone && !zone.contains(event.relatedTarget)) hideComparisonChartTooltip();
+  });
+  plot.addEventListener("click", (event) => {
+    const zone = event.target.closest?.(".comparison-date-hit");
+    if (zone) showComparisonChartTooltip(zone);
+    else hideComparisonChartTooltip();
+  });
+  plot.addEventListener("focus", () => {
+    showComparisonChartTooltip(zoneForIndex(app.comparisonChartActiveIndex));
+  });
+  plot.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideComparisonChartTooltip();
+      plot.focus();
+      return;
+    }
+    const zones = [...svg.querySelectorAll?.(".comparison-date-hit") || []];
+    if (!zones.length) return;
+    let nextIndex = app.comparisonChartActiveIndex;
+    if (event.key === "ArrowLeft") nextIndex -= 1;
+    else if (event.key === "ArrowRight") nextIndex += 1;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = zones.length - 1;
+    else return;
+    event.preventDefault();
+    showComparisonChartTooltip(zoneForIndex(nextIndex));
+  });
+  plot.addEventListener("blur", (event) => {
+    if (!plot.contains(event.relatedTarget)) {
+      hideComparisonChartTooltip();
+    }
+  });
+}
+
 function setComparisonLoading(message) {
+  app.comparison = null;
+  app.eventFacts = null;
   byId("facts-workbench").setAttribute("aria-busy", "true");
   byId("compare-markets").disabled = true;
   hideError(byId("comparison-error"));
@@ -3323,6 +4186,7 @@ function setComparisonLoading(message) {
   ].forEach((id) => {
     byId(id).textContent = "—";
   });
+  clearComparisonChart("Loading the selected markets…");
   byId("comparison-body").innerHTML = '<tr><td colspan="8" class="missing">Loading the selected markets…</td></tr>';
 }
 
@@ -3351,6 +4215,7 @@ function clearComparisonResult(message = "") {
   byId("market-a-volume-heading").textContent = "Market A Volume (USD)";
   byId("market-b-price-heading").textContent = "Market B Price (USD)";
   byId("market-b-volume-heading").textContent = "Market B Volume (USD)";
+  clearComparisonChart(message || "No current comparison result.");
   byId("comparison-body").innerHTML = '<tr><td colspan="8" class="missing">No current result.</td></tr>';
   hideStatus(byId("comparison-status"));
   if (message) showError(byId("comparison-error"), message);
@@ -3384,6 +4249,7 @@ function renderComparison(payload) {
   byId("market-a-volume-heading").textContent = `${payload.market_a.venue} Volume (USD)`;
   byId("market-b-price-heading").textContent = `${payload.market_b.venue} Price (USD)`;
   byId("market-b-volume-heading").textContent = `${payload.market_b.venue} Volume (USD)`;
+  renderComparisonChart(payload);
   const missingLabels = {
     market_a_missing: "A missing · no fill",
     market_b_missing: "B missing · no fill",
@@ -3448,6 +4314,12 @@ async function loadComparison() {
   if (byId("date-end").value) query.set("end", byId("date-end").value);
   setComparisonLoading(`Loading ${token} comparison…`);
   try {
+    const eventPromise = fetchEventFacts({
+      token,
+      start: byId("date-start").value,
+      end: byId("date-end").value,
+      signal: controller.signal,
+    }).catch(() => null);
     const response = await fetch(`/api/markets/compare?${query.toString()}`, {
       signal: controller.signal,
     });
@@ -3455,6 +4327,10 @@ async function loadComparison() {
     if (!response.ok) throw new Error(payload.error || "Comparison failed to load.");
     if (requestId !== app.comparisonRequestId) return false;
     renderComparison(payload);
+    const eventPayload = await eventPromise;
+    if (requestId !== app.comparisonRequestId) return false;
+    app.eventFacts = eventPayload;
+    renderComparisonChart(payload);
     return true;
   } catch (error) {
     if (error.name === "AbortError" || requestId !== app.comparisonRequestId) return false;
@@ -3789,6 +4665,7 @@ function refreshWorkspacePageData() {
   if (app.route?.kind !== "workspace") return;
   if (app.route.page === "compare") loadComparison();
   if (app.route.page === "liquidity") loadExecutionCost();
+  if (app.route.page === "events") loadEvents();
   if (app.route.page === "quality") loadQuality();
 }
 
@@ -4003,6 +4880,30 @@ function bindEvents() {
       replaceCurrentRoute();
     });
   });
+  document.querySelectorAll("[data-comparison-metric]").forEach((button) => {
+    button.addEventListener("click", () => {
+      app.comparisonMetric = comparisonMetricDefinition(
+        button.dataset.comparisonMetric,
+      ).key;
+      syncSegmentedControls();
+      if (app.comparison) {
+        renderComparisonChart(app.comparison);
+      } else {
+        const definition = comparisonMetricDefinition(app.comparisonMetric);
+        byId("comparison-chart-title").textContent = definition.title;
+        byId("comparison-chart-note").textContent = definition.note;
+        hideComparisonChartTooltip();
+      }
+    });
+  });
+  document.querySelectorAll("[data-event-lifecycle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      app.eventLifecycle = button.dataset.eventLifecycle || "all";
+      syncSegmentedControls();
+      replaceCurrentRoute();
+      loadEvents();
+    });
+  });
   document.querySelectorAll("[data-execution-direction]").forEach((button) => {
     button.addEventListener("click", () => {
       app.executionDirection = button.dataset.executionDirection;
@@ -4028,6 +4929,7 @@ function bindEvents() {
     });
   });
   bindLiquidityTooltipEvents();
+  bindComparisonChartTooltipEvents();
   bindFactsMarketWarningEvents();
   const scheduleLiquidityResize = () => {
     if (app.liquidityResizeScheduled) return;
@@ -4044,6 +4946,26 @@ function bindEvents() {
   if (window.ResizeObserver) {
     app.liquidityResizeObserver = new ResizeObserver(scheduleLiquidityResize);
     app.liquidityResizeObserver.observe(byId("liquidity-plot"));
+  }
+  const scheduleComparisonChartResize = () => {
+    if (app.comparisonChartResizeScheduled) return;
+    app.comparisonChartResizeScheduled = true;
+    window.queueMicrotask(() => {
+      app.comparisonChartResizeScheduled = false;
+      if (app.comparison && app.route?.page === "compare") {
+        renderComparisonChart(app.comparison);
+      }
+    });
+  };
+  window.addEventListener("resize", scheduleComparisonChartResize);
+  window.visualViewport?.addEventListener("resize", scheduleComparisonChartResize);
+  window.matchMedia("(max-width: 700px)")
+    .addEventListener("change", scheduleComparisonChartResize);
+  if (window.ResizeObserver) {
+    app.comparisonChartResizeObserver = new ResizeObserver(
+      scheduleComparisonChartResize,
+    );
+    app.comparisonChartResizeObserver.observe(byId("comparison-plot"));
   }
   byId("compare-markets").addEventListener("click", () => {
     persistSelectedPair();

@@ -4,31 +4,65 @@
 
 1. `Screener` is the cross-Token entry point. The global start/end, 7D, 30D,
    90D, and All controls apply only to daily facts.
-2. Selecting a Token opens one persistent workspace with four pages:
-   `Markets`, `Compare`, `Liquidity & Execution`, and `Data Quality`.
+2. Selecting a Token opens one persistent workspace with five pages:
+   `Markets`, `Compare`, `Liquidity & Execution`, `Events`, and `Data Quality`.
 3. Market A and Market B are exact market IDs for the selected Token and remain
    in the URL while the user moves between those pages.
 4. `Methodology` is the shared definition layer; Data Quality reports the
    current status and lineage of one Token's actual markets.
 
 The workspace separates discovery, comparison, executable-liquidity analysis,
-and evidence without losing the selected Token or market pair. TVL, depth, and
-execution remain independently timestamped latest snapshots rather than
-pretending to follow the daily date selector.
+event timing, and evidence without losing the selected Token or market pair.
+TVL, depth, and execution remain independently timestamped latest snapshots
+rather than pretending to follow the daily date selector. Events are a
+manually reviewed source-backed timeline and do not inherit a market-data
+collection cadence.
+
+## Page responsibilities
+
+- `Markets` lists every cataloged CEX pair and DEX pool for the Token and sets
+  exact Market A/B identities.
+- `Compare` aligns A/B daily observations and provides selectable Price,
+  Spread, and Volume line charts plus the raw table.
+- `Liquidity & Execution` compares the latest 10/25/50/100 bps depth and
+  fixed-notional quoted-cost scenarios with source-state timestamps.
+- `Events` lists the latest verified revision of matching Event Facts,
+  lifecycle, timing precision, size/market identity, evidence, and source.
+- `Data Quality` explains coverage, freshness, missing/unsupported facts,
+  warnings, and lineage for the current Token and A/B pair.
 
 ## Spread placement
 
-Spread is not a property of either market alone. For a selected Token, CEX pair,
-DEX pool, and date window:
+Spread is not a property of either market alone. For the selected Token, Market
+A, Market B, and date window, each same-date comparison is:
 
 ```text
-price_spread = dex_price / cex_price - 1
+absolute_spread_usd = abs(price_a_usd - price_b_usd)
+spread_bps =
+  absolute_spread_usd / ((price_a_usd + price_b_usd) / 2) * 10,000
 ```
 
-The two prices must come from the latest date observed by both selected markets.
-It is shown only on the Token comparison row. CEX and DEX rows show `--` in the
-spread column. If either selected price or a common date is missing, spread is
-`N/A`.
+The two prices must come from the same UTC date. If either price is missing or
+invalid, spread is `N/A`. The Compare chart treats missing, invalid, and
+nonconsecutive dates as gaps and never draws through them.
+
+Price and Volume show both A and B; Spread is one derived series. A/B use
+different marker shapes and full type/venue/instrument labels in addition to
+color. This keeps the comparison legible in grayscale and for users who cannot
+distinguish the palette.
+
+## Event placement
+
+The Events page is the auditable record. Compare may add a marker or precision
+interval when a published Event Fact overlaps the chart window. The overlay
+answers only “when did this source-backed event take effect?” It does not
+answer “what did the event cause?” and does not calculate pre/post return,
+abnormal return, volume impact, sentiment, or importance.
+
+Event Facts are curated from official sources and published as append-only
+revisions. The repository starts with 17 reviewed records, while production
+coverage and counts are always read from the latest validated bundle selected
+by `latest.json`.
 
 ## Data contract
 
@@ -37,3 +71,16 @@ for the selected window. It does not send every raw observation to the browser.
 Each venue/pool summary includes latest price, window return, daily log-return
 volatility, summed USD volume, observation-day count, and latest observation
 date. DEX summaries may also include the latest available TVL snapshot.
+
+`/api/markets/compare` supplies the aligned daily observations used by both the
+chart and table. `/api/markets/events` reads the separately published Event
+Fact bundle and filters by Token, optional date interval, and lifecycle.
+
+Fixed-notional execution is a current fact, not future scope. CEX visible-book
+cost explicitly excludes a numeric trading fee because the account tier is
+unknown (`excluded_unknown_account_tier`). Supported DEX V2 execution includes
+the pool swap fee in pool mechanics; this is not a claim about protocol
+treasury or revenue fee.
+
+Funding rates, numeric CEX account fees, gas, DEX V3 fixed-notional execution,
+and event-study outputs remain unsupported.

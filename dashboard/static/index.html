@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260729-catalog-split-v1">
+    <link rel="stylesheet" href="/styles.css?v=20260729-events-v1">
   </head>
   <body>
     <header class="app-header">
@@ -87,7 +87,7 @@
             </a>
             <span class="eyebrow">Single Token research workspace</span>
             <h2 id="facts-title">Token Research</h2>
-            <p id="workspace-description">Select one Token, then move through its markets, daily comparison, liquidity, and data quality without losing the selected pair.</p>
+            <p id="workspace-description">Select one Token, then move through its markets, daily comparison, liquidity, verified events, and data quality without losing the selected pair.</p>
           </div>
           <div class="workspace-heading-meta">
             <span id="workspace-market-count" class="contract-badge">Loading markets</span>
@@ -100,6 +100,7 @@
           <a href="/tokens/AAVE/markets" data-workspace-page="markets">Markets</a>
           <a href="/tokens/AAVE/compare" data-workspace-page="compare">Compare</a>
           <a href="/tokens/AAVE/liquidity" data-workspace-page="liquidity">Liquidity &amp; Execution</a>
+          <a href="/tokens/AAVE/events" data-workspace-page="events">Events</a>
           <a href="/tokens/AAVE/quality" data-workspace-page="quality">Data Quality</a>
         </nav>
 
@@ -422,7 +423,7 @@
               </table>
             </div>
             <p id="execution-method-note" class="method-note">
-              CEX values include visible-book spread and impact but exclude account-specific taker fees. Supported DEX V2 values include the pool fee; gas, router fees, token taxes, latency, and MEV are excluded.
+              CEX values include visible-book spread and impact but exclude account-specific taker fees. Supported DEX V2 values include the pool swap fee; gas, router fees, token taxes, latency, and MEV are excluded.
               <a href="/methodology/execution-cost" data-methodology-link="execution-cost">How execution cost is calculated</a>
             </p>
           </section>
@@ -477,6 +478,78 @@
           </div>
         </div>
 
+        <div class="comparison-chart-toolbar">
+          <div>
+            <h4 id="comparison-chart-title">Daily price observations</h4>
+            <p id="comparison-chart-note">Market A and B source observations in USD; missing dates break the line.</p>
+          </div>
+          <div class="segmented-control" role="group" aria-label="Comparison chart metric">
+            <button
+              type="button"
+              data-comparison-metric="price"
+              class="active"
+              aria-pressed="true"
+            >Price</button>
+            <button
+              type="button"
+              data-comparison-metric="spread"
+              aria-pressed="false"
+            >Spread</button>
+            <button
+              type="button"
+              data-comparison-metric="volume"
+              aria-pressed="false"
+            >Volume</button>
+          </div>
+        </div>
+
+        <figure class="comparison-figure">
+          <div
+            id="comparison-plot"
+            class="comparison-plot"
+            role="group"
+            tabindex="0"
+            aria-label="Interactive daily market comparison chart"
+            aria-labelledby="comparison-chart-title"
+            aria-describedby="comparison-chart-description comparison-chart-method"
+          >
+            <svg
+              id="comparison-chart"
+              viewBox="0 0 900 360"
+              aria-hidden="true"
+              focusable="false"
+              preserveAspectRatio="xMidYMid meet"
+            ></svg>
+            <div id="comparison-chart-empty" class="comparison-chart-empty">
+              Load two markets to draw their daily observations.
+            </div>
+            <div
+              id="comparison-chart-tooltip"
+              class="comparison-chart-tooltip"
+              role="tooltip"
+              aria-live="polite"
+              hidden
+            ></div>
+          </div>
+          <div
+            id="comparison-chart-legend"
+            class="comparison-chart-legend"
+            aria-label="Selected market legend"
+          ></div>
+          <p id="comparison-event-status" class="comparison-event-status">
+            Event overlay loads independently from the daily market series.
+          </p>
+          <figcaption id="comparison-chart-method">
+            Straight segments connect consecutive UTC daily observations only. Missing or invalid
+            values and calendar gaps break the line; no interpolation or forward fill is applied.
+            Verified event overlays show timing only and do not claim return impact or causality.
+          </figcaption>
+        </figure>
+        <p id="comparison-chart-description" class="sr-only">
+          Daily comparison chart. Choose Price, Spread, or Volume. Exact source observations remain
+          available in the table below.
+        </p>
+
         <div
           class="comparison-table-scroll"
           role="region"
@@ -502,6 +575,75 @@
             </tbody>
           </table>
         </div>
+        </section>
+
+        <section
+          id="workspace-page-events"
+          class="workspace-page"
+          data-workspace-view="events"
+          hidden
+        >
+          <div class="page-heading events-heading">
+            <div>
+              <span class="eyebrow">Source-backed event timeline</span>
+              <h3>Verified Event Facts</h3>
+              <p>Officially sourced unlock, airdrop claim-start, and CEX spot-listing facts for this Token, with explicit date precision, lifecycle, evidence status, and revision lineage.</p>
+              <p class="metric-note">An event marker shows temporal overlap only. This page does not estimate return, market impact, sentiment, importance, or causality.</p>
+              <p class="metric-note">This timeline loads the latest verified revision for each Event Fact in the current release; full revision history remains in the auditable bundle. The daily market window applies only when events are overlaid on Compare.</p>
+            </div>
+            <div class="segmented-control events-lifecycle-control" role="group" aria-label="Event lifecycle filter">
+              <button type="button" data-event-lifecycle="all" class="active" aria-pressed="true">All</button>
+              <button type="button" data-event-lifecycle="occurred" aria-pressed="false">Occurred</button>
+              <button type="button" data-event-lifecycle="scheduled" aria-pressed="false">Scheduled</button>
+              <button type="button" data-event-lifecycle="postponed" aria-pressed="false">Postponed</button>
+              <button type="button" data-event-lifecycle="cancelled" aria-pressed="false">Cancelled</button>
+              <button type="button" data-event-lifecycle="superseded" aria-pressed="false">Superseded</button>
+            </div>
+          </div>
+
+          <div id="events-status" class="status-banner" role="status" aria-live="polite">
+            Loading verified Event Facts…
+          </div>
+          <div id="events-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+
+          <div class="events-summary" aria-label="Event Fact coverage summary">
+            <div>
+              <span>Verified records</span>
+              <strong id="events-count">—</strong>
+            </div>
+            <div>
+              <span>Occurred</span>
+              <strong id="events-occurred">—</strong>
+            </div>
+            <div>
+              <span>Scheduled</span>
+              <strong id="events-scheduled">—</strong>
+            </div>
+            <div>
+              <span>Official sources</span>
+              <strong id="events-source-count">—</strong>
+            </div>
+          </div>
+
+          <div class="table-scroll events-table-scroll" role="region" aria-label="Verified Token Event Facts" tabindex="0">
+            <table class="events-table">
+              <caption>Latest published revision of each verified event; blank values remain unavailable rather than zero.</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Effective time</th>
+                  <th scope="col">Type</th>
+                  <th scope="col">Event Fact</th>
+                  <th scope="col">Lifecycle</th>
+                  <th scope="col">Size / Market</th>
+                  <th scope="col">Evidence</th>
+                  <th scope="col">Source &amp; Revision</th>
+                </tr>
+              </thead>
+              <tbody id="events-body">
+                <tr><td colspan="7" class="missing">Loading verified Event Facts</td></tr>
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <section
@@ -655,17 +797,17 @@
           <article id="execution-cost" class="methodology-card">
             <i data-lucide="route"></i>
             <h3>Fixed-notional Execution Cost</h3>
-            <p>CEX scenarios walk visible order-book levels. Supported DEX V2 scenarios use exact integer constant-product mechanics. For DEX, target quantity = requested USD ÷ (pool quote per Token × quote-token USD price). Pool state and the USD-price response have independent timestamps: if either is missing or they differ by more than two hours, cost and fill are withheld as N/A, not zero. The A/B state-time skew is a separate comparison. DEX pool fees are included where supported; CEX account fees, gas, latency, router costs, transfer taxes, and MEV are excluded.</p>
+            <p>CEX scenarios walk visible order-book levels. Supported DEX V2 scenarios use exact integer constant-product mechanics. For DEX, target quantity = requested USD ÷ (pool quote per Token × quote-token USD price). Pool state and the USD-price response have independent timestamps: if either is missing or they differ by more than two hours, cost and fill are withheld as N/A, not zero. The A/B state-time skew is a separate comparison. DEX pool swap fees are included where supported; CEX account fees, gas, latency, router costs, transfer taxes, and MEV are excluded.</p>
           </article>
           <article id="quality-states" class="methodology-card">
             <i data-lucide="shield-check"></i>
             <h3>Quality States</h3>
-            <p><strong>Observed</strong> is measured. <strong>Partial</strong> is usable with a stated boundary. <strong>Unsupported</strong> means no audited method exists. <strong>Failed</strong> is a collection error. <strong>N/A</strong> means the fact does not apply. A measured zero remains zero.</p>
+            <p><strong>Observed</strong> is measured. <strong>Partial</strong> is usable with a stated boundary. <strong>Unsupported</strong> means no protocol-specific, project-validated method exists. <strong>Failed</strong> is a collection error. <strong>N/A</strong> means the fact does not apply. A measured zero remains zero.</p>
           </article>
           <article id="scope-boundaries" class="methodology-card">
             <i data-lucide="circle-off"></i>
             <h3>Current Fact Boundary</h3>
-            <p>Funding rates are not collected and therefore do not appear. Trading-fee treatment is reported inside execution facts: supported DEX pool fees can be included, while account-specific CEX fees remain excluded.</p>
+            <p>Funding rates are not collected and therefore do not appear. Trading-fee treatment is reported inside execution facts: supported DEX pool swap fees can be included, while account-specific CEX fees remain excluded.</p>
           </article>
         </div>
 
@@ -704,7 +846,7 @@
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/navigation.js?v=20260729-catalog-split-v1"></script>
-    <script src="/app.js?v=20260729-catalog-split-v1"></script>
+    <script src="/navigation.js?v=20260729-events-v1"></script>
+    <script src="/app.js?v=20260729-events-v1"></script>
   </body>
 </html>

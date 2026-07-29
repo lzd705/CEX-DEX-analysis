@@ -2,12 +2,14 @@
 
 ## Product boundary
 
-The first product is a fact-only Market Monitor. A user selects a time window,
-a Token, one CEX pair, and one DEX pool, then compares source-backed market
-facts. A separate authenticated administrator page can refresh configured
-Tokens when explicitly enabled; the entire administrator surface is absent by
-default. This release does not include factors, future-return research, event
-study, or public data-edit controls.
+The first product is a fact-only Market Monitor. A user selects a time window
+and a Token, then keeps two exact cataloged markets as Market A and Market B
+while moving through `Markets`, `Compare`, `Liquidity & Execution`, `Events`,
+and `Data Quality`. The A/B markets may be CEX/CEX, CEX/DEX, or DEX/DEX. A
+separate authenticated administrator page can refresh configured Tokens when
+explicitly enabled; the entire administrator surface is absent by default.
+This release does not include factors, future-return research, an event study,
+or public data-edit controls.
 
 ## Current requirements
 
@@ -31,6 +33,14 @@ study, or public data-edit controls.
 9. Publish an auditable market catalog and a two-venue daily comparison that
    exposes raw closes, daily USD volume, absolute price spread, and
    midpoint-relative bps.
+10. Plot the A/B daily comparison as selectable Price, Spread, and Volume
+    lines. Missing, invalid, and nonconsecutive UTC dates break a line instead
+    of being interpolated. Market A and B remain distinguishable by marker
+    shape and labels as well as color.
+11. Publish manually reviewed Event Facts from official sources with source,
+    timing precision, lifecycle, and revision lineage. Event markers are a
+    temporal overlay on Compare only; they do not claim return impact or
+    causality.
 
 ## Local workflow
 
@@ -47,6 +57,9 @@ python3 scripts/run_collection_cycle.py --profile depth --publish-local
 # Manual recovery profile: retry only the point-in-time TVL snapshot.
 python3 scripts/run_collection_cycle.py --profile tvl --publish-local
 
+# Manually build and publish the reviewed, append-only Event Fact bundle.
+python3 scripts/event_facts.py --publish-local
+
 # Import a reviewed snapshot and atomically publish the indexed runtime database.
 python3 scripts/import_local_snapshot.py data/processed
 
@@ -55,11 +68,16 @@ npm --prefix dashboard install
 ./scripts/run_dashboard.sh
 ```
 
-The application code and SQLite schema are versioned in GitHub. Reviewed CSV
-inputs and the generated `market_facts.sqlite3` runtime database live in the
-ignored `data/local/` directory, or an external directory selected by
-`MARKET_DATA_DIR`. The website queries SQLite; it does not rescan all CSV rows
-on each request. See `data/README.md` for the full data lifecycle.
+The application code and SQLite schemas are versioned in GitHub. Reviewed
+market CSV inputs and the generated `market_facts.sqlite3` runtime database
+live in the ignored `data/local/` directory, or an external directory selected
+by `MARKET_DATA_DIR`. The website queries SQLite; it does not rescan all market
+CSV rows on each request. Event Facts use a separate immutable bundle under
+`data/local/events/`, selected by an atomically replaced `latest.json` pointer.
+The committed curated file currently contains 17 initial reviewed records, but
+that number is not a runtime contract: the website reports the count in the
+latest validated bundle. See `data/README.md` for the market-data lifecycle and
+`docs/event-facts-contract.md` for the Event Fact lifecycle.
 The public catalog and comparison contract is documented in
 `docs/market-facts-contract.md`.
 The separate point-in-time TVL lifecycle and missing-value rules are documented
@@ -71,6 +89,9 @@ and execution limitations are documented in `docs/dex-depth-data-contract.md`.
 The fixed-notional definition, quoted-cost formulas, fee scope, long-form
 files, statuses, and hard validation gates are documented in
 `docs/execution-cost-data-contract.md`.
+The Event Fact taxonomy, official-source evidence, append-only revisions,
+bundle publication, and null rules are documented in
+`docs/event-facts-contract.md`.
 Collection profiles, locks, manifests, freshness thresholds, systemd timers,
 and recovery behavior are documented in `docs/collection-operations.md`.
 
@@ -105,14 +126,26 @@ are `deploy/systemd/cex-dex-dashboard.service.in`,
 - Fixed-notional quoted cost walks the original CEX levels or executes the
   supported DEX V2 invariant captured by those collectors. DEX V3 execution is
   explicitly unsupported in this release. Cost is never interpolated from the
-  four depth bands. CEX account fees and DEX gas/router/MEV costs stay
-  explicitly outside the quoted-cost fact.
-- Price spread and midpoint-relative bps compare the selected CEX pair and DEX
-  pool only when both have prices on the same UTC date.
+  four depth bands. Every CEX row explicitly marks its numeric trading fee as
+  `excluded_unknown_account_tier`; the value remains null rather than being
+  treated as zero. Supported DEX V2 rows include the pool's swap fee in the
+  invariant calculation. This is a pool swap fee, not a claim about protocol
+  treasury or revenue. DEX gas/router/MEV costs stay explicitly outside the
+  quoted-cost fact.
+- The A/B comparison reports absolute USD price difference and
+  midpoint-relative bps only when both selected markets have prices on the
+  same UTC date. Its Price, Spread, and Volume lines preserve gaps instead of
+  filling them.
+- Event Facts are manually reviewed facts about event timing and status. Their
+  Compare markers show only temporal overlap with the displayed daily series;
+  the monitor does not infer causal effects.
 
 ## Future scope
 
-Events, additional DEX protocol adapters, gas/MEV-aware quotes, anomaly rules,
-historical TVL backfills, historical depth reconstruction, and adding
-previously unconfigured Tokens require separate data contracts and acceptance
-tests.
+Funding rates, numeric CEX account fees, gas/MEV-aware quotes, DEX V3
+fixed-notional execution, event-study returns/impact, additional DEX protocol
+adapters, anomaly rules, historical TVL backfills, historical depth
+reconstruction, and adding previously unconfigured Tokens require separate
+data contracts and acceptance tests. Unsupported facts remain null or
+explicitly `unsupported`; the dashboard does not estimate them from adjacent
+facts.

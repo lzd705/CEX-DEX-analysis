@@ -8,6 +8,7 @@ import gzip
 import json
 import math
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -36,6 +37,23 @@ def require(condition: bool, message: str) -> None:
 COLLECTED_NOTIONALS = frozenset({1_000, 5_000, 10_000, 50_000, 100_000})
 EXECUTION_DIRECTIONS = frozenset({"sell_token", "buy_token"})
 EXECUTION_STATUSES = frozenset({"observed", "partial", "unsupported", "failed"})
+EVENT_LIFECYCLES = frozenset(
+    {"scheduled", "occurred", "postponed", "cancelled", "superseded"}
+)
+EVENT_EVIDENCE_STATUSES = frozenset(
+    {"primary_confirmed", "cross_checked", "onchain_observed"}
+)
+FORBIDDEN_EVENT_RESULT_FIELDS = frozenset(
+    {
+        "impact",
+        "market_impact",
+        "return",
+        "returns",
+        "future_return",
+        "causality",
+        "causal_result",
+    }
+)
 
 
 def fetch_json(
@@ -310,6 +328,226 @@ def validate_execution(
     )
 
 
+def _nested_keys(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        keys = {str(key).lower() for key in value}
+        for child in value.values():
+            keys.update(_nested_keys(child))
+        return keys
+    if isinstance(value, list):
+        keys: set[str] = set()
+        for child in value:
+            keys.update(_nested_keys(child))
+        return keys
+    return set()
+
+
+def _event_study_result_fields(value: Any) -> set[str]:
+    prohibited_terms = {"impact", "return", "returns", "causal", "causality"}
+    return {
+        key
+        for key in _nested_keys(value)
+        if key in FORBIDDEN_EVENT_RESULT_FIELDS
+        or prohibited_terms.intersection(
+            part for part in key.replace("-", "_").split("_") if part
+        )
+    }
+
+
+def validate_events(
+    payload: dict[str, Any],
+    *,
+    token: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    lifecycle: str | None = None,
+    require_events: bool = True,
+) -> list[dict[str, Any]]:
+    availability = payload.get("availability") or {}
+    require(
+        availability.get("status") == "available",
+        "Event Fact publication is unavailable",
+    )
+    require(availability.get("reason") is None, "Available Event feed has a reason")
+    require(payload.get("schema") == "event_facts_api/v1", "Wrong Event API schema")
+    require(payload.get("fact_schema") == "event_facts/v1", "Wrong Event fact schema")
+    boundary = payload.get("fact_boundary")
+    require(
+        isinstance(boundary, str) and "Source-backed event facts only" in boundary,
+        "Event fact boundary is missing",
+    )
+    require(
+        isinstance(payload.get("bundle_id"), str)
+        and len(payload["bundle_id"]) == 24
+        and all(
+            character in "0123456789abcdef"
+            for character in payload["bundle_id"]
+        ),
+        "Event bundle identity is missing",
+    )
+    require(
+        isinstance(payload.get("built_at_utc"), str)
+        and payload["built_at_utc"],
+        "Event build timestamp is missing",
+    )
+
+    query = payload.get("query") or {}
+    require(query.get("token") == token, "Event token scope was not honored")
+    require(query.get("start") == start, "Event start scope was not honored")
+    require(query.get("end") == end, "Event end scope was not honored")
+    require(
+        query.get("lifecycle") == lifecycle,
+        "Event lifecycle scope was not honored",
+    )
+
+    events = payload.get("events")
+    require(isinstance(events, list), "Event response has no events array")
+    require(
+        payload.get("event_count") == len(events),
+        "Event count does not match returned rows",
+    )
+    for counts_field in (
+        "event_type_counts",
+        "lifecycle_counts",
+        "evidence_status_counts",
+    ):
+        counts = payload.get(counts_field)
+        require(
+            isinstance(counts, dict)
+            and all(
+                isinstance(key, str)
+                and isinstance(value, int)
+                and value > 0
+                for key, value in counts.items()
+            )
+            and sum(counts.values()) == len(events),
+            f"{counts_field} does not match returned Event rows",
+        )
+    if require_events:
+        require(bool(events), "Event response has no verified records")
+
+    forbidden = _event_study_result_fields(events)
+    require(
+        not forbidden,
+        "Event facts leaked event-study result fields: " + ", ".join(sorted(forbidden)),
+    )
+    for event in events:
+        require(isinstance(event, dict), "Event row is not an object")
+        require(
+            isinstance(event.get("event_id"), str) and event["event_id"],
+            "Event identity is missing",
+        )
+        require(
+            event.get("event_type") in {"unlock", "airdrop", "cex_listing"},
+            "Event type is invalid",
+        )
+        require(
+            isinstance(event.get("event_subtype"), str)
+            and event["event_subtype"],
+            "Event subtype is missing",
+        )
+        require(
+            isinstance(event.get("event_name"), str) and event["event_name"],
+            "Event name is missing",
+        )
+        require(
+            isinstance(event.get("revision"), int) and event["revision"] > 0,
+            "Event revision is invalid",
+        )
+        require(
+            isinstance(event.get("token_symbol"), str)
+            and event["token_symbol"],
+            "Event token identity is missing",
+        )
+        if token is not None:
+            require(event["token_symbol"] == token, "Event leaked another Token")
+        require(
+            event.get("lifecycle") in EVENT_LIFECYCLES,
+            "Event lifecycle is invalid",
+        )
+        if lifecycle is not None:
+            require(
+                event["lifecycle"] == lifecycle,
+                "Event leaked another lifecycle",
+            )
+        require(
+            event.get("evidence_status") in EVENT_EVIDENCE_STATUSES,
+            "Event evidence status is invalid",
+        )
+
+        timing = event.get("time") or {}
+        effective_start = timing.get("effective_date_start")
+        effective_end = timing.get("effective_date_end")
+        require(
+            isinstance(effective_start, str)
+            and isinstance(effective_end, str)
+            and effective_start <= effective_end,
+            "Event effective date interval is invalid",
+        )
+        if start is not None:
+            require(effective_end >= start, "Event is before requested window")
+        if end is not None:
+            require(effective_start <= end, "Event is after requested window")
+
+        source = event.get("source") or {}
+        require(
+            isinstance(source.get("kind"), str) and source["kind"],
+            "Event source kind is missing",
+        )
+        require(
+            isinstance(source.get("url"), str)
+            and source["url"].startswith("https://"),
+            "Event source URL is not HTTPS",
+        )
+        require(
+            isinstance(source.get("checked_at_utc"), str)
+            and source["checked_at_utc"],
+            "Event source check timestamp is missing",
+        )
+        require(
+            isinstance(source.get("record_sha256"), str)
+            and len(source["record_sha256"]) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in source["record_sha256"]
+            ),
+            "Event source-record checksum is invalid",
+        )
+        require(
+            isinstance(source.get("record_locator"), str)
+            and source["record_locator"],
+            "Event source-record locator is missing",
+        )
+
+        lineage = event.get("revision_lineage") or {}
+        require(
+            isinstance(lineage.get("recorded_at_utc"), str)
+            and lineage["recorded_at_utc"],
+            "Event revision timestamp is missing",
+        )
+        require(
+            isinstance(lineage.get("reason"), str) and lineage["reason"],
+            "Event revision reason is missing",
+        )
+    expected_counts = {
+        "event_type_counts": dict(
+            sorted(Counter(event["event_type"] for event in events).items())
+        ),
+        "lifecycle_counts": dict(
+            sorted(Counter(event["lifecycle"] for event in events).items())
+        ),
+        "evidence_status_counts": dict(
+            sorted(Counter(event["evidence_status"] for event in events).items())
+        ),
+    }
+    for counts_field, expected in expected_counts.items():
+        require(
+            payload.get(counts_field) == expected,
+            f"{counts_field} does not match returned Event rows",
+        )
+    return events
+
+
 def release_check(args: argparse.Namespace) -> dict[str, Any]:
     metrics: list[ResponseMetrics] = []
     health, health_metrics = fetch_json(
@@ -365,6 +603,40 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
     require(
         len(full_markets) == summary["metadata"].get("catalog_market_count"),
         "Summary catalog count differs from the full audit catalog",
+    )
+
+    all_events, events_metrics = fetch_json(
+        args.base_url,
+        "/api/markets/events",
+        timeout=args.timeout,
+    )
+    metrics.append(events_metrics)
+    event_rows = validate_events(all_events)
+    seed_event = event_rows[0]
+    event_token = seed_event["token_symbol"]
+    event_start = seed_event["time"]["effective_date_start"]
+    event_end = seed_event["time"]["effective_date_end"]
+    event_lifecycle = seed_event["lifecycle"]
+    scoped_events_path = "/api/markets/events?" + urlencode(
+        {
+            "token": event_token,
+            "start": event_start,
+            "end": event_end,
+            "lifecycle": event_lifecycle,
+        }
+    )
+    scoped_events, scoped_events_metrics = fetch_json(
+        args.base_url,
+        scoped_events_path,
+        timeout=args.timeout,
+    )
+    metrics.append(scoped_events_metrics)
+    validate_events(
+        scoped_events,
+        token=event_token,
+        start=event_start,
+        end=event_end,
+        lifecycle=event_lifecycle,
     )
 
     token_summary = token_catalog.get("token_summary") or {}
@@ -472,6 +744,8 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "data_generation": generation,
         "token_count": len(summary["tokens"]),
         "catalog_market_count": len(full_markets),
+        "event_count": len(event_rows),
+        "event_bundle_id": all_events["bundle_id"],
         "requests": [
             {
                 "path": item.path,

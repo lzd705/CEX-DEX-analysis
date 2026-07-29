@@ -23,6 +23,39 @@ passes every configured Token to `run_fact_pipeline.py --append`, so the upsert
 preserves older history. `--full-rebuild` is an explicit exception and must not
 be used by timers.
 
+## Manually reviewed Event Fact publication
+
+Event Facts do not run in the daily or hourly collection profiles. An operator
+first checks the cited official page, updates the versioned source-check
+record, and appends a revision to `data/curated/event_facts.csv`. Existing
+published `(event_id, revision)` rows cannot be deleted or edited in place.
+
+Build a review bundle without publishing:
+
+```bash
+python3 scripts/event_facts.py
+```
+
+After reviewing the source, manifest, hashes, latest-revision CSV, and full
+revision CSV, publish it:
+
+```bash
+python3 scripts/event_facts.py --publish-local
+```
+
+The command writes an immutable bundle under
+`data/local/events/bundles/<bundle_id>/` and atomically replaces
+`data/local/events/latest.json` only after validation. The website reads the
+selected bundle through `/api/markets/events`; it does not read the curated CSV
+directly. The committed curated input contains 17 initial reviewed records,
+but production count and coverage are whatever the currently selected bundle
+actually contains.
+
+This workflow records official-source timing, precision, lifecycle, evidence
+status, and revision lineage. It does not calculate event returns, impact, or
+causality. Source-check freshness is a human review property, not an hourly
+market-data SLA.
+
 ## Lock and manifest
 
 Every profile acquires `data/local/collection/collection.lock`. A second run
@@ -214,6 +247,10 @@ retention requirement before applying or enabling
 - Execution-cost publication passes formula, fill-state, monotonicity, fee
   scope, missing-value, and source-lineage validation. Partial scenarios never
   publish a full-request VWAP or quoted cost.
+- CEX execution rows retain `excluded_unknown_account_tier` and null numeric
+  fee fields. Supported DEX V2 rows retain the pool swap fee used by the pool
+  mechanics; operational reports must not relabel it as protocol treasury or
+  revenue.
 - A timestamp-fresh TVL/depth snapshot with zero observed or partial rows is a
   failed scheduled step. CEX execution must contain a measured row; DEX
   execution may be wholly `unsupported`, but any wholly failed supported
@@ -222,3 +259,11 @@ retention requirement before applying or enabling
 - Collection and publication failures never zero-fill missing values.
 - The public API and rendered page display separate source dates and stale
   states.
+- When Event Facts are published, the selected bundle passes source-record,
+  revision-lineage, SQLite-integrity, manifest-count, and file-hash checks.
+  An unavailable Event bundle is not reported as a verified zero-event result.
+
+Funding rates, numeric account-specific CEX fees, gas, DEX V3 fixed-notional
+execution, and event-study outputs remain unsupported. Collection operations
+must not manufacture them from spot prices, depth, TVL, pool swap fees, or Event
+Facts.

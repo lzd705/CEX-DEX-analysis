@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://docs.starknet.io/learn/protocol/strk",
+  "checked_at_utc": "2026-07-29T07:33:00Z",
+  "source_title": "STRK",
+  "publisher": "Starknet Documentation",
+  "facts": {
+    "monthly_unlock_schedule": {
+      "statement": "The official page states that up to 127 million STRK, or 1.27 percent of total supply, have been and will be unlocked on the fifteenth of each month from 2025-04-15 through 2027-03-15.",
+      "time_precision": "day",
+      "size_relation": "up_to",
+      "source_section": "Supply and distribution"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "No onchain transfer verification is attached."
+  ]
+}
