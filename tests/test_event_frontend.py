@@ -9,6 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = PROJECT_ROOT / "dashboard" / "static" / "app.js"
 INDEX_PATH = PROJECT_ROOT / "dashboard" / "static" / "index.html"
 NAVIGATION_PATH = PROJECT_ROOT / "dashboard" / "static" / "navigation.js"
+STYLES_PATH = PROJECT_ROOT / "dashboard" / "static" / "styles.css"
 
 
 def run_app_javascript(source):
@@ -42,6 +43,17 @@ class EventFrontendTest(unittest.TestCase):
         self.assertIn("/api/markets/events?", app)
         self.assertIn('rel="noopener noreferrer"', app)
         self.assertIn('page === "events"', app)
+        self.assertIn("five research pages", app)
+        self.assertNotIn("four research pages", app)
+
+    def test_mobile_header_keeps_all_navigation_and_freshness_visible(self):
+        styles = STYLES_PATH.read_text(encoding="utf-8")
+
+        mobile = styles.split("@media (max-width: 700px)", 1)[1]
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", mobile)
+        self.assertIn(".primary-navigation a:last-child { grid-column: 1 / -1; }", mobile)
+        self.assertIn("white-space: normal", mobile)
+        self.assertIn("#freshness { min-width: 0; overflow-wrap: anywhere; }", mobile)
 
     def test_event_route_round_trips_lifecycle_filter(self):
         node = shutil.which("node")

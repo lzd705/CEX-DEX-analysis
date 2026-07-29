@@ -1631,15 +1631,26 @@ footer {
   .primary-navigation {
     order: 3;
     width: 100%;
-    overflow-x: auto;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: visible;
   }
-  .primary-navigation a { flex: 1 0 auto; padding-inline: 10px; }
+  .primary-navigation a {
+    min-width: 0;
+    padding-inline: 6px;
+  }
+  .primary-navigation a:last-child { grid-column: 1 / -1; }
   .status-cluster {
     width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    min-width: 0;
+    align-items: flex-start;
+    overflow: visible;
     font-size: 11px;
+    line-height: 1.35;
+    white-space: normal;
   }
+  .status-cluster .status-dot { flex: 0 0 auto; margin-top: 4px; }
+  #freshness { min-width: 0; overflow-wrap: anywhere; }
   main { padding: 8px; }
   .date-fields { width: 100%; }
   .date-fields label { flex: 1; min-width: 0; }

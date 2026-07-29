@@ -1646,7 +1646,7 @@ function renderWorkspaceContext() {
     byId("workspace-description").textContent = (
       `${formatCurrency(aggregates.aggregateTotal)} aggregate window volume · `
       + `${formatShare(aggregates.aggregateDexShare)} DEX share. `
-      + "Market A/B stay shared across the four research pages."
+      + "Market A/B stay shared across the five research pages."
     );
   }
   updateRouteLinks();
