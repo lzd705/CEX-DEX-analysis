@@ -206,15 +206,16 @@ class RunFactPipelineTest(unittest.TestCase):
                 processed_dir=processed_dir,
             )
 
-            with (
-                patch.object(
-                    run_fact_pipeline,
-                    "parse_args",
-                    return_value=arguments,
-                ),
-                patch.object(run_fact_pipeline.fetch_cex, "main") as fetch_cex,
+            with patch.object(
+                run_fact_pipeline,
+                "parse_args",
+                return_value=arguments,
             ):
-                run_fact_pipeline.main()
+                with patch.object(
+                    run_fact_pipeline.fetch_cex,
+                    "main",
+                ) as fetch_cex:
+                    run_fact_pipeline.main()
 
             fetch_cex.assert_called_once()
             self.assertTrue(
@@ -241,13 +242,24 @@ class RunFactPipelineTest(unittest.TestCase):
                 data_dir=data_dir,
                 processed_dir=processed_dir,
             )
-            with (
-                patch.object(run_fact_pipeline, "parse_args", return_value=arguments),
-                patch.object(run_fact_pipeline.fetch_cex, "main") as fetch_cex,
-                patch.object(run_fact_pipeline.fetch_dex, "main") as fetch_dex,
-                patch.object(run_fact_pipeline, "import_snapshot") as publish,
+            with patch.object(
+                run_fact_pipeline,
+                "parse_args",
+                return_value=arguments,
             ):
-                run_fact_pipeline.main()
+                with patch.object(
+                    run_fact_pipeline.fetch_cex,
+                    "main",
+                ) as fetch_cex:
+                    with patch.object(
+                        run_fact_pipeline.fetch_dex,
+                        "main",
+                    ) as fetch_dex:
+                        with patch.object(
+                            run_fact_pipeline,
+                            "import_snapshot",
+                        ) as publish:
+                            run_fact_pipeline.main()
 
             fetch_cex.assert_called_once_with(
                 token_symbols=["XYZ"],
@@ -533,18 +545,27 @@ class RunFactPipelineTest(unittest.TestCase):
                 data_dir=data_dir,
                 processed_dir=root / "processed",
             )
-            with (
-                patch.object(
-                    run_fact_pipeline,
-                    "parse_args",
-                    return_value=arguments,
-                ),
-                patch.object(run_fact_pipeline.fetch_cex, "main") as fetch_cex,
-                patch.object(run_fact_pipeline.fetch_dex, "main") as fetch_dex,
-                patch.object(run_fact_pipeline, "import_snapshot") as publish,
-                self.assertRaises(run_fact_pipeline.CarryForwardEvidenceError),
+            with patch.object(
+                run_fact_pipeline,
+                "parse_args",
+                return_value=arguments,
             ):
-                run_fact_pipeline.main()
+                with patch.object(
+                    run_fact_pipeline.fetch_cex,
+                    "main",
+                ) as fetch_cex:
+                    with patch.object(
+                        run_fact_pipeline.fetch_dex,
+                        "main",
+                    ) as fetch_dex:
+                        with patch.object(
+                            run_fact_pipeline,
+                            "import_snapshot",
+                        ) as publish:
+                            with self.assertRaises(
+                                run_fact_pipeline.CarryForwardEvidenceError
+                            ):
+                                run_fact_pipeline.main()
 
             fetch_cex.assert_not_called()
             fetch_dex.assert_not_called()

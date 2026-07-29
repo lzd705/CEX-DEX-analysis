@@ -1,3 +1,4 @@
+import ast
 import unittest
 from pathlib import Path
 
@@ -6,6 +7,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FrameworkStructureTest(unittest.TestCase):
+    def test_all_python_sources_parse_with_python_38_grammar(self):
+        source_roots = ("dashboard", "deploy", "scripts", "tests")
+        source_paths = sorted(
+            path
+            for source_root in source_roots
+            for path in (PROJECT_ROOT / source_root).rglob("*.py")
+        )
+
+        self.assertTrue(source_paths)
+        for path in source_paths:
+            with self.subTest(path=str(path.relative_to(PROJECT_ROOT))):
+                ast.parse(
+                    path.read_text(encoding="utf-8"),
+                    filename=str(path),
+                    feature_version=8,
+                )
+
     def test_portable_deployment_files_exist(self):
         required_paths = [
             "Dockerfile",

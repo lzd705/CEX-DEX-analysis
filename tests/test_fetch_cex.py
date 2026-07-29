@@ -75,17 +75,22 @@ class FetchCexTests(unittest.TestCase):
         response.read.return_value = json.dumps([kline]).encode("utf-8")
         context = MagicMock()
         context.__enter__.return_value = response
-        with (
-            patch.object(fetch_cex, "BINANCE_BASE_URLS", ["https://binance.test"]),
-            patch("scripts.fetch_cex.urllib.request.urlopen", return_value=context) as request,
+        with patch.object(
+            fetch_cex,
+            "BINANCE_BASE_URLS",
+            ["https://binance.test"],
         ):
-            rows = fetch_cex.fetch_exchange_rows(
-                "UNI",
-                "UNI/USDT",
-                "binance",
-                target_date,
-                target_date,
-            )
+            with patch(
+                "scripts.fetch_cex.urllib.request.urlopen",
+                return_value=context,
+            ) as request:
+                rows = fetch_cex.fetch_exchange_rows(
+                    "UNI",
+                    "UNI/USDT",
+                    "binance",
+                    target_date,
+                    target_date,
+                )
 
         requested_url = request.call_args.args[0]
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(requested_url).query)
@@ -101,11 +106,16 @@ class FetchCexTests(unittest.TestCase):
         response.read.return_value = b"[]"
         context = MagicMock()
         context.__enter__.return_value = response
-        with (
-            patch.object(fetch_cex, "BINANCE_BASE_URLS", ["https://binance.test"]),
-            patch("scripts.fetch_cex.urllib.request.urlopen", return_value=context) as request,
+        with patch.object(
+            fetch_cex,
+            "BINANCE_BASE_URLS",
+            ["https://binance.test"],
         ):
-            fetch_cex.fetch_binance_klines("UNIUSDT", 4)
+            with patch(
+                "scripts.fetch_cex.urllib.request.urlopen",
+                return_value=context,
+            ) as request:
+                fetch_cex.fetch_binance_klines("UNIUSDT", 4)
 
         query = urllib.parse.parse_qs(
             urllib.parse.urlsplit(request.call_args.args[0]).query
