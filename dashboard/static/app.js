@@ -1698,6 +1698,13 @@ function renderQualityBadges(flags) {
   }).join("");
 }
 
+function screenerMetricTooltip(value, tooltip) {
+  const label = `${value}. ${tooltip}`;
+  return `<span class="screener-metric-tooltip" tabindex="0" `
+    + `aria-label="${escapeHtml(label)}" data-tooltip="${escapeHtml(tooltip)}">`
+    + `${escapeHtml(value)}</span>`;
+}
+
 function screenerTokenRow(tokenSummary) {
   const token = tokenSummary.token_symbol;
   const { cex, dex, spread } = comparison(tokenSummary);
@@ -1732,6 +1739,12 @@ function screenerTokenRow(tokenSummary) {
       : statusCounts?.info
         ? "unavailable"
         : "ok";
+  const aggregateValue = formatCurrency(aggregates.aggregateTotal);
+  const priceGapValue = formatPercent(spread);
+  const depthPairValue = [
+    formatDepth(cex?.total_depth_100bps_usd, cex?.depth_100bps_complete),
+    formatDepth(dex?.total_depth_100bps_usd, dex?.depth_100bps_complete),
+  ].join(" / ");
   const researchPath = navigation
     ? navigation.buildWorkspacePath(
       token,
@@ -1743,26 +1756,22 @@ function screenerTokenRow(tokenSummary) {
     <td data-label="Token" class="sticky-token token-name">${escapeHtml(token)}</td>
     <td data-label="Rank value" class="rank-value">
       ${escapeHtml(formatRankValue(tokenSummary))}
-      <span class="metric-note">${app.sortDirection === "asc" ? "Lowest first" : "Highest first"}</span>
     </td>
     <td data-label="Covered markets">
       ${tokenSummary.cex_market_count ?? "—"} CEX · ${tokenSummary.dex_market_count ?? "—"} DEX
-      <span class="metric-note">${finite(catalogCount) ? catalogCount : "Unavailable"} catalog series</span>
     </td>
     <td data-label="Aggregate USD volume">
-      ${formatCurrency(aggregates.aggregateTotal)}
-      <span class="metric-note">CEX ${formatCurrency(aggregates.aggregateCex)} · DEX ${formatCurrency(aggregates.aggregateDex)}</span>
+      ${screenerMetricTooltip(
+        aggregateValue,
+        `CEX ${formatCurrency(aggregates.aggregateCex)} · DEX ${formatCurrency(aggregates.aggregateDex)}`,
+      )}
     </td>
     <td data-label="DEX share">${formatShare(aggregates.aggregateDexShare)}</td>
     <td data-label="Primary price gap" class="${metricClass(spread)}">
-      ${formatPercent(spread)}
-      <span class="metric-note">Primary DEX / CEX − 1</span>
+      ${screenerMetricTooltip(priceGapValue, "Primary DEX / CEX − 1.")}
     </td>
     <td data-label="Primary ±100 bps depth">
-      ${formatDepth(cex?.total_depth_100bps_usd, cex?.depth_100bps_complete)}
-      /
-      ${formatDepth(dex?.total_depth_100bps_usd, dex?.depth_100bps_complete)}
-      <span class="metric-note">Primary CEX / DEX</span>
+      ${screenerMetricTooltip(depthPairValue, "Primary CEX / DEX.")}
     </td>
     <td data-label="Primary DEX TVL">${formatCurrency(dex?.tvl_usd)}</td>
     <td data-label="Quality">

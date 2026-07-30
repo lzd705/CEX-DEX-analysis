@@ -2008,6 +2008,11 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn('aria-busy="true"', index)
         self.assertIn("Midpoint-relative Spread (bps)", index)
         self.assertIn("Primary Price Gap", index)
+        self.assertIn('class="column-info"', index)
+        self.assertIn(
+            "Hover, focus, or tap a value for its CEX / DEX split.",
+            index,
+        )
         self.assertIn('id="export-csv"', index)
         self.assertNotIn("综合", index)
 
@@ -2055,6 +2060,22 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn("aggregate_dex_volume_share", app_js)
         self.assertIn("formatCurrency(aggregates.aggregateDex)", app_js)
         self.assertIn("formatShare(aggregates.aggregateDexShare)", app_js)
+        self.assertIn("function screenerMetricTooltip(", app_js)
+        screener_row = app_js[
+            app_js.index("function screenerTokenRow("):
+            app_js.index("function renderTable()")
+        ]
+        self.assertNotIn("Highest first", screener_row)
+        self.assertNotIn("catalog series", screener_row)
+        self.assertNotIn('class="metric-note"', screener_row)
+        self.assertIn(
+            'screenerMetricTooltip(priceGapValue, "Primary DEX / CEX − 1.")',
+            screener_row,
+        )
+        self.assertIn(
+            'screenerMetricTooltip(depthPairValue, "Primary CEX / DEX.")',
+            screener_row,
+        )
         self.assertIn("value !== 0 && Math.abs(value) < 1", app_js)
         self.assertIn("quality_flags", app_js)
         self.assertIn('id="facts-market-a-warning-trigger"', index)

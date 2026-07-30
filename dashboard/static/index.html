@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260729-critical-round-v1">
+    <link rel="stylesheet" href="/styles.css?v=20260730-compact-screener-v1">
   </head>
   <body>
     <header class="app-header">
@@ -905,10 +905,34 @@
                 <th scope="col" class="sticky-token">Token</th>
                 <th id="rank-value-heading" scope="col">USD Volume · Aggregate</th>
                 <th scope="col">Covered Markets</th>
-                <th scope="col">Aggregate USD Volume</th>
+                <th scope="col">
+                  Aggregate USD Volume
+                  <span
+                    class="column-info"
+                    tabindex="0"
+                    aria-label="Focus an aggregate value for its CEX and DEX volume split."
+                    data-tooltip="Hover, focus, or tap a value for its CEX / DEX split."
+                  ><i data-lucide="info"></i></span>
+                </th>
                 <th scope="col">DEX Share</th>
-                <th scope="col">Primary Price Gap</th>
-                <th scope="col">Primary ±100 bps Depth</th>
+                <th scope="col">
+                  Primary Price Gap
+                  <span
+                    class="column-info"
+                    tabindex="0"
+                    aria-label="Primary price gap equals primary DEX price divided by primary CEX price, minus one."
+                    data-tooltip="Primary DEX / CEX − 1."
+                  ><i data-lucide="info"></i></span>
+                </th>
+                <th scope="col">
+                  Primary ±100 bps Depth
+                  <span
+                    class="column-info"
+                    tabindex="0"
+                    aria-label="Depth values are displayed as primary CEX then primary DEX."
+                    data-tooltip="Primary CEX / DEX."
+                  ><i data-lucide="info"></i></span>
+                </th>
                 <th scope="col">Primary DEX TVL</th>
                 <th scope="col">Quality</th>
                 <th scope="col">Research</th>
@@ -924,6 +948,6 @@
 
     <script src="/vendor/lucide.js"></script>
     <script src="/navigation.js?v=20260729-critical-round-v1"></script>
-    <script src="/app.js?v=20260729-critical-round-v1"></script>
+    <script src="/app.js?v=20260730-compact-screener-v1"></script>
   </body>
 </html>

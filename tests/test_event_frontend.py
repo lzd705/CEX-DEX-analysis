@@ -74,8 +74,8 @@ class EventFrontendTest(unittest.TestCase):
         self.assertIn("overflow: visible", freshness_rule.group(1))
         self.assertIn("white-space: normal", freshness_rule.group(1))
         self.assertIn("#freshness { min-width: 0; overflow-wrap: anywhere; }", mobile)
-        self.assertIn("/styles.css?v=20260729-critical-round-v1", index)
-        self.assertIn("/app.js?v=20260729-critical-round-v1", index)
+        self.assertIn("/styles.css?v=20260730-compact-screener-v1", index)
+        self.assertIn("/app.js?v=20260730-compact-screener-v1", index)
 
     def test_event_route_round_trips_lifecycle_filter(self):
         node = shutil.which("node")
