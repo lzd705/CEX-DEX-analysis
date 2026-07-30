@@ -76,10 +76,49 @@ ATTEMPT_ERROR_MESSAGES = {
     "network": "The source request could not reach the remote service.",
     "rate_limit": "The source rejected the request because its rate limit was reached.",
     "source_unavailable": "The remote source was temporarily unavailable.",
+    "source_range_unavailable": (
+        "The public OHLCV endpoint does not permit the requested historical "
+        "date window."
+    ),
     "not_listed": "The source reported that the requested Token or pool was unavailable.",
     "parse": "The source response could not be decoded into the expected format.",
     "validation": "The source response did not satisfy the collector contract.",
 }
+
+
+class SourceRangeUnavailable(ValueError):
+    """The keyless source cannot serve the requested historical window."""
+
+
+def _is_geckoterminal_ohlcv_url(value):
+    try:
+        parsed = urllib.parse.urlsplit(str(value))
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "api.geckoterminal.com"
+        and "/ohlcv/" in parsed.path
+    )
+
+
+def is_public_history_limit_response(error, request_url):
+    """Recognize only GeckoTerminal's explicit bounded range response."""
+    if (
+        not isinstance(error, urllib.error.HTTPError)
+        or error.code != 401
+        or not _is_geckoterminal_ohlcv_url(request_url)
+        or not _is_geckoterminal_ohlcv_url(error.geturl())
+    ):
+        return False
+    try:
+        payload = error.read(4097)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    if not isinstance(payload, bytes) or len(payload) > 4096:
+        return False
+    lowered = payload.decode("utf-8", errors="replace").lower()
+    return "past 180 days" in lowered and "public api" in lowered
 
 
 def sha256_file(path: Path) -> str:
@@ -112,7 +151,12 @@ def classify_attempt_error(error):
         None,
     )
     lowered = " ".join(str(candidate).lower() for candidate in chain)
-    if http_status == 429 or "rate limit" in lowered or "too many requests" in lowered:
+    if (
+        "source_range_unavailable" in lowered
+        or any(isinstance(candidate, SourceRangeUnavailable) for candidate in chain)
+    ):
+        reason = "source_range_unavailable"
+    elif http_status == 429 or "rate limit" in lowered or "too many requests" in lowered:
         reason = "rate_limit"
     elif http_status is not None and http_status >= 500:
         reason = "source_unavailable"
@@ -127,7 +171,13 @@ def classify_attempt_error(error):
     ):
         reason = "not_listed"
     elif any(
-        isinstance(candidate, (urllib.error.URLError, TimeoutError))
+        (
+            isinstance(candidate, TimeoutError)
+            or (
+                isinstance(candidate, urllib.error.URLError)
+                and not isinstance(candidate, urllib.error.HTTPError)
+            )
+        )
         for candidate in chain
     ):
         reason = "network"
@@ -186,8 +236,12 @@ def dex_attempt_record(
     expected_dates = _window_dates(start_date, end_date)
     if error is not None:
         classified = classify_attempt_error(error)
-        status = "failed"
-        outcome = "request_failed"
+        if classified["reason_code"] == "source_range_unavailable":
+            status = "unsupported"
+            outcome = "range_unavailable"
+        else:
+            status = "failed"
+            outcome = "request_failed"
     elif not observed_dates:
         classified = {
             "reason_code": "no_candles",
@@ -403,11 +457,17 @@ def request_json(url: str):
                 data = json.loads(text)
                 return data
         except Exception as error:
+            if is_public_history_limit_response(error, url):
+                raise SourceRangeUnavailable(
+                    "source_range_unavailable: the public OHLCV endpoint "
+                    "rejected the requested historical window"
+                ) from error
             status_code = get_status_code(error)
             retry_after = None
 
-            if hasattr(error, "headers"):
-                retry_after = error.headers.get("Retry-After")
+            headers = getattr(error, "headers", None)
+            if headers is not None:
+                retry_after = headers.get("Retry-After")
 
             wait_seconds = get_retry_wait_seconds(status_code, retry_after)
 
@@ -1345,11 +1405,16 @@ def fetch_existing_pools(
     pool_volume_rows = []
     failed_pools = []
     pool_count = len(pools)
+    range_error = None
 
     for index, pool in enumerate(pools, start=1):
         try:
+            if range_error is not None:
+                raise range_error
             ohlcv_list = fetch_pool_ohlcv(pool, start_date, end_date)
         except Exception as error:
+            if isinstance(error, SourceRangeUnavailable):
+                range_error = error
             print(
                 "Existing pool failed %s/%s %s %s: %s"
                 % (
@@ -1433,7 +1498,7 @@ def fetch_existing_pools(
                 len(ohlcv_list),
             )
         )
-        if index < pool_count:
+        if index < pool_count and range_error is None:
             time.sleep(INCREMENTAL_POOL_SLEEP_SECONDS)
 
     if failed_pools and fail_on_incomplete:

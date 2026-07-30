@@ -217,7 +217,7 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
             self.issue(
                 "2026-01-05",
                 "source_range_unavailable",
-                "needs_review",
+                "unsupported",
                 False,
             ),
             self.issue(
@@ -267,9 +267,9 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
                 {"not_listed": 1},
             ),
             "2026-01-05": (
-                "needs_review",
+                "unsupported",
                 False,
-                "operator_manual_review",
+                "operator_review_source_outcome",
                 {"source_range_unavailable": 1},
             ),
             "2026-01-06": (
@@ -332,8 +332,9 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
             mixed_fact["issue_status_counts"],
             {
                 "collection_failed": 5,
-                "needs_review": 2,
+                "needs_review": 1,
                 "source_no_observation": 1,
+                "unsupported": 1,
             },
         )
         self.assertIn(

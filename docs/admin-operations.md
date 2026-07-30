@@ -151,9 +151,12 @@ Missing-row causes are evidence-based, not inferred from absence alone:
   retry because repeating the same successful empty response creates a loop.
   The explanatory issue remains visible, but it is excluded from
   `backfill_pending`, retry windows, and the report's warning status;
-- source says the market is unavailable, or its documented recent-only range
-  cannot reach the audited day: `status=needs_review`, with `not_listed` or
-  `source_range_unavailable`, and no automatic retry.
+- source says the market is unavailable: `status=needs_review`,
+  `reason_code=not_listed`, with no automatic retry;
+- the source's documented recent-only range cannot reach the audited day:
+  `status=unsupported`, `reason_code=source_range_unavailable`, with no
+  automatic retry or manual-review queue item. The missing value stays `N/A`
+  and the coverage limitation remains visible as information.
 
 Only a ledger whose recorded CSV SHA-256 matches the staged candidate can
 change a missing issue from `missing_unexplained`. Accepted attempts and their
@@ -201,12 +204,16 @@ current operator path must not silently use it to broaden dates or bypass the
 exact-window allowlist.
 
 `hard_invalid`, `stale_market_unknown`, and lineage-matched `needs_review`
-findings such as `not_listed` or `source_range_unavailable` are different.
+findings such as `not_listed` are different.
 The Admin page reads their sanitized entries from `manual_review_queue` and
 shows the Token, market, date, reason, and primary-source URL hints in a
 separate, read-only table. Those items never receive a retry button. The
 operator must record source evidence and a disposition outside the automatic
 collection queue before changing their lifecycle.
+
+A lineage-matched `source_range_unavailable` issue does not enter that table:
+it is a documented structural coverage limit, exposed as informational
+`unsupported` until an entitled source is configured.
 
 Persistent dispositions live in the revisioned, tracked
 `data/curated/market_lifecycle_reviews.json` contract. A disposed revision must

@@ -1,4 +1,5 @@
 import csv
+from io import BytesIO
 import os
 import unittest
 import urllib.parse
@@ -41,6 +42,7 @@ from scripts.fetch_dex import fetch_existing_pools
 from scripts.fetch_dex import merge_runtime_token_config
 from scripts.fetch_dex import runtime_registry_path
 from scripts.fetch_dex import classify_attempt_error
+from scripts.fetch_dex import SourceRangeUnavailable
 
 
 class FetchDexTests(unittest.TestCase):
@@ -337,6 +339,145 @@ class FetchDexTests(unittest.TestCase):
         self.assertEqual(classified["reason_code"], "not_listed")
         self.assertEqual(classified["http_status"], 404)
         self.assertNotIn("secret", classified["error"])
+
+    def test_bare_unauthorized_response_remains_retryable_source_failure(self):
+        error = urllib.error.HTTPError(
+            "https://api.geckoterminal.com/api/v2/pools/secret/ohlcv/day",
+            401,
+            "Unauthorized",
+            None,
+            None,
+        )
+
+        classified = classify_attempt_error(error)
+        attempt = fetch_dex.dex_attempt_record(
+            "AAVE",
+            "eth",
+            "uniswap_v3",
+            "0xAAVEPOOL",
+            error=error,
+            start_date="2026-01-01",
+            end_date="2026-01-01",
+        )
+
+        self.assertEqual(
+            classified["reason_code"],
+            "source_unavailable",
+        )
+        self.assertEqual(classified["http_status"], 401)
+        self.assertNotIn("secret", classified["error"])
+        self.assertNotIn("http", classified["error"].lower())
+        self.assertEqual(attempt["status"], "failed")
+        self.assertEqual(attempt["outcome"], "request_failed")
+        self.assertEqual(
+            attempt["reason_code"],
+            "source_unavailable",
+        )
+        self.assertEqual(attempt["http_status"], 401)
+
+    def test_explicit_public_history_limit_is_bounded_and_unsupported(self):
+        error = urllib.error.HTTPError(
+            "https://api.geckoterminal.com/api/v2/pools/secret/ohlcv/day",
+            401,
+            "Unauthorized",
+            None,
+            BytesIO(
+                b'{"errors":[{"title":"You can only access data from the '
+                b'past 180 days with Public API."}]}'
+            ),
+        )
+        with patch(
+            "scripts.fetch_dex.urllib.request.urlopen",
+            side_effect=error,
+        ):
+            with self.assertRaises(SourceRangeUnavailable) as raised:
+                fetch_dex.request_json(
+                    "https://api.geckoterminal.com/api/v2/networks/eth/"
+                    "pools/secret/ohlcv/day"
+                )
+
+        classified = classify_attempt_error(raised.exception)
+        attempt = fetch_dex.dex_attempt_record(
+            "AAVE",
+            "eth",
+            "uniswap_v3",
+            "0xAAVEPOOL",
+            error=raised.exception,
+            start_date="2026-01-01",
+            end_date="2026-01-01",
+        )
+        self.assertEqual(
+            classified["reason_code"],
+            "source_range_unavailable",
+        )
+        self.assertEqual(classified["http_status"], 401)
+        self.assertNotIn("secret", classified["error"])
+        self.assertEqual(attempt["status"], "unsupported")
+        self.assertEqual(attempt["outcome"], "range_unavailable")
+
+    def test_same_history_text_on_non_ohlcv_request_stays_retryable(self):
+        error = urllib.error.HTTPError(
+            "https://api.geckoterminal.com/api/v2/networks/eth/tokens/secret",
+            401,
+            "Unauthorized",
+            None,
+            BytesIO(
+                b'{"errors":[{"title":"You can only access data from the '
+                b'past 180 days with Public API."}]}'
+            ),
+        )
+        with patch(
+            "scripts.fetch_dex.urllib.request.urlopen",
+            side_effect=error,
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                fetch_dex.request_json(
+                    "https://api.geckoterminal.com/api/v2/networks/eth/"
+                    "tokens/secret"
+                )
+
+        classified = classify_attempt_error(raised.exception)
+        self.assertEqual(classified["reason_code"], "source_unavailable")
+        self.assertEqual(classified["http_status"], 401)
+
+    def test_range_rejection_is_reused_for_remaining_inventory_pools(self):
+        pools = [
+            {
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "dex": "uniswap_v3",
+                "pool_address": "0xone",
+            },
+            {
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "dex": "uniswap_v3",
+                "pool_address": "0xtwo",
+            },
+        ]
+        attempts = []
+        range_error = SourceRangeUnavailable(
+            "source_range_unavailable: public history limit"
+        )
+        with patch(
+            "scripts.fetch_dex.fetch_pool_ohlcv",
+            side_effect=range_error,
+        ) as fetch, patch("scripts.fetch_dex.time.sleep") as sleep:
+            rows = fetch_existing_pools(
+                pools,
+                attempt_records=attempts,
+                start_date="2025-01-01",
+                end_date="2025-01-02",
+                fail_on_incomplete=False,
+            )
+
+        self.assertEqual(rows, [])
+        fetch.assert_called_once()
+        sleep.assert_not_called()
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(
+            all(item["status"] == "unsupported" for item in attempts)
+        )
 
     def test_every_configured_token_has_chain_config(self):
         token_rows = read_token_config(TOKEN_CONFIG_PATH)

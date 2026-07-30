@@ -373,13 +373,15 @@ class FactQualityTest(unittest.TestCase):
             for item in report["issues"]
             if item["category"] == "d1_active_gap"
         )
-        self.assertEqual(issue["status"], "needs_review")
+        self.assertEqual(issue["status"], "unsupported")
         self.assertEqual(
             issue["reason_code"],
             "source_range_unavailable",
         )
         self.assertFalse(issue["retryable"])
         self.assertEqual(report["retry_windows_by_token"], {})
+        self.assertEqual(report["summary"]["manual_review_count"], 0)
+        self.assertEqual(report["status"], "ok")
 
     def test_dex_no_candles_attempt_explains_historical_gap(self):
         write_csv(
@@ -414,6 +416,61 @@ class FactQualityTest(unittest.TestCase):
         self.assertEqual(issue["reason_code"], "no_candles")
         self.assertFalse(issue["retryable"])
         self.assertEqual(report["retry_windows_by_token"], {})
+
+    def test_dex_source_range_unavailable_is_not_retryable(self):
+        write_csv(
+            self.dex_path,
+            DEX_COLUMNS,
+            [
+                dex_row("2026-07-06"),
+                dex_row("2026-07-08"),
+            ],
+        )
+        attempts_path = self.root / "dex-attempts.json"
+        write_attempt_ledger(
+            attempts_path,
+            market_type="dex",
+            source_csv=self.dex_path,
+            attempts=[
+                dex_attempt(
+                    "2026-07-07",
+                    status="unsupported",
+                    outcome="range_unavailable",
+                    reason_code="source_range_unavailable",
+                    http_status=401,
+                    error=(
+                        "The public OHLCV endpoint does not permit the requested "
+                        "historical date window."
+                    ),
+                )
+            ],
+        )
+
+        report = build_report(
+            self.cex_path,
+            self.dex_path,
+            dex_attempts=attempts_path,
+            today=date(2026, 7, 20),
+        )
+
+        issue = next(
+            item
+            for item in report["issues"]
+            if item["category"] == "historical_gap"
+        )
+        self.assertEqual(issue["status"], "unsupported")
+        self.assertEqual(
+            issue["reason_code"],
+            "source_range_unavailable",
+        )
+        self.assertEqual(
+            issue["details"]["collection_attempt"]["outcome"],
+            "range_unavailable",
+        )
+        self.assertFalse(issue["retryable"])
+        self.assertEqual(report["retry_windows_by_token"], {})
+        self.assertEqual(report["summary"]["manual_review_count"], 0)
+        self.assertEqual(report["status"], "ok")
 
     def test_aave_three_day_historical_gap_is_explicit_and_retryable(self):
         rows = [

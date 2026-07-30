@@ -2707,8 +2707,8 @@ QUALITY_STATUS_SEMANTICS = {
     "provisional": "The current UTC day is not finalized.",
     "partial": "Only part of the requested execution or depth is proved.",
     "unsupported": (
-        "No protocol-specific, project-validated adapter exists for this "
-        "market model."
+        "The current source or project-validated method does not support this "
+        "fact, market model, or requested history range."
     ),
     "source_no_observation": (
         "The source responded successfully but supplied no observation."
@@ -2741,7 +2741,7 @@ DAILY_QUALITY_REASON_RULES = {
     "validation": ("collection_failed", True),
     "no_candles": ("source_no_observation", False),
     "not_listed": ("needs_review", False),
-    "source_range_unavailable": ("needs_review", False),
+    "source_range_unavailable": ("unsupported", False),
     "stale_market_lifecycle_unknown": ("needs_review", False),
     "missing_unexplained": ("backfill_pending", True),
 }
@@ -2750,6 +2750,7 @@ DAILY_QUALITY_STATUS_PRIORITY = {
     "needs_review": 1,
     "backfill_pending": 2,
     "source_no_observation": 3,
+    "unsupported": 4,
 }
 DAILY_QUALITY_CATEGORIES = {
     "historical_gap",
@@ -3058,8 +3059,12 @@ def _overlay_daily_quality_report(
             "The source responded but supplied no candle for one or more "
             "affected dates. This is not an automatic retry."
         ),
+        "unsupported": (
+            "The declared source cannot serve one or more affected historical "
+            "dates under its current public range. Values remain N/A."
+        ),
         "needs_review": (
-            "The source reported a listing or history-range condition that "
+            "The source reported a listing or lifecycle condition that "
             "requires protected operator review."
         ),
         "backfill_pending": (

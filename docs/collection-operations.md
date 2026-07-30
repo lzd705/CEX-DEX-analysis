@@ -65,7 +65,10 @@ unexplained missing-row outcomes enter automatic retry windows. A successful
 source response with no target candle is retained as non-retryable
 `source_no_observation/no_candles`, including when that current evidence
 explains why a formerly active market has no recent row. `not_listed` and
-`source_range_unavailable` are also non-retryable and enter manual review.
+`source_range_unavailable` are also non-retryable, but they remain distinct:
+`not_listed` enters manual review, while a documented source-history cap is
+published as informational `unsupported` coverage and stays outside both the
+retry and manual-review queues.
 
 The separate tracked `data/curated/market_lifecycle_reviews.json` file can
 dispose one exact stale-lifecycle issue after a declared/primary source

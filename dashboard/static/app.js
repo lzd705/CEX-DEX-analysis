@@ -94,6 +94,7 @@ const QUALITY_FLAG_LABELS = {
   daily_needs_review: "Daily source outcome needs review",
   daily_backfill_pending: "Daily backfill pending",
   daily_source_no_observation: "Daily source returned no candle",
+  daily_unsupported: "Daily source history unsupported",
 };
 const QUALITY_FLAG_DEFAULT_SEVERITIES = {
   depth_unavailable: "info",
@@ -116,6 +117,7 @@ const QUALITY_FLAG_DEFAULT_SEVERITIES = {
   daily_needs_review: "warning",
   daily_backfill_pending: "warning",
   daily_source_no_observation: "info",
+  daily_unsupported: "info",
 };
 const DAILY_QUALITY_REASON_LABELS = {
   network: "Network request failed",

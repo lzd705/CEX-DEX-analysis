@@ -8,8 +8,8 @@ This is an internal operator tool, not a public write API.  It deliberately:
 * holds the shared collection lock for the whole batch;
 * invokes only ``run_fact_pipeline.py`` (never TVL or depth collectors);
 * reloads the current report after every window; and
-* stops on collector failure, unchanged publication lineage, or no issue
-  progress.
+* stops on collector failure, unchanged publication lineage, or no stable-gap
+  progress while a selected gap remains retryable.
 
 The default is one window.  Larger batches remain bounded and are still
 strictly sequential.
@@ -179,28 +179,84 @@ def _string_set(value: Any, *, field: str) -> Set[str]:
     return result
 
 
-def window_fingerprint(window: Mapping[str, Any]) -> str:
-    material = {
-        "token_symbol": window["token_symbol"],
-        "start_date": window["start_date"],
-        "end_date": window["end_date"],
-        "market_types": window["market_types"],
-        "market_ids": window["market_ids"],
-        "reason_codes": window["reason_codes"],
-        "issue_ids": window["issue_ids"],
-    }
-    return hashlib.sha256(
+def _stable_identity(prefix: str, material: Mapping[str, Any]) -> str:
+    digest = hashlib.sha256(
         json.dumps(
             material,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()[:20]
+    return "{}-{}".format(prefix, digest)
+
+
+def historical_gap_key(issue: Mapping[str, Any]) -> str:
+    """Return an executor-local identity for one missing market-day fact.
+
+    ``fact_quality.issue_id`` intentionally includes evidence such as reason and
+    collection-attempt details.  Those fields can change after a retry even
+    though the market-day is still missing, so they cannot prove that a
+    backfill filled data.  This key is deliberately narrower and is not written
+    back into the global quality contract.
+    """
+
+    market = issue.get("market")
+    if not isinstance(market, dict):
+        raise QualityContractError(
+            "Historical gap has no market identity"
+        )
+    token = market.get("token_symbol")
+    market_type = market.get("market_type")
+    market_id = market.get("market_id")
+    if (
+        not isinstance(token, str)
+        or token != token.strip().upper()
+        or not TOKEN_PATTERN.fullmatch(token)
+        or market_type not in MARKET_TYPES
+        or not isinstance(market_id, str)
+        or not market_id
+    ):
+        raise QualityContractError(
+            "Historical gap has an incomplete stable market identity"
+        )
+    try:
+        gap_day = date.fromisoformat(str(issue.get("date")))
+    except (TypeError, ValueError) as error:
+        raise QualityContractError(
+            "Historical gap contains an invalid date"
+        ) from error
+    return _stable_identity(
+        "gap",
+        {
+            "market_type": market_type,
+            "token_symbol": token,
+            "market_id": market_id,
+            "date": gap_day.isoformat(),
+        },
+    )
+
+
+def window_fingerprint(window: Mapping[str, Any]) -> str:
+    """Return a stable identity for the exact target and executable scope."""
+
+    material = {
+        "token_symbol": window["token_symbol"],
+        "start_date": window["start_date"],
+        "end_date": window["end_date"],
+        "market_types": window["market_types"],
+        "market_ids": window["market_ids"],
+        "target_gap_keys": window["target_gap_keys"],
+    }
+    return _stable_identity("window", material)
 
 
 def _validated_windows(
     report: Mapping[str, Any],
-) -> Tuple[List[Dict[str, Any]], Set[str]]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    Set[str],
+    Dict[str, Dict[str, Any]],
+]:
     raw_issues = report.get("issues")
     if (
         not isinstance(raw_issues, list)
@@ -210,17 +266,42 @@ def _validated_windows(
             "Quality report issues must be a list of objects"
         )
     retryable_issues: Dict[str, Mapping[str, Any]] = {}
+    issue_gap_keys: Dict[str, str] = {}
+    historical_gaps: Dict[str, Dict[str, Any]] = {}
+    historical_issue_ids: Set[str] = set()
     for issue in raw_issues:
-        if (
-            issue.get("category") != "historical_gap"
-            or issue.get("retryable") is not True
-        ):
+        if issue.get("category") != "historical_gap":
             continue
+        gap_key = historical_gap_key(issue)
+        if gap_key in historical_gaps:
+            raise QualityContractError(
+                "Quality report contains duplicate historical gap identities"
+            )
         issue_id = issue.get("issue_id")
         if not isinstance(issue_id, str) or not issue_id:
             raise QualityContractError(
-                "Retryable historical issue has no stable issue_id"
+                "Historical issue has no issue_id"
             )
+        if issue_id in historical_issue_ids:
+            raise QualityContractError(
+                "Quality report contains duplicate historical issue_ids"
+            )
+        historical_issue_ids.add(issue_id)
+        retryable = issue.get("retryable")
+        if not isinstance(retryable, bool):
+            raise QualityContractError(
+                "Historical issue retryable must be a boolean"
+            )
+        historical_gaps[gap_key] = {
+            "gap_key": gap_key,
+            "issue_id": issue_id,
+            "reason_code": issue.get("reason_code"),
+            "status": issue.get("status"),
+            "retryable": retryable,
+        }
+        issue_gap_keys[issue_id] = gap_key
+        if not retryable:
+            continue
         if issue_id in retryable_issues:
             raise QualityContractError(
                 "Quality report contains duplicate retryable issue_ids"
@@ -301,6 +382,7 @@ def _validated_windows(
             expected_market_ids: Set[str] = set()
             expected_reason_codes: Set[str] = set()
             expected_dates: Set[date] = set()
+            target_gap_keys: Set[str] = set()
             for issue_id in issue_ids:
                 issue = retryable_issues.get(issue_id)
                 if issue is None:
@@ -342,6 +424,7 @@ def _validated_windows(
                 expected_market_ids.add(market_id)
                 expected_reason_codes.add(reason_code)
                 expected_dates.add(issue_day)
+                target_gap_keys.add(issue_gap_keys[issue_id])
 
             expected_days = {
                 date.fromordinal(date.fromisoformat(start_text).toordinal() + offset)
@@ -373,7 +456,22 @@ def _validated_windows(
                 "market_ids": sorted(market_ids),
                 "reason_codes": sorted(reason_codes),
                 "issue_ids": sorted(issue_ids),
+                "target_gap_keys": sorted(target_gap_keys),
             }
+            window["target_id"] = _stable_identity(
+                "target",
+                {"gap_keys": window["target_gap_keys"]},
+            )
+            window["window_scope_id"] = _stable_identity(
+                "scope",
+                {
+                    "token_symbol": token,
+                    "start_date": start_text,
+                    "end_date": end_text,
+                    "market_types": window["market_types"],
+                    "market_ids": window["market_ids"],
+                },
+            )
             window["window_id"] = window_fingerprint(window)
             windows.append(window)
             represented_issue_ids.update(issue_ids)
@@ -390,7 +488,7 @@ def _validated_windows(
             item["window_id"],
         )
     )
-    return windows, represented_issue_ids
+    return windows, represented_issue_ids, historical_gaps
 
 
 def load_quality_snapshot(data_dir: Path) -> Dict[str, Any]:
@@ -427,7 +525,7 @@ def load_quality_snapshot(data_dir: Path) -> Dict[str, Any]:
         raise QualityContractError(
             "Quality report does not match the published SQLite commit point"
         )
-    windows, issue_ids = _validated_windows(report)
+    windows, issue_ids, historical_gaps = _validated_windows(report)
     return {
         "report_path": str(report_path),
         "report_sha256": sha256_file(report_path),
@@ -435,6 +533,13 @@ def load_quality_snapshot(data_dir: Path) -> Dict[str, Any]:
         "dataset_snapshot_id": quality_snapshot_id,
         "windows": windows,
         "issue_ids": issue_ids,
+        "retryable_gap_keys": {
+            gap_key
+            for gap_key, gap in historical_gaps.items()
+            if gap["retryable"]
+        },
+        "historical_gap_keys": set(historical_gaps),
+        "historical_gaps": historical_gaps,
     }
 
 
@@ -588,6 +693,7 @@ def _dry_run_result(
         "quality_dataset_snapshot_id": snapshot["dataset_snapshot_id"],
         "quality_report_sha256": snapshot["report_sha256"],
         "candidate_count": len(snapshot["windows"]),
+        "historical_gap_count": len(snapshot["historical_gap_keys"]),
         "preview_count": len(candidates),
         "max_windows": max_windows,
         "candidates": candidates,
@@ -679,8 +785,13 @@ def run_exact_backfill(
             "status": "running",
             "max_windows": max_windows,
             "baseline_import_run_id": initial_snapshot["import_run_id"],
+            "before_historical_gap_count": len(
+                initial_snapshot["historical_gap_keys"]
+            ),
             "attempted_window_count": 0,
             "progress_window_count": 0,
+            "filled_window_count": 0,
+            "classified_window_count": 0,
         }
         state["batches"].append(batch)
         _persist_state(state_path, latest_path, state)
@@ -716,6 +827,9 @@ def run_exact_backfill(
                 "before_dataset_snapshot_id": before["dataset_snapshot_id"],
                 "before_quality_report_sha256": before["report_sha256"],
                 "before_backfill_issue_count": len(before["issue_ids"]),
+                "before_historical_gap_count": len(
+                    before["historical_gap_keys"]
+                ),
             }
             state["windows"].append(attempt)
             attempted_in_batch += 1
@@ -769,6 +883,24 @@ def run_exact_backfill(
             resolved_issue_ids = sorted(
                 before_issue_ids.difference(after["issue_ids"])
             )
+            selected_gap_keys = set(window["target_gap_keys"])
+            after_historical_gap_keys = set(after["historical_gap_keys"])
+            still_missing_gap_keys = sorted(
+                selected_gap_keys.intersection(after_historical_gap_keys)
+            )
+            filled_gap_keys = sorted(
+                selected_gap_keys.difference(after_historical_gap_keys)
+            )
+            reclassified_nonretryable_gap_keys = sorted(
+                gap_key
+                for gap_key in still_missing_gap_keys
+                if not after["historical_gaps"][gap_key]["retryable"]
+            )
+            still_retryable_gap_keys = sorted(
+                selected_gap_keys.intersection(
+                    after["retryable_gap_keys"]
+                )
+            )
             after_window_ids = {
                 current["window_id"] for current in after["windows"]
             }
@@ -776,8 +908,27 @@ def run_exact_backfill(
             attempt["after_dataset_snapshot_id"] = after["dataset_snapshot_id"]
             attempt["after_quality_report_sha256"] = after["report_sha256"]
             attempt["after_backfill_issue_count"] = len(after["issue_ids"])
+            attempt["after_historical_gap_count"] = len(
+                after["historical_gap_keys"]
+            )
             attempt["resolved_issue_ids"] = resolved_issue_ids
             attempt["unresolved_issue_ids"] = unresolved_issue_ids
+            attempt["filled_gap_keys"] = filled_gap_keys
+            attempt["still_missing_gap_keys"] = still_missing_gap_keys
+            attempt["reclassified_nonretryable_gap_keys"] = (
+                reclassified_nonretryable_gap_keys
+            )
+            attempt["still_retryable_gap_keys"] = still_retryable_gap_keys
+            attempt["gap_outcome"] = {
+                "filled": filled_gap_keys,
+                "still_missing": still_missing_gap_keys,
+                "reclassified_nonretryable": (
+                    reclassified_nonretryable_gap_keys
+                ),
+                "classified_nonretryable": (
+                    reclassified_nonretryable_gap_keys
+                ),
+            }
             attempt["exact_window_still_present"] = (
                 window["window_id"] in after_window_ids
             )
@@ -789,21 +940,31 @@ def run_exact_backfill(
                 )
                 state["status"] = "failed_verification"
                 batch["status"] = "failed_verification"
-            elif not resolved_issue_ids:
-                attempt["status"] = "no_progress"
-                attempt["verification_error"] = (
-                    "Publication changed but none of the selected exact-window "
-                    "issue_ids were resolved"
-                )
-                state["status"] = "no_progress"
-                batch["status"] = "no_progress"
+            elif not filled_gap_keys:
+                if not still_retryable_gap_keys:
+                    attempt["status"] = "classified_nonretryable"
+                    attempt["evidence_only"] = True
+                    batch["classified_window_count"] += 1
+                else:
+                    attempt["status"] = "no_progress"
+                    attempt["verification_error"] = (
+                        "Publication changed but no selected stable market-day "
+                        "gap was filled and at least one remains retryable; "
+                        "issue evidence changes are not fills"
+                    )
+                    state["status"] = "no_progress"
+                    batch["status"] = "no_progress"
             else:
                 attempt["status"] = "progress"
                 batch["progress_window_count"] += 1
+                batch["filled_window_count"] += 1
             attempt["finished_at_utc"] = utc_text()
             _persist_state(state_path, latest_path, state)
 
-            if attempt["status"] != "progress":
+            if attempt["status"] not in {
+                "progress",
+                "classified_nonretryable",
+            }:
                 break
 
         if state["status"] == "running":
@@ -816,6 +977,9 @@ def run_exact_backfill(
                 batch["status"] = "batch_limit_reached"
             state["remaining_window_count"] = len(final_snapshot["windows"])
             state["remaining_issue_count"] = len(final_snapshot["issue_ids"])
+            state["remaining_historical_gap_count"] = len(
+                final_snapshot["historical_gap_keys"]
+            )
             state["final_import_run_id"] = final_snapshot["import_run_id"]
             state["final_dataset_snapshot_id"] = final_snapshot[
                 "dataset_snapshot_id"
@@ -828,12 +992,19 @@ def run_exact_backfill(
             if final_snapshot is not None:
                 state["remaining_window_count"] = len(final_snapshot["windows"])
                 state["remaining_issue_count"] = len(final_snapshot["issue_ids"])
+                state["remaining_historical_gap_count"] = len(
+                    final_snapshot["historical_gap_keys"]
+                )
                 state["final_import_run_id"] = final_snapshot["import_run_id"]
                 state["final_dataset_snapshot_id"] = final_snapshot[
                     "dataset_snapshot_id"
                 ]
 
         batch["finished_at_utc"] = utc_text()
+        if final_snapshot is not None:
+            batch["after_historical_gap_count"] = len(
+                final_snapshot["historical_gap_keys"]
+            )
         state["finished_at_utc"] = utc_text()
         _persist_state(state_path, latest_path, state)
         return state

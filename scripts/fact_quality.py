@@ -964,8 +964,11 @@ def gap_evidence(
             "attempt": None,
         }
     reason = str(attempt["reason_code"])
-    if reason in {"not_listed", "source_range_unavailable"}:
+    if reason == "not_listed":
         status = "needs_review"
+        retryable = False
+    elif reason == "source_range_unavailable":
+        status = "unsupported"
         retryable = False
     elif reason == "no_candles":
         status = "source_no_observation"

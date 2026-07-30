@@ -25,14 +25,20 @@ def issue(
     market_type,
     market_id,
     reason_code="missing_unexplained",
+    retryable=True,
+    status=None,
+    details=None,
 ):
     return {
         "issue_id": issue_id,
         "category": "historical_gap",
-        "status": "backfill_pending",
+        "status": status or (
+            "backfill_pending" if retryable else "source_no_observation"
+        ),
         "reason_code": reason_code,
-        "retryable": True,
+        "retryable": retryable,
         "date": day,
+        "details": details or {},
         "market": {
             "token_symbol": token,
             "market_type": market_type,
@@ -74,7 +80,7 @@ class ExactBackfillTest(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
-    def publish(self, import_run_id, windows):
+    def publish(self, import_run_id, windows, additional_issues=()):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         snapshot_id = "snapshot-{}".format(import_run_id)
         database = sqlite3.connect(
@@ -116,6 +122,7 @@ class ExactBackfillTest(unittest.TestCase):
                 serialized
             )
             issues.extend(source_window["_issues"])
+        issues.extend(additional_issues)
         report = {
             "schema": "fact_quality_report/v1",
             "publication": {
@@ -179,6 +186,28 @@ class ExactBackfillTest(unittest.TestCase):
         self.assertFalse(any("depth" in item for item in command))
         self.assertFalse(self.run_root.exists())
 
+    def test_duplicate_historical_issue_id_is_rejected(self):
+        window = self.dex_window()
+        duplicate = issue(
+            "dex-issue-1",
+            token="ARB",
+            day="2026-07-10",
+            market_type="dex",
+            market_id="dex:arbitrum:0xother",
+            retryable=False,
+        )
+        self.publish(
+            "import-1",
+            [window],
+            additional_issues=[duplicate],
+        )
+
+        with self.assertRaisesRegex(
+            QualityContractError,
+            "duplicate historical issue_ids",
+        ):
+            load_quality_snapshot(self.data_dir)
+
     def test_dynamic_reload_runs_only_current_windows_and_verifies_progress(self):
         dex_window = self.dex_window(day="2026-07-08")
         cex_window = self.cex_window(day="2026-07-09")
@@ -213,6 +242,8 @@ class ExactBackfillTest(unittest.TestCase):
             [entry["status"] for entry in result["windows"]],
             ["progress", "progress"],
         )
+        self.assertEqual(result["batches"][0]["filled_window_count"], 2)
+        self.assertEqual(result["batches"][0]["classified_window_count"], 0)
         self.assertEqual(result["remaining_issue_count"], 0)
         state_path = Path(result["state_path"])
         self.assertTrue(state_path.exists())
@@ -250,6 +281,193 @@ class ExactBackfillTest(unittest.TestCase):
             result["windows"][0]["unresolved_issue_ids"],
             ["dex-issue-1"],
         )
+        self.assertEqual(result["windows"][0]["filled_gap_keys"], [])
+        self.assertEqual(
+            result["windows"][0]["before_historical_gap_count"],
+            1,
+        )
+        self.assertEqual(
+            result["windows"][0]["after_historical_gap_count"],
+            1,
+        )
+
+    def test_reason_change_and_new_issue_id_is_not_fill_progress(self):
+        before_window = self.dex_window()
+        self.publish("import-1", [before_window])
+        replacement = issue(
+            "dex-network-issue",
+            token="ARB",
+            day="2026-07-08",
+            market_type="dex",
+            market_id="dex:arbitrum:0xpool1",
+            reason_code="network",
+        )
+        after_window = exact_window(
+            "ARB",
+            "2026-07-08",
+            "2026-07-08",
+            [replacement],
+        )
+
+        def runner(_command, log_path):
+            log_path.write_text("network failure\n", encoding="utf-8")
+            self.publish("import-2", [after_window])
+            return 0
+
+        result = run_exact_backfill(
+            data_dir=self.data_dir,
+            max_windows=3,
+            run_root=self.run_root,
+            lock_path=self.lock_path,
+            now=NOW,
+            step_runner=runner,
+        )
+
+        attempt = result["windows"][0]
+        self.assertEqual(result["status"], "no_progress")
+        self.assertEqual(attempt["filled_gap_keys"], [])
+        self.assertEqual(
+            attempt["still_missing_gap_keys"],
+            attempt["window"]["target_gap_keys"],
+        )
+        self.assertEqual(attempt["resolved_issue_ids"], ["dex-issue-1"])
+        self.assertEqual(attempt["before_historical_gap_count"], 1)
+        self.assertEqual(attempt["after_historical_gap_count"], 1)
+        self.assertEqual(
+            attempt["window"]["window_id"],
+            load_quality_snapshot(self.data_dir)["windows"][0]["window_id"],
+        )
+
+    def test_attempt_timestamp_issue_id_churn_is_not_fill_progress(self):
+        before_issue = issue(
+            "dex-attempt-old",
+            token="ARB",
+            day="2026-07-08",
+            market_type="dex",
+            market_id="dex:arbitrum:0xpool1",
+            reason_code="network",
+            details={
+                "collection_attempt": {
+                    "finished_at_utc": "2026-07-30T01:00:00+00:00",
+                }
+            },
+        )
+        before_window = exact_window(
+            "ARB",
+            "2026-07-08",
+            "2026-07-08",
+            [before_issue],
+        )
+        self.publish("import-1", [before_window])
+        after_issue = issue(
+            "dex-attempt-new",
+            token="ARB",
+            day="2026-07-08",
+            market_type="dex",
+            market_id="dex:arbitrum:0xpool1",
+            reason_code="network",
+            details={
+                "collection_attempt": {
+                    "finished_at_utc": "2026-07-30T02:00:00+00:00",
+                }
+            },
+        )
+        after_window = exact_window(
+            "ARB",
+            "2026-07-08",
+            "2026-07-08",
+            [after_issue],
+        )
+
+        def runner(_command, log_path):
+            log_path.write_text("network failed again\n", encoding="utf-8")
+            self.publish("import-2", [after_window])
+            return 0
+
+        result = run_exact_backfill(
+            data_dir=self.data_dir,
+            max_windows=2,
+            run_root=self.run_root,
+            lock_path=self.lock_path,
+            now=NOW,
+            step_runner=runner,
+        )
+
+        attempt = result["windows"][0]
+        self.assertEqual(result["status"], "no_progress")
+        self.assertEqual(attempt["gap_outcome"]["filled"], [])
+        self.assertEqual(
+            attempt["gap_outcome"]["still_missing"],
+            attempt["window"]["target_gap_keys"],
+        )
+        self.assertEqual(attempt["before_historical_gap_count"], 1)
+        self.assertEqual(attempt["after_historical_gap_count"], 1)
+
+    def test_nonretryable_classification_continues_without_counting_a_fill(self):
+        before_window = self.dex_window()
+        next_window = self.cex_window(day="2026-07-09")
+        self.publish("import-1", [before_window, next_window])
+        no_candles = issue(
+            "dex-no-candles",
+            token="ARB",
+            day="2026-07-08",
+            market_type="dex",
+            market_id="dex:arbitrum:0xpool1",
+            reason_code="no_candles",
+            retryable=False,
+        )
+
+        call_count = 0
+
+        def runner(_command, log_path):
+            nonlocal call_count
+            call_count += 1
+            log_path.write_text("collector publication\n", encoding="utf-8")
+            if call_count == 1:
+                self.publish(
+                    "import-2",
+                    [next_window],
+                    additional_issues=[no_candles],
+                )
+            else:
+                self.publish(
+                    "import-3",
+                    [],
+                    additional_issues=[no_candles],
+                )
+            return 0
+
+        result = run_exact_backfill(
+            data_dir=self.data_dir,
+            max_windows=2,
+            run_root=self.run_root,
+            lock_path=self.lock_path,
+            now=NOW,
+            step_runner=runner,
+        )
+
+        attempt = result["windows"][0]
+        self.assertEqual(result["status"], "exhausted")
+        self.assertEqual(call_count, 2)
+        self.assertEqual(
+            [item["status"] for item in result["windows"]],
+            ["classified_nonretryable", "progress"],
+        )
+        self.assertEqual(attempt["gap_outcome"]["filled"], [])
+        self.assertEqual(
+            attempt["gap_outcome"]["still_missing"],
+            attempt["window"]["target_gap_keys"],
+        )
+        self.assertEqual(
+            attempt["gap_outcome"]["reclassified_nonretryable"],
+            attempt["window"]["target_gap_keys"],
+        )
+        self.assertEqual(attempt["before_historical_gap_count"], 2)
+        self.assertEqual(attempt["after_historical_gap_count"], 2)
+        self.assertTrue(attempt["evidence_only"])
+        self.assertEqual(result["batches"][0]["filled_window_count"], 1)
+        self.assertEqual(result["batches"][0]["progress_window_count"], 1)
+        self.assertEqual(result["batches"][0]["classified_window_count"], 1)
 
     def test_unchanged_import_run_id_stops_even_if_collector_exits_zero(self):
         self.publish("import-1", [self.dex_window()])
