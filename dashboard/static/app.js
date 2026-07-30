@@ -5009,6 +5009,16 @@ function persistSelectedPair() {
   return false;
 }
 
+function applySelectedPair() {
+  if (!persistSelectedPair()) {
+    replaceCurrentRoute();
+    refreshWorkspacePageData();
+    return false;
+  }
+  navigateTo(currentWorkspacePath("compare"));
+  return true;
+}
+
 function refreshWorkspacePageData() {
   renderFactsMarketWarnings();
   renderWorkspaceContext();
@@ -5345,11 +5355,7 @@ function bindEvents() {
     );
     app.comparisonChartResizeObserver.observe(byId("comparison-plot"));
   }
-  byId("compare-markets").addEventListener("click", () => {
-    persistSelectedPair();
-    replaceCurrentRoute();
-    refreshWorkspacePageData();
-  });
+  byId("compare-markets").addEventListener("click", applySelectedPair);
   byId("export-csv").addEventListener("click", exportVisibleCsv);
   document.addEventListener("click", (event) => {
     const pairButton = event.target.closest?.("[data-set-market-slot]");

@@ -785,6 +785,34 @@ console.log(JSON.stringify({
         self.assertIn('id="apply-window"', form)
         self.assertIn('type="submit"', form)
 
+    def test_apply_pair_navigates_to_compare_after_persisting_valid_selection(self):
+        app_js = APP_PATH.read_text(encoding="utf-8")
+        self.assertIn("function applySelectedPair()", app_js)
+
+        command = app_js[
+            app_js.index("function applySelectedPair()"):
+            app_js.index("function refreshWorkspacePageData()")
+        ]
+        self.assertIn("if (!persistSelectedPair())", command)
+        self.assertIn("replaceCurrentRoute();", command)
+        self.assertIn("refreshWorkspacePageData();", command)
+        self.assertIn('navigateTo(currentWorkspacePath("compare"));', command)
+        self.assertLess(
+            command.index("if (!persistSelectedPair())"),
+            command.index('navigateTo(currentWorkspacePath("compare"));'),
+        )
+
+        binding = app_js[
+            app_js.index('byId("compare-markets").addEventListener("click"'):
+            app_js.index('byId("export-csv").addEventListener("click"')
+        ]
+        self.assertIn(
+            'byId("compare-markets").addEventListener("click", applySelectedPair);',
+            binding,
+        )
+        self.assertNotIn("replaceCurrentRoute();", binding)
+        self.assertNotIn("refreshWorkspacePageData();", binding)
+
     def test_date_error_is_inline_only_and_updates_input_accessibility_state(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
         form_start = index.index('<form id="date-window-form"')

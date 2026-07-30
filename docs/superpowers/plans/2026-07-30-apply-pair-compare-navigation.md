@@ -26,7 +26,7 @@
 - Consumes: `persistSelectedPair() -> boolean`, `replaceCurrentRoute()`, `refreshWorkspacePageData()`, `currentWorkspacePath(page) -> string`, and `navigateTo(path)`.
 - Produces: `applySelectedPair() -> boolean`, called by the `#compare-markets` click handler.
 
-- [ ] **Step 1: Write the failing regression test**
+- [x] **Step 1: Write the failing regression test**
 
 Add a test that extracts `applySelectedPair()` from `dashboard/static/app.js`
 and asserts that invalid persistence refreshes in place while valid persistence
@@ -36,17 +36,17 @@ navigates with:
 navigateTo(currentWorkspacePath("compare"));
 ```
 
-- [ ] **Step 2: Run the focused test to verify it fails**
+- [x] **Step 2: Run the focused test to verify it fails**
 
 Run:
 
 ```bash
-python -m unittest tests.test_dashboard_frontend.DashboardFrontendContractTest.test_apply_pair_navigates_to_compare_after_persisting_valid_selection
+python tests/test_dashboard_frontend.py DashboardFrontendContractTest.test_apply_pair_navigates_to_compare_after_persisting_valid_selection
 ```
 
 Expected: failure because `function applySelectedPair()` does not exist.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [x] **Step 3: Write the minimal implementation**
 
 Add:
 
@@ -68,17 +68,17 @@ Change the `#compare-markets` click handler to:
 byId("compare-markets").addEventListener("click", applySelectedPair);
 ```
 
-- [ ] **Step 4: Run the focused test to verify it passes**
+- [x] **Step 4: Run the focused test to verify it passes**
 
 Run:
 
 ```bash
-python -m unittest tests.test_dashboard_frontend.DashboardFrontendContractTest.test_apply_pair_navigates_to_compare_after_persisting_valid_selection
+python tests/test_dashboard_frontend.py DashboardFrontendContractTest.test_apply_pair_navigates_to_compare_after_persisting_valid_selection
 ```
 
 Expected: one passing test.
 
-- [ ] **Step 5: Run full verification**
+- [x] **Step 5: Run full verification**
 
 Run:
 
