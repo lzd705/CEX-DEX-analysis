@@ -123,6 +123,29 @@ after failure, and survives logout only when linger is enabled. Prefer
 temporary compatibility choice, not a substitute for TLS, rate limiting, or
 closing port 8765.
 
+### Connection-capped demo proxy
+
+When the demo host has no Nginx or TLS endpoint yet, the bounded public
+Add Token and quality-retry actions must not be enabled by weakening the
+application's loopback guard. Instead:
+
+1. run `cex-dex-dashboard.service` on `127.0.0.1:8766`;
+2. render `deploy/systemd/cex-dex-dashboard-proxy.socket.in` with the reviewed
+   private/NAT bind address and install both proxy units under the same user
+   supervisor;
+3. keep `ADMIN_ENABLED=false` and
+   `TRUST_LOOPBACK_PROXY_CLIENT_IP=false`;
+4. enable the app service, then the proxy socket, and verify both the loopback
+   health endpoint and the public endpoint.
+
+The proxy uses `/lib/systemd/systemd-socket-proxyd --connections-max=64`, so
+slow public connections cannot create an unbounded number of application
+threads. It is a raw TCP proxy: it provides no TLS and does not overwrite
+`X-Real-IP`. With proxy-header trust disabled, the application deliberately
+treats all demo users as one conservative global rate-limit bucket. Never set
+`TRUST_LOOPBACK_PROXY_CLIENT_IP=true` for this topology because a client could
+supply that header itself.
+
 For user-level collection timers, use `scripts/install_collection_timers.sh`
 with an absolute `MARKET_DATA_DIR`. It renders the dedicated
 `cex-dex-daily-user.service.in` and `cex-dex-depth-user.service.in` templates,

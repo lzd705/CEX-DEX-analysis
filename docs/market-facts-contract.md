@@ -145,6 +145,12 @@ specific cause. Such evidence distinguishes retryable `collection_failed`,
 non-retryable `source_no_observation` (the source answered successfully but
 returned no target candle), and non-retryable `needs_review`; absence alone
 never becomes `collection_failed`.
+One exact `stale_market_unknown` issue can also become informational
+`source_no_observation` through a validated revision in
+`data/curated/market_lifecycle_reviews.json`. The revision is bound to the
+original issue ID, market ID, and UTC date and retains source-check hashes and
+normalized observations. It does not apply to a later date and cannot mark a
+market inactive or delisted.
 The separate daily quality publication decides whether a D-1 gap satisfies
 the active-market retry rule. Capability limits (`unsupported`), partial
 measurements, observed market conditions, and data-health failures are not

@@ -70,6 +70,26 @@ The server queues one job at a time. A job:
    `market_facts.sqlite3` as the runtime commit point under `data/local/`, and
    atomically replaces the daily quality report.
 
+Historical retry capacity is deliberately bounded by the collector contracts:
+
+- every requested window is inclusive and limited to 180 UTC days;
+- Binance, OKX, Bybit, KuCoin, Gate, Bitget, MEXC, Coinbase, Crypto.com, and
+  Upbit use a source time bound/cursor for that window; Upbit's 200-candle cap
+  remains above the 180-day application cap;
+- HTX and Kraken are recent-only responses capped at 2,000 and 720 bars. The
+  collector checks the oldest returned bar and records
+  `source_range_unavailable` instead of pretending an unreachable date was
+  collected;
+- GeckoTerminal DEX OHLCV uses an exclusive `before_timestamp` cursor and a
+  collector limit no greater than 180 rows for one retry.
+
+Combining disconnected gaps into a wider interval is not automatically safe
+merely because it remains under 180 days: it re-requests already observed
+facts and is outside the current exact-window allowlist.
+These endpoint bounds are not a parallel-request budget. Retry publications
+remain sequential under the collection lock and must reload the current
+quality-report lineage after every committed window.
+
 Job state and server-only logs live under the selected runtime data directory
 at `admin/jobs/`.
 The public server opens `market_facts.sqlite3` read-only. Existing requests
@@ -102,11 +122,19 @@ The report keeps data-quality states separate:
   least three valid observations in the inclusive prior seven-day window.
   Recent trailing missing days appear in `retry_queue` and
   `retry_windows_by_token`.
+- `source_no_observation`: an accepted, lineage-matched source attempt covered
+  the missing day but returned no candle. It remains visible as an
+  informational source outcome and is neither a warning nor an automatic
+  retry candidate.
 - `stale_market_unknown`: a formerly active market has aged out of the
   evidence-backed retry window without explicit inactive/delisted metadata.
   It is retained as a non-retryable `needs_review` item rather than silently
   disappearing or creating an endless automatic retry queue. An operator must
-  verify current source inventory or lifecycle before disposition.
+  verify current source inventory or lifecycle before disposition. If a
+  lineage-matched attempt covering the latest completed UTC day instead proves
+  that the source returned no candle, the market is classified as
+  informational `source_no_observation/no_candles`; it is not mislabeled as
+  an unknown lifecycle and does not remain in the manual-review queue.
 
 Dates before the first observed row are never inferred to be failures or
 historical gaps. A newly listed or otherwise sparse market also does not enter
@@ -120,7 +148,9 @@ Missing-row causes are evidence-based, not inferred from absence alone:
   `network`, `rate_limit`, `source_unavailable`, `parse`, or `validation`;
 - a successful source response without the target candle:
   `status=source_no_observation`, `reason_code=no_candles`, with no automatic
-  retry because repeating the same successful empty response creates a loop;
+  retry because repeating the same successful empty response creates a loop.
+  The explanatory issue remains visible, but it is excluded from
+  `backfill_pending`, retry windows, and the report's warning status;
 - source says the market is unavailable, or its documented recent-only range
   cannot reach the audited day: `status=needs_review`, with `not_listed` or
   `source_range_unavailable`, and no automatic retry.
@@ -165,14 +195,51 @@ non-retryable source outcome such as `not_listed`,
 result reports `observed_count`, `confirmed_absence_count`, and
 `unresolved_count`, so a confirmed source absence cannot be mistaken for a
 successfully collected candle.
+Each emitted window also lists the affected `market_types` (`cex`, `dex`, or
+both). This is source-scope evidence for a separately tested executor; the
+current operator path must not silently use it to broaden dates or bypass the
+exact-window allowlist.
 
 `hard_invalid`, `stale_market_unknown`, and lineage-matched `needs_review`
 findings such as `not_listed` or `source_range_unavailable` are different.
 The Admin page reads their sanitized entries from `manual_review_queue` and
 shows the Token, market, date, reason, and primary-source URL hints in a
 separate, read-only table. Those items never receive a retry button. The
-operator must record primary-source evidence and a disposition outside the
-automatic collection queue before changing their lifecycle.
+operator must record source evidence and a disposition outside the automatic
+collection queue before changing their lifecycle.
+
+Persistent dispositions live in the revisioned, tracked
+`data/curated/market_lifecycle_reviews.json` contract. A disposed revision must
+bind one pending issue ID, market ID, Token, market type, and UTC issue date;
+record the check actor/method/time; retain successful declared or primary
+source URLs, normalized observations, and response SHA-256 hashes; and select
+only the non-retryable `source_no_observation/no_candles` outcome. The quality
+builder validates the entire file and contiguous revision history before use.
+An invalid, ambiguous, cross-market-source, or mismatched record fails closed.
+
+A matching disposition removes that exact `stale_market_unknown` item from the
+manual queue and retains the complete review under the informational issue's
+protected details. It never carries forward to tomorrow. A future missing date
+still requires a new lineage-matched collector attempt or a new reviewed
+revision. Corrections append the next contiguous revision; a `withdrawn`
+latest revision disables the prior disposition without deleting history.
+
+The initial reviewed records make two deliberately narrow findings for
+2026-07-29:
+
+- the configured GRT Arbitrum Uniswap V3 pool exists, while the declared
+  GeckoTerminal source's newest daily candle is 2026-07-22 and its pool
+  endpoint reports zero 24-hour volume and transactions;
+- Upbit's official inventory contains `USDT-LDO`, not `KRW-LDO`, and its
+  official `USDT-LDO` ticker reports the last trade on 2026-07-06 with zero
+  24-hour accumulated volume.
+
+Neither record marks a market delisted, invents a candle, or makes a claim
+about a future UTC date.
+For Upbit, the hints include the fact's configured quote market, the
+collector's KRW/USDT fallback, and the official market inventory endpoint; a
+missing KRW market therefore cannot be presented as evidence that an observed
+USDT market is delisted.
 
 Hard-invalid candidates never overwrite the last good daily publication. They
 are persisted below `quality/rejected/<rejection-id>/`, and
@@ -274,3 +341,11 @@ Historical collection is available only for an exact, bounded window emitted
 under `backfill_windows_by_token` by the currently published quality report.
 Any broader source-specific backfill still requires a separately tested
 collector change rather than bypassing this allowlist.
+
+For a reviewed sequential batch of those same exact historical windows, use
+`scripts/run_exact_backfill.py` as documented in
+`docs/collection-operations.md`. That internal runner shares the collection
+lock, narrows CEX/DEX source scope from the report's `market_types`, skips
+TVL/depth work, and stops if the committed publication or selected issue set
+does not make verifiable progress. It does not create a broader date-input
+surface.

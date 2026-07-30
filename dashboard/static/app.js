@@ -129,6 +129,17 @@ const DAILY_QUALITY_REASON_LABELS = {
   stale_market_lifecycle_unknown: "Market lifecycle needs review",
   missing_unexplained: "No matching collection attempt",
   daily_audit_no_matching_issue: "No exact published audit issue",
+  source_no_two_sided_book: "Source has no two-sided order book",
+  source_no_order_book: "Source returned no order book",
+  source_invalid_order_book: "Source returned an invalid order book",
+  source_rejected_request: "Source rejected the request",
+  unsupported_source: "Source is unsupported",
+  collection_failed: "Collection failed",
+  source_level_limit: "Published depth is a lower bound",
+  target_filled: "Requested execution size was filled",
+  full_book_insufficient_liquidity: "Full book cannot fill the requested size",
+  execution_snapshot_unavailable: "Execution snapshot unavailable",
+  execution_snapshot_invalid: "Execution snapshot invalid",
 };
 const QUALITY_SEVERITY_RANK = { info: 1, warning: 2, critical: 3 };
 const SCREENER_SORT_DEFINITIONS = Object.freeze({
@@ -1784,8 +1795,10 @@ function payloadMarketForCatalog(market) {
 function qualityStateMarkup(status, label = "", tooltip = "") {
   const normalized = String(status || "unavailable").toLowerCase();
   const display = label || normalized.replaceAll("_", " ");
-  const title = tooltip ? ` title="${escapeHtml(tooltip)}"` : "";
-  return `<span class="quality-state" data-state="${escapeHtml(normalized)}"${title}>${escapeHtml(display)}</span>`;
+  const tooltipAttributes = tooltip
+    ? ` tabindex="0" aria-label="${escapeHtml(`${display}. ${tooltip}`)}" data-tooltip="${escapeHtml(tooltip)}"`
+    : "";
+  return `<span class="quality-state" data-state="${escapeHtml(normalized)}"${tooltipAttributes}>${escapeHtml(display)}</span>`;
 }
 
 function renderWorkspaceContext() {
@@ -1973,11 +1986,20 @@ function qualityFactMarkup(name, fact) {
   } else if (value !== null && value !== undefined && value !== "") {
     valueText = String(value);
   }
-  const details = [
-    valueText,
-    fact?.observed_at ? formatUtcTimestamp(fact.observed_at) : "",
-    fact?.message || fact?.reason,
-  ].filter(Boolean);
+  const observedText = fact?.observed_at
+    ? formatUtcTimestamp(fact.observed_at)
+    : "";
+  const reasonCode = fact?.reason_code || "";
+  const reasonLabel = reasonCode
+    ? DAILY_QUALITY_REASON_LABELS[reasonCode]
+      || reasonCode.replaceAll("_", " ")
+    : "";
+  const sourceDetail = fact?.message || fact?.reason || "";
+  const details = [];
+  if (reasonLabel) details.push(`Cause: ${reasonLabel}`);
+  if (sourceDetail && sourceDetail !== reasonCode) {
+    details.push(`Source detail: ${sourceDetail}`);
+  }
   if (name === "daily") {
     if (fact?.coverage_expected_start && fact?.coverage_expected_end) {
       details.push(
@@ -2016,9 +2038,9 @@ function qualityFactMarkup(name, fact) {
   if (fact?.retryable) {
     details.push(
       fact?.action === "operator_review_retry_and_manual_queues"
-        ? "Operator actions: inspect both the protected Admin retry queue and "
-          + "manual-review queue. This public page is read-only."
-        : "Operator action: inspect the protected Admin retry queue. "
+        ? "Operator actions: inspect both protected operator queues: retry and "
+          + "manual review. This public page is read-only."
+        : "Operator action: inspect the protected operator retry queue. "
           + "This public page is read-only.",
     );
   } else if (fact?.action === "operator_manual_review") {
@@ -2077,11 +2099,29 @@ function qualityFactMarkup(name, fact) {
           : []),
       ].filter(Boolean).join(" · ")
     : fact?.reason || "";
+  const hasDetails = details.length > 0 || lineage.length > 0;
+  const factLabel = (
+    {
+      daily: "daily Fact",
+      tvl: "TVL Fact",
+      depth: "depth Fact",
+      execution: "execution Fact",
+    }[name] || `${name} Fact`
+  );
   return `<div class="quality-fact">
     ${qualityStateMarkup(status, "", statusTooltip)}
-    ${details.map((detail) => `<small>${escapeHtml(detail)}</small>`).join("")}
-    ${lineage.length
-      ? `<details><summary>Lineage</summary>${lineage.map((detail) => `<small>${escapeHtml(detail)}</small>`).join("")}</details>`
+    ${valueText ? `<strong class="quality-primary-value">${escapeHtml(valueText)}</strong>` : ""}
+    ${observedText ? `<span class="quality-observed-time">${escapeHtml(observedText)}</span>` : ""}
+    ${hasDetails
+      ? `<details class="quality-fact-details">
+          <summary aria-label="Open ${escapeHtml(factLabel)} details"><span aria-hidden="true">i</span></summary>
+          <div class="quality-fact-detail-body">
+            ${details.map((detail) => `<p>${escapeHtml(detail)}</p>`).join("")}
+            ${lineage.length
+              ? `<strong class="quality-lineage-heading">Lineage</strong>${lineage.map((detail) => `<p>${escapeHtml(detail)}</p>`).join("")}`
+              : ""}
+          </div>
+        </details>`
       : ""}
   </div>`;
 }
@@ -2441,6 +2481,27 @@ function qualityStatusCounts(payload) {
   return counts;
 }
 
+function qualityStatusTiers(counts) {
+  return {
+    critical: (
+      (counts.failed || 0)
+      + (counts.collection_failed || 0)
+      + (counts.invalid || 0)
+    ),
+    pending: (
+      (counts.backfill_pending || 0)
+      + (counts.missing_unexplained || 0)
+      + (counts.stale || 0)
+      + (counts.needs_review || 0)
+    ),
+    informational: (
+      (counts.source_no_observation || 0)
+      + (counts.unsupported || 0)
+      + (counts.not_applicable || 0)
+    ),
+  };
+}
+
 async function loadQuality() {
   const requestId = invalidateQualityRequest();
   const token = selectedWorkspaceToken();
@@ -2479,22 +2540,7 @@ async function loadQuality() {
     if (requestId !== app.qualityRequestId) return false;
     renderQualityPayload(payload);
     const counts = qualityStatusCounts(payload);
-    const critical = (
-      (counts.failed || 0)
-      + (counts.collection_failed || 0)
-      + (counts.invalid || 0)
-    );
-    const pending = (
-      (counts.backfill_pending || 0)
-      + (counts.missing_unexplained || 0)
-      + (counts.stale || 0)
-      + (counts.needs_review || 0)
-      + (counts.source_no_observation || 0)
-    );
-    const structural = (
-      (counts.unsupported || 0)
-      + (counts.not_applicable || 0)
-    );
+    const { critical, pending, informational } = qualityStatusTiers(counts);
     const state = critical ? "critical" : pending ? "warning" : "success";
     const dailyAudit = payload.metadata.daily_quality_report || {};
     const dailyAuditText = dailyAudit.status === "matched"
@@ -2506,7 +2552,7 @@ async function loadQuality() {
         + `${payload.metadata.window_start || "—"} → ${payload.metadata.window_end || "—"} · `
         + `${payload.markets.length} markets · ${counts.observed || 0} observed · `
         + `${pending} attention/limits · ${critical} failed/invalid · `
-        + `${structural} structural · ${counts.partial || 0} partial · `
+        + `${informational} informational/structural · ${counts.partial || 0} partial · `
         + `${dailyAuditText}.`,
       state,
     );
@@ -3866,21 +3912,21 @@ function comparisonMetricDefinition(metric) {
     price: {
       key: "price",
       title: "Daily price observations",
-      note: "Market A and B source observations in USD; missing dates break the line.",
+      note: "USD source prices · gaps break the line",
       axisTitle: "Daily source price (USD)",
       scaleLabel: "Linear USD",
     },
     spread: {
       key: "spread",
       title: "Daily midpoint-relative price spread",
-      note: "Absolute A/B price difference divided by their midpoint; this is not a bid/ask spread.",
+      note: "Midpoint-relative A/B gap · not a bid/ask spread",
       axisTitle: "Midpoint-relative spread (bps)",
       scaleLabel: "Linear bps",
     },
     volume: {
       key: "volume",
       title: "Daily reported volume",
-      note: "Market A and B source-reported daily USD volume; missing values are never converted to zero.",
+      note: "Source-reported USD volume · missing is not zero",
       axisTitle: "Daily source-reported volume (USD)",
       scaleLabel: "Linear USD",
     },

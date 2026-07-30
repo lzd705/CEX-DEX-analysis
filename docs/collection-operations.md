@@ -63,8 +63,25 @@ hard-invalid rejection report.
 Only transport, rate-limit, source-availability, parse, validation, and
 unexplained missing-row outcomes enter automatic retry windows. A successful
 source response with no target candle is retained as non-retryable
-`source_no_observation/no_candles`. `not_listed` and
+`source_no_observation/no_candles`, including when that current evidence
+explains why a formerly active market has no recent row. `not_listed` and
 `source_range_unavailable` are also non-retryable and enter manual review.
+
+The separate tracked `data/curated/market_lifecycle_reviews.json` file can
+dispose one exact stale-lifecycle issue after a declared/primary source
+cross-check. Validate it before publication:
+
+```bash
+python3 scripts/market_lifecycle_reviews.py
+```
+
+The validator requires contiguous revisions, exact issue/market/date identity,
+an approved source host for that market type, check timestamps, normalized
+observations, and response SHA-256 hashes. Only the informational
+`source_no_observation/no_candles` disposition is supported. Review evidence
+does not expire into a guessed lifecycle: it applies to its one recorded UTC
+date, while the next day again depends on fresh collector evidence or a new
+review revision.
 
 ## Manually reviewed Event Fact publication
 
@@ -121,6 +138,83 @@ Scheduled publishing also applies a post-step freshness gate. A collector that
 exits zero while its expected source remains stale is recorded as failed. A
 rate-limited or empty response therefore cannot masquerade as a successful
 refresh.
+
+## Exact historical-gap backfill
+
+Use the internal exact-window runner for historical gaps. It does not accept an
+operator-supplied Token or date, and it does not call the `daily` collection
+profile because that profile also refreshes every TVL pool. Instead, it reads
+the currently published `backfill_windows_by_token`, validates the quality
+report's import/snapshot lineage against SQLite, and calls only
+`run_fact_pipeline.py`:
+
+```bash
+python3 scripts/run_exact_backfill.py \
+  --data-dir /home/ugs/workspace/cex-dex-market-monitor-v1/data/local \
+  --dry-run
+```
+
+The default live batch is one exact window:
+
+```bash
+python3 scripts/run_exact_backfill.py \
+  --data-dir /home/ugs/workspace/cex-dex-market-monitor-v1/data/local
+```
+
+After checking the dry-run scope and current source health, an operator can
+raise the bounded sequential batch size:
+
+```bash
+python3 scripts/run_exact_backfill.py \
+  --data-dir /home/ugs/workspace/cex-dex-market-monitor-v1/data/local \
+  --max-windows 12
+```
+
+The runner holds the same `collection/collection.lock` for the whole batch. It
+reloads the current report before and after every collector invocation. The
+next window runs only if:
+
+- the collector exited zero;
+- the quality report and SQLite still share one publication lineage;
+- `publication.import_run_id` changed; and
+- at least one selected exact-window `issue_id` disappeared.
+
+Any collector failure, unchanged publication, invalid report, or no-progress
+publication stops the batch. The report's `market_types` controls source scope:
+a DEX-only window receives `--dex-only`, a CEX-only window receives
+`--cex-only`, and a genuinely mixed window runs both daily collectors. TVL,
+CEX depth, DEX depth, and execution-cost collectors are never invoked.
+
+“Exact” here means the report-authorized Token and inclusive date window.
+Within an authorized `market_type`, the existing daily collector still queries
+every configured market for that Token; it does not yet accept a pool/exchange
+market allowlist. The state log records the affected `market_ids`, but they are
+verification evidence rather than subprocess arguments. Adding true
+per-market collection scope requires a separate collector-contract change and
+adapter tests.
+
+Immutable logs and recoverable state are written below:
+
+```text
+data/local/collection/exact-backfill/runs/<run_id>/state.json
+data/local/collection/exact-backfill/runs/<run_id>/window-0001.log
+data/local/collection/exact-backfill/latest.json
+```
+
+Resume a bounded or interrupted state log with its validated run ID:
+
+```bash
+python3 scripts/run_exact_backfill.py \
+  --data-dir /home/ugs/workspace/cex-dex-market-monitor-v1/data/local \
+  --resume-run-id <run_id> \
+  --max-windows 12
+```
+
+Resume never trusts the prior command as authorization. It reselects an exact
+window from the live report, so a window already resolved by a completed
+publication is not replayed. A report created before the `market_types`
+contract is rejected; publish a fresh quality report with the current code
+before starting bulk backfill.
 
 ## Pre-publication coverage regression gate
 

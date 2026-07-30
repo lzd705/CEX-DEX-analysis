@@ -13,6 +13,7 @@ from scripts.fact_quality import (
     DEX_REQUIRED_COLUMNS,
     build_report,
     main,
+    source_url_hints,
 )
 
 
@@ -188,6 +189,23 @@ class FactQualityTest(unittest.TestCase):
     def test_required_column_sets_match_daily_contracts(self):
         self.assertEqual(CEX_REQUIRED_COLUMNS, set(CEX_COLUMNS))
         self.assertEqual(DEX_REQUIRED_COLUMNS, set(DEX_COLUMNS))
+
+    def test_upbit_review_hints_match_fact_market_and_collector_fallbacks(self):
+        hints = source_url_hints(
+            {
+                "market_type": "cex",
+                "exchange": "upbit",
+                "instrument": "LDO/USDT",
+            }
+        )
+
+        self.assertEqual(len(hints), 3)
+        self.assertIn("market=USDT-LDO", hints[0])
+        self.assertIn("market=KRW-LDO", hints[1])
+        self.assertEqual(
+            hints[2],
+            "https://api.upbit.com/v1/market/all?is_details=true",
+        )
 
     def test_lineage_matched_rate_limit_attempt_explains_d1_gap(self):
         write_csv(
@@ -421,6 +439,10 @@ class FactQualityTest(unittest.TestCase):
         self.assertTrue(all(issue["retryable"] is True for issue in gaps))
         self.assertEqual(report["summary"]["historical_gap_count"], 3)
         self.assertIn("api.geckoterminal.com", gaps[0]["source_url_hints"][0])
+        self.assertEqual(
+            report["retry_windows_by_token"]["AAVE"][0]["market_types"],
+            ["dex"],
+        )
 
     def test_dates_before_first_observation_are_not_prelisting_gaps(self):
         write_csv(
@@ -644,6 +666,51 @@ class FactQualityTest(unittest.TestCase):
             "stale_market_lifecycle_unknown",
         )
 
+    def test_stale_market_with_latest_no_candle_evidence_is_informational(self):
+        write_csv(
+            self.dex_path,
+            DEX_COLUMNS,
+            [
+                dex_row("2026-07-21"),
+                dex_row("2026-07-22"),
+                dex_row("2026-07-23"),
+            ],
+        )
+        attempts_path = self.root / "dex-attempts.json"
+        write_attempt_ledger(
+            attempts_path,
+            market_type="dex",
+            source_csv=self.dex_path,
+            attempts=[dex_attempt("2026-07-28")],
+        )
+
+        report = build_report(
+            self.cex_path,
+            self.dex_path,
+            dex_attempts=attempts_path,
+            today=date(2026, 7, 29),
+        )
+
+        issue = next(
+            item
+            for item in report["issues"]
+            if item["category"] == "source_no_observation"
+        )
+        self.assertEqual(issue["status"], "source_no_observation")
+        self.assertEqual(issue["reason_code"], "no_candles")
+        self.assertFalse(issue["retryable"])
+        self.assertEqual(
+            issue["details"]["collection_attempt"]["attempt_id"],
+            "attempt-dex",
+        )
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["summary"]["stale_market_unknown_count"], 0)
+        self.assertEqual(report["summary"]["source_no_observation_count"], 1)
+        self.assertEqual(report["summary"]["manual_review_count"], 0)
+        self.assertEqual(report["manual_review_queue"], [])
+        self.assertFalse(report["markets"][0]["stale_market_unknown"])
+        self.assertTrue(report["markets"][0]["source_no_observation"])
+
     def test_recently_active_trailing_days_remain_one_retry_window(self):
         write_csv(
             self.cex_path,
@@ -661,6 +728,7 @@ class FactQualityTest(unittest.TestCase):
         self.assertEqual(window["start_date"], "2026-07-26")
         self.assertEqual(window["end_date"], "2026-07-28")
         self.assertEqual(window["day_count"], 3)
+        self.assertEqual(window["market_types"], ["cex"])
         self.assertEqual(window["reason_codes"], ["missing_unexplained"])
 
     def test_retry_windows_are_per_token_contiguous_and_never_exceed_180_days(self):

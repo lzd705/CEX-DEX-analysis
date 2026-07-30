@@ -27,6 +27,42 @@ def run_app_javascript(source: str):
 
 
 class DashboardFrontendContractTest(unittest.TestCase):
+    def test_expert_context_is_compact_but_remains_accessible(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        styles = STYLES_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("<h3>Token Market Coverage</h3>", index)
+        self.assertNotIn("Where this Token trades", index)
+        self.assertIn('class="module-chip"', index)
+
+        disclosures = index.count('<details class="context-info">')
+        self.assertGreaterEqual(disclosures, 8)
+        self.assertGreaterEqual(index.count('role="tooltip"'), disclosures)
+
+        for disclosure in index.split('<details class="context-info">')[1:]:
+            summary = disclosure.split("</summary>", 1)[0]
+            self.assertIn("aria-label=", summary)
+
+        # The visible copy is compact, while the full expert caveats remain
+        # available through native keyboard/touch-accessible disclosures.
+        self.assertIn("no values are interpolated between them", index)
+        self.assertIn("A past timestamp is never promoted to occurred", index)
+        self.assertIn(
+            "Daily quality and coverage use the selected date window",
+            index,
+        )
+        self.assertIn("account-specific taker fees", index)
+        self.assertIn(
+            ".context-info:focus-within .context-tooltip",
+            styles,
+        )
+        self.assertIn(
+            ".context-info[open] .context-tooltip",
+            styles,
+        )
+        self.assertIn("@media (max-width: 700px)", styles)
+        self.assertIn("max-height: 52vh", styles)
+
     def test_execution_timing_is_visible_and_distinct_from_market_state_skew(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
         app_js = APP_PATH.read_text(encoding="utf-8")
@@ -559,6 +595,25 @@ console.log(JSON.stringify(qualityStatusCounts({
                 "unsupported": 1,
                 "failed": 1,
                 "unavailable": 1,
+            },
+        )
+
+    def test_source_no_observation_is_informational_not_warning(self):
+        result = run_app_javascript(
+            """
+console.log(JSON.stringify(qualityStatusTiers({
+  source_no_observation: 2,
+  unsupported: 1,
+  not_applicable: 1,
+})));
+"""
+        )
+        self.assertEqual(
+            result,
+            {
+                "critical": 0,
+                "pending": 0,
+                "informational": 4,
             },
         )
 

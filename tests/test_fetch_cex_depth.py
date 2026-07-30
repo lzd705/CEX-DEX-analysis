@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import urllib.error
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from scripts.fetch_cex_depth import (
     LATEST_FILENAME,
     collect_depth,
     collect_depth_with_execution,
+    depth_failure_reason_code,
     depth_metrics,
     ensure_full_publish_scope,
     execution_rows_for_book,
@@ -28,6 +30,7 @@ from scripts.fetch_cex_depth import (
     publish_execution_snapshot,
     publish_snapshot,
     source_request,
+    upbit_book,
     validate_snapshot,
 )
 from scripts.publication_gate import CoverageRegressionError
@@ -516,6 +519,10 @@ class FetchCexDepthTest(unittest.TestCase):
             failed_bytes = failed_raw.read_bytes()
 
         self.assertEqual(failed["status"], "failed")
+        self.assertEqual(
+            failed["reason_code"],
+            "source_no_two_sided_book",
+        )
         self.assertIn("/api/v3/depth", failed["source_endpoint"])
         self.assertEqual(failed_bytes, empty_response)
         self.assertEqual(
@@ -532,6 +539,126 @@ class FetchCexDepthTest(unittest.TestCase):
             {row["status"] for row in failed_execution},
             {"failed"},
         )
+        self.assertEqual(
+            {row["status_reason"] for row in failed_execution},
+            {"source_no_two_sided_book"},
+        )
+
+    def test_depth_failure_reasons_separate_source_state_from_transport(self):
+        self.assertEqual(
+            depth_failure_reason_code(
+                urllib.error.HTTPError(
+                    "https://example.test/depth",
+                    404,
+                    "Not found",
+                    {},
+                    None,
+                )
+            ),
+            "not_listed",
+        )
+        self.assertEqual(
+            depth_failure_reason_code(
+                urllib.error.HTTPError(
+                    "https://example.test/depth",
+                    429,
+                    "Rate limit",
+                    {},
+                    None,
+                )
+            ),
+            "rate_limit",
+        )
+        self.assertEqual(
+            depth_failure_reason_code(
+                urllib.error.URLError("temporary DNS failure")
+            ),
+            "network",
+        )
+        self.assertEqual(
+            depth_failure_reason_code(
+                ValueError("exchange returned a crossed or locked order book")
+            ),
+            "source_invalid_order_book",
+        )
+
+    def test_upbit_preserves_transport_reason_through_candidate_wrapping(self):
+        def failed_request(_url):
+            raise urllib.error.URLError("temporary DNS failure")
+
+        with self.assertRaises(Exception) as context:
+            upbit_book("LDO/USDT", failed_request)
+
+        self.assertEqual(
+            depth_failure_reason_code(context.exception),
+            "network",
+        )
+
+    def test_upbit_fx_failure_dominates_later_not_listed_fallback(self):
+        krw_book = [
+            {
+                "market": "KRW-TEST",
+                "timestamp": 1785373200000,
+                "orderbook_units": [
+                    {
+                        "bid_price": 999,
+                        "bid_size": 2,
+                        "ask_price": 1001,
+                        "ask_size": 2,
+                    }
+                ],
+            }
+        ]
+
+        def mixed_request(url):
+            if "markets=KRW-TEST" in url:
+                raw = json.dumps(krw_book).encode()
+                return krw_book, raw
+            if "markets=KRW-USDT" in url:
+                raise urllib.error.URLError("temporary FX DNS failure")
+            raise urllib.error.HTTPError(url, 404, "Not found", {}, None)
+
+        with self.assertRaises(Exception) as context:
+            upbit_book("TEST/USDT", mixed_request)
+
+        error = context.exception
+        self.assertEqual(depth_failure_reason_code(error), "network")
+        self.assertIn("markets=KRW-USDT", error.endpoint)
+        self.assertEqual(error.source_instrument, "KRW-USDT")
+        self.assertEqual(error.raw, b"")
+
+    def test_upbit_fx_parse_failure_hashes_the_fx_response(self):
+        krw_book = [
+            {
+                "market": "KRW-TEST",
+                "timestamp": 1785373200000,
+                "orderbook_units": [
+                    {
+                        "bid_price": 999,
+                        "bid_size": 2,
+                        "ask_price": 1001,
+                        "ask_size": 2,
+                    }
+                ],
+            }
+        ]
+        fx_raw = b'{"unexpected":"fx-response"}'
+
+        def invalid_fx_request(url):
+            if "markets=KRW-TEST" in url:
+                raw = json.dumps(krw_book).encode()
+                return krw_book, raw
+            if "markets=KRW-USDT" in url:
+                return {"unexpected": "fx-response"}, fx_raw
+            raise urllib.error.HTTPError(url, 404, "Not found", {}, None)
+
+        with self.assertRaises(Exception) as context:
+            upbit_book("TEST/USDT", invalid_fx_request)
+
+        error = context.exception
+        self.assertIn("markets=KRW-USDT", error.endpoint)
+        self.assertEqual(error.raw, fx_raw)
+        self.assertNotIn("markets=KRW-TEST", error.endpoint)
 
     def test_validate_requires_exact_inventory_and_observed_book(self):
         row = observed_row(

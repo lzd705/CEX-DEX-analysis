@@ -185,13 +185,21 @@ def _prepare_daily_quality_report(
         for issue in report["issues"]
         if issue.get("category") == "historical_gap"
     ]
+    retryable_historical_issues = [
+        issue
+        for issue in historical_issues
+        if issue.get("retryable") is True
+    ]
     d1_issues = [
         issue
         for issue in report["issues"]
         if issue.get("category") == "d1_active_gap"
     ]
 
-    backfill_pending = [_issue_queue_entry(issue) for issue in historical_issues]
+    backfill_pending = [
+        _issue_queue_entry(issue)
+        for issue in retryable_historical_issues
+    ]
     retry_queue: List[Dict[str, Any]] = []
     for issue in d1_issues:
         if issue.get("retryable") is not True:

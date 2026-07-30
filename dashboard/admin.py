@@ -75,6 +75,10 @@ TRUE_VALUES = {"1", "true", "yes", "on"}
 QUALITY_REPORT_SCHEMA = "fact_quality_report/v1"
 MAX_QUALITY_REPORT_BYTES = 8 * 1024 * 1024
 MAX_REJECTION_POINTER_BYTES = 64 * 1024
+PUBLIC_ADD_TOKEN_REQUESTER = "public:add_token"
+PUBLIC_QUALITY_RETRY_REQUESTER = "public:quality_retry"
+PUBLIC_COMMAND_TIMEOUT_SECONDS = 20 * 60
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 def _read_bounded_bytes(path: Path, maximum_bytes: int) -> bytes:
@@ -179,6 +183,29 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class AdminActionError(ValueError):
+    """Stable service-layer validation error for narrow action endpoints."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+class AdminJobBusyError(RuntimeError):
+    """A collection job is already active in this process."""
+
+
+class AdminWorkerStartError(RuntimeError):
+    """The background worker could not be started."""
 
 
 class AdminService:
@@ -569,8 +596,12 @@ class AdminService:
             },
         }
 
-    def retryable_windows(self) -> list[dict[str, Any]]:
-        report = self._read_quality_report()
+    def retryable_windows(
+        self,
+        *,
+        required: bool = False,
+    ) -> list[dict[str, Any]]:
+        report = self._read_quality_report(required=required)
         if report is None:
             return []
         publication = report.get("publication") or {}
@@ -590,6 +621,20 @@ class AdminService:
             if not isinstance(grouped, dict):
                 raise ValueError("Daily quality report has an invalid retry-window contract")
             if grouped:
+                publication_status = publication.get("status")
+                allowed_statuses = (
+                    {"published_with_retry_queue"}
+                    if queue_type == "latest_completed_day"
+                    else {
+                        "published_with_backfill",
+                        "published_with_retry_queue",
+                    }
+                )
+                if publication_status not in allowed_statuses:
+                    raise ValueError(
+                        "Daily quality report publication does not authorize "
+                        "this retry queue"
+                    )
                 expected_import_run_id = publication.get("import_run_id")
                 if not expected_import_run_id:
                     raise ValueError(
@@ -607,25 +652,70 @@ class AdminService:
                     )
             for token, token_windows in grouped.items():
                 for window in token_windows or []:
+                    normalized_token = str(token).strip().upper()
+                    window_start = str(window.get("start_date") or "")
+                    window_end = str(window.get("end_date") or "")
+                    window_market_ids = window.get("market_ids")
+                    window_reason_codes = window.get("reason_codes")
+                    if (
+                        not normalized_token
+                        or not isinstance(window_market_ids, list)
+                        or not window_market_ids
+                        or not isinstance(window_reason_codes, list)
+                        or not window_reason_codes
+                    ):
+                        raise ValueError(
+                            "Daily quality report has an invalid retry-window scope"
+                        )
                     expected_observations = []
                     for issue_id in window.get("issue_ids") or []:
                         issue = issues_by_id.get(str(issue_id))
                         market = issue.get("market") if issue else None
+                        expected_category = (
+                            "d1_active_gap"
+                            if queue_type == "latest_completed_day"
+                            else "historical_gap"
+                        )
+                        market_id = (
+                            str(market.get("market_id") or "")
+                            if isinstance(market, dict)
+                            else ""
+                        )
+                        issue_date = str(issue.get("date") or "") if issue else ""
                         if (
-                            isinstance(market, dict)
-                            and market.get("market_id")
-                            and issue.get("date")
+                            not isinstance(issue, dict)
+                            or not isinstance(market, dict)
+                            or issue.get("retryable") is not True
+                            or issue.get("category") != expected_category
+                            or str(
+                                market.get("token_symbol") or ""
+                            ).strip().upper()
+                            != normalized_token
+                            or market_id not in window_market_ids
+                            or str(issue.get("reason_code") or "")
+                            not in window_reason_codes
+                            or not window_start
+                            <= issue_date
+                            <= window_end
                         ):
-                            expected_observations.append(
-                                {
-                                    "market_id": str(market["market_id"]),
-                                    "date": str(issue["date"]),
-                                }
+                            raise ValueError(
+                                "Daily quality report retry window does not "
+                                "match its referenced issues"
                             )
+                        expected_observations.append(
+                            {
+                                "market_id": market_id,
+                                "date": issue_date,
+                            }
+                        )
+                    if not expected_observations:
+                        raise ValueError(
+                            "Daily quality report retry window has no audited issues"
+                        )
                     windows.append(
                         {
                             **window,
-                            "token_symbol": str(token).strip().upper(),
+                            "token_symbol": normalized_token,
                             "queue_type": queue_type,
                             "quality_dataset_snapshot_id": publication.get(
                                 "dataset_snapshot_id"
@@ -899,7 +989,7 @@ class AdminService:
         queue_type = str(payload.get("queue_type", "")).strip()
         candidates = [
             window
-            for window in self.retryable_windows()
+            for window in self.retryable_windows(required=True)
             if window["token_symbol"] == token
             and window["start_date"] == start
             and window["end_date"] == end
@@ -915,17 +1005,182 @@ class AdminService:
             None,
         )
         if match is None or len(candidates) != 1:
-            raise ValueError("Retry window is not present in the current quality report")
+            raise AdminActionError(
+                "retry_window_not_approved",
+                "Retry window is not present in the current quality report",
+            )
+        try:
+            start_day = date.fromisoformat(str(match["start_date"]))
+            end_day = date.fromisoformat(str(match["end_date"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise AdminActionError(
+                "quality_retry_unavailable",
+                "Retry window has an invalid date contract",
+                retryable=True,
+            ) from error
+        if (
+            start_day.isoformat() != match["start_date"]
+            or end_day.isoformat() != match["end_date"]
+            or start_day > end_day
+            or (end_day - start_day).days >= 180
+        ):
+            raise AdminActionError(
+                "quality_retry_unavailable",
+                "Retry window has an invalid date contract",
+                retryable=True,
+            )
+        market_ids = match.get("market_ids")
+        if (
+            not isinstance(market_ids, list)
+            or not market_ids
+            or any(
+                not isinstance(market_id, str) or not market_id
+                for market_id in market_ids
+            )
+        ):
+            raise AdminActionError(
+                "quality_retry_unavailable",
+                "Retry window has an invalid market scope",
+                retryable=True,
+            )
+        derived_market_types = {
+            market_id.split(":", 1)[0]
+            for market_id in market_ids
+            if ":" in market_id
+        }
+        configured_market_types = match.get("market_types")
+        if configured_market_types is None:
+            configured_market_types = sorted(derived_market_types)
+        if (
+            not isinstance(configured_market_types, list)
+            or not configured_market_types
+            or any(
+                not isinstance(market_type, str)
+                for market_type in configured_market_types
+            )
+            or set(configured_market_types) != derived_market_types
+            or not derived_market_types.issubset({"cex", "dex"})
+        ):
+            raise AdminActionError(
+                "quality_retry_unavailable",
+                "Retry window has an invalid market-type scope",
+                retryable=True,
+            )
+        expected_observations = match.get("expected_observations")
+        if (
+            not isinstance(expected_observations, list)
+            or not expected_observations
+        ):
+            raise AdminActionError(
+                "quality_retry_unavailable",
+                "Retry window has no exact audited observations",
+                retryable=True,
+            )
+        for observation in expected_observations:
+            if not isinstance(observation, dict):
+                raise AdminActionError(
+                    "quality_retry_unavailable",
+                    "Retry window has an invalid observation scope",
+                    retryable=True,
+                )
+            market_id = observation.get("market_id")
+            observation_date = observation.get("date")
+            try:
+                parsed_observation_date = date.fromisoformat(
+                    str(observation_date)
+                )
+            except (TypeError, ValueError):
+                parsed_observation_date = None
+            if (
+                market_id not in market_ids
+                or not isinstance(observation_date, str)
+                or parsed_observation_date is None
+                or parsed_observation_date.isoformat() != observation_date
+                or not match["start_date"]
+                <= observation_date
+                <= match["end_date"]
+            ):
+                raise AdminActionError(
+                    "quality_retry_unavailable",
+                    "Retry window has an invalid observation scope",
+                    retryable=True,
+                )
+        match = {
+            **match,
+            "market_types": sorted(derived_market_types),
+        }
         if (
             not match.get("quality_dataset_snapshot_id")
             or not match.get("quality_import_run_id")
-            or not match.get("market_ids")
-            or not match.get("expected_observations")
         ):
-            raise ValueError(
-                "Retry window is missing its published quality-report identity"
+            raise AdminActionError(
+                "quality_retry_unavailable",
+                "Retry window is missing its published quality-report identity",
+                retryable=True,
             )
         return dict(match)
+
+    @staticmethod
+    def _retry_authorization_fingerprint(
+        authorization: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        """Canonicalize only the trusted fields that authorize retry scope."""
+        expected_observations = sorted(
+            (
+                str(item.get("market_id") or ""),
+                str(item.get("date") or ""),
+            )
+            for item in authorization.get("expected_observations") or []
+            if isinstance(item, dict)
+        )
+        return (
+            str(authorization.get("token_symbol") or ""),
+            str(authorization.get("start_date") or ""),
+            str(authorization.get("end_date") or ""),
+            str(authorization.get("queue_type") or ""),
+            str(authorization.get("quality_dataset_snapshot_id") or ""),
+            str(authorization.get("quality_import_run_id") or ""),
+            tuple(
+                sorted(
+                    str(value)
+                    for value in authorization.get("market_types") or []
+                )
+            ),
+            tuple(
+                sorted(
+                    str(value)
+                    for value in authorization.get("market_ids") or []
+                )
+            ),
+            tuple(
+                sorted(
+                    str(value)
+                    for value in authorization.get("reason_codes") or []
+                )
+            ),
+            tuple(
+                sorted(
+                    str(value)
+                    for value in authorization.get("issue_ids") or []
+                )
+            ),
+            tuple(expected_observations),
+        )
+
+    def revalidate_retry_authorization(
+        self,
+        job: dict[str, Any],
+    ) -> None:
+        """Require the queued retry authorization to remain byte-scope equivalent."""
+        current = self.validate_retry_job(job)
+        if self._retry_authorization_fingerprint(
+            current
+        ) != self._retry_authorization_fingerprint(job):
+            raise AdminActionError(
+                "retry_authorization_changed",
+                "The quality publication changed after this retry was queued",
+                retryable=True,
+            )
 
     def create_job(self, payload: dict[str, Any], username: str) -> dict[str, Any]:
         job_type = str(payload.get("job_type") or "refresh").strip().lower()
@@ -935,7 +1190,7 @@ class AdminService:
             request = self.validate_retry_job(payload)
         else:
             raise ValueError("job_type must be refresh or retry_failed")
-        job_id = secrets.token_hex(8)
+        job_id = secrets.token_hex(16)
         job = {
             "job_id": job_id,
             **request,
@@ -954,11 +1209,14 @@ class AdminService:
         }
         with self.state_lock:
             if any(existing.get("status") in {"queued", "running"} for existing in self.jobs.values()):
-                raise RuntimeError("Another refresh job is already queued or running")
+                raise AdminJobBusyError(
+                    "Another refresh job is already queued or running"
+                )
             self._save_job(job)
             self.jobs[job_id] = job
+            response = dict(job)
         self._start_job_thread(job_id)
-        return dict(job)
+        return response
 
     def create_onboarding_job(
         self,
@@ -979,7 +1237,7 @@ class AdminService:
                 "identity_changed",
                 "Resolved Token symbol no longer matches the confirmed preview",
             )
-        job_id = secrets.token_hex(8)
+        job_id = secrets.token_hex(16)
         completed_day = utc_now().date() - timedelta(days=1)
         start_day = completed_day - timedelta(days=history_days - 1)
         job = {
@@ -1017,9 +1275,6 @@ class AdminService:
                     },
                 }
             )
-            with self.state_lock:
-                self._save_job(job)
-                self.jobs[job_id] = job
             return dict(job)
         record = build_registry_record(
             candidate,
@@ -1029,7 +1284,9 @@ class AdminService:
         )
         with self.state_lock:
             if any(existing.get("status") in {"queued", "running"} for existing in self.jobs.values()):
-                raise RuntimeError("Another refresh job is already queued or running")
+                raise AdminJobBusyError(
+                    "Another refresh job is already queued or running"
+                )
             self._save_job(job)
             try:
                 self.registry.upsert(
@@ -1046,8 +1303,9 @@ class AdminService:
                     pass
                 raise
             self.jobs[job_id] = job
+            response = dict(job)
         self._start_job_thread(job_id)
-        return dict(job)
+        return response
 
     def _save_job(self, job: dict[str, Any]) -> None:
         self.job_dir.mkdir(parents=True, exist_ok=True)
@@ -1078,7 +1336,9 @@ class AdminService:
                 message="The refresh worker could not be started.",
                 retryable=True,
             )
-            raise RuntimeError("The refresh worker could not be started") from error
+            raise AdminWorkerStartError(
+                "The refresh worker could not be started"
+            ) from error
 
     def _set_job(self, job_id: str, **updates: Any) -> dict[str, Any]:
         with self.state_lock:
@@ -1107,7 +1367,20 @@ class AdminService:
             sys.executable,
             str(PROJECT_ROOT / "scripts/run_fact_pipeline.py"),
         ]
-        if dex_only:
+        retry_market_types = (
+            set(job.get("market_types") or [])
+            if job.get("job_type") == "retry_failed"
+            else set()
+        )
+        if retry_market_types == {"cex"}:
+            command.append("--cex-only")
+        elif retry_market_types == {"dex"}:
+            command.append("--dex-only")
+        elif retry_market_types == {"cex", "dex"}:
+            pass
+        elif retry_market_types:
+            raise ValueError("Retry job has an invalid market-type scope")
+        elif dex_only:
             command.append("--dex-only")
         command.extend(
             [
@@ -1132,6 +1405,7 @@ class AdminService:
         *,
         stage: str,
         extra_environment: dict[str, str] | None = None,
+        timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
     ) -> None:
         command_environment = os.environ.copy()
         command_environment.pop("TOKEN_ONBOARDING_JOB_ID", None)
@@ -1147,7 +1421,7 @@ class AdminService:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 check=True,
-                timeout=2 * 60 * 60,
+                timeout=timeout_seconds,
                 env=command_environment,
             )
 
@@ -1192,6 +1466,12 @@ class AdminService:
                 self._daily_pipeline_command(job, dex_only=dex_only),
                 log_path,
                 stage="collect_daily_facts",
+                timeout_seconds=(
+                    PUBLIC_COMMAND_TIMEOUT_SECONDS
+                    if job.get("requested_by")
+                    == PUBLIC_QUALITY_RETRY_REQUESTER
+                    else DEFAULT_COMMAND_TIMEOUT_SECONDS
+                ),
             )
         except (OSError, subprocess.SubprocessError):
             rejected_outcome = self._new_rejected_candidate_outcome(
@@ -1270,7 +1550,16 @@ class AdminService:
             publication_committed=True,
             result={
                 "daily": "published",
-                "collection_scope": "dex_only" if dex_only else "cex_and_dex",
+                "collection_scope": (
+                    "cex_only"
+                    if set(job.get("market_types") or []) == {"cex"}
+                    else "dex_only"
+                    if (
+                        set(job.get("market_types") or []) == {"dex"}
+                        or dex_only
+                    )
+                    else "cex_and_dex"
+                ),
                 "quality_report": "quality/daily-latest.json",
                 **refresh_result,
             },
@@ -1858,6 +2147,12 @@ class AdminService:
                 extra_environment={
                     "TOKEN_ONBOARDING_JOB_ID": job["job_id"],
                 },
+                timeout_seconds=(
+                    PUBLIC_COMMAND_TIMEOUT_SECONDS
+                    if job.get("requested_by")
+                    == PUBLIC_ADD_TOKEN_REQUESTER
+                    else DEFAULT_COMMAND_TIMEOUT_SECONDS
+                ),
             )
         except (OSError, subprocess.SubprocessError):
             try:
@@ -1926,6 +2221,22 @@ class AdminService:
                 retryable=True,
                 publication_committed=True,
                 status="partial",
+                result=result,
+            )
+            return
+
+        if job.get("requested_by") == PUBLIC_ADD_TOKEN_REQUESTER:
+            result["tvl"] = "deferred_to_scheduled_collection"
+            result["dex_depth"] = "deferred_to_scheduled_collection"
+            self._set_job(
+                job_id,
+                status="succeeded",
+                stage="complete",
+                finished_at=utc_now().isoformat(),
+                error=None,
+                error_code=None,
+                retryable=False,
+                publication_committed=True,
                 result=result,
             )
             return
@@ -2034,6 +2345,23 @@ class AdminService:
                     )
                     return
                 try:
+                    queued_job = self.jobs[job_id]
+                    if queued_job.get("job_type") == "retry_failed":
+                        try:
+                            self.revalidate_retry_authorization(queued_job)
+                        except (OSError, ValueError):
+                            self._fail_job(
+                                job_id,
+                                stage="authorize_retry",
+                                error_code="retry_authorization_expired",
+                                message=(
+                                    "The audited retry authorization changed "
+                                    "before collection began. Refresh the "
+                                    "quality queue before trying again."
+                                ),
+                                retryable=True,
+                            )
+                            return
                     job = self._set_job(
                         job_id,
                         status="running",
@@ -2072,3 +2400,38 @@ class AdminService:
         with self.state_lock:
             jobs = sorted(self.jobs.values(), key=lambda job: job["created_at"], reverse=True)
             return [dict(job) for job in jobs[: max(1, min(limit, 100))]]
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        """Return one server-owned job copy without exposing the jobs mapping."""
+        with self.state_lock:
+            job = self.jobs.get(job_id)
+            return dict(job) if job is not None else None
+
+    def count_jobs_created_on(
+        self,
+        *,
+        requested_by: str | None,
+        job_type: str | None,
+        created_on: date,
+    ) -> int:
+        """Count persisted accepted jobs for one UTC actor/type/day budget."""
+        if not requested_by or not job_type:
+            raise ValueError("Job budget identity is incomplete")
+        count = 0
+        with self.state_lock:
+            for job in self.jobs.values():
+                if (
+                    job.get("requested_by") != requested_by
+                    or job.get("job_type") != job_type
+                ):
+                    continue
+                try:
+                    created_at = datetime.fromisoformat(str(job["created_at"]))
+                    if created_at.tzinfo is None:
+                        continue
+                    created_date = created_at.astimezone(timezone.utc).date()
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if created_date == created_on:
+                    count += 1
+        return count

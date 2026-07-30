@@ -19,6 +19,7 @@
       <nav class="primary-navigation" aria-label="Primary navigation">
         <a href="/screener" data-app-route="screener">Screener</a>
         <a href="/tokens/AAVE/markets" data-app-route="workspace">Token Research</a>
+        <a href="/actions.html">Data Actions</a>
       </nav>
       <div
         id="freshness-cluster"
@@ -39,9 +40,19 @@
         <div class="toolbar-title">
           <i data-lucide="calendar-range"></i>
           <div>
-            <strong>Time window</strong>
+            <div class="toolbar-title-line">
+              <strong>Time window</strong>
+              <details class="context-info">
+                <summary aria-label="Time-window scope details">
+                  <i data-lucide="info"></i>
+                </summary>
+                <div class="context-tooltip" role="tooltip">
+                  <strong>Window scope</strong>
+                  <p>Start and end dates apply only to daily price, volume, return, volatility, comparison, and coverage facts. TVL, depth, and execution remain independently timestamped latest snapshots.</p>
+                </div>
+              </details>
+            </div>
             <span id="available-range">Checking available dates</span>
-            <span class="metric-note">Daily metrics only; TVL, depth, and execution remain latest independent snapshots.</span>
           </div>
         </div>
         <form id="date-window-form" class="date-apply-group" novalidate>
@@ -199,17 +210,40 @@
             Apply pair
           </button>
         </div>
-        <p id="selector-policy" class="selector-policy">
-          Initial A/B choices prefer markets with integrity-valid measured depth and no depth-relevant quality flags. The daily comparison uses the same selected market IDs, so its defaults can differ from the quality-weighted primary market.
-        </p>
+        <div id="selector-policy" class="module-context selector-policy" aria-label="A and B selection policy">
+          <span class="module-chip">Depth-screened defaults</span>
+          <span class="module-chip">Shared A/B identities</span>
+          <details class="context-info">
+            <summary aria-label="A and B market selection policy details">
+              <i data-lucide="info"></i>
+            </summary>
+            <div class="context-tooltip" role="tooltip">
+              <strong>Pair-selection policy</strong>
+              <p>Initial A/B choices prefer markets with integrity-valid measured depth and no depth-relevant quality flags. The daily comparison uses the same selected market IDs, so its defaults can differ from the quality-weighted primary market.</p>
+            </div>
+          </details>
+        </div>
         <div id="workspace-context-notice" class="status-banner" role="status" aria-live="polite" hidden></div>
 
         <section id="workspace-page-markets" class="workspace-page" data-workspace-view="markets">
           <div class="page-heading">
             <div>
               <span class="eyebrow">Market inventory</span>
-              <h3>Where this Token trades</h3>
-              <p>Review every cataloged CEX instrument and DEX pool for the selected Token. Set any two distinct markets as A and B before moving to comparison or execution analysis.</p>
+              <h3>Token Market Coverage</h3>
+              <div class="module-context" aria-label="Market coverage module scope">
+                <span class="module-chip">Full catalog</span>
+                <span class="module-chip">CEX + DEX</span>
+                <span class="module-chip">A/B selectable</span>
+                <details class="context-info">
+                  <summary aria-label="Token market coverage details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip" role="tooltip">
+                    <strong>Market coverage</strong>
+                    <p>Review every cataloged CEX instrument and DEX pool for the selected Token. Set any two distinct markets as A and B before moving to comparison or execution analysis.</p>
+                  </div>
+                </details>
+              </div>
             </div>
             <div class="segmented-control" role="group" aria-label="Market type filter">
               <button type="button" data-workspace-market-type="all" class="active" aria-pressed="true">All</button>
@@ -255,7 +289,21 @@
             <div>
               <span class="eyebrow">P1 · point-in-time source-backed depth</span>
               <h3 id="liquidity-title">Discrete cumulative depth profile</h3>
-              <p>Compare the four measured USD depth bands. Latest snapshots are independent of the daily date window and are not guaranteed to be synchronized.</p>
+              <div class="module-context" aria-label="Liquidity module scope">
+                <span class="module-chip">Point-in-time</span>
+                <span class="module-chip">10 · 25 · 50 · 100 bps</span>
+                <span class="module-chip">No interpolation</span>
+                <details class="context-info">
+                  <summary aria-label="Liquidity measurement details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip" role="tooltip">
+                    <strong>Depth measurement</strong>
+                    <p>Compare four measured cumulative USD depth bands. Latest snapshots are independent of the daily date window and are not guaranteed to be synchronized.</p>
+                    <p>Only markers at ±10, ±25, ±50, and ±100 bps are measured; no values are interpolated between them. A dashed outer ring and ≥ value denote an incomplete lower bound.</p>
+                  </div>
+                </details>
+              </div>
             </div>
             <div class="liquidity-toggles">
               <div class="segmented-control" role="group" aria-label="Liquidity curve series">
@@ -316,8 +364,9 @@
               <div id="liquidity-tooltip" class="liquidity-tooltip" role="tooltip" hidden></div>
             </div>
             <div id="liquidity-legend" class="liquidity-legend" aria-label="Liquidity curve legend"></div>
-            <figcaption id="liquidity-method-note">
-              Only markers at ±10, ±25, ±50, and ±100 bps are measured; no values are interpolated between them. A dashed outer ring and ≥ value denote an incomplete lower bound.
+            <figcaption id="liquidity-method-note" class="module-context compact-context">
+              <span class="module-chip">Measured bands only</span>
+              <span class="module-chip" data-tone="limit">≥ = incomplete lower bound</span>
             </figcaption>
           </figure>
 
@@ -358,7 +407,21 @@
               <div>
                 <span class="eyebrow">Fixed-notional source mechanics</span>
                 <h3 id="execution-title">Execution cost</h3>
-                <p>Walk the same source-backed order book or supported pool state at the five collected USD notionals. These are quoted mechanics, not realized all-in trading costs.</p>
+                <div class="module-context" aria-label="Execution-cost module scope">
+                  <span class="module-chip">5 USD notionals</span>
+                  <span class="module-chip">Quoted mechanics</span>
+                  <span class="module-chip" data-tone="limit">Not realized cost</span>
+                  <details class="context-info">
+                    <summary aria-label="Execution-cost method and fee-scope details">
+                      <i data-lucide="info"></i>
+                    </summary>
+                    <div class="context-tooltip" role="tooltip">
+                      <strong>Execution and fee scope</strong>
+                      <p>The calculation walks the same source-backed order book or supported pool state at $1k, $5k, $10k, $50k, and $100k. These are quoted mechanics, not realized all-in trading costs.</p>
+                      <p>CEX values include visible-book spread and impact but exclude account-specific taker fees. Supported DEX V2 values include the pool swap fee; gas, router fees, token taxes, latency, and MEV are excluded.</p>
+                    </div>
+                  </details>
+                </div>
               </div>
               <div class="execution-controls">
                 <div class="segmented-control" role="group" aria-label="Execution direction">
@@ -436,9 +499,10 @@
                 </tbody>
               </table>
             </div>
-            <p id="execution-method-note" class="method-note">
-              CEX values include visible-book spread and impact but exclude account-specific taker fees. Supported DEX V2 values include the pool swap fee; gas, router fees, token taxes, latency, and MEV are excluded.
-            </p>
+            <div id="execution-method-note" class="module-context compact-context method-note" aria-label="Execution-cost boundaries">
+              <span class="module-chip">Visible source state</span>
+              <span class="module-chip" data-tone="limit">Account fees · gas · latency · MEV excluded</span>
+            </div>
           </section>
         </section>
 
@@ -451,7 +515,21 @@
         <div class="daily-comparison-heading">
           <div>
             <h3>Daily price and volume comparison</h3>
-            <p>UTC daily source observations inside the selected date window; missing values are never filled.</p>
+            <div class="module-context" aria-label="Daily comparison module scope">
+              <span class="module-chip">Daily UTC</span>
+              <span class="module-chip">Same-date comparison</span>
+              <span class="module-chip">No forward fill</span>
+              <details class="context-info">
+                <summary aria-label="Daily comparison method details">
+                  <i data-lucide="info"></i>
+                </summary>
+                <div class="context-tooltip" role="tooltip">
+                  <strong>Comparison method</strong>
+                  <p>Only source observations inside the selected UTC date window are compared. Prices and volumes are never filled, and the spread exists only when both markets have a value on the same date.</p>
+                  <p>Straight segments connect consecutive daily observations. Missing or invalid values and calendar gaps break the line; no interpolation or forward fill is applied. Verified event overlays show timing only and do not claim return impact or causality.</p>
+                </div>
+              </details>
+            </div>
           </div>
           <span class="contract-badge">Daily UTC · USD quote</span>
         </div>
@@ -494,7 +572,7 @@
         <div class="comparison-chart-toolbar">
           <div>
             <h4 id="comparison-chart-title">Daily price observations</h4>
-            <p id="comparison-chart-note">Market A and B source observations in USD; missing dates break the line.</p>
+            <span id="comparison-chart-note" class="chart-context-chip">USD source prices · gaps break the line</span>
           </div>
           <div class="segmented-control" role="group" aria-label="Comparison chart metric">
             <button
@@ -552,10 +630,10 @@
           <p id="comparison-event-status" class="comparison-event-status">
             Event overlay loads independently from the daily market series.
           </p>
-          <figcaption id="comparison-chart-method">
-            Straight segments connect consecutive UTC daily observations only. Missing or invalid
-            values and calendar gaps break the line; no interpolation or forward fill is applied.
-            Verified event overlays show timing only and do not claim return impact or causality.
+          <figcaption id="comparison-chart-method" class="module-context compact-context">
+            <span class="module-chip">Consecutive dates connect</span>
+            <span class="module-chip" data-tone="limit">Gaps break the line</span>
+            <span class="module-chip">Events = timing only</span>
           </figcaption>
         </figure>
         <p id="comparison-chart-description" class="sr-only">
@@ -600,10 +678,22 @@
             <div>
               <span class="eyebrow">Source-backed event timeline</span>
               <h3>Verified Event Facts</h3>
-              <p>Officially sourced unlock, airdrop claim-start, and CEX spot-listing facts for this Token, with explicit date precision, lifecycle, evidence status, and revision lineage.</p>
-              <p class="metric-note">An event marker shows temporal overlap only. This page does not estimate return, market impact, sentiment, importance, or causality.</p>
-              <p class="metric-note">This timeline loads the latest verified revision for each Event Fact in the current release; full revision history remains in the auditable bundle. The daily market window applies only when events are overlaid on Compare.</p>
-              <p class="metric-note"><strong>Scheduled</strong> means an official source announced the exact time but this fact set has no separate confirmation that the event occurred. A past timestamp is never promoted to occurred merely because time passed.</p>
+              <div class="module-context" aria-label="Verified Event Fact scope">
+                <span class="module-chip">Official sources</span>
+                <span class="module-chip">Latest verified revision</span>
+                <span class="module-chip" data-tone="limit">Timing ≠ causality</span>
+                <details class="context-info">
+                  <summary aria-label="Verified Event Fact boundaries and lifecycle details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip context-tooltip-wide" role="tooltip">
+                    <strong>Event Fact boundary</strong>
+                    <p>The timeline covers officially sourced unlock, airdrop claim-start, and CEX spot-listing facts with explicit date precision, lifecycle, evidence status, and revision lineage.</p>
+                    <p>An event marker shows temporal overlap only. This page does not estimate return, market impact, sentiment, importance, or causality. The daily market window applies only when events are overlaid on Compare.</p>
+                    <p>The latest verified revision is shown here; full revision history remains in the auditable bundle. <strong>Scheduled</strong> means an official source announced an exact time but occurrence is not separately confirmed. A past timestamp is never promoted to occurred merely because time passed.</p>
+                  </div>
+                </details>
+              </div>
             </div>
             <div class="segmented-control events-lifecycle-control" role="group" aria-label="Event lifecycle filter">
               <button type="button" data-event-lifecycle="all" class="active" aria-pressed="true">All</button>
@@ -674,9 +764,21 @@
             <div>
               <span class="eyebrow">Fact × Market audit</span>
               <h3>Data Quality</h3>
-              <p>Separate observed values, partial lower bounds, unsupported methods, collection failures, and genuinely missing facts for this Token.</p>
-              <p class="metric-note">Daily quality and coverage use the selected date window. TVL, depth, and execution use their independently timestamped latest snapshots.</p>
-              <p class="metric-note">Hover a daily status to see its cause and affected UTC dates. This public page is read-only: retryable gaps go to the protected operator queue, while confirmed no-candle, listing, and source-history outcomes require operator review rather than a public retry.</p>
+              <div class="module-context" aria-label="Data Quality module scope">
+                <span class="module-chip">Window-aware daily</span>
+                <span class="module-chip">Latest snapshots</span>
+                <span class="module-chip" data-tone="limit">Read-only audit</span>
+                <details class="context-info">
+                  <summary aria-label="Data Quality states and recovery details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip context-tooltip-wide" role="tooltip">
+                    <strong>Quality interpretation</strong>
+                    <p>Observed values, partial lower bounds, unsupported methods, collection failures, and genuinely missing facts remain distinct. Daily quality and coverage use the selected date window. TVL, depth, and execution use independently timestamped latest snapshots.</p>
+                    <p>Hover or focus a daily status to inspect its cause and affected UTC dates. Retryable gaps are routed to a protected operator queue; confirmed no-candle, listing, and source-history outcomes require review rather than an automatic retry.</p>
+                  </div>
+                </details>
+              </div>
             </div>
             <div class="segmented-control" role="group" aria-label="Data quality scope">
               <button type="button" data-quality-scope="all" class="active" aria-pressed="true">All markets</button>
@@ -731,7 +833,20 @@
         <div>
           <span class="eyebrow">Cross-Token discovery</span>
           <h2 id="screener-title">Market Screener</h2>
-          <p>Rank every covered Token in one row, then open a dedicated workspace to inspect its markets, comparison, liquidity, and evidence.</p>
+          <div class="module-context" aria-label="Market Screener scope">
+            <span class="module-chip">1 row / Token</span>
+            <span class="module-chip">Configurable rank</span>
+            <span class="module-chip">Open full workspace</span>
+            <details class="context-info">
+              <summary aria-label="Market Screener workflow details">
+                <i data-lucide="info"></i>
+              </summary>
+              <div class="context-tooltip" role="tooltip">
+                <strong>Screener workflow</strong>
+                <p>Rank every covered Token in one row using the selected metric, scope, direction, and daily window. Open a Token workspace to inspect its complete market catalog, A/B comparison, liquidity, events, and evidence.</p>
+              </div>
+            </details>
+          </div>
         </div>
         <span class="contract-badge">Fact-only · no forecasts</span>
       </div>

@@ -188,9 +188,34 @@ AUDIT_COLUMNS = [
     "source_sequence",
     "raw_response_sha256",
     "status",
+    "reason_code",
     "error",
 ]
 DEPTH_COLUMNS_ALL = BASE_COLUMNS + DEPTH_COLUMNS + AUDIT_COLUMNS
+
+CEX_DEPTH_REASON_CODES = {
+    "observed",
+    "source_level_limit",
+    "source_no_two_sided_book",
+    "source_no_order_book",
+    "source_invalid_order_book",
+    "not_listed",
+    "rate_limit",
+    "source_unavailable",
+    "source_rejected_request",
+    "network",
+    "parse",
+    "unsupported_source",
+    "collection_failed",
+}
+NON_RETRYABLE_DEPTH_REASON_CODES = {
+    "source_no_two_sided_book",
+    "source_no_order_book",
+    "source_invalid_order_book",
+    "not_listed",
+    "source_rejected_request",
+    "unsupported_source",
+}
 
 
 class SourceBookError(RuntimeError):
@@ -204,12 +229,46 @@ class SourceBookError(RuntimeError):
         endpoint: str = "",
         source_instrument: str = "",
         source_quote_asset: str = "",
+        reason_code: str = "",
     ) -> None:
         super().__init__(message)
         self.raw = raw
         self.endpoint = endpoint
         self.source_instrument = source_instrument
         self.source_quote_asset = source_quote_asset
+        self.reason_code = reason_code
+
+
+def depth_failure_reason_code(error: BaseException) -> str:
+    """Map collector failures onto a stable, public quality vocabulary."""
+    if (
+        isinstance(error, SourceBookError)
+        and error.reason_code in CEX_DEPTH_REASON_CODES
+    ):
+        return error.reason_code
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code == 404:
+            return "not_listed"
+        if error.code == 429:
+            return "rate_limit"
+        if 500 <= error.code < 600:
+            return "source_unavailable"
+        return "source_rejected_request"
+    if isinstance(error, (urllib.error.URLError, TimeoutError)):
+        return "network"
+    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "parse"
+
+    message = str(error).lower()
+    if "empty order-book side" in message:
+        return "source_no_two_sided_book"
+    if "crossed or locked" in message or "invalid numeric order-book" in message:
+        return "source_invalid_order_book"
+    if "returned no order book" in message:
+        return "source_no_order_book"
+    if "unsupported exchange" in message or "unsupported source" in message:
+        return "unsupported_source"
+    return "collection_failed"
 
 
 def utc_now_text() -> str:
@@ -623,7 +682,7 @@ def upbit_book(
     cex_symbol: str,
     request: Callable[[str], tuple[Any, bytes]],
 ) -> dict[str, Any]:
-    last_error: Exception | None = None
+    candidate_errors: list[SourceBookError] = []
     for market in make_upbit_market_candidates(cex_symbol):
         raw = b""
         url = query_url(
@@ -634,7 +693,7 @@ def upbit_book(
             payload, raw = request(url)
             parsed = parse_book("upbit", payload, requested_instrument=market)
         except Exception as error:
-            last_error = (
+            candidate_error = (
                 error
                 if isinstance(error, SourceBookError)
                 else SourceBookError(
@@ -643,8 +702,10 @@ def upbit_book(
                     endpoint=url,
                     source_instrument=market,
                     source_quote_asset=market.split("-", 1)[0].upper(),
+                    reason_code=depth_failure_reason_code(error),
                 )
             )
+            candidate_errors.append(candidate_error)
             continue
 
         quote_asset = market.split("-", 1)[0].upper()
@@ -663,13 +724,23 @@ def upbit_book(
         if quote_asset == "USDT":
             return result
         if quote_asset != "KRW":
-            last_error = ValueError(f"Unsupported Upbit quote asset: {quote_asset}")
+            candidate_errors.append(
+                SourceBookError(
+                    f"Unsupported Upbit quote asset: {quote_asset}",
+                    raw=raw,
+                    endpoint=url,
+                    source_instrument=market,
+                    source_quote_asset=quote_asset,
+                    reason_code="unsupported_source",
+                )
+            )
             continue
 
         fx_url = query_url(
             "https://api.upbit.com/v1/orderbook",
             {"markets": "KRW-USDT", "count": 1},
         )
+        fx_raw = b""
         try:
             fx_payload, fx_raw = request(fx_url)
             fx_book = parse_book("upbit", fx_payload, requested_instrument="KRW-USDT")
@@ -683,17 +754,29 @@ def upbit_book(
             result["quote_conversion_raw"] = fx_raw
             return result
         except Exception as error:
-            last_error = SourceBookError(
+            candidate_errors.append(SourceBookError(
                 f"Failed KRW quote conversion: {error}",
-                raw=raw,
-                endpoint=url,
-                source_instrument=market,
+                raw=fx_raw,
+                endpoint=fx_url,
+                source_instrument="KRW-USDT",
                 source_quote_asset=quote_asset,
-            )
+                reason_code=depth_failure_reason_code(error),
+            ))
             continue
-    if isinstance(last_error, SourceBookError):
-        raise last_error
-    raise RuntimeError(f"Failed to fetch Upbit order book for {cex_symbol}: {last_error}")
+    if candidate_errors:
+        # A candidate that answered but failed for another explicit reason
+        # carries stronger evidence than a later fallback candidate's 404.
+        # Only report not_listed when every configured quote candidate is absent.
+        selected_error = next(
+            (
+                error
+                for error in candidate_errors
+                if error.reason_code != "not_listed"
+            ),
+            candidate_errors[-1],
+        )
+        raise selected_error
+    raise RuntimeError(f"Failed to fetch Upbit order book for {cex_symbol}")
 
 
 def fetch_source_book(
@@ -715,6 +798,7 @@ def fetch_source_book(
             endpoint=url,
             source_instrument=instrument,
             source_quote_asset=quote_asset,
+            reason_code=depth_failure_reason_code(error),
         ) from error
     return {
         **parsed,
@@ -1035,6 +1119,7 @@ def observed_row(
     )
     complete = all(row[f"depth_{band}bps_complete"] == "1" for band in DEPTH_BANDS_BPS)
     row["status"] = "observed" if complete else "partial"
+    row["reason_code"] = "observed" if complete else "source_level_limit"
     if not complete:
         incomplete = [
             str(band)
@@ -1060,6 +1145,7 @@ def failure_row(
     source_instrument: str = "",
     source_quote_asset: str = "",
     raw_response_sha256: str = "",
+    reason_code: str = "",
 ) -> dict[str, str]:
     row = base_row(
         market,
@@ -1073,6 +1159,7 @@ def failure_row(
     row["raw_response_sha256"] = raw_response_sha256
     row["requested_level_limit"] = str(REQUESTED_LEVELS[market["exchange"]])
     row["status"] = "failed"
+    row["reason_code"] = reason_code or depth_failure_reason_code(error)
     row["error"] = f"{type(error).__name__}: {error}"
     return row
 
@@ -1143,6 +1230,7 @@ def collect_depth_with_execution(
                 )
         except Exception as error:
             response_received_at = utc_now_text()
+            reason_code = depth_failure_reason_code(error)
             source_endpoint = ""
             source_instrument = ""
             source_quote_asset = ""
@@ -1190,6 +1278,7 @@ def collect_depth_with_execution(
                 source_instrument=source_instrument,
                 source_quote_asset=source_quote_asset,
                 raw_response_sha256=raw_response_sha256,
+                reason_code=reason_code,
             )
             market_execution_rows = failed_execution_rows(
                 market,
@@ -1201,6 +1290,7 @@ def collect_depth_with_execution(
                 source_instrument=source_instrument,
                 source_quote_asset=source_quote_asset,
                 raw_response_sha256=raw_response_sha256,
+                status_reason=reason_code,
             )
         rows.append(row)
         execution_rows.extend(market_execution_rows)
@@ -1226,6 +1316,10 @@ def collect_depth_with_execution(
         "status_counts": {
             status: sum(row["status"] == status for row in rows)
             for status in ("observed", "partial", "failed")
+        },
+        "reason_code_counts": {
+            reason: sum(row["reason_code"] == reason for row in rows)
+            for reason in sorted({row["reason_code"] for row in rows})
         },
         "raw_files": sorted(path.name for path in snapshot_raw_dir.glob("*.json")),
     }
@@ -1276,6 +1370,8 @@ def validate_snapshot(
         raise ValueError("CEX depth snapshot coverage does not match the published inventory")
     if any(row["status"] not in {"observed", "partial", "failed"} for row in rows):
         raise ValueError("CEX depth snapshot contains an invalid status")
+    if any(row.get("reason_code") not in CEX_DEPTH_REASON_CODES for row in rows):
+        raise ValueError("CEX depth snapshot contains an invalid reason code")
     if not any(row["status"] in {"observed", "partial"} for row in rows):
         raise ValueError("CEX depth snapshot contains no observed order books")
     for row in rows:

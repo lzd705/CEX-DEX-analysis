@@ -397,6 +397,35 @@ main { min-width: 0; padding: 14px 18px 30px; }
   background: #24282e;
   color: #aeb5be;
 }
+.quality-state[data-tooltip] {
+  position: relative;
+  cursor: help;
+}
+.quality-state[data-tooltip]::after {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  z-index: 95;
+  display: none;
+  width: min(360px, calc(100vw - 40px));
+  padding: 8px 9px;
+  border: 1px solid #586675;
+  border-radius: 4px;
+  background: rgba(13, 16, 21, .985);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, .45);
+  color: #c8ced6;
+  content: attr(data-tooltip);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+  text-align: left;
+  text-transform: none;
+  white-space: normal;
+}
+.quality-state[data-tooltip]:hover::after,
+.quality-state[data-tooltip]:focus-visible::after {
+  display: block;
+}
 .facts-controls {
   display: grid;
   grid-template-columns: minmax(110px, .55fr) minmax(240px, 1.5fr) minmax(240px, 1.5fr) auto;
@@ -567,6 +596,124 @@ main { min-width: 0; padding: 14px 18px 30px; }
   margin: 7px 0 0;
   color: var(--muted);
   font-size: 11px;
+}
+.toolbar-title-line,
+.module-context {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.toolbar-title-line { flex-wrap: nowrap; }
+.module-context {
+  min-height: 28px;
+  margin-top: 7px;
+}
+.compact-context {
+  min-height: 0;
+  gap: 5px;
+  margin-top: 0;
+}
+.module-chip,
+.chart-context-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 25px;
+  padding: 3px 8px;
+  border: 1px solid #3b4653;
+  border-radius: 999px;
+  background: #1c222a;
+  color: #c3cad3;
+  font-family: Inter, ui-sans-serif, sans-serif;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.module-chip[data-tone="limit"] {
+  border-color: #735b35;
+  background: #2e2619;
+  color: #e9c985;
+}
+.chart-context-chip {
+  min-height: 23px;
+  margin-top: 2px;
+  color: var(--muted);
+  white-space: normal;
+}
+.context-info {
+  position: relative;
+  z-index: 30;
+  display: inline-flex;
+}
+.context-info[open] { z-index: 80; }
+.context-info > summary {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid #46606b;
+  border-radius: 50%;
+  background: #17252b;
+  color: #9fd8dd;
+  cursor: pointer;
+  list-style: none;
+}
+.context-info > summary::-webkit-details-marker { display: none; }
+.context-info > summary::marker { content: ""; }
+.context-info > summary:hover,
+.context-info > summary:focus-visible,
+.context-info[open] > summary {
+  border-color: #70abb1;
+  background: #1b3439;
+  color: #d4f1f3;
+}
+.context-info > summary svg {
+  width: 14px;
+  height: 14px;
+}
+.context-tooltip {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  z-index: 90;
+  width: min(400px, calc(100vw - 36px));
+  padding: 11px 12px;
+  border: 1px solid #586675;
+  border-radius: 4px;
+  background: rgba(13, 16, 21, .985);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .48);
+  color: #c8ced6;
+  font-size: 11px;
+  line-height: 1.5;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-3px);
+  transition: opacity .12s ease, transform .12s ease;
+}
+.context-tooltip-wide { width: min(500px, calc(100vw - 36px)); }
+.context-tooltip > strong {
+  display: block;
+  margin-bottom: 5px;
+  color: #eef2f5;
+  font-size: 12px;
+}
+.context-tooltip p { margin: 0; color: #b7bec8; }
+.context-tooltip p + p {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid var(--line-soft);
+}
+.context-tooltip p strong { color: #e8edf1; }
+.context-info:hover .context-tooltip,
+.context-info:focus-within .context-tooltip,
+.context-info[open] .context-tooltip {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
 }
 .compare-command {
   min-height: 44px;
@@ -1342,22 +1489,79 @@ main { min-width: 0; padding: 14px 18px 30px; }
 .quality-table { min-width: 1120px; }
 .quality-table td { vertical-align: top; white-space: normal; }
 .quality-fact {
+  position: relative;
   display: grid;
-  gap: 4px;
+  gap: 5px;
   min-width: 150px;
+  padding-right: 32px;
 }
-.quality-fact small {
+.quality-primary-value {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 750;
+}
+.quality-observed-time {
   color: var(--muted);
   font-family: Inter, ui-sans-serif, sans-serif;
+  font-size: 11px;
   line-height: 1.35;
 }
-.quality-fact details summary,
 .facts-contract summary,
 .quality-legend summary {
   min-height: 44px;
   display: list-item;
   box-sizing: border-box;
   padding-block: 12px;
+}
+.quality-fact-details { position: static; }
+.quality-fact-details > summary {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #46606b;
+  border-radius: 50%;
+  background: #17252b;
+  color: #9fd8dd;
+  cursor: pointer;
+  font-family: ui-serif, Georgia, serif;
+  font-size: 13px;
+  font-weight: 800;
+  list-style: none;
+}
+.quality-fact-details > summary::-webkit-details-marker { display: none; }
+.quality-fact-details > summary::marker { content: ""; }
+.quality-fact-details > summary:hover,
+.quality-fact-details > summary:focus-visible,
+.quality-fact-details[open] > summary {
+  border-color: #70abb1;
+  background: #1b3439;
+  color: #d4f1f3;
+}
+.quality-fact-detail-body {
+  margin-top: 3px;
+  margin-right: -32px;
+  padding: 8px 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: #12151a;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.quality-fact-detail-body p { margin: 0; overflow-wrap: anywhere; }
+.quality-fact-detail-body p + p { margin-top: 5px; }
+.quality-lineage-heading {
+  display: block;
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--text);
+  font-size: 11px;
 }
 .quality-reasons {
   min-width: 260px;
@@ -1623,6 +1827,23 @@ footer {
 }
 
 @media (max-width: 700px) {
+  .module-context { gap: 5px; }
+  .module-chip {
+    min-height: 24px;
+    padding-inline: 7px;
+    font-size: 9px;
+  }
+  .toolbar-title-line,
+  .module-context { position: relative; }
+  .context-info { position: static; }
+  .context-tooltip,
+  .context-tooltip-wide {
+    top: calc(100% + 6px);
+    left: 0;
+    width: min(500px, calc(100vw - 32px));
+    max-height: 52vh;
+    overflow-y: auto;
+  }
   .app-header {
     min-height: 92px;
     height: auto;

@@ -195,6 +195,62 @@ class ImportLocalSnapshotTest(unittest.TestCase):
                 "The source rejected the request because its rate limit was reached.",
             )
 
+    def test_confirmed_no_candle_is_not_left_in_backfill_pending(self):
+        with tempfile.TemporaryDirectory() as source_name, tempfile.TemporaryDirectory() as target_name:
+            source = Path(source_name)
+            target = Path(target_name)
+            write_snapshot(
+                source,
+                cex_rows=[
+                    cex_row("2026-07-06"),
+                    cex_row("2026-07-08"),
+                ],
+                dex_rows=[
+                    dex_row(
+                        "2026-01-01",
+                        token_symbol="UNI",
+                        pool_address="0xUNIPOOL",
+                        pool_name="UNI / WETH",
+                    )
+                ],
+            )
+            write_cex_attempts(
+                source,
+                [
+                    cex_attempt(
+                        "2026-07-07",
+                        status="no_data",
+                        outcome="no_candles",
+                        reason_code="no_candles",
+                        http_status=None,
+                        error=(
+                            "The source returned no daily candles inside the "
+                            "requested window."
+                        ),
+                    )
+                ],
+            )
+
+            import_snapshot(
+                source,
+                target,
+                quality_today=date(2026, 7, 20),
+            )
+
+            report = read_quality_report(target)
+            issue = next(
+                item
+                for item in report["issues"]
+                if item["category"] == "historical_gap"
+            )
+            self.assertEqual(issue["status"], "source_no_observation")
+            self.assertFalse(issue["retryable"])
+            self.assertEqual(report["backfill_pending"], [])
+            self.assertEqual(report["backfill_windows_by_token"], {})
+            self.assertEqual(report["summary"]["backfill_pending_count"], 0)
+            self.assertEqual(report["publication"]["status"], "published")
+            self.assertEqual(report["status"], "ok")
+
     def test_hard_rejection_report_retains_normalized_attempt_evidence(self):
         with tempfile.TemporaryDirectory() as source_name, tempfile.TemporaryDirectory() as target_name:
             source = Path(source_name)

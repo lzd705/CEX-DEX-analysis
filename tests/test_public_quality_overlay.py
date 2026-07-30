@@ -352,6 +352,39 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
         )
         self.assertEqual(mixed_market["quality_status"], "critical")
 
+    def test_lifecycle_source_no_observation_category_is_public_information(self):
+        lifecycle_issue = self.issue(
+            "2026-01-03",
+            "no_candles",
+            "source_no_observation",
+            False,
+        )
+        lifecycle_issue["category"] = "source_no_observation"
+        self.write_report([lifecycle_issue])
+
+        payload, market = self.quality_for_day("2026-01-03")
+        fact = market["facts"]["daily"]
+        report = payload["metadata"]["daily_quality_report"]
+
+        self.assertEqual(fact["status"], "source_no_observation")
+        self.assertFalse(fact["retryable"])
+        self.assertEqual(
+            fact["action"],
+            "operator_review_source_outcome",
+        )
+        self.assertEqual(
+            fact["reason_code_counts"],
+            {"no_candles": 1},
+        )
+        self.assertEqual(market["quality_status"], "info")
+        source_flag = next(
+            flag
+            for flag in fact["quality_flags"]
+            if flag["code"] == "daily_source_no_observation"
+        )
+        self.assertEqual(source_flag["severity"], "info")
+        self.assertEqual(report["selected_window_issue_count"], 1)
+
     def test_real_fact_quality_report_is_accepted_end_to_end(self):
         report = build_report(
             self.data_dir / server.CEX_FILENAME,
@@ -554,15 +587,27 @@ console.log(JSON.stringify({ markup, mixedMarkup }));
         )
         result = json.loads(completed.stdout)
         markup = result["markup"]
-        self.assertIn('title="A bounded public reason.', markup)
+        self.assertIn('tabindex="0"', markup)
+        self.assertIn('data-tooltip="A bounded public reason.', markup)
+        self.assertIn('aria-label="collection failed. A bounded public reason.', markup)
+        self.assertIn('class="quality-fact-details"', markup)
+        self.assertIn('aria-label="Open daily Fact details"', markup)
         self.assertIn("Network request failed (1)", markup)
         self.assertIn("Source rate limit (2)", markup)
         self.assertIn("2026-01-02, 2026-01-03", markup)
-        self.assertIn("protected Admin retry queue", markup)
+        self.assertIn("protected operator retry queue", markup)
         self.assertIn("public page is read-only", markup)
         self.assertNotIn("retry available", markup)
+        persistent = markup.split(
+            '<details class="quality-fact-details">',
+            1,
+        )[0]
+        self.assertNotIn("Network request failed", persistent)
+        self.assertNotIn("protected operator", persistent)
+        self.assertNotIn("<small", persistent)
+        self.assertNotIn("<p>", persistent)
         self.assertIn(
-            "protected Admin retry queue and manual-review queue",
+            "both protected operator queues: retry and manual review",
             result["mixedMarkup"],
         )
 

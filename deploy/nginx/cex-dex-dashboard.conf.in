@@ -35,7 +35,15 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Overwrite, rather than append, the address consumed by the
+        # loopback-only application's public-action rate limiter. The matching
+        # application environment must explicitly set
+        # TRUST_LOOPBACK_PROXY_CLIENT_IP=true.
+        proxy_set_header X-Real-IP $remote_addr;
         proxy_connect_timeout 3s;
-        proxy_read_timeout 30s;
+        # Token preview performs two bounded upstream source reads (30s each).
+        # Keep the proxy response window above that server-side upper bound so
+        # a mutation response is not abandoned while the backend continues.
+        proxy_read_timeout 75s;
     }
 }

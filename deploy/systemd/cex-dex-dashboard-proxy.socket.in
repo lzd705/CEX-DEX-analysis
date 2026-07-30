@@ -1,0 +1,11 @@
+[Unit]
+Description=Connection-capped public socket for the CEX/DEX Market Monitor
+
+[Socket]
+ListenStream=@PUBLIC_BIND_HOST@:8765
+NoDelay=true
+Backlog=128
+Service=cex-dex-dashboard-proxy.service
+
+[Install]
+WantedBy=sockets.target

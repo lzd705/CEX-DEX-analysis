@@ -13,6 +13,7 @@ validation code, and documentation. Runtime market data stays outside Git.
 | `data/local/market_facts.sqlite3` | Indexed database read by the website | ignored |
 | `data/local/admin/jobs/` | Refresh job state and server-only logs | ignored |
 | `data/schema/` | Versioned SQLite schema | tracked |
+| `data/curated/market_lifecycle_reviews.json` | Revisioned exact-date source reviews for stale daily markets | tracked |
 | `data/public/` | Documentation for intentionally public artifacts | tracked |
 
 The two reviewed CSV inputs are:

@@ -711,6 +711,7 @@ class AdminServiceTest(unittest.TestCase):
                     {
                         "schema": "fact_quality_report/v1",
                         "publication": {
+                            "status": "published_with_retry_queue",
                             "dataset_snapshot_id": "snapshot-before",
                             "import_run_id": "import-before",
                         },
@@ -730,6 +731,9 @@ class AdminServiceTest(unittest.TestCase):
                             {
                                 "issue_id": "issue-before",
                                 "date": "2026-07-28",
+                                "category": "d1_active_gap",
+                                "reason_code": "active_market_missing_d1",
+                                "retryable": True,
                                 "market": {
                                     "token_symbol": "AAVE",
                                     "market_id": "cex:binance:AAVE/USDT",
@@ -776,6 +780,7 @@ class AdminServiceTest(unittest.TestCase):
                     {
                         "schema": "fact_quality_report/v1",
                         "publication": {
+                            "status": "published_with_backfill",
                             "dataset_snapshot_id": "snapshot-before",
                             "import_run_id": "import-before",
                         },
@@ -801,6 +806,9 @@ class AdminServiceTest(unittest.TestCase):
                             {
                                 "issue_id": f"historical-{index}",
                                 "date": f"2026-07-0{index}",
+                                "category": "historical_gap",
+                                "reason_code": "historical_market_gap",
+                                "retryable": True,
                                 "market": {
                                     "token_symbol": "AAVE",
                                     "market_id": "cex:binance:AAVE/USDT",
@@ -1102,6 +1110,7 @@ class AdminServiceTest(unittest.TestCase):
             baseline_report = {
                 "schema": "fact_quality_report/v1",
                 "publication": {
+                    "status": "published_with_retry_queue",
                     "dataset_snapshot_id": "snapshot-before",
                     "import_run_id": "import-before",
                 },
@@ -1121,6 +1130,8 @@ class AdminServiceTest(unittest.TestCase):
                         "date": "2026-07-28",
                         "issue_id": "issue-before",
                         "category": "d1_active_gap",
+                        "reason_code": "d1_active_market_gap",
+                        "retryable": True,
                         "market": {
                             "token_symbol": "AAVE",
                             "market_id": "cex:binance:AAVE/USDT",

@@ -1,0 +1,116 @@
+{
+  "schema": "market_lifecycle_reviews/v1",
+  "generated_at_utc": "2026-07-30T03:23:13Z",
+  "review_count": 2,
+  "reviews": [
+    {
+      "review_id": "grt-arbitrum-uniswap-v3-no-recent-candle",
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_status": "disposed",
+      "reviewed_issue_id": "32f20c07a5dce8a07fab",
+      "original_category": "stale_market_unknown",
+      "original_reason_code": "stale_market_lifecycle_unknown",
+      "market_id": "dex:arbitrum:uniswap_v3_arbitrum:0xbec22ca49e499c752542ca242b708c97739e4baf:GRT",
+      "market_type": "dex",
+      "token_symbol": "GRT",
+      "issue_date": "2026-07-29",
+      "disposition_status": "source_no_observation",
+      "disposition_reason_code": "no_candles",
+      "market_lifecycle": "pool_exists_dormant",
+      "evidence_status": "declared_source_confirmed",
+      "review_method": "manual_declared_source_cross_check",
+      "review_actor": "codex_agent_with_operator_authorization",
+      "reviewed_at_utc": "2026-07-30T03:21:51Z",
+      "disposition_note": "The configured GeckoTerminal pool still exists, but its latest returned daily candle is 2026-07-22 and the pool endpoint reports zero 24-hour volume and zero buys/sells. This resolves only the 2026-07-29 lifecycle-review issue as a confirmed source no-observation; it does not mark the pool delisted or classify any future date.",
+      "source_checks": [
+        {
+          "source_kind": "declared_dex_market_data_api",
+          "url": "https://api.geckoterminal.com/api/v2/networks/arbitrum/pools/0xbec22ca49e499c752542ca242b708c97739e4baf",
+          "http_status": 200,
+          "response_sha256": "102d0b69d55b3d997e06e2e028150a0ec7943aabaa1f8f6030feb818c821cc4c",
+          "checked_at_utc": "2026-07-30T03:21:51Z",
+          "observations": {
+            "pool_address": "0xbec22ca49e499c752542ca242b708c97739e4baf",
+            "pool_created_at": "2024-02-17T23:54:33Z",
+            "pool_name": "GRT / USDC 1%",
+            "dex_id": "uniswap_v3_arbitrum",
+            "reserve_in_usd": "198.5829",
+            "h24_volume_usd": "0.0",
+            "h24_buys": 0,
+            "h24_sells": 0
+          }
+        },
+        {
+          "source_kind": "declared_dex_daily_ohlcv_api",
+          "url": "https://api.geckoterminal.com/api/v2/networks/arbitrum/pools/0xbec22ca49e499c752542ca242b708c97739e4baf/ohlcv/day?aggregate=1&currency=usd&limit=30",
+          "http_status": 200,
+          "response_sha256": "ee50f997ebb5c4fa1d6fdbdc0a2ec40d293f7b5f65a54b7cf8bab79b02c09c69",
+          "checked_at_utc": "2026-07-30T03:21:51Z",
+          "observations": {
+            "latest_candle_timestamp": 1784678400,
+            "latest_candle_date_utc": "2026-07-22",
+            "latest_candle_volume_usd": 0.629667957860628,
+            "requested_limit": 30
+          }
+        }
+      ]
+    },
+    {
+      "review_id": "upbit-ldo-usdt-listed-no-recent-candle",
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_status": "disposed",
+      "reviewed_issue_id": "abdc6f37d16c047ad6ce",
+      "original_category": "stale_market_unknown",
+      "original_reason_code": "stale_market_lifecycle_unknown",
+      "market_id": "cex:upbit:LDO/USDT",
+      "market_type": "cex",
+      "token_symbol": "LDO",
+      "issue_date": "2026-07-29",
+      "disposition_status": "source_no_observation",
+      "disposition_reason_code": "no_candles",
+      "market_lifecycle": "listed_quote_market_dormant",
+      "evidence_status": "primary_confirmed",
+      "review_method": "manual_primary_source_cross_check",
+      "review_actor": "codex_agent_with_operator_authorization",
+      "reviewed_at_utc": "2026-07-30T03:23:13Z",
+      "disposition_note": "Upbit's official inventory contains USDT-LDO and does not contain KRW-LDO. The official USDT-LDO ticker reports its last trade on 2026-07-06 and zero 24-hour accumulated volume. This resolves only the 2026-07-29 lifecycle-review issue as a confirmed source no-observation; KRW-LDO absence is not treated as evidence that LDO/USDT is delisted, and no future date is classified by this record.",
+      "source_checks": [
+        {
+          "source_kind": "official_exchange_market_inventory",
+          "url": "https://api.upbit.com/v1/market/all?is_details=true",
+          "http_status": 200,
+          "response_sha256": "750ddd183f91a3046b9b2d322d3bbfcc42c3868766a130ea18d912b6cbf0c8ac",
+          "checked_at_utc": "2026-07-30T03:23:13Z",
+          "observations": {
+            "inventory_market_count": 797,
+            "present_market_codes": [
+              "USDT-LDO"
+            ],
+            "absent_market_codes": [
+              "KRW-LDO"
+            ],
+            "usdt_ldo_english_name": "Lido DAO",
+            "usdt_ldo_warning": false
+          }
+        },
+        {
+          "source_kind": "official_exchange_ticker",
+          "url": "https://api.upbit.com/v1/ticker?markets=USDT-LDO",
+          "http_status": 200,
+          "response_sha256": "89659a18f39769133940c693a7ca09ffa3e66aece08be548c2720422f9f0df12",
+          "checked_at_utc": "2026-07-30T03:23:13Z",
+          "observations": {
+            "market": "USDT-LDO",
+            "last_trade_date_utc": "2026-07-06",
+            "last_trade_time_utc": "11:55:14",
+            "last_trade_price": 0.4498,
+            "acc_trade_price_24h": 0,
+            "acc_trade_volume_24h": 0
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Data Actions · CEX / DEX Market Monitor</title>
+    <link rel="stylesheet" href="/styles.css?v=20260730-quality-actions-v1">
+    <link rel="stylesheet" href="/actions.css?v=20260730-quality-actions-v1">
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark">CD</div>
+        <div>
+          <h1>CEX / DEX Market Monitor</h1>
+          <p>Bounded collection actions</p>
+        </div>
+      </div>
+      <nav class="primary-navigation" aria-label="Primary navigation">
+        <a href="/screener">Screener</a>
+        <a href="/tokens/AAVE/markets">Token Research</a>
+        <a href="/actions.html" aria-current="page">Data Actions</a>
+      </nav>
+    </header>
+
+    <main class="data-actions-main">
+      <section class="actions-heading" aria-labelledby="actions-title">
+        <div>
+          <span class="eyebrow">Collection control</span>
+          <h2 id="actions-title">Data Actions</h2>
+          <div class="module-context" aria-label="Public action scope">
+            <span class="module-chip">Contract-qualified</span>
+            <span class="module-chip">Audited windows only</span>
+            <span class="module-chip">Rate limited</span>
+            <details class="context-info">
+              <summary aria-label="Data action guardrails">
+                <i data-lucide="info"></i>
+              </summary>
+              <div class="context-tooltip" role="tooltip">
+                <strong>Server-controlled scope</strong>
+                <p>Add Token always collects a fixed 30-day DEX history. Recovery can run only an exact retry window published by the latest quality audit; dates and markets cannot be entered manually.</p>
+              </div>
+            </details>
+          </div>
+        </div>
+        <a class="actions-back-link" href="/screener">
+          <i data-lucide="chart-no-axes-combined"></i>
+          View dashboard
+        </a>
+      </section>
+
+      <div id="actions-global-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+
+      <div class="actions-grid">
+        <section class="action-panel" aria-labelledby="add-token-title">
+          <div class="action-panel-heading">
+            <div>
+              <span class="eyebrow">Catalog expansion</span>
+              <h2 id="add-token-title">Add Token</h2>
+            </div>
+            <span class="module-chip">30D DEX</span>
+          </div>
+
+          <form id="public-token-resolve-form" class="public-token-form">
+            <label>
+              <span>Chain</span>
+              <select id="public-token-chain" required>
+                <option value="eth">Ethereum</option>
+                <option value="arbitrum">Arbitrum</option>
+                <option value="base">Base</option>
+                <option value="optimism">Optimism</option>
+                <option value="bsc">BNB Chain</option>
+                <option value="avax">Avalanche</option>
+                <option value="zksync">zkSync</option>
+                <option value="starknet">Starknet</option>
+                <option value="solana">Solana</option>
+              </select>
+            </label>
+            <label class="public-contract-field">
+              <span>Smart-contract address</span>
+              <input
+                id="public-token-contract"
+                spellcheck="false"
+                autocomplete="off"
+                maxlength="128"
+                required
+              >
+            </label>
+            <button id="public-token-resolve" class="action-secondary" type="submit">
+              <i data-lucide="search-check"></i>
+              Validate
+            </button>
+          </form>
+
+          <div id="public-token-preview" class="public-token-preview" hidden>
+            <div>
+              <span>Identity</span>
+              <strong id="public-token-identity">—</strong>
+              <small id="public-token-address">—</small>
+            </div>
+            <div>
+              <span>DEX coverage</span>
+              <strong id="public-token-pools">—</strong>
+              <small id="public-token-top-pool">—</small>
+            </div>
+            <div>
+              <span>CEX mapping</span>
+              <strong id="public-token-cex">—</strong>
+              <small id="public-token-cex-note">Never inferred from a contract</small>
+            </div>
+            <button id="public-token-add" class="action-primary" type="button">
+              <i data-lucide="database-zap"></i>
+              Add &amp; collect 30D
+            </button>
+          </div>
+          <div id="public-token-status" class="action-status" role="status" aria-live="polite" hidden></div>
+        </section>
+
+        <section class="action-panel" aria-labelledby="recovery-title">
+          <div class="action-panel-heading">
+            <div>
+              <span class="eyebrow">Quality recovery</span>
+              <h2 id="recovery-title">Retry Missing Facts</h2>
+            </div>
+            <div class="action-panel-tools">
+              <span id="public-retry-count" class="module-chip">Checking</span>
+              <button id="public-retry-refresh" class="icon-action" type="button" title="Refresh audited windows" aria-label="Refresh audited windows">
+                <i data-lucide="refresh-cw"></i>
+              </button>
+            </div>
+          </div>
+
+          <div class="public-retry-table-wrap" role="region" aria-label="Audited retry windows" tabindex="0">
+            <table class="public-retry-table">
+              <caption>Exact missing-fact windows authorized by the latest quality audit.</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Token</th>
+                  <th scope="col">Window</th>
+                  <th scope="col">Source</th>
+                  <th scope="col">Reason</th>
+                  <th scope="col">Action</th>
+                </tr>
+              </thead>
+              <tbody id="public-retry-body">
+                <tr><td colspan="5" class="actions-empty">Loading audited windows</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="public-retry-status" class="action-status" role="status" aria-live="polite" hidden></div>
+        </section>
+      </div>
+
+      <section id="public-job-panel" class="action-panel public-job-panel" aria-labelledby="public-job-title" hidden>
+        <div class="action-panel-heading">
+          <div>
+            <span class="eyebrow">Current browser session</span>
+            <h2 id="public-job-title">Collection Jobs</h2>
+          </div>
+          <span id="public-job-count" class="module-chip">0 jobs</span>
+        </div>
+        <div id="public-jobs" class="public-jobs" role="status" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <script src="/vendor/lucide.js"></script>
+    <script src="/actions.js?v=20260730-quality-actions-v1"></script>
+  </body>
+</html>

@@ -27,6 +27,17 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import quote, urlencode
 
+if __package__:
+    from .market_lifecycle_reviews import (
+        DEFAULT_REVIEW_PATH,
+        load_lifecycle_reviews,
+    )
+else:
+    from market_lifecycle_reviews import (
+        DEFAULT_REVIEW_PATH,
+        load_lifecycle_reviews,
+    )
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CEX_CSV = PROJECT_ROOT / "data/local/cex_exchange_volume_daily.csv"
@@ -100,7 +111,8 @@ CATEGORY_ORDER = {
     "hard_invalid": 0,
     "d1_active_gap": 1,
     "stale_market_unknown": 2,
-    "historical_gap": 3,
+    "source_no_observation": 3,
+    "historical_gap": 4,
 }
 
 
@@ -397,6 +409,33 @@ def source_url_hints(market: Mapping[str, Any]) -> List[str]:
     compact = "{}{}".format(base, quote_asset)
     dashed = "{}-{}".format(base, quote_asset)
     underscored = "{}_{}".format(base, quote_asset)
+    if exchange == "upbit":
+        # Upbit uses QUOTE-BASE identifiers and the collector can fall back
+        # between KRW and USDT. A hint hard-coded to KRW can therefore point
+        # at the wrong lifecycle (for example, LDO/USDT while KRW-LDO is not
+        # listed). Put the market represented by the fact first, retain the
+        # collector fallback, and expose the official market inventory.
+        quote_candidates = []
+        if quote_asset in {"KRW", "USDT"}:
+            quote_candidates.append(quote_asset)
+        for candidate in ("KRW", "USDT"):
+            if candidate not in quote_candidates:
+                quote_candidates.append(candidate)
+        return [
+            "https://api.upbit.com/v1/candles/days?{}".format(
+                urlencode(
+                    {
+                        "market": "{}-{}".format(candidate, base),
+                        "count": "30",
+                    }
+                )
+            )
+            for candidate in quote_candidates
+        ] + [
+            "https://api.upbit.com/v1/market/all?{}".format(
+                urlencode({"is_details": "true"})
+            )
+        ]
     urls = {
         "binance": "https://api.binance.com/api/v3/klines?{}".format(
             urlencode({"symbol": compact, "interval": "1d", "limit": "30"})
@@ -442,9 +481,6 @@ def source_url_hints(market: Mapping[str, Any]) -> List[str]:
             "https://api.crypto.com/exchange/v1/public/get-candlestick?{}"
         ).format(
             urlencode({"instrument_name": underscored, "timeframe": "1D"})
-        ),
-        "upbit": "https://api.upbit.com/v1/candles/days?{}".format(
-            urlencode({"market": "KRW-{}".format(base), "count": "30"})
         ),
     }
     return [urls[exchange]] if exchange in urls else []
@@ -1106,41 +1142,91 @@ def gap_issues(
                         details=details,
                     )
                 )
-        elif stale_market_unknown:
+        source_no_observation = False
+        if stale_market_unknown:
             assert last_day is not None
-            issues.append(
-                make_issue(
-                    category="stale_market_unknown",
-                    status="needs_review",
-                    reason_code="stale_market_lifecycle_unknown",
-                    retryable=False,
-                    market=market,
-                    day_text=target_day.isoformat(),
-                    message=(
-                        "This previously active market has stopped producing "
-                        "daily rows, but no explicit inactive or delisted "
-                        "metadata is available."
-                    ),
-                    details={
-                        "last_observed_date": last_day.isoformat(),
-                        "missing_since": (
-                            last_day + timedelta(days=1)
-                        ).isoformat(),
-                        "last_active_reference_window_start": (
-                            active_reference_start.isoformat()
-                            if active_reference_start is not None
-                            else None
-                        ),
-                        "last_active_reference_window_end": (
-                            active_reference_end.isoformat()
-                            if active_reference_end is not None
-                            else None
-                        ),
-                        "last_active_observation_count": last_active_count,
-                        "explicit_inactive_metadata": False,
-                    },
-                )
+            evidence = gap_evidence(
+                attempts=attempts,
+                market=market,
+                missing_day=target_day,
+                default_message=(
+                    "This previously active market has stopped producing "
+                    "daily rows, but no explicit inactive or delisted "
+                    "metadata is available."
+                ),
             )
+            if evidence["status"] == "source_no_observation":
+                source_no_observation = True
+                stale_market_unknown = False
+                details = {
+                    "last_observed_date": last_day.isoformat(),
+                    "missing_since": (
+                        last_day + timedelta(days=1)
+                    ).isoformat(),
+                    "last_active_reference_window_start": (
+                        active_reference_start.isoformat()
+                        if active_reference_start is not None
+                        else None
+                    ),
+                    "last_active_reference_window_end": (
+                        active_reference_end.isoformat()
+                        if active_reference_end is not None
+                        else None
+                    ),
+                    "last_active_observation_count": last_active_count,
+                    "explicit_inactive_metadata": False,
+                    "collection_attempt": evidence["attempt"],
+                }
+                issues.append(
+                    make_issue(
+                        category="source_no_observation",
+                        status="source_no_observation",
+                        reason_code=str(evidence["reason_code"]),
+                        retryable=False,
+                        market=market,
+                        day_text=target_day.isoformat(),
+                        message=(
+                            "The market has no recent daily row, and the "
+                            "lineage-matched source attempt returned no candle "
+                            "for the latest completed UTC day."
+                        ),
+                        details=details,
+                    )
+                )
+            else:
+                issues.append(
+                    make_issue(
+                        category="stale_market_unknown",
+                        status="needs_review",
+                        reason_code="stale_market_lifecycle_unknown",
+                        retryable=False,
+                        market=market,
+                        day_text=target_day.isoformat(),
+                        message=(
+                            "This previously active market has stopped "
+                            "producing daily rows, but no explicit inactive or "
+                            "delisted metadata is available."
+                        ),
+                        details={
+                            "last_observed_date": last_day.isoformat(),
+                            "missing_since": (
+                                last_day + timedelta(days=1)
+                            ).isoformat(),
+                            "last_active_reference_window_start": (
+                                active_reference_start.isoformat()
+                                if active_reference_start is not None
+                                else None
+                            ),
+                            "last_active_reference_window_end": (
+                                active_reference_end.isoformat()
+                                if active_reference_end is not None
+                                else None
+                            ),
+                            "last_active_observation_count": last_active_count,
+                            "explicit_inactive_metadata": False,
+                        },
+                    )
+                )
 
         summaries[market_id] = {
             "market": dict(market),
@@ -1151,6 +1237,7 @@ def gap_issues(
             "historical_gap_count": len(historical_missing),
             "d1_active_gap": d1_gap,
             "stale_market_unknown": stale_market_unknown,
+            "source_no_observation": source_no_observation,
             "trailing_active_gap_count": len(trailing_missing),
             "trailing_active_gap_start": (
                 trailing_missing[0].isoformat() if trailing_missing else None
@@ -1158,6 +1245,92 @@ def gap_issues(
             "d1_active_observation_count": recent_valid_count,
         }
     return issues, summaries
+
+
+def apply_lifecycle_review_dispositions(
+    issues: Sequence[Mapping[str, Any]],
+    market_summaries: Dict[str, Dict[str, Any]],
+    reviews: Sequence[Mapping[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Apply exact, source-backed manual dispositions without future carryover.
+
+    A review must bind the pending issue ID, market ID, Token, market type, and
+    UTC date. Unmatched historical review records remain audit evidence but
+    have no effect on the current report.
+    """
+
+    reviews_by_issue = {
+        str(review["reviewed_issue_id"]): review
+        for review in reviews
+    }
+    output: List[Dict[str, Any]] = []
+    applied_review_ids: List[str] = []
+    for raw_issue in issues:
+        issue = dict(raw_issue)
+        review = reviews_by_issue.get(str(issue.get("issue_id") or ""))
+        if review is None:
+            output.append(issue)
+            continue
+        market = issue.get("market")
+        if not isinstance(market, dict):
+            raise FactQualityInputError(
+                "Lifecycle review matched an issue without a market identity"
+            )
+        expected_identity = (
+            issue.get("category") == review["original_category"]
+            and issue.get("reason_code") == review["original_reason_code"]
+            and issue.get("status") == "needs_review"
+            and issue.get("retryable") is False
+            and issue.get("date") == review["issue_date"]
+            and market.get("market_id") == review["market_id"]
+            and market.get("market_type") == review["market_type"]
+            and market.get("token_symbol") == review["token_symbol"]
+        )
+        if not expected_identity:
+            raise FactQualityInputError(
+                "Lifecycle review {} does not match the current issue identity".format(
+                    review["review_id"]
+                )
+            )
+        details = dict(issue.get("details") or {})
+        details["manual_lifecycle_review"] = {
+            "review_id": review["review_id"],
+            "revision": review["revision"],
+            "reviewed_issue_id": review["reviewed_issue_id"],
+            "review_status": review["review_status"],
+            "market_lifecycle": review["market_lifecycle"],
+            "evidence_status": review["evidence_status"],
+            "review_method": review["review_method"],
+            "review_actor": review["review_actor"],
+            "reviewed_at_utc": review["reviewed_at_utc"],
+            "disposition_note": review["disposition_note"],
+            "source_checks": list(review["source_checks"]),
+        }
+        disposed = make_issue(
+            category="source_no_observation",
+            status=str(review["disposition_status"]),
+            reason_code=str(review["disposition_reason_code"]),
+            retryable=False,
+            market=market,
+            day_text=str(issue["date"]),
+            message=(
+                "A bounded manual source review confirmed that this market "
+                "exists but supplied no daily observation for the reviewed "
+                "UTC date."
+            ),
+            details=details,
+        )
+        output.append(disposed)
+        applied_review_ids.append(str(review["review_id"]))
+        market_id = str(market["market_id"])
+        if market_id in market_summaries:
+            market_summaries[market_id]["stale_market_unknown"] = False
+            market_summaries[market_id]["source_no_observation"] = True
+            market_summaries[market_id][
+                "lifecycle_review_id"
+            ] = review["review_id"]
+
+    return output, sorted(applied_review_ids)
 
 
 def split_consecutive_days(
@@ -1200,6 +1373,7 @@ def build_retry_windows(
         lambda: defaultdict(
             lambda: {
                 "market_ids": set(),
+                "market_types": set(),
                 "reason_codes": set(),
                 "issue_ids": set(),
             }
@@ -1216,6 +1390,8 @@ def build_retry_windows(
         entry = by_token_date[token][parsed_day]
         if market.get("market_id"):
             entry["market_ids"].add(str(market["market_id"]))
+        if market.get("market_type") in {"cex", "dex"}:
+            entry["market_types"].add(str(market["market_type"]))
         if issue.get("reason_code"):
             entry["reason_codes"].add(str(issue["reason_code"]))
         if issue.get("issue_id"):
@@ -1235,6 +1411,11 @@ def build_retry_windows(
                     "market_ids": sorted(
                         set().union(
                             *(entry["market_ids"] for entry in metadata)
+                        )
+                    ),
+                    "market_types": sorted(
+                        set().union(
+                            *(entry["market_types"] for entry in metadata)
                         )
                     ),
                     "reason_codes": sorted(
@@ -1303,6 +1484,7 @@ def build_report(
     *,
     cex_attempts: Optional[Path] = None,
     dex_attempts: Optional[Path] = None,
+    lifecycle_reviews: Optional[Path] = DEFAULT_REVIEW_PATH,
     today: Optional[date] = None,
     active_lookback_days: int = ACTIVE_LOOKBACK_DAYS,
     active_min_observations: int = ACTIVE_MIN_OBSERVATIONS,
@@ -1344,6 +1526,19 @@ def build_report(
         active_min_observations=active_min_observations,
         attempts=collection_attempts,
     )
+    lifecycle_review_records, lifecycle_review_source = load_lifecycle_reviews(
+        lifecycle_reviews
+    )
+    gaps, applied_lifecycle_review_ids = apply_lifecycle_review_dispositions(
+        gaps,
+        market_summaries,
+        lifecycle_review_records,
+    )
+    lifecycle_review_source = {
+        **lifecycle_review_source,
+        "applied_disposition_count": len(applied_lifecycle_review_ids),
+        "applied_review_ids": applied_lifecycle_review_ids,
+    }
     issues = sorted([*cex_issues, *dex_issues, *gaps], key=issue_sort_key)
     category_counts = Counter(str(issue["category"]) for issue in issues)
     status_counts = Counter(str(issue["status"]) for issue in issues)
@@ -1351,12 +1546,29 @@ def build_report(
     hard_count = category_counts.get("hard_invalid", 0)
     d1_count = category_counts.get("d1_active_gap", 0)
     stale_count = category_counts.get("stale_market_unknown", 0)
+    source_no_observation_count = sum(
+        issue.get("status") == "source_no_observation"
+        for issue in issues
+    )
     historical_count = category_counts.get("historical_gap", 0)
     retryable_count = sum(issue.get("retryable") is True for issue in issues)
-    reviews = manual_review_queue(issues)
-    if hard_count or d1_count:
+    manual_reviews = manual_review_queue(issues)
+    blocking_d1_count = sum(
+        issue.get("category") == "d1_active_gap"
+        and (
+            issue.get("retryable") is True
+            or issue.get("status") == "collection_failed"
+        )
+        for issue in issues
+    )
+    warning_count = sum(
+        issue.get("retryable") is True
+        or issue.get("status") in {"collection_failed", "needs_review"}
+        for issue in issues
+    )
+    if hard_count or blocking_d1_count:
         report_status = "failed"
-    elif historical_count or stale_count:
+    elif warning_count:
         report_status = "warning"
     else:
         report_status = "ok"
@@ -1379,7 +1591,11 @@ def build_report(
                 "stale_lifecycle_rule": (
                     "A previously active market that ages out of the retry "
                     "window becomes non-retryable needs_review until explicit "
-                    "inactive or delisted metadata exists."
+                    "inactive/delisted metadata exists or a lineage-matched "
+                    "latest-day attempt proves source_no_observation. A "
+                    "revisioned manual disposition may resolve only one exact "
+                    "issue ID, market ID, and UTC date; it never carries "
+                    "forward to a future date."
                 ),
             },
             "missing_row_status": "backfill_pending",
@@ -1392,6 +1608,7 @@ def build_report(
         },
         "sources": [cex_source, dex_source],
         "attempt_sources": [cex_attempt_source, dex_attempt_source],
+        "lifecycle_review_source": lifecycle_review_source,
         "collection_attempt_summary": {
             "attempt_count": len(collection_attempts),
             "status_counts": dict(
@@ -1418,8 +1635,9 @@ def build_report(
             "historical_gap_count": historical_count,
             "d1_active_gap_count": d1_count,
             "stale_market_unknown_count": stale_count,
+            "source_no_observation_count": source_no_observation_count,
             "retryable_issue_count": retryable_count,
-            "manual_review_count": len(reviews),
+            "manual_review_count": len(manual_reviews),
         },
         "category_counts": {
             category: category_counts.get(category, 0)
@@ -1428,13 +1646,14 @@ def build_report(
                 "historical_gap",
                 "d1_active_gap",
                 "stale_market_unknown",
+                "source_no_observation",
             )
         },
         "status_counts": dict(sorted(status_counts.items())),
         "reason_code_counts": dict(sorted(reason_counts.items())),
         "issues": issues,
         "retry_windows_by_token": build_retry_windows(issues),
-        "manual_review_queue": reviews,
+        "manual_review_queue": manual_reviews,
         "markets": [
             market_summaries[market_id]
             for market_id in sorted(market_summaries)
@@ -1450,6 +1669,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--dex-csv", type=Path, default=DEFAULT_DEX_CSV)
     parser.add_argument("--cex-attempts", type=Path)
     parser.add_argument("--dex-attempts", type=Path)
+    parser.add_argument(
+        "--lifecycle-reviews",
+        type=Path,
+        default=DEFAULT_REVIEW_PATH,
+        help=(
+            "Revisioned exact-date manual lifecycle dispositions "
+            "(defaults to data/curated/market_lifecycle_reviews.json)"
+        ),
+    )
     parser.add_argument(
         "--today",
         type=date.fromisoformat,
@@ -1477,6 +1705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.dex_csv,
             cex_attempts=args.cex_attempts,
             dex_attempts=args.dex_attempts,
+            lifecycle_reviews=args.lifecycle_reviews,
             today=args.today,
         )
     except (FactQualityInputError, FileNotFoundError, OSError, ValueError) as error:

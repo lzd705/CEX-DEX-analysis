@@ -30,7 +30,12 @@ from typing import Any, Iterable, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 try:
-    from dashboard.admin import AdminService
+    from dashboard.admin import (
+        AdminJobBusyError,
+        AdminService,
+        AdminWorkerStartError,
+        environment_flag,
+    )
     from dashboard.freshness import build_source_freshness
     from dashboard.market_facts import (
         MARKET_QUALITY_THRESHOLDS,
@@ -42,8 +47,30 @@ try:
         enrich_market_quality,
         market_series_statistics,
     )
+    from dashboard.public_actions import (
+        PUBLIC_ACTION_PATHS,
+        PUBLIC_ADD_TOKEN_ACTOR,
+        PUBLIC_JOB_STATUS_PREFIX,
+        PUBLIC_QUALITY_RETRY_ACTOR,
+        PUBLIC_QUALITY_RETRYABLE_PATH,
+        PUBLIC_QUALITY_RETRY_PATH,
+        PUBLIC_TOKEN_ADD_PATH,
+        PUBLIC_TOKEN_HISTORY_DAYS,
+        PUBLIC_TOKEN_RESOLVE_PATH,
+        PublicActionError,
+        PublicActionPolicy,
+        public_job,
+        public_retry_window,
+        public_token_candidate,
+        require_exact_string_fields,
+    )
 except ModuleNotFoundError:
-    from admin import AdminService
+    from admin import (  # type: ignore[no-redef]
+        AdminJobBusyError,
+        AdminService,
+        AdminWorkerStartError,
+        environment_flag,
+    )
     from freshness import build_source_freshness
     from market_facts import (
         MARKET_QUALITY_THRESHOLDS,
@@ -54,6 +81,23 @@ except ModuleNotFoundError:
         compare_daily_rows,
         enrich_market_quality,
         market_series_statistics,
+    )
+    from public_actions import (  # type: ignore[no-redef]
+        PUBLIC_ACTION_PATHS,
+        PUBLIC_ADD_TOKEN_ACTOR,
+        PUBLIC_JOB_STATUS_PREFIX,
+        PUBLIC_QUALITY_RETRY_ACTOR,
+        PUBLIC_QUALITY_RETRYABLE_PATH,
+        PUBLIC_QUALITY_RETRY_PATH,
+        PUBLIC_TOKEN_ADD_PATH,
+        PUBLIC_TOKEN_HISTORY_DAYS,
+        PUBLIC_TOKEN_RESOLVE_PATH,
+        PublicActionError,
+        PublicActionPolicy,
+        public_job,
+        public_retry_window,
+        public_token_candidate,
+        require_exact_string_fields,
     )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +148,23 @@ VENDOR_FILES = {
 PUBLIC_DATA_UNAVAILABLE_MESSAGE = (
     "Market fact data is temporarily unavailable. Retry after the next refresh."
 )
+NON_RETRYABLE_CEX_DEPTH_REASON_CODES = {
+    "source_no_two_sided_book",
+    "source_no_order_book",
+    "source_invalid_order_book",
+    "not_listed",
+    "source_rejected_request",
+    "unsupported_source",
+}
+CEX_DEPTH_REASON_CODES = NON_RETRYABLE_CEX_DEPTH_REASON_CODES | {
+    "observed",
+    "source_level_limit",
+    "rate_limit",
+    "source_unavailable",
+    "network",
+    "parse",
+    "collection_failed",
+}
 API_FRESHNESS_CACHE_SECONDS = 60
 LARGE_PAYLOAD_CACHE_SIZE = 8
 SERIALIZED_RESPONSE_CACHE_SIZE = 64
@@ -145,6 +206,9 @@ SPA_TOKEN_ROUTE = re.compile(
 SPA_METHODOLOGY_ROUTE = re.compile(
     r"/methodology/[a-z0-9]+(?:-[a-z0-9]+)*/?"
 )
+PUBLIC_JOB_STATUS_ROUTE = re.compile(
+    rf"^{re.escape(PUBLIC_JOB_STATUS_PREFIX)}([0-9a-f]{{32}})$"
+)
 
 
 def load_local_environment(path: Path) -> None:
@@ -167,6 +231,10 @@ def load_local_environment(path: Path) -> None:
 
 load_local_environment(PROJECT_ROOT / ".env")
 ADMIN_SERVICE = AdminService()
+PUBLIC_ACTION_POLICY = PublicActionPolicy()
+TRUST_LOOPBACK_PROXY_CLIENT_IP = environment_flag(
+    "TRUST_LOOPBACK_PROXY_CLIENT_IP"
+)
 
 
 def parse_number(value: str | float | int | None) -> float | None:
@@ -853,6 +921,32 @@ def _load_cex_depth_snapshot_cached(
     }
 
 
+def cex_depth_reason_code(depth_row: dict[str, str]) -> str | None:
+    """Prefer the stable collector code and classify legacy rows conservatively."""
+    reason_code = str(depth_row.get("reason_code") or "").strip()
+    if reason_code:
+        return (
+            reason_code
+            if reason_code in CEX_DEPTH_REASON_CODES
+            else "collection_failed"
+        )
+    status = str(depth_row.get("status") or "").strip()
+    error = str(depth_row.get("error") or "").lower()
+    if status == "observed":
+        return "observed"
+    if status == "partial":
+        return "source_level_limit"
+    if "empty order-book side" in error:
+        return "source_no_two_sided_book"
+    if "crossed or locked" in error or "invalid numeric order-book" in error:
+        return "source_invalid_order_book"
+    if "returned no order book" in error:
+        return "source_no_order_book"
+    if status == "failed":
+        return "collection_failed"
+    return None
+
+
 def overlay_cex_depth_snapshot(
     payload: dict[str, Any],
     depth_path: Path | None,
@@ -868,6 +962,7 @@ def overlay_cex_depth_snapshot(
             market["depth_source"] = None
             market["depth_source_endpoint"] = None
             market["depth_raw_response_sha256"] = None
+            market["depth_reason_code"] = None
             market["depth_error"] = None
         result["metadata"]["cex_depth_note"] = (
             "CEX depth snapshot is unavailable. Daily volume is not used as a depth proxy."
@@ -919,6 +1014,7 @@ def overlay_cex_depth_snapshot(
             market["depth_source"] = None
             market["depth_source_endpoint"] = None
             market["depth_raw_response_sha256"] = None
+            market["depth_reason_code"] = "not_cataloged_in_snapshot"
             market["depth_error"] = None
             for field in numeric_fields:
                 market[field] = None
@@ -941,6 +1037,7 @@ def overlay_cex_depth_snapshot(
         market["depth_raw_response_sha256"] = (
             depth_row.get("raw_response_sha256") or None
         )
+        market["depth_reason_code"] = cex_depth_reason_code(depth_row)
         market["depth_error"] = depth_row.get("error") or None
         observed = depth_row.get("status") in {"observed", "partial"}
         for field in numeric_fields:
@@ -2658,6 +2755,7 @@ DAILY_QUALITY_CATEGORIES = {
     "historical_gap",
     "d1_active_gap",
     "stale_market_unknown",
+    "source_no_observation",
 }
 DAILY_QUALITY_PUBLICATION_STATUSES = {
     "published",
@@ -3347,12 +3445,22 @@ def _tvl_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
 def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
     market_type = market["market_type"]
     status = market.get("depth_status") or "unavailable"
+    reason_code = (
+        market.get("depth_reason_code")
+        if market_type == "cex"
+        else market.get("depth_error")
+    )
     retryable = status in {
         "failed",
         "error",
         "collection_failed",
         "not_cataloged_in_snapshot",
     }
+    if (
+        market_type == "cex"
+        and reason_code in NON_RETRYABLE_CEX_DEPTH_REASON_CODES
+    ):
+        retryable = False
     temporal_alignment = {
         "state_observed_at": (
             market.get("depth_block_timestamp")
@@ -3440,7 +3548,7 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             source_endpoint=market.get("depth_source_endpoint"),
             method=market.get("depth_method"),
             reason=market.get("depth_error"),
-            reason_code=market.get("depth_error"),
+            reason_code=reason_code,
             retryable=retryable,
             action="retry_depth_collection" if retryable else None,
             snapshot_id=market.get("depth_snapshot_id"),
@@ -3622,6 +3730,19 @@ def _execution_quality_fact(
             if row.get("error")
         }
     )
+    lineage_reason = (
+        temporal_alignment["reason"]
+        if measured and not temporal_alignment["usable"]
+        else (
+            sorted(reason_counts)[0]
+            if len(reason_counts) == 1
+            else "mixed_execution_status_reasons"
+        )
+    )
+    retryable = (
+        status == "failed"
+        and lineage_reason not in NON_RETRYABLE_CEX_DEPTH_REASON_CODES
+    )
     return {
         **_quality_lineage(
             status=status,
@@ -3632,19 +3753,12 @@ def _execution_quality_fact(
                 "source_endpoint",
             ),
             method=_one_execution_value(rows, "calculation_method"),
-            reason=(
-                temporal_alignment["reason"]
-                if measured and not temporal_alignment["usable"]
-                else (
-                    sorted(reason_counts)[0]
-                    if len(reason_counts) == 1
-                    else "mixed_execution_status_reasons"
-                )
-            ),
-            retryable=status == "failed",
+            reason=lineage_reason,
+            reason_code=lineage_reason,
+            retryable=retryable,
             action=(
                 "retry_execution_collection"
-                if status == "failed"
+                if retryable
                 else None
             ),
             snapshot_id=_one_execution_value(rows, "snapshot_id"),
@@ -4317,6 +4431,15 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+def write_surface_enabled() -> bool:
+    """Any enabled mutation surface requires the loopback HTTPS boundary."""
+    return bool(
+        ADMIN_SERVICE.available
+        or PUBLIC_ACTION_POLICY.add_token_enabled
+        or PUBLIC_ACTION_POLICY.quality_retry_enabled
+    )
+
+
 def is_spa_shell_path(path: str) -> bool:
     """Return true only for the dashboard's declared client-side routes."""
     decoded = unquote(urlparse(path).path)
@@ -4399,6 +4522,435 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             raise ValueError("JSON body must be an object")
         return payload
 
+    def send_public_action_error(self, error: PublicActionError) -> None:
+        headers = None
+        if error.retry_after_seconds is not None:
+            headers = {"Retry-After": str(error.retry_after_seconds)}
+        self.send_json(
+            error.as_dict(),
+            error.status,
+            extra_headers=headers,
+        )
+
+    def public_client_address(self) -> str:
+        """Use the direct peer unless an explicitly trusted proxy overwrites IP."""
+        peer_address = str(self.client_address[0])
+        if (
+            not TRUST_LOOPBACK_PROXY_CLIENT_IP
+            or not is_loopback_host(peer_address)
+        ):
+            return peer_address
+        forwarded_address = self.headers.get("X-Real-IP", "").strip()
+        try:
+            return str(ipaddress.ip_address(forwarded_address))
+        except ValueError:
+            return peer_address
+
+    def send_public_token_error(self, error: BaseException) -> None:
+        """Map known onboarding failures without exposing server internals."""
+        error_code = str(getattr(error, "code", "invalid_token_request"))
+        allowed_codes = {
+            "identity_changed",
+            "identity_conflict",
+            "identity_mismatch",
+            "invalid_chain",
+            "invalid_contract_address",
+            "invalid_token_request",
+            "invalid_token_symbol",
+            "no_usable_pool",
+            "pool_token_mismatch",
+            "source_invalid_response",
+            "source_rate_limited",
+            "source_unavailable",
+            "symbol_collision",
+            "token_not_found",
+        }
+        if error_code not in allowed_codes:
+            self.send_public_action_error(
+                PublicActionError(
+                    "token_onboarding_unavailable",
+                    "Token onboarding is temporarily unavailable",
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    retryable=False,
+                )
+            )
+            return
+        retryable = bool(getattr(error, "retryable", False))
+        status = (
+            HTTPStatus.NOT_FOUND
+            if error_code == "token_not_found"
+            else HTTPStatus.CONFLICT
+            if error_code in {"symbol_collision", "identity_conflict"}
+            else HTTPStatus.SERVICE_UNAVAILABLE
+            if error_code
+            in {
+                "source_rate_limited",
+                "source_unavailable",
+                "source_invalid_response",
+            }
+            else HTTPStatus.UNPROCESSABLE_ENTITY
+            if error_code
+            in {
+                "no_usable_pool",
+                "pool_token_mismatch",
+                "identity_mismatch",
+                "identity_changed",
+            }
+            else HTTPStatus.BAD_REQUEST
+        )
+        response: dict[str, Any] = {
+            "error": str(error),
+            "error_code": error_code,
+            "retryable": retryable,
+        }
+        self.send_json(response, status)
+
+    @staticmethod
+    def validate_public_retry_request(
+        payload: dict[str, Any],
+    ) -> dict[str, str]:
+        request = require_exact_string_fields(
+            payload,
+            {
+                "token_symbol": 32,
+                "start_date": 10,
+                "end_date": 10,
+                "queue_type": 32,
+            },
+        )
+        try:
+            start = date.fromisoformat(request["start_date"]).isoformat()
+            end = date.fromisoformat(request["end_date"]).isoformat()
+        except ValueError as error:
+            raise PublicActionError(
+                "invalid_public_action_request",
+                "start_date and end_date must be ISO calendar dates",
+            ) from error
+        if start != request["start_date"] or end != request["end_date"]:
+            raise PublicActionError(
+                "invalid_public_action_request",
+                "start_date and end_date must use canonical YYYY-MM-DD format",
+            )
+        if request["queue_type"] not in {
+            "latest_completed_day",
+            "historical_gap",
+        }:
+            raise PublicActionError(
+                "invalid_public_action_request",
+                "queue_type is not an approved retry queue",
+            )
+        request["token_symbol"] = request["token_symbol"].upper()
+        return request
+
+    def handle_public_quality_retryable(self, parsed: Any) -> None:
+        if not PUBLIC_ACTION_POLICY.enabled_for_path(parsed.path):
+            self.send_public_action_error(PUBLIC_ACTION_POLICY.disabled_error())
+            return
+        if parsed.query:
+            self.send_public_action_error(
+                PublicActionError(
+                    "invalid_public_action_request",
+                    "This endpoint does not accept query parameters",
+                )
+            )
+            return
+        try:
+            with PUBLIC_ACTION_POLICY.permit(
+                "quality_retryable",
+                self.public_client_address(),
+            ):
+                windows = ADMIN_SERVICE.retryable_windows(required=True)
+                public_windows = [
+                    public_retry_window(window) for window in windows
+                ]
+        except PublicActionError as error:
+            self.send_public_action_error(error)
+            return
+        except (KeyError, OSError, TypeError, ValueError):
+            self.send_public_action_error(
+                PublicActionError(
+                    "quality_retry_unavailable",
+                    "The current quality retry queue is unavailable",
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    retryable=True,
+                )
+            )
+            return
+        self.send_json(
+            {
+                "windows": public_windows,
+                "count": len(public_windows),
+            }
+        )
+
+    def handle_public_job_status(self, parsed: Any) -> None:
+        route_match = PUBLIC_JOB_STATUS_ROUTE.fullmatch(parsed.path)
+        if route_match is None:
+            self.send_public_action_error(
+                PublicActionError(
+                    "public_job_not_found",
+                    "Public action job was not found",
+                    status=HTTPStatus.NOT_FOUND,
+                )
+            )
+            return
+        if not (
+            PUBLIC_ACTION_POLICY.add_token_enabled
+            or PUBLIC_ACTION_POLICY.quality_retry_enabled
+        ):
+            self.send_public_action_error(PUBLIC_ACTION_POLICY.disabled_error())
+            return
+        if parsed.query:
+            self.send_public_action_error(
+                PublicActionError(
+                    "invalid_public_action_request",
+                    "This endpoint does not accept query parameters",
+                )
+            )
+            return
+        try:
+            with PUBLIC_ACTION_POLICY.permit(
+                "job_status",
+                self.public_client_address(),
+            ):
+                job = ADMIN_SERVICE.get_job(route_match.group(1))
+        except PublicActionError as error:
+            self.send_public_action_error(error)
+            return
+        actor = job.get("requested_by") if job else None
+        actor_enabled = (
+            actor == PUBLIC_ADD_TOKEN_ACTOR
+            and PUBLIC_ACTION_POLICY.add_token_enabled
+        ) or (
+            actor == PUBLIC_QUALITY_RETRY_ACTOR
+            and PUBLIC_ACTION_POLICY.quality_retry_enabled
+        )
+        if not job or not actor_enabled:
+            self.send_public_action_error(
+                PublicActionError(
+                    "public_job_not_found",
+                    "Public action job was not found",
+                    status=HTTPStatus.NOT_FOUND,
+                )
+            )
+            return
+        self.send_json(public_job(job))
+
+    def handle_public_action_post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if path == PUBLIC_TOKEN_RESOLVE_PATH:
+            try:
+                request = require_exact_string_fields(
+                    payload,
+                    {"chain": 32, "contract_address": 128},
+                )
+                with PUBLIC_ACTION_POLICY.permit(
+                    "token_resolve",
+                    self.public_client_address(),
+                ):
+                    candidate = ADMIN_SERVICE.resolve_token(
+                        request["chain"],
+                        request["contract_address"],
+                    )
+            except PublicActionError as error:
+                self.send_public_action_error(error)
+                return
+            except ValueError as error:
+                self.send_public_token_error(error)
+                return
+            except (KeyError, OSError, TypeError):
+                self.send_public_action_error(
+                    PublicActionError(
+                        "token_onboarding_unavailable",
+                        "Token resolution is temporarily unavailable",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                )
+                return
+            try:
+                response = public_token_candidate(candidate)
+            except (TypeError, ValueError):
+                self.send_public_action_error(
+                    PublicActionError(
+                        "token_onboarding_unavailable",
+                        "Resolved Token preview is temporarily unavailable",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                )
+                return
+            self.send_json(response)
+            return
+
+        if path == PUBLIC_TOKEN_ADD_PATH:
+            try:
+                request = require_exact_string_fields(
+                    payload,
+                    {
+                        "chain": 32,
+                        "contract_address": 128,
+                        "expected_token_symbol": 32,
+                    },
+                )
+                with PUBLIC_ACTION_POLICY.permit(
+                    "token_add",
+                    self.public_client_address(),
+                    service=ADMIN_SERVICE,
+                ):
+                    job = ADMIN_SERVICE.create_onboarding_job(
+                        {
+                            **request,
+                            "history_days": PUBLIC_TOKEN_HISTORY_DAYS,
+                        },
+                        PUBLIC_ADD_TOKEN_ACTOR,
+                    )
+            except PublicActionError as error:
+                self.send_public_action_error(error)
+                return
+            except AdminJobBusyError:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "refresh_job_busy",
+                        "Another collection job is already queued or running",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                        retry_after_seconds=30,
+                    )
+                )
+                return
+            except AdminWorkerStartError:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "public_worker_start_failed",
+                        "The Token onboarding worker could not be started",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                )
+                return
+            except RuntimeError:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "token_onboarding_unavailable",
+                        "Token onboarding is temporarily unavailable",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                )
+                return
+            except ValueError as error:
+                self.send_public_token_error(error)
+                return
+            except (KeyError, OSError, TypeError):
+                self.send_public_action_error(
+                    PublicActionError(
+                        "token_onboarding_unavailable",
+                        "Token onboarding is temporarily unavailable",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                )
+                return
+            self.send_json(
+                public_job(job),
+                (
+                    HTTPStatus.OK
+                    if job.get("status") == "succeeded"
+                    else HTTPStatus.ACCEPTED
+                ),
+            )
+            return
+
+        if path == PUBLIC_QUALITY_RETRY_PATH:
+            try:
+                request = self.validate_public_retry_request(payload)
+                with PUBLIC_ACTION_POLICY.permit(
+                    "quality_retry",
+                    self.public_client_address(),
+                    service=ADMIN_SERVICE,
+                ):
+                    job = ADMIN_SERVICE.create_job(
+                        {
+                            **request,
+                            "job_type": "retry_failed",
+                        },
+                        PUBLIC_QUALITY_RETRY_ACTOR,
+                    )
+            except PublicActionError as error:
+                self.send_public_action_error(error)
+                return
+            except AdminJobBusyError:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "refresh_job_busy",
+                        "Another collection job is already queued or running",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                        retry_after_seconds=30,
+                    )
+                )
+                return
+            except AdminWorkerStartError:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "public_worker_start_failed",
+                        "The quality retry worker could not be started",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                )
+                return
+            except RuntimeError:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "quality_retry_unavailable",
+                        "The quality retry worker is temporarily unavailable",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                )
+                return
+            except (KeyError, TypeError, ValueError) as error:
+                error_code = str(
+                    getattr(error, "code", "quality_retry_unavailable")
+                )
+                self.send_public_action_error(
+                    PublicActionError(
+                        error_code,
+                        (
+                            "The selected retry window is not approved by the "
+                            "current quality report"
+                            if error_code == "retry_window_not_approved"
+                            else "The current quality retry queue is unavailable"
+                        ),
+                        status=(
+                            HTTPStatus.UNPROCESSABLE_ENTITY
+                            if error_code == "retry_window_not_approved"
+                            else HTTPStatus.SERVICE_UNAVAILABLE
+                        ),
+                        retryable=bool(getattr(error, "retryable", True)),
+                    )
+                )
+                return
+            except OSError:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "quality_retry_unavailable",
+                        "The quality retry job could not be persisted",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                )
+                return
+            self.send_json(public_job(job), HTTPStatus.ACCEPTED)
+            return
+
+        self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+
     def admin_session_token(self) -> str | None:
         cookie = SimpleCookie()
         cookie.load(self.headers.get("Cookie", ""))
@@ -4479,6 +5031,26 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path.startswith(PUBLIC_JOB_STATUS_PREFIX):
+            self.handle_public_job_status(parsed)
+            return
+        if parsed.path in PUBLIC_ACTION_PATHS:
+            if parsed.path == PUBLIC_QUALITY_RETRYABLE_PATH:
+                self.handle_public_quality_retryable(parsed)
+                return
+            if not PUBLIC_ACTION_POLICY.enabled_for_path(parsed.path):
+                self.send_public_action_error(
+                    PUBLIC_ACTION_POLICY.disabled_error()
+                )
+                return
+            self.send_public_action_error(
+                PublicActionError(
+                    "public_action_method_not_allowed",
+                    "This public action requires POST",
+                    status=HTTPStatus.METHOD_NOT_ALLOWED,
+                )
+            )
             return
         if parsed.path == "/api/markets/catalog":
             query = parse_qs(parsed.query, keep_blank_values=True)
@@ -4654,14 +5226,65 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if is_admin_surface_path(path) and not self.admin_surface_available():
             self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
             return
+        if path in PUBLIC_ACTION_PATHS:
+            if not PUBLIC_ACTION_POLICY.enabled_for_path(path):
+                self.send_public_action_error(
+                    PUBLIC_ACTION_POLICY.disabled_error()
+                )
+                return
+            if parsed.query:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "invalid_public_action_request",
+                        "Public action endpoints do not accept query parameters",
+                    )
+                )
+                return
+            if path == PUBLIC_QUALITY_RETRYABLE_PATH:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "public_action_method_not_allowed",
+                        "This public action requires GET",
+                        status=HTTPStatus.METHOD_NOT_ALLOWED,
+                    )
+                )
+                return
+            content_type = (
+                self.headers.get("Content-Type", "")
+                .split(";", 1)[0]
+                .strip()
+                .lower()
+            )
+            if content_type != "application/json":
+                self.send_public_action_error(
+                    PublicActionError(
+                        "public_action_json_required",
+                        "Public action requests require application/json",
+                        status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                    )
+                )
+                return
         try:
             payload = self.read_json()
         except (ValueError, json.JSONDecodeError) as error:
-            self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            if path in PUBLIC_ACTION_PATHS:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "invalid_public_action_request",
+                        str(error),
+                    )
+                )
+            else:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if path in PUBLIC_ACTION_PATHS:
+            self.handle_public_action_post(path, payload)
             return
 
         if path == "/api/admin/login":
@@ -4836,10 +5459,10 @@ def main() -> None:
     if args.data_dir:
         os.environ["MARKET_DATA_DIR"] = str(Path(args.data_dir).expanduser().resolve())
         ADMIN_SERVICE = AdminService()
-    if ADMIN_SERVICE.available and not is_loopback_host(args.host):
+    if write_surface_enabled() and not is_loopback_host(args.host):
         raise SystemExit(
-            "Administrator surface requires a loopback bind. "
-            "Run behind an HTTPS reverse proxy or disable ADMIN_ENABLED."
+            "Write-capable surfaces require a loopback bind. Run behind an "
+            "HTTPS reverse proxy or disable administrator and public actions."
         )
     server = ThreadingHTTPServer((args.host, args.port), MarketMonitorHandler)
     print(f"Market Monitor running at http://{args.host}:{args.port}")
