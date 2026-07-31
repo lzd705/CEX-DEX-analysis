@@ -15,7 +15,7 @@ import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +28,8 @@ REVIEW_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,95}$")
 ISSUE_ID_PATTERN = re.compile(r"^[0-9a-f]{20}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 TOKEN_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
+LOWER_COMPONENT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+EVM_ADDRESS_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
 ALLOWED_REVIEW_STATUSES = {"disposed", "withdrawn"}
 ALLOWED_MARKET_TYPES = {"cex", "dex"}
 ALLOWED_LIFECYCLES = {
@@ -46,10 +48,69 @@ ALLOWED_SOURCE_HOSTS = {
     "api.geckoterminal.com",
     "api.upbit.com",
 }
+ROOT_FIELDS = {
+    "schema",
+    "generated_at_utc",
+    "review_count",
+    "reviews",
+}
+REVISION_FIELDS = {
+    "review_id",
+    "revision",
+    "supersedes_revision",
+    "review_status",
+    "reviewed_issue_id",
+    "original_category",
+    "original_reason_code",
+    "market_id",
+    "market_type",
+    "token_symbol",
+    "issue_date",
+    "disposition_status",
+    "disposition_reason_code",
+    "market_lifecycle",
+    "evidence_status",
+    "review_method",
+    "review_actor",
+    "reviewed_at_utc",
+    "disposition_note",
+    "source_checks",
+}
+SOURCE_CHECK_FIELDS = {
+    "source_kind",
+    "url",
+    "http_status",
+    "response_sha256",
+    "checked_at_utc",
+    "observations",
+}
+UPBIT_TICKER_SOURCE = "official_exchange_ticker"
+UPBIT_INVENTORY_SOURCE = "official_exchange_market_inventory"
+DEX_POOL_SOURCE = "declared_dex_market_data_api"
+DEX_OHLCV_SOURCE = "declared_dex_daily_ohlcv_api"
+IMMUTABLE_REVISION_FIELDS = (
+    "reviewed_issue_id",
+    "original_category",
+    "original_reason_code",
+    "market_id",
+    "market_type",
+    "token_symbol",
+    "issue_date",
+)
 
 
 class LifecycleReviewError(ValueError):
     """A curated lifecycle review is invalid or ambiguous."""
+
+
+def _require_exact_keys(
+    value: Mapping[str, Any],
+    expected: Sequence[str],
+    *,
+    field: str,
+) -> None:
+    if set(value) != set(expected):
+        raise LifecycleReviewError("{} contains unknown or missing fields".format(field))
 
 
 def sha256_file(path: Path) -> str:
@@ -99,6 +160,127 @@ def _iso_timestamp(value: Any, *, field: str) -> str:
     return text
 
 
+def _utc_timestamp(value: str) -> datetime:
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    return datetime.fromisoformat(normalized).astimezone(timezone.utc)
+
+
+def _canonical_token(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not TOKEN_PATTERN.fullmatch(value):
+        raise LifecycleReviewError("{} is not a canonical symbol".format(field))
+    return value
+
+
+def _canonical_lower_component(value: str, *, field: str) -> str:
+    if not LOWER_COMPONENT_PATTERN.fullmatch(value):
+        raise LifecycleReviewError("{} is not canonical".format(field))
+    return value
+
+
+def _normalized_evm_address(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not EVM_ADDRESS_PATTERN.fullmatch(value):
+        raise LifecycleReviewError("{} is not an EVM pool address".format(field))
+    return value.lower()
+
+
+def _parse_market_identity(
+    market_id: str,
+    *,
+    market_type: str,
+    token_symbol: str,
+    review_id: str,
+) -> Dict[str, str]:
+    field = review_id + ".market_id"
+    parts = market_id.split(":")
+    if market_type == "cex":
+        if len(parts) != 3 or parts[0] != "cex":
+            raise LifecycleReviewError(
+                "{} is not a canonical CEX market identity".format(field)
+            )
+        exchange = _canonical_lower_component(parts[1], field=field + ".exchange")
+        instrument_parts = parts[2].split("/")
+        if len(instrument_parts) != 2:
+            raise LifecycleReviewError(
+                "{} instrument is not BASE/QUOTE".format(field)
+            )
+        base = _canonical_token(instrument_parts[0], field=field + ".base")
+        quote = _canonical_token(instrument_parts[1], field=field + ".quote")
+        if base != token_symbol:
+            raise LifecycleReviewError(
+                "{} base does not match token_symbol".format(field)
+            )
+        if exchange != "upbit":
+            raise LifecycleReviewError(
+                "{} has no declared lifecycle evidence adapter".format(field)
+            )
+        return {
+            "exchange": exchange,
+            "base": base,
+            "quote": quote,
+            "source_market": "{}-{}".format(quote, base),
+        }
+
+    if market_type == "dex":
+        if len(parts) != 5 or parts[0] != "dex":
+            raise LifecycleReviewError(
+                "{} is not a canonical DEX market identity".format(field)
+            )
+        chain = _canonical_lower_component(parts[1], field=field + ".chain")
+        dex = _canonical_lower_component(parts[2], field=field + ".dex")
+        pool = _normalized_evm_address(parts[3], field=field + ".pool")
+        if parts[3] != pool:
+            raise LifecycleReviewError(
+                "{} pool address is not normalized".format(field)
+            )
+        trailing_token = _canonical_token(parts[4], field=field + ".token")
+        if trailing_token != token_symbol:
+            raise LifecycleReviewError(
+                "{} token does not match token_symbol".format(field)
+            )
+        return {
+            "chain": chain,
+            "dex": dex,
+            "pool": pool,
+            "token": trailing_token,
+        }
+
+    raise LifecycleReviewError("{} has an unsupported market type".format(field))
+
+
+def _safe_official_url(url: str, *, field: str):
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise LifecycleReviewError("{} has an invalid port".format(field)) from error
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in ALLOWED_SOURCE_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+        or parsed.netloc != parsed.hostname
+        or "%" in parsed.path
+        or "%" in parsed.query
+    ):
+        raise LifecycleReviewError(
+            "{} is not an allowed official HTTPS source".format(field)
+        )
+    return parsed
+
+
+def _exact_query(url: str, *, field: str) -> List[Tuple[str, str]]:
+    try:
+        return parse_qsl(
+            urlsplit(url).query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+    except ValueError as error:
+        raise LifecycleReviewError("{} has an invalid query".format(field)) from error
+
+
 def _source_check(
     value: Any,
     *,
@@ -108,17 +290,9 @@ def _source_check(
     field = "{}.source_checks[{}]".format(review_id, position)
     if not isinstance(value, dict):
         raise LifecycleReviewError("{} must be an object".format(field))
+    _require_exact_keys(value, SOURCE_CHECK_FIELDS, field=field)
     url = _bounded_text(value.get("url"), field=field + ".url", maximum=2_000)
-    parsed = urlsplit(url)
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname not in ALLOWED_SOURCE_HOSTS
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        raise LifecycleReviewError(
-            "{} is not an allowed official HTTPS source".format(field)
-        )
+    _safe_official_url(url, field=field + ".url")
     http_status = value.get("http_status")
     if (
         not isinstance(http_status, int)
@@ -157,12 +331,13 @@ def _source_check(
         raise LifecycleReviewError(
             "{} observations exceed the size limit".format(field)
         )
+    source_kind = _bounded_text(
+        value.get("source_kind"),
+        field=field + ".source_kind",
+        maximum=64,
+    )
     return {
-        "source_kind": _bounded_text(
-            value.get("source_kind"),
-            field=field + ".source_kind",
-            maximum=64,
-        ),
+        "source_kind": source_kind,
         "url": url,
         "http_status": http_status,
         "response_sha256": response_sha256,
@@ -174,9 +349,227 @@ def _source_check(
     }
 
 
+def _checks_by_kind(
+    source_checks: Sequence[Mapping[str, Any]],
+    *,
+    review_id: str,
+    allowed: Sequence[str],
+) -> Dict[str, Mapping[str, Any]]:
+    allowed_set = set(allowed)
+    by_kind: Dict[str, Mapping[str, Any]] = {}
+    for check in source_checks:
+        source_kind = str(check["source_kind"])
+        if source_kind not in allowed_set:
+            raise LifecycleReviewError(
+                "{} contains an unsupported source_kind".format(review_id)
+            )
+        if source_kind in by_kind:
+            raise LifecycleReviewError(
+                "{} contains a duplicate source_kind".format(review_id)
+            )
+        by_kind[source_kind] = check
+    return by_kind
+
+
+def _validate_upbit_evidence(
+    source_checks: Sequence[Mapping[str, Any]],
+    *,
+    identity: Mapping[str, str],
+    issue_date: str,
+    review_id: str,
+) -> None:
+    checks = _checks_by_kind(
+        source_checks,
+        review_id=review_id,
+        allowed=(UPBIT_TICKER_SOURCE, UPBIT_INVENTORY_SOURCE),
+    )
+    ticker = checks.get(UPBIT_TICKER_SOURCE)
+    if ticker is None:
+        raise LifecycleReviewError(
+            "{} requires an exact Upbit ticker check".format(review_id)
+        )
+    expected_market = identity["source_market"]
+    ticker_url = str(ticker["url"])
+    ticker_parts = _safe_official_url(
+        ticker_url,
+        field=review_id + ".ticker.url",
+    )
+    if (
+        ticker_parts.hostname != "api.upbit.com"
+        or ticker_parts.path != "/v1/ticker"
+        or _exact_query(ticker_url, field=review_id + ".ticker.url")
+        != [("markets", expected_market)]
+    ):
+        raise LifecycleReviewError(
+            "{} ticker does not query the exact market".format(review_id)
+        )
+    ticker_observations = ticker["observations"]
+    if ticker_observations.get("market") != expected_market:
+        raise LifecycleReviewError(
+            "{} ticker observation does not match the exact market".format(
+                review_id
+            )
+        )
+    last_trade_day = _iso_day(
+        ticker_observations.get("last_trade_date_utc"),
+        field=review_id + ".ticker.last_trade_date_utc",
+    )
+    if date.fromisoformat(last_trade_day) >= date.fromisoformat(issue_date):
+        raise LifecycleReviewError(
+            "{} ticker trade date does not precede issue_date".format(review_id)
+        )
+
+    inventory = checks.get(UPBIT_INVENTORY_SOURCE)
+    if inventory is None:
+        return
+    inventory_url = str(inventory["url"])
+    inventory_parts = _safe_official_url(
+        inventory_url,
+        field=review_id + ".inventory.url",
+    )
+    if (
+        inventory_parts.hostname != "api.upbit.com"
+        or inventory_parts.path != "/v1/market/all"
+        or _exact_query(inventory_url, field=review_id + ".inventory.url")
+        != [("is_details", "true")]
+    ):
+        raise LifecycleReviewError(
+            "{} inventory does not use the declared endpoint".format(review_id)
+        )
+    present_codes = inventory["observations"].get("present_market_codes")
+    if (
+        not isinstance(present_codes, list)
+        or any(not isinstance(code, str) for code in present_codes)
+        or expected_market not in present_codes
+    ):
+        raise LifecycleReviewError(
+            "{} inventory does not include the exact target market".format(
+                review_id
+            )
+        )
+
+
+def _validate_dex_evidence(
+    source_checks: Sequence[Mapping[str, Any]],
+    *,
+    identity: Mapping[str, str],
+    issue_date: str,
+    review_id: str,
+) -> None:
+    checks = _checks_by_kind(
+        source_checks,
+        review_id=review_id,
+        allowed=(DEX_POOL_SOURCE, DEX_OHLCV_SOURCE),
+    )
+    if set(checks) != {DEX_POOL_SOURCE, DEX_OHLCV_SOURCE}:
+        raise LifecycleReviewError(
+            "{} requires exact pool and daily OHLCV checks".format(review_id)
+        )
+    pool = identity["pool"]
+    chain = identity["chain"]
+    dex = identity["dex"]
+    expected_pool_path = "/api/v2/networks/{}/pools/{}".format(chain, pool)
+
+    pool_check = checks[DEX_POOL_SOURCE]
+    pool_url = str(pool_check["url"])
+    pool_parts = _safe_official_url(
+        pool_url,
+        field=review_id + ".pool.url",
+    )
+    if (
+        pool_parts.hostname != "api.geckoterminal.com"
+        or pool_parts.path != expected_pool_path
+        or pool_parts.query
+    ):
+        raise LifecycleReviewError(
+            "{} pool check does not bind the exact network and pool".format(
+                review_id
+            )
+        )
+    pool_observations = pool_check["observations"]
+    observed_pool = _normalized_evm_address(
+        pool_observations.get("pool_address"),
+        field=review_id + ".pool.pool_address",
+    )
+    if observed_pool != pool or pool_observations.get("dex_id") != dex:
+        raise LifecycleReviewError(
+            "{} pool observation does not bind the exact pool and dex".format(
+                review_id
+            )
+        )
+
+    ohlcv_check = checks[DEX_OHLCV_SOURCE]
+    ohlcv_url = str(ohlcv_check["url"])
+    ohlcv_parts = _safe_official_url(
+        ohlcv_url,
+        field=review_id + ".ohlcv.url",
+    )
+    query_pairs = _exact_query(ohlcv_url, field=review_id + ".ohlcv.url")
+    query = dict(query_pairs)
+    limit = query.get("limit", "")
+    if (
+        ohlcv_parts.hostname != "api.geckoterminal.com"
+        or ohlcv_parts.path != expected_pool_path + "/ohlcv/day"
+        or len(query_pairs) != 3
+        or len(query) != 3
+        or query.get("aggregate") != "1"
+        or query.get("currency") != "usd"
+        or not limit.isdigit()
+        or str(int(limit)) != limit
+        or int(limit) < 1
+        or int(limit) > 1_000
+    ):
+        raise LifecycleReviewError(
+            "{} OHLCV check is not an exact uncut daily query".format(review_id)
+        )
+    observations = ohlcv_check["observations"]
+    if "pool_address" in observations:
+        observed_ohlcv_pool = _normalized_evm_address(
+            observations.get("pool_address"),
+            field=review_id + ".ohlcv.pool_address",
+        )
+        if observed_ohlcv_pool != pool:
+            raise LifecycleReviewError(
+                "{} OHLCV observation names another pool".format(review_id)
+            )
+    if "dex_id" in observations and observations.get("dex_id") != dex:
+        raise LifecycleReviewError(
+            "{} OHLCV observation names another dex".format(review_id)
+        )
+    latest_timestamp = observations.get("latest_candle_timestamp")
+    if not isinstance(latest_timestamp, int) or isinstance(latest_timestamp, bool):
+        raise LifecycleReviewError(
+            "{} OHLCV latest timestamp is invalid".format(review_id)
+        )
+    try:
+        timestamp_day = datetime.fromtimestamp(
+            latest_timestamp,
+            timezone.utc,
+        ).date()
+    except (OverflowError, OSError, ValueError) as error:
+        raise LifecycleReviewError(
+            "{} OHLCV latest timestamp is invalid".format(review_id)
+        ) from error
+    latest_day = _iso_day(
+        observations.get("latest_candle_date_utc"),
+        field=review_id + ".ohlcv.latest_candle_date_utc",
+    )
+    if timestamp_day.isoformat() != latest_day:
+        raise LifecycleReviewError(
+            "{} OHLCV timestamp and date disagree".format(review_id)
+        )
+    if timestamp_day >= date.fromisoformat(issue_date):
+        raise LifecycleReviewError(
+            "{} OHLCV latest candle does not precede issue_date".format(
+                review_id
+            )
+        )
+
+
 def _review_revision(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise LifecycleReviewError("Lifecycle review revision must be an object")
+    _require_exact_keys(value, REVISION_FIELDS, field="Lifecycle review revision")
     review_id = _bounded_text(
         value.get("review_id"),
         field="review_id",
@@ -233,17 +626,19 @@ def _review_revision(value: Any) -> Dict[str, Any]:
         raise LifecycleReviewError(
             "{} has an inconsistent market_type".format(review_id)
         )
-    token_symbol = value.get("token_symbol")
-    if (
-        not isinstance(token_symbol, str)
-        or not TOKEN_PATTERN.fullmatch(token_symbol)
-    ):
-        raise LifecycleReviewError(
-            "{} has an invalid token_symbol".format(review_id)
-        )
+    token_symbol = _canonical_token(
+        value.get("token_symbol"),
+        field=review_id + ".token_symbol",
+    )
     issue_date = _iso_day(
         value.get("issue_date"),
         field=review_id + ".issue_date",
+    )
+    market_identity = _parse_market_identity(
+        market_id,
+        market_type=market_type,
+        token_symbol=token_symbol,
+        review_id=review_id,
     )
 
     disposition_status = value.get("disposition_status")
@@ -287,6 +682,11 @@ def _review_revision(value: Any) -> Dict[str, Any]:
         raise LifecycleReviewError(
             "{} contains duplicate source URLs".format(review_id)
         )
+    source_kinds = [check["source_kind"] for check in source_checks]
+    if len(source_kinds) != len(set(source_kinds)):
+        raise LifecycleReviewError(
+            "{} contains a duplicate source_kind".format(review_id)
+        )
 
     original_category = _bounded_text(
         value.get("original_category"),
@@ -323,15 +723,34 @@ def _review_revision(value: Any) -> Dict[str, Any]:
         raise LifecycleReviewError(
             "{} has an unsupported review_method".format(review_id)
         )
+    expected_contract = {
+        "cex": (
+            "listed_quote_market_dormant",
+            "primary_confirmed",
+            "manual_primary_source_cross_check",
+        ),
+        "dex": (
+            "pool_exists_dormant",
+            "declared_source_confirmed",
+            "manual_declared_source_cross_check",
+        ),
+    }[market_type]
+    if review_status == "disposed" and market_lifecycle != expected_contract[0]:
+        raise LifecycleReviewError(
+            "{} lifecycle does not match market_type".format(review_id)
+        )
+    if (
+        evidence_status != expected_contract[1]
+        or review_method != expected_contract[2]
+    ):
+        raise LifecycleReviewError(
+            "{} evidence contract does not match market_type".format(review_id)
+        )
     reviewed_at_utc = _iso_timestamp(
         value.get("reviewed_at_utc"),
         field=review_id + ".reviewed_at_utc",
     )
-    reviewed_at = datetime.fromisoformat(
-        reviewed_at_utc[:-1] + "+00:00"
-        if reviewed_at_utc.endswith("Z")
-        else reviewed_at_utc
-    ).astimezone(timezone.utc)
+    reviewed_at = _utc_timestamp(reviewed_at_utc)
     if date.fromisoformat(issue_date) > reviewed_at.date():
         raise LifecycleReviewError(
             "{} was reviewed before its issue date".format(review_id)
@@ -350,15 +769,32 @@ def _review_revision(value: Any) -> Dict[str, Any]:
         )
     for check in source_checks:
         checked_text = check["checked_at_utc"]
-        checked_at = datetime.fromisoformat(
-            checked_text[:-1] + "+00:00"
-            if checked_text.endswith("Z")
-            else checked_text
-        ).astimezone(timezone.utc)
+        checked_at = _utc_timestamp(checked_text)
+        if checked_at.date() <= date.fromisoformat(issue_date):
+            raise LifecycleReviewError(
+                "{} contains evidence checked before issue day completed".format(
+                    review_id
+                )
+            )
         if checked_at > reviewed_at:
             raise LifecycleReviewError(
                 "{} contains evidence checked after review".format(review_id)
             )
+
+    if market_type == "cex":
+        _validate_upbit_evidence(
+            source_checks,
+            identity=market_identity,
+            issue_date=issue_date,
+            review_id=review_id,
+        )
+    else:
+        _validate_dex_evidence(
+            source_checks,
+            identity=market_identity,
+            issue_date=issue_date,
+            review_id=review_id,
+        )
 
     return {
         "review_id": review_id,
@@ -431,6 +867,7 @@ def load_lifecycle_reviews(
         ) from error
     if not isinstance(payload, dict) or payload.get("schema") != REVIEW_SCHEMA:
         raise LifecycleReviewError("Lifecycle review schema is unsupported")
+    _require_exact_keys(payload, ROOT_FIELDS, field="Lifecycle review file")
     _iso_timestamp(payload.get("generated_at_utc"), field="generated_at_utc")
     raw_reviews = payload.get("reviews")
     if (
@@ -456,20 +893,36 @@ def load_lifecycle_reviews(
             raise LifecycleReviewError(
                 "{} revisions are not contiguous".format(review_id)
             )
+        original = review_revisions[1]
+        original_identity = tuple(
+            original[field] for field in IMMUTABLE_REVISION_FIELDS
+        )
+        previous_reviewed_at: Optional[datetime] = None
+        for revision_number in expected:
+            revision = review_revisions[revision_number]
+            revision_identity = tuple(
+                revision[field] for field in IMMUTABLE_REVISION_FIELDS
+            )
+            if revision_identity != original_identity:
+                raise LifecycleReviewError(
+                    "{} revision identity is immutable".format(review_id)
+                )
+            reviewed_at = _utc_timestamp(str(revision["reviewed_at_utc"]))
+            if (
+                previous_reviewed_at is not None
+                and reviewed_at <= previous_reviewed_at
+            ):
+                raise LifecycleReviewError(
+                    "{} review timestamps must increase".format(review_id)
+                )
+            previous_reviewed_at = reviewed_at
         latest.append(review_revisions[max(review_revisions)])
 
     active = [
         item for item in latest if item["review_status"] == "disposed"
     ]
-    active_keys = [
-        (
-            item["reviewed_issue_id"],
-            item["market_id"],
-            item["issue_date"],
-        )
-        for item in active
-    ]
-    if len(active_keys) != len(set(active_keys)):
+    active_issue_ids = [item["reviewed_issue_id"] for item in active]
+    if len(active_issue_ids) != len(set(active_issue_ids)):
         raise LifecycleReviewError(
             "Lifecycle review has ambiguous active dispositions"
         )

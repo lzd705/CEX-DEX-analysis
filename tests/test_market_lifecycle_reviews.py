@@ -2,7 +2,8 @@ import csv
 import json
 import tempfile
 import unittest
-from datetime import date
+from copy import deepcopy
+from datetime import date, timedelta
 from pathlib import Path
 
 from scripts.fact_quality import (
@@ -44,7 +45,7 @@ def review_payload(issue):
     market = issue["market"]
     return {
         "schema": "market_lifecycle_reviews/v1",
-        "generated_at_utc": "2026-07-29T02:00:00Z",
+        "generated_at_utc": "2026-07-30T02:00:00Z",
         "review_count": 1,
         "reviews": [
             {
@@ -65,7 +66,7 @@ def review_payload(issue):
                 "evidence_status": "primary_confirmed",
                 "review_method": "manual_primary_source_cross_check",
                 "review_actor": "test-reviewer",
-                "reviewed_at_utc": "2026-07-29T02:00:00Z",
+                "reviewed_at_utc": "2026-07-30T02:00:00Z",
                 "disposition_note": (
                     "The exact market remains listed and the official source "
                     "contains no candle for this reviewed date."
@@ -79,12 +80,80 @@ def review_payload(issue):
                         ),
                         "http_status": 200,
                         "response_sha256": "a" * 64,
-                        "checked_at_utc": "2026-07-29T01:59:00Z",
+                        "checked_at_utc": "2026-07-30T01:59:00Z",
                         "observations": {
                             "market": "USDT-AAVE",
                             "last_trade_date_utc": "2026-07-23",
                         },
                     }
+                ],
+            }
+        ],
+    }
+
+
+def dex_review_payload():
+    pool = "0xbec22ca49e499c752542ca242b708c97739e4baf"
+    return {
+        "schema": "market_lifecycle_reviews/v1",
+        "generated_at_utc": "2026-07-30T03:00:00Z",
+        "review_count": 1,
+        "reviews": [
+            {
+                "review_id": "grt-arbitrum-exact-pool-no-recent-candle",
+                "revision": 1,
+                "supersedes_revision": None,
+                "review_status": "disposed",
+                "reviewed_issue_id": "1" * 20,
+                "original_category": "stale_market_unknown",
+                "original_reason_code": "stale_market_lifecycle_unknown",
+                "market_id": (
+                    "dex:arbitrum:uniswap_v3_arbitrum:{}:GRT".format(pool)
+                ),
+                "market_type": "dex",
+                "token_symbol": "GRT",
+                "issue_date": "2026-07-29",
+                "disposition_status": "source_no_observation",
+                "disposition_reason_code": "no_candles",
+                "market_lifecycle": "pool_exists_dormant",
+                "evidence_status": "declared_source_confirmed",
+                "review_method": "manual_declared_source_cross_check",
+                "review_actor": "test-reviewer",
+                "reviewed_at_utc": "2026-07-30T03:00:00Z",
+                "disposition_note": (
+                    "The exact pool exists but its latest exact daily candle "
+                    "precedes the reviewed issue date."
+                ),
+                "source_checks": [
+                    {
+                        "source_kind": "declared_dex_market_data_api",
+                        "url": (
+                            "https://api.geckoterminal.com/api/v2/networks/"
+                            "arbitrum/pools/{}".format(pool)
+                        ),
+                        "http_status": 200,
+                        "response_sha256": "b" * 64,
+                        "checked_at_utc": "2026-07-30T02:58:00Z",
+                        "observations": {
+                            "pool_address": pool,
+                            "dex_id": "uniswap_v3_arbitrum",
+                        },
+                    },
+                    {
+                        "source_kind": "declared_dex_daily_ohlcv_api",
+                        "url": (
+                            "https://api.geckoterminal.com/api/v2/networks/"
+                            "arbitrum/pools/{}/ohlcv/day?aggregate=1&"
+                            "currency=usd&limit=30".format(pool)
+                        ),
+                        "http_status": 200,
+                        "response_sha256": "c" * 64,
+                        "checked_at_utc": "2026-07-30T02:59:00Z",
+                        "observations": {
+                            "latest_candle_timestamp": 1784678400,
+                            "latest_candle_date_utc": "2026-07-22",
+                        },
+                    },
                 ],
             }
         ],
@@ -114,6 +183,27 @@ class MarketLifecycleReviewTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def baseline_stale_issue(self):
+        baseline = build_report(
+            self.cex_path,
+            self.dex_path,
+            lifecycle_reviews=None,
+            today=date(2026, 7, 29),
+        )
+        return next(
+            issue
+            for issue in baseline["issues"]
+            if issue["category"] == "stale_market_unknown"
+        )
+
+    def write_reviews(self, payload, name="reviews.json"):
+        review_path = self.root / name
+        review_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return review_path
 
     def test_committed_grt_and_ldo_reviews_are_valid_and_exact_date(self):
         reviews, metadata = load_lifecycle_reviews(DEFAULT_REVIEW_PATH)
@@ -312,6 +402,483 @@ class MarketLifecycleReviewTest(unittest.TestCase):
             "count is inconsistent",
         ):
             load_lifecycle_reviews(review_path)
+
+    def test_cex_market_identity_must_be_canonical_and_match_token(self):
+        stale = self.baseline_stale_issue()
+        cases = (
+            ("cex:upbit:AAVE", "AAVE"),
+            ("cex:Upbit:AAVE/USDT", "AAVE"),
+            ("cex:upbit:aave/USDT", "AAVE"),
+            ("cex:upbit:AAVE/USDT", "LDO"),
+            ("cex:binance:AAVE/USDT", "AAVE"),
+        )
+        for position, (market_id, token_symbol) in enumerate(cases):
+            with self.subTest(market_id=market_id, token_symbol=token_symbol):
+                payload = review_payload(stale)
+                review = payload["reviews"][0]
+                review["market_id"] = market_id
+                review["token_symbol"] = token_symbol
+                path = self.write_reviews(payload, "bad-cex-{}.json".format(position))
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(path)
+
+    def test_cex_ticker_query_and_observation_bind_exact_instrument(self):
+        stale = self.baseline_stale_issue()
+        mutations = (
+            (
+                "wrong path",
+                "url",
+                "https://api.upbit.com/v1/trades/ticks?markets=USDT-AAVE",
+            ),
+            (
+                "wrong query",
+                "url",
+                "https://api.upbit.com/v1/ticker?markets=KRW-AAVE",
+            ),
+            (
+                "duplicate query",
+                "url",
+                (
+                    "https://api.upbit.com/v1/ticker?markets=USDT-AAVE&"
+                    "markets=KRW-AAVE"
+                ),
+            ),
+            ("wrong observation", "market", "KRW-AAVE"),
+        )
+        for position, (label, field, value) in enumerate(mutations):
+            with self.subTest(case=label):
+                payload = review_payload(stale)
+                check = payload["reviews"][0]["source_checks"][0]
+                if field == "url":
+                    check["url"] = value
+                else:
+                    check["observations"][field] = value
+                path = self.write_reviews(
+                    payload,
+                    "bad-ticker-binding-{}.json".format(position),
+                )
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(path)
+
+    def test_cex_ticker_requires_a_strictly_earlier_trade_date(self):
+        stale = self.baseline_stale_issue()
+        issue_day = stale["date"]
+        next_day = (
+            date.fromisoformat(issue_day) + timedelta(days=1)
+        ).isoformat()
+        for trade_day in (issue_day, next_day):
+            with self.subTest(last_trade_date_utc=trade_day):
+                payload = review_payload(stale)
+                payload["reviews"][0]["source_checks"][0]["observations"][
+                    "last_trade_date_utc"
+                ] = trade_day
+                path = self.write_reviews(
+                    payload,
+                    "bad-trade-day-{}.json".format(trade_day),
+                )
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(path)
+
+    def test_dex_market_identity_is_canonical_and_matches_trailing_token(self):
+        base = dex_review_payload()
+        pool = "0xbec22ca49e499c752542ca242b708c97739e4baf"
+        cases = (
+            "dex:Arbitrum:uniswap_v3_arbitrum:{}:GRT".format(pool),
+            "dex:arbitrum:uniswap_v3_arbitrum:{}:LDO".format(pool),
+            "dex:arbitrum:uniswap_v3_arbitrum:{}:GRT".format(pool.upper()),
+            "dex:arbitrum:uniswap_v3_arbitrum:{}".format(pool),
+        )
+        for position, market_id in enumerate(cases):
+            with self.subTest(market_id=market_id):
+                payload = deepcopy(base)
+                payload["reviews"][0]["market_id"] = market_id
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "bad-dex-identity-{}.json".format(position),
+                        )
+                    )
+
+    def test_upbit_inventory_is_auxiliary_and_must_include_exact_target(self):
+        stale = self.baseline_stale_issue()
+        payload = review_payload(stale)
+        ticker = payload["reviews"][0]["source_checks"][0]
+        inventory = {
+            "source_kind": "official_exchange_market_inventory",
+            "url": "https://api.upbit.com/v1/market/all?is_details=true",
+            "http_status": 200,
+            "response_sha256": "d" * 64,
+            "checked_at_utc": "2026-07-30T01:58:00Z",
+            "observations": {
+                "present_market_codes": ["KRW-AAVE"],
+                "absent_market_codes": ["USDT-AAVE"],
+            },
+        }
+
+        inventory_only = deepcopy(payload)
+        inventory_only["reviews"][0]["source_checks"] = [inventory]
+        with self.assertRaises(LifecycleReviewError):
+            load_lifecycle_reviews(
+                self.write_reviews(inventory_only, "inventory-only.json")
+            )
+
+        wrong_inventory = deepcopy(payload)
+        wrong_inventory["reviews"][0]["source_checks"] = [inventory, ticker]
+        with self.assertRaises(LifecycleReviewError):
+            load_lifecycle_reviews(
+                self.write_reviews(wrong_inventory, "wrong-inventory.json")
+            )
+
+        exact_inventory = deepcopy(payload)
+        inventory["observations"]["present_market_codes"] = ["USDT-AAVE"]
+        exact_inventory["reviews"][0]["source_checks"] = [inventory, ticker]
+        reviews, _ = load_lifecycle_reviews(
+            self.write_reviews(exact_inventory, "exact-inventory.json")
+        )
+        self.assertEqual(len(reviews), 1)
+
+    def test_evidence_must_be_checked_after_issue_day_completes(self):
+        stale = self.baseline_stale_issue()
+        payload = review_payload(stale)
+        review = payload["reviews"][0]
+        issue_day = stale["date"]
+        review["reviewed_at_utc"] = issue_day + "T23:59:59Z"
+        review["source_checks"][0]["checked_at_utc"] = (
+            issue_day + "T23:59:58Z"
+        )
+        path = self.write_reviews(payload, "same-day-evidence.json")
+        with self.assertRaises(LifecycleReviewError):
+            load_lifecycle_reviews(path)
+
+    def test_source_kinds_are_allowlisted_unique_and_market_specific(self):
+        stale = self.baseline_stale_issue()
+        for position, source_kind in enumerate(
+            ("unknown_source", "declared_dex_daily_ohlcv_api")
+        ):
+            with self.subTest(source_kind=source_kind):
+                payload = review_payload(stale)
+                payload["reviews"][0]["source_checks"][0][
+                    "source_kind"
+                ] = source_kind
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "bad-source-kind-{}.json".format(position),
+                        )
+                    )
+
+        duplicate = review_payload(stale)
+        duplicate["reviews"][0]["source_checks"].append(
+            deepcopy(duplicate["reviews"][0]["source_checks"][0])
+        )
+        duplicate["reviews"][0]["source_checks"][1]["url"] = (
+            "https://api.upbit.com/v1/ticker?markets=USDT-AAVE#duplicate"
+        )
+        with self.assertRaises(LifecycleReviewError):
+            load_lifecycle_reviews(
+                self.write_reviews(duplicate, "duplicate-source-kind.json")
+            )
+
+    def test_urls_reject_ports_fragments_credentials_and_extra_components(self):
+        stale = self.baseline_stale_issue()
+        unsafe_urls = (
+            "https://api.upbit.com:443/v1/ticker?markets=USDT-AAVE",
+            "https://api.upbit.com/v1/ticker?markets=USDT-AAVE#fragment",
+            "https://user@api.upbit.com/v1/ticker?markets=USDT-AAVE",
+            "https://api.upbit.com/v1/ticker?markets=USDT-AAVE&extra=1",
+            "https://api.upbit.com/v1/ticker?markets=%55SDT-AAVE",
+        )
+        for position, unsafe_url in enumerate(unsafe_urls):
+            with self.subTest(url=unsafe_url):
+                payload = review_payload(stale)
+                payload["reviews"][0]["source_checks"][0]["url"] = unsafe_url
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "unsafe-url-{}.json".format(position),
+                        )
+                    )
+
+    def test_unknown_ledger_revision_and_source_fields_fail_closed(self):
+        stale = self.baseline_stale_issue()
+        locations = ("root", "revision", "source")
+        for position, location in enumerate(locations):
+            with self.subTest(location=location):
+                payload = review_payload(stale)
+                if location == "root":
+                    payload["unexpected"] = True
+                elif location == "revision":
+                    payload["reviews"][0]["unexpected"] = True
+                else:
+                    payload["reviews"][0]["source_checks"][0][
+                        "unexpected"
+                    ] = True
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "unknown-field-{}.json".format(position),
+                        )
+                    )
+
+    def test_dex_market_and_checks_bind_exact_network_pool_and_dex(self):
+        base = dex_review_payload()
+        pool = "0xbec22ca49e499c752542ca242b708c97739e4baf"
+        other_pool = "0x" + "2" * 40
+        mutations = (
+            ("wrong network", (0, "url"), (
+                "https://api.geckoterminal.com/api/v2/networks/ethereum/"
+                "pools/{}".format(pool)
+            )),
+            ("wrong pool path", (0, "url"), (
+                "https://api.geckoterminal.com/api/v2/networks/arbitrum/"
+                "pools/{}".format(other_pool)
+            )),
+            ("wrong observation pool", (0, "pool_address"), other_pool),
+            ("wrong observation dex", (0, "dex_id"), "camelot"),
+            ("wrong OHLCV observation pool", (1, "pool_address"), other_pool),
+            ("wrong OHLCV observation dex", (1, "dex_id"), "camelot"),
+            ("wrong ohlcv pool", (1, "url"), (
+                "https://api.geckoterminal.com/api/v2/networks/arbitrum/"
+                "pools/{}/ohlcv/day?aggregate=1&currency=usd&limit=30".format(
+                    other_pool
+                )
+            )),
+            ("historical cutoff", (1, "url"), (
+                "https://api.geckoterminal.com/api/v2/networks/arbitrum/"
+                "pools/{}/ohlcv/day?aggregate=1&currency=usd&limit=30&"
+                "before_timestamp=1784678400".format(pool)
+            )),
+        )
+        for position, (label, target, value) in enumerate(mutations):
+            with self.subTest(case=label):
+                payload = deepcopy(base)
+                check = payload["reviews"][0]["source_checks"][target[0]]
+                if target[1] == "url":
+                    check["url"] = value
+                else:
+                    check["observations"][target[1]] = value
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "bad-dex-binding-{}.json".format(position),
+                        )
+                    )
+
+    def test_dex_requires_pool_and_daily_ohlcv_checks(self):
+        payload = dex_review_payload()
+        for keep_position in (0, 1):
+            with self.subTest(keep_position=keep_position):
+                only_one = deepcopy(payload)
+                only_one["reviews"][0]["source_checks"] = [
+                    only_one["reviews"][0]["source_checks"][keep_position]
+                ]
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            only_one,
+                            "incomplete-dex-evidence-{}.json".format(keep_position),
+                        )
+                    )
+
+    def test_dex_latest_candle_must_be_consistent_and_precede_issue(self):
+        cases = (
+            ("2026-07-29", 1785283200),
+            ("2026-07-30", 1785369600),
+            ("2026-07-22", 1784764800),
+            ("2026-07-22", True),
+        )
+        for position, (latest_day, timestamp) in enumerate(cases):
+            with self.subTest(latest_day=latest_day, timestamp=timestamp):
+                payload = dex_review_payload()
+                observations = payload["reviews"][0]["source_checks"][1][
+                    "observations"
+                ]
+                observations["latest_candle_date_utc"] = latest_day
+                observations["latest_candle_timestamp"] = timestamp
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "bad-dex-candle-{}.json".format(position),
+                        )
+                    )
+
+    def test_boolean_values_cannot_impersonate_integer_contract_fields(self):
+        stale = self.baseline_stale_issue()
+        mutations = ("revision", "http_status")
+        for position, field in enumerate(mutations):
+            with self.subTest(field=field):
+                payload = review_payload(stale)
+                if field == "revision":
+                    payload["reviews"][0]["revision"] = True
+                else:
+                    payload["reviews"][0]["source_checks"][0][field] = True
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "boolean-contract-{}.json".format(position),
+                        )
+                    )
+
+    def test_market_type_lifecycle_evidence_and_method_must_agree(self):
+        mutations = (
+            ("market_lifecycle", "listed_quote_market_dormant"),
+            ("evidence_status", "primary_confirmed"),
+            ("review_method", "manual_primary_source_cross_check"),
+        )
+        for position, (field, value) in enumerate(mutations):
+            with self.subTest(field=field):
+                payload = dex_review_payload()
+                payload["reviews"][0][field] = value
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "wrong-dex-combo-{}.json".format(position),
+                        )
+                    )
+
+    def test_revision_identity_is_immutable_for_every_frozen_field(self):
+        stale = self.baseline_stale_issue()
+        mutations = {
+            "reviewed_issue_id": "f" * 20,
+            "original_category": "other_category",
+            "original_reason_code": "other_reason",
+            "market_id": "cex:upbit:AAVE/BTC",
+            "market_type": "dex",
+            "token_symbol": "LDO",
+            "issue_date": "2026-07-27",
+        }
+        for position, (field, value) in enumerate(mutations.items()):
+            with self.subTest(field=field):
+                payload = review_payload(stale)
+                revision_2 = deepcopy(payload["reviews"][0])
+                revision_2["revision"] = 2
+                revision_2["supersedes_revision"] = 1
+                revision_2["reviewed_at_utc"] = "2026-07-30T03:00:00Z"
+                revision_2[field] = value
+                if field == "market_id":
+                    revision_2["source_checks"][0]["url"] = (
+                        "https://api.upbit.com/v1/ticker?markets=BTC-AAVE"
+                    )
+                    revision_2["source_checks"][0]["observations"][
+                        "market"
+                    ] = "BTC-AAVE"
+                if field == "market_type":
+                    dex_revision = dex_review_payload()["reviews"][0]
+                    revision_2["market_id"] = (
+                        "dex:arbitrum:uniswap_v3_arbitrum:"
+                        "0xbec22ca49e499c752542ca242b708c97739e4baf:AAVE"
+                    )
+                    revision_2["market_lifecycle"] = "pool_exists_dormant"
+                    revision_2["evidence_status"] = "declared_source_confirmed"
+                    revision_2["review_method"] = (
+                        "manual_declared_source_cross_check"
+                    )
+                    revision_2["source_checks"] = deepcopy(
+                        dex_revision["source_checks"]
+                    )
+                if field == "token_symbol":
+                    revision_2["market_id"] = "cex:upbit:LDO/USDT"
+                    revision_2["source_checks"][0]["url"] = (
+                        "https://api.upbit.com/v1/ticker?markets=USDT-LDO"
+                    )
+                    revision_2["source_checks"][0]["observations"][
+                        "market"
+                    ] = "USDT-LDO"
+                payload["reviews"].append(revision_2)
+                payload["review_count"] = 2
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "mutated-identity-{}.json".format(position),
+                        )
+                    )
+
+    def test_revision_may_update_evidence_note_or_withdraw_disposition(self):
+        stale = self.baseline_stale_issue()
+        payload = review_payload(stale)
+        revision_2 = deepcopy(payload["reviews"][0])
+        revision_2["revision"] = 2
+        revision_2["supersedes_revision"] = 1
+        revision_2["reviewed_at_utc"] = "2026-07-30T03:00:00Z"
+        revision_2["source_checks"][0]["checked_at_utc"] = (
+            "2026-07-30T02:59:00Z"
+        )
+        revision_2["source_checks"][0]["response_sha256"] = "e" * 64
+        revision_2["disposition_note"] = "Updated exact-source evidence note."
+        payload["reviews"].append(revision_2)
+        payload["review_count"] = 2
+
+        reviews, metadata = load_lifecycle_reviews(
+            self.write_reviews(payload, "valid-revision.json")
+        )
+        self.assertEqual(metadata["revision_count"], 2)
+        self.assertEqual(reviews[0]["revision"], 2)
+        self.assertEqual(
+            reviews[0]["disposition_note"],
+            "Updated exact-source evidence note.",
+        )
+
+        withdrawn = deepcopy(payload)
+        withdrawn_revision = withdrawn["reviews"][1]
+        withdrawn_revision["review_status"] = "withdrawn"
+        withdrawn_revision["disposition_status"] = None
+        withdrawn_revision["disposition_reason_code"] = None
+        withdrawn_revision["market_lifecycle"] = None
+        reviews, metadata = load_lifecycle_reviews(
+            self.write_reviews(withdrawn, "withdrawn-revision.json")
+        )
+        self.assertEqual(reviews, [])
+        self.assertEqual(metadata["active_disposition_count"], 0)
+
+    def test_revision_review_times_must_increase(self):
+        stale = self.baseline_stale_issue()
+        payload = review_payload(stale)
+        revision_2 = deepcopy(payload["reviews"][0])
+        revision_2["revision"] = 2
+        revision_2["supersedes_revision"] = 1
+        payload["reviews"].append(revision_2)
+        payload["review_count"] = 2
+        with self.assertRaises(LifecycleReviewError):
+            load_lifecycle_reviews(
+                self.write_reviews(payload, "nonmonotonic-revision.json")
+            )
+
+    def test_duplicate_active_reviewed_issue_id_is_rejected(self):
+        stale = self.baseline_stale_issue()
+        payload = review_payload(stale)
+        duplicate = deepcopy(payload["reviews"][0])
+        duplicate["review_id"] = "aave-upbit-second-active-review"
+        duplicate["disposition_note"] = "A second active disposition is invalid."
+        payload["reviews"].append(duplicate)
+        payload["review_count"] = 2
+        with self.assertRaises(LifecycleReviewError):
+            load_lifecycle_reviews(
+                self.write_reviews(payload, "duplicate-active-issue.json")
+            )
+
+    def test_build_report_rejects_wrong_source_evidence_fail_closed(self):
+        stale = self.baseline_stale_issue()
+        payload = review_payload(stale)
+        payload["reviews"][0]["source_checks"][0]["url"] = (
+            "https://api.upbit.com/v1/ticker?markets=KRW-AAVE"
+        )
+        path = self.write_reviews(payload, "wrong-evidence-report.json")
+        with self.assertRaises(LifecycleReviewError):
+            build_report(
+                self.cex_path,
+                self.dex_path,
+                lifecycle_reviews=path,
+                today=date(2026, 7, 29),
+            )
 
 
 if __name__ == "__main__":
