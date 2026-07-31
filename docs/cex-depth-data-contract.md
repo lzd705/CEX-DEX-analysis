@@ -91,15 +91,25 @@ count. The ID is therefore an inventory-bound publication/source-lineage key.
 It is not an observation timestamp and does not prove that different venues
 were observed simultaneously.
 
-The public depth history, depth latest/current views, and execution latest view
-are validated before replacement and then passed to one family publication
-bundle. The bundle restores all pre-existing public bytes when an ordinary
+Both full and exact publication first resolve the two private and four public
+destinations listed below and reject any private/public overlap before making
+any write. Full publication then validates aligned depth/execution lineage,
+the exact execution scenario inventory, and both standard coverage reports.
+Exact publication instead checks aligned lineage and complete execution
+scenarios, validates both candidate-bound exact-target coverage reports and
+their target/mode/common generation, and requires exactly one target history
+row identical to the target depth-latest row.
+Only after those guards pass are the two private current files written
+independently and the four public destinations passed to one family bundle.
+
+The public bundle restores all pre-existing public bytes when an ordinary
 in-process I/O exception interrupts replacement. This is failure-atomic error
-handling for ordinary I/O failures only. It is not process-crash atomic: power
-loss, interpreter termination, or an operating-system crash can still leave a
-partially replaced multi-file family and requires manifest/hash diagnosis.
-The private processed depth/execution `current` files are written independently
-and are not part of the public reader boundary.
+handling for ordinary I/O failures only. It is not process-crash atomic, and
+the resolved-path overlap check is not protection against a concurrent path or
+symlink change after the check (a TOCTOU race). Power loss, interpreter
+termination, an operating-system crash, or an unsupported concurrent direct
+publisher can still require manifest/hash diagnosis. The two private current
+files are outside the public reader boundary and outside public rollback.
 
 Metadata exposes canonical `observed_at_min`, `observed_at_max`, and
 `observation_span_seconds` for the family. These bounds describe bounded
@@ -110,12 +120,19 @@ publication nor lineage validation converts it to zero.
 
 ## Files
 
-| File | Meaning |
-| --- | --- |
-| `data/processed/cex_depth_snapshot.csv` | Current collection awaiting review |
-| `data/local/cex_depth_latest.csv` | Latest published complete market inventory |
-| `data/local/cex_depth_history.csv` | Append-only normalized snapshot history |
-| `data/raw/cex-depth/<snapshot_id>/*.json` | Raw venue responses, conversion responses, failures, and manifest |
+| Boundary | File | Meaning |
+| --- | --- | --- |
+| Public bundle 1/4 | `data/local/cex_depth_history.csv` | Normalized depth history keyed by snapshot and Market |
+| Public bundle 2/4 | `data/local/cex_depth_latest.csv` | Latest published complete depth inventory |
+| Public bundle 3/4 | `data/local/cex_depth_snapshot.csv` | Public current depth view |
+| Public bundle 4/4 | `data/local/cex_execution_cost_latest.csv` | Latest execution scenarios derived from the same source cohort |
+| Private current 1/2 | `data/processed/cex_depth_snapshot.csv` | Candidate depth current file awaiting/recording publication work |
+| Private current 2/2 | `data/processed/cex_execution_cost_snapshot.csv` | Candidate execution current file awaiting/recording publication work |
+| Raw evidence | `data/raw/cex-depth/<snapshot_id>/*.json` | Venue responses, conversion responses, failures, and manifest |
+
+The public and private depth-current files intentionally share the basename
+`cex_depth_snapshot.csv`; their `data/local` versus `data/processed`
+directories define different destinations and reader roles.
 
 Runtime files are Git-ignored. The collector, tests, and this contract are
 versioned.

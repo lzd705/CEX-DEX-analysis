@@ -272,18 +272,33 @@ replaced with broad failure rows. Passing and rejected structured reports are
 copied into `steps[].publication_gates` in the collection manifest.
 
 For both full-inventory and canonical one-market `--merge-publish`
-publication, the family's public depth history, depth latest/current, and
-execution latest bytes are passed to one staged replacement bundle. If an
+publication, a shared guard first resolves and compares all destinations. Each
+CEX/DEX family has four public destinations—depth history, depth latest, public
+depth current, and execution latest—and two private destinations—processed
+depth current and processed execution current. Any resolved private/public
+overlap is rejected before `mkdir`, private writes, history reads, or public
+replacement. This pre-write guard applies to both full and exact publication.
+
+After the overlap guard, full publication validates aligned lineage, execution
+scenario inventory, and both standard coverage reports. Exact publication
+checks aligned lineage and complete execution scenarios, validates both
+candidate-bound exact-target reports and their target/mode/common generation,
+and requires exactly one target history row identical to the target
+depth-latest row. The private current files are then written independently.
+The four public bytes are passed to one staged replacement bundle; if an
 ordinary in-process I/O exception interrupts replacement, the helper restores
-every public destination to its pre-call bytes. This is failure-atomic error
-handling for ordinary I/O failures only. It is not process-crash atomic:
-power loss, interpreter termination, or an operating-system crash can still
-leave a partially replaced multi-file family and requires manifest/hash-based
-diagnosis. The private processed depth/execution `current` files are written
-independently before the public bundle and are not a server-visible commit
-point. The CEX and DEX family bundles also remain separate from each other.
-True crash-atomic cross-family publication would require immutable generation
-directories and one atomically replaced manifest pointer.
+every public destination to its pre-call bytes.
+
+This is failure-atomic error handling for ordinary in-process I/O failures
+only. It is not process-crash atomic, and resolving paths before writing does
+not eliminate a check-to-use race if another process changes a path or symlink
+after validation. Power loss, interpreter termination, an operating-system
+crash, or an unsupported concurrent direct publisher can still leave state
+requiring manifest/hash-based diagnosis. The private current files are not a
+server-visible commit point and are not included in public rollback. The CEX
+and DEX family bundles also remain separate from each other. True crash-atomic
+cross-family publication would require immutable generation directories and
+one atomically replaced manifest pointer.
 
 The production runner lock serializes managed profiles; concurrent direct
 collector invocations with `--publish-local` are unsupported.
@@ -333,8 +348,9 @@ assembling facts from different cohorts. A malformed depth publication also
 closes every public route that consumes the depth-enriched catalog, and
 `/health` reports `status=degraded`, `data_ready=false`, and HTTP 503. An
 execution-only file error is isolated from routes and health checks that do not
-load execution. Genuine absence remains `unavailable`/`null` rather than being
-treated as a mismatched cohort or converted to zero.
+require a valid execution publication. Genuine absence remains
+`unavailable`/`null` rather than being treated as a mismatched cohort or
+converted to zero.
 
 ### Exact latest-fact refresh
 
@@ -356,6 +372,10 @@ market was observed simultaneously. The bounded public files are committed as
 one staged bundle for ordinary I/O failure handling. Fault-injection tests at
 every server-visible replacement require all old files to remain byte-identical
 on failure; this still does not claim crash-atomic multi-file semantics.
+Before either the full or exact helper writes anything, the shared resolved-
+destination guard also requires the two private current paths to be disjoint
+from all four public paths. This overlap check is not a TOCTOU guarantee against
+unsupported concurrent path or symlink mutation.
 
 The exact preflight seal binds every raw candidate field, not only identity and
 status. Commit revalidates the current baseline hash, the common

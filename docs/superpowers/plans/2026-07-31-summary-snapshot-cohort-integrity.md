@@ -1,275 +1,137 @@
-# Summary Performance and Snapshot Cohort Integrity Implementation Plan
-
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
-**Goal:** Reduce default Summary cold latency and prevent public depth/execution responses from crossing publication cohorts.
-
-**Architecture:** Keep the existing source-signature and Fact contracts. Replace repeated whole-payload copies with a copy-on-overlay boundary, prewarm the default serialized Summary, failure-atomically publish each full depth/execution family, and validate exact family lineage at read time and release time.
-
-**Tech Stack:** Python 3.8+, standard library HTTP/CSV/SQLite, `unittest`, existing publication and quality helpers.
-
-## Global Constraints
-
-- Never describe cross-venue or cross-chain observations as simultaneous.
-- Preserve nulls; never convert unavailable Facts to zero.
-- Preserve `data_generation`, freshness-bucket, and source-fence semantics.
-- Full publication is failure-atomic for ordinary I/O errors, not crash-atomic.
-- Funding Rate and all-in fee/gas/transfer-cost Facts are out of scope.
-- Every commit uses an explicit message and receives a GitHub commit comment.
-
----
-
-### Task 1: Copy-on-overlay Summary optimization
-
-**Files:**
-- Modify: `dashboard/server.py`
-- Test: `tests/test_dashboard.py`
-
-**Interfaces:**
-- Produces: `_copy_payload_for_overlay(payload: dict[str, Any]) -> dict[str, Any]`.
-- Consumed by: `overlay_tvl_snapshot`, `overlay_cex_depth_snapshot`, and `overlay_dex_depth_snapshot`.
-
-- [ ] **Step 1: Write the failing immutability test**
-
-Create a payload with nested `price_points`, call the missing helper, then assert:
-
-```python
-self.assertEqual(result, payload)
-self.assertIsNot(result, payload)
-self.assertIsNot(result["metadata"], payload["metadata"])
-self.assertIsNot(result["cex_markets"][0], payload["cex_markets"][0])
-self.assertIs(
-    result["cex_markets"][0]["price_points"],
-    payload["cex_markets"][0]["price_points"],
-)
-```
-
-Mutate cloned metadata and top-level row fields and prove the source remains
-unchanged.
-
-- [ ] **Step 2: Run the focused test and verify RED**
-
-Run:
-
-```bash
-python3 -m unittest tests.test_dashboard.MarketMonitorServerTest.test_overlay_copy_shares_only_read_only_daily_series
-```
-
-Expected: `AttributeError` because `_copy_payload_for_overlay` does not exist.
-
-- [ ] **Step 3: Implement the minimal copy boundary**
-
-Deep-copy only metadata, shallow-copy every market row, and retain all other
-top-level immutable values. Replace all three `copy.deepcopy(payload)` calls.
-
-- [ ] **Step 4: Run overlay and dashboard tests**
-
-Run:
-
-```bash
-python3 -m unittest tests.test_dashboard tests.test_market_facts
-```
-
-Expected: all tests pass and existing overlay golden values remain unchanged.
-
----
-
-### Task 2: Default Summary startup warmup
-
-**Files:**
-- Modify: `dashboard/server.py`
-- Test: `tests/test_dashboard.py`
-
-**Interfaces:**
-- Produces: `warm_default_market_summary() -> None`.
-- Consumes: `_build_public_api_response_cached`, `api_source_signature`, and `api_freshness_bucket`.
-
-- [ ] **Step 1: Write failing success/failure-isolation tests**
-
-Patch the serialized response builder and assert one `summary` call with empty
-query items and the current signature/bucket. Patch it to raise and assert the
-startup wrapper logs a bounded warning without preventing server startup.
-
-- [ ] **Step 2: Run the focused tests and verify RED**
-
-Run:
-
-```bash
-python3 -m unittest tests.test_dashboard -k warm_default_market_summary
-```
-
-Expected: failure because the warmup helper is absent.
-
-- [ ] **Step 3: Implement warmup and startup integration**
-
-Build the default serialized Summary once after binding the socket and before
-`serve_forever()`. Catch `Exception`, print only its exception class in the
-bounded warning, and continue so `/health` remains diagnosable.
-
-- [ ] **Step 4: Verify cache/freshness regressions**
-
-Run:
-
-```bash
-python3 -m unittest tests.test_dashboard tests.test_freshness
-```
-
-Expected: all tests pass; the 60-second freshness key remains unchanged.
-
----
-
-### Task 3: Full family failure-atomic publication
-
-**Files:**
-- Modify: `scripts/fetch_cex_depth.py`
-- Modify: `scripts/fetch_dex_depth.py`
-- Test: `tests/test_fetch_cex_depth.py`
-- Test: `tests/test_fetch_dex_depth.py`
-
-**Interfaces:**
-- Produces in both collectors: `publish_full_publication_bundle(depth_rows, execution_rows, *, output_dir, publish_dir, preflight_reports) -> tuple[dict[str, Any], dict[str, Any]]`.
-- Consumes: existing coverage validators, lineage validators, CSV payload helpers, and `atomic_replace_bundle`.
-
-- [ ] **Step 1: Write CEX and DEX fault-injection tests**
-
-Prepare valid full candidates and four pre-existing public destinations.
-Inject `OSError` at each replacement position and assert every public file
-retains its original bytes.
-
-- [ ] **Step 2: Run focused tests and verify RED**
-
-Run:
-
-```bash
-python3 -m unittest tests.test_fetch_cex_depth tests.test_fetch_dex_depth -k full_publication_bundle
-```
-
-Expected: import or attribute failure because the full bundle function is absent.
-
-- [ ] **Step 3: Implement full bundle functions**
-
-Validate aligned depth/execution lineage, scenario completeness, and both
-standard coverage reports before preparing history/latest/current payloads.
-Write private processed current files independently, then publish all public
-destinations through one `atomic_replace_bundle` call.
-
-- [ ] **Step 4: Route unfiltered main publication through the bundle**
-
-Keep exact refresh on `publish_exact_publication_bundle`; replace only the full
-publish path. Preserve result JSON fields used by collection-cycle tests.
-
-- [ ] **Step 5: Run collector suites**
-
-Run:
-
-```bash
-python3 -m unittest tests.test_atomic_publication tests.test_fetch_cex_depth tests.test_fetch_dex_depth tests.test_collection_cycle
-```
-
-Expected: all tests pass.
-
----
-
-### Task 4: Read-time and release-time cohort lineage guard
-
-**Files:**
-- Modify: `dashboard/server.py`
-- Modify: `scripts/check_dashboard_release.py`
-- Test: `tests/test_dashboard.py`
-- Test: `tests/test_release_smoke.py`
-
-**Interfaces:**
-- Produces: `validate_depth_execution_cohort(metadata, snapshot, market_type) -> dict[str, Any]`.
-- Produces metadata fields: `observation_span_seconds` and `cohort_lineage`.
-
-- [ ] **Step 1: Write matching and mismatch tests**
-
-Cover wrong execution `snapshot_id`, wrong `source_snapshot_id`, multiple IDs,
-and market-count mismatch. Matching input returns one bounded projection;
-mismatch raises a `RuntimeError` subclass and public handlers return 503.
-
-- [ ] **Step 2: Write release-check counterexamples**
-
-Pass full-catalog depth metadata into `validate_execution`. Mutate each lineage
-field while leaving generation unchanged and require `ReleaseCheckError`.
-
-- [ ] **Step 3: Run focused tests and verify RED**
-
-Run:
-
-```bash
-python3 -m unittest tests.test_dashboard tests.test_release_smoke -k cohort
-```
-
-- [ ] **Step 4: Implement metadata and guards**
-
-Compute nonnegative spans from canonical timestamp bounds. Validate one exact
-depth/execution/source snapshot ID and equal inventory counts before returning
-execution or selected-quality Facts. Include the validated projection in the
-execution response and independently compare it with full-catalog metadata in
-the release checker.
-
-- [ ] **Step 5: Run server/release tests**
-
-Run:
-
-```bash
-python3 -m unittest tests.test_dashboard tests.test_release_smoke tests.test_public_quality_overlay
-```
-
-Expected: all tests pass.
-
----
-
-### Task 5: Documentation, complete verification, and release
-
-**Files:**
-- Modify: `docs/cex-depth-data-contract.md`
-- Modify: `docs/dex-depth-data-contract.md`
-- Modify: `docs/collection-operations.md`
-- Modify: `docs/market-facts-contract.md`
-- Test: all tests
-
-**Interfaces:**
-- Documents exact meanings of `snapshot_id`, cohort span, failure atomicity,
-  reader fail-closed behavior, and non-simultaneity.
-
-- [ ] **Step 1: Update contracts without overclaiming**
-
-State explicitly that family rows are bounded sequential observations and that
-the bundle handles ordinary I/O rollback but not process-crash atomicity.
-
-- [ ] **Step 2: Run full verification**
-
-Run:
-
-```bash
-python3 -m unittest discover -s tests -p 'test_*.py'
-git diff --check
-```
-
-Then run Python 3.8 compile/import checks in the production-compatible
-preflight environment.
-
-- [ ] **Step 3: Benchmark**
-
-Measure a fresh-process default Summary before serving and the immediate warm
-call. Record latency, response bytes, and generation equality. Do not encode a
-machine-dependent latency threshold as a unit test.
-
-- [ ] **Step 4: Commit and comment**
-
-```bash
-git add dashboard scripts tests docs
-git commit -m "perf(data): harden snapshot cohorts and warm summary"
-git push origin codex/critical-quality-sorting-token-refresh
-```
-
-Add a GitHub commit comment with test count, benchmark, atomicity boundary, and
-lineage counterexamples.
-
-- [ ] **Step 5: Preflight, deploy, and verify**
-
-Use an isolated production worktree/service, run the full release checker on a
-stable generation, cut over the main service, rerun the checker, verify public
-desktop/mobile behavior, and remove the preflight unit/worktree.
+# Summary Performance and Snapshot Cohort Integrity Execution Record
+
+**Goal:** Reduce default Summary cold latency and prevent public
+depth/execution responses from crossing publication cohorts.
+
+**Status:** Local implementation, contract reconciliation, and local regression
+verification are complete. The remaining work is explicitly listed under
+`Pending external release gates`; nothing else in this record is an instruction
+to rerun historical RED tests, publish data, push, or deploy.
+
+## Binding constraints
+
+- Cross-venue and cross-chain observations are bounded sequential
+  observations, never simultaneous observations.
+- Missing/unavailable Facts remain `null`; measured zero remains zero.
+- `data_generation`, freshness-bucket, and source-fence semantics are
+  unchanged.
+- Full and exact family publication are failure-atomic only for ordinary
+  in-process I/O failures. They are not process-crash atomic or TOCTOU-atomic.
+- Funding Rate and all-in fee, gas, and transfer-cost Facts remain out of scope.
+- External release actions require the controller's explicit authorization and
+  their own recorded evidence.
+
+## Completed implementation record
+
+The commands and expected failures from the original implementation plan were
+historical TDD steps. They have been removed so an operator cannot rerun stale
+RED commands that expected missing helpers or reuse the obsolete broad
+`git add`/single-commit/push recipe.
+
+### Task 1 — Copy-on-overlay Summary optimization: complete
+
+- [x] Added the overlay-safe payload copy boundary.
+- [x] Preserved input immutability and shared read-only daily series.
+- [x] Routed TVL, CEX-depth, and DEX-depth overlays through that boundary.
+- Commit: `f57be27` (`perf(summary): reduce overlay copy cost`).
+
+### Task 2 — Default Summary startup warmup: complete
+
+- [x] Added default serialized Summary warmup before normal serving.
+- [x] Preserved source signature, freshness bucket, and generation fences.
+- [x] Isolated warmup failures so startup remains diagnosable.
+- Commit: `f485e57` (`perf(summary): warm default response at startup`).
+
+### Task 3 — Full/exact family publication: complete
+
+- [x] Full CEX and DEX publication validate depth/execution lineage, scenario
+  inventories, and both coverage reports before private or public publication.
+- [x] Full publication passes four public destinations to one ordinary-I/O
+  failure-atomic bundle per family.
+- [x] Full publication rejects resolved private/public destination overlap
+  before any write.
+- [x] Exact publication checks aligned lineage and complete execution
+  scenarios, validates candidate-bound exact-target reports and their
+  target/mode/common generation, and seals one target history row to the
+  target depth-latest row.
+- [x] Exact publication uses the same resolved destination overlap guard before
+  any write and the same four-destination public bundle boundary.
+- [x] Fault-injection and same/aliased-directory overlap regressions are covered
+  for CEX and DEX.
+- Commits:
+  - `90b3db7` — `fix(data): publish depth execution as one cohort`
+  - `406f135` — `fix(data): reject overlapping publication paths`
+  - `1b14f2a` — `fix(data): reject exact publication path overlap`
+
+The overlap guard resolves two private and four public paths and compares them
+before `mkdir` or write. It does not eliminate a check-to-use race caused by an
+unsupported concurrent path/symlink mutation. Public rollback covers ordinary
+in-process I/O errors, not process crashes; private current files remain outside
+the public rollback boundary.
+
+### Task 4 — Read/release cohort lineage guard: complete
+
+- [x] Added canonical observation bounds and
+  `observation_span_seconds` validation.
+- [x] Required exactly one equal depth, execution, and execution-source
+  snapshot ID per loaded family.
+- [x] Bound snapshot/source identity to equal depth/execution Market inventory
+  counts.
+- [x] Made execution-cost, Quality, and depth-consuming public routes fail
+  closed on their applicable invalid cohort boundary.
+- [x] Added bounded HTTP 503 handling, degraded health for malformed
+  depth-consuming state, and independent release-checker counterexamples.
+- [x] Aligned the empty-book fixture with the real same-source failed depth row
+  plus ten execution rows.
+- Commits:
+  - `a4f9b2d` — `fix(api): fail closed on snapshot cohort mismatch`
+  - `9434f7e` — `fix(api): validate raw cohort evidence strictly`
+  - `cfe35b8` — `test(quality): align empty-book cohort fixture`
+
+### Task 5 — Local documentation and verification: complete
+
+- [x] Documented bounded sequential observation semantics, inventory-bound
+  lineage, null preservation, route/health fail-closed boundaries, and the
+  ordinary-I/O-only family publication guarantee.
+- [x] Listed the four public bundle destinations and two private current
+  destinations separately for CEX and DEX.
+- [x] Recorded that both full and exact publication perform the resolved-path
+  overlap guard before any write, without claiming crash or TOCTOU atomicity.
+- [x] Added this implementation record to the repository.
+- Initial documentation commit: `5f97669`
+  (`docs(data): document cohort and summary guarantees`).
+- Contract reconciliation: the follow-up commit containing this execution
+  record; its SHA is intentionally obtained from Git rather than self-embedded.
+
+## Local verification evidence
+
+- Fresh complete local suite at `1b14f2a`: 778 tests, 0 failures, 0 errors.
+- Python 3.8 grammar gate passed under the local compatibility test.
+- Local Python 3.13.5 py_compile/import checks passed for the changed
+  production modules and related tests.
+- Diff whitespace checks passed for the completed commits.
+- The only local cold/warm measurement used a 1-Token/3-Market QA fixture. It
+  is retained as a development measurement only and is not production-scale
+  evidence or a substitute for the required 493-Market benchmark.
+
+## Pending external release gates
+
+These are the only incomplete items in this execution record:
+
+- [ ] Run compile and import preflight with the actual production Python
+  3.8.10 interpreter.
+- [ ] Run a fresh-process cold build and immediate warm default Summary call
+  against the production 493-Market snapshot; record unmodified latency,
+  response bytes, and `data_generation` equality without a machine-dependent
+  pass/fail threshold.
+- [ ] Run the release checker against one stable production generation before
+  and after cutover.
+- [ ] Push the currently unpushed documentation, exact-overlap, and follow-up
+  reconciliation commits, then add the required commit comments with test and
+  benchmark evidence. Do not collapse them into the obsolete historical
+  single-commit recipe.
+- [ ] Use an isolated production preflight worktree/service, perform cutover,
+  verify public desktop and mobile behavior plus health, and remove the
+  temporary preflight resources only after successful verification.
+
+No item above was executed as part of the local documentation fix round.

@@ -107,10 +107,11 @@ Invalid depth/execution lineage makes execution-cost and Quality return a
 bounded 503. A malformed depth cohort also makes every route that consumes the
 depth-enriched catalog fail closed; `/health` then returns degraded/data-not-
 ready with HTTP 503. An execution-only publication error is isolated from
-routes and health checks that do not load execution. The release checker
-independently rejects mismatched IDs, inventory counts, or observation bounds.
-Actual source absence is not a lineage mismatch: unavailable or unsupported
-facts retain their status and JSON `null`, never an invented zero.
+routes and health checks that do not require a valid execution publication.
+The release checker independently rejects mismatched IDs, inventory counts, or
+observation bounds. Actual source absence is not a lineage mismatch:
+unavailable or unsupported facts retain their status and JSON `null`, never an
+invented zero.
 
 When the selected daily report identity is matched, evidence is also bound to
 each exact Market. `daily_quality_report.market_issue_rollups` contains one

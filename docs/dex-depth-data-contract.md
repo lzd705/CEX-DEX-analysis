@@ -145,14 +145,21 @@ off-market pool. The actual pool-state depth remains visible with its lineage.
 
 ## Files and publication
 
-| File | Meaning |
-| --- | --- |
-| `data/processed/dex_pool_tvl_snapshot.csv` | Temporary current-run GeckoTerminal USD-price input; not a published TVL fact |
-| `data/processed/dex_depth_snapshot.csv` | Current collection awaiting publication |
-| `data/local/dex_depth_latest.csv` | Latest published complete inventory |
-| `data/local/dex_depth_history.csv` | Append-only normalized history |
-| `data/raw/dex-depth/<snapshot_id>/*.json` | Per-pool RPC transcripts and errors |
-| `data/raw/dex-depth/<snapshot_id>/manifest.json` | Fixed blocks, status counts, bands, and raw-file inventory |
+| Boundary | File | Meaning |
+| --- | --- | --- |
+| Public bundle 1/4 | `data/local/dex_depth_history.csv` | Normalized depth history keyed by snapshot and pool |
+| Public bundle 2/4 | `data/local/dex_depth_latest.csv` | Latest published complete depth inventory |
+| Public bundle 3/4 | `data/local/dex_depth_snapshot.csv` | Public current depth view |
+| Public bundle 4/4 | `data/local/dex_execution_cost_latest.csv` | Latest execution scenarios derived from the same source cohort |
+| Private current 1/2 | `data/processed/dex_depth_snapshot.csv` | Candidate depth current file awaiting/recording publication work |
+| Private current 2/2 | `data/processed/dex_execution_cost_snapshot.csv` | Candidate execution current file awaiting/recording publication work |
+| Price dependency | `data/processed/dex_pool_tvl_snapshot.csv` | Temporary current-run GeckoTerminal USD-price input; not a published TVL fact |
+| Raw evidence | `data/raw/dex-depth/<snapshot_id>/*.json` | Per-pool RPC transcripts and errors |
+| Raw manifest | `data/raw/dex-depth/<snapshot_id>/manifest.json` | Fixed blocks, status counts, bands, and raw-file inventory |
+
+The public and private depth-current files intentionally share the basename
+`dex_depth_snapshot.csv`; their `data/local` versus `data/processed`
+directories define different destinations and reader roles.
 
 Publishing requires exactly one explicit status row per TVL-inventory
 Token/chain/pool key and at least one measured pool. Latest replacement is
@@ -185,15 +192,25 @@ therefore exposes canonical `observed_at_min`, `observed_at_max`, and
 `observation_span_seconds`. The span measures earliest-to-latest cohort skew;
 it does not redefine the snapshot ID or create cross-chain simultaneity.
 
-After depth and execution candidates and both coverage reports pass, public
-depth history, depth latest/current, and execution latest bytes are replaced
-through one family bundle. An ordinary in-process I/O exception rolls all
-public destinations back to their pre-call bytes. This is failure-atomic for
-ordinary I/O failures only, not process-crash atomic. Power loss, interpreter
-termination, or an operating-system crash may still expose a partially
-replaced multi-file family and requires manifest/hash diagnosis. The private
-processed depth/execution `current` files are independently written outside
-that public bundle.
+Both full and exact publication first resolve the two private and four public
+destinations above and reject any private/public overlap before making any
+write. Full publication then validates aligned depth/execution lineage, the
+exact execution scenario inventory (including DEX USD-price timing), and both
+standard coverage reports. Exact publication instead checks aligned lineage
+and complete execution scenarios with DEX USD-price timing, validates both
+candidate-bound exact-target coverage reports and their target/mode/common
+generation, and requires exactly one target history row identical to the
+target depth-latest row. Only after those guards pass are the two private
+current files written independently and the four public destinations passed
+to one family bundle.
+
+An ordinary in-process I/O exception rolls all public destinations back to
+their pre-call bytes. This is failure-atomic for ordinary I/O failures only,
+not process-crash atomic. The resolved-path overlap check also does not prevent
+a concurrent path or symlink change after the check (a TOCTOU race). Power
+loss, interpreter termination, an operating-system crash, or an unsupported
+concurrent direct publisher can still require manifest/hash diagnosis. The two
+private current files are outside the public bundle and its rollback.
 
 Real absence and capability limits retain their existing meanings:
 `unsupported`, `failed`, or otherwise unavailable facts keep their measured
