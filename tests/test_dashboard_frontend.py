@@ -530,6 +530,7 @@ function state() {
 announceRoute = () => {};
 updateRouteLinks = () => {};
 canonicalizeCurrentRoute = () => {};
+const realCachedTokenCatalog = cachedTokenCatalog;
 cachedTokenCatalog = () => null;
 applyWorkspaceRoute = (route) => { app.route = route; };
 const realLoadMarket = loadMarket;
@@ -781,14 +782,23 @@ async function summaryFailureSurvivesCatalogRecovery() {
     json: async () => catalogPayload,
   });
   const initialApplied = await initialRoute;
+  const afterStaleCatalog = {
+    ...state(),
+    errorHidden: document.getElementById("global-error").hidden,
+    globalError: document.getElementById("global-error").textContent,
+  };
+  cachedTokenCatalog = realCachedTokenCatalog;
+  const ordinaryApplied = await applyRouteFromLocation();
   return {
     applied,
     recovered,
     initialApplied,
+    ordinaryApplied,
     requestUrls: pending.map((request) => request.url),
     afterFailure,
     afterRecovery,
-    afterStaleCatalog: {
+    afterStaleCatalog,
+    afterOrdinaryNavigation: {
       ...state(),
       errorHidden: document.getElementById("global-error").hidden,
       globalError: document.getElementById("global-error").textContent,
@@ -888,6 +898,7 @@ globalThis.MarketMonitorNavigation = {
         self.assertFalse(summary_failure["applied"])
         self.assertTrue(summary_failure["recovered"])
         self.assertFalse(summary_failure["initialApplied"])
+        self.assertTrue(summary_failure["ordinaryApplied"])
         self.assertEqual(summary_failure["requestUrls"], [
             "/api/markets/catalog?token=BTC&start=2026-06-30&end=2026-07-29",
             "/api/markets/summary?start=2026-07-20&end=2026-07-21",
@@ -925,6 +936,13 @@ globalThis.MarketMonitorNavigation = {
                     "remains visible."
                 ),
             })
+        self.assertEqual(summary_failure["afterOrdinaryNavigation"], {
+            **expected_recovery_state,
+            "catalogMarker": None,
+            "activeCatalogKey": "BTC|2026-06-30|2026-07-29|g1",
+            "errorHidden": True,
+            "globalError": "",
+        })
 
     def test_summary_window_commit_uses_summary_as_the_only_transaction_boundary(self):
         self.maxDiff = None

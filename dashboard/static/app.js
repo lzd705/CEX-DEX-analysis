@@ -1003,6 +1003,7 @@ function setWorkspaceCatalogLoading(
   catalogKey = "",
   { preserveGlobalError = false } = {},
 ) {
+  if (!preserveGlobalError) hideError(byId("global-error"));
   if (app.activeCatalogKey === catalogKey && app.catalog) return;
   app.catalog = null;
   app.activeCatalogToken = "";
@@ -1015,7 +1016,6 @@ function setWorkspaceCatalogLoading(
   app.execution = null;
   app.eventFacts = null;
   app.quality = null;
-  if (!preserveGlobalError) hideError(byId("global-error"));
   hideLiquidityTooltip();
   closeFactsMarketWarnings();
   renderFactsMarketWarning("a", null);
