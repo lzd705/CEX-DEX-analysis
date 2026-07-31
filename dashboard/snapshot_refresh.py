@@ -107,8 +107,8 @@ _CEX_NUMBERS = {
     "bid_depth_50bps_usd", "ask_depth_50bps_usd", "total_depth_50bps_usd",
     "bid_depth_100bps_usd", "ask_depth_100bps_usd", "total_depth_100bps_usd",
 }
-_DEX_DEPTH_NUMBERS = {
-    "block_number", "fee_bps", "pool_state_price_usd", "source_target_price_usd",
+_DEX_DEPTH_FACT_NUMBERS = {
+    "fee_bps", "pool_state_price_usd", "source_target_price_usd",
     "price_difference_bps", "sell_depth_10bps_usd", "buy_depth_10bps_usd",
     "total_depth_10bps_usd", "sell_depth_25bps_usd", "buy_depth_25bps_usd",
     "total_depth_25bps_usd", "sell_depth_50bps_usd", "buy_depth_50bps_usd",
@@ -164,6 +164,15 @@ def _finite(value: Any) -> None:
         raise ValueError("observed snapshot value is invalid") from error
     if not math.isfinite(number):
         raise ValueError("observed snapshot value is not finite")
+
+
+def _block_number(value: Any) -> None:
+    """Validate optional fixed-block provenance without treating it as a fact."""
+    text = _text(value, MAX_SNAPSHOT_ID_LENGTH)
+    if not text:
+        return
+    if not text.isdigit():
+        raise ValueError("snapshot block number is not a nonnegative integer")
 
 
 def _parse_request(request: Dict[str, Any]) -> Tuple[str, str, str, Tuple[str, ...]]:
@@ -330,8 +339,9 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
     elif fact_type == "depth":
         if raw_status not in {"observed", "complete", "partial", "unsupported", "failed"}:
             raise ValueError("snapshot status is invalid")
-        if raw_status in {"observed", "partial"}:
-            for field in _DEX_DEPTH_NUMBERS:
+        _block_number(row.get("block_number"))
+        if raw_status in {"observed", "complete", "partial"}:
+            for field in _DEX_DEPTH_FACT_NUMBERS:
                 if field == "price_difference_bps":
                     _finite(row.get(field))
                 else:
@@ -340,7 +350,7 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
                 if _text(row.get(field), 4) not in {"0", "1"}:
                     raise ValueError("snapshot completeness flag is invalid")
         else:
-            for field in _DEX_DEPTH_NUMBERS:
+            for field in _DEX_DEPTH_FACT_NUMBERS:
                 if _text(row.get(field)):
                     raise ValueError("unmeasured snapshot row contains a numeric value")
             for field in ("depth_10bps_complete", "depth_25bps_complete", "depth_50bps_complete", "depth_100bps_complete"):

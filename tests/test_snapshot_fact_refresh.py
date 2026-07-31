@@ -157,7 +157,7 @@ CEX_MEASURED = (
     "depth_100bps_complete",
 )
 DEX_MEASURED = (
-    "block_number", "fee_bps", "pool_state_price_usd", "source_target_price_usd",
+    "fee_bps", "pool_state_price_usd", "source_target_price_usd",
     "price_difference_bps", "sell_depth_10bps_usd", "buy_depth_10bps_usd",
     "total_depth_10bps_usd", "sell_depth_25bps_usd", "buy_depth_25bps_usd",
     "total_depth_25bps_usd", "sell_depth_50bps_usd", "buy_depth_50bps_usd",
@@ -166,8 +166,6 @@ DEX_MEASURED = (
     "depth_10bps_complete", "depth_25bps_complete", "depth_50bps_complete",
     "depth_100bps_complete",
 )
-
-
 def write_rows(path, rows):
     import csv
 
@@ -559,6 +557,41 @@ class SnapshotFactReaderTest(unittest.TestCase):
         self.assertEqual(result.status, "observed")
         with self.assertRaises(ValueError):
             self.read("dex_pool_tvl_latest.csv", tvl_request, [tvl_row(tvl_usd="")])
+
+    def test_producer_failed_dex_row_retains_block_provenance_but_no_measurements(self):
+        request = {
+            "token_symbol": "AAVE", "market_id": "dex:eth:uniswap_v3:0xabc:AAVE", "fact_type": "depth",
+        }
+        failed = unmeasured(
+            dex_depth_row(status="failed", block_number="123", error="RpcError: unavailable"),
+            DEX_MEASURED,
+        )
+        after = self.read("dex_depth_latest.csv", request, [failed])
+        self.assertEqual(after.status, "failed")
+        self.assertIsNone(after.reason_code)
+        result = evaluate_snapshot_refresh(
+            state("before", "a" * 64, "collection_failed", "network", retryable=True,
+                  market_id=request["market_id"]),
+            after,
+        )
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.error_code, "snapshot_target_unresolved")
+        for value in ("NaN", "-1.5"):
+            with self.subTest(block_number=value):
+                invalid = unmeasured(dex_depth_row(status="failed", block_number=value), DEX_MEASURED)
+                with self.assertRaises(ValueError):
+                    self.read("dex_depth_latest.csv", request, [invalid])
+
+    def test_complete_dex_row_requires_complete_measurements_and_normalizes_observed(self):
+        request = {
+            "token_symbol": "AAVE", "market_id": "dex:eth:uniswap_v3:0xabc:AAVE", "fact_type": "depth",
+        }
+        complete = self.read("dex_depth_latest.csv", request, [dex_depth_row(status="complete")])
+        self.assertEqual((complete.status, complete.reason_code), ("observed", "observed"))
+        for field, value in (("sell_depth_10bps_usd", ""), ("pool_state_price_usd", "NaN")):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ValueError):
+                    self.read("dex_depth_latest.csv", request, [dex_depth_row(status="complete", **{field: value})])
 
     def test_mixed_snapshot_ids_are_rejected_even_for_non_target_rows(self):
         with self.assertRaises(ValueError):
