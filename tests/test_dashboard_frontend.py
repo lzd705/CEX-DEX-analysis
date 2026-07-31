@@ -426,6 +426,230 @@ globalThis.MarketMonitorNavigation = {
             },
         })
 
+    def test_catalog_window_boundary_keeps_committed_state_and_guards_generation_refresh(self):
+        self.maxDiff = None
+        result = run_app_javascript(
+            """
+function control(dataset = {}) {
+  const item = {
+    value: "", hidden: false, disabled: false, textContent: "", innerHTML: "",
+    dataset, attributes: {}, active: false, style: {},
+    addEventListener() {},
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+    contains() { return false; },
+  };
+  item.classList = {
+    toggle(_name, active) { item.active = Boolean(active); },
+    add() { item.active = true; },
+    remove() { item.active = false; },
+  };
+  item.parentElement = item;
+  return item;
+}
+
+const controls = new Map();
+const presets = ["7", "30", "90", "all"].map((days) => control({ days }));
+global.document = {
+  getElementById(id) {
+    if (!controls.has(id)) controls.set(id, control());
+    return controls.get(id);
+  },
+  querySelectorAll(selector) { return selector === "[data-days]" ? presets : []; },
+};
+global.window = {
+  location: { pathname: "/tokens/BTC/markets", search: "" },
+  history: { replaceState() {} },
+  lucide: null,
+};
+
+const OLD_START = "2026-06-30";
+const NEW_START = "2026-07-23";
+const END = "2026-07-29";
+function payload(start, generation) {
+  return {
+    metadata: {
+      response_scope: "screener_summary", summary_version: 1,
+      data_generation: generation, start_date: start, end_date: END,
+      available_start: "2026-05-01", available_end: END,
+    },
+    tokens: [{ token_symbol: "BTC" }],
+  };
+}
+function writeApplied(start, generation, visible, catalog = null) {
+  app.payload = payload(start, generation);
+  app.visibleTokens = [{ token_symbol: visible }];
+  app.catalog = catalog;
+  app.activeCatalogKey = catalog ? `BTC|${start}|${END}|${generation}` : "";
+  setDraftTimeWindow({ start, end: END });
+  syncTimeWindowControls();
+}
+function moveRoute(start, generation, visible, catalog = null) {
+  window.location.search = `?start=${start}&end=${END}`;
+  app.route = {
+    kind: "workspace", token: "BTC", page: "markets",
+    state: { start, end: END },
+  };
+  writeApplied(start, generation, visible, catalog);
+}
+function reset(start, generation) {
+  app.defaultPayload = null;
+  app.routeReady = true;
+  app.routeRequestId = 0;
+  app.marketRequestId = 0;
+  app.marketController = null;
+  app.catalogController = null;
+  app.catalogsByToken.clear();
+  document.getElementById("custom-window-toggle")
+    .setAttribute("aria-expanded", "false");
+  document.getElementById("custom-window-editor").hidden = true;
+  moveRoute(start, generation, generation);
+}
+function state() {
+  return {
+    payload: appliedTimeWindow(),
+    draft: draftTimeWindow(),
+    summary: controls.get("applied-window-summary").textContent,
+    active: presets.filter((button) => button.active).map((button) => button.dataset.days),
+    editorHidden: controls.get("custom-window-editor").hidden,
+    expanded: controls.get("custom-window-toggle").getAttribute("aria-expanded"),
+    route: `${window.location.pathname}${window.location.search}`,
+    visibleTokens: app.visibleTokens.map((token) => token.token_symbol),
+    catalogMarker: app.catalog?.marker || null,
+    activeCatalogKey: app.activeCatalogKey,
+  };
+}
+
+announceRoute = () => {};
+updateRouteLinks = () => {};
+canonicalizeCurrentRoute = () => {};
+cachedTokenCatalog = () => null;
+applyWorkspaceRoute = (route) => { app.route = route; };
+
+async function catalogFailure() {
+  reset(NEW_START, "g2");
+  let marketLoads = 0;
+  loadMarket = async () => { marketLoads += 1; return true; };
+  loadTokenCatalog = async () => { throw new Error("catalog unavailable"); };
+  const applied = await applyRouteFromLocation();
+  return {
+    applied, marketLoads, ...state(),
+    notice: controls.get("workspace-context-notice").textContent,
+    noticeState: controls.get("workspace-context-notice").dataset.state,
+    globalError: controls.get("global-error").textContent,
+    busy: controls.get("facts-workbench").getAttribute("aria-busy"),
+  };
+}
+
+async function staleMismatch() {
+  reset(OLD_START, "g1");
+  let rejectCatalog;
+  let marketLoads = 0;
+  loadTokenCatalog = () => new Promise((_resolve, reject) => { rejectCatalog = reject; });
+  loadMarket = async (start) => {
+    marketLoads += 1;
+    writeApplied(start, "stale-refresh", "STALE_REFRESH");
+    return true;
+  };
+  const completion = applyRouteFromLocation();
+  if (!rejectCatalog) throw new Error("The controlled catalog request did not start.");
+  invalidateRouteRequest();
+  moveRoute(NEW_START, "g2", "NEWER", { marker: "newer" });
+  const mismatch = new Error("generation changed");
+  mismatch.code = "data_generation_mismatch";
+  rejectCatalog(mismatch);
+  return { applied: await completion, marketLoads, ...state() };
+}
+
+async function currentMismatch() {
+  reset(OLD_START, "g1");
+  let marketLoads = 0;
+  const catalogKeys = [];
+  loadMarket = async (start) => {
+    marketLoads += 1;
+    writeApplied(start, "g2", "g2");
+    return true;
+  };
+  loadTokenCatalog = async (_token, _start, _end, _signal, cacheKey) => {
+    catalogKeys.push(cacheKey);
+    if (catalogKeys.length === 1) {
+      const mismatch = new Error("generation changed");
+      mismatch.code = "data_generation_mismatch";
+      throw mismatch;
+    }
+    return { marker: "g2" };
+  };
+  const applied = await applyRouteFromLocation();
+  return {
+    applied, marketLoads, catalogKeys,
+    catalogMarker: app.catalog?.marker || null,
+    activeCatalogKey: app.activeCatalogKey,
+  };
+}
+
+(async () => console.log(JSON.stringify({
+  catalogFailure: await catalogFailure(),
+  staleMismatch: await staleMismatch(),
+  currentMismatch: await currentMismatch(),
+})))();
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  parseRoute(pathname, search) {
+    const parts = pathname.split("/");
+    const params = new URLSearchParams(search);
+    return {
+      kind: "workspace", token: parts[2], page: parts[3],
+      state: { start: params.get("start") || "", end: params.get("end") || "" },
+    };
+  },
+};
+""",
+        )
+
+        new_window = {
+            "payload": {"start": "2026-07-23", "end": "2026-07-29"},
+            "draft": {"start": "2026-07-23", "end": "2026-07-29"},
+            "summary": "23–29 Jul 2026 · 7 days",
+            "active": ["7"],
+            "editorHidden": True,
+            "expanded": "false",
+            "route": (
+                "/tokens/BTC/markets?start=2026-07-23&end=2026-07-29"
+            ),
+        }
+        self.assertEqual(result["catalogFailure"], {
+            "applied": False,
+            "marketLoads": 0,
+            **new_window,
+            "visibleTokens": ["g2"],
+            "catalogMarker": None,
+            "activeCatalogKey": "",
+            "notice": "BTC facts are unavailable; no previous Token data is shown.",
+            "noticeState": "critical",
+            "globalError": "The BTC market catalog failed to load: catalog unavailable",
+            "busy": "false",
+        })
+        self.assertEqual(result["staleMismatch"], {
+            "applied": False,
+            "marketLoads": 0,
+            **new_window,
+            "visibleTokens": ["NEWER"],
+            "catalogMarker": "newer",
+            "activeCatalogKey": "BTC|2026-07-23|2026-07-29|g2",
+        })
+        self.assertEqual(result["currentMismatch"], {
+            "applied": True,
+            "marketLoads": 1,
+            "catalogKeys": [
+                "BTC|2026-06-30|2026-07-29|g1",
+                "BTC|2026-06-30|2026-07-29|g2",
+            ],
+            "catalogMarker": "g2",
+            "activeCatalogKey": "BTC|2026-06-30|2026-07-29|g2",
+        })
+
     def test_summary_window_commit_uses_summary_as_the_only_transaction_boundary(self):
         self.maxDiff = None
         result = run_app_javascript(

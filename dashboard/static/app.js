@@ -1227,6 +1227,7 @@ async function applyRouteFromLocation() {
               );
             } catch (error) {
               if (error.code !== "data_generation_mismatch" || attempt > 0) throw error;
+              if (requestId !== app.routeRequestId) return false;
               const refreshed = await loadMarket(
                 catalogWindow.start,
                 catalogWindow.end,
