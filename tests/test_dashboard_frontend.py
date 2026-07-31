@@ -457,6 +457,7 @@ global.document = {
     if (!controls.has(id)) controls.set(id, control());
     return controls.get(id);
   },
+  querySelector(selector) { return selector === ".facts-controls" ? control() : null; },
   querySelectorAll(selector) { return selector === "[data-days]" ? presets : []; },
 };
 global.window = {
@@ -471,7 +472,7 @@ const END = "2026-07-29";
 function payload(start, generation) {
   return {
     metadata: {
-      response_scope: "screener_summary", summary_version: 1,
+      response_scope: "screener_summary", summary_version: 2,
       data_generation: generation, start_date: start, end_date: END,
       available_start: "2026-05-01", available_end: END,
       sources: [], tvl_note: "TVL unavailable",
@@ -838,7 +839,7 @@ function summaryPayload(start, end, generation = "generation-a") {
   return {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 1,
+      summary_version: 2,
       data_generation: generation,
       start_date: start,
       end_date: end,
@@ -1356,7 +1357,7 @@ function summaryPayload() {
   return {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 1,
+      summary_version: 2,
       data_generation: "generation-b",
       start_date: "2026-07-23",
       end_date: "2026-07-29",
@@ -1407,7 +1408,7 @@ applyWorkspaceRoute = (route) => { workspaceApplications += 1; app.route = route
 app.payload = {
   metadata: {
     response_scope: "screener_summary",
-    summary_version: 1,
+    summary_version: 2,
     data_generation: "generation-a",
     start_date: "2026-06-30",
     end_date: "2026-07-29",
