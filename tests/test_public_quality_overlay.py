@@ -185,6 +185,47 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
         )
         return payload, market
 
+    def token_catalog_generation_for_day(self, day):
+        """Read the real single-Token catalog produced by the frozen fixture."""
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            catalog = server.build_token_market_catalog(
+                "BTC",
+                start=day,
+                end=day,
+                allow_empty_window=True,
+            )
+        return catalog["metadata"]["data_generation"]
+
+    def test_quality_keeps_selected_window_and_screener_projections_separate(self):
+        self.write_report(
+            [
+                self.issue(
+                    "2026-01-02",
+                    "network",
+                    "collection_failed",
+                    True,
+                )
+            ]
+        )
+        payload, market = self.quality_for_day("2026-01-02")
+
+        self.assertEqual(payload["metadata"]["contract_version"], 4)
+        self.assertEqual(
+            payload["metadata"]["data_generation"],
+            self.token_catalog_generation_for_day("2026-01-02"),
+        )
+        self.assertIn("screening_quality_status", market)
+        self.assertIn("screening_quality_flags", market)
+        self.assertEqual(market["quality_status"], "critical")
+        self.assertEqual(market["screening_quality_status"], "warning")
+        self.assertEqual(
+            [flag["code"] for flag in market["screening_quality_flags"]],
+            ["depth_unavailable", "low_daily_coverage"],
+        )
+        serialized = json.dumps(payload)
+        self.assertNotIn("screening_quality_source", serialized)
+        self.assertNotIn(str(self.data_dir), serialized)
+
     def test_reason_mapping_date_filter_and_mixed_status_priority(self):
         issues = [
             self.issue("2026-01-02", "network", "collection_failed", True),

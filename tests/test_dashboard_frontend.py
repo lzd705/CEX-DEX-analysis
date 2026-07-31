@@ -1154,6 +1154,50 @@ console.log(JSON.stringify({ html: qualityBody.innerHTML }));
         self.assertIn("Observed $5,000", result["html"])
         self.assertIn("minimum $100,000", result["html"])
 
+    def test_screener_quality_origin_uses_screening_projection_everywhere(self):
+        result = run_app_javascript(
+            """
+const qualityBody = { innerHTML: "" };
+const filterSummary = { hidden: true, textContent: "", dataset: {} };
+global.document = {
+  getElementById(id) {
+    return id === "quality-body" ? qualityBody
+      : id === "quality-filter-summary" ? filterSummary : null;
+  },
+};
+const payload = {
+  markets: [{
+    market_id: "cex:binance:AAVE/USDT",
+    market_type: "cex",
+    token_symbol: "AAVE",
+    venue: "binance",
+    instrument: "AAVE/USDT",
+    quality_status: "ok",
+    quality_flags: [],
+    screening_quality_status: "warning",
+    screening_quality_flags: [{
+      code: "low_daily_coverage",
+      severity: "warning",
+      category: "data_health",
+      message: "Screener-only warning reason.",
+    }],
+    facts: {},
+  }],
+};
+app.qualityOrigin = "screener";
+app.qualitySeverity = "warning";
+renderQualityPayload(payload);
+const screener = { html: qualityBody.innerHTML, summary: filterSummary.textContent };
+app.qualityOrigin = "";
+app.qualitySeverity = "";
+renderQualityPayload(payload);
+console.log(JSON.stringify({ screener, selected: qualityBody.innerHTML }));
+"""
+        )
+        self.assertIn("Screener-only warning reason.", result["screener"]["html"])
+        self.assertIn("1 warning reason", result["screener"]["summary"])
+        self.assertNotIn("Screener-only warning reason.", result["selected"])
+
 
 if __name__ == "__main__":
     unittest.main()

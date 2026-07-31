@@ -2378,23 +2378,44 @@ function qualityFactMarkup(name, fact) {
   </div>`;
 }
 
+function qualityProjection(item) {
+  const source = item || {};
+  const market = source.market || source;
+  if (app.qualityOrigin === "screener") {
+    return {
+      status: source.screening_quality_status || "ok",
+      flags: Array.isArray(source.screening_quality_flags)
+        ? source.screening_quality_flags
+        : [],
+    };
+  }
+  return {
+    status: source.quality_status || market.quality_status || "ok",
+    flags: Array.isArray(source.quality_flags)
+      ? source.quality_flags
+      : Array.isArray(market.quality_flags)
+        ? market.quality_flags
+        : [],
+  };
+}
+
 function renderQualityPayload(payload) {
   app.quality = payload;
   const sourceRows = Array.isArray(payload?.markets) ? payload.markets : [];
   const severity = app.qualityOrigin === "screener" ? app.qualitySeverity : "";
   const rows = severity
     ? sourceRows.filter((item) => {
-      const market = item.market || item;
-      const flags = Array.isArray(item.quality_flags) ? item.quality_flags : [];
-      return market.quality_status === severity
-        || flags.some((flag) => flag?.severity === severity);
+      const projection = qualityProjection(item);
+      return projection.status === severity
+        || projection.flags.some((flag) => flag?.severity === severity);
     })
     : sourceRows;
   const matchingReasonCount = severity
     ? rows.reduce((total, item) => {
-      const flags = Array.isArray(item.quality_flags) ? item.quality_flags : [];
+      const projection = qualityProjection(item);
+      const flags = projection.flags;
       const matches = flags.filter((flag) => flag?.severity === severity).length;
-      return total + (matches || ((item.market || item).quality_status === severity ? 1 : 0));
+      return total + (matches || (projection.status === severity ? 1 : 0));
     }, 0)
     : 0;
   const filterSummary = byId("quality-filter-summary");
@@ -2409,8 +2430,9 @@ function renderQualityPayload(payload) {
     ? rows.map((item) => {
         const market = item.market || item;
         const facts = item.facts || {};
-        const flags = Array.isArray(item.quality_flags)
-          ? item.quality_flags.map((flag) => ({
+        const projection = qualityProjection(item);
+        const flags = Array.isArray(projection.flags)
+          ? projection.flags.map((flag) => ({
               code: flag.code,
               severity: flag.severity || "warning",
               category: flag.category || "data_health",

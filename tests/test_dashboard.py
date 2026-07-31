@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from collections import Counter
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -719,6 +720,70 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "quality_flags",
             ):
                 self.assertIn(field, primary)
+
+    def test_screener_quality_counts_match_screening_projection_for_every_token(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            summary = server.build_market_summary(
+                start="2026-01-01",
+                end="2026-01-02",
+            )
+            for token_row in summary["tokens"]:
+                quality = server.build_market_quality(
+                    token_row["token_symbol"],
+                    start="2026-01-01",
+                    end="2026-01-02",
+                )
+                screening_statuses = Counter(
+                    market["screening_quality_status"]
+                    for market in quality["markets"]
+                )
+                screening_alerts = Counter(
+                    flag["severity"]
+                    for market in quality["markets"]
+                    for flag in market["screening_quality_flags"]
+                )
+                self.assertEqual(
+                    dict(screening_statuses),
+                    token_row["quality_status_counts"],
+                )
+                self.assertEqual(
+                    dict(screening_alerts),
+                    token_row["quality_alert_counts"],
+                )
+
+    def test_empty_catalog_warning_projects_one_shared_bounded_fallback(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            catalog = server.build_market_catalog()
+            fallback_market = {
+                **catalog["markets"][0],
+                "quality_status": "warning",
+                "quality_flag_details": [],
+            }
+            fallback_catalog = {
+                **catalog,
+                "markets": [fallback_market, *catalog["markets"][1:]],
+            }
+            summary = server.catalog_summary_from_catalog(fallback_catalog)
+            with patch.object(server, "build_market_catalog", return_value=fallback_catalog):
+                quality = server.build_market_quality(
+                    "BTC",
+                    start="2026-01-01",
+                    end="2026-01-02",
+                )
+
+        token_summary = summary["token_summaries"][0]
+        fallback_quality = next(
+            market
+            for market in quality["markets"]
+            if market["market_id"] == fallback_market["market_id"]
+        )
+        self.assertEqual(token_summary["quality_alert_counts"]["warning"], 1)
+        self.assertEqual(fallback_quality["screening_quality_status"], "warning")
+        self.assertEqual(len(fallback_quality["screening_quality_flags"]), 1)
+        self.assertEqual(
+            fallback_quality["screening_quality_flags"][0]["code"],
+            "catalog_quality_status",
+        )
 
     def test_single_token_catalog_filters_and_preserves_window_metrics(self):
         with patch.dict(server.os.environ, self.environment, clear=True):

@@ -1735,6 +1735,94 @@ def _catalog_default_workspace_token(
     return token_summaries[0]["token_symbol"]
 
 
+SCREENING_QUALITY_FLAG_CODES = frozenset(
+    {
+        "depth_unavailable",
+        "depth_unsupported",
+        "depth_partial",
+        "depth_failed",
+        "zero_depth_10bps",
+        "tiny_pool",
+        "off_market_pool_state_price",
+        "wide_quoted_spread",
+        "low_daily_coverage",
+    }
+)
+SCREENING_QUALITY_FLAG_MESSAGES = {
+    "depth_unavailable": "No executable-depth observation is available.",
+    "depth_unsupported": "Executable depth is unsupported for this market.",
+    "depth_partial": (
+        "Depth is a measured lower bound because one or more bands are incomplete."
+    ),
+    "depth_failed": "The most recent executable-depth collection failed.",
+    "zero_depth_10bps": (
+        "No executable notional was observed inside the ±10 bps band."
+    ),
+    "tiny_pool": "The point-in-time pool TVL is below the quality threshold.",
+    "off_market_pool_state_price": (
+        "Pool-state price deviates materially from the source target price."
+    ),
+    "wide_quoted_spread": "Quoted CEX spread exceeds the quality threshold.",
+    "low_daily_coverage": (
+        "Daily close coverage is below the declared primary-market threshold."
+    ),
+}
+SCREENING_QUALITY_CATEGORIES = frozenset(
+    {
+        "data_health",
+        "availability",
+        "capability",
+        "measurement_limit",
+        "market_condition",
+    }
+)
+SCREENING_QUALITY_SEVERITIES = frozenset({"info", "warning", "critical"})
+
+
+def screening_quality_projection(market: dict[str, Any]) -> dict[str, Any]:
+    """Return the bounded catalog-quality projection used by Screener contracts."""
+    status = market.get("quality_status")
+    if status not in {"ok", "info", "warning", "critical"}:
+        status = "ok"
+    flags = []
+    for detail in market.get("quality_flag_details") or []:
+        if not isinstance(detail, dict):
+            continue
+        code = detail.get("code")
+        severity = detail.get("severity")
+        if (
+            code not in SCREENING_QUALITY_FLAG_CODES
+            or severity not in SCREENING_QUALITY_SEVERITIES
+        ):
+            continue
+        category = detail.get("category")
+        flags.append(
+            {
+                "code": code,
+                "severity": severity,
+                "category": (
+                    category
+                    if category in SCREENING_QUALITY_CATEGORIES
+                    else "data_health"
+                ),
+                "message": SCREENING_QUALITY_FLAG_MESSAGES[code],
+            }
+        )
+    if not flags and status in SCREENING_QUALITY_SEVERITIES:
+        flags.append(
+            {
+                "code": "catalog_quality_status",
+                "severity": status,
+                "category": "data_health",
+                "message": (
+                    "The catalog reports a non-OK quality status without a "
+                    "structured reason."
+                ),
+            }
+        )
+    return {"status": status, "flags": flags}
+
+
 def catalog_summary_from_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
     """Project the audit catalog into a small all-Token screener contract."""
     markets_by_token: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1756,23 +1844,17 @@ def catalog_summary_from_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
         market_type_counts = Counter(
             market.get("market_type") or "unknown" for market in token_markets
         )
+        screening_projections = [
+            screening_quality_projection(market) for market in token_markets
+        ]
         quality_status_counts = Counter(
-            market["quality_status"] for market in token_markets
+            projection["status"] for projection in screening_projections
         )
         quality_alert_counts: Counter[str] = Counter()
-        for market in token_markets:
-            details = [
-                detail
-                for detail in market.get("quality_flag_details") or []
-                if isinstance(detail, dict)
-                and detail.get("severity") in {"info", "warning", "critical"}
-            ]
-            if details:
-                quality_alert_counts.update(
-                    detail["severity"] for detail in details
-                )
-            elif market["quality_status"] in {"info", "warning", "critical"}:
-                quality_alert_counts[market["quality_status"]] += 1
+        for projection in screening_projections:
+            quality_alert_counts.update(
+                flag["severity"] for flag in projection["flags"]
+            )
         measured_depth_market_counts = Counter(
             market.get("market_type") or "unknown"
             for market in token_markets
@@ -2795,7 +2877,7 @@ def build_execution_cost_comparison(
     }
 
 
-QUALITY_CONTRACT_VERSION = 3
+QUALITY_CONTRACT_VERSION = 4
 QUALITY_STATUS_SEMANTICS = {
     "observed": "A source-backed fact is present.",
     "provisional": "The current UTC day is not finalized.",
@@ -4062,6 +4144,7 @@ def build_market_quality(
     }
     quality_markets = []
     for market in token_markets:
+        screening = screening_quality_projection(market)
         daily_fact = _daily_quality_fact(
             market,
             catalog["metadata"],
@@ -4174,6 +4257,8 @@ def build_market_quality(
                 "pool_address": market.get("pool_address"),
                 "quality_status": quality_status,
                 "quality_flags": quality_flags,
+                "screening_quality_status": screening["status"],
+                "screening_quality_flags": screening["flags"],
                 "market_conditions": [
                     flag
                     for flag in quality_flags
@@ -4222,6 +4307,7 @@ def build_market_quality(
     return {
         "metadata": {
             "contract_version": QUALITY_CONTRACT_VERSION,
+            "data_generation": catalog["metadata"]["data_generation"],
             "scope": normalized_scope,
             "selected_market_ids": selected_ids,
             "facts": ["daily", "tvl", "depth", "execution"],
