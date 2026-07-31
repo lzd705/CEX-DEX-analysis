@@ -794,33 +794,102 @@ def _inventory_observed_at_bounds(
     return min(observed).isoformat(), max(observed).isoformat()
 
 
+def _parse_cohort_timestamp(
+    value: Any,
+    label: str,
+    *,
+    empty_is_missing: bool = False,
+) -> datetime | None:
+    """Parse one timezone-aware cohort timestamp or fail closed."""
+    if value is None or (empty_is_missing and value == ""):
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+    ):
+        raise DepthExecutionCohortError(
+            f"{label} must be a timezone-aware ISO timestamp"
+        )
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise DepthExecutionCohortError(
+            f"{label} must be a timezone-aware ISO timestamp"
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise DepthExecutionCohortError(
+            f"{label} must be a timezone-aware ISO timestamp"
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+def _cohort_observed_at_bounds(
+    rows: Iterable[dict[str, Any]],
+    field: str = "observed_at",
+) -> tuple[str | None, str | None]:
+    """Return UTC bounds after validating every nonempty raw timestamp."""
+    observed = []
+    for index, row in enumerate(rows):
+        parsed = _parse_cohort_timestamp(
+            row.get(field),
+            f"Cohort row {index + 1} {field}",
+            empty_is_missing=True,
+        )
+        if parsed is not None:
+            observed.append(parsed)
+    if not observed:
+        return None, None
+    return min(observed).isoformat(), max(observed).isoformat()
+
+
+def _one_raw_cohort_id(
+    rows: Iterable[dict[str, Any]],
+    field: str,
+    label: str,
+) -> str:
+    """Validate every raw lineage value before deriving its unique ID."""
+    values = [row.get(field) for row in rows]
+    if not values or not all(
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        for value in values
+    ):
+        raise DepthExecutionCohortError(
+            f"{label} must contain one exact non-empty snapshot ID"
+        )
+    unique_values = set(values)
+    if len(unique_values) != 1:
+        raise DepthExecutionCohortError(
+            f"{label} must contain one exact non-empty snapshot ID"
+        )
+    return next(iter(unique_values))
+
+
 def observation_span_seconds(
     observed_at_min: str | None,
     observed_at_max: str | None,
 ) -> float | None:
-    """Return a nonnegative span for canonical timestamp bounds."""
-    if not observed_at_min or not observed_at_max:
+    """Return the ordered span for canonical timestamp bounds."""
+    if observed_at_min is None or observed_at_max is None:
         return None
-    try:
-        lower = datetime.fromisoformat(
-            observed_at_min.replace("Z", "+00:00")
+    lower = _parse_cohort_timestamp(
+        observed_at_min,
+        "Cohort observed_at_min",
+    )
+    upper = _parse_cohort_timestamp(
+        observed_at_max,
+        "Cohort observed_at_max",
+    )
+    if lower is None or upper is None:  # pragma: no cover - guarded above
+        return None
+    span = (upper - lower).total_seconds()
+    if span < 0:
+        raise DepthExecutionCohortError(
+            "Cohort observation bounds are reversed"
         )
-        upper = datetime.fromisoformat(
-            observed_at_max.replace("Z", "+00:00")
-        )
-    except ValueError:
-        return None
-    if (
-        lower.tzinfo is None
-        or lower.utcoffset() is None
-        or upper.tzinfo is None
-        or upper.utcoffset() is None
-    ):
-        return None
-    span = (
-        upper.astimezone(timezone.utc) - lower.astimezone(timezone.utc)
-    ).total_seconds()
-    return max(0.0, span)
+    return span
 
 
 @lru_cache(maxsize=8)
@@ -1033,6 +1102,11 @@ def _load_cex_depth_snapshot_cached(
     if not rows:
         raise ValueError(f"{path.name} contains no CEX depth rows")
 
+    snapshot_id = _one_raw_cohort_id(
+        rows,
+        "snapshot_id",
+        "CEX depth publication",
+    )
     latest: dict[tuple[str, str, str], dict[str, str]] = {}
     for row in rows:
         key = (
@@ -1040,16 +1114,18 @@ def _load_cex_depth_snapshot_cached(
             row["exchange"].lower(),
             row["cex_symbol"].upper(),
         )
-        if key not in latest or row["response_received_at"] > latest[key]["response_received_at"]:
-            latest[key] = row
-    snapshot_ids = sorted({row["snapshot_id"] for row in rows if row.get("snapshot_id")})
-    observed_at_min, observed_at_max = _inventory_observed_at_bounds(
+        if key in latest:
+            raise DepthExecutionCohortError(
+                "CEX depth publication contains a duplicate market identity"
+            )
+        latest[key] = row
+    observed_at_min, observed_at_max = _cohort_observed_at_bounds(
         latest.values()
     )
     return {
         "path": path,
         "rows": latest,
-        "snapshot_ids": snapshot_ids,
+        "snapshot_ids": [snapshot_id],
         "observed_at": observed_at_min,
         "observed_at_min": observed_at_min,
         "observed_at_max": observed_at_max,
@@ -1058,7 +1134,9 @@ def _load_cex_depth_snapshot_cached(
             observed_at_max,
         ),
         "status_counts": {
-            status: sum(row.get("status") == status for row in rows)
+            status: sum(
+                row.get("status") == status for row in latest.values()
+            )
             for status in ("observed", "partial", "failed")
         },
     }
@@ -1268,6 +1346,11 @@ def _load_dex_depth_snapshot_cached(
     if not rows:
         raise ValueError(f"{path.name} contains no DEX depth rows")
 
+    snapshot_id = _one_raw_cohort_id(
+        rows,
+        "snapshot_id",
+        "DEX depth publication",
+    )
     latest: dict[tuple[str, str, str], dict[str, str]] = {}
     for row in rows:
         address = row["pool_address"]
@@ -1276,21 +1359,18 @@ def _load_dex_depth_snapshot_cached(
             row["chain"].lower(),
             address.lower() if address.startswith("0x") else address,
         )
-        if (
-            key not in latest
-            or row["response_received_at"] > latest[key]["response_received_at"]
-        ):
-            latest[key] = row
-    snapshot_ids = sorted(
-        {row["snapshot_id"] for row in rows if row.get("snapshot_id")}
-    )
-    observed_at_min, observed_at_max = _inventory_observed_at_bounds(
+        if key in latest:
+            raise DepthExecutionCohortError(
+                "DEX depth publication contains a duplicate market identity"
+            )
+        latest[key] = row
+    observed_at_min, observed_at_max = _cohort_observed_at_bounds(
         latest.values()
     )
     return {
         "path": path,
         "rows": latest,
-        "snapshot_ids": snapshot_ids,
+        "snapshot_ids": [snapshot_id],
         "observed_at": observed_at_min,
         "observed_at_min": observed_at_min,
         "observed_at_max": observed_at_max,
@@ -1299,7 +1379,10 @@ def _load_dex_depth_snapshot_cached(
             observed_at_max,
         ),
         "status_counts": dict(
-            Counter(row.get("status") or "missing_status" for row in rows)
+            Counter(
+                row.get("status") or "missing_status"
+                for row in latest.values()
+            )
         ),
     }
 
@@ -1724,7 +1807,7 @@ def execution_freshness_observed_at(path: Path | None) -> str | None:
         return None
     try:
         snapshot = load_execution_cost_snapshot(path)
-    except (OSError, ValueError):
+    except (OSError, ValueError, DepthExecutionCohortError):
         return None
     return snapshot.get("state_observed_at_min") if snapshot else None
 
@@ -2762,27 +2845,20 @@ def _load_execution_cost_snapshot_cached(
         rows = list(reader)
     if not rows:
         raise ValueError(f"{path.name} contains no execution-cost rows")
-    snapshot_values = [row.get("snapshot_id") for row in rows]
-    source_snapshot_values = [
-        row.get("source_snapshot_id") for row in rows
-    ]
-    snapshot_ids = sorted(set(snapshot_values))
-    source_snapshot_ids = sorted(set(source_snapshot_values))
-    if (
-        not all(
-            isinstance(value, str)
-            and bool(value)
-            and value == value.strip()
-            for value in snapshot_values + source_snapshot_values
-        )
-        or len(snapshot_ids) != 1
-        or not snapshot_ids[0]
-        or len(source_snapshot_ids) != 1
-        or not source_snapshot_ids[0]
-    ):
-        raise DepthExecutionCohortError(
-            "Execution publication must contain one exact snapshot lineage"
-        )
+    snapshot_id = _one_raw_cohort_id(
+        rows,
+        "snapshot_id",
+        "Execution publication snapshot lineage",
+    )
+    source_snapshot_id = _one_raw_cohort_id(
+        rows,
+        "source_snapshot_id",
+        "Execution publication source lineage",
+    )
+    observed_at_min, observed_at_max = _cohort_observed_at_bounds(rows)
+    state_observed_at_min, state_observed_at_max = (
+        _cohort_observed_at_bounds(rows, "state_observed_at")
+    )
     market_ids = {row["market_id"] for row in rows if row.get("market_id")}
     validate_execution_snapshot(market_ids, rows)
     by_market: dict[str, list[dict[str, str]]] = defaultdict(list)
@@ -2795,16 +2871,12 @@ def _load_execution_cost_snapshot_cached(
                 EXECUTION_DIRECTIONS.index(row["direction"]),
             )
         )
-    observed_at_min, observed_at_max = _inventory_observed_at_bounds(rows)
-    state_observed_at_min, state_observed_at_max = (
-        _inventory_observed_at_bounds(rows, "state_observed_at")
-    )
     return {
         "path": path,
         "rows": rows,
         "by_market": by_market,
-        "snapshot_ids": snapshot_ids,
-        "source_snapshot_ids": source_snapshot_ids,
+        "snapshot_ids": [snapshot_id],
+        "source_snapshot_ids": [source_snapshot_id],
         "observed_at": observed_at_min,
         "observed_at_min": observed_at_min,
         "observed_at_max": observed_at_max,
@@ -2969,6 +3041,79 @@ def _one_cohort_id(value: Any, label: str) -> str:
     return value[0]
 
 
+def _validate_cohort_observation_metadata(
+    value: dict[str, Any],
+    label: str,
+) -> None:
+    """Require canonical, internally consistent cohort observation bounds."""
+    required = {
+        "observed_at",
+        "observed_at_min",
+        "observed_at_max",
+        "observation_span_seconds",
+    }
+    if not required.issubset(value):
+        raise DepthExecutionCohortError(
+            f"{label} observation metadata is incomplete"
+        )
+    observed_at = value.get("observed_at")
+    observed_at_min = value.get("observed_at_min")
+    observed_at_max = value.get("observed_at_max")
+    span = value.get("observation_span_seconds")
+    if observed_at is None and observed_at_min is None and observed_at_max is None:
+        if span is not None:
+            raise DepthExecutionCohortError(
+                f"{label} observation span has no timestamp bounds"
+            )
+        return
+    if (
+        observed_at is None
+        or observed_at_min is None
+        or observed_at_max is None
+    ):
+        raise DepthExecutionCohortError(
+            f"{label} observation bounds are incomplete"
+        )
+    lower = _parse_cohort_timestamp(
+        observed_at_min,
+        f"{label} observed_at_min",
+    )
+    upper = _parse_cohort_timestamp(
+        observed_at_max,
+        f"{label} observed_at_max",
+    )
+    first = _parse_cohort_timestamp(
+        observed_at,
+        f"{label} observed_at",
+    )
+    if lower is None or upper is None or first is None:  # pragma: no cover
+        raise DepthExecutionCohortError(
+            f"{label} observation bounds are incomplete"
+        )
+    if (
+        lower.isoformat() != observed_at_min
+        or upper.isoformat() != observed_at_max
+        or first.isoformat() != observed_at
+        or first != lower
+    ):
+        raise DepthExecutionCohortError(
+            f"{label} observation bounds are not canonical"
+        )
+    expected_span = observation_span_seconds(
+        observed_at_min,
+        observed_at_max,
+    )
+    if (
+        type(span) not in {int, float}
+        or not math.isfinite(span)
+        or span < 0
+        or span != expected_span
+    ):
+        raise DepthExecutionCohortError(
+            f"{label} observation span differs from its bounds"
+        )
+
+
 def validate_depth_execution_cohort(
     metadata: dict[str, Any],
     snapshot: dict[str, Any],
@@ -2983,6 +3128,14 @@ def validate_depth_execution_cohort(
         raise DepthExecutionCohortError(
             f"{normalized_type.upper()} depth cohort metadata is unavailable"
         )
+    _validate_cohort_observation_metadata(
+        depth,
+        f"{normalized_type.upper()} depth cohort",
+    )
+    _validate_cohort_observation_metadata(
+        snapshot,
+        f"{normalized_type.upper()} execution cohort",
+    )
     depth_snapshot_id = _one_cohort_id(
         depth.get("snapshot_ids"),
         f"{normalized_type.upper()} depth snapshot_ids",
@@ -6083,7 +6236,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 )
             except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
-            except ValueError:
+            except (DepthExecutionCohortError, ValueError):
                 self.send_public_data_validation_error()
             return
         if parsed.path == "/api/markets/summary":
@@ -6097,7 +6250,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 )
             except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
-            except ValueError:
+            except (DepthExecutionCohortError, ValueError):
                 self.send_public_data_validation_error()
             return
         if parsed.path == "/api/markets/compare":
@@ -6111,7 +6264,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 )
             except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
-            except ValueError:
+            except (DepthExecutionCohortError, ValueError):
                 self.send_public_data_validation_error()
             return
         if parsed.path == "/api/markets/execution-cost":
@@ -6179,7 +6332,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 )
             except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
-            except ValueError:
+            except (DepthExecutionCohortError, ValueError):
                 self.send_public_data_validation_error()
             return
         if parsed.path == "/api/admin/session":
@@ -6251,7 +6404,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                         "freshness": metadata["freshness"],
                     }
                 )
-            except (FileNotFoundError, ValueError):
+            except (
+                FileNotFoundError,
+                ValueError,
+                DepthExecutionCohortError,
+            ):
                 self.send_json(
                     {
                         "status": "degraded",

@@ -12,7 +12,7 @@ import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -1479,6 +1479,74 @@ def _execution_scenario_key(row: dict[str, Any]) -> tuple[str, int] | None:
     return direction, int(notional)
 
 
+def _validate_cohort_observation_metadata(
+    value: dict[str, Any],
+    label: str,
+) -> None:
+    """Independently verify canonical cohort bounds and their exact span."""
+    required = {
+        "observed_at",
+        "observed_at_min",
+        "observed_at_max",
+        "observation_span_seconds",
+    }
+    require(
+        required.issubset(value),
+        f"{label} observation metadata is incomplete",
+    )
+    observed_at = value.get("observed_at")
+    observed_at_min = value.get("observed_at_min")
+    observed_at_max = value.get("observed_at_max")
+    span = value.get("observation_span_seconds")
+    if observed_at is None and observed_at_min is None and observed_at_max is None:
+        require(span is None, f"{label} span has no observation bounds")
+        return
+    require(
+        observed_at is not None
+        and observed_at_min is not None
+        and observed_at_max is not None,
+        f"{label} observation bounds are incomplete",
+    )
+
+    def canonical_timestamp(raw: Any, field: str) -> datetime:
+        require(
+            isinstance(raw, str)
+            and bool(raw)
+            and raw == raw.strip(),
+            f"{label} {field} is invalid",
+        )
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ReleaseCheckError(
+                f"{label} {field} is invalid"
+            ) from error
+        require(
+            parsed.tzinfo is not None and parsed.utcoffset() is not None,
+            f"{label} {field} is not timezone-aware",
+        )
+        normalized = parsed.astimezone(timezone.utc)
+        require(
+            normalized.isoformat() == raw,
+            f"{label} {field} is not canonical UTC",
+        )
+        return normalized
+
+    first = canonical_timestamp(observed_at, "observed_at")
+    lower = canonical_timestamp(observed_at_min, "observed_at_min")
+    upper = canonical_timestamp(observed_at_max, "observed_at_max")
+    require(first == lower, f"{label} observed_at is not the lower bound")
+    expected_span = (upper - lower).total_seconds()
+    require(expected_span >= 0, f"{label} observation bounds are reversed")
+    require(
+        type(span) in {int, float}
+        and math.isfinite(span)
+        and span >= 0
+        and span == expected_span,
+        f"{label} observation span differs from its bounds",
+    )
+
+
 def validate_execution(
     payload: dict[str, Any],
     *,
@@ -1577,6 +1645,14 @@ def validate_execution(
             and isinstance(lineage, dict),
             f"Execution {market_type.upper()} cohort metadata is missing",
         )
+        _validate_cohort_observation_metadata(
+            depth,
+            f"Execution {market_type.upper()} depth cohort",
+        )
+        _validate_cohort_observation_metadata(
+            snapshot,
+            f"Execution {market_type.upper()} execution cohort",
+        )
 
         def one_id(value: Any, label: str) -> str:
             require(
@@ -1650,8 +1726,32 @@ def validate_execution(
             "execution_market_count": execution_market_count,
         }
         require(
-            set(lineage) == lineage_fields
-            and lineage == expected_lineage,
+            set(lineage) == lineage_fields,
+            f"Execution {market_type.upper()} cohort lineage has unknown fields",
+        )
+        require(
+            lineage.get("market_type") == market_type
+            and all(
+                isinstance(lineage.get(field), str)
+                and bool(lineage[field])
+                and lineage[field] == lineage[field].strip()
+                for field in (
+                    "depth_snapshot_id",
+                    "execution_snapshot_id",
+                    "execution_source_snapshot_id",
+                )
+            )
+            and all(
+                type(lineage.get(field)) is int and lineage[field] > 0
+                for field in (
+                    "depth_market_count",
+                    "execution_market_count",
+                )
+            ),
+            f"Execution {market_type.upper()} cohort lineage types are invalid",
+        )
+        require(
+            lineage == expected_lineage,
             f"Execution {market_type.upper()} cohort lineage differs from catalog",
         )
     require(

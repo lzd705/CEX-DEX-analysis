@@ -1592,11 +1592,19 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     "cex": {
                         "snapshot_ids": ["cex-cohort-1"],
                         "source_snapshot_ids": ["cex-cohort-1"],
+                        "observed_at": "2026-01-02T00:00:05+00:00",
+                        "observed_at_min": "2026-01-02T00:00:05+00:00",
+                        "observed_at_max": "2026-01-02T00:00:09+00:00",
+                        "observation_span_seconds": 4,
                         "market_count": 1,
                     },
                     "dex": {
                         "snapshot_ids": ["dex-cohort-1"],
                         "source_snapshot_ids": ["dex-cohort-1"],
+                        "observed_at": "2026-01-02T00:00:05+00:00",
+                        "observed_at_min": "2026-01-02T00:00:05+00:00",
+                        "observed_at_max": "2026-01-02T00:00:09+00:00",
+                        "observation_span_seconds": 4,
                         "market_count": 1,
                     },
                 },
@@ -1634,10 +1642,18 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         catalog_metadata = {
             "cex_depth_snapshot": {
                 "snapshot_ids": ["cex-cohort-1"],
+                "observed_at": "2026-01-02T00:00:00+00:00",
+                "observed_at_min": "2026-01-02T00:00:00+00:00",
+                "observed_at_max": "2026-01-02T00:00:04+00:00",
+                "observation_span_seconds": 4,
                 "market_rows": 1,
             },
             "dex_depth_snapshot": {
                 "snapshot_ids": ["dex-cohort-1"],
+                "observed_at": "2026-01-02T00:00:00+00:00",
+                "observed_at_min": "2026-01-02T00:00:00+00:00",
+                "observed_at_max": "2026-01-02T00:00:04+00:00",
+                "observation_span_seconds": 4,
                 "pool_rows": 1,
             },
         }
@@ -1718,11 +1734,19 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     "cex": {
                         "snapshot_ids": ["cex-cohort-1"],
                         "source_snapshot_ids": ["cex-cohort-1"],
+                        "observed_at": "2026-01-02T00:00:05+00:00",
+                        "observed_at_min": "2026-01-02T00:00:05+00:00",
+                        "observed_at_max": "2026-01-02T00:00:09+00:00",
+                        "observation_span_seconds": 4,
                         "market_count": 1,
                     },
                     "dex": {
                         "snapshot_ids": ["dex-cohort-1"],
                         "source_snapshot_ids": ["dex-cohort-1"],
+                        "observed_at": "2026-01-02T00:00:05+00:00",
+                        "observed_at_min": "2026-01-02T00:00:05+00:00",
+                        "observed_at_max": "2026-01-02T00:00:09+00:00",
+                        "observation_span_seconds": 4,
                         "market_count": 1,
                     },
                 },
@@ -1752,10 +1776,18 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         catalog_metadata = {
             "cex_depth_snapshot": {
                 "snapshot_ids": ["cex-cohort-1"],
+                "observed_at": "2026-01-02T00:00:00+00:00",
+                "observed_at_min": "2026-01-02T00:00:00+00:00",
+                "observed_at_max": "2026-01-02T00:00:04+00:00",
+                "observation_span_seconds": 4,
                 "market_rows": 1,
             },
             "dex_depth_snapshot": {
                 "snapshot_ids": ["dex-cohort-1"],
+                "observed_at": "2026-01-02T00:00:00+00:00",
+                "observed_at_min": "2026-01-02T00:00:00+00:00",
+                "observed_at_max": "2026-01-02T00:00:04+00:00",
+                "observation_span_seconds": 4,
                 "pool_rows": 1,
             },
         }
@@ -1800,6 +1832,63 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                         market_b=market_b,
                         expected_generation="generation-1",
                         catalog_metadata=catalog_metadata,
+                    )
+
+        for count_field in (
+            "depth_market_count",
+            "execution_market_count",
+        ):
+            for invalid_count in (True, 1.0):
+                with self.subTest(
+                    count_field=count_field,
+                    invalid_count=invalid_count,
+                ):
+                    invalid = copy.deepcopy(payload)
+                    invalid["metadata"]["cohort_lineage"]["cex"][
+                        count_field
+                    ] = invalid_count
+                    with self.assertRaises(ReleaseCheckError):
+                        validate_execution(
+                            invalid,
+                            token="AAVE",
+                            market_a=market_a,
+                            market_b=market_b,
+                            expected_generation="generation-1",
+                            catalog_metadata=catalog_metadata,
+                        )
+
+        bounds_counterexamples = (
+            ("depth", "observed_at_min", "not-a-time"),
+            ("depth", "observed_at_max", "2026-01-02T00:00:04"),
+            ("depth", "observed_at", "2026-01-02T00:00:01+00:00"),
+            ("depth", "observation_span_seconds", -1),
+            ("depth", "observation_span_seconds", 5),
+            ("execution", "observed_at_min", None),
+            ("execution", "observation_span_seconds", True),
+            ("execution", "observation_span_seconds", 5),
+        )
+        for location, field, invalid_value in bounds_counterexamples:
+            with self.subTest(
+                location=location,
+                field=field,
+                invalid_value=invalid_value,
+            ):
+                invalid_payload = copy.deepcopy(payload)
+                invalid_catalog = copy.deepcopy(catalog_metadata)
+                target = (
+                    invalid_catalog["cex_depth_snapshot"]
+                    if location == "depth"
+                    else invalid_payload["metadata"]["snapshots"]["cex"]
+                )
+                target[field] = invalid_value
+                with self.assertRaises(ReleaseCheckError):
+                    validate_execution(
+                        invalid_payload,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                        catalog_metadata=invalid_catalog,
                     )
 
         counterexamples = {
