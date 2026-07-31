@@ -1298,7 +1298,10 @@ function showDateWindowError(message) {
 }
 
 function setDateWindowDisabled(disabled) {
-  document.querySelectorAll("#date-window-form input, #date-window-form button")
+  document.querySelectorAll(
+    "#date-window-form input, #date-window-form button, "
+    + "#time-presets button, #custom-window-toggle",
+  )
     .forEach((control) => {
       control.disabled = disabled;
     });
@@ -5018,6 +5021,31 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
   }
 }
 
+function setCustomWindowOpen(open, { restoreFocus = false } = {}) {
+  const editor = byId("custom-window-editor");
+  const toggle = byId("custom-window-toggle");
+  editor.hidden = !open;
+  toggle.setAttribute("aria-expanded", String(open));
+  if (open) byId("date-start").focus();
+  else if (restoreFocus) toggle.focus();
+}
+
+function openCustomWindowEditor() {
+  const { start, end } = appliedTimeWindow();
+  byId("date-start").value = start;
+  byId("date-end").value = end;
+  showDateWindowError("");
+  setCustomWindowOpen(true);
+}
+
+function cancelCustomWindowEditor() {
+  const { start, end } = appliedTimeWindow();
+  byId("date-start").value = start;
+  byId("date-end").value = end;
+  showDateWindowError("");
+  setCustomWindowOpen(false, { restoreFocus: true });
+}
+
 function setPreset(days) {
   if (!app.payload) return;
   const { start, end } = presetWindow(days);
@@ -5031,16 +5059,18 @@ async function applyWindow() {
   const dateError = validateDateRange(start, end, { required: true });
   if (dateError) {
     showDateWindowError(dateError);
-    return;
+    return false;
   }
   showDateWindowError("");
   if (app.route.kind === "workspace") {
     replaceCurrentRoute();
     await applyRouteFromLocation();
-    return;
+    return true;
   }
-  await loadMarket(start, end, { preserve: Boolean(app.payload) });
+  const loaded = await loadMarket(start, end, { preserve: Boolean(app.payload) });
+  if (!loaded) return false;
   replaceCurrentRoute();
+  return true;
 }
 
 function persistSelectedPair() {
@@ -5225,17 +5255,33 @@ function bindEvents() {
     renderTable();
     replaceCurrentRoute();
   };
-  byId("date-window-form").addEventListener("submit", (event) => {
+  byId("date-window-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    void applyWindow();
+    const applied = await applyWindow();
+    if (applied) {
+      syncTimeWindowControls();
+      setCustomWindowOpen(false, { restoreFocus: true });
+    }
   });
+  byId("custom-window-toggle").addEventListener("click", () => {
+    if (byId("custom-window-toggle").getAttribute("aria-expanded") === "true") {
+      cancelCustomWindowEditor();
+    } else {
+      openCustomWindowEditor();
+    }
+  });
+  byId("cancel-window").addEventListener("click", cancelCustomWindowEditor);
   ["date-start", "date-end"].forEach((id) => {
     byId(id).addEventListener("input", () => showDateWindowError(""));
   });
   document.querySelectorAll("[data-days]").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
       setPreset(button.dataset.days);
-      applyWindow();
+      const applied = await applyWindow();
+      if (applied) {
+        syncTimeWindowControls();
+        setCustomWindowOpen(false);
+      }
     });
   });
   document.querySelectorAll("[data-scope]").forEach((button) => {

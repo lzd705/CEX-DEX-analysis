@@ -155,6 +155,172 @@ console.log(JSON.stringify({
         self.assertEqual(result["active"], ["all"])
         self.assertEqual(result["pressed"], ["all"])
 
+    def test_custom_time_window_lifecycle_preserves_applied_state(self):
+        result = run_app_javascript(
+            """
+function control({ value = "", hidden = false, dataset = {} } = {}) {
+  return {
+    value,
+    hidden,
+    dataset,
+    disabled: false,
+    textContent: "",
+    attributes: {},
+    focused: false,
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return this.attributes[name] || null; },
+    focus() { this.focused = true; },
+  };
+}
+const start = control();
+const end = control();
+const error = control({ hidden: true });
+const editor = control({ hidden: true });
+const toggle = control();
+toggle.setAttribute("aria-expanded", "false");
+const presets = ["7", "30", "90", "all"].map((days) => control({ dataset: { days } }));
+const formButton = control();
+const controls = [start, end, formButton, ...presets, toggle];
+global.document = {
+  getElementById(id) {
+    return {
+      "date-start": start,
+      "date-end": end,
+      "date-window-error": error,
+      "custom-window-editor": editor,
+      "custom-window-toggle": toggle,
+    }[id] || null;
+  },
+  querySelectorAll(selector) {
+    if (selector === "[data-days]") return presets;
+    if (selector.includes("#date-window-form input")) return controls;
+    return [];
+  },
+};
+app.payload = {
+  metadata: {
+    start_date: "2026-07-01",
+    end_date: "2026-07-29",
+    available_start: "2026-05-01",
+    available_end: "2026-07-29",
+  },
+};
+app.route = { kind: "screener" };
+
+if (typeof openCustomWindowEditor !== "function") {
+  console.log(JSON.stringify({ missingLifecycle: true }));
+} else {
+  start.value = "2026-07-20";
+  end.value = "2026-07-21";
+  showDateWindowError("Old error");
+  openCustomWindowEditor();
+  const opened = {
+    start: start.value,
+    end: end.value,
+    hidden: editor.hidden,
+    expanded: toggle.getAttribute("aria-expanded"),
+    errorHidden: error.hidden,
+    startFocused: start.focused,
+  };
+
+  start.value = "2026-07-22";
+  end.value = "2026-07-23";
+  cancelCustomWindowEditor();
+  const cancelled = {
+    start: start.value,
+    end: end.value,
+    hidden: editor.hidden,
+    expanded: toggle.getAttribute("aria-expanded"),
+    toggleFocused: toggle.focused,
+  };
+
+  openCustomWindowEditor();
+  start.value = "";
+  const invalidApplied = await applyWindow();
+  const invalid = {
+    applied: invalidApplied,
+    hidden: editor.hidden,
+    errorHidden: error.hidden,
+  };
+
+  start.value = "2026-07-23";
+  end.value = "2026-07-29";
+  let loadedWindow = null;
+  loadMarket = async (loadedStart, loadedEnd) => {
+    loadedWindow = { start: loadedStart, end: loadedEnd };
+    return true;
+  };
+  const screenerApplied = await applyWindow();
+
+  app.route = { kind: "workspace" };
+  let workspaceReloaded = false;
+  applyRouteFromLocation = async () => { workspaceReloaded = true; };
+  const workspaceApplied = await applyWindow();
+
+  setPreset("7");
+  const draftPreset = { start: start.value, end: end.value };
+  const appliedWindow = appliedTimeWindow();
+  setDateWindowDisabled(true);
+  const disabled = controls.every((control) => control.disabled);
+  setDateWindowDisabled(false);
+  const enabled = controls.every((control) => !control.disabled);
+
+  console.log(JSON.stringify({
+    missingLifecycle: false,
+    opened,
+    cancelled,
+    invalid,
+    screenerApplied,
+    loadedWindow,
+    workspaceApplied,
+    workspaceReloaded,
+    draftPreset,
+    appliedWindow,
+    disabled,
+    enabled,
+  }));
+}
+"""
+        )
+        self.assertFalse(result["missingLifecycle"])
+        self.assertEqual(result["opened"], {
+            "start": "2026-07-01",
+            "end": "2026-07-29",
+            "hidden": False,
+            "expanded": "true",
+            "errorHidden": True,
+            "startFocused": True,
+        })
+        self.assertEqual(result["cancelled"], {
+            "start": "2026-07-01",
+            "end": "2026-07-29",
+            "hidden": True,
+            "expanded": "false",
+            "toggleFocused": True,
+        })
+        self.assertEqual(result["invalid"], {
+            "applied": False,
+            "hidden": False,
+            "errorHidden": False,
+        })
+        self.assertTrue(result["screenerApplied"])
+        self.assertEqual(result["loadedWindow"], {
+            "start": "2026-07-23",
+            "end": "2026-07-29",
+        })
+        self.assertTrue(result["workspaceApplied"])
+        self.assertTrue(result["workspaceReloaded"])
+        self.assertEqual(result["draftPreset"], {
+            "start": "2026-07-23",
+            "end": "2026-07-29",
+        })
+        self.assertEqual(result["appliedWindow"], {
+            "start": "2026-07-01",
+            "end": "2026-07-29",
+        })
+        self.assertTrue(result["disabled"])
+        self.assertTrue(result["enabled"])
+
     def test_expert_context_is_compact_but_remains_accessible(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
         styles = STYLES_PATH.read_text(encoding="utf-8")
@@ -1080,27 +1246,38 @@ console.log(JSON.stringify({
         self.assertEqual(result["fallback"], "Market data is unavailable.")
 
     def test_workspace_window_change_reloads_matching_summary_and_catalog_in_order(self):
-        app_js = APP_PATH.read_text(encoding="utf-8")
-        apply_window = app_js[
-            app_js.index("async function applyWindow()"):
-            app_js.index("function persistSelectedPair()")
-        ]
-        workspace_branch = apply_window[
-            apply_window.index(
-                'if (app.route.kind === "workspace")'
-            ):
-        ]
-        self.assertLess(
-            workspace_branch.index("replaceCurrentRoute();"),
-            workspace_branch.index("await applyRouteFromLocation();"),
+        result = run_app_javascript(
+            """
+const start = { value: "2026-07-01", setAttribute() {} };
+const end = { value: "2026-07-29", setAttribute() {} };
+const error = { hidden: true, textContent: "" };
+global.document = {
+  getElementById(id) {
+    return {
+      "date-start": start,
+      "date-end": end,
+      "date-window-error": error,
+    }[id] || null;
+  },
+};
+app.payload = {
+  metadata: {
+    available_start: "2026-05-01",
+    available_end: "2026-07-29",
+  },
+};
+app.route = { kind: "workspace", page: "compare" };
+const steps = [];
+replaceCurrentRoute = () => { steps.push("route"); };
+applyRouteFromLocation = async () => { steps.push("reload"); };
+(async () => {
+  const applied = await applyWindow();
+  console.log(JSON.stringify({ applied, steps }));
+})();
+"""
         )
-        self.assertIn("return;", workspace_branch)
-        self.assertNotIn("Promise.allSettled", apply_window)
-        self.assertNotIn("loadComparison()", apply_window)
-        self.assertNotIn(
-            'app.route.kind === "workspace" && app.route.page === "compare"',
-            apply_window,
-        )
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["steps"], ["route", "reload"])
 
     def test_route_and_loading_contract_prevents_stale_window_or_permanent_loading(self):
         app_js = APP_PATH.read_text(encoding="utf-8")
