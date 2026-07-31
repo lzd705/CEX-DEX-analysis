@@ -535,31 +535,80 @@ function syncSegmentedControls() {
   });
 }
 
-function syncTimePresetButtons() {
-  if (!app.payload) return;
-  const start = byId("date-start").value;
-  const end = byId("date-end").value;
-  let activePreset = "";
-  if (start && end) {
-    if (
-      start === app.payload.metadata.available_start
-      && end === app.payload.metadata.available_end
-    ) {
-      activePreset = "all";
-    } else {
-      const startTime = Date.parse(`${start}T00:00:00Z`);
-      const endTime = Date.parse(`${end}T00:00:00Z`);
-      if (Number.isFinite(startTime) && Number.isFinite(endTime)) {
-        const inclusiveDays = Math.round((endTime - startTime) / 86_400_000) + 1;
-        if ([7, 30, 90].includes(inclusiveDays)) activePreset = String(inclusiveDays);
-      }
-    }
+function appliedTimeWindow() {
+  return {
+    start: app.payload?.metadata?.start_date || "",
+    end: app.payload?.metadata?.end_date || "",
+  };
+}
+
+function presetWindow(days) {
+  const availableStart = app.payload?.metadata?.available_start || "";
+  const availableEnd = app.payload?.metadata?.available_end || "";
+  if (!availableStart || !availableEnd) return { start: "", end: "" };
+  if (days === "all") return { start: availableStart, end: availableEnd };
+  const startDate = new Date(`${availableEnd}T00:00:00Z`);
+  startDate.setUTCDate(startDate.getUTCDate() - Number(days) + 1);
+  const candidate = startDate.toISOString().slice(0, 10);
+  return {
+    start: candidate < availableStart ? availableStart : candidate,
+    end: availableEnd,
+  };
+}
+
+function formatAppliedWindowSummary(start, end) {
+  const startDate = new Date(`${start}T00:00:00Z`);
+  const endDate = new Date(`${end}T00:00:00Z`);
+  if (
+    !start
+    || !end
+    || Number.isNaN(startDate.getTime())
+    || Number.isNaN(endDate.getTime())
+  ) return "No applied range";
+
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const inclusiveDays = Math.round(
+    (endDate.getTime() - startDate.getTime()) / 86_400_000,
+  ) + 1;
+  const sameYear = startDate.getUTCFullYear() === endDate.getUTCFullYear();
+  const sameMonth = sameYear
+    && startDate.getUTCMonth() === endDate.getUTCMonth();
+  let range;
+  if (sameMonth) {
+    range = `${startDate.getUTCDate()}–${endDate.getUTCDate()} `
+      + `${months[endDate.getUTCMonth()]} ${endDate.getUTCFullYear()}`;
+  } else if (sameYear) {
+    range = `${startDate.getUTCDate()} ${months[startDate.getUTCMonth()]}–`
+      + `${endDate.getUTCDate()} ${months[endDate.getUTCMonth()]} `
+      + `${endDate.getUTCFullYear()}`;
+  } else {
+    range = `${startDate.getUTCDate()} ${months[startDate.getUTCMonth()]} `
+      + `${startDate.getUTCFullYear()}–${endDate.getUTCDate()} `
+      + `${months[endDate.getUTCMonth()]} ${endDate.getUTCFullYear()}`;
   }
+  return `${range} · ${inclusiveDays} ${inclusiveDays === 1 ? "day" : "days"}`;
+}
+
+function syncTimeWindowControls() {
+  const { start, end } = appliedTimeWindow();
+  let activePreset = "";
   document.querySelectorAll("[data-days]").forEach((button) => {
-    const active = button.dataset.days === activePreset;
+    const preset = presetWindow(button.dataset.days);
+    const active = Boolean(
+      start
+      && end
+      && start === preset.start
+      && end === preset.end,
+    );
+    if (active) activePreset = button.dataset.days;
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   });
+  byId("applied-window-summary").textContent = formatAppliedWindowSummary(start, end);
+  const customActive = Boolean(start && end && !activePreset);
+  byId("custom-window-toggle").classList.toggle("active", customActive);
+  byId("custom-window-toggle").setAttribute("aria-pressed", String(customActive));
 }
 
 function availableMarketWindow() {
@@ -726,7 +775,7 @@ function hydrateScreenerControls(route, { normalizeWindow = true } = {}) {
 function applyScreenerRoute(route) {
   app.route = route;
   const window = hydrateScreenerControls(route);
-  syncTimePresetButtons();
+  syncTimeWindowControls();
   setActiveAppView("screener");
   byId("time-toolbar").hidden = false;
   renderTable();
@@ -798,7 +847,7 @@ function applyWorkspaceRoute(route) {
   const window = compareRouteWindow(route);
   byId("date-start").value = window.start;
   byId("date-end").value = window.end;
-  syncTimePresetButtons();
+  syncTimeWindowControls();
   syncMarketPayloadForWindow(window.start, window.end);
 
   if (route.page === "liquidity") {
@@ -2828,7 +2877,7 @@ function updateMetadata() {
   end.max = metadata.available_end;
   start.value = metadata.start_date;
   end.value = metadata.end_date;
-  syncTimePresetButtons();
+  syncTimeWindowControls();
   byId("available-range").textContent = `Available ${metadata.available_start} to ${metadata.available_end}`;
   const freshness = metadata.freshness;
   if (freshness) {
@@ -4936,7 +4985,7 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
     if (preserve && app.payload) {
       byId("date-start").value = app.payload.metadata.start_date;
       byId("date-end").value = app.payload.metadata.end_date;
-      syncTimePresetButtons();
+      syncTimeWindowControls();
       byId("export-csv").disabled = false;
       showStatus(
         byId("market-status"),
@@ -4962,18 +5011,9 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
 
 function setPreset(days) {
   if (!app.payload) return;
-  const end = new Date(`${app.payload.metadata.available_end}T00:00:00Z`);
-  const start = new Date(end);
-  if (days === "all") {
-    byId("date-start").value = app.payload.metadata.available_start;
-  } else {
-    start.setUTCDate(start.getUTCDate() - Number(days) + 1);
-    const candidate = start.toISOString().slice(0, 10);
-    byId("date-start").value = candidate < app.payload.metadata.available_start
-      ? app.payload.metadata.available_start
-      : candidate;
-  }
-  byId("date-end").value = app.payload.metadata.available_end;
+  const { start, end } = presetWindow(days);
+  byId("date-start").value = start;
+  byId("date-end").value = end;
 }
 
 async function applyWindow() {
@@ -5185,11 +5225,6 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-days]").forEach((button) => {
     button.addEventListener("click", () => {
-      document.querySelectorAll("[data-days]").forEach((item) => {
-        const active = item === button;
-        item.classList.toggle("active", active);
-        item.setAttribute("aria-pressed", String(active));
-      });
       setPreset(button.dataset.days);
       applyWindow();
     });

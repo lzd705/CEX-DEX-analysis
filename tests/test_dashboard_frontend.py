@@ -27,6 +27,77 @@ def run_app_javascript(source: str):
 
 
 class DashboardFrontendContractTest(unittest.TestCase):
+    def test_time_window_summary_and_active_state_use_applied_payload(self):
+        result = run_app_javascript(
+            """
+function control(dataset = {}) {
+  return {
+    dataset,
+    textContent: "",
+    attributes: {},
+    active: false,
+    classList: {
+      owner: null,
+      toggle(name, enabled) {
+        if (name === "active") this.owner.active = enabled;
+      },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+  };
+}
+const summary = control();
+const custom = control();
+summary.classList.owner = summary;
+custom.classList.owner = custom;
+const presets = ["7", "30", "90", "all"].map((days) => {
+  const button = control({ days });
+  button.classList.owner = button;
+  return button;
+});
+global.document = {
+  getElementById(id) {
+    return {
+      "applied-window-summary": summary,
+      "custom-window-toggle": custom,
+    }[id] || null;
+  },
+  querySelectorAll(selector) {
+    return selector === "[data-days]" ? presets : [];
+  },
+};
+app.payload = {
+  metadata: {
+    start_date: "2026-07-23",
+    end_date: "2026-07-29",
+    available_start: "2025-05-14",
+    available_end: "2026-07-29",
+  },
+};
+syncTimeWindowControls();
+const presetState = {
+  summary: summary.textContent,
+  active: presets.find((button) => button.active)?.dataset.days,
+  custom: custom.active,
+};
+app.payload.metadata.start_date = "2026-07-01";
+syncTimeWindowControls();
+console.log(JSON.stringify({
+  presetState,
+  customState: {
+    activePreset: presets.find((button) => button.active)?.dataset.days || "",
+    custom: custom.active,
+    pressed: custom.attributes["aria-pressed"],
+  },
+}));
+"""
+        )
+        self.assertEqual(result["presetState"]["summary"], "23–29 Jul 2026 · 7 days")
+        self.assertEqual(result["presetState"]["active"], "7")
+        self.assertFalse(result["presetState"]["custom"])
+        self.assertEqual(result["customState"]["activePreset"], "")
+        self.assertTrue(result["customState"]["custom"])
+        self.assertEqual(result["customState"]["pressed"], "true")
+
     def test_expert_context_is_compact_but_remains_accessible(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
         styles = STYLES_PATH.read_text(encoding="utf-8")
