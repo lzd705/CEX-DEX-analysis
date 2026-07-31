@@ -424,6 +424,33 @@ class FetchCexTests(unittest.TestCase):
                 with self.subTest(field=field), self.assertRaises(ValueError):
                     write_attempt_ledger(root / (field + ".json"), [dict(attempt, **{field: ""})], source_csv=source_csv)
 
+    def test_attempt_writer_rejects_wrong_type_and_invalid_alias_before_publication(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_csv = root / "cex.csv"
+            source_csv.write_text("date,token_symbol\n", encoding="utf-8")
+            valid = cex_attempt_record("AAVE", "upbit", "AAVE/USDT", rows=[], start_date="2026-07-28", end_date="2026-07-28")
+            invalid_alias = dict(valid, source_instrument="UNI/KRW", source_instrument_alias_validated=True)
+            for name, candidate in (("wrong-type", dict(valid, market_type="dex")), ("alias", invalid_alias)):
+                path = root / (name + ".json")
+                with self.subTest(case=name), self.assertRaises(ValueError):
+                    write_attempt_ledger(path, [valid, candidate], source_csv=source_csv)
+                self.assertFalse(path.exists())
+
+    def test_exchange_writer_strips_only_transient_source_instrument(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "rows.csv"
+            row = {"date": "2026-07-28", "token_symbol": "AAVE", "exchange": "upbit", "cex_symbol": "AAVE/USDT", "open": 1, "high": 1, "low": 1, "close": 1, "base_volume": 1, "quote_volume_usd": 1, "source_instrument": "AAVE/KRW"}
+            write_exchange_rows([row], path)
+            self.assertNotIn("source_instrument", path.read_text(encoding="utf-8"))
+            with self.assertRaises(ValueError):
+                write_exchange_rows([dict(row, unexpected="no")], path)
+
+    def test_unbounded_full_rebuild_suppresses_attempt_ledger(self):
+        with TemporaryDirectory() as directory, patch("scripts.fetch_cex.build_rows", return_value=[]), patch("scripts.fetch_cex.write_attempt_ledger") as writer:
+            fetch_cex.main(exchanges=["binance"], output_dir=Path(directory))
+        writer.assert_not_called()
+
     def test_upbit_fallback_keeps_the_configured_canonical_symbol_and_alias_lineage(self):
         candle = {
             "market": "KRW-AAVE",
@@ -443,6 +470,10 @@ class FetchCexTests(unittest.TestCase):
         )
 
         self.assertEqual(rows[0]["cex_symbol"], "AAVE/USDT")
+        self.assertEqual(
+            {key: rows[0][key] for key in ("open", "high", "low", "close", "quote_volume_usd")},
+            {"open": 100.0, "high": 110.0, "low": 90.0, "close": 105.0, "quote_volume_usd": 1050.0},
+        )
         self.assertEqual(
             {key: attempt[key] for key in ("instrument", "source_instrument", "source_instrument_alias_validated")},
             {"instrument": "AAVE/USDT", "source_instrument": "AAVE/KRW", "source_instrument_alias_validated": True},

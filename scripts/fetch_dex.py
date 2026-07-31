@@ -32,6 +32,11 @@ except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
 try:
+    from scripts.fact_quality import normalize_collection_attempts
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from fact_quality import normalize_collection_attempts
+
+try:
     from scripts.token_registry import (
         DEFAULT_REGISTRY_PATH,
         TokenRegistry,
@@ -339,6 +344,10 @@ def write_attempt_ledger(
         attempt_ids.add(attempt_id)
         if not all(str(attempt.get(key) or "").strip() for key in ("token_symbol", "chain", "dex", "pool_address")):
             raise ValueError("DEX attempt identity is incomplete")
+    normalized_attempts = normalize_collection_attempts(
+        validated_attempts,
+        market_type="dex",
+    )
     payload = {
         "schema": ATTEMPT_SCHEMA,
         "collector": "dex",
@@ -349,9 +358,9 @@ def write_attempt_ledger(
         },
         "source_csv": source_csv.name,
         "source_csv_sha256": sha256_file(source_csv),
-        "attempt_count": len(validated_attempts),
+        "attempt_count": len(normalized_attempts),
         "attempts": sorted(
-            validated_attempts,
+            normalized_attempts,
             key=lambda item: (
                 item["token_symbol"],
                 item.get("chain") or "",
@@ -1435,6 +1444,7 @@ def fetch_existing_pools(
             if attempt_records is not None and not any(
                 item["token_symbol"] == pool.get("token_symbol")
                 and item.get("chain") == pool.get("chain")
+                and item.get("dex") == pool.get("dex")
                 and item.get("pool_address")
                 == (
                     pool.get("pool_address", "").lower()
@@ -1561,7 +1571,8 @@ def main(
 
     selected_pools = []
     pool_volume_rows = []
-    attempt_records = []
+    publish_attempts = start_date is not None and end_date is not None
+    attempt_records = [] if publish_attempts else None
     discovery_token_rows = token_rows
     invalid_pool_keys = []
     if append:
@@ -1599,7 +1610,7 @@ def main(
                     )
                 )
             except Exception:
-                if dex_pool_volume_output_path.exists():
+                if publish_attempts and dex_pool_volume_output_path.exists():
                     write_attempt_ledger(
                         attempt_output_path,
                         attempt_records,
@@ -1691,13 +1702,16 @@ def main(
     write_pool_rows(selected_pools, dex_pools_output_path)
     write_pool_volume_rows(pool_volume_rows, dex_pool_volume_output_path)
     write_volume_rows(volume_rows, dex_volume_output_path)
-    write_attempt_ledger(
-        attempt_output_path,
-        attempt_records,
-        source_csv=dex_pool_volume_output_path,
-        start_date=start_date,
-        end_date=end_date,
-    )
+    if publish_attempts:
+        write_attempt_ledger(
+            attempt_output_path,
+            attempt_records,
+            source_csv=dex_pool_volume_output_path,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    else:
+        attempt_output_path.unlink(missing_ok=True)
 
     print("Wrote %s pools to %s" % (len(selected_pools), dex_pools_output_path))
     print(
@@ -1707,7 +1721,7 @@ def main(
     print("Wrote %s rows to %s" % (len(volume_rows), dex_volume_output_path))
     print(
         "Wrote %s collection attempts to %s"
-        % (len(attempt_records), attempt_output_path)
+        % (len(attempt_records or []), attempt_output_path)
     )
 
 

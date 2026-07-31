@@ -517,6 +517,17 @@ class RunFactPipelineTest(unittest.TestCase):
         self.assertEqual(first_slice["source_instrument"], "UNI/KRW")
         self.assertTrue(first_slice["source_instrument_alias_validated"])
 
+    def test_partial_carry_omits_zero_observation_slice_and_keeps_measured_slice(self):
+        prior = cex_attempt("UNI", "2026-07-01", "2026-07-05", reason="no_candles")
+        prior.update(status="partial", outcome="partial_observation", observed_dates=["2026-07-01", "2026-07-03"], observed_day_count=2)
+        replacement = cex_attempt("UNI", "2026-07-04", "2026-07-04", reason="no_candles")
+        carried = run_fact_pipeline._carried_segments(
+            [prior], [replacement],
+            gap_keys={(("cex", "UNI", "binance", "UNI/USDT"), "2026-07-02"), (("cex", "UNI", "binance", "UNI/USDT"), "2026-07-05")},
+        )
+        self.assertEqual(len(carried), 1)
+        self.assertEqual((carried[0]["requested_start_date"], carried[0]["status"], carried[0]["observed_dates"]), ("2026-07-01", "partial", ["2026-07-01", "2026-07-03"]))
+
     def test_carry_keys_keep_cex_quote_and_dex_adapter_distinct(self):
         self.assertNotEqual(
             run_fact_pipeline._stable_market_key(cex_attempt("UNI", "2026-07-01", "2026-07-01")),

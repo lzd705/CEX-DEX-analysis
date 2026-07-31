@@ -413,6 +413,26 @@ class FactQualityTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     normalize_collection_attempts([candidate], market_type="cex")
 
+    def test_partial_and_no_data_use_only_their_exact_outcomes(self):
+        invalid = (
+            {"status": "partial", "outcome": "no_candles", "observed_dates": ["2026-07-19"], "observed_day_count": 1},
+            {"status": "no_data", "outcome": "partial_observation"},
+        )
+        for mutation in invalid:
+            with self.subTest(mutation=mutation):
+                candidate = cex_attempt("2026-07-19", **mutation)
+                candidate["reason_code"] = "no_candles"
+                candidate["error"] = "The source returned no daily candles inside the requested window."
+                with self.assertRaises(ValueError):
+                    normalize_collection_attempts([candidate], market_type="cex")
+
+    def test_malformed_canonical_cex_instrument_is_invalid(self):
+        for instrument in ("AAVEUSDT", "AAVE/", "/USDT", "AAVE//USDT"):
+            with self.subTest(instrument=instrument), self.assertRaises(ValueError):
+                normalize_collection_attempts(
+                    [cex_attempt("2026-07-19", instrument=instrument)], market_type="cex"
+                )
+
     def test_z_completion_time_is_normalized_to_canonical_utc(self):
         normalized = normalize_collection_attempts(
             [cex_attempt("2026-07-19", finished_at_utc="2026-07-20T00:30:00Z")],

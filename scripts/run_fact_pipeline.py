@@ -325,7 +325,7 @@ def _attempt_with_window(
     attempt: Mapping[str, Any],
     start_day: date,
     end_day: date,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     start_text = start_day.isoformat()
     end_text = end_day.isoformat()
     observed_dates = [
@@ -338,6 +338,16 @@ def _attempt_with_window(
     result["requested_end_date"] = end_text
     result["observed_dates"] = observed_dates
     result["observed_day_count"] = len(observed_dates)
+    if result.get("status") == "partial":
+        if not observed_dates:
+            return None
+        requested_days = (end_day - start_day).days + 1
+        if len(observed_dates) == requested_days:
+            result["status"] = "succeeded"
+            result["outcome"] = "observed"
+            result["reason_code"] = "observed"
+            result["http_status"] = None
+            result["error"] = None
     identity = {
         key: result.get(key)
         for key in (
@@ -452,13 +462,9 @@ def _carried_segments(
                 for key, day_text in gap_keys
             )
             if explains_gap:
-                carried.append(
-                    _attempt_with_window(
-                        attempt,
-                        segment_start,
-                        segment_end,
-                    )
-                )
+                sliced = _attempt_with_window(attempt, segment_start, segment_end)
+                if sliced is not None:
+                    carried.append(sliced)
     return carried
 
 
@@ -539,6 +545,7 @@ def merge_append_attempt_evidence(
             if market_type == "cex"
             else fetch_dex.write_attempt_ledger
         )
+        merged = normalize_collection_attempts(merged, market_type=market_type)
         writer(
             ledger_path,
             merged,

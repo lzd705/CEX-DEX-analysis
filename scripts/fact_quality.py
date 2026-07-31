@@ -147,9 +147,13 @@ def normalize_collection_attempts(
             and reason_code == "observed"
             and outcome == "observed"
         ) or (
-            status in {"partial", "no_data"}
+            status == "partial"
             and reason_code == "no_candles"
-            and outcome in {"partial_observation", "no_candles"}
+            and outcome == "partial_observation"
+        ) or (
+            status == "no_data"
+            and reason_code == "no_candles"
+            and outcome == "no_candles"
         ) or (
             status == "unsupported"
             and reason_code == "source_range_unavailable"
@@ -255,6 +259,11 @@ def normalize_collection_attempts(
         dex = str(raw.get("dex") or "").strip().lower() or None
         if market_type == "cex" and (not exchange or not instrument):
             raise ValueError("CEX attempt exact identity is incomplete")
+        if market_type == "cex" and (
+            instrument.count("/") != 1
+            or any(not piece for piece in instrument.split("/"))
+        ):
+            raise ValueError("CEX canonical instrument is invalid")
         if market_type == "dex" and (not chain or not dex or not pool_address):
             raise ValueError("DEX attempt exact identity is incomplete")
         source_instrument = None

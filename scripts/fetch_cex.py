@@ -28,6 +28,11 @@ try:
 except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
+try:
+    from scripts.fact_quality import normalize_collection_attempts
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from fact_quality import normalize_collection_attempts
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TOKEN_CONFIG_PATH = PROJECT_ROOT / "config/tokens.csv"
@@ -283,6 +288,11 @@ def cex_attempt_record(
     if len(source_instruments) > 1:
         raise ValueError("CEX attempt returned multiple source instruments")
     canonical_instrument = str(instrument).strip().upper()
+    if (
+        canonical_instrument.count("/") != 1
+        or any(not piece for piece in canonical_instrument.split("/"))
+    ):
+        raise ValueError("CEX canonical instrument is invalid")
     source_instrument = next(iter(source_instruments), None)
     source_alias_validated = False
     if source_instrument and source_instrument != canonical_instrument:
@@ -364,6 +374,10 @@ def write_attempt_ledger(
         attempt_ids.add(attempt_id)
         if not all(str(attempt.get(key) or "").strip() for key in ("token_symbol", "exchange", "instrument")):
             raise ValueError("CEX attempt identity is incomplete")
+    normalized_attempts = normalize_collection_attempts(
+        validated_attempts,
+        market_type="cex",
+    )
     payload = {
         "schema": ATTEMPT_SCHEMA,
         "collector": "cex",
@@ -374,9 +388,9 @@ def write_attempt_ledger(
         },
         "source_csv": source_csv.name,
         "source_csv_sha256": sha256_file(source_csv),
-        "attempt_count": len(validated_attempts),
+        "attempt_count": len(normalized_attempts),
         "attempts": sorted(
-            validated_attempts,
+            normalized_attempts,
             key=lambda item: (
                 item["token_symbol"],
                 item["exchange"],
@@ -1565,12 +1579,15 @@ def write_exchange_rows(rows, output_path: Path):
 
     rows = sorted(rows, key=lambda row: (row["token_symbol"], row["exchange"], row["date"]))
 
+    serializable_rows = []
+    for row in rows:
+        serializable = dict(row)
+        serializable.pop("source_instrument", None)
+        serializable_rows.append(serializable)
     with output_path.open("w", newline="") as file:
-        writer = csv.DictWriter(
-            file, fieldnames=fieldnames, lineterminator="\n", extrasaction="ignore"
-        )
+        writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(serializable_rows)
 
 
 def write_aggregated_rows(rows, output_path: Path):
@@ -1638,7 +1655,8 @@ def main(
     if unknown_exchanges:
         raise ValueError("Unsupported exchanges: %s" % ", ".join(unknown_exchanges))
     get_request_window(limit_days, start_date, end_date)
-    attempt_records = []
+    publish_attempts = start_date is not None and end_date is not None
+    attempt_records = [] if publish_attempts else None
     rows = build_rows(
         token_rows,
         selected_exchanges,
@@ -1679,20 +1697,23 @@ def main(
     write_exchange_rows(rows, exchange_output_path)
     write_coverage_rows(coverage_rows, coverage_output_path)
     write_aggregated_rows(aggregated_rows, output_path)
-    write_attempt_ledger(
-        attempt_output_path,
-        attempt_records,
-        source_csv=exchange_output_path,
-        start_date=start_date,
-        end_date=end_date,
-    )
+    if publish_attempts:
+        write_attempt_ledger(
+            attempt_output_path,
+            attempt_records,
+            source_csv=exchange_output_path,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    else:
+        attempt_output_path.unlink(missing_ok=True)
 
     print("Wrote %s rows to %s" % (len(rows), exchange_output_path))
     print("Wrote %s rows to %s" % (len(coverage_rows), coverage_output_path))
     print("Wrote %s rows to %s" % (len(aggregated_rows), output_path))
     print(
         "Wrote %s collection attempts to %s"
-        % (len(attempt_records), attempt_output_path)
+        % (len(attempt_records or []), attempt_output_path)
     )
 
 

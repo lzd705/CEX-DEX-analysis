@@ -328,6 +328,16 @@ class FetchDexTests(unittest.TestCase):
         self.assertEqual(attempts[0]["status"], "no_data")
         self.assertEqual(attempts[0]["reason_code"], "no_candles")
 
+    def test_no_data_attempt_dedup_keeps_distinct_dex_adapters(self):
+        pools = [
+            {"token_symbol": "UNI", "chain": "eth", "dex": "uniswap_v3", "pool_address": "0xpool"},
+            {"token_symbol": "UNI", "chain": "eth", "dex": "curve", "pool_address": "0xpool"},
+        ]
+        attempts = []
+        with patch("scripts.fetch_dex.fetch_pool_ohlcv", return_value=[]), patch("scripts.fetch_dex.time.sleep"):
+            fetch_existing_pools(pools, attempt_records=attempts, start_date="2026-07-28", end_date="2026-07-28", fail_on_incomplete=False)
+        self.assertEqual([(item["dex"], item["status"]) for item in attempts], [("uniswap_v3", "no_data"), ("curve", "no_data")])
+
     def test_dex_attempt_error_is_classified_without_raw_url(self):
         error = urllib.error.HTTPError(
             "https://api.example/pool?token=secret",
@@ -374,6 +384,22 @@ class FetchDexTests(unittest.TestCase):
             for field in ("token_symbol", "chain", "dex", "pool_address"):
                 with self.subTest(field=field), self.assertRaises(ValueError):
                     write_attempt_ledger(root / (field + ".json"), [dict(attempt, **{field: ""})], source_csv=source_csv)
+
+    def test_attempt_writer_rejects_wrong_market_type_before_publication(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_csv = root / "dex.csv"
+            source_csv.write_text("date,token_symbol\n", encoding="utf-8")
+            attempt = dex_attempt_record("UNI", "eth", "uniswap_v3", "0xpool", rows=[], start_date="2026-07-28", end_date="2026-07-28")
+            path = root / "wrong-type.json"
+            with self.assertRaises(ValueError):
+                write_attempt_ledger(path, [dict(attempt, market_type="cex")], source_csv=source_csv)
+            self.assertFalse(path.exists())
+
+    def test_unbounded_full_rebuild_suppresses_attempt_ledger(self):
+        with TemporaryDirectory() as directory, patch("scripts.fetch_dex.fetch_selected_tokens", return_value=([], [])), patch("scripts.fetch_dex.write_attempt_ledger") as writer:
+            fetch_dex.main(output_dir=Path(directory), local_dir=Path(directory))
+        writer.assert_not_called()
 
     def test_token_level_discovery_failure_does_not_become_market_attempt_evidence(self):
         attempts = []
