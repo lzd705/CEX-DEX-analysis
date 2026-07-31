@@ -367,14 +367,22 @@ function cachedTokenCatalog(cacheKey) {
   return catalog;
 }
 
-function currentScreenerFilters() {
+function cacheTokenCatalog(cacheKey, catalog) {
+  if (app.catalogsByToken.has(cacheKey)) app.catalogsByToken.delete(cacheKey);
+  app.catalogsByToken.set(cacheKey, catalog);
+  while (app.catalogsByToken.size > 8) {
+    app.catalogsByToken.delete(app.catalogsByToken.keys().next().value);
+  }
+}
+
+function currentScreenerFilters({ window = appliedTimeWindow() } = {}) {
   const filters = {
     q: byId("token-search")?.value.trim() || "",
     scope: app.scope,
     sort: byId("sort-field")?.value || "volume",
     dir: app.sortDirection,
-    start: byId("date-start")?.value || "",
-    end: byId("date-end")?.value || "",
+    start: window.start || "",
+    end: window.end || "",
   };
   if (filters.scope === "combined") delete filters.scope;
   if (filters.sort === "volume") delete filters.sort;
@@ -392,23 +400,18 @@ function currentScreenerFilters() {
   return filters;
 }
 
-function currentWorkspaceRouteState(page) {
+function currentWorkspaceRouteState(
+  page,
+  { window = appliedTimeWindow() } = {},
+) {
   const state = selectedPairState();
   if (app.route?.kind === "workspace" && !app.catalog) {
     state.marketA ||= app.route.state?.marketA || "";
     state.marketB ||= app.route.state?.marketB || "";
   }
   if (!state.marketA || !state.marketB) state.pairMode = "manual";
-  state.start = (
-    byId("date-start")?.value
-    || (app.route?.kind === "workspace" ? app.route.state?.start : "")
-    || ""
-  );
-  state.end = (
-    byId("date-end")?.value
-    || (app.route?.kind === "workspace" ? app.route.state?.end : "")
-    || ""
-  );
+  state.start = window.start || "";
+  state.end = window.end || "";
   if (page === "liquidity") {
     state.side = app.executionDirection === "sell_token" ? "sell" : "buy";
     state.notionalUsd = app.executionNotionalUsd;
@@ -424,20 +427,20 @@ function currentWorkspaceRouteState(page) {
   return state;
 }
 
-function currentWorkspacePath(page = app.route?.page || "markets") {
+function currentWorkspacePath(
+  page = app.route?.page || "markets",
+  { window = appliedTimeWindow() } = {},
+) {
   if (!navigation) return "/screener";
   return navigation.buildWorkspacePath(
     selectedWorkspaceToken(),
     page,
-    currentWorkspaceRouteState(page),
+    currentWorkspaceRouteState(page, { window }),
   );
 }
 
 function currentSummaryWindowRouteState() {
-  return {
-    start: app.payload?.metadata?.start_date || "",
-    end: app.payload?.metadata?.end_date || "",
-  };
+  return appliedTimeWindow();
 }
 
 function workspaceEntryRouteState(page) {
@@ -507,16 +510,22 @@ function updateRouteLinks() {
   }
 }
 
-function replaceCurrentRoute() {
-  if (!navigation || !app.routeReady) return;
+function replaceCurrentRoute({
+  window = appliedTimeWindow(),
+  allowBeforeReady = false,
+} = {}) {
+  if (!navigation || (!app.routeReady && !allowBeforeReady)) return;
   let path;
   if (app.route.kind === "workspace") {
-    path = currentWorkspacePath(app.route.page);
+    path = currentWorkspacePath(app.route.page, { window });
   } else {
-    path = navigation.buildScreenerPath(currentScreenerFilters());
+    path = navigation.buildScreenerPath(currentScreenerFilters({ window }));
   }
-  window.history.replaceState({}, "", path);
-  app.route = navigation.parseRoute(window.location.pathname, window.location.search);
+  globalThis.window.history.replaceState({}, "", path);
+  app.route = navigation.parseRoute(
+    globalThis.window.location.pathname,
+    globalThis.window.location.search,
+  );
   updateRouteLinks();
 }
 
@@ -593,31 +602,123 @@ function syncSegmentedControls() {
   });
 }
 
-function syncTimePresetButtons() {
-  if (!app.payload) return;
-  const start = byId("date-start").value;
-  const end = byId("date-end").value;
-  let activePreset = "";
-  if (start && end) {
-    if (
-      start === app.payload.metadata.available_start
-      && end === app.payload.metadata.available_end
-    ) {
-      activePreset = "all";
-    } else {
-      const startTime = Date.parse(`${start}T00:00:00Z`);
-      const endTime = Date.parse(`${end}T00:00:00Z`);
-      if (Number.isFinite(startTime) && Number.isFinite(endTime)) {
-        const inclusiveDays = Math.round((endTime - startTime) / 86_400_000) + 1;
-        if ([7, 30, 90].includes(inclusiveDays)) activePreset = String(inclusiveDays);
-      }
-    }
+function draftTimeWindow() {
+  return {
+    start: byId("date-start")?.value || "",
+    end: byId("date-end")?.value || "",
+  };
+}
+
+function setDraftTimeWindow({ start = "", end = "" } = {}) {
+  byId("date-start").value = start;
+  byId("date-end").value = end;
+}
+
+function appliedTimeWindow() {
+  const metadata = app.payload?.metadata || app.defaultPayload?.metadata;
+  if (metadata?.start_date && metadata?.end_date) {
+    return { start: metadata.start_date, end: metadata.end_date };
   }
+  if (app.route?.kind === "workspace") {
+    return {
+      start: app.route.state?.start || "",
+      end: app.route.state?.end || "",
+    };
+  }
+  return {
+    start: app.route?.filters?.start || "",
+    end: app.route?.filters?.end || "",
+  };
+}
+
+function customWindowIsOpen() {
+  return byId("custom-window-toggle")?.getAttribute("aria-expanded") === "true";
+}
+
+function syncClosedDraftToApplied() {
+  if (!customWindowIsOpen()) setDraftTimeWindow(appliedTimeWindow());
+}
+
+function presetWindow(days) {
+  const availableStart = app.payload?.metadata?.available_start || "";
+  const availableEnd = app.payload?.metadata?.available_end || "";
+  if (!availableStart || !availableEnd) return { start: "", end: "" };
+  if (days === "all") return { start: availableStart, end: availableEnd };
+  const startDate = new Date(`${availableEnd}T00:00:00Z`);
+  startDate.setUTCDate(startDate.getUTCDate() - Number(days) + 1);
+  const candidate = startDate.toISOString().slice(0, 10);
+  return {
+    start: candidate < availableStart ? availableStart : candidate,
+    end: availableEnd,
+  };
+}
+
+function formatAppliedWindowSummary(start, end) {
+  const startDate = new Date(`${start}T00:00:00Z`);
+  const endDate = new Date(`${end}T00:00:00Z`);
+  if (
+    !start
+    || !end
+    || Number.isNaN(startDate.getTime())
+    || Number.isNaN(endDate.getTime())
+  ) return "No applied range";
+
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const inclusiveDays = Math.round(
+    (endDate.getTime() - startDate.getTime()) / 86_400_000,
+  ) + 1;
+  const sameYear = startDate.getUTCFullYear() === endDate.getUTCFullYear();
+  const sameMonth = sameYear
+    && startDate.getUTCMonth() === endDate.getUTCMonth();
+  let range;
+  if (sameMonth) {
+    range = `${startDate.getUTCDate()}–${endDate.getUTCDate()} `
+      + `${months[endDate.getUTCMonth()]} ${endDate.getUTCFullYear()}`;
+  } else if (sameYear) {
+    range = `${startDate.getUTCDate()} ${months[startDate.getUTCMonth()]}–`
+      + `${endDate.getUTCDate()} ${months[endDate.getUTCMonth()]} `
+      + `${endDate.getUTCFullYear()}`;
+  } else {
+    range = `${startDate.getUTCDate()} ${months[startDate.getUTCMonth()]} `
+      + `${startDate.getUTCFullYear()}–${endDate.getUTCDate()} `
+      + `${months[endDate.getUTCMonth()]} ${endDate.getUTCFullYear()}`;
+  }
+  return `${range} · ${inclusiveDays} ${inclusiveDays === 1 ? "day" : "days"}`;
+}
+
+function renderAppliedTimeWindowControls() {
+  const { start, end } = appliedTimeWindow();
+  const allPreset = presetWindow("all");
+  const fullRangeActive = Boolean(
+    start
+    && end
+    && start === allPreset.start
+    && end === allPreset.end,
+  );
+  let activePreset = "";
   document.querySelectorAll("[data-days]").forEach((button) => {
-    const active = button.dataset.days === activePreset;
+    const preset = presetWindow(button.dataset.days);
+    const active = fullRangeActive
+      ? button.dataset.days === "all"
+      : Boolean(
+        start
+        && end
+        && start === preset.start
+        && end === preset.end,
+      );
+    if (active) activePreset = button.dataset.days;
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   });
+  byId("applied-window-summary").textContent = formatAppliedWindowSummary(start, end);
+  const customActive = Boolean(start && end && !activePreset);
+  byId("custom-window-toggle").classList.toggle("active", customActive);
+  byId("custom-window-toggle").setAttribute("aria-pressed", String(customActive));
+}
+
+function syncTimeWindowControls() {
+  renderAppliedTimeWindowControls();
 }
 
 function availableMarketWindow() {
@@ -776,15 +877,14 @@ function hydrateScreenerControls(route, { normalizeWindow = true } = {}) {
         start: route.filters?.start || "",
         end: route.filters?.end || "",
       };
-  byId("date-start").value = window.start;
-  byId("date-end").value = window.end;
+  if (!customWindowIsOpen()) setDraftTimeWindow(window);
   return window;
 }
 
 function applyScreenerRoute(route) {
   app.route = route;
   const window = hydrateScreenerControls(route);
-  syncTimePresetButtons();
+  syncTimeWindowControls();
   setActiveAppView("screener");
   byId("time-toolbar").hidden = false;
   renderTable();
@@ -854,9 +954,8 @@ function applyWorkspaceRoute(route) {
   }
 
   const window = compareRouteWindow(route);
-  byId("date-start").value = window.start;
-  byId("date-end").value = window.end;
-  syncTimePresetButtons();
+  if (!customWindowIsOpen()) setDraftTimeWindow(window);
+  syncTimeWindowControls();
   syncMarketPayloadForWindow(window.start, window.end);
 
   if (route.page === "liquidity") {
@@ -898,7 +997,13 @@ function invalidateRouteRequest() {
   return app.routeRequestId;
 }
 
-function setWorkspaceCatalogLoading(token, page, catalogKey = "") {
+function setWorkspaceCatalogLoading(
+  token,
+  page,
+  catalogKey = "",
+  { preserveGlobalError = false } = {},
+) {
+  if (!preserveGlobalError) hideError(byId("global-error"));
   if (app.activeCatalogKey === catalogKey && app.catalog) return;
   app.catalog = null;
   app.activeCatalogToken = "";
@@ -911,7 +1016,6 @@ function setWorkspaceCatalogLoading(token, page, catalogKey = "") {
   app.execution = null;
   app.eventFacts = null;
   app.quality = null;
-  hideError(byId("global-error"));
   hideLiquidityTooltip();
   closeFactsMarketWarnings();
   renderFactsMarketWarning("a", null);
@@ -1070,8 +1174,8 @@ function setWorkspaceDataUnavailable(token, message) {
   updateRouteLinks();
 }
 
-async function applyRouteFromLocation() {
-  if (!navigation) return;
+async function applyRouteFromLocation({ preserveWorkspaceError = false } = {}) {
+  if (!navigation) return false;
   if (app.marketController) {
     invalidateMarketRequest();
     hideStatus(byId("market-loading"));
@@ -1080,6 +1184,20 @@ async function applyRouteFromLocation() {
     byId("export-csv").disabled = !app.payload;
   }
   const requestId = invalidateRouteRequest();
+  let marketRequestIntent = app.marketRequestId;
+  const loadMarketForRoute = (start, end, options = {}) => {
+    let ownedRequestId = marketRequestIntent;
+    const completion = loadMarket(start, end, {
+      ...options,
+      onRequestStart(requestId) { ownedRequestId = requestId; },
+    });
+    marketRequestIntent = ownedRequestId;
+    return completion;
+  };
+  const routeStillOwnsIntent = () => (
+    requestId === app.routeRequestId
+    && marketRequestIntent === app.marketRequestId
+  );
   let route = navigation.parseRoute(window.location.pathname, window.location.search);
   if (route.kind !== "unknown") app.route = route;
   if (route.kind === "workspace") {
@@ -1095,7 +1213,12 @@ async function applyRouteFromLocation() {
     );
     setActiveAppView("workspace");
     setActiveWorkspacePage(route.page);
-    setWorkspaceCatalogLoading(provisionalToken, route.page, provisionalKey);
+    setWorkspaceCatalogLoading(
+      provisionalToken,
+      route.page,
+      provisionalKey,
+      { preserveGlobalError: preserveWorkspaceError },
+    );
   } else {
     setActiveAppView("screener");
     byId("time-toolbar").hidden = false;
@@ -1111,8 +1234,8 @@ async function applyRouteFromLocation() {
       : route.kind === "workspace"
         ? route.state?.end || ""
         : "";
-    const loaded = await loadMarket(start, end);
-    if (requestId !== app.routeRequestId) return;
+    const loaded = await loadMarketForRoute(start, end);
+    if (!routeStillOwnsIntent()) return false;
     if (!loaded || !app.payload) {
       if (route.kind === "workspace") {
         setWorkspaceDataUnavailable(
@@ -1120,7 +1243,7 @@ async function applyRouteFromLocation() {
           "The Screener summary required for this Token could not be loaded.",
         );
       }
-      return;
+      return false;
     }
   }
   if (route.kind === "workspace") {
@@ -1132,12 +1255,12 @@ async function applyRouteFromLocation() {
           requestedWindow.end,
         )
       ) {
-        const loaded = await loadMarket(
+        const loaded = await loadMarketForRoute(
           requestedWindow.start,
           requestedWindow.end,
           { preserve: true },
         );
-        if (requestId !== app.routeRequestId) return;
+        if (!routeStillOwnsIntent()) return false;
         if (
           !loaded
           || !app.payload
@@ -1151,7 +1274,7 @@ async function applyRouteFromLocation() {
             String(route.token || "").toUpperCase(),
             "The requested daily window could not be loaded, so no mismatched Token catalog is shown.",
           );
-          return;
+          return false;
         }
       }
       const exactToken = app.payload.tokens
@@ -1180,10 +1303,17 @@ async function applyRouteFromLocation() {
         );
         setActiveAppView("workspace");
         setActiveWorkspacePage(exactRoute.page);
-        setWorkspaceCatalogLoading(exactToken, exactRoute.page, catalogKey);
+        setWorkspaceCatalogLoading(
+          exactToken,
+          exactRoute.page,
+          catalogKey,
+          { preserveGlobalError: preserveWorkspaceError },
+        );
         try {
+          if (!routeStillOwnsIntent()) return false;
           let catalog = cachedTokenCatalog(catalogKey);
           for (let attempt = 0; !catalog && attempt < 2; attempt += 1) {
+            if (!routeStillOwnsIntent()) return false;
             const controller = new AbortController();
             app.catalogController = controller;
             try {
@@ -1196,12 +1326,30 @@ async function applyRouteFromLocation() {
               );
             } catch (error) {
               if (error.code !== "data_generation_mismatch" || attempt > 0) throw error;
-              await loadMarket(
+              if (!routeStillOwnsIntent()) return false;
+              app.catalogsByToken.clear();
+              const refreshed = await loadMarketForRoute(
                 catalogWindow.start,
                 catalogWindow.end,
-                { preserve: true },
+                {
+                  preserve: true,
+                  refreshWorkspaceOnGenerationChange: false,
+                },
               );
-              if (requestId !== app.routeRequestId || !app.payload) return;
+              if (!routeStillOwnsIntent()) return false;
+              if (
+                !refreshed
+                || !app.payload
+                || !marketPayloadMatchesWindow(
+                  app.payload,
+                  catalogWindow.start,
+                  catalogWindow.end,
+                )
+              ) {
+                throw new Error(
+                  `The ${exactToken} Screener summary could not be refreshed.`,
+                );
+              }
               catalogKey = tokenCatalogCacheKey(
                 exactToken,
                 catalogWindow.start,
@@ -1215,13 +1363,14 @@ async function applyRouteFromLocation() {
             window.location.search,
           );
           if (
-            requestId !== app.routeRequestId
+            !routeStillOwnsIntent()
             || latestRoute.kind !== "workspace"
             || String(latestRoute.token || "").toUpperCase() !== exactToken
           ) {
-            return;
+            return false;
           }
           if (!catalog) throw new Error(`The ${exactToken} catalog is unavailable.`);
+          cacheTokenCatalog(catalogKey, catalog);
           app.catalogController = null;
           app.catalog = catalog;
           app.activeCatalogToken = exactToken;
@@ -1229,7 +1378,7 @@ async function applyRouteFromLocation() {
           route = { ...latestRoute, token: exactToken };
           applyWorkspaceRoute(route);
         } catch (error) {
-          if (error.name === "AbortError" || requestId !== app.routeRequestId) return;
+          if (error.name === "AbortError" || !routeStillOwnsIntent()) return false;
           app.catalogController = null;
           const message = (
             `The ${exactToken} market catalog failed to load: `
@@ -1240,7 +1389,8 @@ async function applyRouteFromLocation() {
             byId("global-error"),
             message,
           );
-          return;
+          finalizeRoutePresentation();
+          return false;
         }
       }
   } else if (route.kind === "screener") {
@@ -1249,7 +1399,12 @@ async function applyRouteFromLocation() {
     window.history.replaceState({}, "", "/screener");
     applyScreenerRoute(navigation.parseRoute("/screener", ""));
   }
-  if (requestId !== app.routeRequestId) return;
+  if (requestId !== app.routeRequestId) return false;
+  finalizeRoutePresentation();
+  return true;
+}
+
+function finalizeRoutePresentation() {
   app.routeReady = true;
   announceRoute(app.route);
   updateRouteLinks();
@@ -1257,11 +1412,7 @@ async function applyRouteFromLocation() {
   if (window.lucide) window.lucide.createIcons();
 }
 
-function validateDateRange(
-  start = byId("date-start").value,
-  end = byId("date-end").value,
-  { required = false } = {},
-) {
+function validateDateRange(start = "", end = "", { required = false } = {}) {
   if (required && (!start || !end)) {
     return "Choose both a start date and an end date.";
   }
@@ -1300,7 +1451,10 @@ function showDateWindowError(message) {
 }
 
 function setDateWindowDisabled(disabled) {
-  document.querySelectorAll("#date-window-form input, #date-window-form button")
+  document.querySelectorAll(
+    "#date-window-form input, #date-window-form button, "
+    + "#time-presets button, #custom-window-toggle",
+  )
     .forEach((control) => {
       control.disabled = disabled;
     });
@@ -2821,6 +2975,7 @@ function qualityStatusTiers(counts) {
 }
 
 async function loadQuality() {
+  const window = appliedTimeWindow();
   const requestId = invalidateQualityRequest();
   const token = selectedWorkspaceToken();
   const { marketA, marketB } = selectedPairState();
@@ -2841,8 +2996,8 @@ async function loadQuality() {
   const controller = new AbortController();
   app.qualityController = controller;
   const query = new URLSearchParams({ token, scope: app.qualityScope });
-  if (byId("date-start").value) query.set("start", byId("date-start").value);
-  if (byId("date-end").value) query.set("end", byId("date-end").value);
+  if (window.start) query.set("start", window.start);
+  if (window.end) query.set("end", window.end);
   if (app.qualityScope === "selected") {
     query.set("market_a", marketA);
     query.set("market_b", marketB);
@@ -3063,6 +3218,7 @@ async function fetchEventFacts({
 }
 
 async function loadEvents() {
+  const window = appliedTimeWindow();
   const requestId = invalidateEventRequest();
   const token = selectedWorkspaceToken();
   if (!app.catalog || !token) {
@@ -3076,6 +3232,8 @@ async function loadEvents() {
   try {
     const payload = await fetchEventFacts({
       token,
+      start: window.start,
+      end: window.end,
       lifecycle: app.eventLifecycle,
       signal: controller.signal,
     });
@@ -3133,9 +3291,8 @@ function updateMetadata() {
   start.max = metadata.available_end;
   end.min = metadata.available_start;
   end.max = metadata.available_end;
-  start.value = metadata.start_date;
-  end.value = metadata.end_date;
-  syncTimePresetButtons();
+  syncTimeWindowControls();
+  syncClosedDraftToApplied();
   byId("available-range").textContent = `Available ${metadata.available_start} to ${metadata.available_end}`;
   const freshness = metadata.freshness;
   if (freshness) {
@@ -4967,12 +5124,13 @@ function publicErrorMessage(error, fallback = "Request failed.") {
 }
 
 async function loadComparison() {
+  const window = appliedTimeWindow();
   const requestId = invalidateComparisonRequest();
   if (!app.catalog) {
     clearComparisonResult("Market catalog is unavailable.");
     return false;
   }
-  const dateError = validateDateRange();
+  const dateError = validateDateRange(window.start, window.end);
   if (dateError) {
     clearComparisonResult(dateError);
     return false;
@@ -4991,14 +5149,14 @@ async function loadComparison() {
   const controller = new AbortController();
   app.comparisonController = controller;
   const query = new URLSearchParams({ token, market_a: marketA, market_b: marketB });
-  if (byId("date-start").value) query.set("start", byId("date-start").value);
-  if (byId("date-end").value) query.set("end", byId("date-end").value);
+  if (window.start) query.set("start", window.start);
+  if (window.end) query.set("end", window.end);
   setComparisonLoading(`Loading ${token} comparison…`);
   try {
     const eventPromise = fetchEventFacts({
       token,
-      start: byId("date-start").value,
-      end: byId("date-end").value,
+      start: window.start,
+      end: window.end,
       signal: controller.signal,
     }).catch(() => null);
     const response = await fetch(`/api/markets/compare?${query.toString()}`, {
@@ -5045,7 +5203,6 @@ async function loadTokenCatalog(token, start, end, signal, cacheKey) {
     throw new Error("The summary/catalog generation contract is missing.");
   }
   if (summaryGeneration !== catalogGeneration) {
-    app.catalogsByToken.clear();
     const error = new Error(
       "The data generation changed during navigation. Refreshing the summary.",
     );
@@ -5057,11 +5214,6 @@ async function loadTokenCatalog(token, start, end, signal, cacheKey) {
     || payload.metadata?.window_end !== end
   ) {
     throw new Error(`The ${token} catalog returned the wrong daily window.`);
-  }
-  if (app.catalogsByToken.has(cacheKey)) app.catalogsByToken.delete(cacheKey);
-  app.catalogsByToken.set(cacheKey, payload);
-  while (app.catalogsByToken.size > 8) {
-    app.catalogsByToken.delete(app.catalogsByToken.keys().next().value);
   }
   return payload;
 }
@@ -5111,7 +5263,10 @@ function clearDefaultMarketCache() {
   }
 }
 
-function displayMarket(payload, { cached = false } = {}) {
+function displayMarket(
+  payload,
+  { cached = false, refreshWorkspaceOnGenerationChange = true } = {},
+) {
   const previousGeneration = app.payload?.metadata?.data_generation;
   const nextGeneration = payload.metadata?.data_generation;
   const generationChanged = Boolean(
@@ -5172,7 +5327,12 @@ function displayMarket(payload, { cached = false } = {}) {
   ) {
     populateFactsMarkets({ preserve: true });
   }
-  if (generationChanged && app.routeReady && app.route?.kind === "workspace") {
+  if (
+    refreshWorkspaceOnGenerationChange
+    && generationChanged
+    && app.routeReady
+    && app.route?.kind === "workspace"
+  ) {
     void applyRouteFromLocation();
   }
 }
@@ -5216,8 +5376,17 @@ function clearMarketResult(message = "") {
   byId("export-csv").disabled = true;
 }
 
-async function loadMarket(start = "", end = "", { preserve = false } = {}) {
+async function loadMarket(
+  start = "",
+  end = "",
+  {
+    preserve = false,
+    refreshWorkspaceOnGenerationChange = true,
+    onRequestStart = null,
+  } = {},
+) {
   const requestId = invalidateMarketRequest();
+  if (onRequestStart) onRequestStart(requestId);
   const dateError = validateDateRange(start, end);
   if (dateError) {
     clearMarketResult(dateError);
@@ -5246,7 +5415,7 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
       throw new Error("Screener summary failed its compact response contract.");
     }
     if (requestId !== app.marketRequestId) return false;
-    displayMarket(payload);
+    displayMarket(payload, { refreshWorkspaceOnGenerationChange });
     if (!start && !end) writeDefaultMarketCache(payload);
     hideStatus(byId("market-loading"));
     return true;
@@ -5259,9 +5428,6 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
       ? " The explicitly marked cached snapshot remains visible."
       : " No result is shown for the failed request.";
     if (preserve && app.payload) {
-      byId("date-start").value = app.payload.metadata.start_date;
-      byId("date-end").value = app.payload.metadata.end_date;
-      syncTimePresetButtons();
       byId("export-csv").disabled = false;
       showStatus(
         byId("market-status"),
@@ -5285,38 +5451,91 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
   }
 }
 
-function setPreset(days) {
-  if (!app.payload) return;
-  const end = new Date(`${app.payload.metadata.available_end}T00:00:00Z`);
-  const start = new Date(end);
-  if (days === "all") {
-    byId("date-start").value = app.payload.metadata.available_start;
-  } else {
-    start.setUTCDate(start.getUTCDate() - Number(days) + 1);
-    const candidate = start.toISOString().slice(0, 10);
-    byId("date-start").value = candidate < app.payload.metadata.available_start
-      ? app.payload.metadata.available_start
-      : candidate;
-  }
-  byId("date-end").value = app.payload.metadata.available_end;
+function setCustomWindowOpen(open, { restoreFocus = false } = {}) {
+  const editor = byId("custom-window-editor");
+  const toggle = byId("custom-window-toggle");
+  editor.hidden = !open;
+  toggle.setAttribute("aria-expanded", String(open));
+  if (open) byId("date-start").focus();
+  else if (restoreFocus) toggle.focus();
 }
 
-async function applyWindow() {
-  const start = byId("date-start").value;
-  const end = byId("date-end").value;
+function openCustomWindowEditor() {
+  setDraftTimeWindow(appliedTimeWindow());
+  showDateWindowError("");
+  setCustomWindowOpen(true);
+}
+
+function cancelCustomWindowEditor() {
+  setDraftTimeWindow(appliedTimeWindow());
+  showDateWindowError("");
+  setCustomWindowOpen(false, { restoreFocus: true });
+}
+
+async function applyWindow(candidate = draftTimeWindow()) {
+  const { start, end } = candidate;
   const dateError = validateDateRange(start, end, { required: true });
   if (dateError) {
     showDateWindowError(dateError);
-    return;
+    return false;
   }
   showDateWindowError("");
-  if (app.route.kind === "workspace") {
-    replaceCurrentRoute();
-    await applyRouteFromLocation();
-    return;
+  const routeAtApply = app.route.kind === "workspace"
+    ? { ...app.route, state: { ...(app.route.state || {}) } }
+    : app.route;
+  const appliedLocation = `${window.location.pathname}${window.location.search}`;
+  const loading = loadMarket(start, end, {
+    preserve: Boolean(app.payload),
+    refreshWorkspaceOnGenerationChange: false,
+  });
+  const applyRequestId = app.marketRequestId;
+  const loaded = await loading;
+  if (!loaded) {
+    const locationUnchanged = (
+      `${window.location.pathname}${window.location.search}` === appliedLocation
+    );
+    if (
+      routeAtApply.kind === "workspace"
+      && applyRequestId === app.marketRequestId
+      && locationUnchanged
+    ) {
+      void applyRouteFromLocation({ preserveWorkspaceError: true });
+    }
+    return false;
   }
-  await loadMarket(start, end, { preserve: Boolean(app.payload) });
-  replaceCurrentRoute();
+  const applied = appliedTimeWindow();
+  if (routeAtApply.kind === "workspace" && navigation) {
+    const latestRoute = navigation.parseRoute(
+      window.location.pathname,
+      window.location.search,
+    );
+    const routeForCommit = (
+      latestRoute.kind === "workspace"
+      && String(latestRoute.token || "").toUpperCase()
+        === String(routeAtApply.token || "").toUpperCase()
+      && latestRoute.page === routeAtApply.page
+    )
+      ? latestRoute
+      : routeAtApply;
+    const state = {
+      ...(routeForCommit.state || {}),
+      start: applied.start,
+      end: applied.end,
+    };
+    const path = navigation.buildWorkspacePath(
+      routeForCommit.token,
+      routeForCommit.page,
+      state,
+    );
+    window.history.replaceState({}, "", path);
+    app.route = navigation.parseRoute(window.location.pathname, window.location.search);
+    updateRouteLinks();
+    void applyRouteFromLocation();
+  } else {
+    replaceCurrentRoute({ window: applied, allowBeforeReady: true });
+    if (routeAtApply.kind === "workspace") void applyRouteFromLocation();
+  }
+  return true;
 }
 
 function persistSelectedPair() {
@@ -5391,6 +5610,7 @@ function csvEscape(value) {
 }
 
 function exportVisibleCsv() {
+  const window = appliedTimeWindow();
   if (!app.payload || !app.visibleTokens.length) return;
   const headers = [
     "token",
@@ -5487,7 +5707,7 @@ function exportVisibleCsv() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `cex-dex-market-facts-${byId("date-start").value}-${byId("date-end").value}.csv`;
+  link.download = `cex-dex-market-facts-${window.start}-${window.end}.csv`;
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -5501,22 +5721,34 @@ function bindEvents() {
     renderTable();
     replaceCurrentRoute();
   };
-  byId("date-window-form").addEventListener("submit", (event) => {
+  byId("date-window-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    void applyWindow();
+    const applied = await applyWindow(draftTimeWindow());
+    if (applied) {
+      setDraftTimeWindow(appliedTimeWindow());
+      syncTimeWindowControls();
+      setCustomWindowOpen(false, { restoreFocus: true });
+    }
   });
+  byId("custom-window-toggle").addEventListener("click", () => {
+    if (byId("custom-window-toggle").getAttribute("aria-expanded") === "true") {
+      cancelCustomWindowEditor();
+    } else {
+      openCustomWindowEditor();
+    }
+  });
+  byId("cancel-window").addEventListener("click", cancelCustomWindowEditor);
   ["date-start", "date-end"].forEach((id) => {
     byId(id).addEventListener("input", () => showDateWindowError(""));
   });
   document.querySelectorAll("[data-days]").forEach((button) => {
-    button.addEventListener("click", () => {
-      document.querySelectorAll("[data-days]").forEach((item) => {
-        const active = item === button;
-        item.classList.toggle("active", active);
-        item.setAttribute("aria-pressed", String(active));
-      });
-      setPreset(button.dataset.days);
-      applyWindow();
+    button.addEventListener("click", async () => {
+      const applied = await applyWindow(presetWindow(button.dataset.days));
+      if (applied) {
+        setDraftTimeWindow(appliedTimeWindow());
+        syncTimeWindowControls();
+        setCustomWindowOpen(false);
+      }
     });
   });
   document.querySelectorAll("[data-scope]").forEach((button) => {
@@ -5726,8 +5958,7 @@ function bindEvents() {
 function primeInitialRouteView(route) {
   if (route.kind === "workspace") {
     const window = compareRouteWindow(route);
-    byId("date-start").value = window.start;
-    byId("date-end").value = window.end;
+    setDraftTimeWindow(window);
     setActiveAppView("workspace");
     setActiveWorkspacePage(route.page);
     updateRouteLinks();

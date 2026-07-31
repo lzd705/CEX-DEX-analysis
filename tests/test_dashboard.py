@@ -3021,11 +3021,11 @@ class MarketMonitorServerTest(unittest.TestCase):
         ]
         market_loader = app_js[
             app_js.index("async function loadMarket("):
-            app_js.index("function setPreset(")
+            app_js.index("async function applyWindow(")
         ]
         self.assertLess(
             comparison_loader.index("invalidateComparisonRequest()"),
-            comparison_loader.index("validateDateRange()"),
+            comparison_loader.index("validateDateRange(window.start, window.end)"),
         )
         self.assertLess(
             market_loader.index("invalidateMarketRequest()"),
@@ -3037,7 +3037,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn('hideStatus(byId("market-status"))', app_js)
         self.assertIn("app.payload = null;", app_js)
         self.assertIn("No current market result.", app_js)
-        self.assertIn("validateDateRange()", app_js)
+        self.assertIn("validateDateRange(window.start, window.end)", app_js)
         self.assertIn("selectionOverrides", app_js)
         self.assertIn('state.pairMode = "manual";', app_js)
         self.assertIn(

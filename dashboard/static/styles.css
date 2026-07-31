@@ -157,18 +157,62 @@ main { min-width: 0; padding: 14px 18px 30px; }
   border: 1px solid var(--line);
   background: var(--surface);
 }
-.time-toolbar { position: sticky; top: 0; z-index: 20; }
+.time-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: block;
+}
+.time-toolbar-row {
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) minmax(220px, auto) auto;
+  align-items: center;
+  gap: 18px;
+}
 .toolbar-title { min-width: 210px; display: flex; align-items: center; gap: 9px; }
 .toolbar-title svg { width: 17px; height: 17px; color: var(--accent); }
 .toolbar-title strong, .toolbar-title span { display: block; }
 .toolbar-title strong { font-size: 16px; }
 .toolbar-title span { margin-top: 3px; color: var(--muted); font-size: 12px; }
-.date-apply-group {
+.applied-window span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.applied-window strong { color: var(--text); font-size: 15px; }
+.time-window-actions,
+.custom-window-commands {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.custom-window-toggle,
+.secondary-command {
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 750;
+}
+.custom-window-toggle.active {
+  border-color: #477e83;
+  background: var(--accent-soft);
+  color: #a9e1e5;
+}
+.custom-window-editor {
   position: relative;
   display: flex;
   align-items: end;
-  gap: 8px;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
 }
+.custom-window-editor[hidden] { display: none; }
 .date-fields { display: flex; align-items: end; gap: 8px; }
 .date-fields label span, .sort-control span { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; text-transform: uppercase; }
 .date-fields input,
@@ -1969,12 +2013,13 @@ footer {
 }
 
 @media (max-width: 1100px) {
-  .time-toolbar { flex-wrap: wrap; }
+  .monitor-toolbar { flex-wrap: wrap; }
 }
 
 @media (max-width: 900px) {
-  .time-toolbar { align-items: stretch; flex-wrap: wrap; position: relative; }
-  .toolbar-title { width: 100%; }
+  .time-toolbar { position: relative; }
+  .time-toolbar-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .time-toolbar-row .toolbar-title { grid-column: 1 / -1; }
   .search-control { margin-left: 0; }
   .monitor-toolbar { flex-wrap: wrap; }
   .comparison-summary { grid-template-columns: 1fr 1fr; }
@@ -2043,18 +2088,19 @@ footer {
   .status-cluster .status-dot { flex: 0 0 auto; margin-top: 4px; }
   #freshness { min-width: 0; overflow-wrap: anywhere; }
   main { padding: 8px; }
-  .date-apply-group {
-    width: 100%;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .date-fields { width: 100%; }
-  .date-fields label { flex: 1; min-width: 0; }
-  .date-fields input { width: 100%; min-width: 0; }
-  .date-apply-group .icon-command { width: 100%; justify-content: center; }
-  .date-window-error { position: static; grid-column: 1 / -1; max-width: none; }
-  .preset-group { width: 100%; }
+  .time-toolbar-row { display: flex; flex-direction: column; align-items: stretch; }
+  .time-window-actions { display: grid; grid-template-columns: 1fr; }
+  .preset-group { display: flex; width: 100%; }
   .preset-group button { flex: 1; }
+  .custom-window-toggle { width: 100%; }
+  .custom-window-editor { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .date-fields { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .date-arrow { display: none; }
+  .custom-window-commands { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); }
+  .custom-window-commands button { width: 100%; justify-content: center; }
+  .date-fields label { min-width: 0; }
+  .date-fields input { width: 100%; min-width: 0; }
+  .date-window-error { position: static; grid-column: 1 / -1; max-width: none; }
   .facts-workbench { padding: 14px 10px; }
   .facts-heading { display: block; }
   .workspace-heading-meta { justify-content: flex-start; margin-top: 8px; }
@@ -2370,6 +2416,8 @@ footer {
   #market-table .metric-note,
   #market-table .spread-date { text-align: right; }
 }
+
+.custom-window-editor[hidden] { display: none; }
 
 @media (prefers-reduced-motion: reduce) {
   * { scroll-behavior: auto !important; }
