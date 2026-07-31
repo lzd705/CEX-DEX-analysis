@@ -29,9 +29,12 @@ except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
 try:
-    from scripts.fact_quality import normalize_collection_attempts
+    from scripts.fact_quality import (
+        normalize_cex_instrument,
+        normalize_collection_attempts,
+    )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
-    from fact_quality import normalize_collection_attempts
+    from fact_quality import normalize_cex_instrument, normalize_collection_attempts
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -280,19 +283,27 @@ def cex_attempt_record(
         }
         status = "succeeded"
         outcome = "observed"
-    source_instruments = {
-        str(row.get("source_instrument") or row.get("cex_symbol") or "").strip().upper()
-        for row in (rows or [])
-        if str(row.get("source_instrument") or row.get("cex_symbol") or "").strip()
-    }
+    source_instruments = set()
+    for row in rows or []:
+        has_explicit_source = "source_instrument" in row
+        raw_source = (
+            row.get("source_instrument")
+            if has_explicit_source
+            else row.get("cex_symbol")
+        )
+        if has_explicit_source or raw_source not in (None, ""):
+            source_instruments.add(
+                normalize_cex_instrument(
+                    raw_source,
+                    field_name="CEX source instrument",
+                )
+            )
     if len(source_instruments) > 1:
         raise ValueError("CEX attempt returned multiple source instruments")
-    canonical_instrument = str(instrument).strip().upper()
-    if (
-        canonical_instrument.count("/") != 1
-        or any(not piece for piece in canonical_instrument.split("/"))
-    ):
-        raise ValueError("CEX canonical instrument is invalid")
+    canonical_instrument = normalize_cex_instrument(
+        instrument,
+        field_name="CEX canonical instrument",
+    )
     source_instrument = next(iter(source_instruments), None)
     source_alias_validated = False
     if source_instrument and source_instrument != canonical_instrument:

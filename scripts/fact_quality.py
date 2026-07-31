@@ -19,6 +19,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -49,6 +50,12 @@ ATTEMPT_SCHEMA = "daily_collection_attempts/v1"
 ACTIVE_LOOKBACK_DAYS = 7
 ACTIVE_MIN_OBSERVATIONS = 3
 MAX_RETRY_WINDOW_DAYS = 180
+MAX_CEX_INSTRUMENT_COMPONENT_LENGTH = 32
+MAX_CEX_INSTRUMENT_LENGTH = 65
+CEX_INSTRUMENT_PATTERN = re.compile(
+    r"[A-Z0-9._-]+/[A-Z0-9._-]+",
+    re.ASCII,
+)
 ATTEMPT_STATUSES = {
     "succeeded",
     "partial",
@@ -112,6 +119,31 @@ CATEGORY_ORDER = {
 
 class FactQualityInputError(ValueError):
     """Raised when a source CSV cannot satisfy the audit input contract."""
+
+
+def normalize_cex_instrument(value: Any, *, field_name: str = "CEX instrument") -> str:
+    """Return one bounded canonical ASCII BASE/QUOTE identity.
+
+    Case is canonicalized for existing configured venue symbols, but whitespace,
+    control characters, non-ASCII text, and malformed components are rejected
+    rather than repaired.
+    """
+
+    if not isinstance(value, str) or not value or not value.isascii():
+        raise ValueError("{} is not a canonical ASCII pair".format(field_name))
+    canonical = value.upper()
+    if (
+        len(canonical) > MAX_CEX_INSTRUMENT_LENGTH
+        or CEX_INSTRUMENT_PATTERN.fullmatch(canonical) is None
+    ):
+        raise ValueError("{} is not a canonical ASCII pair".format(field_name))
+    base, quote_asset = canonical.split("/", 1)
+    if (
+        len(base) > MAX_CEX_INSTRUMENT_COMPONENT_LENGTH
+        or len(quote_asset) > MAX_CEX_INSTRUMENT_COMPONENT_LENGTH
+    ):
+        raise ValueError("{} exceeds the supported pair bounds".format(field_name))
+    return canonical
 
 
 def normalize_collection_attempts(
@@ -254,16 +286,16 @@ def normalize_collection_attempts(
         if pool_address and pool_address.startswith("0x"):
             pool_address = pool_address.lower()
         exchange = str(raw.get("exchange") or "").strip().lower() or None
-        instrument = str(raw.get("instrument") or "").strip().upper() or None
+        instrument = None
+        if market_type == "cex":
+            instrument = normalize_cex_instrument(
+                raw.get("instrument"),
+                field_name="CEX canonical instrument",
+            )
         chain = str(raw.get("chain") or "").strip().lower() or None
         dex = str(raw.get("dex") or "").strip().lower() or None
-        if market_type == "cex" and (not exchange or not instrument):
+        if market_type == "cex" and not exchange:
             raise ValueError("CEX attempt exact identity is incomplete")
-        if market_type == "cex" and (
-            instrument.count("/") != 1
-            or any(not piece for piece in instrument.split("/"))
-        ):
-            raise ValueError("CEX canonical instrument is invalid")
         if market_type == "dex" and (not chain or not dex or not pool_address):
             raise ValueError("DEX attempt exact identity is incomplete")
         source_instrument = None
@@ -271,16 +303,10 @@ def normalize_collection_attempts(
         if market_type == "cex":
             raw_source = raw.get("source_instrument")
             if raw_source is not None:
-                if not isinstance(raw_source, str):
-                    raise ValueError("source instrument is invalid")
-                source_instrument = raw_source.strip().upper()
-                if (
-                    not source_instrument
-                    or len(source_instrument) > 64
-                    or source_instrument.count("/") != 1
-                    or any(not piece for piece in source_instrument.split("/"))
-                ):
-                    raise ValueError("source instrument is invalid")
+                source_instrument = normalize_cex_instrument(
+                    raw_source,
+                    field_name="CEX source instrument",
+                )
             if not isinstance(source_alias_validated, bool):
                 raise ValueError("source alias validation flag is invalid")
             if source_instrument is None:

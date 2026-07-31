@@ -437,6 +437,81 @@ class FetchCexTests(unittest.TestCase):
                     write_attempt_ledger(path, [valid, candidate], source_csv=source_csv)
                 self.assertFalse(path.exists())
 
+    def test_producer_and_writer_share_strict_cex_pair_validation(self):
+        invalid_pairs = (
+            "",
+            " AAVE/USDT",
+            "AAVE/US DT",
+            "AAVE/USDT\n",
+            "AAVE/US\x00DT",
+            "ÅAVE/USDT",
+            "A" * 33 + "/USDT",
+            "AAVE/" + "U" * 33,
+        )
+        for pair in invalid_pairs:
+            with self.subTest(path="producer", pair=pair), self.assertRaises(ValueError):
+                cex_attempt_record(
+                    "AAVE", "binance", pair, rows=[],
+                    start_date="2026-07-28", end_date="2026-07-28",
+                )
+
+        valid = cex_attempt_record(
+            "AAVE", "upbit", "AAVE/USDT", rows=[],
+            start_date="2026-07-28", end_date="2026-07-28",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_csv = root / "cex.csv"
+            source_csv.write_text("date,token_symbol\n", encoding="utf-8")
+            for pair in invalid_pairs:
+                path = root / "invalid.json"
+                with self.subTest(path="writer", pair=pair), self.assertRaises(ValueError):
+                    write_attempt_ledger(
+                        path, [dict(valid, instrument=pair)], source_csv=source_csv
+                    )
+                self.assertFalse(path.exists())
+                with self.subTest(path="writer-source", pair=pair), self.assertRaises(ValueError):
+                    write_attempt_ledger(
+                        path,
+                        [
+                            dict(
+                                valid,
+                                source_instrument=pair,
+                                source_instrument_alias_validated=True,
+                            )
+                        ],
+                        source_csv=source_csv,
+                    )
+                self.assertFalse(path.exists())
+
+    def test_producer_rejects_invalid_source_pair_before_alias_validation(self):
+        invalid_sources = (
+            "",
+            " AAVE/KRW",
+            "AAVE/KR W",
+            "AAVE/KRW\n",
+            "AAVE/KR\x00W",
+            "AAVÉ/KRW",
+            "A" * 33 + "/KRW",
+            "AAVE/" + "K" * 33,
+        )
+        for source in invalid_sources:
+            rows = [{"date": "2026-07-28", "cex_symbol": "AAVE/USDT", "source_instrument": source}]
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                cex_attempt_record(
+                    "AAVE", "upbit", "AAVE/USDT", rows=rows,
+                    start_date="2026-07-28", end_date="2026-07-28",
+                )
+
+    def test_producer_accepts_exact_cex_pair_boundary_and_canonicalizes_case(self):
+        pair = "a" * 32 + "/" + "q" * 32
+        attempt = cex_attempt_record(
+            "AAVE", "binance", pair, rows=[],
+            start_date="2026-07-28", end_date="2026-07-28",
+        )
+        self.assertEqual(attempt["instrument"], pair.upper())
+        self.assertEqual(len(attempt["instrument"]), 65)
+
     def test_exchange_writer_strips_only_transient_source_instrument(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "rows.csv"

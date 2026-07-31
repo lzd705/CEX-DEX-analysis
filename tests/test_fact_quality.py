@@ -427,10 +427,72 @@ class FactQualityTest(unittest.TestCase):
                     normalize_collection_attempts([candidate], market_type="cex")
 
     def test_malformed_canonical_cex_instrument_is_invalid(self):
-        for instrument in ("AAVEUSDT", "AAVE/", "/USDT", "AAVE//USDT"):
+        invalid = (
+            "AAVEUSDT",
+            "AAVE/",
+            "/USDT",
+            "AAVE//USDT",
+            " AAVE/USDT",
+            "AAVE/USDT ",
+            "AA VE/USDT",
+            "AAVE/US DT",
+            "AAVE/USDT\n",
+            "AAVE/US\x00DT",
+            "ÅAVE/USDT",
+            "AAVE/ＵＳＤＴ",
+            "A" * 33 + "/USDT",
+            "AAVE/" + "U" * 33,
+        )
+        for instrument in invalid:
             with self.subTest(instrument=instrument), self.assertRaises(ValueError):
                 normalize_collection_attempts(
                     [cex_attempt("2026-07-19", instrument=instrument)], market_type="cex"
+                )
+
+    def test_canonical_cex_instrument_accepts_ascii_grammar_and_exact_bounds(self):
+        normalized = normalize_collection_attempts(
+            [
+                cex_attempt(
+                    "2026-07-19",
+                    instrument="a.b_c-d/usdt",
+                    source_instrument="a.b_c-d/usdt",
+                    source_instrument_alias_validated=False,
+                ),
+                cex_attempt(
+                    "2026-07-20",
+                    attempt_id="boundary-pair",
+                    instrument="A" * 32 + "/" + "Q" * 32,
+                ),
+            ],
+            market_type="cex",
+        )
+        self.assertEqual(normalized[0]["instrument"], "A.B_C-D/USDT")
+        self.assertEqual(normalized[0]["source_instrument"], "A.B_C-D/USDT")
+        self.assertEqual(len(normalized[1]["instrument"]), 65)
+
+    def test_source_instrument_uses_the_same_strict_ascii_pair_grammar(self):
+        invalid_sources = (
+            "",
+            " AAVE/KRW",
+            "AAVE/KR W",
+            "AAVE/KRW\n",
+            "AAVE/KR\x01W",
+            "AAVÉ/KRW",
+            "A" * 33 + "/KRW",
+            "AAVE/" + "K" * 33,
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                normalize_collection_attempts(
+                    [
+                        cex_attempt(
+                            "2026-07-19",
+                            exchange="upbit",
+                            source_instrument=source,
+                            source_instrument_alias_validated=True,
+                        )
+                    ],
+                    market_type="cex",
                 )
 
     def test_z_completion_time_is_normalized_to_canonical_utc(self):
