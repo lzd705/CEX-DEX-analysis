@@ -347,6 +347,14 @@ function cachedTokenCatalog(cacheKey) {
   return catalog;
 }
 
+function cacheTokenCatalog(cacheKey, catalog) {
+  if (app.catalogsByToken.has(cacheKey)) app.catalogsByToken.delete(cacheKey);
+  app.catalogsByToken.set(cacheKey, catalog);
+  while (app.catalogsByToken.size > 8) {
+    app.catalogsByToken.delete(app.catalogsByToken.keys().next().value);
+  }
+}
+
 function currentScreenerFilters({ window = appliedTimeWindow() } = {}) {
   const filters = {
     q: byId("token-search")?.value.trim() || "",
@@ -1111,6 +1119,20 @@ async function applyRouteFromLocation() {
     byId("export-csv").disabled = !app.payload;
   }
   const requestId = invalidateRouteRequest();
+  let marketRequestIntent = app.marketRequestId;
+  const loadMarketForRoute = (start, end, options = {}) => {
+    let ownedRequestId = marketRequestIntent;
+    const completion = loadMarket(start, end, {
+      ...options,
+      onRequestStart(requestId) { ownedRequestId = requestId; },
+    });
+    marketRequestIntent = ownedRequestId;
+    return completion;
+  };
+  const routeStillOwnsIntent = () => (
+    requestId === app.routeRequestId
+    && marketRequestIntent === app.marketRequestId
+  );
   let route = navigation.parseRoute(window.location.pathname, window.location.search);
   if (route.kind !== "unknown") app.route = route;
   if (route.kind === "workspace") {
@@ -1142,8 +1164,8 @@ async function applyRouteFromLocation() {
       : route.kind === "workspace"
         ? route.state?.end || ""
         : "";
-    const loaded = await loadMarket(start, end);
-    if (requestId !== app.routeRequestId) return false;
+    const loaded = await loadMarketForRoute(start, end);
+    if (!routeStillOwnsIntent()) return false;
     if (!loaded || !app.payload) {
       if (route.kind === "workspace") {
         setWorkspaceDataUnavailable(
@@ -1163,12 +1185,12 @@ async function applyRouteFromLocation() {
           requestedWindow.end,
         )
       ) {
-        const loaded = await loadMarket(
+        const loaded = await loadMarketForRoute(
           requestedWindow.start,
           requestedWindow.end,
           { preserve: true },
         );
-        if (requestId !== app.routeRequestId) return false;
+        if (!routeStillOwnsIntent()) return false;
         if (
           !loaded
           || !app.payload
@@ -1213,8 +1235,10 @@ async function applyRouteFromLocation() {
         setActiveWorkspacePage(exactRoute.page);
         setWorkspaceCatalogLoading(exactToken, exactRoute.page, catalogKey);
         try {
+          if (!routeStillOwnsIntent()) return false;
           let catalog = cachedTokenCatalog(catalogKey);
           for (let attempt = 0; !catalog && attempt < 2; attempt += 1) {
+            if (!routeStillOwnsIntent()) return false;
             const controller = new AbortController();
             app.catalogController = controller;
             try {
@@ -1227,8 +1251,9 @@ async function applyRouteFromLocation() {
               );
             } catch (error) {
               if (error.code !== "data_generation_mismatch" || attempt > 0) throw error;
-              if (requestId !== app.routeRequestId) return false;
-              const refreshed = await loadMarket(
+              if (!routeStillOwnsIntent()) return false;
+              app.catalogsByToken.clear();
+              const refreshed = await loadMarketForRoute(
                 catalogWindow.start,
                 catalogWindow.end,
                 {
@@ -1236,7 +1261,7 @@ async function applyRouteFromLocation() {
                   refreshWorkspaceOnGenerationChange: false,
                 },
               );
-              if (requestId !== app.routeRequestId) return false;
+              if (!routeStillOwnsIntent()) return false;
               if (
                 !refreshed
                 || !app.payload
@@ -1263,13 +1288,14 @@ async function applyRouteFromLocation() {
             window.location.search,
           );
           if (
-            requestId !== app.routeRequestId
+            !routeStillOwnsIntent()
             || latestRoute.kind !== "workspace"
             || String(latestRoute.token || "").toUpperCase() !== exactToken
           ) {
             return false;
           }
           if (!catalog) throw new Error(`The ${exactToken} catalog is unavailable.`);
+          cacheTokenCatalog(catalogKey, catalog);
           app.catalogController = null;
           app.catalog = catalog;
           app.activeCatalogToken = exactToken;
@@ -1277,7 +1303,7 @@ async function applyRouteFromLocation() {
           route = { ...latestRoute, token: exactToken };
           applyWorkspaceRoute(route);
         } catch (error) {
-          if (error.name === "AbortError" || requestId !== app.routeRequestId) return false;
+          if (error.name === "AbortError" || !routeStillOwnsIntent()) return false;
           app.catalogController = null;
           const message = (
             `The ${exactToken} market catalog failed to load: `
@@ -1288,6 +1314,7 @@ async function applyRouteFromLocation() {
             byId("global-error"),
             message,
           );
+          finalizeRoutePresentation();
           return false;
         }
       }
@@ -1298,12 +1325,16 @@ async function applyRouteFromLocation() {
     applyScreenerRoute(navigation.parseRoute("/screener", ""));
   }
   if (requestId !== app.routeRequestId) return false;
+  finalizeRoutePresentation();
+  return true;
+}
+
+function finalizeRoutePresentation() {
   app.routeReady = true;
   announceRoute(app.route);
   updateRouteLinks();
   canonicalizeCurrentRoute();
   if (window.lucide) window.lucide.createIcons();
-  return true;
 }
 
 function validateDateRange(start = "", end = "", { required = false } = {}) {
@@ -4832,7 +4863,6 @@ async function loadTokenCatalog(token, start, end, signal, cacheKey) {
     throw new Error("The summary/catalog generation contract is missing.");
   }
   if (summaryGeneration !== catalogGeneration) {
-    app.catalogsByToken.clear();
     const error = new Error(
       "The data generation changed during navigation. Refreshing the summary.",
     );
@@ -4844,11 +4874,6 @@ async function loadTokenCatalog(token, start, end, signal, cacheKey) {
     || payload.metadata?.window_end !== end
   ) {
     throw new Error(`The ${token} catalog returned the wrong daily window.`);
-  }
-  if (app.catalogsByToken.has(cacheKey)) app.catalogsByToken.delete(cacheKey);
-  app.catalogsByToken.set(cacheKey, payload);
-  while (app.catalogsByToken.size > 8) {
-    app.catalogsByToken.delete(app.catalogsByToken.keys().next().value);
   }
   return payload;
 }
@@ -5014,9 +5039,14 @@ function clearMarketResult(message = "") {
 async function loadMarket(
   start = "",
   end = "",
-  { preserve = false, refreshWorkspaceOnGenerationChange = true } = {},
+  {
+    preserve = false,
+    refreshWorkspaceOnGenerationChange = true,
+    onRequestStart = null,
+  } = {},
 ) {
   const requestId = invalidateMarketRequest();
+  if (onRequestStart) onRequestStart(requestId);
   const dateError = validateDateRange(start, end);
   if (dateError) {
     clearMarketResult(dateError);
@@ -5102,11 +5132,6 @@ function cancelCustomWindowEditor() {
   setCustomWindowOpen(false, { restoreFocus: true });
 }
 
-function setPreset(days) {
-  if (!app.payload) return;
-  setDraftTimeWindow(presetWindow(days));
-}
-
 async function applyWindow(candidate = draftTimeWindow()) {
   const { start, end } = candidate;
   const dateError = validateDateRange(start, end, { required: true });
@@ -5115,15 +5140,49 @@ async function applyWindow(candidate = draftTimeWindow()) {
     return false;
   }
   showDateWindowError("");
-  const routeKind = app.route.kind;
-  const loaded = await loadMarket(start, end, {
+  const routeAtApply = app.route.kind === "workspace"
+    ? { ...app.route, state: { ...(app.route.state || {}) } }
+    : app.route;
+  const appliedLocation = `${window.location.pathname}${window.location.search}`;
+  const loading = loadMarket(start, end, {
     preserve: Boolean(app.payload),
     refreshWorkspaceOnGenerationChange: false,
   });
-  if (!loaded) return false;
+  const applyRequestId = app.marketRequestId;
+  const loaded = await loading;
+  if (!loaded) {
+    const locationUnchanged = (
+      `${window.location.pathname}${window.location.search}` === appliedLocation
+    );
+    if (
+      routeAtApply.kind === "workspace"
+      && applyRequestId === app.marketRequestId
+      && locationUnchanged
+    ) {
+      void applyRouteFromLocation();
+    }
+    return false;
+  }
   const applied = appliedTimeWindow();
-  replaceCurrentRoute({ window: applied, allowBeforeReady: true });
-  if (routeKind === "workspace") void applyRouteFromLocation();
+  if (routeAtApply.kind === "workspace" && navigation) {
+    const state = {
+      ...(routeAtApply.state || {}),
+      start: applied.start,
+      end: applied.end,
+    };
+    const path = navigation.buildWorkspacePath(
+      routeAtApply.token,
+      routeAtApply.page,
+      state,
+    );
+    window.history.replaceState({}, "", path);
+    app.route = navigation.parseRoute(window.location.pathname, window.location.search);
+    updateRouteLinks();
+    void applyRouteFromLocation();
+  } else {
+    replaceCurrentRoute({ window: applied, allowBeforeReady: true });
+    if (routeAtApply.kind === "workspace") void applyRouteFromLocation();
+  }
   return true;
 }
 

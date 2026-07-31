@@ -2032,7 +2032,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         ]
         market_loader = app_js[
             app_js.index("async function loadMarket("):
-            app_js.index("function setPreset(")
+            app_js.index("async function applyWindow(")
         ]
         self.assertLess(
             comparison_loader.index("invalidateComparisonRequest()"),
