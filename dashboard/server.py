@@ -49,6 +49,12 @@ try:
         enrich_market_quality,
         market_series_statistics,
     )
+    from scripts.quality_outcomes import (
+        cex_reason_code,
+        normalize_cex_source_outcome,
+        project_dex_unsupported_error,
+        quality_outcome_rule,
+    )
     from dashboard.public_actions import (
         PUBLIC_ACTION_PATHS,
         PUBLIC_ADD_TOKEN_ACTOR,
@@ -87,6 +93,12 @@ except ModuleNotFoundError:
         dex_market_id,
         enrich_market_quality,
         market_series_statistics,
+    )
+    from scripts.quality_outcomes import (
+        cex_reason_code,
+        normalize_cex_source_outcome,
+        project_dex_unsupported_error,
+        quality_outcome_rule,
     )
     from public_actions import (  # type: ignore[no-redef]
         PUBLIC_ACTION_PATHS,
@@ -931,25 +943,16 @@ def _load_cex_depth_snapshot_cached(
 
 def cex_depth_reason_code(depth_row: dict[str, str]) -> str | None:
     """Prefer the stable collector code and classify legacy rows conservatively."""
-    reason_code = str(depth_row.get("reason_code") or "").strip()
-    if reason_code:
-        return (
-            reason_code
-            if reason_code in CEX_DEPTH_REASON_CODES
-            else "collection_failed"
-        )
+    classified_reason = cex_reason_code(
+        depth_row.get("reason_code"), depth_row.get("error")
+    )
+    if classified_reason:
+        return classified_reason
     status = str(depth_row.get("status") or "").strip()
-    error = str(depth_row.get("error") or "").lower()
     if status == "observed":
         return "observed"
     if status == "partial":
         return "source_level_limit"
-    if "empty order-book side" in error:
-        return "source_no_two_sided_book"
-    if "crossed or locked" in error or "invalid numeric order-book" in error:
-        return "source_invalid_order_book"
-    if "returned no order book" in error:
-        return "source_no_order_book"
     if status == "failed":
         return "collection_failed"
     return None
@@ -1174,6 +1177,7 @@ def overlay_dex_depth_snapshot(
             pool["dex_depth_usd_price_observed_at"] = None
             pool["dex_depth_usd_price_skew_seconds"] = None
             pool["dex_depth_usd_price_freshness_status"] = "unavailable"
+            pool["depth_requires_usd_price_alignment"] = False
         result["metadata"]["dex_depth_note"] = (
             "DEX pool-state depth snapshot is unavailable. TVL and daily volume "
             "are not used as depth proxies."
@@ -1222,6 +1226,7 @@ def overlay_dex_depth_snapshot(
             pool["dex_depth_usd_price_observed_at"] = None
             pool["dex_depth_usd_price_skew_seconds"] = None
             pool["dex_depth_usd_price_freshness_status"] = "unavailable"
+            pool["depth_requires_usd_price_alignment"] = False
             for field in numeric_fields:
                 pool[field] = None
             for field in completeness_fields:
@@ -1268,15 +1273,23 @@ def overlay_dex_depth_snapshot(
             depth_row.get("raw_response_sha256") or None
         )
         pool["dex_depth_error"] = depth_row.get("error") or None
+        pool["depth_requires_usd_price_alignment"] = str(
+            depth_row.get("depth_requires_usd_price_alignment") or ""
+        ).strip().lower() in {"1", "true", "yes"}
         source_status = depth_row.get("status")
         measured = (
             source_status in {"observed", "partial"}
-            and price_timing["usable"]
+            and (
+                not pool["depth_requires_usd_price_alignment"]
+                or price_timing["usable"]
+            )
         )
         pool["dex_depth_source_status"] = source_status
-        if source_status in {"observed", "partial"} and not price_timing[
-            "usable"
-        ]:
+        if (
+            source_status in {"observed", "partial"}
+            and pool["depth_requires_usd_price_alignment"]
+            and not price_timing["usable"]
+        ):
             pool["dex_depth_status"] = "failed"
             pool["dex_depth_error"] = price_timing["reason"]
         for field in numeric_fields:
@@ -3530,23 +3543,33 @@ def _tvl_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
 
 def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
     market_type = market["market_type"]
-    status = market.get("depth_status") or "unavailable"
-    reason_code = (
-        market.get("depth_reason_code")
-        if market_type == "cex"
-        else market.get("depth_error")
-    )
-    retryable = status in {
-        "failed",
-        "error",
-        "collection_failed",
-        "not_cataloged_in_snapshot",
-    }
-    if (
-        market_type == "cex"
-        and reason_code in NON_RETRYABLE_CEX_DEPTH_REASON_CODES
-    ):
-        retryable = False
+    raw_status = str(market.get("depth_status") or "unavailable").lower()
+    if market_type == "cex":
+        status, reason_code = normalize_cex_source_outcome(
+            raw_status,
+            market.get("depth_reason_code"),
+            market.get("depth_error"),
+        )
+        if (
+            status in {"failed", "error", "collection_failed"}
+            and reason_code is None
+        ):
+            status, reason_code = "collection_failed", "source_unavailable"
+    elif raw_status == "unsupported":
+        status = "unsupported"
+        reason_code = project_dex_unsupported_error(market.get("depth_error"))
+        if reason_code is None:
+            reason_code = "unsupported_source"
+    elif raw_status in {"observed", "complete"}:
+        status, reason_code = "observed", "observed"
+    elif raw_status == "partial":
+        status, reason_code = "partial", "measurement_limit"
+    elif raw_status in {"failed", "error", "collection_failed"}:
+        status, reason_code = "collection_failed", "source_unavailable"
+    else:
+        status, reason_code = raw_status, None
+    outcome = quality_outcome_rule(status, reason_code)
+    retryable = outcome.retryable if outcome is not None else False
     temporal_alignment = {
         "state_observed_at": (
             market.get("depth_block_timestamp")
@@ -3579,8 +3602,36 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
         ),
     }
     quality_flags = list(_quality_flags_for_fact(market, "depth"))
+    if status == "source_no_observation":
+        quality_flags = [
+            flag for flag in quality_flags
+            if flag.get("code") not in {"depth_failed", "failed_depth"}
+        ]
+        quality_flags.append(
+            {
+                "code": "depth_source_no_observation",
+                "severity": "info",
+                "category": "source_outcome",
+                "message": (
+                    "The source responded successfully but supplied no "
+                    "two-sided executable order-book observation."
+                ),
+            }
+        )
     timing_status = temporal_alignment["status"]
-    if market_type == "dex" and timing_status in {"stale", "unavailable"}:
+    measured = (
+        market_type == "dex"
+        and raw_status in {"observed", "partial", "complete"}
+        and any(
+            parse_number(market.get("total_depth_{}bps_usd".format(band)))
+            is not None
+            for band in (10, 25, 50, 100)
+        )
+    )
+    alignment_applicable = (
+        measured and bool(market.get("depth_requires_usd_price_alignment"))
+    )
+    if alignment_applicable and timing_status in {"stale", "unavailable"}:
         quality_flags.append(
             {
                 "code": "depth_usd_price_time_mismatch",
@@ -3596,7 +3647,7 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
                 "threshold": USD_PRICE_SKEW_MAX_SECONDS,
             }
         )
-    elif market_type == "dex" and timing_status == "warning":
+    elif alignment_applicable and timing_status == "warning":
         quality_flags.append(
             {
                 "code": "depth_usd_price_time_warning",
@@ -3633,7 +3684,7 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             source=market.get("depth_source"),
             source_endpoint=market.get("depth_source_endpoint"),
             method=market.get("depth_method"),
-            reason=market.get("depth_error"),
+            reason=reason_code,
             reason_code=reason_code,
             retryable=retryable,
             action="retry_depth_collection" if retryable else None,
@@ -3825,10 +3876,41 @@ def _execution_quality_fact(
             else "mixed_execution_status_reasons"
         )
     )
-    retryable = (
-        status == "failed"
-        and lineage_reason not in NON_RETRYABLE_CEX_DEPTH_REASON_CODES
-    )
+    market_type = str(
+        market.get("market_type") or _one_execution_value(rows, "market_type") or ""
+    ).lower()
+    if market_type == "cex":
+        public_status, public_reason_code = normalize_cex_source_outcome(
+            status,
+            lineage_reason,
+            None,
+        )
+        public_outcome = quality_outcome_rule(
+            public_status, public_reason_code
+        )
+        if public_outcome is not None:
+            status, lineage_reason = public_status, public_reason_code
+            retryable = public_outcome.retryable
+        else:
+            retryable = status == "failed"
+    else:
+        retryable = status == "failed"
+    if status == "source_no_observation":
+        temporal_flags = [
+            flag for flag in temporal_flags
+            if flag.get("category") != "data_health"
+        ]
+        temporal_flags.append(
+            {
+                "code": "execution_source_no_observation",
+                "severity": "info",
+                "category": "source_outcome",
+                "message": (
+                    "The source responded successfully but supplied no "
+                    "two-sided executable order-book observation."
+                ),
+            }
+        )
     return {
         **_quality_lineage(
             status=status,
@@ -3973,10 +4055,20 @@ def build_market_quality(
                 execution_sources[market["market_type"]],
             ),
         }
+        source_no_observation_facts = {
+            name for name, fact in facts.items()
+            if fact.get("status") == "source_no_observation"
+        }
         quality_flags = [
             flag
             for flag in (market.get("quality_flag_details") or [])
-            if flag.get("code") != "low_daily_coverage"
+            if (
+                flag.get("code") != "low_daily_coverage"
+                and not (
+                    "depth" in source_no_observation_facts
+                    and flag.get("code") in {"depth_failed", "failed_depth"}
+                )
+            )
         ]
         known_codes = {
             flag.get("code")

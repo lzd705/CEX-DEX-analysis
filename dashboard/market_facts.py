@@ -910,6 +910,9 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     "depth_raw_response_sha256"
                 ),
                 "depth_error": row.get("depth_error"),
+                "depth_requires_usd_price_alignment": row.get(
+                    "depth_requires_usd_price_alignment", False
+                ),
                 "depth_source_instrument": row.get("depth_source_instrument"),
                 "depth_source_quote_asset": row.get("depth_source_quote_asset"),
                 "depth_quote_conversion_method": row.get(
@@ -1038,6 +1041,9 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "depth_usd_price_freshness_status": row.get(
                     "dex_depth_usd_price_freshness_status"
+                ),
+                "depth_requires_usd_price_alignment": row.get(
+                    "depth_requires_usd_price_alignment", False
                 ),
                 "fee_bps": row.get("fee_bps"),
                 "pool_state_price_usd": row.get("pool_state_price_usd"),

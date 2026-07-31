@@ -2666,6 +2666,42 @@ assert.equal(
         self.assertAlmostEqual(payload["tokens"][0]["price_spread"], 105 / 102 - 1)
         self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)
 
+class DashboardApiTest(unittest.TestCase):
+    def test_dex_depth_quality_rejects_stale_usd_alignment(self):
+        base_market = {
+            "market_type": "dex",
+            "depth_status": "observed",
+            "depth_error": "observed",
+            "total_depth_100bps_usd": 42.0,
+            "depth_requires_usd_price_alignment": True,
+        }
+        stale_fact = server._depth_quality_fact({
+            **base_market,
+            "depth_usd_price_freshness_status": "stale",
+        })
+        warning_fact = server._depth_quality_fact({
+            **base_market,
+            "depth_usd_price_freshness_status": "warning",
+        })
+        no_alignment_fact = server._depth_quality_fact({
+            **base_market,
+            "depth_requires_usd_price_alignment": False,
+            "depth_usd_price_freshness_status": "stale",
+        })
+
+        self.assertIn(
+            "depth_usd_price_time_mismatch",
+            {flag["code"] for flag in stale_fact["quality_flags"]},
+        )
+        self.assertIn(
+            "depth_usd_price_time_warning",
+            {flag["code"] for flag in warning_fact["quality_flags"]},
+        )
+        self.assertFalse({
+            "depth_usd_price_time_mismatch",
+            "depth_usd_price_time_warning",
+        } & {flag["code"] for flag in no_alignment_fact["quality_flags"]})
+
 
 if __name__ == "__main__":
     unittest.main()
