@@ -321,6 +321,252 @@ if (typeof openCustomWindowEditor !== "function") {
         self.assertTrue(result["disabled"])
         self.assertTrue(result["enabled"])
 
+    def test_bound_time_window_commands_apply_only_after_success(self):
+        result = run_app_javascript(
+            """
+function control({ value = "", hidden = false, dataset = {} } = {}) {
+  return {
+    value,
+    hidden,
+    dataset,
+    disabled: false,
+    textContent: "",
+    attributes: {},
+    listeners: {},
+    active: false,
+    focused: false,
+    classList: {
+      owner: null,
+      toggle(name, active) {
+        if (name === "active") this.owner.active = active;
+      },
+    },
+    addEventListener(type, listener) {
+      this.listeners[type] = this.listeners[type] || [];
+      this.listeners[type].push(listener);
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return this.attributes[name] || null; },
+    focus() { this.focused = true; },
+  };
+}
+async function trigger(control, type, event = {}) {
+  for (const listener of control.listeners[type] || []) {
+    await listener({ preventDefault() {}, ...event });
+  }
+}
+const start = control();
+const end = control();
+const error = control({ hidden: true });
+const editor = control({ hidden: true });
+const toggle = control();
+const cancel = control();
+const form = control();
+const summary = control();
+const presets = ["7", "30", "90", "all"].map((days) => control({ dataset: { days } }));
+const genericControls = new Map();
+for (const item of [start, end, error, editor, toggle, cancel, form, summary, ...presets]) {
+  item.classList.owner = item;
+}
+toggle.setAttribute("aria-expanded", "false");
+const elements = {
+  "date-start": start,
+  "date-end": end,
+  "date-window-error": error,
+  "custom-window-editor": editor,
+  "custom-window-toggle": toggle,
+  "cancel-window": cancel,
+  "date-window-form": form,
+  "applied-window-summary": summary,
+};
+global.document = {
+  getElementById(id) {
+    if (elements[id]) return elements[id];
+    if (!genericControls.has(id)) genericControls.set(id, control());
+    return genericControls.get(id);
+  },
+  querySelectorAll(selector) {
+    if (selector === "[data-days]") return presets;
+    return [];
+  },
+  addEventListener() {},
+};
+global.window = {
+  addEventListener() {},
+  visualViewport: null,
+  matchMedia() { return { addEventListener() {} }; },
+};
+app.payload = {
+  metadata: {
+    start_date: "2026-06-30",
+    end_date: "2026-07-29",
+    available_start: "2026-05-01",
+    available_end: "2026-07-29",
+  },
+};
+app.route = { kind: "screener" };
+syncTimeWindowControls();
+let syncCalls = 0;
+const syncOriginal = syncTimeWindowControls;
+syncTimeWindowControls = () => {
+  syncCalls += 1;
+  syncOriginal();
+};
+bindEvents();
+
+await trigger(toggle, "click");
+start.value = "2026-07-20";
+end.value = "2026-07-21";
+showDateWindowError("Choose both dates.");
+await trigger(cancel, "click");
+const cancelled = {
+  start: start.value,
+  end: end.value,
+  errorHidden: error.hidden,
+  error: error.textContent,
+  startInvalid: start.getAttribute("aria-invalid"),
+  endInvalid: end.getAttribute("aria-invalid"),
+  editorHidden: editor.hidden,
+  expanded: toggle.getAttribute("aria-expanded"),
+  focus: toggle.focused,
+};
+
+let applyCalls = 0;
+applyWindow = async () => {
+  applyCalls += 1;
+  app.payload.metadata.start_date = start.value;
+  app.payload.metadata.end_date = end.value;
+  return true;
+};
+await trigger(toggle, "click");
+await trigger(form, "submit");
+const customSuccess = {
+  applyCalls,
+  syncCalls,
+  editorHidden: editor.hidden,
+  expanded: toggle.getAttribute("aria-expanded"),
+  focus: toggle.focused,
+};
+
+applyWindow = async () => {
+  applyCalls += 1;
+  return false;
+};
+await trigger(toggle, "click");
+const syncBeforeFailedCustom = syncCalls;
+await trigger(form, "submit");
+const customFailure = {
+  applyCalls,
+  syncCalls: syncCalls - syncBeforeFailedCustom,
+  editorHidden: editor.hidden,
+  expanded: toggle.getAttribute("aria-expanded"),
+};
+
+app.payload.metadata.start_date = "2026-06-30";
+app.payload.metadata.end_date = "2026-07-29";
+syncOriginal();
+applyCalls = 0;
+const presetResults = [];
+for (const button of presets) {
+  const shouldSucceed = button.dataset.days !== "7";
+  applyWindow = async () => {
+    applyCalls += 1;
+    if (!shouldSucceed) return false;
+    app.payload.metadata.start_date = start.value;
+    app.payload.metadata.end_date = end.value;
+    return true;
+  };
+  setCustomWindowOpen(true);
+  const syncBefore = syncCalls;
+  await trigger(button, "click");
+  presetResults.push({
+    days: button.dataset.days,
+    applyCalls,
+    syncCalls: syncCalls - syncBefore,
+    editorHidden: editor.hidden,
+    expanded: toggle.getAttribute("aria-expanded"),
+    active: presets.filter((item) => item.active).map((item) => item.dataset.days),
+  });
+}
+console.log(JSON.stringify({
+  listenerCounts: {
+    submit: form.listeners.submit?.length || 0,
+    cancel: cancel.listeners.click?.length || 0,
+    custom: toggle.listeners.click?.length || 0,
+    presets: presets.map((button) => button.listeners.click?.length || 0),
+  },
+  cancelled,
+  customSuccess,
+  customFailure,
+  presetResults,
+}));
+"""
+        )
+        self.assertEqual(result["listenerCounts"], {
+            "submit": 1,
+            "cancel": 1,
+            "custom": 1,
+            "presets": [1, 1, 1, 1],
+        })
+        self.assertEqual(result["cancelled"], {
+            "start": "2026-06-30",
+            "end": "2026-07-29",
+            "errorHidden": True,
+            "error": "",
+            "startInvalid": "false",
+            "endInvalid": "false",
+            "editorHidden": True,
+            "expanded": "false",
+            "focus": True,
+        })
+        self.assertEqual(result["customSuccess"], {
+            "applyCalls": 1,
+            "syncCalls": 1,
+            "editorHidden": True,
+            "expanded": "false",
+            "focus": True,
+        })
+        self.assertEqual(result["customFailure"], {
+            "applyCalls": 2,
+            "syncCalls": 0,
+            "editorHidden": False,
+            "expanded": "true",
+        })
+        self.assertEqual(result["presetResults"], [
+            {
+                "days": "7",
+                "applyCalls": 1,
+                "syncCalls": 0,
+                "editorHidden": False,
+                "expanded": "true",
+                "active": ["30"],
+            },
+            {
+                "days": "30",
+                "applyCalls": 2,
+                "syncCalls": 1,
+                "editorHidden": True,
+                "expanded": "false",
+                "active": ["30"],
+            },
+            {
+                "days": "90",
+                "applyCalls": 3,
+                "syncCalls": 1,
+                "editorHidden": True,
+                "expanded": "false",
+                "active": ["all"],
+            },
+            {
+                "days": "all",
+                "applyCalls": 4,
+                "syncCalls": 1,
+                "editorHidden": True,
+                "expanded": "false",
+                "active": ["all"],
+            },
+        ])
+
     def test_expert_context_is_compact_but_remains_accessible(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
         styles = STYLES_PATH.read_text(encoding="utf-8")
