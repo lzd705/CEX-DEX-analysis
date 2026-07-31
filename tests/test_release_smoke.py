@@ -95,6 +95,13 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             expected_generation="generation-1",
         )
         self.assertEqual(parity["market_count"], 2)
+        self.assertEqual(
+            parity["market_ids"],
+            [
+                "cex:binance:AAVE/USDT",
+                "dex:eth:uniswap_v3:pool:AAVE",
+            ],
+        )
         self.assertEqual(parity["status_counts"], {"ok": 2})
         self.assertEqual(parity["alert_counts"], {"info": 1})
 
@@ -164,6 +171,26 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "url message": {**valid_flag, "message": "See https://example.test"},
             "path message": {**valid_flag, "message": "Read /private/data/a.json"},
             "generic path message": {**valid_flag, "message": "Read /srv/app/a.json"},
+            "equals srv path": {
+                **valid_flag,
+                "message": "error=/srv/app/secret",
+            },
+            "colon var path": {
+                **valid_flag,
+                "message": "path:/var/lib/dashboard/data.json",
+            },
+            "colon tmp path": {
+                **valid_flag,
+                "message": "path:/tmp/secret",
+            },
+            "colon etc path": {
+                **valid_flag,
+                "message": "path:/etc/passwd",
+            },
+            "colon opt path": {
+                **valid_flag,
+                "message": "path:/opt/app/secret",
+            },
             "equals home path": {
                 **valid_flag,
                 "message": "error=/home/ugs/secret",
@@ -215,6 +242,21 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             safe_slash,
             expected_generation="generation-1",
         )
+        for safe_message in (
+            "CEX/DEX and TVL/depth remain visible when the value is N/A.",
+            "Punctuation such as :/ or [/] is not itself a source path.",
+            "The A/B comparison uses 1/2 only as ordinary prose.",
+        ):
+            with self.subTest(safe_message=safe_message):
+                safe = self.screening_quality()
+                safe["markets"][0]["screening_quality_flags"][0][
+                    "message"
+                ] = safe_message
+                validate_screening_quality_parity(
+                    self.summary()["tokens"][0],
+                    safe,
+                    expected_generation="generation-1",
+                )
 
     def test_screening_quality_rejects_bad_market_shapes_and_fallbacks(self):
         mutations = []
@@ -415,6 +457,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             token: self.screening_quality(token)
             for token in ("AAVE", "UNI")
         }
+        valid_quality_by_token = copy.deepcopy(quality_by_token)
         full_catalog = {
             "markets": [
                 {
@@ -543,7 +586,36 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         quality_by_token["UNI"]["metadata"]["data_generation"] = "generation-2"
         with self.assertRaisesRegex(ReleaseCheckError, "generation"):
             run_release()
-        quality_by_token["UNI"]["metadata"]["data_generation"] = "generation-1"
+        quality_by_token = copy.deepcopy(valid_quality_by_token)
+
+        quality_by_token["UNI"]["markets"][0]["market_id"] = (
+            quality_by_token["AAVE"]["markets"][0]["market_id"]
+        )
+        with self.assertRaisesRegex(ReleaseCheckError, "reused across Tokens"):
+            run_release()
+        quality_by_token = copy.deepcopy(valid_quality_by_token)
+
+        quality_by_token["AAVE"]["markets"][0]["market_id"] = (
+            "cex:bogus:AAVE/USDT"
+        )
+        with self.assertRaisesRegex(ReleaseCheckError, "exact market inventory"):
+            run_release()
+        quality_by_token = copy.deepcopy(valid_quality_by_token)
+
+        aave_market_id = quality_by_token["AAVE"]["markets"][0]["market_id"]
+        uni_market_id = quality_by_token["UNI"]["markets"][0]["market_id"]
+        quality_by_token["AAVE"]["markets"][0]["market_id"] = uni_market_id
+        quality_by_token["UNI"]["markets"][0]["market_id"] = aave_market_id
+        with self.assertRaisesRegex(ReleaseCheckError, "exact market inventory"):
+            run_release()
+        quality_by_token = copy.deepcopy(valid_quality_by_token)
+
+        substituted_full_catalog = copy.deepcopy(valid_full_markets)
+        substituted_full_catalog[0]["market_id"] = "cex:bogus:AAVE/USDT"
+        full_catalog["markets"] = substituted_full_catalog
+        with self.assertRaisesRegex(ReleaseCheckError, "exact market inventory"):
+            run_release()
+        full_catalog["markets"] = copy.deepcopy(valid_full_markets)
 
         missing_market_token = copy.deepcopy(valid_full_markets)
         missing_market_token[0].pop("token_symbol")

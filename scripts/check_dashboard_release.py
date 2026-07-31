@@ -73,13 +73,10 @@ RAW_URL_PATTERN = re.compile(
     r"\b[a-z][a-z0-9+.-]*://|\bwww\.",
     flags=re.ASCII | re.IGNORECASE,
 )
-PROTECTED_PATH_PATTERN = re.compile(
-    r"(?:^|[\s(\"'])/(?:[a-z0-9._-]+(?:/|\Z))"
-    r"|\b[a-z]:\\",
-    flags=re.ASCII | re.IGNORECASE,
-)
-PROTECTED_POSIX_PREFIX_PATTERN = re.compile(
-    r"/(?:home|private|users)/",
+ABSOLUTE_POSIX_PATH_PATTERN = re.compile(
+    r"(?:^|[^a-z0-9])/"
+    r"(?:[a-z0-9._~][a-z0-9._~-]{0,239}/){0,32}"
+    r"[a-z0-9._~][a-z0-9._~-]{0,239}",
     flags=re.ASCII | re.IGNORECASE,
 )
 CANONICAL_DATE_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
@@ -545,11 +542,7 @@ def _validate_screening_flag(flag: Any) -> dict[str, str]:
         "Quality screening flag message contains a raw URL",
     )
     require(
-        PROTECTED_PATH_PATTERN.search(message) is None,
-        "Quality screening flag message contains a protected path",
-    )
-    require(
-        PROTECTED_POSIX_PREFIX_PATTERN.search(message) is None
+        ABSOLUTE_POSIX_PATH_PATTERN.search(message) is None
         and "\\" not in message,
         "Quality screening flag message contains a protected path",
     )
@@ -676,6 +669,7 @@ def validate_screening_quality_parity(
     return {
         "token_symbol": token,
         "market_count": len(markets),
+        "market_ids": sorted(market_ids),
         "status_counts": actual_status_counts,
         "alert_counts": actual_alert_counts,
     }
@@ -1036,6 +1030,8 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
 
     screening_quality_parity_count = 0
     screening_quality_market_count = 0
+    audited_market_pairs: set[tuple[str, str]] = set()
+    audited_market_ids: set[str] = set()
     for summary_row in summary["tokens"]:
         quality_token = summary_row.get("token_symbol")
         require(
@@ -1058,6 +1054,18 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         )
         screening_quality_parity_count += 1
         screening_quality_market_count += parity["market_count"]
+        for market_id in parity["market_ids"]:
+            market_pair = (quality_token, market_id)
+            require(
+                market_id not in audited_market_ids,
+                "Screening Quality market ID is reused across Tokens",
+            )
+            require(
+                market_pair not in audited_market_pairs,
+                "Screening Quality market identity is duplicated",
+            )
+            audited_market_ids.add(market_id)
+            audited_market_pairs.add(market_pair)
 
     summary_metadata = summary.get("metadata")
     require(isinstance(summary_metadata, dict), "Summary metadata is invalid")
@@ -1109,6 +1117,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
     require(isinstance(full_markets, list), "Full audit catalog has no markets array")
     full_catalog_tokens: set[str] = set()
     full_market_ids: set[str] = set()
+    full_market_pairs: set[tuple[str, str]] = set()
     for market in full_markets:
         require(isinstance(market, dict), "Full audit catalog market is not an object")
         market_token = market.get("token_symbol")
@@ -1131,6 +1140,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
             "Full audit catalog market IDs are not unique",
         )
         full_market_ids.add(market_id)
+        full_market_pairs.add((market_token, market_id))
         full_catalog_tokens.add(market_token)
     require(
         full_catalog_tokens == summary_token_set,
@@ -1143,6 +1153,10 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
     require(
         screening_quality_market_count == len(full_markets),
         "Screening parity market count differs from the full audit catalog",
+    )
+    require(
+        audited_market_pairs == full_market_pairs,
+        "Screening Quality exact market inventory differs from the full catalog",
     )
 
     all_events, events_metrics = fetch_json(

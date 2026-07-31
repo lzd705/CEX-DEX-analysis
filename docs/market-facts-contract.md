@@ -78,7 +78,9 @@ Summary `token_count` must equal its Token rows and
 `catalog_market_count` must equal their summed market counts. Those declared
 totals must equal the audited Quality totals and the full catalog; the full
 catalog must contain the same Token set, valid per-market Token identities, and
-unique nonempty market IDs. Selected quality accepts exactly two distinct
+unique nonempty market IDs. The audited and full-catalog
+`(token_symbol, market_id)` sets must be identical, and one bare Market ID
+cannot be reused across Tokens. Selected quality accepts exactly two distinct
 selected IDs, real integer report counts, and sorted unique canonical
 `YYYY-MM-DD` affected dates.
 

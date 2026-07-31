@@ -129,7 +129,9 @@ count dictionaries must agree; a non-OK market with no structured fallback
 flag or any mid-run generation drift fails the release.
 Summary's typed `token_count` and `catalog_market_count`, the accumulated
 all-Token Quality audit, and the full catalog must form one exact inventory.
-The full catalog must contain the same Token set and valid unique Market rows.
+The full catalog must contain the same Token set and valid unique Market rows;
+its exact `(token_symbol, market_id)` set must equal the Quality audit, with no
+bare Market ID reused across Tokens.
 Selected quality accepts exactly two distinct selected Market IDs; daily audit
 counts are real integers and affected dates are sorted, unique canonical UTC
 dates. Public flag messages containing a raw URL, protected POSIX path, any
