@@ -493,7 +493,12 @@ setWorkspaceCatalogLoading = () => {};
 setWorkspaceDataUnavailable = () => {};
 announceRoute = () => {};
 updateRouteLinks = () => {};
-canonicalizeCurrentRoute = () => {};
+let canonicalizeHook = null;
+canonicalizeCurrentRoute = () => {
+  const hook = canonicalizeHook;
+  canonicalizeHook = null;
+  if (hook) hook();
+};
 replaceCurrentRoute = () => {};
 cachedTokenCatalog = () => null;
 applyWorkspaceRoute = (route) => {
@@ -580,7 +585,60 @@ async function runInterleaving({ bound }) {
 
 const direct = await runInterleaving({ bound: false });
 const bound = await runInterleaving({ bound: true });
-console.log(JSON.stringify({ direct, bound }));
+
+async function runResolvedSuccessGap({ bound }) {
+  routeWindow = { start: "2026-06-30", end: "2026-07-29" };
+  app.payload = payload(routeWindow.start, routeWindow.end);
+  app.visibleTokens = [{ token_symbol: "OLD" }];
+  app.route = globalThis.__workspaceRoute();
+  app.routeReady = true;
+  app.routeRequestId = 0;
+  app.marketRequestId = 0;
+  app.marketController = null;
+  app.catalogController = null;
+  app.catalogsByToken.clear();
+  syncCalls = 0;
+  start.value = routeWindow.start;
+  end.value = routeWindow.end;
+  realSync();
+  setCustomWindowOpen(true);
+  toggle.focusCalls = 0;
+  loadTokenCatalog = async () => ({ metadata: { window: "current" } });
+
+  let newerRoutePromise = null;
+  canonicalizeHook = () => {
+    queueMicrotask(() => {
+      routeWindow = { start: "2026-07-23", end: "2026-07-29" };
+      newerRoutePromise = applyRouteFromLocation();
+    });
+  };
+  const olderCompletion = bound
+    ? trigger(form, "submit")
+    : applyWindow();
+  const olderRouteRequestId = app.routeRequestId;
+  const olderApplied = await olderCompletion;
+  if (!newerRoutePromise) throw new Error("The newer route microtask did not start.");
+  const newerApplied = await newerRoutePromise;
+
+  return {
+    newerApplied,
+    olderApplied: bound ? null : olderApplied,
+    ownershipChanged: olderRouteRequestId !== app.routeRequestId,
+    payloadStart: app.payload.metadata.start_date,
+    visibleTokens: app.visibleTokens.map((token) => token.token_symbol),
+    draft: { start: start.value, end: end.value },
+    summary: summary.textContent,
+    active: presets.filter((button) => button.active).map((button) => button.dataset.days),
+    successOnlySyncCalls: syncCalls,
+    editorHidden: editor.hidden,
+    expanded: toggle.getAttribute("aria-expanded"),
+    focusCalls: toggle.focusCalls,
+  };
+}
+
+const resolvedDirect = await runResolvedSuccessGap({ bound: false });
+const resolvedBound = await runResolvedSuccessGap({ bound: true });
+console.log(JSON.stringify({ direct, bound, resolvedDirect, resolvedBound }));
 """,
             prelude="""
 globalThis.MarketMonitorNavigation = {
@@ -607,6 +665,16 @@ globalThis.MarketMonitorNavigation = {
             },
             "bound": {
                 "olderApplied": None,
+                **newer_state,
+            },
+            "resolvedDirect": {
+                "olderApplied": False,
+                "ownershipChanged": True,
+                **newer_state,
+            },
+            "resolvedBound": {
+                "olderApplied": None,
+                "ownershipChanged": True,
                 **newer_state,
             },
         })
