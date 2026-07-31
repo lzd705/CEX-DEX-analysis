@@ -234,6 +234,10 @@ class SourceGenerationChanged(FileNotFoundError):
     """Signal temporary source unavailability across one response build."""
 
 
+class DepthExecutionCohortError(RuntimeError):
+    """A depth/execution publication does not form one exact cohort."""
+
+
 class PublicClientRequestError(ValueError):
     """A bounded public GET parameter error that is safe to return as HTTP 400."""
 
@@ -790,6 +794,35 @@ def _inventory_observed_at_bounds(
     return min(observed).isoformat(), max(observed).isoformat()
 
 
+def observation_span_seconds(
+    observed_at_min: str | None,
+    observed_at_max: str | None,
+) -> float | None:
+    """Return a nonnegative span for canonical timestamp bounds."""
+    if not observed_at_min or not observed_at_max:
+        return None
+    try:
+        lower = datetime.fromisoformat(
+            observed_at_min.replace("Z", "+00:00")
+        )
+        upper = datetime.fromisoformat(
+            observed_at_max.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+    if (
+        lower.tzinfo is None
+        or lower.utcoffset() is None
+        or upper.tzinfo is None
+        or upper.utcoffset() is None
+    ):
+        return None
+    span = (
+        upper.astimezone(timezone.utc) - lower.astimezone(timezone.utc)
+    ).total_seconds()
+    return max(0.0, span)
+
+
 @lru_cache(maxsize=8)
 def _load_tvl_snapshot_cached(
     path_text: str,
@@ -1020,6 +1053,10 @@ def _load_cex_depth_snapshot_cached(
         "observed_at": observed_at_min,
         "observed_at_min": observed_at_min,
         "observed_at_max": observed_at_max,
+        "observation_span_seconds": observation_span_seconds(
+            observed_at_min,
+            observed_at_max,
+        ),
         "status_counts": {
             status: sum(row.get("status") == status for row in rows)
             for status in ("observed", "partial", "failed")
@@ -1164,6 +1201,9 @@ def overlay_cex_depth_snapshot(
         "observed_at": snapshot["observed_at"],
         "observed_at_min": snapshot["observed_at_min"],
         "observed_at_max": snapshot["observed_at_max"],
+        "observation_span_seconds": snapshot[
+            "observation_span_seconds"
+        ],
         "market_rows": len(snapshot["rows"]),
         "matched_market_rows": matched,
         "status_counts": snapshot["status_counts"],
@@ -1254,6 +1294,10 @@ def _load_dex_depth_snapshot_cached(
         "observed_at": observed_at_min,
         "observed_at_min": observed_at_min,
         "observed_at_max": observed_at_max,
+        "observation_span_seconds": observation_span_seconds(
+            observed_at_min,
+            observed_at_max,
+        ),
         "status_counts": dict(
             Counter(row.get("status") or "missing_status" for row in rows)
         ),
@@ -1425,6 +1469,9 @@ def overlay_dex_depth_snapshot(
         "observed_at": snapshot["observed_at"],
         "observed_at_min": snapshot["observed_at_min"],
         "observed_at_max": snapshot["observed_at_max"],
+        "observation_span_seconds": snapshot[
+            "observation_span_seconds"
+        ],
         "pool_rows": len(snapshot["rows"]),
         "matched_market_rows": matched,
         "status_counts": snapshot["status_counts"],
@@ -2715,6 +2762,27 @@ def _load_execution_cost_snapshot_cached(
         rows = list(reader)
     if not rows:
         raise ValueError(f"{path.name} contains no execution-cost rows")
+    snapshot_values = [row.get("snapshot_id") for row in rows]
+    source_snapshot_values = [
+        row.get("source_snapshot_id") for row in rows
+    ]
+    snapshot_ids = sorted(set(snapshot_values))
+    source_snapshot_ids = sorted(set(source_snapshot_values))
+    if (
+        not all(
+            isinstance(value, str)
+            and bool(value)
+            and value == value.strip()
+            for value in snapshot_values + source_snapshot_values
+        )
+        or len(snapshot_ids) != 1
+        or not snapshot_ids[0]
+        or len(source_snapshot_ids) != 1
+        or not source_snapshot_ids[0]
+    ):
+        raise DepthExecutionCohortError(
+            "Execution publication must contain one exact snapshot lineage"
+        )
     market_ids = {row["market_id"] for row in rows if row.get("market_id")}
     validate_execution_snapshot(market_ids, rows)
     by_market: dict[str, list[dict[str, str]]] = defaultdict(list)
@@ -2735,19 +2803,15 @@ def _load_execution_cost_snapshot_cached(
         "path": path,
         "rows": rows,
         "by_market": by_market,
-        "snapshot_ids": sorted(
-            {row["snapshot_id"] for row in rows if row.get("snapshot_id")}
-        ),
-        "source_snapshot_ids": sorted(
-            {
-                row["source_snapshot_id"]
-                for row in rows
-                if row.get("source_snapshot_id")
-            }
-        ),
+        "snapshot_ids": snapshot_ids,
+        "source_snapshot_ids": source_snapshot_ids,
         "observed_at": observed_at_min,
         "observed_at_min": observed_at_min,
         "observed_at_max": observed_at_max,
+        "observation_span_seconds": observation_span_seconds(
+            observed_at_min,
+            observed_at_max,
+        ),
         "state_observed_at": state_observed_at_min,
         "state_observed_at_min": state_observed_at_min,
         "state_observed_at_max": state_observed_at_max,
@@ -2878,6 +2942,9 @@ def _execution_snapshot_metadata(
         "observed_at": snapshot["observed_at"],
         "observed_at_min": snapshot["observed_at_min"],
         "observed_at_max": snapshot["observed_at_max"],
+        "observation_span_seconds": snapshot[
+            "observation_span_seconds"
+        ],
         "state_observed_at": snapshot["state_observed_at"],
         "state_observed_at_min": snapshot["state_observed_at_min"],
         "state_observed_at_max": snapshot["state_observed_at_max"],
@@ -2885,6 +2952,82 @@ def _execution_snapshot_metadata(
         "row_count": snapshot["row_count"],
         "status_counts": snapshot["status_counts"],
         "source": file_metadata(snapshot["path"]),
+    }
+
+
+def _one_cohort_id(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, list)
+        or len(value) != 1
+        or not isinstance(value[0], str)
+        or not value[0]
+        or value[0] != value[0].strip()
+    ):
+        raise DepthExecutionCohortError(
+            f"{label} must contain exactly one non-empty snapshot ID"
+        )
+    return value[0]
+
+
+def validate_depth_execution_cohort(
+    metadata: dict[str, Any],
+    snapshot: dict[str, Any],
+    market_type: str,
+) -> dict[str, Any]:
+    """Validate one exact depth/execution cohort and return a bounded lineage."""
+    normalized_type = str(market_type or "").strip().lower()
+    if normalized_type not in {"cex", "dex"}:
+        raise DepthExecutionCohortError("Market type is not CEX or DEX")
+    depth = metadata.get(f"{normalized_type}_depth_snapshot")
+    if not isinstance(depth, dict):
+        raise DepthExecutionCohortError(
+            f"{normalized_type.upper()} depth cohort metadata is unavailable"
+        )
+    depth_snapshot_id = _one_cohort_id(
+        depth.get("snapshot_ids"),
+        f"{normalized_type.upper()} depth snapshot_ids",
+    )
+    execution_snapshot_id = _one_cohort_id(
+        snapshot.get("snapshot_ids"),
+        f"{normalized_type.upper()} execution snapshot_ids",
+    )
+    execution_source_snapshot_id = _one_cohort_id(
+        snapshot.get("source_snapshot_ids"),
+        f"{normalized_type.upper()} execution source_snapshot_ids",
+    )
+    if len(
+        {
+            depth_snapshot_id,
+            execution_snapshot_id,
+            execution_source_snapshot_id,
+        }
+    ) != 1:
+        raise DepthExecutionCohortError(
+            f"{normalized_type.upper()} depth/execution snapshot IDs differ"
+        )
+
+    depth_count_field = (
+        "market_rows" if normalized_type == "cex" else "pool_rows"
+    )
+    depth_market_count = depth.get(depth_count_field)
+    execution_market_count = snapshot.get("market_count")
+    if (
+        type(depth_market_count) is not int
+        or depth_market_count < 1
+        or type(execution_market_count) is not int
+        or execution_market_count < 1
+        or execution_market_count != depth_market_count
+    ):
+        raise DepthExecutionCohortError(
+            f"{normalized_type.upper()} depth/execution market counts differ"
+        )
+    return {
+        "market_type": normalized_type,
+        "depth_snapshot_id": depth_snapshot_id,
+        "execution_snapshot_id": execution_snapshot_id,
+        "execution_source_snapshot_id": execution_source_snapshot_id,
+        "depth_market_count": depth_market_count,
+        "execution_market_count": execution_market_count,
     }
 
 
@@ -2931,6 +3074,15 @@ def build_execution_cost_comparison(
             snapshot_paths[market_type]()
         )
         for market_type in selected_market_types
+    }
+    cohort_lineage = {
+        market_type: validate_depth_execution_cohort(
+            catalog["metadata"],
+            snapshot,
+            market_type,
+        )
+        for market_type, snapshot in snapshots.items()
+        if snapshot is not None
     }
 
     def market_result(market: dict[str, Any]) -> dict[str, Any]:
@@ -3039,6 +3191,8 @@ def build_execution_cost_comparison(
                 "conversions have no independent price timestamp."
             ),
             "snapshot_skew_seconds": skew,
+            "cohort_observation_model": "bounded_sequential_observations",
+            "cohort_lineage": cohort_lineage,
             "snapshots": {
                 market_type: _execution_snapshot_metadata(snapshot)
                 for market_type, snapshot in snapshots.items()
@@ -4415,14 +4569,27 @@ def build_market_quality(
     for issue in selected_report_issues:
         report_issues_by_market[issue["market_id"]].append(issue)
 
-    execution_sources = {
-        "cex": _execution_quality_source(
-            resolve_cex_execution_cost_path
-        ),
-        "dex": _execution_quality_source(
-            resolve_dex_execution_cost_path
-        ),
+    selected_market_types = {
+        market["market_type"] for market in token_markets
     }
+    execution_resolvers = {
+        "cex": resolve_cex_execution_cost_path,
+        "dex": resolve_dex_execution_cost_path,
+    }
+    execution_sources = {
+        market_type: _execution_quality_source(
+            execution_resolvers[market_type]
+        )
+        for market_type in selected_market_types
+    }
+    for market_type, source_state in execution_sources.items():
+        snapshot = source_state["snapshot"]
+        if snapshot is not None:
+            validate_depth_execution_cohort(
+                catalog["metadata"],
+                snapshot,
+                market_type,
+            )
     quality_markets = []
     for market in token_markets:
         screening = screening_quality_projection(market)
@@ -5958,6 +6125,8 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 )
             except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except DepthExecutionCohortError:
+                self.send_public_data_validation_error()
             except ValueError:
                 self.send_public_data_validation_error()
             return
@@ -5972,6 +6141,8 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 )
             except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except DepthExecutionCohortError:
+                self.send_public_data_validation_error()
             except ValueError:
                 self.send_public_data_validation_error()
             return

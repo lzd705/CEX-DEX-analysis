@@ -1,5 +1,6 @@
 import csv
 import gzip
+import inspect
 import json
 import shutil
 import subprocess
@@ -151,6 +152,222 @@ class MarketMonitorServerTest(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
+    def cohort_validator(self):
+        validator = getattr(
+            server,
+            "validate_depth_execution_cohort",
+            None,
+        )
+        self.assertIsNotNone(
+            validator,
+            "validate_depth_execution_cohort must be implemented",
+        )
+        return validator
+
+    @staticmethod
+    def cohort_fixture(market_type="cex"):
+        row_count_field = "market_rows" if market_type == "cex" else "pool_rows"
+        metadata = {
+            f"{market_type}_depth_snapshot": {
+                "snapshot_ids": [f"{market_type}-cohort-1"],
+                "observed_at_min": "2026-01-02T00:00:00+00:00",
+                "observed_at_max": "2026-01-02T00:00:07+00:00",
+                "observation_span_seconds": 7,
+                row_count_field: 2,
+            }
+        }
+        snapshot = {
+            "snapshot_ids": [f"{market_type}-cohort-1"],
+            "source_snapshot_ids": [f"{market_type}-cohort-1"],
+            "observed_at_min": "2026-01-02T00:00:08+00:00",
+            "observed_at_max": "2026-01-02T00:00:12+00:00",
+            "observation_span_seconds": 4,
+            "market_count": 2,
+        }
+        return metadata, snapshot
+
+    def test_matching_depth_execution_cohort_returns_one_bounded_projection(self):
+        metadata, snapshot = self.cohort_fixture()
+
+        projection = self.cohort_validator()(metadata, snapshot, "cex")
+
+        self.assertEqual(
+            projection,
+            {
+                "market_type": "cex",
+                "depth_snapshot_id": "cex-cohort-1",
+                "execution_snapshot_id": "cex-cohort-1",
+                "execution_source_snapshot_id": "cex-cohort-1",
+                "depth_market_count": 2,
+                "execution_market_count": 2,
+            },
+        )
+
+    def test_depth_execution_cohort_rejects_wrong_lineage_ids(self):
+        mutations = (
+            ("snapshot_ids", ["wrong-execution-snapshot"]),
+            ("source_snapshot_ids", ["wrong-source-snapshot"]),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                metadata, snapshot = self.cohort_fixture()
+                snapshot[field] = value
+                with self.assertRaises(RuntimeError):
+                    self.cohort_validator()(metadata, snapshot, "cex")
+
+    def test_depth_execution_cohort_rejects_multiple_lineage_ids(self):
+        mutations = (
+            ("depth", "snapshot_ids"),
+            ("execution", "snapshot_ids"),
+            ("execution", "source_snapshot_ids"),
+        )
+        for location, field in mutations:
+            with self.subTest(location=location, field=field):
+                metadata, snapshot = self.cohort_fixture()
+                target = (
+                    metadata["cex_depth_snapshot"]
+                    if location == "depth"
+                    else snapshot
+                )
+                target[field] = ["cex-cohort-1", "cex-cohort-2"]
+                with self.assertRaises(RuntimeError):
+                    self.cohort_validator()(metadata, snapshot, "cex")
+
+    def test_execution_loader_classifies_multiple_ids_as_cohort_mismatch(self):
+        market_id = "cex:binance:BTC/USDT"
+        error_type = getattr(server, "DepthExecutionCohortError", RuntimeError)
+        for field, value in (
+            ("snapshot_id", "cex-depth-2"),
+            ("source_snapshot_id", "cex-depth-2"),
+            ("snapshot_id", " cex-depth-1 "),
+        ):
+            with self.subTest(field=field, value=value):
+                rows = self.execution_rows(
+                    market_id,
+                    "cex",
+                    state_observed_at="2026-01-02T00:00:00+00:00",
+                )
+                rows[-1][field] = value
+                write_csv(
+                    self.cex_execution_path,
+                    EXECUTION_COST_COLUMNS,
+                    rows,
+                )
+                server._load_execution_cost_snapshot_cached.cache_clear()
+                try:
+                    server.load_execution_cost_snapshot(
+                        self.cex_execution_path
+                    )
+                except error_type:
+                    pass
+                except ValueError:
+                    self.fail(
+                        "execution lineage mismatch must use the cohort error"
+                    )
+                else:
+                    self.fail("execution lineage mismatch was accepted")
+
+    def test_depth_execution_cohort_rejects_market_count_mismatch(self):
+        metadata, snapshot = self.cohort_fixture("dex")
+        snapshot["market_count"] = 1
+
+        with self.assertRaises(RuntimeError):
+            self.cohort_validator()(metadata, snapshot, "dex")
+
+    def test_depth_execution_cohort_span_uses_canonical_bounds_and_preserves_null(self):
+        span = getattr(server, "observation_span_seconds", None)
+        self.assertIsNotNone(
+            span,
+            "observation_span_seconds must be implemented",
+        )
+        self.assertEqual(
+            span(
+                "2026-01-02T00:00:07+00:00",
+                "2026-01-02T00:00:12+00:00",
+            ),
+            5,
+        )
+        self.assertGreaterEqual(
+            span(
+                "2026-01-02T00:00:12+00:00",
+                "2026-01-02T00:00:07+00:00",
+            ),
+            0,
+        )
+        self.assertIsNone(span(None, "2026-01-02T00:00:07+00:00"))
+
+    def test_cex_depth_cohort_metadata_exposes_canonical_observation_span(self):
+        depth_row = {field: "" for field in DEPTH_COLUMNS_ALL}
+        depth_row.update(
+            {
+                "snapshot_id": "cex-cohort-1",
+                "observed_at": "2026-01-02T00:00:07+00:00",
+                "response_received_at": "2026-01-02T00:00:08+00:00",
+                "token_symbol": "BTC",
+                "exchange": "binance",
+                "cex_symbol": "BTC/USDT",
+                "source_instrument": "BTCUSDT",
+                "source_quote_asset": "USDT",
+                "quote_conversion_method": "USDT=USD proxy",
+                "depth_method": "midpoint_symmetric_quote_notional",
+                "source_endpoint": "https://example.test/depth",
+                "raw_response_sha256": "a" * 64,
+                "status": "observed",
+            }
+        )
+        write_csv(self.depth_path, DEPTH_COLUMNS_ALL, [depth_row])
+
+        snapshot = server._load_cex_depth_snapshot_cached(
+            str(self.depth_path),
+            server.data_signature([self.depth_path]),
+        )
+
+        self.assertIn("observation_span_seconds", snapshot)
+        self.assertEqual(snapshot["observation_span_seconds"], 0)
+
+    def test_depth_execution_cohort_mismatch_is_http_503_for_public_fact_routes(self):
+        error_type = getattr(server, "DepthExecutionCohortError", None)
+        self.assertIsNotNone(
+            error_type,
+            "DepthExecutionCohortError must be implemented",
+        )
+        paths = (
+            "/api/markets/execution-cost?token=BTC&market_a=a&market_b=b",
+            (
+                "/api/markets/quality?token=BTC&scope=selected"
+                "&market_a=a&market_b=b"
+            ),
+        )
+        expected = {
+            "code": "public_data_validation_failed",
+            "message": (
+                "Published market fact data failed validation. "
+                "Retry after the next refresh."
+            ),
+        }
+        for path in paths:
+            with self.subTest(path=path):
+                handler = object.__new__(server.MarketMonitorHandler)
+                handler.path = path
+                with patch.object(
+                    server.MarketMonitorHandler,
+                    "send_public_api",
+                    side_effect=error_type("private cohort mismatch"),
+                ), patch.object(
+                    server.MarketMonitorHandler,
+                    "send_json",
+                ) as send_json:
+                    try:
+                        handler.do_GET()
+                    except RuntimeError:
+                        pass
+
+                send_json.assert_called_once_with(expected, 503)
+                self.assertNotIn(
+                    "private cohort mismatch",
+                    json.dumps(send_json.call_args.args[0]),
+                )
+
     def test_warm_default_market_summary_uses_current_cache_generation(self):
         source_signature = (("market_facts.sqlite3", 10, 20),)
         with (
@@ -261,7 +478,7 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "excluded_costs": "gas,router_fee,transfer_tax,MEV",
             }
         common = {
-            "snapshot_id": f"{market_type}-execution-1",
+            "snapshot_id": f"{market_type}-depth-1",
             "source_snapshot_id": f"{market_type}-depth-1",
             "calculation_method": f"{market_type}_fixture_walk",
             "observed_at": "2026-01-02T00:02:00+00:00",
@@ -352,6 +569,78 @@ class MarketMonitorServerTest(unittest.TestCase):
                     )
                 )
         return rows
+
+    def write_cex_depth_cohort(self, markets):
+        rows = []
+        for market in markets:
+            row = {field: "" for field in DEPTH_COLUMNS_ALL}
+            row.update(
+                {
+                    "snapshot_id": "cex-depth-1",
+                    "observed_at": market.get(
+                        "observed_at",
+                        "2026-01-02T00:00:00+00:00",
+                    ),
+                    "response_received_at": market.get(
+                        "observed_at",
+                        "2026-01-02T00:00:00+00:00",
+                    ),
+                    "token_symbol": market.get("token_symbol", "BTC"),
+                    "exchange": market["exchange"],
+                    "cex_symbol": market.get("cex_symbol", "BTC/USDT"),
+                    "source_instrument": market.get(
+                        "source_instrument",
+                        "BTCUSDT",
+                    ),
+                    "source_quote_asset": "USDT",
+                    "quote_conversion_method": "USDT=USD proxy",
+                    "depth_method": "midpoint_symmetric_quote_notional",
+                    "source_endpoint": "https://example.test/depth",
+                    "raw_response_sha256": "d" * 64,
+                    "status": "observed",
+                }
+            )
+            rows.append(row)
+        write_csv(self.depth_path, DEPTH_COLUMNS_ALL, rows)
+
+    def write_dex_depth_cohort(self, pools):
+        rows = []
+        for pool in pools:
+            row = {field: "" for field in DEX_DEPTH_COLUMNS}
+            row.update(
+                {
+                    "snapshot_id": "dex-depth-1",
+                    "observed_at": pool.get(
+                        "observed_at",
+                        "2026-01-02T00:00:00+00:00",
+                    ),
+                    "response_received_at": pool.get(
+                        "observed_at",
+                        "2026-01-02T00:00:00+00:00",
+                    ),
+                    "token_symbol": pool.get("token_symbol", "BTC"),
+                    "chain": pool["chain"],
+                    "dex": pool["dex"],
+                    "pool_address": pool["pool_address"],
+                    "protocol_model": pool.get(
+                        "protocol_model",
+                        "constant_product_v2",
+                    ),
+                    "block_number": pool.get("block_number", "123"),
+                    "block_timestamp": pool.get(
+                        "observed_at",
+                        "2026-01-02T00:00:00+00:00",
+                    ),
+                    "depth_method": (
+                        "fixed_block_pool_state_marginal_price_band"
+                    ),
+                    "source_endpoint": "https://example.test/depth",
+                    "raw_response_sha256": "d" * 64,
+                    "status": "observed",
+                }
+            )
+            rows.append(row)
+        write_csv(self.dex_depth_path, DEX_DEPTH_COLUMNS, rows)
 
     def test_parse_number_preserves_missing_values(self):
         self.assertIsNone(server.parse_number(""))
@@ -1817,6 +2106,16 @@ class MarketMonitorServerTest(unittest.TestCase):
     def test_execution_cost_api_returns_long_form_source_backed_facts(self):
         cex_id = "cex:binance:BTC/USDT"
         dex_id = "dex:eth:uniswap:0xpool:BTC"
+        self.write_cex_depth_cohort([{"exchange": "binance"}])
+        self.write_dex_depth_cohort(
+            [
+                {
+                    "chain": "eth",
+                    "dex": "uniswap",
+                    "pool_address": "0xpool",
+                }
+            ]
+        )
         write_csv(
             self.cex_execution_path,
             EXECUTION_COST_COLUMNS,
@@ -1837,6 +2136,8 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         environment = {
             **self.environment,
+            "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
+            "MARKET_DEX_DEPTH_DATA": str(self.dex_depth_path),
             "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
             "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
         }
@@ -1891,6 +2192,16 @@ class MarketMonitorServerTest(unittest.TestCase):
     def test_stale_dex_price_time_withholds_public_execution_and_flags_quality(self):
         cex_id = "cex:binance:BTC/USDT"
         dex_id = "dex:eth:uniswap:0xpool:BTC"
+        self.write_cex_depth_cohort([{"exchange": "binance"}])
+        self.write_dex_depth_cohort(
+            [
+                {
+                    "chain": "eth",
+                    "dex": "uniswap",
+                    "pool_address": "0xpool",
+                }
+            ]
+        )
         write_csv(
             self.cex_execution_path,
             EXECUTION_COST_COLUMNS,
@@ -1912,6 +2223,8 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         environment = {
             **self.environment,
+            "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
+            "MARKET_DEX_DEPTH_DATA": str(self.dex_depth_path),
             "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
             "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
         }
@@ -1970,6 +2283,7 @@ class MarketMonitorServerTest(unittest.TestCase):
 
     def test_execution_cost_api_does_not_load_an_unselected_broken_source(self):
         cex_id = "cex:binance:BTC/USDT"
+        self.write_cex_depth_cohort([{"exchange": "binance"}])
         write_csv(
             self.cex_execution_path,
             EXECUTION_COST_COLUMNS,
@@ -1982,6 +2296,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.dex_execution_path.write_text("broken\nvalue\n", encoding="utf-8")
         environment = {
             **self.environment,
+            "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
             "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
             "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
         }
@@ -2290,6 +2605,24 @@ class MarketMonitorServerTest(unittest.TestCase):
                     "50",
                 ]
             )
+        self.write_cex_depth_cohort(
+            [
+                {"exchange": "binance"},
+                {
+                    "exchange": "okx",
+                    "source_instrument": "BTC-USDT",
+                },
+            ]
+        )
+        self.write_dex_depth_cohort(
+            [
+                {
+                    "chain": "eth",
+                    "dex": "uniswap",
+                    "pool_address": "0xpool",
+                }
+            ]
+        )
         write_csv(
             self.cex_execution_path,
             EXECUTION_COST_COLUMNS,
@@ -2322,6 +2655,8 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         environment = {
             **self.environment,
+            "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
+            "MARKET_DEX_DEPTH_DATA": str(self.dex_depth_path),
             "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
             "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
         }
@@ -2548,6 +2883,7 @@ class MarketMonitorServerTest(unittest.TestCase):
 
     def test_quality_api_reports_partial_execution_without_cost_claim(self):
         binance_id = "cex:binance:BTC/USDT"
+        self.write_cex_depth_cohort([{"exchange": "binance"}])
         write_csv(
             self.cex_execution_path,
             EXECUTION_COST_COLUMNS,
@@ -2560,6 +2896,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         environment = {
             **self.environment,
+            "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
             "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
         }
         server.clear_runtime_caches()
@@ -2608,7 +2945,7 @@ class MarketMonitorServerTest(unittest.TestCase):
                 ]
             )
         solana_common = {
-            "snapshot_id": "dex-execution-1",
+            "snapshot_id": "dex-depth-1",
             "source_snapshot_id": "dex-depth-1",
             "calculation_method": "unsupported_pool_model",
             "observed_at": "2026-01-02T00:02:00+00:00",
@@ -2646,8 +2983,24 @@ class MarketMonitorServerTest(unittest.TestCase):
                 *solana_rows,
             ],
         )
+        self.write_dex_depth_cohort(
+            [
+                {
+                    "chain": "eth",
+                    "dex": "uniswap",
+                    "pool_address": "0xpool",
+                },
+                {
+                    "chain": "solana",
+                    "dex": "orca",
+                    "pool_address": solana_address,
+                    "protocol_model": "unsupported",
+                },
+            ]
+        )
         environment = {
             **self.environment,
+            "MARKET_DEX_DEPTH_DATA": str(self.dex_depth_path),
             "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
         }
         server.clear_runtime_caches()

@@ -1486,11 +1486,17 @@ def validate_execution(
     market_a: str,
     market_b: str,
     expected_generation: str,
+    catalog_metadata: dict[str, Any],
 ) -> None:
     metadata = payload.get("metadata") or {}
     require(
         metadata.get("data_generation") == expected_generation,
         "Summary and Execution generations differ",
+    )
+    require(
+        metadata.get("cohort_observation_model")
+        == "bounded_sequential_observations",
+        "Execution cohort observation model is invalid",
     )
     require(payload.get("token_symbol") == token, "Execution returned wrong Token")
     expected_scenarios = {
@@ -1498,6 +1504,7 @@ def validate_execution(
         for direction in EXECUTION_DIRECTIONS
         for notional in COLLECTED_NOTIONALS
     }
+    selected_market_types: dict[str, list[dict[str, Any]]] = {}
     has_measured_rows = False
     for label, expected_market in (
         ("market_a", market_a),
@@ -1531,6 +1538,121 @@ def validate_execution(
         )
         has_measured_rows = has_measured_rows or any(
             row.get("status") in {"observed", "partial"} for row in rows
+        )
+        market_type = expected_market.split(":", 1)[0]
+        require(
+            market_type in {"cex", "dex"},
+            f"Execution {label} market type is invalid",
+        )
+        selected_market_types.setdefault(market_type, []).extend(rows)
+
+    snapshots = metadata.get("snapshots")
+    cohort_lineage = metadata.get("cohort_lineage")
+    require(
+        isinstance(snapshots, dict)
+        and isinstance(cohort_lineage, dict),
+        "Execution cohort metadata is missing",
+    )
+    expected_market_types = set(selected_market_types)
+    require(
+        set(snapshots) == expected_market_types
+        and set(cohort_lineage) == expected_market_types,
+        "Execution cohort metadata is not bounded to selected market types",
+    )
+    lineage_fields = {
+        "market_type",
+        "depth_snapshot_id",
+        "execution_snapshot_id",
+        "execution_source_snapshot_id",
+        "depth_market_count",
+        "execution_market_count",
+    }
+    for market_type, rows in selected_market_types.items():
+        depth = catalog_metadata.get(f"{market_type}_depth_snapshot")
+        snapshot = snapshots.get(market_type)
+        lineage = cohort_lineage.get(market_type)
+        require(
+            isinstance(depth, dict)
+            and isinstance(snapshot, dict)
+            and isinstance(lineage, dict),
+            f"Execution {market_type.upper()} cohort metadata is missing",
+        )
+
+        def one_id(value: Any, label: str) -> str:
+            require(
+                isinstance(value, list)
+                and len(value) == 1
+                and isinstance(value[0], str)
+                and bool(value[0])
+                and value[0] == value[0].strip(),
+                label,
+            )
+            return value[0]
+
+        depth_snapshot_id = one_id(
+            depth.get("snapshot_ids"),
+            f"Execution {market_type.upper()} depth lineage is invalid",
+        )
+        execution_snapshot_id = one_id(
+            snapshot.get("snapshot_ids"),
+            f"Execution {market_type.upper()} snapshot lineage is invalid",
+        )
+        execution_source_snapshot_id = one_id(
+            snapshot.get("source_snapshot_ids"),
+            f"Execution {market_type.upper()} source lineage is invalid",
+        )
+        row_snapshot_values = [row.get("snapshot_id") for row in rows]
+        row_source_snapshot_values = [
+            row.get("source_snapshot_id") for row in rows
+        ]
+        require(
+            all(
+                isinstance(value, str)
+                and bool(value)
+                and value == value.strip()
+                for value in (
+                    row_snapshot_values + row_source_snapshot_values
+                )
+            ),
+            f"Execution {market_type.upper()} row lineage is invalid",
+        )
+        row_snapshot_ids = set(row_snapshot_values)
+        row_source_snapshot_ids = set(row_source_snapshot_values)
+        require(
+            {
+                depth_snapshot_id,
+                execution_snapshot_id,
+                execution_source_snapshot_id,
+            }
+            == {depth_snapshot_id}
+            and row_snapshot_ids == {depth_snapshot_id}
+            and row_source_snapshot_ids == {depth_snapshot_id},
+            f"Execution {market_type.upper()} cohort snapshot IDs differ",
+        )
+        depth_count_field = (
+            "market_rows" if market_type == "cex" else "pool_rows"
+        )
+        depth_market_count = depth.get(depth_count_field)
+        execution_market_count = snapshot.get("market_count")
+        require(
+            type(depth_market_count) is int
+            and depth_market_count > 0
+            and type(execution_market_count) is int
+            and execution_market_count == depth_market_count,
+            f"Execution {market_type.upper()} cohort market counts differ",
+        )
+        expected_lineage = {
+            "market_type": market_type,
+            "depth_snapshot_id": depth_snapshot_id,
+            "execution_snapshot_id": execution_snapshot_id,
+            "execution_source_snapshot_id": execution_source_snapshot_id,
+            "depth_market_count": depth_market_count,
+            "execution_market_count": execution_market_count,
+        }
+        require(
+            set(lineage) == lineage_fields
+            and lineage == expected_lineage,
+            f"Execution {market_type.upper()} cohort lineage differs from catalog",
         )
     require(
         has_measured_rows,
@@ -2130,6 +2252,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         market_a=market_a,
         market_b=market_b,
         expected_generation=generation,
+        catalog_metadata=full_catalog.get("metadata") or {},
     )
 
     final_summary, final_summary_metrics = fetch_json(

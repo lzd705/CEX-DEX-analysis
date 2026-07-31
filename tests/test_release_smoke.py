@@ -1,5 +1,6 @@
 import argparse
 import copy
+import inspect
 import unittest
 from contextlib import ExitStack
 from unittest.mock import patch
@@ -1568,6 +1569,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     )
 
         def execution_rows(market_id, status):
+            cohort_id = f"{market_id.split(':', 1)[0]}-cohort-1"
             return [
                 {
                     "market_id": market_id,
@@ -1575,13 +1577,48 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     "direction": direction,
                     "requested_notional_usd": notional,
                     "status": status,
+                    "snapshot_id": cohort_id,
+                    "source_snapshot_id": cohort_id,
                 }
                 for direction in ("sell_token", "buy_token")
                 for notional in (1_000, 5_000, 10_000, 50_000, 100_000)
             ]
 
         execution = {
-            "metadata": {"data_generation": "generation-1"},
+            "metadata": {
+                "data_generation": "generation-1",
+                "cohort_observation_model": "bounded_sequential_observations",
+                "snapshots": {
+                    "cex": {
+                        "snapshot_ids": ["cex-cohort-1"],
+                        "source_snapshot_ids": ["cex-cohort-1"],
+                        "market_count": 1,
+                    },
+                    "dex": {
+                        "snapshot_ids": ["dex-cohort-1"],
+                        "source_snapshot_ids": ["dex-cohort-1"],
+                        "market_count": 1,
+                    },
+                },
+                "cohort_lineage": {
+                    "cex": {
+                        "market_type": "cex",
+                        "depth_snapshot_id": "cex-cohort-1",
+                        "execution_snapshot_id": "cex-cohort-1",
+                        "execution_source_snapshot_id": "cex-cohort-1",
+                        "depth_market_count": 1,
+                        "execution_market_count": 1,
+                    },
+                    "dex": {
+                        "market_type": "dex",
+                        "depth_snapshot_id": "dex-cohort-1",
+                        "execution_snapshot_id": "dex-cohort-1",
+                        "execution_source_snapshot_id": "dex-cohort-1",
+                        "depth_market_count": 1,
+                        "execution_market_count": 1,
+                    },
+                },
+            },
             "token_symbol": "AAVE",
             "market_a": {
                 "market": {"market_id": market_a},
@@ -1594,12 +1631,27 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "rows": execution_rows(market_b, "unsupported"),
             },
         }
+        catalog_metadata = {
+            "cex_depth_snapshot": {
+                "snapshot_ids": ["cex-cohort-1"],
+                "market_rows": 1,
+            },
+            "dex_depth_snapshot": {
+                "snapshot_ids": ["dex-cohort-1"],
+                "pool_rows": 1,
+            },
+        }
+        self.assertIn(
+            "catalog_metadata",
+            inspect.signature(validate_execution).parameters,
+        )
         validate_execution(
             execution,
             token="AAVE",
             market_a=market_a,
             market_b=market_b,
             expected_generation="generation-1",
+            catalog_metadata=catalog_metadata,
         )
         stale_execution = copy.deepcopy(execution)
         stale_execution["metadata"]["data_generation"] = "generation-2"
@@ -1610,6 +1662,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 market_a=market_a,
                 market_b=market_b,
                 expected_generation="generation-1",
+                catalog_metadata=catalog_metadata,
             )
         unsupported_execution = {
             **execution,
@@ -1625,7 +1678,167 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 market_a=market_a,
                 market_b=market_b,
                 expected_generation="generation-1",
+                catalog_metadata=catalog_metadata,
             )
+
+    def test_release_execution_cohort_lineage_counterexamples_fail_closed(self):
+        market_a = "cex:binance:AAVE/USDT"
+        market_b = "dex:eth:uniswap_v3:pool:AAVE"
+
+        def rows(market_id, cohort_id, status):
+            return [
+                {
+                    "market_id": market_id,
+                    "token_symbol": "AAVE",
+                    "direction": direction,
+                    "requested_notional_usd": notional,
+                    "status": status,
+                    "snapshot_id": cohort_id,
+                    "source_snapshot_id": cohort_id,
+                }
+                for direction in ("sell_token", "buy_token")
+                for notional in (1_000, 5_000, 10_000, 50_000, 100_000)
+            ]
+
+        def lineage(market_type, cohort_id):
+            return {
+                "market_type": market_type,
+                "depth_snapshot_id": cohort_id,
+                "execution_snapshot_id": cohort_id,
+                "execution_source_snapshot_id": cohort_id,
+                "depth_market_count": 1,
+                "execution_market_count": 1,
+            }
+
+        payload = {
+            "metadata": {
+                "data_generation": "generation-1",
+                "cohort_observation_model": "bounded_sequential_observations",
+                "snapshots": {
+                    "cex": {
+                        "snapshot_ids": ["cex-cohort-1"],
+                        "source_snapshot_ids": ["cex-cohort-1"],
+                        "market_count": 1,
+                    },
+                    "dex": {
+                        "snapshot_ids": ["dex-cohort-1"],
+                        "source_snapshot_ids": ["dex-cohort-1"],
+                        "market_count": 1,
+                    },
+                },
+                "cohort_lineage": {
+                    "cex": lineage("cex", "cex-cohort-1"),
+                    "dex": lineage("dex", "dex-cohort-1"),
+                },
+            },
+            "token_symbol": "AAVE",
+            "market_a": {
+                "market": {
+                    "market_id": market_a,
+                    "market_type": "cex",
+                },
+                "status": "available",
+                "rows": rows(market_a, "cex-cohort-1", "observed"),
+            },
+            "market_b": {
+                "market": {
+                    "market_id": market_b,
+                    "market_type": "dex",
+                },
+                "status": "available",
+                "rows": rows(market_b, "dex-cohort-1", "unsupported"),
+            },
+        }
+        catalog_metadata = {
+            "cex_depth_snapshot": {
+                "snapshot_ids": ["cex-cohort-1"],
+                "market_rows": 1,
+            },
+            "dex_depth_snapshot": {
+                "snapshot_ids": ["dex-cohort-1"],
+                "pool_rows": 1,
+            },
+        }
+        self.assertIn(
+            "catalog_metadata",
+            inspect.signature(validate_execution).parameters,
+        )
+        validate_execution(
+            payload,
+            token="AAVE",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation="generation-1",
+            catalog_metadata=catalog_metadata,
+        )
+
+        simultaneous_claim = copy.deepcopy(payload)
+        simultaneous_claim["metadata"]["cohort_observation_model"] = (
+            "simultaneous_observations"
+        )
+        with self.assertRaises(ReleaseCheckError):
+            validate_execution(
+                simultaneous_claim,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+                catalog_metadata=catalog_metadata,
+            )
+
+        for metadata_field in ("cohort_lineage", "snapshots"):
+            with self.subTest(extra_metadata=metadata_field):
+                invalid = copy.deepcopy(payload)
+                invalid["metadata"][metadata_field]["unexpected"] = {
+                    "simultaneous": True,
+                }
+                with self.assertRaises(ReleaseCheckError):
+                    validate_execution(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                        catalog_metadata=catalog_metadata,
+                    )
+
+        counterexamples = {
+            "market_type": "dex",
+            "depth_snapshot_id": "wrong-depth",
+            "execution_snapshot_id": "wrong-execution",
+            "execution_source_snapshot_id": "wrong-source",
+            "depth_market_count": 2,
+            "execution_market_count": 2,
+        }
+        for field, wrong_value in counterexamples.items():
+            with self.subTest(field=field):
+                invalid = copy.deepcopy(payload)
+                invalid["metadata"]["cohort_lineage"]["cex"][field] = (
+                    wrong_value
+                )
+                with self.assertRaises(ReleaseCheckError):
+                    validate_execution(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                        catalog_metadata=catalog_metadata,
+                    )
+
+        for field in ("snapshot_id", "source_snapshot_id"):
+            with self.subTest(row_field=field):
+                invalid = copy.deepcopy(payload)
+                invalid["market_a"]["rows"][0][field] = None
+                with self.assertRaises(ReleaseCheckError):
+                    validate_execution(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                        catalog_metadata=catalog_metadata,
+                    )
 
     def event_payload(self):
         event = {
