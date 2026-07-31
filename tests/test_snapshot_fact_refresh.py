@@ -615,7 +615,7 @@ class SnapshotFactReaderTest(unittest.TestCase):
                 with self.subTest(status=status, block_number=block_number):
                     self.read("dex_depth_latest.csv", request, [row_for(status, block_number)])
         for status in ("observed", "partial", "complete", "failed", "unsupported"):
-            for block_number in ("-1", "1.5", "NaN", "not-a-number"):
+            for block_number in ("-1", "1.5", "NaN", "not-a-number", "²", "١", "１２"):
                 with self.subTest(status=status, block_number=block_number):
                     with self.assertRaises(ValueError):
                         self.read("dex_depth_latest.csv", request, [row_for(status, block_number)])

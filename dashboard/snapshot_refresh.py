@@ -173,7 +173,7 @@ def _block_number(value: Any, *, required: bool = False) -> None:
         if required:
             raise ValueError("measured snapshot row has no block identity")
         return
-    if not text.isdigit():
+    if not text.isascii() or not text.isdecimal():
         raise ValueError("snapshot block number is not a nonnegative integer")
 
 
