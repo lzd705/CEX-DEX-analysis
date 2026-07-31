@@ -27,6 +27,266 @@ def run_app_javascript(source: str, prelude: str = ""):
 
 
 class DashboardFrontendContractTest(unittest.TestCase):
+    def test_unsubmitted_custom_window_never_leaks_to_applied_consumers(self):
+        result = run_app_javascript(
+            """
+function control(value = "") {
+  return {
+    value,
+    hidden: false,
+    disabled: false,
+    textContent: "",
+    innerHTML: "",
+    dataset: {},
+    attributes: {},
+    setAttribute(name, nextValue) { this.attributes[name] = nextValue; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+
+const elements = new Map(Object.entries({
+  "date-start": control("2026-07-20"),
+  "date-end": control("2026-07-22"),
+  "token-search": control(""),
+  "sort-field": control("volume"),
+  "facts-token": control("BTC"),
+  "facts-market-a": control("cex:binance:BTC/USDT"),
+  "facts-market-b": control("dex:uniswap:BTC/USDC"),
+}));
+const requestUrls = [];
+let exportName = "";
+let replacedPath = "";
+
+global.document = {
+  body: { appendChild() {} },
+  getElementById(id) {
+    if (!elements.has(id)) elements.set(id, control());
+    return elements.get(id);
+  },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+  createElement(tag) {
+    if (tag !== "a") throw new Error(`Unexpected element: ${tag}`);
+    return {
+      href: "",
+      download: "",
+      click() { exportName = this.download; },
+      remove() {},
+    };
+  },
+};
+global.window = {
+  location: { pathname: "/tokens/BTC/compare", search: "" },
+  history: {
+    replaceState(_state, _title, path) { replacedPath = path; },
+  },
+};
+global.URL.createObjectURL = () => "blob:market-facts";
+global.URL.revokeObjectURL = () => {};
+global.fetch = async (url) => {
+  requestUrls.push(url);
+  if (url.startsWith("/api/markets/quality?")) {
+    return {
+      ok: true,
+      json: async () => ({
+        token_symbol: "BTC",
+        metadata: {
+          scope: "all",
+          window_start: "2026-07-01",
+          window_end: "2026-07-29",
+          daily_quality_report: { status: "unavailable" },
+        },
+        markets: [],
+      }),
+    };
+  }
+  if (url.startsWith("/api/markets/events?")) {
+    return { ok: true, json: async () => ({ query: { token: "BTC" }, events: [] }) };
+  }
+  if (url.startsWith("/api/markets/compare?")) {
+    return { ok: true, json: async () => ({ metadata: {} }) };
+  }
+  throw new Error(`Unexpected request: ${url}`);
+};
+
+renderComparison = (payload) => { app.comparison = payload; };
+renderComparisonChart = () => {};
+clearComparisonChart = () => {};
+renderEventFacts = (payload) => { app.eventFacts = payload; };
+
+const tokenSummary = {
+  token_symbol: "BTC",
+  aggregate_volume_usd: 1,
+  primary_cex: null,
+  primary_dex: null,
+};
+app.payload = {
+  metadata: {
+    start_date: "2026-07-01",
+    end_date: "2026-07-29",
+    available_start: "2026-05-01",
+    available_end: "2026-07-29",
+  },
+  tokens: [tokenSummary],
+};
+app.defaultPayload = null;
+app.visibleTokens = [tokenSummary];
+app.catalog = { metadata: {} };
+app.route = {
+  kind: "workspace",
+  token: "BTC",
+  page: "compare",
+  state: { start: "2026-07-01", end: "2026-07-29" },
+};
+app.routeReady = true;
+app.qualityScope = "all";
+app.scope = "combined";
+app.sortDirection = "desc";
+
+const screenerWindow = currentScreenerFilters();
+const workspaceWindow = currentWorkspaceRouteState("compare");
+const workspacePath = currentWorkspacePath("compare");
+const candidate = { start: "2026-07-10", end: "2026-07-11" };
+const candidateScreener = currentScreenerFilters({ window: candidate });
+const candidateWorkspace = currentWorkspaceRouteState("compare", { window: candidate });
+replaceCurrentRoute({ window: candidate });
+(async () => {
+  await loadQuality();
+  await loadComparison();
+  await loadEvents();
+  exportVisibleCsv();
+  const draftHelperAvailable = typeof draftTimeWindow === "function";
+  const draft = draftHelperAvailable
+    ? draftTimeWindow()
+    : {
+        start: elements.get("date-start").value,
+        end: elements.get("date-end").value,
+      };
+  const draftSetterAvailable = typeof setDraftTimeWindow === "function";
+  let draftSetterRoundTrip = null;
+  if (draftSetterAvailable) {
+    setDraftTimeWindow({ start: "2026-07-24", end: "2026-07-25" });
+    draftSetterRoundTrip = draftTimeWindow();
+    setDraftTimeWindow(draft);
+  }
+  const payload = app.payload;
+  app.payload = null;
+  app.defaultPayload = {
+    metadata: { start_date: "2026-06-01", end_date: "2026-06-30" },
+  };
+  const defaultPayloadBootstrap = appliedTimeWindow();
+  app.defaultPayload = null;
+  app.route = {
+    kind: "workspace",
+    state: { start: "2026-05-01", end: "2026-05-31" },
+  };
+  const workspaceBootstrap = appliedTimeWindow();
+  app.route = {
+    kind: "screener",
+    filters: { start: "2026-04-01", end: "2026-04-30" },
+  };
+  const screenerBootstrap = appliedTimeWindow();
+  app.payload = payload;
+
+  console.log(JSON.stringify({
+    screenerWindow: { start: screenerWindow.start, end: screenerWindow.end },
+    workspaceWindow: { start: workspaceWindow.start, end: workspaceWindow.end },
+    workspacePath,
+    qualityUrl: requestUrls.find((url) => url.startsWith("/api/markets/quality?")),
+    comparisonUrl: requestUrls.find((url) => url.startsWith("/api/markets/compare?")),
+    eventUrls: requestUrls.filter((url) => url.startsWith("/api/markets/events?")),
+    exportName,
+    draft,
+    draftHelperAvailable,
+    draftSetterAvailable,
+    draftSetterRoundTrip,
+    defaultPayloadBootstrap,
+    workspaceBootstrap,
+    screenerBootstrap,
+    candidateScreener: {
+      start: candidateScreener.start,
+      end: candidateScreener.end,
+    },
+    candidateWorkspace: {
+      start: candidateWorkspace.start,
+      end: candidateWorkspace.end,
+    },
+    replacedPath,
+  }));
+})();
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  buildScreenerPath(filters) {
+    return `/screener?${new URLSearchParams(filters).toString()}`;
+  },
+  buildWorkspacePath(token, page, state) {
+    return `/tokens/${token}/${page}?${new URLSearchParams(state).toString()}`;
+  },
+  parseRoute() {
+    return {
+      kind: "workspace",
+      token: "BTC",
+      page: "compare",
+      state: {},
+    };
+  },
+};
+""",
+        )
+        self.assertEqual(result["screenerWindow"], {
+            "start": "2026-07-01",
+            "end": "2026-07-29",
+        })
+        self.assertEqual(result["workspaceWindow"], {
+            "start": "2026-07-01",
+            "end": "2026-07-29",
+        })
+        self.assertIn("start=2026-07-01", result["workspacePath"])
+        self.assertIn("end=2026-07-29", result["workspacePath"])
+        self.assertIn("start=2026-07-01", result["qualityUrl"])
+        self.assertIn("end=2026-07-29", result["qualityUrl"])
+        self.assertIn("start=2026-07-01", result["comparisonUrl"])
+        self.assertIn("end=2026-07-29", result["comparisonUrl"])
+        self.assertEqual(len(result["eventUrls"]), 2)
+        for event_url in result["eventUrls"]:
+            self.assertIn("start=2026-07-01", event_url)
+            self.assertIn("end=2026-07-29", event_url)
+        self.assertEqual(
+            result["exportName"],
+            "cex-dex-market-facts-2026-07-01-2026-07-29.csv",
+        )
+        self.assertEqual(result["draft"], {
+            "start": "2026-07-20",
+            "end": "2026-07-22",
+        })
+        self.assertTrue(result["draftHelperAvailable"])
+        self.assertTrue(result["draftSetterAvailable"])
+        self.assertEqual(result["draftSetterRoundTrip"], {
+            "start": "2026-07-24",
+            "end": "2026-07-25",
+        })
+        self.assertEqual(result["defaultPayloadBootstrap"], {
+            "start": "2026-06-01",
+            "end": "2026-06-30",
+        })
+        self.assertEqual(result["workspaceBootstrap"], {
+            "start": "2026-05-01",
+            "end": "2026-05-31",
+        })
+        self.assertEqual(result["screenerBootstrap"], {
+            "start": "2026-04-01",
+            "end": "2026-04-30",
+        })
+        candidate = {
+            "start": "2026-07-10",
+            "end": "2026-07-11",
+        }
+        self.assertEqual(result["candidateScreener"], candidate)
+        self.assertEqual(result["candidateWorkspace"], candidate)
+        self.assertIn("start=2026-07-10", result["replacedPath"])
+        self.assertIn("end=2026-07-11", result["replacedPath"])
+
     def test_workspace_route_reports_load_abort_and_catalog_outcomes(self):
         result = run_app_javascript(
             """
@@ -2241,11 +2501,10 @@ applyRouteFromLocation = async () => {
         ]
         route_links = app_js[
             app_js.index("function updateRouteLinks()"):
-            app_js.index("function replaceCurrentRoute()")
+            app_js.index("function replaceCurrentRoute(")
         ]
 
-        self.assertIn("app.payload?.metadata?.start_date", summary_state)
-        self.assertIn("app.payload?.metadata?.end_date", summary_state)
+        self.assertIn("return appliedTimeWindow();", summary_state)
         self.assertIn("currentSummaryWindowRouteState()", row_renderer)
         self.assertIn("currentSummaryWindowRouteState()", route_links)
 

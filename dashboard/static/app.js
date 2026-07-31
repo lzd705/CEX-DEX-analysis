@@ -347,14 +347,14 @@ function cachedTokenCatalog(cacheKey) {
   return catalog;
 }
 
-function currentScreenerFilters() {
+function currentScreenerFilters({ window = appliedTimeWindow() } = {}) {
   const filters = {
     q: byId("token-search")?.value.trim() || "",
     scope: app.scope,
     sort: byId("sort-field")?.value || "volume",
     dir: app.sortDirection,
-    start: byId("date-start")?.value || "",
-    end: byId("date-end")?.value || "",
+    start: window.start || "",
+    end: window.end || "",
   };
   if (filters.scope === "combined") delete filters.scope;
   if (filters.sort === "volume") delete filters.sort;
@@ -372,23 +372,18 @@ function currentScreenerFilters() {
   return filters;
 }
 
-function currentWorkspaceRouteState(page) {
+function currentWorkspaceRouteState(
+  page,
+  { window = appliedTimeWindow() } = {},
+) {
   const state = selectedPairState();
   if (app.route?.kind === "workspace" && !app.catalog) {
     state.marketA ||= app.route.state?.marketA || "";
     state.marketB ||= app.route.state?.marketB || "";
   }
   if (!state.marketA || !state.marketB) state.pairMode = "manual";
-  state.start = (
-    byId("date-start")?.value
-    || (app.route?.kind === "workspace" ? app.route.state?.start : "")
-    || ""
-  );
-  state.end = (
-    byId("date-end")?.value
-    || (app.route?.kind === "workspace" ? app.route.state?.end : "")
-    || ""
-  );
+  state.start = window.start || "";
+  state.end = window.end || "";
   if (page === "liquidity") {
     state.side = app.executionDirection === "sell_token" ? "sell" : "buy";
     state.notionalUsd = app.executionNotionalUsd;
@@ -402,20 +397,20 @@ function currentWorkspaceRouteState(page) {
   return state;
 }
 
-function currentWorkspacePath(page = app.route?.page || "markets") {
+function currentWorkspacePath(
+  page = app.route?.page || "markets",
+  { window = appliedTimeWindow() } = {},
+) {
   if (!navigation) return "/screener";
   return navigation.buildWorkspacePath(
     selectedWorkspaceToken(),
     page,
-    currentWorkspaceRouteState(page),
+    currentWorkspaceRouteState(page, { window }),
   );
 }
 
 function currentSummaryWindowRouteState() {
-  return {
-    start: app.payload?.metadata?.start_date || "",
-    end: app.payload?.metadata?.end_date || "",
-  };
+  return appliedTimeWindow();
 }
 
 function updateRouteLinks() {
@@ -454,16 +449,19 @@ function updateRouteLinks() {
   if (back && navigation) back.href = navigation.buildScreenerPath(currentScreenerFilters());
 }
 
-function replaceCurrentRoute() {
+function replaceCurrentRoute({ window = appliedTimeWindow() } = {}) {
   if (!navigation || !app.routeReady) return;
   let path;
   if (app.route.kind === "workspace") {
-    path = currentWorkspacePath(app.route.page);
+    path = currentWorkspacePath(app.route.page, { window });
   } else {
-    path = navigation.buildScreenerPath(currentScreenerFilters());
+    path = navigation.buildScreenerPath(currentScreenerFilters({ window }));
   }
-  window.history.replaceState({}, "", path);
-  app.route = navigation.parseRoute(window.location.pathname, window.location.search);
+  globalThis.window.history.replaceState({}, "", path);
+  app.route = navigation.parseRoute(
+    globalThis.window.location.pathname,
+    globalThis.window.location.search,
+  );
   updateRouteLinks();
 }
 
@@ -535,10 +533,32 @@ function syncSegmentedControls() {
   });
 }
 
-function appliedTimeWindow() {
+function draftTimeWindow() {
   return {
-    start: app.payload?.metadata?.start_date || "",
-    end: app.payload?.metadata?.end_date || "",
+    start: byId("date-start")?.value || "",
+    end: byId("date-end")?.value || "",
+  };
+}
+
+function setDraftTimeWindow({ start = "", end = "" } = {}) {
+  byId("date-start").value = start;
+  byId("date-end").value = end;
+}
+
+function appliedTimeWindow() {
+  const metadata = app.payload?.metadata || app.defaultPayload?.metadata;
+  if (metadata?.start_date && metadata?.end_date) {
+    return { start: metadata.start_date, end: metadata.end_date };
+  }
+  if (app.route?.kind === "workspace") {
+    return {
+      start: app.route.state?.start || "",
+      end: app.route.state?.end || "",
+    };
+  }
+  return {
+    start: app.route?.filters?.start || "",
+    end: app.route?.filters?.end || "",
   };
 }
 
@@ -1273,11 +1293,7 @@ async function applyRouteFromLocation() {
   return true;
 }
 
-function validateDateRange(
-  start = byId("date-start").value,
-  end = byId("date-end").value,
-  { required = false } = {},
-) {
+function validateDateRange(start = "", end = "", { required = false } = {}) {
   if (required && (!start || !end)) {
     return "Choose both a start date and an end date.";
   }
@@ -2593,6 +2609,7 @@ function qualityStatusTiers(counts) {
 }
 
 async function loadQuality() {
+  const window = appliedTimeWindow();
   const requestId = invalidateQualityRequest();
   const token = selectedWorkspaceToken();
   const { marketA, marketB } = selectedPairState();
@@ -2613,8 +2630,8 @@ async function loadQuality() {
   const controller = new AbortController();
   app.qualityController = controller;
   const query = new URLSearchParams({ token, scope: app.qualityScope });
-  if (byId("date-start").value) query.set("start", byId("date-start").value);
-  if (byId("date-end").value) query.set("end", byId("date-end").value);
+  if (window.start) query.set("start", window.start);
+  if (window.end) query.set("end", window.end);
   if (app.qualityScope === "selected") {
     query.set("market_a", marketA);
     query.set("market_b", marketB);
@@ -2835,6 +2852,7 @@ async function fetchEventFacts({
 }
 
 async function loadEvents() {
+  const window = appliedTimeWindow();
   const requestId = invalidateEventRequest();
   const token = selectedWorkspaceToken();
   if (!app.catalog || !token) {
@@ -2848,6 +2866,8 @@ async function loadEvents() {
   try {
     const payload = await fetchEventFacts({
       token,
+      start: window.start,
+      end: window.end,
       lifecycle: app.eventLifecycle,
       signal: controller.signal,
     });
@@ -4721,12 +4741,13 @@ function publicErrorMessage(error, fallback = "Request failed.") {
 }
 
 async function loadComparison() {
+  const window = appliedTimeWindow();
   const requestId = invalidateComparisonRequest();
   if (!app.catalog) {
     clearComparisonResult("Market catalog is unavailable.");
     return false;
   }
-  const dateError = validateDateRange();
+  const dateError = validateDateRange(window.start, window.end);
   if (dateError) {
     clearComparisonResult(dateError);
     return false;
@@ -4745,14 +4766,14 @@ async function loadComparison() {
   const controller = new AbortController();
   app.comparisonController = controller;
   const query = new URLSearchParams({ token, market_a: marketA, market_b: marketB });
-  if (byId("date-start").value) query.set("start", byId("date-start").value);
-  if (byId("date-end").value) query.set("end", byId("date-end").value);
+  if (window.start) query.set("start", window.start);
+  if (window.end) query.set("end", window.end);
   setComparisonLoading(`Loading ${token} comparison…`);
   try {
     const eventPromise = fetchEventFacts({
       token,
-      start: byId("date-start").value,
-      end: byId("date-end").value,
+      start: window.start,
+      end: window.end,
       signal: controller.signal,
     }).catch(() => null);
     const response = await fetch(`/api/markets/compare?${query.toString()}`, {
@@ -5049,31 +5070,24 @@ function setCustomWindowOpen(open, { restoreFocus = false } = {}) {
 }
 
 function openCustomWindowEditor() {
-  const { start, end } = appliedTimeWindow();
-  byId("date-start").value = start;
-  byId("date-end").value = end;
+  setDraftTimeWindow(appliedTimeWindow());
   showDateWindowError("");
   setCustomWindowOpen(true);
 }
 
 function cancelCustomWindowEditor() {
-  const { start, end } = appliedTimeWindow();
-  byId("date-start").value = start;
-  byId("date-end").value = end;
+  setDraftTimeWindow(appliedTimeWindow());
   showDateWindowError("");
   setCustomWindowOpen(false, { restoreFocus: true });
 }
 
 function setPreset(days) {
   if (!app.payload) return;
-  const { start, end } = presetWindow(days);
-  byId("date-start").value = start;
-  byId("date-end").value = end;
+  setDraftTimeWindow(presetWindow(days));
 }
 
 async function applyWindow() {
-  const start = byId("date-start").value;
-  const end = byId("date-end").value;
+  const { start, end } = draftTimeWindow();
   const dateError = validateDateRange(start, end, { required: true });
   if (dateError) {
     showDateWindowError(dateError);
@@ -5176,6 +5190,7 @@ function csvEscape(value) {
 }
 
 function exportVisibleCsv() {
+  const window = appliedTimeWindow();
   if (!app.payload || !app.visibleTokens.length) return;
   const headers = [
     "token",
@@ -5272,7 +5287,7 @@ function exportVisibleCsv() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `cex-dex-market-facts-${byId("date-start").value}-${byId("date-end").value}.csv`;
+  link.download = `cex-dex-market-facts-${window.start}-${window.end}.csv`;
   document.body.appendChild(link);
   link.click();
   link.remove();
