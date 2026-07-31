@@ -2027,8 +2027,9 @@ class AdminService:
                     "unresolved_count": 0,
                 },
             )
-        confirmed_absences: set[tuple[str, str]] = set()
-        confirmed_absence_reasons: dict[tuple[str, str], str] = {}
+        outcomes_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {
+            pair: [] for pair in expected
+        }
         for issue in report.get("issues") or []:
             if not isinstance(issue, dict):
                 continue
@@ -2039,12 +2040,20 @@ class AdminService:
                 str(market.get("market_id") or ""),
                 str(issue.get("date") or ""),
             )
+            if pair in outcomes_by_pair:
+                outcomes_by_pair[pair].append(issue)
+
+        confirmed_absences: set[tuple[str, str]] = set()
+        confirmed_absence_reasons: dict[tuple[str, str], str] = {}
+        for pair, outcomes in outcomes_by_pair.items():
+            if len(outcomes) != 1:
+                continue
+            issue = outcomes[0]
             status = str(issue.get("status") or "").strip().lower()
             reason = str(issue.get("reason_code") or "").strip().lower()
             rule = quality_outcome_rule(status, reason)
             if (
-                pair in expected
-                and rule is not None
+                rule is not None
                 and issue.get("retryable") is rule.retryable
                 and rule.terminal
                 and rule.resolution

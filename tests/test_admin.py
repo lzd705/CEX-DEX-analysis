@@ -1267,6 +1267,114 @@ class AdminServiceTest(unittest.TestCase):
             self.assertEqual(evidence["confirmed_absence_count"], 0)
             self.assertEqual(evidence["unresolved_count"], 1)
 
+            def retry_outcome(status, reason_code, retryable):
+                return {
+                    "date": "2026-07-28",
+                    "category": "historical_gap",
+                    "status": status,
+                    "reason_code": reason_code,
+                    "retryable": retryable,
+                    "market": {
+                        "token_symbol": "AAVE",
+                        "market_id": "cex:binance:AAVE/USDT",
+                    },
+                }
+
+            outcome_cases = (
+                (
+                    "one valid terminal source absence resolves",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        )
+                    ],
+                    True,
+                ),
+                (
+                    "terminal source absence with collection failure remains unresolved",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                        retry_outcome("collection_failed", "network", True),
+                    ],
+                    False,
+                ),
+                (
+                    "terminal source absence with needs review remains unresolved",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                        retry_outcome("needs_review", "not_listed", False),
+                    ],
+                    False,
+                ),
+                (
+                    "conflicting terminal resolutions remain unresolved",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                        retry_outcome(
+                            "unsupported",
+                            "source_range_unavailable",
+                            False,
+                        ),
+                    ],
+                    False,
+                ),
+                (
+                    "duplicate terminal outcomes remain unresolved",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                    ],
+                    False,
+                ),
+            )
+            for name, issues, resolves in outcome_cases:
+                with self.subTest(case=name):
+                    refreshed_report["issues"] = issues
+                    report_path.write_text(
+                        json.dumps(refreshed_report),
+                        encoding="utf-8",
+                    )
+                    write_retry_database(database_path, "import-after")
+
+                    error, evidence = service._retry_resolution_evidence(
+                        service.jobs["retry"]
+                    )
+
+                    if resolves:
+                        self.assertIsNone(error)
+                        self.assertEqual(
+                            evidence["confirmed_absence_count"], 1
+                        )
+                        self.assertEqual(evidence["unresolved_count"], 0)
+                    else:
+                        self.assertIn("remain neither observed", error)
+                        self.assertEqual(
+                            evidence["confirmed_absence_count"], 0
+                        )
+                        self.assertEqual(evidence["unresolved_count"], 1)
+
     def test_onboarding_lock_conflict_reconciles_pending_registry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
