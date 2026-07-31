@@ -1907,11 +1907,18 @@ def token_catalog_from_catalog(
     catalog_tokens = set(catalog.get("tokens", []))
     if token not in catalog_tokens:
         raise ValueError("Token is not cataloged")
-    markets = [
-        market
-        for market in catalog.get("markets", [])
-        if market.get("token_symbol") == token
-    ]
+    markets = []
+    for market in catalog.get("markets", []):
+        if market.get("token_symbol") != token:
+            continue
+        screening = screening_quality_projection(market)
+        markets.append(
+            {
+                **market,
+                "screening_quality_status": screening["status"],
+                "screening_quality_flags": screening["flags"],
+            }
+        )
     return {
         "metadata": {
             **catalog.get("metadata", {}),

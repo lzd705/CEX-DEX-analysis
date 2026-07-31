@@ -1198,6 +1198,68 @@ console.log(JSON.stringify({ screener, selected: qualityBody.innerHTML }));
         self.assertIn("1 warning reason", result["screener"]["summary"])
         self.assertNotIn("Screener-only warning reason.", result["selected"])
 
+    def test_catalog_fallback_keeps_screener_projection_after_quality_request_failure(self):
+        result = run_app_javascript(
+            """
+(async () => {
+  const nodes = {
+    "facts-token": { value: "AAVE" },
+    "facts-market-a": { value: "" },
+    "facts-market-b": { value: "" },
+    "date-start": { value: "" },
+    "date-end": { value: "" },
+    "quality-body": { innerHTML: "" },
+    "quality-filter-summary": { hidden: true, textContent: "", dataset: {} },
+    "quality-error": { hidden: true, textContent: "", dataset: {} },
+    "quality-status": { textContent: "", dataset: {} },
+  };
+  global.document = { getElementById(id) { return nodes[id] || null; } };
+  app.payload = { metadata: { default_workspace_token: "AAVE" }, tokens: [] };
+  app.catalog = {
+    metadata: { market_quality_thresholds: { minimum_primary_coverage_ratio: 0.8 } },
+    markets: [{
+      market_id: "cex:binance:AAVE/USDT",
+      market_type: "cex",
+      token_symbol: "AAVE",
+      venue: "binance",
+      instrument: "AAVE/USDT",
+      quality_status: "ok",
+      quality_flags: [],
+      screening_quality_status: "warning",
+      screening_quality_flags: [{
+        code: "low_daily_coverage",
+        severity: "warning",
+        category: "data_health",
+        message: "Exact catalog screening reason.",
+      }],
+    }],
+  };
+  app.qualityScope = "all";
+  app.qualityOrigin = "screener";
+  app.qualitySeverity = "warning";
+  renderQualityFromCatalog();
+  const initial = {
+    html: nodes["quality-body"].innerHTML,
+    summary: nodes["quality-filter-summary"].textContent,
+  };
+  global.fetch = async () => { throw new Error("quality endpoint unavailable"); };
+  const loaded = await loadQuality();
+  console.log(JSON.stringify({
+    initial,
+    afterFailure: {
+      html: nodes["quality-body"].innerHTML,
+      summary: nodes["quality-filter-summary"].textContent,
+    },
+    loaded,
+  }));
+})();
+"""
+        )
+        self.assertFalse(result["loaded"])
+        for state in (result["initial"], result["afterFailure"]):
+            self.assertIn("Exact catalog screening reason.", state["html"])
+            self.assertIn("1 warning reason", state["summary"])
+
 
 if __name__ == "__main__":
     unittest.main()

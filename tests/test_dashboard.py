@@ -831,6 +831,26 @@ class MarketMonitorServerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not cataloged"):
                 server.build_token_market_catalog("ETH")
 
+    def test_single_token_catalog_includes_bounded_screener_projection(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            catalog = server.build_token_market_catalog("BTC")
+
+        market = next(
+            item
+            for item in catalog["markets"]
+            if item["market_id"] == "cex:binance:BTC/USDT"
+        )
+        self.assertIn("screening_quality_status", market)
+        self.assertIn("screening_quality_flags", market)
+        self.assertEqual(market["screening_quality_status"], "ok")
+        self.assertEqual(
+            [flag["code"] for flag in market["screening_quality_flags"]],
+            ["depth_unavailable"],
+        )
+        serialized = json.dumps(catalog)
+        self.assertNotIn("screening_quality_source", serialized)
+        self.assertNotIn(str(self.temporary_directory.name), serialized)
+
     def test_screener_default_token_always_exists_in_selected_window(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
             payload = server.build_market_payload()

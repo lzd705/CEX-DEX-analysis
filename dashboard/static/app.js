@@ -2190,6 +2190,10 @@ function catalogQualityPayload() {
       return {
         market,
         quality_flags: factsMarketWarningFlags(market),
+        screening_quality_status: market.screening_quality_status,
+        screening_quality_flags: Array.isArray(market.screening_quality_flags)
+          ? market.screening_quality_flags
+          : [],
         facts: {
           daily: {
             status: dailyStatus,
