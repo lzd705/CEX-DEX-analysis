@@ -23,6 +23,9 @@
   const SCREENER_SORTS = new Set([
     "volume",
     "spread",
+    "spread_max",
+    "spread_mean",
+    "spread_median",
     "return",
     "volatility",
     "depth_100bps",
@@ -35,6 +38,18 @@
       defaultScope: "combined",
     }),
     spread: Object.freeze({
+      scopes: new Set(["cross"]),
+      defaultScope: "cross",
+    }),
+    spread_max: Object.freeze({
+      scopes: new Set(["cross"]),
+      defaultScope: "cross",
+    }),
+    spread_mean: Object.freeze({
+      scopes: new Set(["cross"]),
+      defaultScope: "cross",
+    }),
+    spread_median: Object.freeze({
       scopes: new Set(["cross"]),
       defaultScope: "cross",
     }),
@@ -60,6 +75,8 @@
   const LIQUIDITY_VIEWS = new Set(["total", "directional"]);
   const LIQUIDITY_SCALES = new Set(["linear", "log"]);
   const QUALITY_SCOPES = new Set(["all", "selected"]);
+  const QUALITY_SEVERITIES = new Set(["critical", "warning", "info"]);
+  const QUALITY_ORIGINS = new Set(["screener"]);
   const EVENT_LIFECYCLES = new Set([
     "all",
     "occurred",
@@ -196,7 +213,13 @@
       if (scale !== null && LIQUIDITY_SCALES.has(scale)) state.scale = scale;
     } else if (page === "quality") {
       const scope = firstParam(params, ["scope"]);
+      const severity = firstParam(params, ["severity"]);
+      const origin = firstParam(params, ["origin"]);
       if (scope !== null && QUALITY_SCOPES.has(scope)) state.scope = scope;
+      if (severity !== null && QUALITY_SEVERITIES.has(severity)) {
+        state.severity = severity;
+      }
+      if (origin !== null && QUALITY_ORIGINS.has(origin)) state.origin = origin;
     } else if (page === "events") {
       const lifecycle = firstParam(params, ["lifecycle"]);
       if (
@@ -297,6 +320,8 @@
       setEnum(params, "scale", state.scale, LIQUIDITY_SCALES);
     } else if (page === "quality") {
       setEnum(params, "scope", state.scope, QUALITY_SCOPES);
+      setEnum(params, "severity", state.severity, QUALITY_SEVERITIES);
+      setEnum(params, "origin", state.origin, QUALITY_ORIGINS);
     } else if (page === "events") {
       if (state.lifecycle !== "all") {
         setEnum(params, "lifecycle", state.lifecycle, EVENT_LIFECYCLES);

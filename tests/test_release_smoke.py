@@ -17,13 +17,29 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         return {
             "metadata": {
                 "response_scope": "screener_summary",
-                "summary_version": 1,
+                "summary_version": 2,
                 "data_generation": "generation-1",
                 "start_date": "2026-01-01",
                 "end_date": "2026-01-31",
                 "default_workspace_token": "AAVE",
             },
-            "tokens": [{"token_symbol": "AAVE"}],
+            "tokens": [{
+                "token_symbol": "AAVE",
+                "market_count": 2,
+                "quality_status_counts": {"ok": 2},
+                "quality_alert_counts": {"info": 1},
+                "spread_comparable_days": 20,
+                "primary_cex": {
+                    "refresh_market_id": "cex:binance:AAVE/USDT",
+                    "depth_retryable": False,
+                    "tvl_retryable": False,
+                },
+                "primary_dex": {
+                    "refresh_market_id": "dex:eth:uniswap_v3:pool:AAVE",
+                    "depth_retryable": True,
+                    "tvl_retryable": True,
+                },
+            }],
         }
 
     def metrics(self, path="/api/markets/summary", raw=1000, wire=500):
@@ -55,6 +71,25 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             validate_summary(
                 summary,
                 self.metrics(raw=2001),
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "version is not 2"):
+            validate_summary(
+                {
+                    **summary,
+                    "metadata": {**summary["metadata"], "summary_version": 1},
+                },
+                self.metrics(),
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "retryability"):
+            broken = self.summary()
+            broken["tokens"][0]["primary_cex"].pop("depth_retryable")
+            validate_summary(
+                broken,
+                self.metrics(),
                 raw_max=2000,
                 gzip_max=1000,
             )

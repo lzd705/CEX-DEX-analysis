@@ -13,6 +13,8 @@ from dashboard.admin import (
 )
 from dashboard.public_actions import (
     PUBLIC_ADD_TOKEN_ACTOR,
+    PUBLIC_FACT_REFRESH_ACTOR,
+    PUBLIC_FACT_REFRESH_PATH,
     PUBLIC_QUALITY_RETRY_ACTOR,
     PUBLIC_QUALITY_RETRYABLE_PATH,
     PUBLIC_QUALITY_RETRY_PATH,
@@ -37,6 +39,7 @@ class PublicActionPolicyTest(unittest.TestCase):
         self.assertFalse(
             disabled.enabled_for_path(PUBLIC_QUALITY_RETRY_PATH)
         )
+        self.assertFalse(disabled.enabled_for_path(PUBLIC_FACT_REFRESH_PATH))
 
         enabled = PublicActionPolicy(
             add_token_enabled=True,
@@ -47,6 +50,12 @@ class PublicActionPolicyTest(unittest.TestCase):
         self.assertFalse(
             enabled.enabled_for_path(PUBLIC_QUALITY_RETRYABLE_PATH)
         )
+
+        fact_enabled = PublicActionPolicy(fact_refresh_enabled=True)
+        self.assertTrue(
+            fact_enabled.enabled_for_path(PUBLIC_FACT_REFRESH_PATH)
+        )
+        self.assertFalse(fact_enabled.enabled_for_path(PUBLIC_TOKEN_ADD_PATH))
 
     def test_rate_limit_is_per_client_and_returns_retry_after(self):
         clock = [100.0]
@@ -890,6 +899,78 @@ class PublicActionHandlerTest(unittest.TestCase):
             "invalid_public_action_request",
         )
 
+    def test_fact_refresh_accepts_only_backend_verified_canonical_identity(self):
+        service = Mock()
+        service.count_jobs_created_on.return_value = 0
+        service.create_job.return_value = {
+            "job_id": "job-fact-refresh",
+            "job_type": "snapshot_refresh",
+            "token_symbol": "AAVE",
+            "market_id": "cex:binance:AAVE/USDT",
+            "fact_type": "depth",
+            "status": "queued",
+            "stage": "queued",
+            "created_at": "2026-07-31T12:00:00+00:00",
+            "requested_by": PUBLIC_FACT_REFRESH_ACTOR,
+        }
+        quality = {
+            "markets": [
+                {
+                    "market_id": "cex:binance:AAVE/USDT",
+                    "facts": {"depth": {"retryable": True}},
+                }
+            ]
+        }
+        handler = self.handler(
+            PUBLIC_FACT_REFRESH_PATH,
+            {
+                "token_symbol": "aave",
+                "market_id": "cex:binance:AAVE/USDT",
+                "fact_type": "depth",
+            },
+        )
+        policy = PublicActionPolicy(fact_refresh_enabled=True)
+
+        with patch.object(server, "PUBLIC_ACTION_POLICY", policy), patch.object(
+            server,
+            "ADMIN_SERVICE",
+            service,
+        ), patch.object(server, "build_market_quality", return_value=quality):
+            handler.do_POST()
+
+        request, actor = service.create_job.call_args.args
+        self.assertEqual(actor, PUBLIC_FACT_REFRESH_ACTOR)
+        self.assertEqual(
+            request,
+            {
+                "token_symbol": "AAVE",
+                "market_id": "cex:binance:AAVE/USDT",
+                "fact_type": "depth",
+                "job_type": "snapshot_refresh",
+            },
+        )
+        response, status = handler.send_json.call_args.args[:2]
+        self.assertEqual(status, server.HTTPStatus.ACCEPTED)
+        self.assertEqual(response["job_id"], "job-fact-refresh")
+
+        legacy = self.handler(
+            PUBLIC_FACT_REFRESH_PATH,
+            {
+                "token_symbol": "AAVE",
+                "market_id": "binance|AAVE/USDT",
+                "fact_type": "depth",
+            },
+        )
+        with patch.object(server, "PUBLIC_ACTION_POLICY", policy), patch.object(
+            server,
+            "ADMIN_SERVICE",
+            service,
+        ), patch.object(server, "build_market_quality", return_value=quality):
+            legacy.do_POST()
+        legacy_response, legacy_status = legacy.send_json.call_args.args[:2]
+        self.assertEqual(legacy_status, server.HTTPStatus.UNPROCESSABLE_ENTITY)
+        self.assertEqual(legacy_response["error_code"], "fact_refresh_not_found")
+
     def test_public_retry_maps_unapproved_window_to_stable_error(self):
         service = Mock()
         service.count_jobs_created_on.return_value = 0
@@ -1074,9 +1155,10 @@ class PublicActionHandlerTest(unittest.TestCase):
             "public_job_not_found",
         )
 
-    def test_public_surface_does_not_add_refresh_job_or_job_list_routes(self):
+    def test_public_surface_exposes_only_the_bounded_fact_refresh_route(self):
         self.assertNotIn("/api/actions/jobs", server.PUBLIC_ACTION_PATHS)
         self.assertNotIn("/api/actions/refresh", server.PUBLIC_ACTION_PATHS)
+        self.assertIn(PUBLIC_FACT_REFRESH_PATH, server.PUBLIC_ACTION_PATHS)
         self.assertNotIn(
             "/api/actions/quality/manual-review",
             server.PUBLIC_ACTION_PATHS,

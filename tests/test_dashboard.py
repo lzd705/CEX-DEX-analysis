@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from dashboard import server
+from dashboard import market_facts, server
 from scripts.fetch_cex_depth import DEPTH_COLUMNS_ALL
 from scripts.fetch_dex_depth import DEX_DEPTH_COLUMNS
 from scripts.execution_cost import (
@@ -290,6 +290,68 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIsNone(server.parse_number("nan"))
         self.assertEqual(server.parse_number("12.5"), 12.5)
         self.assertEqual(server.parse_number(12.5), 12.5)
+
+    def test_screener_refresh_identity_is_canonical_and_retryability_is_server_owned(self):
+        cex = server._compact_screener_market(
+            {
+                "token_symbol": "AAVE",
+                "venue": "binance",
+                "instrument": "AAVE/USDT",
+                "depth_status": "collection_failed",
+                "depth_reason_code": "network",
+            },
+            "cex",
+        )
+        dex = server._compact_screener_market(
+            {
+                "token_symbol": "AAVE",
+                "venue": "eth / uniswap_v3",
+                "pool_address": "0xAbC",
+                "tvl_status": "not_cataloged_in_snapshot",
+                "dex_depth_status": "unsupported",
+                "depth_error": "unsupported_protocol",
+            },
+            "dex",
+        )
+
+        self.assertEqual(cex["market_id"], "binance|AAVE/USDT")
+        self.assertEqual(
+            cex["refresh_market_id"],
+            "cex:binance:AAVE/USDT",
+        )
+        self.assertTrue(cex["depth_retryable"])
+        self.assertEqual(dex["market_id"], "0xAbC")
+        self.assertEqual(
+            dex["refresh_market_id"],
+            "dex:eth:uniswap_v3:0xabc:AAVE",
+        )
+        self.assertTrue(dex["tvl_retryable"])
+        self.assertFalse(dex["depth_retryable"])
+
+    def test_spread_summary_supports_latest_max_mean_and_median_ranking(self):
+        summary = market_facts._common_price_comparison(
+            {
+                "price_points": [
+                    {"date": "2026-07-01", "price_usd": 100},
+                    {"date": "2026-07-02", "price_usd": 100},
+                    {"date": "2026-07-03", "price_usd": 100},
+                ]
+            },
+            {
+                "price_points": [
+                    {"date": "2026-07-01", "price_usd": 99},
+                    {"date": "2026-07-02", "price_usd": 102},
+                    {"date": "2026-07-03", "price_usd": 104},
+                ]
+            },
+        )
+
+        self.assertEqual(summary["date"], "2026-07-03")
+        self.assertAlmostEqual(summary["latest"], 0.04)
+        self.assertAlmostEqual(summary["maximum_absolute"], 0.04)
+        self.assertAlmostEqual(summary["mean_absolute"], (0.01 + 0.02 + 0.04) / 3)
+        self.assertAlmostEqual(summary["median_absolute"], 0.02)
+        self.assertEqual(summary["comparable_days"], 3)
 
     def test_payload_contains_only_market_facts_and_token_level_spread(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
@@ -608,7 +670,7 @@ class MarketMonitorServerTest(unittest.TestCase):
 
         self.assertEqual(set(summary), {"metadata", "tokens"})
         self.assertEqual(summary["metadata"]["response_scope"], "screener_summary")
-        self.assertEqual(summary["metadata"]["summary_version"], 1)
+        self.assertEqual(summary["metadata"]["summary_version"], 2)
         self.assertTrue(summary["metadata"]["data_generation"])
         self.assertNotIn("markets", summary)
         self.assertNotIn("cex_markets", summary)
@@ -637,11 +699,14 @@ class MarketMonitorServerTest(unittest.TestCase):
             sum(compact["quality_status_counts"].values()),
             compact["market_count"],
         )
+        self.assertGreater(compact["quality_alert_counts"].get("info", 0), 0)
         self.assertEqual(compact["primary_cex"]["market_type"], "cex")
         self.assertEqual(compact["primary_dex"]["market_type"], "dex")
         self.assertNotIn("price_points", compact["primary_cex"])
         self.assertNotIn("price_points", compact["primary_dex"])
         for primary in (compact["primary_cex"], compact["primary_dex"]):
+            self.assertIn("refresh_market_id", primary)
+            self.assertIsInstance(primary["depth_retryable"], bool)
             for field in (
                 "first_observed_date",
                 "latest_observed_date",
@@ -757,7 +822,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             {**metadata, "start_date": "2025-12-01"},
             first_signature,
         )
-        with patch.object(server, "CATALOG_SUMMARY_VERSION", 2):
+        with patch.object(server, "CATALOG_SUMMARY_VERSION", 3):
             changed_contract = server._public_data_generation(
                 metadata,
                 first_signature,
@@ -2072,10 +2137,9 @@ class MarketMonitorServerTest(unittest.TestCase):
             'screenerMetricTooltip(priceGapValue, "Primary DEX / CEX − 1.")',
             screener_row,
         )
-        self.assertIn(
-            'screenerMetricTooltip(depthPairValue, "Primary CEX / DEX.")',
-            screener_row,
-        )
+        self.assertIn("screenerDepthMarkup(cex, token)", screener_row)
+        self.assertIn("screenerDepthMarkup(dex, token)", screener_row)
+        self.assertIn("naFactMarkup(snapshotMissingReason(", screener_row)
         self.assertIn("value !== 0 && Math.abs(value) < 1", app_js)
         self.assertIn("quality_flags", app_js)
         self.assertIn('id="facts-market-a-warning-trigger"', index)

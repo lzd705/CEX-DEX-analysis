@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260730-compact-screener-v1">
+    <link rel="stylesheet" href="/styles.css?v=20260731-spread-quality-v1">
   </head>
   <body>
     <header class="app-header">
@@ -18,7 +18,8 @@
       </div>
       <nav class="primary-navigation" aria-label="Primary navigation">
         <a href="/screener" data-app-route="screener">Screener</a>
-        <a href="/tokens/AAVE/markets" data-app-route="workspace">Token Research</a>
+        <a href="/tokens/AAVE/markets" data-app-route="markets">Markets</a>
+        <a href="/tokens/AAVE/compare" data-app-route="research">Token Research</a>
         <a href="/actions.html">Data Actions</a>
       </nav>
       <div
@@ -143,7 +144,6 @@
         </div>
 
         <nav class="workspace-tabs" aria-label="Token research pages">
-          <a href="/tokens/AAVE/markets" data-workspace-page="markets">Markets</a>
           <a href="/tokens/AAVE/compare" data-workspace-page="compare">Compare</a>
           <a href="/tokens/AAVE/liquidity" data-workspace-page="liquidity">Liquidity &amp; Execution</a>
           <a href="/tokens/AAVE/events" data-workspace-page="events">Events</a>
@@ -243,6 +243,11 @@
               <p>Initial A/B choices prefer markets with integrity-valid measured depth and no depth-relevant quality flags. The daily comparison uses the same selected market IDs, so its defaults can differ from the quality-weighted primary market.</p>
             </div>
           </details>
+        </div>
+        <div id="research-pair-context" class="research-pair-context" hidden>
+          <span><strong>Market A</strong> <span id="research-market-a">Not selected</span></span>
+          <span><strong>Market B</strong> <span id="research-market-b">Not selected</span></span>
+          <a id="change-markets" class="route-action" href="/tokens/AAVE/markets">Change markets</a>
         </div>
         <div id="workspace-context-notice" class="status-banner" role="status" aria-live="polite" hidden></div>
 
@@ -809,6 +814,7 @@
           <div id="quality-status" class="status-banner" role="status" aria-live="polite">
             Loading Token quality facts…
           </div>
+          <div id="quality-filter-summary" class="status-banner quality-filter-summary" role="status" hidden></div>
           <div id="quality-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
           <div class="table-scroll" role="region" aria-label="Token fact quality matrix" tabindex="0">
             <table id="quality-table" class="quality-table">
@@ -872,17 +878,23 @@
         <span class="contract-badge">Fact-only · no forecasts</span>
       </div>
       <section class="monitor-toolbar">
-        <div class="segmented-control" role="group" aria-label="Sort market scope">
-          <button type="button" data-scope="combined" class="active" aria-pressed="true">Aggregate</button>
-          <button type="button" data-scope="cross" aria-pressed="false">Cross-venue</button>
-          <button type="button" data-scope="cex" aria-pressed="false">CEX</button>
-          <button type="button" data-scope="dex" aria-pressed="false">DEX</button>
+        <div class="screener-scope-control">
+          <span class="toolbar-field-label">Scope</span>
+          <div id="sort-scope-buttons" class="segmented-control" role="group" aria-label="Sort market scope">
+            <button type="button" data-scope="combined" class="active" aria-pressed="true">Aggregate</button>
+            <button type="button" data-scope="cex" aria-pressed="false">CEX</button>
+            <button type="button" data-scope="dex" aria-pressed="false">DEX</button>
+          </div>
+          <span id="sort-scope-fixed" class="fixed-scope-chip" hidden></span>
         </div>
         <label class="sort-control">
           <span>Rank by</span>
           <select id="sort-field">
             <option value="volume">USD Volume</option>
-            <option value="spread">Absolute Spread</option>
+            <option value="spread">Latest Absolute Price Gap</option>
+            <option value="spread_max">Maximum Absolute Price Gap</option>
+            <option value="spread_mean">Average Absolute Price Gap</option>
+            <option value="spread_median">Median Absolute Price Gap</option>
             <option value="return">Window Return</option>
             <option value="volatility">Daily Volatility</option>
             <option value="depth_100bps">Primary ±100 bps Depth</option>
@@ -968,7 +980,7 @@
     </main>
 
     <script src="/vendor/lucide.js"></script>
-    <script src="/navigation.js?v=20260729-critical-round-v1"></script>
-    <script src="/app.js?v=20260730-compact-screener-v1"></script>
+    <script src="/navigation.js?v=20260731-spread-quality-v1"></script>
+    <script src="/app.js?v=20260731-spread-quality-v1"></script>
   </body>
 </html>

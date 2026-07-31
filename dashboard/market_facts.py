@@ -567,9 +567,16 @@ def select_primary_market(
 def _common_price_comparison(
     cex: dict[str, Any] | None,
     dex: dict[str, Any] | None,
-) -> tuple[str | None, float | None]:
+) -> dict[str, Any]:
     if not cex or not dex:
-        return None, None
+        return {
+            "date": None,
+            "latest": None,
+            "maximum_absolute": None,
+            "mean_absolute": None,
+            "median_absolute": None,
+            "comparable_days": 0,
+        }
     cex_prices = {
         point["date"]: finite_number(point.get("price_usd"))
         for point in cex.get("price_points", [])
@@ -586,10 +593,34 @@ def _common_price_comparison(
         and cex_prices[day] > 0
     )
     if not common_dates:
-        return None, None
+        return {
+            "date": None,
+            "latest": None,
+            "maximum_absolute": None,
+            "mean_absolute": None,
+            "median_absolute": None,
+            "comparable_days": 0,
+        }
+    absolute_spreads = sorted(
+        abs(dex_prices[day] / cex_prices[day] - 1)
+        for day in common_dates
+    )
     comparison_date = common_dates[-1]
     spread = dex_prices[comparison_date] / cex_prices[comparison_date] - 1
-    return comparison_date, spread
+    middle = len(absolute_spreads) // 2
+    median = (
+        absolute_spreads[middle]
+        if len(absolute_spreads) % 2
+        else (absolute_spreads[middle - 1] + absolute_spreads[middle]) / 2
+    )
+    return {
+        "date": comparison_date,
+        "latest": spread,
+        "maximum_absolute": max(absolute_spreads),
+        "mean_absolute": sum(absolute_spreads) / len(absolute_spreads),
+        "median_absolute": median,
+        "comparable_days": len(absolute_spreads),
+    }
 
 
 def build_token_summaries(
@@ -630,7 +661,7 @@ def build_token_summaries(
         aggregate_volume = (
             sum(observed_aggregates) if observed_aggregates else None
         )
-        comparison_date, spread = _common_price_comparison(
+        spread_summary = _common_price_comparison(
             primary_cex,
             primary_dex,
         )
@@ -667,8 +698,16 @@ def build_token_summaries(
                 or selected_dex_volume is not None
                 else None
             ),
-            "price_spread": spread,
-            "spread_date": comparison_date,
+            "price_spread": spread_summary["latest"],
+            "spread_date": spread_summary["date"],
+            "maximum_absolute_price_spread": spread_summary[
+                "maximum_absolute"
+            ],
+            "mean_absolute_price_spread": spread_summary["mean_absolute"],
+            "median_absolute_price_spread": spread_summary[
+                "median_absolute"
+            ],
+            "spread_comparable_days": spread_summary["comparable_days"],
             "primary_cex_id": market_identity(primary_cex) if primary_cex else None,
             "primary_dex_id": market_identity(primary_dex) if primary_dex else None,
             "primary_cex_selection_reason": cex_reason,

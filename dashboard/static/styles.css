@@ -470,6 +470,37 @@ main { min-width: 0; padding: 14px 18px 30px; }
 .quality-state[data-tooltip]:focus-visible::after {
   display: block;
 }
+.quality-count-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.quality-count-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 3px 8px;
+  border: 1px solid #59616c;
+  border-radius: 999px;
+  background: #24282e;
+  color: #c8ced6;
+  font-size: 10px;
+  font-weight: 800;
+  text-decoration: none;
+  text-transform: uppercase;
+}
+.quality-count-chip[data-severity="warning"] {
+  border-color: #806335;
+  background: #362a17;
+  color: #f0cc87;
+}
+.quality-count-chip[data-severity="critical"] {
+  border-color: #82424d;
+  background: #3b1e25;
+  color: #ffb4bf;
+}
+.quality-count-chip:hover,
+.quality-count-chip:focus-visible { border-color: var(--accent); color: #fff; }
 .facts-controls {
   display: grid;
   grid-template-columns: minmax(110px, .55fr) minmax(240px, 1.5fr) minmax(240px, 1.5fr) auto;
@@ -495,19 +526,84 @@ main { min-width: 0; padding: 14px 18px 30px; }
   color: var(--text);
 }
 .market-selector-shell {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 6px;
-  align-items: center;
-}
-.market-selector-shell.has-market-warning {
-  grid-template-columns: minmax(0, 1fr) 44px;
-}
-.market-warning-anchor {
   position: relative;
+}
+.market-selector-shell.has-market-warning select { padding-right: 54px; }
+.market-warning-anchor {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 3;
   width: 44px;
   height: 44px;
 }
+.research-pair-context {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 14px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #111419;
+  color: var(--muted);
+  font-size: 12px;
+}
+.research-pair-context[hidden] { display: none; }
+.research-pair-context strong { color: var(--text); }
+.research-pair-context .route-action { margin-left: auto; }
+.screener-scope-control { display: grid; gap: 4px; }
+.toolbar-field-label {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+.fixed-scope-chip {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 11px;
+  border: 1px solid #477e83;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: #a9e1e5;
+  font-size: 12px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+.fixed-scope-chip[hidden] { display: none; }
+.na-disclosure { display: inline-block; position: relative; }
+.na-disclosure > summary {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+}
+.na-disclosure > summary::-webkit-details-marker { display: none; }
+.na-disclosure > summary svg { width: 15px; height: 15px; color: var(--accent); }
+.na-disclosure-panel {
+  position: absolute;
+  z-index: 50;
+  top: calc(100% + 4px);
+  right: 0;
+  width: min(320px, calc(100vw - 32px));
+  padding: 10px;
+  border: 1px solid #477e83;
+  border-radius: 4px;
+  background: rgba(15, 17, 21, .98);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .45);
+  color: #cfd4db;
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  white-space: normal;
+}
+.na-disclosure-panel p { margin: 0; }
+.na-refresh-action { margin-top: 8px; min-height: 36px; }
 .market-warning-trigger {
   width: 44px;
   height: 44px;
@@ -1637,6 +1733,14 @@ main { min-width: 0; padding: 14px 18px 30px; }
 }
 .quality-reasons li[data-severity="critical"] { border-color: var(--negative); }
 .quality-reasons strong { display: block; color: var(--text); }
+.quality-filter-summary { margin-bottom: 10px; }
+.quality-linked-row { background: rgba(126, 190, 195, .045); }
+.quality-linked-row[data-highlight-severity="critical"] {
+  box-shadow: inset 3px 0 0 var(--negative);
+}
+.quality-linked-row[data-highlight-severity="warning"] {
+  box-shadow: inset 3px 0 0 var(--amber);
+}
 .facts-contract {
   margin-top: 12px;
   padding: 10px 12px;
@@ -2010,6 +2114,12 @@ footer {
   .view-heading .contract-badge { margin-top: 9px; }
   .contract-badge { display: inline-block; margin-top: 10px; }
   .facts-controls { grid-template-columns: 1fr; }
+  .research-pair-context .route-action { width: 100%; margin-left: 0; }
+  .na-disclosure-panel {
+    position: static;
+    width: min(100%, 320px);
+    margin-top: 4px;
+  }
   .market-warning-tooltip {
     width: min(380px, calc(100vw - 32px));
     max-height: 55vh;
@@ -2163,6 +2273,71 @@ footer {
     border: 1px solid var(--line);
     scrollbar-color: var(--accent) var(--surface-2);
   }
+  .workspace-page:has(#workspace-market-table) .table-scroll {
+    overflow: visible;
+    border: 0;
+  }
+  #workspace-market-table {
+    display: block;
+    min-width: 0;
+    margin-top: 0;
+    background: transparent;
+  }
+  #workspace-market-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+  #workspace-market-table tbody {
+    display: grid;
+    gap: 9px;
+  }
+  #workspace-market-table tr {
+    display: grid;
+    overflow: visible;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--surface-2);
+  }
+  #workspace-market-table td {
+    position: static;
+    display: grid;
+    grid-template-columns: minmax(108px, .8fr) minmax(0, 1.2fr);
+    gap: 10px;
+    width: 100%;
+    min-height: 42px;
+    height: auto;
+    padding: 8px 9px;
+    border-bottom: 1px solid var(--line-soft);
+    background: transparent;
+    text-align: right;
+    white-space: normal;
+  }
+  #workspace-market-table td:last-child { border-bottom: 0; }
+  #workspace-market-table td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-family: Inter, ui-sans-serif, sans-serif;
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: .03em;
+    text-align: left;
+    text-transform: uppercase;
+  }
+  #workspace-market-table .market-identity,
+  #workspace-market-table .quality-fact,
+  #workspace-market-table .na-disclosure {
+    min-width: 0;
+    justify-self: stretch;
+    text-align: right;
+  }
+  #workspace-market-table .na-disclosure-panel {
+    width: 100%;
+    text-align: left;
+  }
+  #workspace-market-table .pair-actions { justify-content: flex-end; }
   #market-table {
     display: block;
     min-width: 0;

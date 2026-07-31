@@ -113,6 +113,28 @@ console.log(JSON.stringify(result));
             {"marketA", "marketB", "start", "end", "scope"},
         )
 
+    def test_screener_quality_alert_link_preserves_exact_severity(self):
+        result = run_navigation_javascript(
+            """
+const path = navigation.buildWorkspacePath("AAVE", "quality", {
+  start: "2026-07-01",
+  end: "2026-07-28",
+  scope: "all",
+  severity: "warning",
+  origin: "screener",
+});
+const url = new URL(path, "https://example.test");
+console.log(JSON.stringify({
+  path,
+  route: navigation.parseRoute(url.pathname, url.search),
+}));
+"""
+        )
+        self.assertIn("severity=warning", result["path"])
+        self.assertIn("origin=screener", result["path"])
+        self.assertEqual(result["route"]["state"]["severity"], "warning")
+        self.assertEqual(result["route"]["state"]["origin"], "screener")
+
     def test_validate_pair_accepts_two_exact_catalog_ids(self):
         result = run_navigation_javascript(
             """

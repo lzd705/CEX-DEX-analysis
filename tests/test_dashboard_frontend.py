@@ -1971,7 +1971,7 @@ if (typeof openCustomWindowEditor !== "function") {
 const summary = {
   metadata: {
     response_scope: "screener_summary",
-    summary_version: 1,
+    summary_version: 2,
     data_generation: "g1",
   },
   tokens: [{
@@ -1979,6 +1979,10 @@ const summary = {
     primary_cex: null,
     primary_dex: null,
   }],
+};
+const staleSummary = {
+  ...summary,
+  metadata: {...summary.metadata, summary_version: 1},
 };
 const legacy = {
   metadata: {},
@@ -1988,12 +1992,14 @@ const legacy = {
 };
 console.log(JSON.stringify({
   summary: isMarketPayload(summary),
+  staleSummary: isMarketPayload(staleSummary),
   legacy: isMarketPayload(legacy),
   missingAggregates: aggregateFacts({}, [], []),
 }));
 """
         )
         self.assertTrue(result["summary"])
+        self.assertFalse(result["staleSummary"])
         self.assertFalse(result["legacy"])
         self.assertEqual(
             result["missingAggregates"],
@@ -2081,7 +2087,7 @@ console.log(JSON.stringify({
   app.payload = {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 1,
+      summary_version: 2,
       data_generation: "g1",
     },
     tokens: [],
@@ -2134,7 +2140,7 @@ console.log(JSON.stringify({
   app.payload = {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 1,
+      summary_version: 2,
       data_generation: "g1",
     },
     tokens: [],
@@ -2192,7 +2198,8 @@ const html = screenerTokenRow({
 console.log(JSON.stringify({ html }));
 """
         )
-        self.assertIn("Unavailable", result["html"])
+        self.assertIn("Catalog quality counts are incomplete", result["html"])
+        self.assertIn('aria-label="N/A reason"', result["html"])
         self.assertNotIn("Healthy", result["html"])
 
     def test_compact_primary_markets_keep_cex_and_dex_selection_metrics(self):
@@ -2341,6 +2348,41 @@ console.log(JSON.stringify({
         self.assertNotIn("combined", result["volatility"]["allowedScopes"])
         self.assertEqual(result["volatility"]["defaultScope"], "cex")
         self.assertEqual(result["tvl"]["allowedScopes"], ["dex"])
+
+    def test_cross_venue_is_metric_context_and_missing_facts_explain_recovery(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        app_js = APP_PATH.read_text(encoding="utf-8")
+        styles = STYLES_PATH.read_text(encoding="utf-8")
+
+        self.assertNotIn('data-scope="cross"', index)
+        self.assertIn('id="sort-scope-fixed"', index)
+        self.assertIn('value="spread_max"', index)
+        self.assertIn('value="spread_mean"', index)
+        self.assertIn('value="spread_median"', index)
+        self.assertIn("Cross-venue · Primary CEX ↔ DEX", app_js)
+        self.assertIn("function naFactMarkup(", app_js)
+        self.assertIn('data-refresh-market-id=', app_js)
+        self.assertIn('fetch("/api/actions/facts/refresh"', app_js)
+        self.assertIn('market?.[`${fact}_retryable`] === true', app_js)
+        self.assertIn(".na-disclosure-panel", styles)
+
+    def test_market_pair_controls_share_one_aligned_grid_without_warning_column(self):
+        styles = STYLES_PATH.read_text(encoding="utf-8")
+        app_js = APP_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "grid-template-columns: minmax(110px, .55fr) minmax(240px, 1.5fr) minmax(240px, 1.5fr) auto",
+            styles,
+        )
+        self.assertIn(".market-selector-shell {\n  position: relative;", styles)
+        warning_rule = styles[
+            styles.index(".market-warning-anchor {"):
+            styles.index(".research-pair-context {")
+        ]
+        self.assertIn("position: absolute", warning_rule)
+        self.assertNotIn("grid-template-columns", warning_rule)
+        self.assertIn('data-label="±100 bps depth"', app_js)
+        self.assertIn("#workspace-market-table tbody", styles)
+        self.assertIn("#workspace-market-table .na-disclosure-panel", styles)
 
     def test_rank_value_is_rendered_and_csv_carries_sort_contract(self):
         result = run_app_javascript(
@@ -2976,7 +3018,8 @@ console.log(JSON.stringify({
 
         self.assertIn("return appliedTimeWindow();", summary_state)
         self.assertIn("currentSummaryWindowRouteState()", row_renderer)
-        self.assertIn("currentSummaryWindowRouteState()", route_links)
+        self.assertIn("workspaceEntryRouteState", route_links)
+        self.assertIn("currentSummaryWindowRouteState()", summary_state)
 
     def test_compare_window_preset_resolves_to_explicit_utc_dates(self):
         result = run_app_javascript(

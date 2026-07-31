@@ -14,6 +14,8 @@ const app = {
   sortDirection: "desc",
   workspaceMarketType: "all",
   qualityScope: "all",
+  qualitySeverity: "",
+  qualityOrigin: "",
   liquidityView: "total",
   liquidityScale: "log",
   comparisonMetric: "price",
@@ -152,7 +154,25 @@ const SCREENER_SORT_DEFINITIONS = Object.freeze({
     snapshot: false,
   }),
   spread: Object.freeze({
-    label: "Absolute Primary Price Gap",
+    label: "Latest Absolute Price Gap",
+    allowedScopes: Object.freeze(["cross"]),
+    defaultScope: "cross",
+    snapshot: false,
+  }),
+  spread_max: Object.freeze({
+    label: "Maximum Absolute Price Gap",
+    allowedScopes: Object.freeze(["cross"]),
+    defaultScope: "cross",
+    snapshot: false,
+  }),
+  spread_mean: Object.freeze({
+    label: "Average Absolute Price Gap",
+    allowedScopes: Object.freeze(["cross"]),
+    defaultScope: "cross",
+    snapshot: false,
+  }),
+  spread_median: Object.freeze({
+    label: "Median Absolute Price Gap",
     allowedScopes: Object.freeze(["cross"]),
     defaultScope: "cross",
     snapshot: false,
@@ -399,6 +419,8 @@ function currentWorkspaceRouteState(
     state.scale = app.liquidityScale;
   } else if (page === "quality") {
     state.scope = app.qualityScope;
+    if (app.qualitySeverity) state.severity = app.qualitySeverity;
+    if (app.qualityOrigin) state.origin = app.qualityOrigin;
   } else if (page === "events") {
     state.lifecycle = app.eventLifecycle;
   }
@@ -421,19 +443,39 @@ function currentSummaryWindowRouteState() {
   return appliedTimeWindow();
 }
 
+function workspaceEntryRouteState(page) {
+  if (app.route?.kind === "screener") {
+    return currentSummaryWindowRouteState();
+  }
+  return currentWorkspaceRouteState(page);
+}
+
 function updateRouteLinks() {
   const token = (
     app.route?.kind === "workspace"
       ? String(app.route.token || "").toUpperCase()
       : selectedWorkspaceToken()
   ) || "AAVE";
-  const primaryWorkspace = document.querySelector('[data-app-route="workspace"]');
-  if (primaryWorkspace && navigation) {
-    const page = app.route?.kind === "workspace" ? app.route.page : "markets";
-    const state = app.route?.kind === "workspace"
-      ? currentWorkspaceRouteState(page)
-      : currentSummaryWindowRouteState();
-    primaryWorkspace.href = navigation.buildWorkspacePath(token, page, state);
+  if (navigation) {
+    const marketsLink = document.querySelector('[data-app-route="markets"]');
+    const researchLink = document.querySelector('[data-app-route="research"]');
+    if (marketsLink) {
+      marketsLink.href = navigation.buildWorkspacePath(
+        token,
+        "markets",
+        workspaceEntryRouteState("markets"),
+      );
+    }
+    if (researchLink) {
+      const researchPage = app.route?.kind === "workspace" && app.route.page !== "markets"
+        ? app.route.page
+        : "compare";
+      researchLink.href = navigation.buildWorkspacePath(
+        token,
+        researchPage,
+        workspaceEntryRouteState(researchPage),
+      );
+    }
   }
   document.querySelectorAll("[data-workspace-page]").forEach((link) => {
     const page = link.dataset.workspacePage;
@@ -447,14 +489,25 @@ function updateRouteLinks() {
     else link.removeAttribute("aria-current");
   });
   document.querySelectorAll("[data-app-route]").forEach((link) => {
-    const active = link.dataset.appRoute === (
-      app.route?.kind === "workspace" ? "workspace" : app.route?.kind
-    );
+    const activeRoute = app.route?.kind !== "workspace"
+      ? app.route?.kind
+      : app.route.page === "markets"
+        ? "markets"
+        : "research";
+    const active = link.dataset.appRoute === activeRoute;
     if (active) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   });
   const back = byId("back-to-screener");
   if (back && navigation) back.href = navigation.buildScreenerPath(currentScreenerFilters());
+  const changeMarkets = byId("change-markets");
+  if (changeMarkets && navigation) {
+    changeMarkets.href = navigation.buildWorkspacePath(
+      token,
+      "markets",
+      currentWorkspaceRouteState("markets"),
+    );
+  }
 }
 
 function replaceCurrentRoute({
@@ -510,7 +563,12 @@ function setActiveWorkspacePage(page) {
   const compareVisible = page === "compare";
   byId("comparison-status").hidden = !compareVisible;
   if (!compareVisible) byId("comparison-error").hidden = true;
-  byId("time-toolbar").hidden = page === "events";
+  const isMarkets = page === "markets";
+  byId("time-toolbar").hidden = page === "events" || page === "liquidity";
+  byId("facts-workbench").classList.toggle("markets-page", isMarkets);
+  byId("research-pair-context").hidden = isMarkets;
+  document.querySelector(".facts-controls").hidden = !isMarkets;
+  byId("selector-policy").hidden = !isMarkets;
 }
 
 function syncSegmentedControls() {
@@ -909,6 +967,8 @@ function applyWorkspaceRoute(route) {
     syncSegmentedControls();
   } else if (route.page === "quality") {
     app.qualityScope = route.state?.scope || "all";
+    app.qualitySeverity = route.state?.severity || "";
+    app.qualityOrigin = route.state?.origin || "";
     syncSegmentedControls();
   } else if (route.page === "events") {
     app.eventLifecycle = route.state?.lifecycle || "all";
@@ -1491,17 +1551,26 @@ function syncScreenerSortControls() {
   if (!definition.allowedScopes.includes(app.scope)) {
     app.scope = definition.defaultScope;
   }
+  const fixedScope = definition.allowedScopes.length === 1;
+  const scopeButtons = byId("sort-scope-buttons");
+  const fixedScopeChip = byId("sort-scope-fixed");
+  if (scopeButtons) scopeButtons.hidden = fixedScope;
+  if (fixedScopeChip) {
+    fixedScopeChip.hidden = !fixedScope;
+    fixedScopeChip.textContent = definition.allowedScopes[0] === "cross"
+      ? "Cross-venue · Primary CEX ↔ DEX"
+      : "DEX market scope";
+  }
   document.querySelectorAll("[data-scope]").forEach((button) => {
     const allowed = definition.allowedScopes.includes(button.dataset.scope);
     const active = allowed && button.dataset.scope === app.scope;
-    button.disabled = !allowed;
+    button.hidden = !allowed;
+    button.disabled = false;
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
     button.setAttribute(
       "aria-label",
-      allowed
-        ? `${button.textContent.trim()} ranking scope`
-        : `${button.textContent.trim()} is not available for ${definition.label}`,
+      `${button.textContent.trim()} ranking scope`,
     );
   });
   const scopeLabel = {
@@ -1528,6 +1597,18 @@ function sortValue(tokenSummary) {
   const { cex, dex, spread } = comparison(tokenSummary);
   const field = byId("sort-field").value;
   if (field === "spread") return finite(spread) ? Math.abs(spread) : -Infinity;
+  if (field === "spread_max") {
+    const value = tokenSummary.maximum_absolute_price_spread;
+    return finite(value) ? value : -Infinity;
+  }
+  if (field === "spread_mean") {
+    const value = tokenSummary.mean_absolute_price_spread;
+    return finite(value) ? value : -Infinity;
+  }
+  if (field === "spread_median") {
+    const value = tokenSummary.median_absolute_price_spread;
+    return finite(value) ? value : -Infinity;
+  }
   if (field === "return") {
     const value = app.scope === "dex" ? dex?.window_return : cex?.window_return;
     return finite(value) ? value : -Infinity;
@@ -1572,9 +1653,9 @@ function compareScreenerTokens(a, b) {
 
 function formatRankValue(tokenSummary) {
   const value = sortValue(tokenSummary);
-  if (!finite(value)) return "N/A";
+  if (!finite(value)) return null;
   const field = byId("sort-field").value;
-  if (field === "spread") return `${bpsFormat.format(value * 10_000)} bps`;
+  if (field.startsWith("spread")) return `${bpsFormat.format(value * 10_000)} bps`;
   if (field === "return" || field === "volatility") return formatPercent(value);
   return formatCurrency(value);
 }
@@ -1844,11 +1925,86 @@ function screenerMetricTooltip(value, tooltip) {
     + `${escapeHtml(value)}</span>`;
 }
 
+function naFactMarkup(reason, {
+  retryable = false,
+  token = "",
+  marketId = "",
+  fact = "",
+} = {}) {
+  const action = retryable && token && marketId && fact
+    ? `<button type="button" class="na-refresh-action secondary-command" `
+      + `data-refresh-fact="${escapeHtml(fact)}" `
+      + `data-refresh-token="${escapeHtml(token)}" `
+      + `data-refresh-market-id="${escapeHtml(marketId)}">Refresh this fact</button>`
+    : "";
+  return `<details class="na-disclosure">
+    <summary aria-label="N/A reason"><span>N/A</span><i data-lucide="info"></i></summary>
+    <div class="na-disclosure-panel"><p>${escapeHtml(reason)}</p>${action}</div>
+  </details>`;
+}
+
+function snapshotRetryable(market, fact) {
+  return market?.[`${fact}_retryable`] === true;
+}
+
+function snapshotMissingReason(market, fact, fallback) {
+  const status = market?.[`${fact}_status`] || "unavailable";
+  const reasonCode = market?.[`${fact}_na_reason`];
+  const reason = reasonCode
+    ? DAILY_QUALITY_REASON_LABELS[reasonCode]
+      || reasonCode.replaceAll("_", " ")
+    : fallback;
+  return `${reason} Status: ${status}.`;
+}
+
+function screenerDepthMarkup(market, token) {
+  if (finite(market?.total_depth_100bps_usd)) {
+    return formatDepth(market.total_depth_100bps_usd, market.depth_100bps_complete);
+  }
+  return naFactMarkup(snapshotMissingReason(
+    market,
+    "depth",
+    "No measured ±100 bps depth is published.",
+  ), {
+    retryable: snapshotRetryable(market, "depth"),
+    token,
+    marketId: market?.refresh_market_id,
+    fact: "depth",
+  });
+}
+
+function screenerQualityMarkup(token, statusCounts, countsComplete) {
+  if (!countsComplete) {
+    return naFactMarkup("Catalog quality counts are incomplete for this Token.");
+  }
+  const chips = [
+    ["critical", "Critical reasons"],
+    ["warning", "Warning reasons"],
+    ["info", "Info reasons"],
+  ].filter(([severity]) => finite(statusCounts?.[severity]) && statusCounts[severity] > 0)
+    .map(([severity, label]) => {
+      const path = navigation
+        ? navigation.buildWorkspacePath(token, "quality", {
+          ...currentSummaryWindowRouteState(),
+          scope: "all",
+          severity,
+          origin: "screener",
+        })
+        : "#";
+      return `<a class="quality-count-chip" data-severity="${severity}" `
+        + `href="${escapeHtml(path)}">${statusCounts[severity]} ${label}</a>`;
+    });
+  return chips.length
+    ? `<span class="quality-count-chips">${chips.join("")}</span>`
+    : qualityStateMarkup("ok");
+}
+
 function screenerTokenRow(tokenSummary) {
   const token = tokenSummary.token_symbol;
   const { cex, dex, spread } = comparison(tokenSummary);
   const aggregates = aggregateFacts(tokenSummary, [], []);
   const statusCounts = tokenSummary.quality_status_counts || null;
+  const alertCounts = tokenSummary.quality_alert_counts || statusCounts;
   const catalogCount = tokenSummary.market_count;
   const qualityCountTotal = statusCounts
     ? Object.values(statusCounts).reduce((total, value) => (
@@ -1860,30 +2016,9 @@ function screenerTokenRow(tokenSummary) {
     && catalogCount > 0
     && qualityCountTotal === catalogCount
   );
-  const qualityText = !qualityCountsComplete
-    ? "Unavailable"
-    : statusCounts?.critical
-    ? `${statusCounts.critical} critical`
-    : statusCounts?.warning
-      ? `${statusCounts.warning} warning`
-      : statusCounts?.info
-        ? `${statusCounts.info} informational`
-        : "Healthy";
-  const qualityState = !qualityCountsComplete
-    ? "unavailable"
-    : statusCounts?.critical
-    ? "critical"
-    : statusCounts?.warning
-      ? "warning"
-      : statusCounts?.info
-        ? "unavailable"
-        : "ok";
   const aggregateValue = formatCurrency(aggregates.aggregateTotal);
   const priceGapValue = formatPercent(spread);
-  const depthPairValue = [
-    formatDepth(cex?.total_depth_100bps_usd, cex?.depth_100bps_complete),
-    formatDepth(dex?.total_depth_100bps_usd, dex?.depth_100bps_complete),
-  ].join(" / ");
+  const rankValue = formatRankValue(tokenSummary);
   const researchPath = navigation
     ? navigation.buildWorkspacePath(
       token,
@@ -1894,27 +2029,46 @@ function screenerTokenRow(tokenSummary) {
   return `<tr class="token-row screener-token-row">
     <td data-label="Token" class="sticky-token token-name">${escapeHtml(token)}</td>
     <td data-label="Rank value" class="rank-value">
-      ${escapeHtml(formatRankValue(tokenSummary))}
+      ${rankValue === null
+        ? naFactMarkup("The selected ranking metric has no valid source observation for this Token and window.")
+        : escapeHtml(rankValue)}
     </td>
     <td data-label="Covered markets">
       ${tokenSummary.cex_market_count ?? "—"} CEX · ${tokenSummary.dex_market_count ?? "—"} DEX
     </td>
     <td data-label="Aggregate USD volume">
-      ${screenerMetricTooltip(
-        aggregateValue,
-        `CEX ${formatCurrency(aggregates.aggregateCex)} · DEX ${formatCurrency(aggregates.aggregateDex)}`,
-      )}
+      ${finite(aggregates.aggregateTotal)
+        ? screenerMetricTooltip(
+          aggregateValue,
+          `CEX ${formatCurrency(aggregates.aggregateCex)} · DEX ${formatCurrency(aggregates.aggregateDex)}`,
+        )
+        : naFactMarkup("No finite daily volume is available in the selected window.")}
     </td>
-    <td data-label="DEX share">${formatShare(aggregates.aggregateDexShare)}</td>
+    <td data-label="DEX share">${finite(aggregates.aggregateDexShare)
+      ? formatShare(aggregates.aggregateDexShare)
+      : naFactMarkup("DEX volume share cannot be calculated because aggregate CEX/DEX volume is unavailable or zero.")}</td>
     <td data-label="Primary price gap" class="${metricClass(spread)}">
-      ${screenerMetricTooltip(priceGapValue, "Primary DEX / CEX − 1.")}
+      ${finite(spread)
+        ? screenerMetricTooltip(priceGapValue, "Primary DEX / CEX − 1.")
+        : naFactMarkup("Primary CEX and DEX prices are not comparable on a common observed date.")}
     </td>
     <td data-label="Primary ±100 bps depth">
-      ${screenerMetricTooltip(depthPairValue, "Primary CEX / DEX.")}
+      <span class="depth-pair-values">${screenerDepthMarkup(cex, token)} / ${screenerDepthMarkup(dex, token)}</span>
     </td>
-    <td data-label="Primary DEX TVL">${formatCurrency(dex?.tvl_usd)}</td>
+    <td data-label="Primary DEX TVL">${finite(dex?.tvl_usd)
+      ? formatCurrency(dex.tvl_usd)
+      : naFactMarkup(snapshotMissingReason(
+        dex,
+        "tvl",
+        "No DEX TVL value is published.",
+      ), {
+        retryable: snapshotRetryable(dex, "tvl"),
+        token,
+        marketId: dex?.refresh_market_id,
+        fact: "tvl",
+      })}</td>
     <td data-label="Quality">
-      <span class="quality-state" data-state="${escapeHtml(qualityState)}">${escapeHtml(qualityText)}</span>
+      ${screenerQualityMarkup(token, alertCounts, qualityCountsComplete)}
     </td>
     <td data-label="Research">
       <a class="route-action" href="${escapeHtml(researchPath)}" data-open-token="${escapeHtml(token)}">Open workspace</a>
@@ -1935,6 +2089,42 @@ function renderTable() {
     ? tokens.map((token) => screenerTokenRow(token)).join("")
     : `<tr><td data-label="Result" colspan="10" class="missing">No Token matches this search.</td></tr>`;
   byId("row-count").textContent = `${tokens.length} Tokens · one row per Token`;
+  if (window.lucide) window.lucide.createIcons();
+}
+
+async function requestSnapshotFactRefresh(button) {
+  if (!button || button.disabled) return;
+  const payload = {
+    token_symbol: button.dataset.refreshToken || "",
+    market_id: button.dataset.refreshMarketId || "",
+    fact_type: button.dataset.refreshFact || "",
+  };
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Queuing refresh…";
+  try {
+    const response = await fetch("/api/actions/facts/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await responseJson(response);
+    if (!response.ok) throw new Error(result.error || "Fact refresh was rejected.");
+    button.textContent = "Refresh queued";
+    showStatus(
+      byId("market-status"),
+      `${payload.token_symbol} ${payload.fact_type.toUpperCase()} refresh queued. `
+        + "The N/A remains until a validated snapshot is published.",
+      "success",
+    );
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = originalText;
+    showError(
+      byId("global-error"),
+      publicErrorMessage(error, "Fact refresh is unavailable."),
+    );
+  }
 }
 
 function payloadMarketForCatalog(market) {
@@ -1944,7 +2134,11 @@ function payloadMarketForCatalog(market) {
 
 function qualityStateMarkup(status, label = "", tooltip = "") {
   const normalized = String(status || "unavailable").toLowerCase();
-  const display = label || normalized.replaceAll("_", " ");
+  const display = label || (
+    normalized === "ok"
+      ? "No active alerts"
+      : normalized.replaceAll("_", " ")
+  );
   const tooltipAttributes = tooltip
     ? ` tabindex="0" aria-label="${escapeHtml(`${display}. ${tooltip}`)}" data-tooltip="${escapeHtml(tooltip)}"`
     : "";
@@ -1985,9 +2179,17 @@ function renderWorkspaceContext() {
     byId("workspace-description").textContent = (
       `${formatCurrency(aggregates.aggregateTotal)} aggregate window volume · `
       + `${formatShare(aggregates.aggregateDexShare)} DEX share. `
-      + "Market A/B stay shared across the five research pages."
+      + "Market A/B stay shared across the four research pages."
     );
   }
+  const pair = selectedPairState();
+  const byMarketId = new Map(markets.map((market) => [market.market_id, market]));
+  byId("research-market-a").textContent = pair.marketA
+    ? factsMarketLabel(byMarketId.get(pair.marketA))
+    : "Not selected";
+  byId("research-market-b").textContent = pair.marketB
+    ? factsMarketLabel(byMarketId.get(pair.marketB))
+    : "Not selected";
   updateRouteLinks();
 }
 
@@ -2002,39 +2204,78 @@ function renderWorkspaceMarkets() {
     ? markets.map((market) => {
         const row = payloadMarketForCatalog(market);
         const flags = factsMarketWarningFlags(market);
+        const rowQualityStatus = flags.length
+          ? factsMarketWarningSeverity(market, flags)
+          : market.quality_status || "ok";
+        const rowQualityLabel = rowQualityStatus === "info" ? "Informational" : "";
         const selectedA = pair.marketA === market.market_id;
         const selectedB = pair.marketB === market.market_id;
-        const depth = formatDepth(
-          market.total_depth_100bps_usd,
-          market.depth_100bps_complete,
-        );
-        const tvl = market.market_type === "dex"
-          ? formatCurrency(firstFinite(row?.tvl_usd, market.tvl_usd))
-          : "N/A";
+        const depth = finite(market.total_depth_100bps_usd)
+          ? formatDepth(
+            market.total_depth_100bps_usd,
+            market.depth_100bps_complete,
+          )
+          : naFactMarkup(
+            snapshotMissingReason(
+              market,
+              "depth",
+              "No measured ±100 bps depth is published.",
+            ),
+            {
+              retryable: snapshotRetryable(market, "depth"),
+              token,
+              marketId: market.market_id,
+              fact: "depth",
+            },
+          );
+        const tvlValue = firstFinite(row?.tvl_usd, market.tvl_usd);
+        const tvl = market.market_type === "cex"
+          ? naFactMarkup("TVL is not applicable to a centralized order book.")
+          : finite(tvlValue)
+            ? formatCurrency(tvlValue)
+            : naFactMarkup(
+              snapshotMissingReason(
+                market,
+                "tvl",
+                "No DEX TVL value is published.",
+              ),
+              {
+                retryable: snapshotRetryable(market, "tvl"),
+                token,
+                marketId: market.market_id,
+                fact: "tvl",
+              },
+            );
         const identityMeta = [
           market.market_type.toUpperCase(),
           market.chain,
           market.source_quote_asset_label,
         ].filter(Boolean).join(" · ");
         return `<tr>
-          <td>
+          <td data-label="Market">
             <span class="market-identity">
               <strong>${escapeHtml(factsMarketLabel(market))}</strong>
               <small>${escapeHtml(identityMeta)}</small>
               ${market.pool_address ? `<small>${escapeHtml(market.pool_address)}</small>` : ""}
             </span>
           </td>
-          <td>${qualityStateMarkup(market.market_type, market.market_type.toUpperCase())}</td>
-          <td>${formatPrice(row?.price_usd)}</td>
-          <td>${formatCurrency(row?.volume_usd)}</td>
-          <td>${tvl}</td>
-          <td>${depth}<span class="metric-note">${escapeHtml(market.depth_status || "unavailable")}</span></td>
-          <td>${formatRatio(row?.coverage_ratio)}</td>
-          <td>
-            ${qualityStateMarkup(market.quality_status || "ok")}
+          <td data-label="Type">${qualityStateMarkup(market.market_type, market.market_type.toUpperCase())}</td>
+          <td data-label="Window price">${finite(row?.price_usd)
+            ? formatPrice(row.price_usd)
+            : naFactMarkup("No finite daily close is available for this market in the selected window.")}</td>
+          <td data-label="Window volume">${finite(row?.volume_usd)
+            ? formatCurrency(row.volume_usd)
+            : naFactMarkup("No finite daily USD volume is available for this market in the selected window.")}</td>
+          <td data-label="TVL">${tvl}</td>
+          <td data-label="±100 bps depth">${depth}<span class="metric-note">${escapeHtml(market.depth_status || "unavailable")}</span></td>
+          <td data-label="Coverage">${finite(row?.coverage_ratio)
+            ? formatRatio(row?.coverage_ratio)
+            : naFactMarkup("Coverage is unavailable because no valid daily observation count was published.")}</td>
+          <td data-label="Quality">
+            ${qualityStateMarkup(rowQualityStatus, rowQualityLabel)}
             <span class="metric-note">${flags.length} reason${flags.length === 1 ? "" : "s"}</span>
           </td>
-          <td>
+          <td data-label="Pair selection">
             <span class="pair-actions">
               <button
                 type="button"
@@ -2278,7 +2519,31 @@ function qualityFactMarkup(name, fact) {
 
 function renderQualityPayload(payload) {
   app.quality = payload;
-  const rows = Array.isArray(payload?.markets) ? payload.markets : [];
+  const sourceRows = Array.isArray(payload?.markets) ? payload.markets : [];
+  const severity = app.qualityOrigin === "screener" ? app.qualitySeverity : "";
+  const rows = severity
+    ? sourceRows.filter((item) => {
+      const market = item.market || item;
+      const flags = Array.isArray(item.quality_flags) ? item.quality_flags : [];
+      return market.quality_status === severity
+        || flags.some((flag) => flag?.severity === severity);
+    })
+    : sourceRows;
+  const matchingReasonCount = severity
+    ? rows.reduce((total, item) => {
+      const flags = Array.isArray(item.quality_flags) ? item.quality_flags : [];
+      const matches = flags.filter((flag) => flag?.severity === severity).length;
+      return total + (matches || ((item.market || item).quality_status === severity ? 1 : 0));
+    }, 0)
+    : 0;
+  const filterSummary = byId("quality-filter-summary");
+  if (filterSummary) {
+    filterSummary.hidden = !severity;
+    filterSummary.textContent = severity
+      ? `Showing ${rows.length} market${rows.length === 1 ? "" : "s"} with ${matchingReasonCount} ${severity} reason${matchingReasonCount === 1 ? "" : "s"} linked from the Screener.`
+      : "";
+    filterSummary.dataset.state = severity === "critical" ? "critical" : "warning";
+  }
   byId("quality-body").innerHTML = rows.length
     ? rows.map((item) => {
         const market = item.market || item;
@@ -2300,7 +2565,7 @@ function renderQualityPayload(payload) {
           return groups;
         }, {});
         const reasons = flags.length
-          ? `<details class="quality-reasons">
+          ? `<details class="quality-reasons" ${severity ? "open" : ""}>
               <summary>${flags.length} current reason${flags.length === 1 ? "" : "s"}</summary>
               ${Object.entries(reasonGroups).map(([category, categoryFlags]) => `
                 <strong class="quality-reason-category">${escapeHtml(category.replaceAll("_", " "))}</strong>
@@ -2312,7 +2577,7 @@ function renderQualityPayload(payload) {
               `).join("")}
             </details>`
           : '<span class="missing">No current quality flags</span>';
-        return `<tr>
+        return `<tr ${severity ? `class="quality-linked-row" data-highlight-severity="${escapeHtml(severity)}"` : ""}>
           <td data-label="Market"><span class="market-identity"><strong>${escapeHtml(factsMarketLabel(market))}</strong><small>${escapeHtml(market.market_id)}</small></span></td>
           <td data-label="Daily Facts">${qualityFactMarkup("daily", facts.daily)}</td>
           <td data-label="TVL">${qualityFactMarkup("tvl", facts.tvl)}</td>
@@ -2321,7 +2586,9 @@ function renderQualityPayload(payload) {
           <td data-label="Current Reasons">${reasons}</td>
         </tr>`;
       }).join("")
-    : '<tr><td colspan="6" class="missing">No markets are available for this quality scope.</td></tr>';
+    : `<tr><td colspan="6" class="missing">${severity
+      ? `No ${escapeHtml(severity)} market alerts match this Screener link.`
+      : "No markets are available for this quality scope."}</td></tr>`;
 }
 
 function renderQualityFromCatalog() {
@@ -2348,6 +2615,20 @@ function formatExecutionCost(row) {
 function formatExecutionFill(row) {
   const fill = decimalNumber(row?.fill_ratio);
   return fill === null ? "N/A" : formatShare(fill);
+}
+
+function executionCostMarkup(row) {
+  const value = formatExecutionCost(row);
+  return value === "N/A"
+    ? naFactMarkup("No collected execution-cost scenario exists for this market, side, and notional.")
+    : escapeHtml(value);
+}
+
+function executionFillMarkup(row) {
+  const value = formatExecutionFill(row);
+  return value === "N/A"
+    ? naFactMarkup("Fill ratio is unavailable because no matching execution scenario was published.")
+    : escapeHtml(value);
 }
 
 function executionScenario(result, direction, notional) {
@@ -2511,11 +2792,11 @@ function renderExecution(payload) {
     const rowB = rowsB[index];
     return `<tr>
       <th scope="row" data-label="Requested Notional">${formatCurrency(Number(notional))}</th>
-      <td data-label="A Cost">${escapeHtml(formatExecutionCost(rowA))}</td>
-      <td data-label="A Fill">${escapeHtml(formatExecutionFill(rowA))}</td>
+      <td data-label="A Cost">${executionCostMarkup(rowA)}</td>
+      <td data-label="A Fill">${executionFillMarkup(rowA)}</td>
       <td data-label="A Status">${executionStatusMarkup(rowA, resultA)}</td>
-      <td data-label="B Cost">${escapeHtml(formatExecutionCost(rowB))}</td>
-      <td data-label="B Fill">${escapeHtml(formatExecutionFill(rowB))}</td>
+      <td data-label="B Cost">${executionCostMarkup(rowB)}</td>
+      <td data-label="B Fill">${executionFillMarkup(rowB)}</td>
       <td data-label="B Status">${executionStatusMarkup(rowB, resultB)}</td>
     </tr>`;
   }).join("");
@@ -3683,6 +3964,20 @@ function liquidityCompletenessLabel(market, dataMarket, band, invalid) {
   return dataMarket[`depth_${band}bps_complete`] ? "Complete" : "Lower bound";
 }
 
+function liquidityDepthMarkup(value, complete, market, band, component) {
+  if (validDepth(value)) return formatExactDepth(value, complete);
+  return naFactMarkup(snapshotMissingReason(
+    market,
+    "depth",
+    `No ${component} depth was published inside ±${band} bps.`,
+  ), {
+    retryable: snapshotRetryable(market, "depth"),
+    token: selectedWorkspaceToken(),
+    marketId: market?.market_id,
+    fact: "depth",
+  });
+}
+
 function renderLiquidityTable(marketA, marketB, dataMarketA, dataMarketB, invalidA, invalidB) {
   const sidesA = liquiditySideDefinition(marketA);
   const sidesB = liquiditySideDefinition(marketB);
@@ -3697,13 +3992,13 @@ function renderLiquidityTable(marketA, marketB, dataMarketA, dataMarketB, invali
     const completeB = Boolean(dataMarketB?.[`depth_${band}bps_complete`]);
     return `<tr>
       <th scope="row" data-label="Band">±${band} bps</th>
-      <td data-label="A Total">${formatExactDepth(liquidityDepthValue(dataMarketA, band), completeA)}</td>
-      <td data-label="A Sell execution">${formatExactDepth(liquidityDepthValue(dataMarketA, band, sidesA.sellField), completeA)}</td>
-      <td data-label="A Buy execution">${formatExactDepth(liquidityDepthValue(dataMarketA, band, sidesA.buyField), completeA)}</td>
+      <td data-label="A Total">${liquidityDepthMarkup(liquidityDepthValue(dataMarketA, band), completeA, marketA, band, "total")}</td>
+      <td data-label="A Sell execution">${liquidityDepthMarkup(liquidityDepthValue(dataMarketA, band, sidesA.sellField), completeA, marketA, band, sidesA.sellLabel.toLowerCase())}</td>
+      <td data-label="A Buy execution">${liquidityDepthMarkup(liquidityDepthValue(dataMarketA, band, sidesA.buyField), completeA, marketA, band, sidesA.buyLabel.toLowerCase())}</td>
       <td data-label="A Completeness">${escapeHtml(liquidityCompletenessLabel(marketA, dataMarketA, band, invalidA))}</td>
-      <td data-label="B Total">${formatExactDepth(liquidityDepthValue(dataMarketB, band), completeB)}</td>
-      <td data-label="B Sell execution">${formatExactDepth(liquidityDepthValue(dataMarketB, band, sidesB.sellField), completeB)}</td>
-      <td data-label="B Buy execution">${formatExactDepth(liquidityDepthValue(dataMarketB, band, sidesB.buyField), completeB)}</td>
+      <td data-label="B Total">${liquidityDepthMarkup(liquidityDepthValue(dataMarketB, band), completeB, marketB, band, "total")}</td>
+      <td data-label="B Sell execution">${liquidityDepthMarkup(liquidityDepthValue(dataMarketB, band, sidesB.sellField), completeB, marketB, band, sidesB.sellLabel.toLowerCase())}</td>
+      <td data-label="B Buy execution">${liquidityDepthMarkup(liquidityDepthValue(dataMarketB, band, sidesB.buyField), completeB, marketB, band, sidesB.buyLabel.toLowerCase())}</td>
       <td data-label="B Completeness">${escapeHtml(liquidityCompletenessLabel(marketB, dataMarketB, band, invalidB))}</td>
     </tr>`;
   }).join("");
@@ -4709,6 +5004,10 @@ function clearComparisonResult(message = "") {
   byId("compare-markets").disabled = false;
 }
 
+function comparisonValueMarkup(value, formatter, reason) {
+  return finite(value) ? escapeHtml(formatter(value)) : naFactMarkup(reason);
+}
+
 function renderComparison(payload) {
   app.comparison = payload;
   const latest = payload.latest_comparable_observation;
@@ -4744,12 +5043,12 @@ function renderComparison(payload) {
   byId("comparison-body").innerHTML = rows.length
     ? rows.map((row) => `<tr>
         <td>${escapeHtml(row.date)}</td>
-        <td>${formatRawUsd(row.market_a.price_usd)}</td>
-        <td>${formatRawVolume(row.market_a.volume_usd)}</td>
-        <td>${formatRawUsd(row.market_b.price_usd)}</td>
-        <td>${formatRawVolume(row.market_b.volume_usd)}</td>
-        <td>${formatRawUsd(row.absolute_spread_usd)}</td>
-        <td>${finite(row.spread_bps) ? bpsFormat.format(row.spread_bps) : "N/A"}</td>
+        <td>${comparisonValueMarkup(row.market_a.price_usd, formatRawUsd, "Market A has no valid daily USD price on this UTC date.")}</td>
+        <td>${comparisonValueMarkup(row.market_a.volume_usd, formatRawVolume, "Market A has no valid daily USD volume on this UTC date.")}</td>
+        <td>${comparisonValueMarkup(row.market_b.price_usd, formatRawUsd, "Market B has no valid daily USD price on this UTC date.")}</td>
+        <td>${comparisonValueMarkup(row.market_b.volume_usd, formatRawVolume, "Market B has no valid daily USD volume on this UTC date.")}</td>
+        <td>${comparisonValueMarkup(row.absolute_spread_usd, formatRawUsd, "Absolute spread requires valid Market A and B prices on the same UTC date.")}</td>
+        <td>${comparisonValueMarkup(row.spread_bps, (value) => bpsFormat.format(value), "Spread bps requires valid Market A and B prices on the same UTC date.")}</td>
         <td class="${row.missing_reason ? "missing" : ""}">${escapeHtml(missingLabels[row.missing_reason] || "Comparable")}</td>
       </tr>`).join("")
     : '<tr><td colspan="8" class="missing">No observations in this window.</td></tr>';
@@ -4883,7 +5182,7 @@ function isMarketPayload(payload) {
     payload
     && payload.metadata
     && payload.metadata.response_scope === "screener_summary"
-    && payload.metadata.summary_version === 1
+    && payload.metadata.summary_version === 2
     && typeof payload.metadata.data_generation === "string"
     && payload.metadata.data_generation.length > 0
     && Array.isArray(payload.tokens)
@@ -5515,6 +5814,8 @@ function bindEvents() {
   document.querySelectorAll("[data-quality-scope]").forEach((button) => {
     button.addEventListener("click", () => {
       app.qualityScope = button.dataset.qualityScope;
+      app.qualitySeverity = "";
+      app.qualityOrigin = "";
       syncSegmentedControls();
       renderQualityFromCatalog();
       replaceCurrentRoute();
@@ -5563,6 +5864,12 @@ function bindEvents() {
   byId("compare-markets").addEventListener("click", applySelectedPair);
   byId("export-csv").addEventListener("click", exportVisibleCsv);
   document.addEventListener("click", (event) => {
+    const refreshButton = event.target.closest?.("[data-refresh-fact]");
+    if (refreshButton) {
+      event.preventDefault();
+      void requestSnapshotFactRefresh(refreshButton);
+      return;
+    }
     const pairButton = event.target.closest?.("[data-set-market-slot]");
     if (pairButton) {
       selectWorkspaceMarket(
