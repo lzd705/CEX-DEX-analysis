@@ -391,6 +391,75 @@ class FetchCexTests(unittest.TestCase):
             self.assertEqual(payload["attempt_count"], 1)
             self.assertEqual(len(payload["source_csv_sha256"]), 64)
 
+    def test_attempt_ids_include_the_single_captured_completion_time(self):
+        with patch("scripts.fetch_cex.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(2026, 7, 28, 1, tzinfo=timezone.utc)
+            first = cex_attempt_record(
+                "UNI", "binance", "UNI/USDT", rows=[], start_date="2026-07-28", end_date="2026-07-28"
+            )
+            mocked_datetime.now.return_value = datetime(2026, 7, 28, 2, tzinfo=timezone.utc)
+            second = cex_attempt_record(
+                "UNI", "binance", "UNI/USDT", rows=[], start_date="2026-07-28", end_date="2026-07-28"
+            )
+
+        self.assertEqual(len(first["attempt_id"]), 20)
+        self.assertNotEqual(first["attempt_id"], second["attempt_id"])
+
+    def test_attempt_writer_rejects_duplicate_or_incomplete_identity(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_csv = root / "cex.csv"
+            source_csv.write_text("date,token_symbol\n", encoding="utf-8")
+            attempt = cex_attempt_record(
+                "UNI", "binance", "UNI/USDT", rows=[], start_date="2026-07-28", end_date="2026-07-28"
+            )
+            with self.assertRaises(ValueError):
+                write_attempt_ledger(root / "duplicate.json", [attempt, dict(attempt)], source_csv=source_csv)
+            incomplete = dict(attempt, instrument=None)
+            with self.assertRaises(ValueError):
+                write_attempt_ledger(root / "incomplete.json", [incomplete], source_csv=source_csv)
+            with self.assertRaises(ValueError):
+                write_attempt_ledger(root / "long-id.json", [dict(attempt, attempt_id="x" * 65)], source_csv=source_csv)
+            for field in ("token_symbol", "exchange", "instrument"):
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    write_attempt_ledger(root / (field + ".json"), [dict(attempt, **{field: ""})], source_csv=source_csv)
+
+    def test_upbit_fallback_keeps_the_configured_canonical_symbol_and_alias_lineage(self):
+        candle = {
+            "market": "KRW-AAVE",
+            "candle_date_time_utc": "2026-07-28T00:00:00",
+            "opening_price": 100000,
+            "high_price": 110000,
+            "low_price": 90000,
+            "trade_price": 105000,
+            "candle_acc_trade_volume": 10,
+            "candle_acc_trade_price": 1050000,
+        }
+        reference = dict(candle, market="KRW-USDT", trade_price=1000)
+        with patch("scripts.fetch_cex.fetch_upbit_candles", side_effect=[[candle], [reference]]):
+            rows = fetch_cex.build_upbit_rows("AAVE", "AAVE/USDT", 1)
+        attempt = cex_attempt_record(
+            "AAVE", "upbit", "AAVE/USDT", rows=rows, start_date="2026-07-28", end_date="2026-07-28"
+        )
+
+        self.assertEqual(rows[0]["cex_symbol"], "AAVE/USDT")
+        self.assertEqual(
+            {key: attempt[key] for key in ("instrument", "source_instrument", "source_instrument_alias_validated")},
+            {"instrument": "AAVE/USDT", "source_instrument": "AAVE/KRW", "source_instrument_alias_validated": True},
+        )
+
+    def test_upbit_canonicalization_preserves_ldo_usdt_review_identity(self):
+        candle = {
+            "market": "KRW-LDO", "candle_date_time_utc": "2026-07-28T00:00:00",
+            "opening_price": 1000, "high_price": 1100, "low_price": 900,
+            "trade_price": 1050, "candle_acc_trade_volume": 10,
+            "candle_acc_trade_price": 10500,
+        }
+        reference = dict(candle, market="KRW-USDT", trade_price=1000)
+        with patch("scripts.fetch_cex.fetch_upbit_candles", side_effect=[[candle], [reference]]):
+            rows = fetch_cex.build_upbit_rows("LDO", "LDO/USDT", 1)
+        self.assertEqual(rows[0]["cex_symbol"], "LDO/USDT")
+
     def test_https_requests_use_a_verified_tls_context(self):
         self.assertEqual(TLS_CONTEXT.verify_mode, 2)
         self.assertTrue(TLS_CONTEXT.check_hostname)

@@ -11,10 +11,14 @@ from pathlib import Path
 from scripts.fact_quality import (
     CEX_REQUIRED_COLUMNS,
     DEX_REQUIRED_COLUMNS,
+    _attempt_matches_market,
+    _attempt_source,
+    attempt_for_gap,
     build_report,
     cex_market,
     gap_evidence,
     main,
+    normalize_collection_attempts,
     source_url_hints,
 )
 from scripts.quality_outcomes import quality_outcome_rule
@@ -272,6 +276,173 @@ class FactQualityTest(unittest.TestCase):
             evidence["reason_code"], "daily_quality_outcome_invalid"
         )
         self.assertFalse(evidence["retryable"])
+
+    def test_cex_attempt_cannot_cross_quote_instruments(self):
+        market = {
+            "market_type": "cex",
+            "token_symbol": "AAVE",
+            "exchange": "upbit",
+            "instrument": "AAVE/USDT",
+        }
+        attempt = cex_attempt(
+            "2026-07-19",
+            exchange="upbit",
+            instrument="AAVE/KRW",
+        )
+
+        self.assertIsNone(attempt_for_gap([attempt], market, date(2026, 7, 19)))
+
+    def test_invalid_attempt_ledger_invalidates_the_whole_ledger(self):
+        for name, mutation in {
+            "empty_id": {"attempt_id": ""},
+            "naive_timestamp": {"finished_at_utc": "2026-07-20T00:30:00"},
+            "outside_window": {"observed_dates": ["2026-07-21"], "observed_day_count": 1},
+            "missing_instrument": {"instrument": None},
+        }.items():
+            with self.subTest(mutation=name):
+                ledger = self.root / (name + ".json")
+                attempt = cex_attempt("2026-07-19", **mutation)
+                write_attempt_ledger(
+                    ledger,
+                    market_type="cex",
+                    source_csv=self.cex_path,
+                    attempts=[attempt],
+                )
+                attempts, metadata = _attempt_source(
+                    path=ledger,
+                    market_type="cex",
+                    source_csv_sha256=hashlib.sha256(self.cex_path.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(attempts, [])
+                self.assertEqual(metadata["status"], "ignored_invalid")
+
+    def test_duplicate_attempt_id_invalidates_the_whole_ledger(self):
+        ledger = self.root / "duplicate.json"
+        attempts = [
+            cex_attempt("2026-07-19", attempt_id="repeated-id"),
+            cex_attempt("2026-07-20", attempt_id="repeated-id"),
+        ]
+        write_attempt_ledger(
+            ledger,
+            market_type="cex",
+            source_csv=self.cex_path,
+            attempts=attempts,
+        )
+
+        loaded, metadata = _attempt_source(
+            path=ledger,
+            market_type="cex",
+            source_csv_sha256=hashlib.sha256(self.cex_path.read_bytes()).hexdigest(),
+        )
+
+        self.assertEqual(loaded, [])
+        self.assertEqual(metadata["status"], "ignored_invalid")
+
+    def test_attempt_selection_uses_actual_utc_completion_instant(self):
+        earlier = cex_attempt(
+            "2026-07-19",
+            attempt_id="earlier",
+            finished_at_utc="2026-07-20T01:00:00+02:00",
+        )
+        later = cex_attempt(
+            "2026-07-19",
+            attempt_id="later",
+            finished_at_utc="2026-07-20T00:30:00Z",
+        )
+
+        selected = attempt_for_gap(
+            [later, earlier],
+            cex_market(cex_row("2026-07-19")),
+            date(2026, 7, 19),
+        )
+
+        self.assertEqual(selected["attempt_id"], "later")
+
+    def test_upbit_source_alias_accepts_only_the_explicit_usdt_to_krw_fallback(self):
+        valid = cex_attempt(
+            "2026-07-19",
+            exchange="upbit",
+            instrument="AAVE/USDT",
+            source_instrument="AAVE/KRW",
+            source_instrument_alias_validated=True,
+        )
+        normalized = normalize_collection_attempts([valid], market_type="cex")
+        self.assertEqual(normalized[0]["source_instrument"], "AAVE/KRW")
+        self.assertTrue(normalized[0]["source_instrument_alias_validated"])
+
+        direct = dict(
+            valid,
+            source_instrument="AAVE/USDT",
+            source_instrument_alias_validated=False,
+        )
+        direct_normalized = normalize_collection_attempts([direct], market_type="cex")
+        self.assertFalse(direct_normalized[0]["source_instrument_alias_validated"])
+
+        invalid = (
+            {"exchange": "binance"},
+            {"source_instrument": "UNI/KRW"},
+            {"instrument": "AAVE/KRW", "source_instrument": "AAVE/USDT"},
+            {"source_instrument_alias_validated": False},
+            {"source_instrument": "AAVE/USDT", "source_instrument_alias_validated": True},
+        )
+        for mutation in invalid:
+            with self.subTest(mutation=mutation):
+                candidate = dict(valid)
+                candidate.update(mutation)
+                with self.assertRaises(ValueError):
+                    normalize_collection_attempts([candidate], market_type="cex")
+
+    def test_missing_or_noncanonical_window_dates_and_count_contract_invalidate_ledger(self):
+        invalid = {
+            "missing_window": {"requested_start_date": None},
+            "noncanonical_window": {"requested_start_date": "2026-7-19"},
+            "noncanonical_observed_date": {"observed_dates": ["2026-7-19"], "observed_day_count": 1},
+            "succeeded_without_full_window": {
+                "status": "succeeded", "outcome": "observed", "reason_code": "observed",
+                "error": None, "http_status": None,
+            },
+            "no_data_with_observation": {
+                "status": "no_data", "outcome": "no_candles", "reason_code": "no_candles",
+                "error": "The source returned no daily candles inside the requested window.",
+                "observed_dates": ["2026-07-19"], "observed_day_count": 1,
+            },
+        }
+        for name, mutation in invalid.items():
+            with self.subTest(mutation=name):
+                candidate = cex_attempt("2026-07-19", **mutation)
+                with self.assertRaises(ValueError):
+                    normalize_collection_attempts([candidate], market_type="cex")
+
+    def test_z_completion_time_is_normalized_to_canonical_utc(self):
+        normalized = normalize_collection_attempts(
+            [cex_attempt("2026-07-19", finished_at_utc="2026-07-20T00:30:00Z")],
+            market_type="cex",
+        )
+        self.assertEqual(normalized[0]["finished_at_utc"], "2026-07-20T00:30:00+00:00")
+
+    def test_dex_attempt_cannot_cross_dex_adapter_identity(self):
+        attempt = dex_attempt("2026-07-19", dex="curve")
+        market = {
+            "market_type": "dex", "token_symbol": "AAVE", "chain": "eth",
+            "dex": "uniswap_v3", "pool_address": "0xaavepool",
+        }
+        self.assertFalse(_attempt_matches_market(attempt, market))
+
+    def test_whole_invalid_ledger_leaves_gap_unexplained(self):
+        write_csv(self.cex_path, CEX_COLUMNS, [
+            cex_row("2026-07-16"), cex_row("2026-07-17"), cex_row("2026-07-18"),
+        ])
+        ledger = self.root / "invalid-whole-ledger.json"
+        write_attempt_ledger(
+            ledger, market_type="cex", source_csv=self.cex_path,
+            attempts=[cex_attempt("2026-07-19", attempt_id="")],
+        )
+        report = build_report(
+            self.cex_path, self.dex_path, cex_attempts=ledger, today=date(2026, 7, 20)
+        )
+        issue = next(item for item in report["issues"] if item["category"] == "d1_active_gap")
+        self.assertEqual(report["attempt_sources"][0]["status"], "ignored_invalid")
+        self.assertEqual(issue["reason_code"], "missing_unexplained")
 
     def test_upbit_review_hints_match_fact_market_and_collector_fallbacks(self):
         hints = source_url_hints(

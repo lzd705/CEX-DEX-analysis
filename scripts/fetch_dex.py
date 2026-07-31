@@ -284,12 +284,14 @@ def dex_attempt_record(
         "dex": str(dex or "").strip().lower() or None,
         "pool_address": address or None,
     }
+    finished_at_utc = datetime.now(timezone.utc).isoformat()
     id_material = {
         **identity,
         "requested_start_date": start_date,
         "requested_end_date": end_date,
         "status": status,
         "reason_code": classified["reason_code"],
+        "finished_at_utc": finished_at_utc,
     }
     return {
         "attempt_id": hashlib.sha256(
@@ -307,7 +309,7 @@ def dex_attempt_record(
         "status": status,
         "outcome": outcome,
         **classified,
-        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+        "finished_at_utc": finished_at_utc,
     }
 
 
@@ -319,6 +321,24 @@ def write_attempt_ledger(
     start_date=None,
     end_date=None,
 ):
+    validated_attempts = list(attempts)
+    attempt_ids = set()
+    for attempt in validated_attempts:
+        if not isinstance(attempt, dict):
+            raise ValueError("attempt must be an object")
+        attempt_id = attempt.get("attempt_id")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id.strip()
+            or attempt_id != attempt_id.strip()
+            or len(attempt_id) > 64
+        ):
+            raise ValueError("attempt ID is missing or outside the supported range")
+        if attempt_id in attempt_ids:
+            raise ValueError("attempt IDs must be unique")
+        attempt_ids.add(attempt_id)
+        if not all(str(attempt.get(key) or "").strip() for key in ("token_symbol", "chain", "dex", "pool_address")):
+            raise ValueError("DEX attempt identity is incomplete")
     payload = {
         "schema": ATTEMPT_SCHEMA,
         "collector": "dex",
@@ -329,9 +349,9 @@ def write_attempt_ledger(
         },
         "source_csv": source_csv.name,
         "source_csv_sha256": sha256_file(source_csv),
-        "attempt_count": len(attempts),
+        "attempt_count": len(validated_attempts),
         "attempts": sorted(
-            attempts,
+            validated_attempts,
             key=lambda item: (
                 item["token_symbol"],
                 item.get("chain") or "",
@@ -1294,18 +1314,6 @@ def fetch_selected_tokens(
 
         if len(token_chain_rows) == 0:
             print("No token-chain config found for %s" % token_symbol)
-            if attempt_records is not None:
-                attempt_records.append(
-                    dex_attempt_record(
-                        token_symbol,
-                        None,
-                        None,
-                        None,
-                        error=ValueError("Token chain configuration is missing"),
-                        start_date=start_date,
-                        end_date=end_date,
-                    )
-                )
             continue
 
         discovery_errors = []
@@ -1318,35 +1326,16 @@ def fetch_selected_tokens(
                 end_date,
             )
         except Exception as error:
-            print("Failed %s: %s" % (token_symbol, error))
-            if attempt_records is not None:
-                attempt_records.append(
-                    dex_attempt_record(
-                        token_symbol,
-                        None,
-                        None,
-                        None,
-                        error=error,
-                        start_date=start_date,
-                        end_date=end_date,
-                    )
-                )
+            # Discovery is token-level only until a pool has been resolved, so
+            # retain a bounded diagnostic but never publish it as market evidence.
+            print(
+                "DEX discovery failed for %s: %s"
+                % (token_symbol, classify_attempt_error(error)["error"])
+            )
             continue
 
         if len(pool_results) == 0:
             print("No usable pool found for %s" % token_symbol)
-            if attempt_records is not None:
-                attempt_records.append(
-                    dex_attempt_record(
-                        token_symbol,
-                        None,
-                        None,
-                        None,
-                        error=discovery_errors[-1] if discovery_errors else None,
-                        start_date=start_date,
-                        end_date=end_date,
-                    )
-                )
             continue
 
         for pool_result in pool_results:

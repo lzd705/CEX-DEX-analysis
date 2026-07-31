@@ -129,6 +129,7 @@ def normalize_collection_attempts(
     if market_type not in {"cex", "dex"}:
         raise ValueError("unknown collection-attempt market type")
     normalized: List[Dict[str, Any]] = []
+    seen_attempt_ids: Set[str] = set()
     for raw in raw_attempts:
         if not isinstance(raw, dict):
             raise ValueError("attempt is not an object")
@@ -173,27 +174,49 @@ def normalize_collection_attempts(
         token = str(raw.get("token_symbol") or "").strip().upper()
         if not token:
             raise ValueError("attempt Token identity is missing")
+        attempt_id = raw.get("attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id.strip() or len(attempt_id) > 64:
+            raise ValueError("attempt_id is missing or outside the supported range")
+        if attempt_id != attempt_id.strip() or attempt_id in seen_attempt_ids:
+            raise ValueError("attempt_id is not globally unique")
+        seen_attempt_ids.add(attempt_id)
         start_text = raw.get("requested_start_date")
         end_text = raw.get("requested_end_date")
-        if bool(start_text) != bool(end_text):
+        if not isinstance(start_text, str) or not isinstance(end_text, str):
             raise ValueError("attempt window is incomplete")
-        if start_text and end_text:
-            start_day = date.fromisoformat(str(start_text))
-            end_day = date.fromisoformat(str(end_text))
-            day_count = (end_day - start_day).days + 1
-            if day_count < 1 or day_count > MAX_RETRY_WINDOW_DAYS:
-                raise ValueError("attempt window is outside the supported range")
+        start_day = date.fromisoformat(start_text)
+        end_day = date.fromisoformat(end_text)
+        if start_text != start_day.isoformat() or end_text != end_day.isoformat():
+            raise ValueError("attempt window is not canonical")
+        day_count = (end_day - start_day).days + 1
+        if day_count < 1 or day_count > MAX_RETRY_WINDOW_DAYS:
+            raise ValueError("attempt window is outside the supported range")
         observed_dates = raw.get("observed_dates")
         if not isinstance(observed_dates, list):
             raise ValueError("observed_dates is not a list")
-        normalized_dates = sorted(
-            {
-                date.fromisoformat(str(item)).isoformat()
-                for item in observed_dates
-            }
-        )
+        normalized_dates = []
+        for item in observed_dates:
+            if not isinstance(item, str):
+                raise ValueError("observed date is not canonical")
+            observed_day = date.fromisoformat(item)
+            if item != observed_day.isoformat() or not start_day <= observed_day <= end_day:
+                raise ValueError("observed date is outside the requested window")
+            normalized_dates.append(observed_day.isoformat())
+        if len(normalized_dates) != len(set(normalized_dates)):
+            raise ValueError("observed_dates contains duplicates")
+        normalized_dates.sort()
         if raw.get("observed_day_count") != len(normalized_dates):
             raise ValueError("observed_day_count does not match observed_dates")
+        expected_dates = {
+            (start_day + timedelta(days=offset)).isoformat()
+            for offset in range(day_count)
+        }
+        if status == "succeeded" and set(normalized_dates) != expected_dates:
+            raise ValueError("successful attempt does not cover its requested window")
+        if status == "partial" and not (0 < len(normalized_dates) < day_count):
+            raise ValueError("partial attempt has an invalid observed-day count")
+        if status in {"no_data", "failed", "unsupported"} and normalized_dates:
+            raise ValueError("terminal non-observation attempt contains observed dates")
         error_text = raw.get("error")
         if error_text is not None:
             error_text = str(error_text).strip()
@@ -226,22 +249,70 @@ def normalize_collection_attempts(
         pool_address = str(raw.get("pool_address") or "").strip() or None
         if pool_address and pool_address.startswith("0x"):
             pool_address = pool_address.lower()
+        exchange = str(raw.get("exchange") or "").strip().lower() or None
+        instrument = str(raw.get("instrument") or "").strip().upper() or None
+        chain = str(raw.get("chain") or "").strip().lower() or None
+        dex = str(raw.get("dex") or "").strip().lower() or None
+        if market_type == "cex" and (not exchange or not instrument):
+            raise ValueError("CEX attempt exact identity is incomplete")
+        if market_type == "dex" and (not chain or not dex or not pool_address):
+            raise ValueError("DEX attempt exact identity is incomplete")
+        source_instrument = None
+        source_alias_validated = raw.get("source_instrument_alias_validated", False)
+        if market_type == "cex":
+            raw_source = raw.get("source_instrument")
+            if raw_source is not None:
+                if not isinstance(raw_source, str):
+                    raise ValueError("source instrument is invalid")
+                source_instrument = raw_source.strip().upper()
+                if (
+                    not source_instrument
+                    or len(source_instrument) > 64
+                    or source_instrument.count("/") != 1
+                    or any(not piece for piece in source_instrument.split("/"))
+                ):
+                    raise ValueError("source instrument is invalid")
+            if not isinstance(source_alias_validated, bool):
+                raise ValueError("source alias validation flag is invalid")
+            if source_instrument is None:
+                if source_alias_validated:
+                    raise ValueError("source alias cannot be validated without a source instrument")
+            elif source_instrument == instrument:
+                if source_alias_validated:
+                    raise ValueError("direct source instrument cannot claim alias validation")
+            else:
+                canonical_base, canonical_quote = instrument.split("/", 1)
+                source_base, source_quote = source_instrument.split("/", 1)
+                if not (
+                    source_alias_validated is True
+                    and exchange == "upbit"
+                    and canonical_quote == "USDT"
+                    and source_quote == "KRW"
+                    and canonical_base == source_base
+                ):
+                    raise ValueError("source instrument alias is not an approved Upbit fallback")
+        finished_text = raw.get("finished_at_utc")
+        if not isinstance(finished_text, str) or not finished_text or len(finished_text) > 64:
+            raise ValueError("finished_at_utc is missing or outside the supported range")
+        parse_text = finished_text[:-1] + "+00:00" if finished_text.endswith("Z") else finished_text
+        finished_at = datetime.fromisoformat(parse_text)
+        if finished_at.tzinfo is None or finished_at.utcoffset() is None:
+            raise ValueError("finished_at_utc must include a UTC offset")
+        finished_at_utc = finished_at.astimezone(timezone.utc).isoformat()
         normalized.append(
             {
-                "attempt_id": str(raw.get("attempt_id") or "")[:64],
+                "attempt_id": attempt_id,
                 "market_type": market_type,
                 "token_symbol": token,
-                "exchange": (
-                    str(raw.get("exchange") or "").strip().lower() or None
-                ),
-                "instrument": (
-                    str(raw.get("instrument") or "").strip().upper() or None
-                ),
-                "chain": str(raw.get("chain") or "").strip().lower() or None,
-                "dex": str(raw.get("dex") or "").strip().lower() or None,
+                "exchange": exchange,
+                "instrument": instrument,
+                "source_instrument": source_instrument,
+                "source_instrument_alias_validated": source_alias_validated,
+                "chain": chain,
+                "dex": dex,
                 "pool_address": pool_address,
-                "requested_start_date": str(start_text) if start_text else None,
-                "requested_end_date": str(end_text) if end_text else None,
+                "requested_start_date": start_text,
+                "requested_end_date": end_text,
                 "observed_dates": normalized_dates,
                 "observed_day_count": len(normalized_dates),
                 "status": status,
@@ -249,9 +320,7 @@ def normalize_collection_attempts(
                 "reason_code": reason_code,
                 "http_status": http_status,
                 "error": error_text,
-                "finished_at_utc": (
-                    str(raw.get("finished_at_utc") or "")[:64] or None
-                ),
+                "finished_at_utc": finished_at_utc,
             }
         )
     return normalized
@@ -899,11 +968,13 @@ def _attempt_matches_market(
     ):
         return False
     if market.get("market_type") == "cex":
-        # Token+exchange is the stable adapter identity. Upbit may resolve the
-        # configured USDT symbol to an observed KRW instrument.
-        return attempt.get("exchange") == market.get("exchange")
+        return (
+            attempt.get("exchange") == market.get("exchange")
+            and attempt.get("instrument") == market.get("instrument")
+        )
     return (
         attempt.get("chain") == market.get("chain")
+        and attempt.get("dex") == market.get("dex")
         and attempt.get("pool_address") == market.get("pool_address")
     )
 
@@ -918,9 +989,18 @@ def attempt_for_gap(
     for attempt in attempts:
         if not _attempt_matches_market(attempt, market):
             continue
-        start = attempt.get("requested_start_date")
-        end = attempt.get("requested_end_date")
-        if not start or not end or not start <= day_text <= end:
+        try:
+            start = date.fromisoformat(str(attempt.get("requested_start_date") or ""))
+            end = date.fromisoformat(str(attempt.get("requested_end_date") or ""))
+            finished_text = str(attempt.get("finished_at_utc") or "")
+            finished_at = datetime.fromisoformat(
+                finished_text[:-1] + "+00:00" if finished_text.endswith("Z") else finished_text
+            )
+            if finished_at.tzinfo is None or finished_at.utcoffset() is None:
+                continue
+        except ValueError:
+            continue
+        if not start <= missing_day <= end:
             continue
         if day_text in set(attempt.get("observed_dates") or []):
             continue
@@ -935,7 +1015,9 @@ def attempt_for_gap(
     return sorted(
         matches,
         key=lambda item: (
-            str(item.get("finished_at_utc") or ""),
+            datetime.fromisoformat(
+                str(item.get("finished_at_utc") or "").replace("Z", "+00:00")
+            ).astimezone(timezone.utc),
             str(item.get("attempt_id") or ""),
         ),
     )[-1]

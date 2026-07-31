@@ -279,16 +279,18 @@ def _stable_market_key(attempt_or_market: Mapping[str, Any]) -> Optional[Tuple[s
     token = str(attempt_or_market.get("token_symbol") or "").strip().upper()
     if market_type == "cex":
         exchange = str(attempt_or_market.get("exchange") or "").strip().lower()
-        if token and exchange:
-            return ("cex", token, exchange)
+        instrument = str(attempt_or_market.get("instrument") or "").strip().upper()
+        if token and exchange and instrument:
+            return ("cex", token, exchange, instrument)
         return None
     if market_type == "dex":
         chain = str(attempt_or_market.get("chain") or "").strip().lower()
+        dex = str(attempt_or_market.get("dex") or "").strip().lower()
         address = str(attempt_or_market.get("pool_address") or "").strip()
         if address.startswith("0x"):
             address = address.lower()
-        if token and chain and address:
-            return ("dex", token, chain, address)
+        if token and chain and dex and address:
+            return ("dex", token, chain, dex, address)
     return None
 
 
@@ -350,6 +352,7 @@ def _attempt_with_window(
     }
     id_material = {
         **identity,
+        "original_attempt_id": attempt.get("attempt_id"),
         "requested_start_date": start_text,
         "requested_end_date": end_text,
         "status": result.get("status"),
@@ -376,6 +379,7 @@ def _dedupe_key(attempt: Mapping[str, Any]) -> Tuple[Any, ...]:
             "chain",
             "dex",
             "pool_address",
+            "attempt_id",
             "requested_start_date",
             "requested_end_date",
         )

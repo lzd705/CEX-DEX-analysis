@@ -473,9 +473,9 @@ class RunFactPipelineTest(unittest.TestCase):
             finished_at="2026-07-05T00:00:00+00:00",
         )
         gap_keys = {
-            (("cex", "UNI", "binance"), "2026-07-02"),
-            (("cex", "UNI", "binance"), "2026-07-03"),
-            (("cex", "UNI", "binance"), "2026-07-04"),
+            (("cex", "UNI", "binance", "UNI/USDT"), "2026-07-02"),
+            (("cex", "UNI", "binance", "UNI/USDT"), "2026-07-03"),
+            (("cex", "UNI", "binance", "UNI/USDT"), "2026-07-04"),
         }
 
         carried = run_fact_pipeline._carried_segments(
@@ -501,6 +501,35 @@ class RunFactPipelineTest(unittest.TestCase):
         )
         self.assertTrue(all(len(item["attempt_id"]) == 20 for item in carried))
         self.assertEqual(len({item["attempt_id"] for item in carried}), 2)
+
+    def test_sliced_attempt_ids_keep_the_original_attempt_identity(self):
+        first = cex_attempt("UNI", "2026-07-01", "2026-07-03", reason="no_candles")
+        first.update(
+            exchange="upbit", instrument="UNI/USDT", source_instrument="UNI/KRW",
+            source_instrument_alias_validated=True,
+        )
+        second = dict(first, attempt_id="a-different-source-attempt")
+
+        first_slice = run_fact_pipeline._attempt_with_window(first, date(2026, 7, 2), date(2026, 7, 2))
+        second_slice = run_fact_pipeline._attempt_with_window(second, date(2026, 7, 2), date(2026, 7, 2))
+
+        self.assertNotEqual(first_slice["attempt_id"], second_slice["attempt_id"])
+        self.assertEqual(first_slice["source_instrument"], "UNI/KRW")
+        self.assertTrue(first_slice["source_instrument_alias_validated"])
+
+    def test_carry_keys_keep_cex_quote_and_dex_adapter_distinct(self):
+        self.assertNotEqual(
+            run_fact_pipeline._stable_market_key(cex_attempt("UNI", "2026-07-01", "2026-07-01")),
+            run_fact_pipeline._stable_market_key(
+                dict(cex_attempt("UNI", "2026-07-01", "2026-07-01"), instrument="UNI/KRW")
+            ),
+        )
+        self.assertNotEqual(
+            run_fact_pipeline._stable_market_key(dex_attempt("UNI", "2026-07-01", "2026-07-01")),
+            run_fact_pipeline._stable_market_key(
+                dict(dex_attempt("UNI", "2026-07-01", "2026-07-01"), dex="curve")
+            ),
+        )
 
     def test_append_quality_lineage_or_hash_mismatch_fails_closed(self):
         for mismatch in ("import_run_id", "source_hash", "invalid_attempt"):

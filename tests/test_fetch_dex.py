@@ -43,6 +43,9 @@ from scripts.fetch_dex import merge_runtime_token_config
 from scripts.fetch_dex import runtime_registry_path
 from scripts.fetch_dex import classify_attempt_error
 from scripts.fetch_dex import SourceRangeUnavailable
+from scripts.fetch_dex import dex_attempt_record
+from scripts.fetch_dex import write_attempt_ledger
+from scripts.fetch_dex import fetch_selected_tokens
 
 
 class FetchDexTests(unittest.TestCase):
@@ -339,6 +342,71 @@ class FetchDexTests(unittest.TestCase):
         self.assertEqual(classified["reason_code"], "not_listed")
         self.assertEqual(classified["http_status"], 404)
         self.assertNotIn("secret", classified["error"])
+
+    def test_attempt_ids_include_the_single_captured_completion_time(self):
+        with patch("scripts.fetch_dex.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(2026, 7, 28, 1, tzinfo=timezone.utc)
+            first = dex_attempt_record(
+                "UNI", "eth", "uniswap_v3", "0xpool", rows=[], start_date="2026-07-28", end_date="2026-07-28"
+            )
+            mocked_datetime.now.return_value = datetime(2026, 7, 28, 2, tzinfo=timezone.utc)
+            second = dex_attempt_record(
+                "UNI", "eth", "uniswap_v3", "0xpool", rows=[], start_date="2026-07-28", end_date="2026-07-28"
+            )
+
+        self.assertEqual(len(first["attempt_id"]), 20)
+        self.assertNotEqual(first["attempt_id"], second["attempt_id"])
+
+    def test_attempt_writer_rejects_duplicate_or_incomplete_identity(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_csv = root / "dex.csv"
+            source_csv.write_text("date,token_symbol\n", encoding="utf-8")
+            attempt = dex_attempt_record(
+                "UNI", "eth", "uniswap_v3", "0xpool", rows=[], start_date="2026-07-28", end_date="2026-07-28"
+            )
+            with self.assertRaises(ValueError):
+                write_attempt_ledger(root / "duplicate.json", [attempt, dict(attempt)], source_csv=source_csv)
+            with self.assertRaises(ValueError):
+                write_attempt_ledger(root / "incomplete.json", [dict(attempt, dex=None)], source_csv=source_csv)
+            with self.assertRaises(ValueError):
+                write_attempt_ledger(root / "long-id.json", [dict(attempt, attempt_id="x" * 65)], source_csv=source_csv)
+            for field in ("token_symbol", "chain", "dex", "pool_address"):
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    write_attempt_ledger(root / (field + ".json"), [dict(attempt, **{field: ""})], source_csv=source_csv)
+
+    def test_token_level_discovery_failure_does_not_become_market_attempt_evidence(self):
+        attempts = []
+        pools, rows = fetch_selected_tokens(
+            [{"token_symbol": "UNI"}],
+            {},
+            attempt_records=attempts,
+            start_date="2026-07-28",
+            end_date="2026-07-28",
+        )
+
+        self.assertEqual((pools, rows, attempts), ([], [], []))
+
+    def test_discovery_error_leaves_existing_exact_pool_attempts_untouched(self):
+        exact_attempt = dex_attempt_record(
+            "AAVE", "eth", "uniswap_v3", "0xaavepool", rows=[],
+            start_date="2026-07-28", end_date="2026-07-28",
+        )
+        attempts = [exact_attempt]
+        with patch(
+            "scripts.fetch_dex.find_top_pools_with_ohlcv",
+            side_effect=RuntimeError("discovery endpoint unavailable"),
+        ):
+            pools, rows = fetch_selected_tokens(
+                [{"token_symbol": "UNI"}],
+                {"UNI": [{"chain": "eth", "contract_address": "0xuni"}]},
+                attempt_records=attempts,
+                start_date="2026-07-28",
+                end_date="2026-07-28",
+            )
+
+        self.assertEqual((pools, rows), ([], []))
+        self.assertEqual(attempts, [exact_attempt])
 
     def test_bare_unauthorized_response_remains_retryable_source_failure(self):
         error = urllib.error.HTTPError(

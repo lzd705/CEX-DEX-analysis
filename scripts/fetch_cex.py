@@ -275,21 +275,46 @@ def cex_attempt_record(
         }
         status = "succeeded"
         outcome = "observed"
+    source_instruments = {
+        str(row.get("source_instrument") or row.get("cex_symbol") or "").strip().upper()
+        for row in (rows or [])
+        if str(row.get("source_instrument") or row.get("cex_symbol") or "").strip()
+    }
+    if len(source_instruments) > 1:
+        raise ValueError("CEX attempt returned multiple source instruments")
+    canonical_instrument = str(instrument).strip().upper()
+    source_instrument = next(iter(source_instruments), None)
+    source_alias_validated = False
+    if source_instrument and source_instrument != canonical_instrument:
+        canonical_base, _, canonical_quote = canonical_instrument.partition("/")
+        source_base, _, source_quote = source_instrument.partition("/")
+        if not (
+            str(exchange).strip().lower() == "upbit"
+            and canonical_quote == "USDT"
+            and source_quote == "KRW"
+            and canonical_base == source_base
+        ):
+            raise ValueError("CEX source instrument is not an approved alias")
+        source_alias_validated = True
     identity = {
         "market_type": "cex",
         "token_symbol": str(token_symbol).strip().upper(),
         "exchange": str(exchange).strip().lower(),
-        "instrument": str(instrument).strip().upper(),
+        "instrument": canonical_instrument,
         "chain": None,
         "dex": None,
         "pool_address": None,
     }
+    finished_at_utc = datetime.now(timezone.utc).isoformat()
     id_material = {
         **identity,
+        "source_instrument": source_instrument,
+        "source_instrument_alias_validated": source_alias_validated,
         "requested_start_date": start_date,
         "requested_end_date": end_date,
         "status": status,
         "reason_code": classified["reason_code"],
+        "finished_at_utc": finished_at_utc,
     }
     return {
         "attempt_id": hashlib.sha256(
@@ -300,6 +325,8 @@ def cex_attempt_record(
             ).encode("utf-8")
         ).hexdigest()[:20],
         **identity,
+        "source_instrument": source_instrument,
+        "source_instrument_alias_validated": source_alias_validated,
         "requested_start_date": start_date,
         "requested_end_date": end_date,
         "observed_dates": observed_dates,
@@ -307,7 +334,7 @@ def cex_attempt_record(
         "status": status,
         "outcome": outcome,
         **classified,
-        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+        "finished_at_utc": finished_at_utc,
     }
 
 
@@ -319,6 +346,24 @@ def write_attempt_ledger(
     start_date=None,
     end_date=None,
 ):
+    validated_attempts = list(attempts)
+    attempt_ids = set()
+    for attempt in validated_attempts:
+        if not isinstance(attempt, dict):
+            raise ValueError("attempt must be an object")
+        attempt_id = attempt.get("attempt_id")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id.strip()
+            or attempt_id != attempt_id.strip()
+            or len(attempt_id) > 64
+        ):
+            raise ValueError("attempt ID is missing or outside the supported range")
+        if attempt_id in attempt_ids:
+            raise ValueError("attempt IDs must be unique")
+        attempt_ids.add(attempt_id)
+        if not all(str(attempt.get(key) or "").strip() for key in ("token_symbol", "exchange", "instrument")):
+            raise ValueError("CEX attempt identity is incomplete")
     payload = {
         "schema": ATTEMPT_SCHEMA,
         "collector": "cex",
@@ -329,9 +374,9 @@ def write_attempt_ledger(
         },
         "source_csv": source_csv.name,
         "source_csv_sha256": sha256_file(source_csv),
-        "attempt_count": len(attempts),
+        "attempt_count": len(validated_attempts),
         "attempts": sorted(
-            attempts,
+            validated_attempts,
             key=lambda item: (
                 item["token_symbol"],
                 item["exchange"],
@@ -1117,6 +1162,8 @@ def build_upbit_rows(
                 continue
 
             row = convert_upbit_candle(candle, token_symbol, quote_to_usd)
+            row["source_instrument"] = row["cex_symbol"]
+            row["cex_symbol"] = cex_symbol.upper()
             rows.append(row)
 
         if rows:
@@ -1519,7 +1566,9 @@ def write_exchange_rows(rows, output_path: Path):
     rows = sorted(rows, key=lambda row: (row["token_symbol"], row["exchange"], row["date"]))
 
     with output_path.open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
+        writer = csv.DictWriter(
+            file, fieldnames=fieldnames, lineterminator="\n", extrasaction="ignore"
+        )
         writer.writeheader()
         writer.writerows(rows)
 
