@@ -12,6 +12,7 @@ from dashboard import server
 from scripts.check_dashboard_release import validate_quality
 from scripts.fact_quality import build_report
 from scripts.market_database import build_database
+from scripts.quality_outcomes import quality_outcome_rule
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -267,6 +268,12 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
                 "backfill_pending",
                 True,
             ),
+            self.issue(
+                "2026-01-07",
+                "stale_market_lifecycle_unknown",
+                "needs_review",
+                False,
+            ),
         ]
         foreign_issue = self.issue(
             "2026-01-02",
@@ -319,6 +326,12 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
                 "operator_review_retry_queue",
                 {"missing_unexplained": 1},
             ),
+            "2026-01-07": (
+                "needs_review",
+                False,
+                "operator_manual_review",
+                {"stale_market_lifecycle_unknown": 1},
+            ),
         }
         for day, (
             status,
@@ -330,8 +343,15 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
                 payload, market = self.quality_for_day(day)
                 fact = market["facts"]["daily"]
                 report = payload["metadata"]["daily_quality_report"]
+                reason_code = next(iter(reasons))
+                rule = quality_outcome_rule(status, reason_code)
+                self.assertIsNotNone(rule)
                 self.assertEqual(fact["status"], status)
                 self.assertIs(fact["retryable"], retryable)
+                self.assertEqual(
+                    (fact["status"], fact["retryable"]),
+                    (status, rule.retryable),
+                )
                 self.assertEqual(fact["action"], action)
                 self.assertEqual(fact["reason_code_counts"], reasons)
                 self.assertEqual(fact["affected_dates"], [day])
@@ -393,6 +413,45 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
             },
         )
         self.assertEqual(mixed_market["quality_status"], "critical")
+
+    def test_invalid_daily_outcome_contract_fails_closed_to_manual_review(self):
+        cases = (
+            ("unknown pair", "unknown_reason", "unsupported", False),
+            (
+                "mismatched pair",
+                "source_range_unavailable",
+                "needs_review",
+                False,
+            ),
+        )
+        for name, reason_code, status, retryable in cases:
+            with self.subTest(case=name):
+                self.write_report(
+                    [
+                        self.issue(
+                            "2026-01-02",
+                            reason_code,
+                            status,
+                            retryable,
+                        )
+                    ]
+                )
+
+                _payload, market = self.quality_for_day("2026-01-02")
+                fact = market["facts"]["daily"]
+                rule = quality_outcome_rule(
+                    "needs_review",
+                    "daily_quality_outcome_invalid",
+                )
+
+                self.assertIsNotNone(rule)
+                self.assertEqual(fact["status"], "needs_review")
+                self.assertEqual(
+                    fact["reason_code_counts"],
+                    {"daily_quality_outcome_invalid": 1},
+                )
+                self.assertIs(fact["retryable"], rule.retryable)
+                self.assertEqual(fact["action"], "operator_manual_review")
 
     def test_lifecycle_source_no_observation_category_is_public_information(self):
         lifecycle_issue = self.issue(

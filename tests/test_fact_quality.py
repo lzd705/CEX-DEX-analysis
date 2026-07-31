@@ -12,9 +12,12 @@ from scripts.fact_quality import (
     CEX_REQUIRED_COLUMNS,
     DEX_REQUIRED_COLUMNS,
     build_report,
+    cex_market,
+    gap_evidence,
     main,
     source_url_hints,
 )
+from scripts.quality_outcomes import quality_outcome_rule
 
 
 CEX_COLUMNS = [
@@ -189,6 +192,86 @@ class FactQualityTest(unittest.TestCase):
     def test_required_column_sets_match_daily_contracts(self):
         self.assertEqual(CEX_REQUIRED_COLUMNS, set(CEX_COLUMNS))
         self.assertEqual(DEX_REQUIRED_COLUMNS, set(DEX_COLUMNS))
+
+    def test_gap_evidence_uses_the_shared_daily_outcome_matrix(self):
+        market = cex_market(cex_row("2026-07-19"))
+        cases = (
+            ("missing", None, "backfill_pending", "missing_unexplained", True),
+            ("network", "network", "collection_failed", "network", True),
+            ("rate limit", "rate_limit", "collection_failed", "rate_limit", True),
+            (
+                "source unavailable",
+                "source_unavailable",
+                "collection_failed",
+                "source_unavailable",
+                True,
+            ),
+            ("parse", "parse", "collection_failed", "parse", True),
+            ("validation", "validation", "collection_failed", "validation", True),
+            (
+                "no candles",
+                "no_candles",
+                "source_no_observation",
+                "no_candles",
+                False,
+            ),
+            ("not listed", "not_listed", "needs_review", "not_listed", False),
+            (
+                "source range unavailable",
+                "source_range_unavailable",
+                "unsupported",
+                "source_range_unavailable",
+                False,
+            ),
+        )
+        for name, attempt_reason, status, reason_code, retryable in cases:
+            with self.subTest(case=name):
+                attempts = []
+                if attempt_reason is not None:
+                    attempt = cex_attempt("2026-07-19", reason_code=attempt_reason)
+                    if attempt_reason == "no_candles":
+                        attempt.update(
+                            status="no_data",
+                            outcome="no_candles",
+                            http_status=None,
+                        )
+                    elif attempt_reason == "source_range_unavailable":
+                        attempt.update(
+                            status="unsupported",
+                            outcome="range_unavailable",
+                            http_status=None,
+                        )
+                    attempts = [attempt]
+                evidence = gap_evidence(
+                    attempts=attempts,
+                    market=market,
+                    missing_day=date(2026, 7, 19),
+                    default_message="Missing daily observation.",
+                )
+                rule = quality_outcome_rule(status, reason_code)
+                self.assertIsNotNone(rule)
+                self.assertEqual(
+                    (evidence["status"], evidence["retryable"]),
+                    (status, retryable),
+                )
+                self.assertEqual(
+                    (rule.retryable, rule.terminal),
+                    (retryable, status not in {"collection_failed", "needs_review", "backfill_pending"}),
+                )
+
+    def test_gap_evidence_fails_closed_for_an_unknown_attempt_outcome(self):
+        evidence = gap_evidence(
+            attempts=[cex_attempt("2026-07-19", reason_code="unknown_reason")],
+            market=cex_market(cex_row("2026-07-19")),
+            missing_day=date(2026, 7, 19),
+            default_message="Missing daily observation.",
+        )
+
+        self.assertEqual(evidence["status"], "needs_review")
+        self.assertEqual(
+            evidence["reason_code"], "daily_quality_outcome_invalid"
+        )
+        self.assertFalse(evidence["retryable"])
 
     def test_upbit_review_hints_match_fact_market_and_collector_fallbacks(self):
         hints = source_url_hints(

@@ -2916,18 +2916,6 @@ QUALITY_STATUS_SEMANTICS = {
     ),
     "not_applicable": "This fact is not defined for this market type.",
 }
-DAILY_QUALITY_REASON_RULES = {
-    "network": ("collection_failed", True),
-    "rate_limit": ("collection_failed", True),
-    "source_unavailable": ("collection_failed", True),
-    "parse": ("collection_failed", True),
-    "validation": ("collection_failed", True),
-    "no_candles": ("source_no_observation", False),
-    "not_listed": ("needs_review", False),
-    "source_range_unavailable": ("unsupported", False),
-    "stale_market_lifecycle_unknown": ("needs_review", False),
-    "missing_unexplained": ("backfill_pending", True),
-}
 DAILY_QUALITY_STATUS_PRIORITY = {
     "collection_failed": 0,
     "needs_review": 1,
@@ -3065,19 +3053,20 @@ def _load_daily_quality_report_cached(
         if day_value is not None:
             day_value = _parse_quality_day(day_value)
 
-        rule = DAILY_QUALITY_REASON_RULES.get(reason_code)
         if (
             category not in DAILY_QUALITY_CATEGORIES
-            or rule is None
             or market_id is None
             or day_value is None
         ):
             # Hard-invalid details and other non-daily evidence remain in the
             # protected operator report, never in the public projection.
             continue
-        expected_status, expected_retryable = rule
-        if status != expected_status or retryable is not expected_retryable:
-            raise ValueError("Daily quality issue outcome is inconsistent")
+        rule = quality_outcome_rule(status, reason_code)
+        if rule is None or retryable is not rule.retryable:
+            status = "needs_review"
+            reason_code = "daily_quality_outcome_invalid"
+            rule = quality_outcome_rule(status, reason_code)
+            assert rule is not None
         key = (market_id, day_value, reason_code)
         if key in seen:
             continue
@@ -3087,9 +3076,9 @@ def _load_daily_quality_report_cached(
                 "market_id": market_id,
                 "date": day_value,
                 "category": category,
-                "status": expected_status,
+                "status": status,
                 "reason_code": reason_code,
-                "retryable": expected_retryable,
+                "retryable": rule.retryable,
             }
         )
 

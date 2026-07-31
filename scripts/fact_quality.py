@@ -32,11 +32,13 @@ if __package__:
         DEFAULT_REVIEW_PATH,
         load_lifecycle_reviews,
     )
+    from .quality_outcomes import quality_outcome_rule
 else:
     from market_lifecycle_reviews import (
         DEFAULT_REVIEW_PATH,
         load_lifecycle_reviews,
     )
+    from quality_outcomes import quality_outcome_rule
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -72,14 +74,6 @@ ATTEMPT_OUTCOMES = {
     "request_failed",
     "range_unavailable",
 }
-RETRYABLE_ATTEMPT_REASONS = {
-    "network",
-    "rate_limit",
-    "source_unavailable",
-    "parse",
-    "validation",
-}
-
 CEX_REQUIRED_COLUMNS = {
     "date",
     "token_symbol",
@@ -947,6 +941,21 @@ def attempt_for_gap(
     )[-1]
 
 
+def _daily_gap_outcome_rule(reason_code: str) -> Tuple[Optional[str], Any]:
+    """Resolve a daily gap reason through the shared exact outcome matrix."""
+    for status in (
+        "collection_failed",
+        "source_no_observation",
+        "unsupported",
+        "needs_review",
+        "backfill_pending",
+    ):
+        rule = quality_outcome_rule(status, reason_code)
+        if rule is not None:
+            return status, rule
+    return None, None
+
+
 def gap_evidence(
     *,
     attempts: Sequence[Mapping[str, Any]],
@@ -956,35 +965,28 @@ def gap_evidence(
 ) -> Dict[str, Any]:
     attempt = attempt_for_gap(attempts, market, missing_day)
     if attempt is None:
-        return {
-            "status": "backfill_pending",
-            "reason_code": "missing_unexplained",
-            "retryable": True,
-            "message": default_message,
-            "attempt": None,
-        }
-    reason = str(attempt["reason_code"])
-    if reason == "not_listed":
-        status = "needs_review"
-        retryable = False
-    elif reason == "source_range_unavailable":
-        status = "unsupported"
-        retryable = False
-    elif reason == "no_candles":
-        status = "source_no_observation"
-        retryable = False
+        reason = "missing_unexplained"
     else:
-        status = "collection_failed"
-        retryable = reason in RETRYABLE_ATTEMPT_REASONS
+        reason = str(attempt["reason_code"])
+    status, rule = _daily_gap_outcome_rule(reason)
+    if rule is None:
+        status = "needs_review"
+        reason = "daily_quality_outcome_invalid"
+        rule = quality_outcome_rule(status, reason)
+        assert rule is not None
     return {
         "status": status,
         "reason_code": reason,
-        "retryable": retryable,
+        "retryable": rule.retryable,
         "message": (
-            "The requested daily fact is absent and the matching collection "
-            "attempt reported {}.".format(reason.replace("_", " "))
+            default_message
+            if attempt is None
+            else (
+                "The requested daily fact is absent and the matching collection "
+                "attempt reported {}.".format(reason.replace("_", " "))
+            )
         ),
-        "attempt": {
+        "attempt": None if attempt is None else {
             "attempt_id": attempt.get("attempt_id"),
             "status": attempt.get("status"),
             "outcome": attempt.get("outcome"),
@@ -1197,12 +1199,17 @@ def gap_issues(
                     )
                 )
             else:
+                outcome = quality_outcome_rule(
+                    "needs_review",
+                    "stale_market_lifecycle_unknown",
+                )
+                assert outcome is not None
                 issues.append(
                     make_issue(
                         category="stale_market_unknown",
                         status="needs_review",
                         reason_code="stale_market_lifecycle_unknown",
-                        retryable=False,
+                        retryable=outcome.retryable,
                         market=market,
                         day_text=target_day.isoformat(),
                         message=(

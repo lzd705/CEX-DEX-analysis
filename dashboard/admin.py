@@ -35,6 +35,7 @@ try:
         utc_now_text,
     )
     from scripts.fact_quality import cex_market, dex_market
+    from scripts.quality_outcomes import quality_outcome_rule
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     project_root = str(Path(__file__).resolve().parents[1])
     if project_root not in sys.path:
@@ -54,6 +55,9 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from scripts.fact_quality import (  # type: ignore[no-redef]
         cex_market,
         dex_market,
+    )
+    from scripts.quality_outcomes import (  # type: ignore[no-redef]
+        quality_outcome_rule,
     )
 
 
@@ -2023,17 +2027,8 @@ class AdminService:
                     "unresolved_count": 0,
                 },
             )
-        explicit_absence_reasons = {
-            "unsupported",
-            "not_supported",
-            "source_unsupported",
-            "not_listed",
-            "source_no_observation",
-            "source_range_unavailable",
-            "no_candle",
-            "no_candles",
-        }
         confirmed_absences: set[tuple[str, str]] = set()
+        confirmed_absence_reasons: dict[tuple[str, str], str] = {}
         for issue in report.get("issues") or []:
             if not isinstance(issue, dict):
                 continue
@@ -2044,19 +2039,19 @@ class AdminService:
                 str(market.get("market_id") or ""),
                 str(issue.get("date") or ""),
             )
-            reason = (
-                str(issue.get("reason_code") or "")
-                .strip()
-                .lower()
-                .replace("-", "_")
-            )
+            status = str(issue.get("status") or "").strip().lower()
+            reason = str(issue.get("reason_code") or "").strip().lower()
+            rule = quality_outcome_rule(status, reason)
             if (
                 pair in expected
-                and issue.get("retryable") is False
-                and str(issue.get("status") or "") != "collection_failed"
-                and reason in explicit_absence_reasons
+                and rule is not None
+                and issue.get("retryable") is rule.retryable
+                and rule.terminal
+                and rule.resolution
+                in {"confirmed_absence", "confirmed_unsupported"}
             ):
                 confirmed_absences.add(pair)
+                confirmed_absence_reasons[pair] = reason
         observed_expected = expected.intersection(observed)
         confirmed_absences.difference_update(observed_expected)
         resolved = observed_expected.union(confirmed_absences)
@@ -2068,15 +2063,8 @@ class AdminService:
             "confirmed_absence_reason_counts": dict(
                 sorted(
                     Counter(
-                        str(issue.get("reason_code") or "unknown")
-                        for issue in report.get("issues") or []
-                        if isinstance(issue, dict)
-                        and isinstance(issue.get("market"), dict)
-                        and (
-                            str(issue["market"].get("market_id") or ""),
-                            str(issue.get("date") or ""),
-                        )
-                        in confirmed_absences
+                        confirmed_absence_reasons[pair]
+                        for pair in confirmed_absences
                     ).items()
                 )
             ),

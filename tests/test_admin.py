@@ -1262,13 +1262,10 @@ class AdminServiceTest(unittest.TestCase):
             error, evidence = service._retry_resolution_evidence(
                 service.jobs["retry"]
             )
-            self.assertIsNone(error)
+            self.assertIn("remain neither observed", error)
             self.assertEqual(evidence["observed_count"], 0)
-            self.assertEqual(evidence["confirmed_absence_count"], 1)
-            self.assertEqual(
-                evidence["confirmed_absence_reason_counts"],
-                {"source_range_unavailable": 1},
-            )
+            self.assertEqual(evidence["confirmed_absence_count"], 0)
+            self.assertEqual(evidence["unresolved_count"], 1)
 
     def test_onboarding_lock_conflict_reconciles_pending_registry(self):
         with tempfile.TemporaryDirectory() as directory:
