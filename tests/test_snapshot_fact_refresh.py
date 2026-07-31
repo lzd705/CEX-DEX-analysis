@@ -593,6 +593,33 @@ class SnapshotFactReaderTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.read("dex_depth_latest.csv", request, [dex_depth_row(status="complete", **{field: value})])
 
+    def test_dex_block_identity_status_matrix(self):
+        request = {
+            "token_symbol": "AAVE", "market_id": "dex:eth:uniswap_v3:0xabc:AAVE", "fact_type": "depth",
+        }
+
+        def row_for(status, block_number):
+            row = dex_depth_row(status=status, block_number=block_number)
+            if status in {"failed", "unsupported"}:
+                row = unmeasured(row, DEX_MEASURED)
+            return row
+
+        for status in ("observed", "partial", "complete"):
+            with self.subTest(status=status, block_number=""):
+                with self.assertRaises(ValueError):
+                    self.read("dex_depth_latest.csv", request, [row_for(status, "")])
+            with self.subTest(status=status, block_number="123"):
+                self.read("dex_depth_latest.csv", request, [row_for(status, "123")])
+        for status in ("failed", "unsupported"):
+            for block_number in ("", "123"):
+                with self.subTest(status=status, block_number=block_number):
+                    self.read("dex_depth_latest.csv", request, [row_for(status, block_number)])
+        for status in ("observed", "partial", "complete", "failed", "unsupported"):
+            for block_number in ("-1", "1.5", "NaN", "not-a-number"):
+                with self.subTest(status=status, block_number=block_number):
+                    with self.assertRaises(ValueError):
+                        self.read("dex_depth_latest.csv", request, [row_for(status, block_number)])
+
     def test_mixed_snapshot_ids_are_rejected_even_for_non_target_rows(self):
         with self.assertRaises(ValueError):
             self.read("cex_depth_latest.csv", {

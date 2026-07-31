@@ -166,10 +166,12 @@ def _finite(value: Any) -> None:
         raise ValueError("observed snapshot value is not finite")
 
 
-def _block_number(value: Any) -> None:
+def _block_number(value: Any, *, required: bool = False) -> None:
     """Validate optional fixed-block provenance without treating it as a fact."""
     text = _text(value, MAX_SNAPSHOT_ID_LENGTH)
     if not text:
+        if required:
+            raise ValueError("measured snapshot row has no block identity")
         return
     if not text.isdigit():
         raise ValueError("snapshot block number is not a nonnegative integer")
@@ -339,7 +341,10 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
     elif fact_type == "depth":
         if raw_status not in {"observed", "complete", "partial", "unsupported", "failed"}:
             raise ValueError("snapshot status is invalid")
-        _block_number(row.get("block_number"))
+        _block_number(
+            row.get("block_number"),
+            required=raw_status in {"observed", "complete", "partial"},
+        )
         if raw_status in {"observed", "complete", "partial"}:
             for field in _DEX_DEPTH_FACT_NUMBERS:
                 if field == "price_difference_bps":
