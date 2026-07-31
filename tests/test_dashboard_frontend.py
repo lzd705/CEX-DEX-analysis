@@ -335,6 +335,7 @@ function control({ value = "", hidden = false, dataset = {} } = {}) {
     listeners: {},
     active: false,
     focused: false,
+    focusCalls: 0,
     classList: {
       owner: null,
       toggle(name, active) {
@@ -347,7 +348,10 @@ function control({ value = "", hidden = false, dataset = {} } = {}) {
     },
     setAttribute(name, value) { this.attributes[name] = value; },
     getAttribute(name) { return this.attributes[name] || null; },
-    focus() { this.focused = true; },
+    focus() {
+      this.focused = true;
+      this.focusCalls += 1;
+    },
   };
 }
 async function trigger(control, type, event = {}) {
@@ -429,6 +433,7 @@ const cancelled = {
   editorHidden: editor.hidden,
   expanded: toggle.getAttribute("aria-expanded"),
   focus: toggle.focused,
+  focusCalls: toggle.focusCalls,
 };
 
 let applyCalls = 0;
@@ -439,6 +444,7 @@ applyWindow = async () => {
   return true;
 };
 await trigger(toggle, "click");
+const focusBeforeSuccessfulCustom = toggle.focusCalls;
 await trigger(form, "submit");
 const customSuccess = {
   applyCalls,
@@ -446,6 +452,7 @@ const customSuccess = {
   editorHidden: editor.hidden,
   expanded: toggle.getAttribute("aria-expanded"),
   focus: toggle.focused,
+  focusCalls: toggle.focusCalls - focusBeforeSuccessfulCustom,
 };
 
 applyWindow = async () => {
@@ -518,6 +525,7 @@ console.log(JSON.stringify({
             "editorHidden": True,
             "expanded": "false",
             "focus": True,
+            "focusCalls": 1,
         })
         self.assertEqual(result["customSuccess"], {
             "applyCalls": 1,
@@ -525,6 +533,7 @@ console.log(JSON.stringify({
             "editorHidden": True,
             "expanded": "false",
             "focus": True,
+            "focusCalls": 1,
         })
         self.assertEqual(result["customFailure"], {
             "applyCalls": 2,
