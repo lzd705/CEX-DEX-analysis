@@ -195,7 +195,7 @@ public projection, and refresh postchecks:
 | `collection_failed` | network, rate limit, source unavailable, parse, validation | yes | retry remains open |
 | `source_no_observation` | no candles, no two-sided book | no | terminal source outcome |
 | `unsupported` | validated source range, chain, protocol, or method limit | no | terminal capability outcome |
-| `needs_review` | listing/lifecycle ambiguity | no | unresolved manual queue |
+| `needs_review` | listing/lifecycle ambiguity or invalid outcome-contract evidence | no | unresolved manual queue |
 | `backfill_pending` | missing unexplained | yes | retry remains open |
 | `invalid` | hard fact-contract violation | no | blocked for review |
 
