@@ -785,6 +785,35 @@ console.log(JSON.stringify({
         self.assertIn('id="apply-window"', form)
         self.assertIn('type="submit"', form)
 
+    def test_time_window_uses_summary_presets_and_inline_custom_editor(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        styles = STYLES_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('id="applied-window-summary"', index)
+        self.assertIn('id="time-presets"', index)
+        self.assertIn('id="custom-window-toggle"', index)
+        self.assertIn('aria-controls="custom-window-editor"', index)
+        self.assertIn('aria-expanded="false"', index)
+        self.assertIn('id="custom-window-editor"', index)
+        self.assertIn('id="cancel-window"', index)
+
+        editor_start = index.index('id="custom-window-editor"')
+        editor_end = index.index("</form>", editor_start)
+        editor = index[editor_start:editor_end]
+        self.assertIn('id="date-start"', editor)
+        self.assertIn('id="date-end"', editor)
+        self.assertIn('id="apply-window"', editor)
+        self.assertIn("Apply custom range", editor)
+        self.assertIn('id="date-window-error"', editor)
+
+        self.assertIn(".time-toolbar-row", styles)
+        self.assertIn(".custom-window-editor[hidden]", styles)
+        mobile_start = styles.index("@media (max-width: 700px)")
+        mobile = styles[mobile_start:]
+        self.assertIn(".time-window-actions", mobile)
+        self.assertIn(".custom-window-editor", mobile)
+        self.assertIn(".custom-window-commands", mobile)
+
     def test_apply_pair_navigates_to_compare_after_persisting_valid_selection(self):
         app_js = APP_PATH.read_text(encoding="utf-8")
         self.assertIn("function applySelectedPair()", app_js)

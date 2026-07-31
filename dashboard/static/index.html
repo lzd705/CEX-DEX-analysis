@@ -37,25 +37,48 @@
       <div id="route-announcer" class="sr-only" role="status" aria-live="polite"></div>
 
       <section id="time-toolbar" class="time-toolbar" aria-label="Daily fact time window">
-        <div class="toolbar-title">
-          <i data-lucide="calendar-range"></i>
-          <div>
-            <div class="toolbar-title-line">
-              <strong>Time window</strong>
-              <details class="context-info">
-                <summary aria-label="Time-window scope details">
-                  <i data-lucide="info"></i>
-                </summary>
-                <div class="context-tooltip" role="tooltip">
-                  <strong>Window scope</strong>
-                  <p>Start and end dates apply only to daily price, volume, return, volatility, comparison, and coverage facts. TVL, depth, and execution remain independently timestamped latest snapshots.</p>
-                </div>
-              </details>
+        <div class="time-toolbar-row">
+          <div class="toolbar-title">
+            <i data-lucide="calendar-range"></i>
+            <div>
+              <div class="toolbar-title-line">
+                <strong>Time window</strong>
+                <details class="context-info">
+                  <summary aria-label="Time-window scope details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip" role="tooltip">
+                    <strong>Window scope</strong>
+                    <p>Start and end dates apply only to daily price, volume, return, volatility, comparison, and coverage facts. TVL, depth, and execution remain independently timestamped latest snapshots.</p>
+                  </div>
+                </details>
+              </div>
+              <span id="available-range">Checking available dates</span>
             </div>
-            <span id="available-range">Checking available dates</span>
+          </div>
+          <div class="applied-window" aria-live="polite">
+            <span>Applied range</span>
+            <strong id="applied-window-summary">Loading selected dates</strong>
+          </div>
+          <div class="time-window-actions">
+            <div id="time-presets" class="preset-group" role="group" aria-label="Time presets">
+              <button type="button" data-days="7" aria-pressed="false">7D</button>
+              <button type="button" data-days="30" class="active" aria-pressed="true">30D</button>
+              <button type="button" data-days="90" aria-pressed="false">90D</button>
+              <button type="button" data-days="all" aria-pressed="false">All</button>
+            </div>
+            <button
+              id="custom-window-toggle"
+              class="custom-window-toggle"
+              type="button"
+              aria-controls="custom-window-editor"
+              aria-expanded="false"
+              aria-pressed="false"
+            >Custom…</button>
           </div>
         </div>
-        <form id="date-window-form" class="date-apply-group" novalidate>
+        <div id="custom-window-editor" hidden>
+        <form id="date-window-form" class="custom-window-editor" novalidate>
           <div class="date-fields">
             <label>
               <span>Start</span>
@@ -79,17 +102,15 @@
               >
             </label>
           </div>
-          <button id="apply-window" class="icon-command" type="submit" title="Apply time window">
-            <i data-lucide="refresh-cw"></i>
-            <span>Apply</span>
-          </button>
+          <div class="custom-window-commands">
+            <button id="cancel-window" class="secondary-command" type="button">Cancel</button>
+            <button id="apply-window" class="icon-command" type="submit">
+              <i data-lucide="refresh-cw"></i>
+              <span>Apply custom range</span>
+            </button>
+          </div>
           <div id="date-window-error" class="date-window-error" role="alert" aria-live="assertive" hidden></div>
         </form>
-        <div class="preset-group" role="group" aria-label="Time presets">
-          <button type="button" data-days="7" aria-pressed="false">7D</button>
-          <button type="button" data-days="30" class="active" aria-pressed="true">30D</button>
-          <button type="button" data-days="90" aria-pressed="false">90D</button>
-          <button type="button" data-days="all" aria-pressed="false">All</button>
         </div>
       </section>
 
