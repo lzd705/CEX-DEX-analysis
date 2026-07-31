@@ -90,6 +90,9 @@ server's quality contract marks the exact canonical market Fact as
 only `cex:<venue>:<instrument>` or
 `dex:<chain>:<dex>:<pool>:<TOKEN>` identities. Unsupported methods,
 not-applicable Facts, and genuine observed zeroes never become refreshable.
+Execution is refreshed only as the atomically derived companion of a supported
+depth refresh; a missing execution inventory row never exposes a dead-end
+execution-only action.
 
 Data Quality contract v4 deliberately carries two same-publication views. The
 selected-window `quality_status` / `quality_flags` explain the current research

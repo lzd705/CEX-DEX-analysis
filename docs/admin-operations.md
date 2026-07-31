@@ -369,6 +369,15 @@ files were untouched. For DEX depth, USD time-alignment warnings are evaluated
 only when a measured band and a declared time-sensitive conversion exist.
 Unsupported or failed `N/A` rows do not receive a synthetic temporal mismatch.
 
+Execution is the depth collector's atomically published companion Fact; it is
+not an independent public refresh target. An execution market that is absent
+from the current execution baseline is therefore non-retryable. Recovery is
+offered only through the same market's separately retryable `depth` Fact when
+the bounded public endpoint accepts it. A market absent from both depth and
+execution baselines remains an explicit `N/A` until a full scheduled snapshot
+(or a separately reviewed inventory change) catalogs it. The dashboard never
+advertises an execution retry action that the backend cannot safely perform.
+
 ### One-shot MORPHO recovery gate
 
 The bounded MORPHO Upbit action is an operator release step, not a retry loop.

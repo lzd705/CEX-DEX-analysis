@@ -2258,6 +2258,8 @@ class MarketMonitorServerTest(unittest.TestCase):
             by_id[kraken_id]["status"],
             "not_cataloged_in_snapshot",
         )
+        self.assertFalse(by_id[kraken_id]["retryable"])
+        self.assertIsNone(by_id[kraken_id]["action"])
         self.assertEqual(
             by_id[binance_id]["raw_response_sha256"],
             "a" * 64,

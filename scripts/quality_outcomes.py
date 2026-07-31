@@ -97,10 +97,13 @@ _RULES = {
         "not_cataloged_in_snapshot",
         "depth_market_not_cataloged_in_snapshot",
     ): _rule(False, False, "unavailable"),
+    # Execution is published atomically with depth, but it has no independent
+    # exact-refresh job. A market absent from both baselines must not expose a
+    # retry action that the public API cannot execute safely.
     (
         "not_cataloged_in_snapshot",
         "execution_market_not_cataloged_in_snapshot",
-    ): _rule(True, False, "retry_open"),
+    ): _rule(False, False, "unavailable"),
     ("not_applicable", "cex_markets_do_not_have_pool_tvl"): _rule(
         False, True, "not_applicable"
     ),

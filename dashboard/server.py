@@ -4093,13 +4093,21 @@ def _execution_quality_fact(
         }
     rows = snapshot["by_market"].get(market["market_id"])
     if rows is None:
+        status = "not_cataloged_in_snapshot"
+        reason_code = "execution_market_not_cataloged_in_snapshot"
+        outcome = quality_outcome_rule(status, reason_code)
+        assert outcome is not None
         return {
             **_quality_lineage(
-                status="not_cataloged_in_snapshot",
-                reason="execution_market_not_cataloged_in_snapshot",
-                reason_code="execution_market_not_cataloged_in_snapshot",
-                retryable=True,
-                action="retry_execution_collection",
+                status=status,
+                reason=reason_code,
+                reason_code=reason_code,
+                retryable=outcome.retryable,
+                action=(
+                    "retry_execution_collection"
+                    if outcome.retryable
+                    else None
+                ),
             ),
             "published_at": snapshot.get("observed_at"),
             "status_counts": {},
