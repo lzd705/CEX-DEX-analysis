@@ -11,11 +11,11 @@ INDEX_PATH = PROJECT_ROOT / "dashboard" / "static" / "index.html"
 STYLES_PATH = PROJECT_ROOT / "dashboard" / "static" / "styles.css"
 
 
-def run_app_javascript(source: str):
+def run_app_javascript(source: str, prelude: str = ""):
     node = shutil.which("node")
     if node is None:
         raise unittest.SkipTest("Node.js is not installed in this runtime")
-    script = APP_PATH.read_text(encoding="utf-8") + "\n" + source
+    script = prelude + "\n" + APP_PATH.read_text(encoding="utf-8") + "\n" + source
     completed = subprocess.run(
         [node, "-e", script],
         cwd=PROJECT_ROOT,
@@ -27,6 +27,363 @@ def run_app_javascript(source: str):
 
 
 class DashboardFrontendContractTest(unittest.TestCase):
+    def test_workspace_route_reports_load_abort_and_catalog_outcomes(self):
+        result = run_app_javascript(
+            """
+function control() {
+  return {
+    value: "",
+    hidden: false,
+    disabled: false,
+    textContent: "",
+    dataset: {},
+    attributes: {},
+    setAttribute(name, value) { this.attributes[name] = value; },
+  };
+}
+const controls = new Map();
+global.document = {
+  getElementById(id) {
+    if (!controls.has(id)) controls.set(id, control());
+    return controls.get(id);
+  },
+  querySelectorAll() { return []; },
+};
+global.window = {
+  location: { pathname: "/tokens/BTC/markets", search: "" },
+  history: { replaceState() {} },
+  lucide: null,
+};
+let requestedStart = "2026-06-30";
+globalThis.__workspaceRoute = () => ({
+  kind: "workspace",
+  token: "BTC",
+  page: "markets",
+  state: { start: requestedStart, end: "2026-07-29" },
+});
+
+setActiveAppView = () => {};
+setActiveWorkspacePage = () => {};
+setWorkspaceCatalogLoading = () => {};
+setWorkspaceDataUnavailable = () => {};
+applyWorkspaceRoute = (route) => { app.route = route; };
+announceRoute = () => {};
+updateRouteLinks = () => {};
+canonicalizeCurrentRoute = () => {};
+cachedTokenCatalog = () => null;
+
+function payload(start = "2026-06-30", end = "2026-07-29") {
+  return {
+    metadata: {
+      start_date: start,
+      end_date: end,
+      available_start: "2026-05-01",
+      available_end: "2026-07-29",
+      data_generation: "generation-a",
+    },
+    tokens: [{ token_symbol: "BTC" }],
+  };
+}
+
+async function runScenario(mode) {
+  requestedStart = mode === "market-load-failure" ? "2026-07-23" : "2026-06-30";
+  app.payload = payload();
+  app.route = globalThis.__workspaceRoute();
+  app.routeReady = false;
+  app.routeRequestId = 0;
+  app.marketRequestId = 0;
+  app.marketController = null;
+  app.catalogController = null;
+  app.catalogsByToken.clear();
+  let marketLoads = 0;
+  let catalogLoads = 0;
+  loadMarket = async () => {
+    marketLoads += 1;
+    return mode !== "market-load-failure" && mode !== "generation-refresh-failure";
+  };
+  loadTokenCatalog = async () => {
+    catalogLoads += 1;
+    if (mode === "catalog-abort") {
+      const error = new Error("cancelled");
+      error.name = "AbortError";
+      throw error;
+    }
+    if (mode === "catalog-failure") throw new Error("catalog unavailable");
+    if (mode === "generation-refresh-failure") {
+      const error = new Error("generation changed");
+      error.code = "data_generation_mismatch";
+      throw error;
+    }
+    return { metadata: {} };
+  };
+  const applied = await applyRouteFromLocation();
+  return { applied, marketLoads, catalogLoads };
+}
+
+const outcomes = {};
+for (const mode of [
+  "market-load-failure",
+  "catalog-abort",
+  "catalog-failure",
+  "generation-refresh-failure",
+  "success",
+]) {
+  outcomes[mode] = await runScenario(mode);
+}
+console.log(JSON.stringify(outcomes));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  parseRoute() { return globalThis.__workspaceRoute(); },
+};
+""",
+        )
+        self.assertEqual(result, {
+            "market-load-failure": {
+                "applied": False,
+                "marketLoads": 1,
+                "catalogLoads": 0,
+            },
+            "catalog-abort": {
+                "applied": False,
+                "marketLoads": 0,
+                "catalogLoads": 1,
+            },
+            "catalog-failure": {
+                "applied": False,
+                "marketLoads": 0,
+                "catalogLoads": 1,
+            },
+            "generation-refresh-failure": {
+                "applied": False,
+                "marketLoads": 1,
+                "catalogLoads": 1,
+            },
+            "success": {
+                "applied": True,
+                "marketLoads": 0,
+                "catalogLoads": 1,
+            },
+        })
+
+    def test_bound_workspace_window_commands_use_real_apply_result(self):
+        result = run_app_javascript(
+            """
+function control({ value = "", hidden = false, dataset = {} } = {}) {
+  return {
+    value,
+    hidden,
+    dataset,
+    disabled: false,
+    textContent: "",
+    attributes: {},
+    listeners: {},
+    active: false,
+    focusCalls: 0,
+    classList: {
+      owner: null,
+      toggle(name, active) {
+        if (name === "active") this.owner.active = active;
+      },
+    },
+    addEventListener(type, listener) {
+      this.listeners[type] = this.listeners[type] || [];
+      this.listeners[type].push(listener);
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return this.attributes[name] || null; },
+    focus() { this.focusCalls += 1; },
+  };
+}
+async function trigger(target, type) {
+  for (const listener of target.listeners[type] || []) {
+    await listener({ preventDefault() {} });
+  }
+}
+function payload(start = "2026-06-30", end = "2026-07-29") {
+  return {
+    metadata: {
+      start_date: start,
+      end_date: end,
+      available_start: "2026-05-01",
+      available_end: "2026-07-29",
+      data_generation: "generation-a",
+    },
+    tokens: [{ token_symbol: "BTC" }],
+  };
+}
+const start = control();
+const end = control();
+const error = control({ hidden: true });
+const editor = control({ hidden: true });
+const toggle = control();
+const form = control();
+const cancel = control();
+const summary = control();
+const presets = ["7", "30", "90", "all"].map((days) => control({ dataset: { days } }));
+const genericControls = new Map();
+for (const item of [start, end, error, editor, toggle, form, cancel, summary, ...presets]) {
+  item.classList.owner = item;
+}
+toggle.setAttribute("aria-expanded", "false");
+const elements = {
+  "date-start": start,
+  "date-end": end,
+  "date-window-error": error,
+  "custom-window-editor": editor,
+  "custom-window-toggle": toggle,
+  "date-window-form": form,
+  "cancel-window": cancel,
+  "applied-window-summary": summary,
+};
+global.document = {
+  getElementById(id) {
+    if (elements[id]) return elements[id];
+    if (!genericControls.has(id)) genericControls.set(id, control());
+    return genericControls.get(id);
+  },
+  querySelectorAll(selector) {
+    if (selector === "[data-days]") return presets;
+    return [];
+  },
+  addEventListener() {},
+};
+global.window = {
+  location: { pathname: "/tokens/BTC/markets", search: "" },
+  history: { replaceState() {} },
+  addEventListener() {},
+  visualViewport: null,
+  matchMedia() { return { addEventListener() {} }; },
+  lucide: null,
+};
+globalThis.__workspaceRoute = () => ({
+  kind: "workspace",
+  token: "BTC",
+  page: "markets",
+  state: { start: start.value, end: end.value },
+});
+
+setActiveAppView = () => {};
+setActiveWorkspacePage = () => {};
+setWorkspaceCatalogLoading = () => {};
+setWorkspaceDataUnavailable = () => {};
+applyWorkspaceRoute = (route) => { app.route = route; };
+announceRoute = () => {};
+updateRouteLinks = () => {};
+canonicalizeCurrentRoute = () => {};
+replaceCurrentRoute = () => {};
+cachedTokenCatalog = () => null;
+
+let mode = "market-failure";
+loadMarket = async (loadedStart, loadedEnd) => {
+  if (mode === "market-failure") return false;
+  app.payload = payload(loadedStart, loadedEnd);
+  renderAppliedTimeWindowControls();
+  return true;
+};
+loadTokenCatalog = async () => {
+  if (mode === "catalog-failure") throw new Error("catalog unavailable");
+  return { metadata: {} };
+};
+
+app.payload = payload();
+app.route = globalThis.__workspaceRoute();
+app.routeReady = true;
+syncTimeWindowControls();
+const syncOriginal = syncTimeWindowControls;
+let syncCalls = 0;
+syncTimeWindowControls = () => {
+  syncCalls += 1;
+  syncOriginal();
+};
+bindEvents();
+
+openCustomWindowEditor();
+start.value = "2026-07-20";
+end.value = "2026-07-21";
+const customFailureSyncBefore = syncCalls;
+const customFailureFocusBefore = toggle.focusCalls;
+await trigger(form, "submit");
+const customFailure = {
+  syncCalls: syncCalls - customFailureSyncBefore,
+  editorHidden: editor.hidden,
+  expanded: toggle.getAttribute("aria-expanded"),
+  focusCalls: toggle.focusCalls - customFailureFocusBefore,
+  summary: summary.textContent,
+  active: presets.filter((button) => button.active).map((button) => button.dataset.days),
+  applied: appliedTimeWindow(),
+};
+
+app.payload = payload();
+syncOriginal();
+setCustomWindowOpen(true);
+mode = "catalog-failure";
+const presetFailureSyncBefore = syncCalls;
+await trigger(presets[0], "click");
+const presetFailure = {
+  syncCalls: syncCalls - presetFailureSyncBefore,
+  editorHidden: editor.hidden,
+  expanded: toggle.getAttribute("aria-expanded"),
+  summary: summary.textContent,
+  active: presets.filter((button) => button.active).map((button) => button.dataset.days),
+  applied: appliedTimeWindow(),
+};
+
+app.payload = payload();
+syncOriginal();
+openCustomWindowEditor();
+start.value = "2026-07-23";
+end.value = "2026-07-29";
+mode = "success";
+const successSyncBefore = syncCalls;
+const successFocusBefore = toggle.focusCalls;
+await trigger(form, "submit");
+const customSuccess = {
+  syncCalls: syncCalls - successSyncBefore,
+  editorHidden: editor.hidden,
+  expanded: toggle.getAttribute("aria-expanded"),
+  focusCalls: toggle.focusCalls - successFocusBefore,
+  summary: summary.textContent,
+  active: presets.filter((button) => button.active).map((button) => button.dataset.days),
+  applied: appliedTimeWindow(),
+};
+
+console.log(JSON.stringify({ customFailure, presetFailure, customSuccess }));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  parseRoute() { return globalThis.__workspaceRoute(); },
+};
+""",
+        )
+        unchanged = {
+            "summary": "30 Jun–29 Jul 2026 · 30 days",
+            "active": ["30"],
+            "applied": {"start": "2026-06-30", "end": "2026-07-29"},
+        }
+        self.assertEqual(result["customFailure"], {
+            "syncCalls": 0,
+            "editorHidden": False,
+            "expanded": "true",
+            "focusCalls": 0,
+            **unchanged,
+        })
+        self.assertEqual(result["presetFailure"], {
+            "syncCalls": 0,
+            "editorHidden": False,
+            "expanded": "true",
+            **unchanged,
+        })
+        self.assertEqual(result["customSuccess"], {
+            "syncCalls": 1,
+            "editorHidden": True,
+            "expanded": "false",
+            "focusCalls": 1,
+            "summary": "23–29 Jul 2026 · 7 days",
+            "active": ["7"],
+            "applied": {"start": "2026-07-23", "end": "2026-07-29"},
+        })
+
     def test_time_window_summary_and_active_state_use_applied_payload(self):
         result = run_app_javascript(
             """
@@ -254,7 +611,10 @@ if (typeof openCustomWindowEditor !== "function") {
 
   app.route = { kind: "workspace" };
   let workspaceReloaded = false;
-  applyRouteFromLocation = async () => { workspaceReloaded = true; };
+  applyRouteFromLocation = async () => {
+    workspaceReloaded = true;
+    return true;
+  };
   const workspaceApplied = await applyWindow();
 
   setPreset("7");
@@ -1524,7 +1884,10 @@ app.payload = {
 app.route = { kind: "workspace", page: "compare" };
 const steps = [];
 replaceCurrentRoute = () => { steps.push("route"); };
-applyRouteFromLocation = async () => { steps.push("reload"); };
+applyRouteFromLocation = async () => {
+  steps.push("reload");
+  return true;
+};
 (async () => {
   const applied = await applyWindow();
   console.log(JSON.stringify({ applied, steps }));
