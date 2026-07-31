@@ -600,7 +600,7 @@ function visibleState(focusBefore = toggle.focusCalls) {
   };
 }
 
-function reset({ draft, open = true } = {}) {
+function reset({ draft, open = true, routeReady = true } = {}) {
   app.payload = summaryPayload("2026-06-30", "2026-07-29");
   app.defaultPayload = null;
   app.visibleTokens = [...app.payload.tokens];
@@ -611,7 +611,7 @@ function reset({ draft, open = true } = {}) {
     page: "markets",
     state: { start: "2026-06-30", end: "2026-07-29" },
   };
-  app.routeReady = true;
+  app.routeReady = routeReady;
   app.marketRequestId = 0;
   app.marketRequestWindowKey = "";
   app.marketController = null;
@@ -683,6 +683,30 @@ bindEvents();
   await completion;
   const generationSuccess = visibleState(focusBefore);
 
+  reset({ routeReady: false });
+  replaceCurrentRoute({
+    window: { start: "2026-07-23", end: "2026-07-29" },
+  });
+  const ordinaryBeforeReady = {
+    route: routeUrl(),
+    routeWrites: [...routeWrites],
+    routeReady: app.routeReady,
+  };
+
+  reset({
+    draft: { start: "2026-07-22", end: "2026-07-29" },
+    routeReady: false,
+  });
+  focusBefore = toggle.focusCalls;
+  completion = trigger(form, "submit");
+  await Promise.resolve();
+  respond(0, { ok: true, body: summaryPayload("2026-07-23", "2026-07-29") });
+  await completion;
+  const initializingWorkspaceSuccess = {
+    ...visibleState(focusBefore),
+    routeReady: app.routeReady,
+  };
+
   reset({ draft: { start: "2026-07-20", end: "2026-07-21" } });
   focusBefore = toggle.focusCalls;
   const olderCompletion = trigger(form, "submit");
@@ -706,6 +730,8 @@ bindEvents();
     presetFailure,
     presetSuccess,
     generationSuccess,
+    ordinaryBeforeReady,
+    initializingWorkspaceSuccess,
     overlapping,
   }));
 })();
@@ -833,6 +859,24 @@ globalThis.MarketMonitorNavigation = {
             "requests": [
                 "/api/markets/summary?start=2026-07-22&end=2026-07-29"
             ],
+        })
+        self.assertEqual(result["ordinaryBeforeReady"], {
+            "route": (
+                "/tokens/BTC/markets?start=2026-06-30&end=2026-07-29"
+            ),
+            "routeWrites": [],
+            "routeReady": False,
+        })
+        self.assertEqual(result["initializingWorkspaceSuccess"], {
+            **new_applied,
+            "focusDelta": 1,
+            "routeDrafts": [
+                {"start": "2026-07-22", "end": "2026-07-29"}
+            ],
+            "requests": [
+                "/api/markets/summary?start=2026-07-22&end=2026-07-29"
+            ],
+            "routeReady": False,
         })
         self.assertEqual(result["overlapping"], {
             **new_applied,

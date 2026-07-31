@@ -449,8 +449,11 @@ function updateRouteLinks() {
   if (back && navigation) back.href = navigation.buildScreenerPath(currentScreenerFilters());
 }
 
-function replaceCurrentRoute({ window = appliedTimeWindow() } = {}) {
-  if (!navigation || !app.routeReady) return;
+function replaceCurrentRoute({
+  window = appliedTimeWindow(),
+  allowBeforeReady = false,
+} = {}) {
+  if (!navigation || (!app.routeReady && !allowBeforeReady)) return;
   let path;
   if (app.route.kind === "workspace") {
     path = currentWorkspacePath(app.route.page, { window });
@@ -5115,7 +5118,7 @@ async function applyWindow(candidate = draftTimeWindow()) {
   });
   if (!loaded) return false;
   const applied = appliedTimeWindow();
-  replaceCurrentRoute({ window: applied });
+  replaceCurrentRoute({ window: applied, allowBeforeReady: true });
   if (routeKind === "workspace") void applyRouteFromLocation();
   return true;
 }
