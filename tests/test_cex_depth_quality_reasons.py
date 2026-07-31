@@ -7,7 +7,11 @@ from unittest.mock import patch
 
 from dashboard import server
 from scripts.execution_cost import EXECUTION_COST_COLUMNS
-from scripts.fetch_cex_depth import DEPTH_COLUMNS_ALL, failed_execution_rows
+from scripts.fetch_cex_depth import (
+    DEPTH_COLUMNS_ALL,
+    failed_execution_rows,
+    failure_row,
+)
 from scripts.quality_outcomes import quality_outcome_rule
 
 
@@ -27,6 +31,7 @@ def public_empty_book_execution_fact():
         data_dir = Path(directory)
         cex_path = data_dir / server.CEX_FILENAME
         dex_path = data_dir / server.DEX_FILENAME
+        depth_path = data_dir / server.CEX_DEPTH_FILENAME
         execution_path = data_dir / server.CEX_EXECUTION_COST_FILENAME
         write_csv(
             cex_path,
@@ -63,6 +68,15 @@ def public_empty_book_execution_fact():
         raw_error = SourceBookError(
             "crypto_com returned an empty order-book side"
         )
+        depth_row = failure_row(
+            market,
+            snapshot_id="cex-depth-1",
+            request_started_at="2026-07-30T00:00:00+00:00",
+            response_received_at="2026-07-30T00:00:01+00:00",
+            error=raw_error,
+            reason_code="source_no_two_sided_book",
+        )
+        write_csv(depth_path, DEPTH_COLUMNS_ALL, [depth_row])
         rows = failed_execution_rows(
             market,
             snapshot_id="cex-depth-1",
@@ -77,6 +91,7 @@ def public_empty_book_execution_fact():
         environment = {
             "MARKET_CEX_DATA": str(cex_path),
             "MARKET_DEX_DATA": str(dex_path),
+            "MARKET_CEX_DEPTH_DATA": str(depth_path),
             "MARKET_CEX_EXECUTION_COST_DATA": str(execution_path),
         }
         server.clear_runtime_caches()
