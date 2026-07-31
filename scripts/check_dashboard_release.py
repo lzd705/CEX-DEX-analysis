@@ -43,6 +43,7 @@ EVENT_LIFECYCLES = frozenset(
 EVENT_EVIDENCE_STATUSES = frozenset(
     {"primary_confirmed", "cross_checked", "onchain_observed"}
 )
+EXPECTED_SUMMARY_VERSION = 2
 FORBIDDEN_EVENT_RESULT_FIELDS = frozenset(
     {
         "impact",
@@ -113,8 +114,62 @@ def validate_summary(
         metadata.get("response_scope") == "screener_summary",
         "Summary response_scope is not screener_summary",
     )
-    require(metadata.get("summary_version") == 1, "Summary version is not 1")
+    require(
+        metadata.get("summary_version") == EXPECTED_SUMMARY_VERSION,
+        f"Summary version is not {EXPECTED_SUMMARY_VERSION}",
+    )
     require(isinstance(tokens, list) and tokens, "Summary has no Token rows")
+    for row in tokens:
+        require(isinstance(row, dict), "Summary Token row is not an object")
+        market_count = row.get("market_count")
+        status_counts = row.get("quality_status_counts")
+        alert_counts = row.get("quality_alert_counts")
+        require(
+            isinstance(market_count, int) and market_count > 0,
+            "Summary Token market_count is invalid",
+        )
+        require(
+            isinstance(status_counts, dict)
+            and all(
+                isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= 0
+                for count in status_counts.values()
+            )
+            and sum(status_counts.values()) == market_count,
+            "Summary quality status counts do not match market_count",
+        )
+        require(
+            isinstance(alert_counts, dict)
+            and all(
+                severity in {"info", "warning", "critical"}
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= 0
+                for severity, count in alert_counts.items()
+            ),
+            "Summary quality alert counts are invalid",
+        )
+        require(
+            isinstance(row.get("spread_comparable_days"), int)
+            and row["spread_comparable_days"] >= 0,
+            "Summary spread comparable-day count is invalid",
+        )
+        for market_type in ("cex", "dex"):
+            market = row.get(f"primary_{market_type}")
+            if market is None:
+                continue
+            refresh_id = market.get("refresh_market_id")
+            require(
+                isinstance(refresh_id, str)
+                and refresh_id.startswith(f"{market_type}:"),
+                "Summary primary market refresh identity is invalid",
+            )
+            require(
+                isinstance(market.get("depth_retryable"), bool)
+                and isinstance(market.get("tvl_retryable"), bool),
+                "Summary primary market retryability is invalid",
+            )
     for forbidden in ("markets", "cex_markets", "dex_pools", "price_points"):
         require(forbidden not in payload, f"Summary leaked heavy root field: {forbidden}")
     require(metrics.compressed, "Summary response was not gzip compressed")
