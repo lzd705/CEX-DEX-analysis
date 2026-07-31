@@ -80,6 +80,34 @@ Failures remain missing; they are never replaced with zero.
    95% retention of comparable prior `observed`/`partial` identities,
    including the exchange-cohort gate in `collection-operations.md`.
 
+## Cohort identity and publication boundary
+
+One accepted order-book response produces one depth row and the ten matching
+execution rows (two directions at five notionals) for that exact Market. A full
+family candidate has exactly one nonempty `snapshot_id`; the execution
+`snapshot_id` and `source_snapshot_id` must equal the depth `snapshot_id`, and
+the execution Market count must equal the exact published depth inventory row
+count. The ID is therefore an inventory-bound publication/source-lineage key.
+It is not an observation timestamp and does not prove that different venues
+were observed simultaneously.
+
+The public depth history, depth latest/current views, and execution latest view
+are validated before replacement and then passed to one family publication
+bundle. The bundle restores all pre-existing public bytes when an ordinary
+in-process I/O exception interrupts replacement. This is failure-atomic error
+handling for ordinary I/O failures only. It is not process-crash atomic: power
+loss, interpreter termination, or an operating-system crash can still leave a
+partially replaced multi-file family and requires manifest/hash diagnosis.
+The private processed depth/execution `current` files are written independently
+and are not part of the public reader boundary.
+
+Metadata exposes canonical `observed_at_min`, `observed_at_max`, and
+`observation_span_seconds` for the family. These bounds describe bounded
+sequential observations collected across venues. They do not convert the
+family into a same-instant order book. A genuine source absence remains its
+explicit non-measured status with numeric values blank/JSON `null`; neither
+publication nor lineage validation converts it to zero.
+
 ## Files
 
 | File | Meaning |
@@ -117,7 +145,9 @@ limits are recorded per row so coverage can be audited rather than assumed.
 The observation time prefers the exchange-provided order-book timestamp and
 falls back to the local response-received time when the venue omits one.
 Because markets change continuously, comparisons across exchanges are
-near-contemporaneous sequential snapshots, not an atomic cross-venue book.
+bounded sequential observations, not a simultaneous or atomic cross-venue
+book. `observation_span_seconds` reports the canonical earliest-to-latest
+observation span; it is cohort-skew metadata, not a simultaneity guarantee.
 
 Repeated snapshots can form an observation history, but the current collector
 does not claim tick-perfect reconstruction. WebSocket sequence maintenance is

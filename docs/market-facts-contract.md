@@ -90,6 +90,28 @@ cannot be reused across Tokens. Selected quality accepts exactly two distinct
 selected IDs, real integer report counts, and sorted unique canonical
 `YYYY-MM-DD` affected dates.
 
+Depth/execution snapshot lineage is a separate fail-closed gate from
+`data_generation`. For each loaded CEX or DEX family, readers require exactly
+one nonempty depth `snapshot_id`, one execution `snapshot_id`, and one
+execution `source_snapshot_id`; all three must be equal. The unique execution
+Market count must equal the exact published depth inventory row count. A
+snapshot/source ID is therefore bound to its inventory count. It is a
+publication/source-lineage key, not an observation time and not evidence that
+venues or chains were observed simultaneously.
+
+Depth and execution metadata carry canonical earliest/latest observation
+bounds plus `observation_span_seconds`, and execution responses declare
+`cohort_observation_model=bounded_sequential_observations`. The raw inputs are
+bounded sequential observations, not synchronous or same-instant samples.
+Invalid depth/execution lineage makes execution-cost and Quality return a
+bounded 503. A malformed depth cohort also makes every route that consumes the
+depth-enriched catalog fail closed; `/health` then returns degraded/data-not-
+ready with HTTP 503. An execution-only publication error is isolated from
+routes and health checks that do not load execution. The release checker
+independently rejects mismatched IDs, inventory counts, or observation bounds.
+Actual source absence is not a lineage mismatch: unavailable or unsupported
+facts retain their status and JSON `null`, never an invented zero.
+
 When the selected daily report identity is matched, evidence is also bound to
 each exact Market. `daily_quality_report.market_issue_rollups` contains one
 rollup for every returned Market, including explicit zero-count rollups for

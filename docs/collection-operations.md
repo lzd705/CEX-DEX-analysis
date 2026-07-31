@@ -265,23 +265,28 @@ identity-incomplete baseline fails closed. There is no silent override and no
 mixing of old successful rows into a rejected candidate.
 
 CEX and DEX preflight depth and execution together. If either coverage check
-rejects during that bundle preflight, neither corresponding latest view is
-changed. Both family reports remain available for diagnosis. The collector
-exits nonzero, and the previous latest naturally becomes stale rather than
-being replaced with broad failure rows. Passing and rejected structured
-reports are copied into `steps[].publication_gates` in the collection
-manifest.
+rejects during that bundle preflight, no public family destination is changed.
+Both family reports remain available for diagnosis. The collector exits
+nonzero, and the previous latest naturally becomes stale rather than being
+replaced with broad failure rows. Passing and rejected structured reports are
+copied into `steps[].publication_gates` in the collection manifest.
 
-For a full-inventory publication, depth/history and execution latest remain
-separate atomic file replacements, not one cross-file transaction. An I/O or
-process failure after the commit phase begins is not rolled back across those
-files. A canonical one-market `--merge-publish` instead stages the bounded
-history/latest/current/execution bundle beside its destinations and restores
-every pre-call byte if an ordinary I/O exception interrupts replacement. This
-is failure-atomic error handling, not a claim of crash-atomic multi-file
-storage: power loss or process termination still requires manifest/hash-based
-diagnosis. The production runner lock serializes managed profiles; concurrent
-direct collector invocations with `--publish-local` are unsupported.
+For both full-inventory and canonical one-market `--merge-publish`
+publication, the family's public depth history, depth latest/current, and
+execution latest bytes are passed to one staged replacement bundle. If an
+ordinary in-process I/O exception interrupts replacement, the helper restores
+every public destination to its pre-call bytes. This is failure-atomic error
+handling for ordinary I/O failures only. It is not process-crash atomic:
+power loss, interpreter termination, or an operating-system crash can still
+leave a partially replaced multi-file family and requires manifest/hash-based
+diagnosis. The private processed depth/execution `current` files are written
+independently before the public bundle and are not a server-visible commit
+point. The CEX and DEX family bundles also remain separate from each other.
+True crash-atomic cross-family publication would require immutable generation
+directories and one atomically replaced manifest pointer.
+
+The production runner lock serializes managed profiles; concurrent direct
+collector invocations with `--publish-local` are unsupported.
 
 The separate fact lifecycles remain explicit:
 
@@ -289,10 +294,11 @@ The separate fact lifecycles remain explicit:
   database is staged and atomically replaced last through
   `import_local_snapshot.py`;
 - TVL appends normalized history, then atomically replaces its latest snapshot;
-- CEX and DEX depth each append normalized history, then atomically replace
-  their own latest snapshots. Their matching long-form execution-cost
-  latest views reuse the same raw response/fixed-block lineage. Retained raw
-  responses and manifests are the execution audit history for this release.
+- CEX and DEX each publish depth history, depth latest/current, and the matching
+  long-form execution-cost latest view through its own ordinary-I/O
+  failure-atomic family bundle. Depth and execution reuse the same raw
+  response/fixed-block lineage. Retained raw responses and manifests are the
+  execution audit history for this release.
 
 The hourly DEX USD-price refresh reuses the TVL collector's GeckoTerminal
 multi-pool response but writes only
@@ -304,6 +310,31 @@ file. If the refresh step fails, DEX depth is recorded as
 A full collection manifest coordinates these publications but does not claim
 that the CSVs, histories, latest snapshots, and SQLite database form one
 multi-file transaction, or that all source APIs were observed at one instant.
+
+### Snapshot cohort and reader boundary
+
+For one CEX or DEX family, the raw inputs are bounded sequential observations:
+CEX venues are requested in sequence, while DEX pool states are fixed to their
+declared per-chain blocks but collected across pools and chains over time. The
+canonical earliest and latest observation timestamps define
+`observation_span_seconds`. This is a cohort-skew bound, not a claim of
+simultaneous, synchronous, or same-instant observation.
+
+Every published family must expose exactly one nonempty depth `snapshot_id`,
+one execution `snapshot_id`, and one execution `source_snapshot_id`; all three
+must be equal. The execution Market count must also equal the exact depth
+inventory row count. The ID is therefore meaningful only together with the
+validated inventory count and observation bounds. It is a publication/source
+lineage key, not the observation time.
+
+Readers fail closed on malformed depth cohorts and depth/execution lineage
+mismatches. Execution-cost and Quality routes return a bounded 503 rather than
+assembling facts from different cohorts. A malformed depth publication also
+closes every public route that consumes the depth-enriched catalog, and
+`/health` reports `status=degraded`, `data_ready=false`, and HTTP 503. An
+execution-only file error is isolated from routes and health checks that do not
+load execution. Genuine absence remains `unavailable`/`null` rather than being
+treated as a mismatched cohort or converted to zero.
 
 ### Exact latest-fact refresh
 

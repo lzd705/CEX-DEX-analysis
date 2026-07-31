@@ -156,7 +156,8 @@ off-market pool. The actual pool-state depth remains visible with its lineage.
 
 Publishing requires exactly one explicit status row per TVL-inventory
 Token/chain/pool key and at least one measured pool. Latest replacement is
-atomic; history is append-only by snapshot and pool key.
+performed only after candidate validation; history remains keyed by snapshot
+and pool.
 
 Before the managed commit phase starts, both depth and execution-cost coverage
 are preflighted. Supported rows must retain at least 80% current usable
@@ -164,8 +165,39 @@ coverage and 95% of comparable prior usable identities. Structural
 `unsupported` rows do not enter the supported denominator. The adapter
 classifier is recomputed for this gate, so a V2/V3-capable pool mislabeled
 `unsupported` cannot hide an RPC or collector failure. Each destination file
-is replaced atomically, but the two files are not one cross-file transaction.
-The full bundle/cohort semantics are in `collection-operations.md`.
+participates in the full family bundle described below. The shared operational
+details are also recorded in `collection-operations.md`.
+
+## Cohort identity, skew, and failure boundary
+
+One accepted fixed-block pool state produces one depth row and the ten matching
+execution rows (two directions at five notionals) for that exact Market. A full
+DEX family candidate has exactly one nonempty `snapshot_id`; the execution
+`snapshot_id` and `source_snapshot_id` must equal the depth `snapshot_id`, and
+the execution Market count must equal the exact published depth inventory row
+count. The ID binds a publication/source cohort to its inventory. It is not a
+block timestamp, observation timestamp, or proof that pools on independent
+chains were observed simultaneously.
+
+Within one chain, every call for a pool uses the declared fixed block. Across
+pools and chains, the raw inputs are bounded sequential observations. Metadata
+therefore exposes canonical `observed_at_min`, `observed_at_max`, and
+`observation_span_seconds`. The span measures earliest-to-latest cohort skew;
+it does not redefine the snapshot ID or create cross-chain simultaneity.
+
+After depth and execution candidates and both coverage reports pass, public
+depth history, depth latest/current, and execution latest bytes are replaced
+through one family bundle. An ordinary in-process I/O exception rolls all
+public destinations back to their pre-call bytes. This is failure-atomic for
+ordinary I/O failures only, not process-crash atomic. Power loss, interpreter
+termination, or an operating-system crash may still expose a partially
+replaced multi-file family and requires manifest/hash diagnosis. The private
+processed depth/execution `current` files are independently written outside
+that public bundle.
+
+Real absence and capability limits retain their existing meanings:
+`unsupported`, `failed`, or otherwise unavailable facts keep their measured
+values blank/JSON `null`. Cohort validation never substitutes zero.
 
 ## RPC endpoints
 
