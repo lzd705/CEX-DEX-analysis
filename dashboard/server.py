@@ -5030,6 +5030,26 @@ def _build_public_api_response_cached(
     return encode_json_payload(payload, "gzip")
 
 
+def warm_default_market_summary() -> None:
+    """Populate the default Summary response cache without blocking startup."""
+    try:
+        source_signature = api_source_signature()
+        freshness_bucket = api_freshness_bucket()
+        ensure_source_cache_generation(source_signature)
+        ensure_public_response_cache_generation(
+            source_signature,
+            freshness_bucket,
+        )
+        _build_public_api_response_cached(
+            "summary",
+            (),
+            source_signature,
+            freshness_bucket,
+        )
+    except Exception as error:
+        print(f"Default summary warmup failed: {type(error).__name__}")
+
+
 def clear_runtime_caches() -> None:
     """Drop every payload derived from a previous published source generation."""
     global _SOURCE_CACHE_GENERATION, _PUBLIC_RESPONSE_CACHE_GENERATION
@@ -6313,6 +6333,7 @@ def main() -> None:
         )
     server = ThreadingHTTPServer((args.host, args.port), MarketMonitorHandler)
     print(f"Market Monitor running at http://{args.host}:{args.port}")
+    warm_default_market_summary()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
