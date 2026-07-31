@@ -18,6 +18,17 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+try:
+    from scripts.quality_outcomes import (
+        canonical_quality_fact_action,
+        canonical_quality_fact_rule,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from quality_outcomes import (
+        canonical_quality_fact_action,
+        canonical_quality_fact_rule,
+    )
+
 
 @dataclass(frozen=True)
 class ResponseMetrics:
@@ -64,6 +75,69 @@ SCREENING_QUALITY_FLAG_FIELDS = frozenset(
 )
 SCREENING_QUALITY_MARKET_FIELDS = frozenset(
     {"screening_quality_status", "screening_quality_flags"}
+)
+SELECTED_QUALITY_MARKET_FIELDS = frozenset(
+    {
+        "quality_status",
+        "quality_flags",
+        "screening_quality_status",
+        "screening_quality_flags",
+    }
+)
+QUALITY_FACT_NAMES = frozenset({"daily", "tvl", "depth", "execution"})
+DAILY_QUALITY_STATUS_PRIORITY = {
+    "collection_failed": 0,
+    "needs_review": 1,
+    "backfill_pending": 2,
+    "source_no_observation": 3,
+    "unsupported": 4,
+}
+DAILY_FACT_EVIDENCE_FIELDS = frozenset(
+    {
+        "daily_evidence_mode",
+        "issue_status_counts",
+        "reason_code_counts",
+        "affected_date_count",
+        "affected_dates",
+    }
+)
+DAILY_MATCHED_NO_ISSUE_OUTCOMES = frozenset(
+    {
+        ("observed", "observed"),
+        (
+            "not_applicable",
+            "selected_window_before_first_market_observation",
+        ),
+        ("needs_review", "daily_quality_outcome_invalid"),
+    }
+)
+DAILY_FALLBACK_OUTCOMES = frozenset(
+    set(DAILY_MATCHED_NO_ISSUE_OUTCOMES)
+    | {
+        ("backfill_pending", "missing_unexplained"),
+        (
+            "backfill_pending",
+            "missing_daily_observations_inside_observed_market_lifecycle",
+        ),
+        (
+            "backfill_pending",
+            "missing_daily_observations_in_selected_window",
+        ),
+        (
+            "missing_unexplained",
+            "no_daily_observations_after_latest_observed_market_date",
+        ),
+        (
+            "missing_unexplained",
+            "no_daily_observations_in_selected_window",
+        ),
+    }
+)
+SELECTED_QUALITY_CATEGORIES = frozenset(
+    set(SCREENING_QUALITY_CATEGORIES) | {"source_outcome"}
+)
+SELECTED_QUALITY_FLAG_FIELDS = frozenset(
+    {"code", "severity", "category", "message", "observed_value", "threshold"}
 )
 SCREENING_QUALITY_CODE_PATTERN = re.compile(
     r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z",
@@ -204,6 +278,10 @@ def validate_summary(
             market = row.get(f"primary_{market_type}")
             if market is None:
                 continue
+            require(
+                isinstance(market, dict),
+                "Summary primary market is not an object",
+            )
             refresh_id = market.get("refresh_market_id")
             require(
                 isinstance(refresh_id, str)
@@ -215,6 +293,24 @@ def validate_summary(
                 and isinstance(market.get("tvl_retryable"), bool),
                 "Summary primary market retryability is invalid",
             )
+            for fact_name in ("tvl", "depth"):
+                status = market.get(f"{fact_name}_status")
+                reason_field = f"{fact_name}_na_reason"
+                reason = market.get(reason_field)
+                retryable = market.get(f"{fact_name}_retryable")
+                rule = canonical_quality_fact_rule(
+                    market_type,
+                    fact_name,
+                    status,
+                    reason,
+                )
+                require(
+                    reason_field in market
+                    and isinstance(status, str)
+                    and rule is not None
+                    and retryable is rule.retryable,
+                    "Summary primary market N/A outcome is not canonical",
+                )
     for forbidden in ("markets", "cex_markets", "dex_pools", "price_points"):
         require(forbidden not in payload, f"Summary leaked heavy root field: {forbidden}")
     require(metrics.compressed, "Summary response was not gzip compressed")
@@ -271,6 +367,20 @@ def validate_token_catalog(
         all(row.get("token_symbol") == token for row in markets),
         "Token catalog leaked another Token",
     )
+    market_ids = [
+        row.get("market_id") if isinstance(row, dict) else None
+        for row in markets
+    ]
+    require(
+        all(
+            isinstance(market_id, str)
+            and bool(market_id)
+            and market_id == market_id.strip()
+            for market_id in market_ids
+        )
+        and len(set(market_ids)) == len(market_ids),
+        "Token catalog market IDs are invalid or duplicated",
+    )
     require(metadata.get("window_start") == start, "Token catalog start window differs")
     require(metadata.get("window_end") == end, "Token catalog end window differs")
     require(
@@ -297,6 +407,7 @@ def validate_comparison(
     market_b: str,
     start: str,
     end: str,
+    expected_generation: str,
 ) -> None:
     metadata = payload.get("metadata") or {}
     observations = payload.get("observations")
@@ -311,6 +422,10 @@ def validate_comparison(
     )
     require(metadata.get("start_date") == start, "Compare returned wrong start window")
     require(metadata.get("end_date") == end, "Compare returned wrong end window")
+    require(
+        metadata.get("data_generation") == expected_generation,
+        "Summary and Compare generations differ",
+    )
     require(
         isinstance(observations, list) and observations,
         "Compare returned no daily observations",
@@ -335,6 +450,281 @@ def validate_comparison(
     )
 
 
+def _normalized_daily_count_map(
+    value: Any,
+    *,
+    label: str,
+    allowed_keys: frozenset[str] | None = None,
+    require_positive_entries: bool = False,
+) -> dict[str, int]:
+    require(isinstance(value, dict), label)
+    normalized: dict[str, int] = {}
+    for key, count in value.items():
+        require(
+            isinstance(key, str)
+            and bool(key)
+            and SCREENING_QUALITY_CODE_PATTERN.fullmatch(key) is not None
+            and (allowed_keys is None or key in allowed_keys)
+            and type(count) is int
+            and count >= 0
+            and (not require_positive_entries or count > 0),
+            label,
+        )
+        if count:
+            normalized[key] = count
+    return dict(sorted(normalized.items()))
+
+
+def _validate_daily_quality_report(report: Any) -> dict[str, Any]:
+    require(
+        isinstance(report, dict)
+        and report.get("status")
+        in {
+            "matched",
+            "unavailable",
+            "ignored_invalid",
+            "ignored_identity_unavailable",
+            "ignored_identity_mismatch",
+        },
+        "Quality daily-audit status is invalid",
+    )
+    status = report["status"]
+    expected_evidence_mode = (
+        "published_daily_audit"
+        if status == "matched"
+        else "catalog_window_inference"
+    )
+    require(
+        report.get("evidence_mode") == expected_evidence_mode,
+        "Quality daily-audit evidence mode is invalid",
+    )
+    if status == "matched":
+        require(
+            report.get("schema") == "fact_quality_report/v1"
+            and report.get("identity_status") == "matched_current_import",
+            "Quality daily audit lacks a verified current publication identity",
+        )
+    else:
+        require(
+            report.get("identity_status")
+            in {"not_verified", "unavailable", "mismatch"},
+            "Quality fallback has an invalid publication identity status",
+        )
+
+    issue_count = report.get("selected_window_issue_count")
+    require(
+        type(issue_count) is int and issue_count >= 0,
+        "Quality daily-audit reason/status counts are inconsistent",
+    )
+    reason_counts = _normalized_daily_count_map(
+        report.get("reason_code_counts"),
+        label="Quality daily-audit reason/status counts are inconsistent",
+    )
+    status_counts = _normalized_daily_count_map(
+        report.get("status_counts"),
+        label="Quality daily-audit reason/status counts are inconsistent",
+        allowed_keys=frozenset(DAILY_QUALITY_STATUS_PRIORITY),
+    )
+    require(
+        sum(reason_counts.values()) == issue_count
+        and sum(status_counts.values()) == issue_count,
+        "Quality daily-audit reason/status counts are inconsistent",
+    )
+    affected_dates = report.get("affected_dates")
+    require(
+        isinstance(affected_dates, list)
+        and all(_is_canonical_date(value) for value in affected_dates)
+        and affected_dates == sorted(set(affected_dates))
+        and type(report.get("affected_date_count")) is int
+        and report["affected_date_count"] == len(affected_dates)
+        and len(affected_dates) <= issue_count,
+        "Quality daily-audit affected dates are inconsistent",
+    )
+    if status != "matched":
+        require(
+            issue_count == 0
+            and not reason_counts
+            and not status_counts
+            and not affected_dates,
+            "Quality fallback cannot claim published daily-audit issues",
+        )
+    return {
+        "status": status,
+        "issue_count": issue_count,
+        "reason_counts": reason_counts,
+        "status_counts": status_counts,
+        "affected_dates": affected_dates,
+    }
+
+
+def _validate_daily_fact_evidence(
+    fact: dict[str, Any],
+    *,
+    market_type: str,
+    report_status: str,
+) -> dict[str, Any]:
+    status = fact["status"]
+    reason_code = fact["reason_code"]
+    retryable = fact["retryable"]
+    mode = fact.get("daily_evidence_mode")
+    present_evidence_fields = {
+        field for field in DAILY_FACT_EVIDENCE_FIELDS if field in fact
+    }
+
+    if mode == "published_daily_audit":
+        require(
+            report_status == "matched"
+            and present_evidence_fields == DAILY_FACT_EVIDENCE_FIELDS,
+            "Quality daily fact evidence/action is incomplete",
+        )
+        status_counts = _normalized_daily_count_map(
+            fact.get("issue_status_counts"),
+            label="Quality daily fact evidence/action counts are invalid",
+            allowed_keys=frozenset(DAILY_QUALITY_STATUS_PRIORITY),
+            require_positive_entries=True,
+        )
+        reason_counts = _normalized_daily_count_map(
+            fact.get("reason_code_counts"),
+            label="Quality daily fact evidence/action counts are invalid",
+            require_positive_entries=True,
+        )
+        issue_count = sum(status_counts.values())
+        require(
+            issue_count > 0 and sum(reason_counts.values()) == issue_count,
+            "Quality daily fact evidence/action counts are inconsistent",
+        )
+        affected_dates = fact.get("affected_dates")
+        require(
+            isinstance(affected_dates, list)
+            and bool(affected_dates)
+            and all(_is_canonical_date(value) for value in affected_dates)
+            and affected_dates == sorted(set(affected_dates))
+            and type(fact.get("affected_date_count")) is int
+            and fact["affected_date_count"] == len(affected_dates)
+            and len(affected_dates) <= issue_count,
+            "Quality daily fact evidence/action dates are inconsistent",
+        )
+        require(
+            all(
+                any(
+                    canonical_quality_fact_rule(
+                        market_type,
+                        "daily",
+                        issue_status,
+                        issue_reason,
+                    )
+                    is not None
+                    for issue_status in status_counts
+                )
+                for issue_reason in reason_counts
+            ),
+            "Quality daily fact evidence/action reasons are impossible",
+        )
+        expected_status = min(
+            status_counts,
+            key=lambda candidate: DAILY_QUALITY_STATUS_PRIORITY[candidate],
+        )
+        expected_reason = (
+            next(iter(reason_counts))
+            if len(reason_counts) == 1
+            else "multiple_daily_quality_reasons"
+        )
+        expected_retryable = any(
+            issue_status in {"collection_failed", "backfill_pending"}
+            for issue_status in status_counts
+        )
+        manual_review_present = bool(status_counts.get("needs_review"))
+        try:
+            expected_action = canonical_quality_fact_action(
+                market_type,
+                "daily",
+                expected_status,
+                expected_reason,
+                expected_retryable,
+                manual_review_present=manual_review_present,
+            )
+        except ValueError as error:
+            raise ReleaseCheckError(
+                "Quality daily fact evidence/action outcome is invalid"
+            ) from error
+        require(
+            status == expected_status
+            and reason_code == expected_reason
+            and retryable is expected_retryable
+            and fact.get("action") == expected_action,
+            "Quality daily fact evidence/action does not match its issues",
+        )
+        return {
+            "mode": mode,
+            "issue_count": issue_count,
+            "status_counts": status_counts,
+            "reason_counts": reason_counts,
+            "affected_dates": affected_dates,
+        }
+
+    if mode == "catalog_report_reconciliation":
+        require(
+            report_status == "matched"
+            and present_evidence_fields == DAILY_FACT_EVIDENCE_FIELDS
+            and fact.get("issue_status_counts") == {}
+            and fact.get("reason_code_counts")
+            == {"daily_audit_no_matching_issue": 1}
+            and fact.get("affected_date_count") == 0
+            and fact.get("affected_dates") == []
+            and status == "needs_review"
+            and reason_code == "daily_audit_no_matching_issue"
+            and retryable is False
+            and fact.get("action") == "operator_manual_review",
+            "Quality daily fact reconciliation evidence/action is invalid",
+        )
+        return {
+            "mode": mode,
+            "issue_count": 0,
+            "status_counts": {},
+            "reason_counts": {},
+            "affected_dates": [],
+        }
+
+    require(
+        mode is None and not present_evidence_fields,
+        "Quality daily fact evidence/action mode is invalid",
+    )
+    pair = (status, reason_code)
+    allowed = (
+        DAILY_MATCHED_NO_ISSUE_OUTCOMES
+        if report_status == "matched"
+        else DAILY_FALLBACK_OUTCOMES
+    )
+    require(
+        pair in allowed,
+        "Quality daily fact lacks required published evidence/action",
+    )
+    try:
+        expected_action = canonical_quality_fact_action(
+            market_type,
+            "daily",
+            status,
+            reason_code,
+            retryable,
+            manual_review_present=False,
+        )
+    except ValueError as error:
+        raise ReleaseCheckError(
+            "Quality daily fact action outcome is invalid"
+        ) from error
+    require(
+        fact.get("action") == expected_action,
+        "Quality daily fact action is not canonical",
+    )
+    return {
+        "mode": None,
+        "issue_count": 0,
+        "status_counts": {},
+        "reason_counts": {},
+        "affected_dates": [],
+    }
+
+
 def validate_quality(
     payload: dict[str, Any],
     *,
@@ -346,6 +736,10 @@ def validate_quality(
     metadata = payload.get("metadata") or {}
     markets = payload.get("markets")
     expected_ids = {market_a, market_b}
+    daily_report = _validate_daily_quality_report(
+        metadata.get("daily_quality_report")
+    )
+    daily_evidence_rows: list[dict[str, Any]] = []
     require(payload.get("token_symbol") == token, "Quality returned wrong Token")
     require(metadata.get("scope") == "selected", "Quality did not honor selected scope")
     require(
@@ -376,93 +770,168 @@ def validate_quality(
         == expected_ids,
         "Quality returned the wrong market identities",
     )
-    require(
-        all(
-            row.get("token_symbol") == token
-            and isinstance(row.get("facts"), dict)
-            and row["facts"]
-            for row in markets
-        ),
-        "Quality returned an empty or wrong-Token fact set",
-    )
-    report = metadata.get("daily_quality_report")
-    require(
-        isinstance(report, dict)
-        and report.get("status")
-        in {
-            "matched",
-            "unavailable",
-            "ignored_invalid",
-            "ignored_identity_unavailable",
-            "ignored_identity_mismatch",
-        },
-        "Quality daily-audit status is invalid",
-    )
-    require(
-        report.get("evidence_mode")
-        in {"published_daily_audit", "catalog_window_inference"},
-        "Quality daily-audit evidence mode is invalid",
-    )
-    if report.get("status") == "matched":
+    for row in markets:
         require(
-            report.get("schema") == "fact_quality_report/v1"
-            and report.get("identity_status") == "matched_current_import",
-            "Quality daily audit lacks a verified current publication identity",
+            isinstance(row, dict) and row.get("token_symbol") == token,
+            "Quality returned an empty or wrong-Token fact set",
         )
-    else:
+        quality_fields = {
+            field for field in SELECTED_QUALITY_MARKET_FIELDS if field in row
+        }
         require(
-            report.get("identity_status")
-            in {"not_verified", "unavailable", "mismatch"},
-            "Quality fallback has an invalid publication identity status",
+            quality_fields == SELECTED_QUALITY_MARKET_FIELDS,
+            "Quality selected quality contract has missing projection fields",
         )
-    issue_count = report.get("selected_window_issue_count")
-    reason_counts = report.get("reason_code_counts")
-    status_counts = report.get("status_counts")
-    affected_dates = report.get("affected_dates")
-    require(
-        type(issue_count) is int
-        and issue_count >= 0
-        and isinstance(reason_counts, dict)
-        and all(
-            isinstance(key, str)
-            and key
-            and isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 0
-            for key, value in reason_counts.items()
+        selected_status = row["quality_status"]
+        selected_flags = row["quality_flags"]
+        screening_status = row["screening_quality_status"]
+        screening_flags = row["screening_quality_flags"]
+        require(
+            selected_status in SCREENING_QUALITY_STATUSES
+            and isinstance(selected_flags, list)
+            and (selected_status == "ok" or bool(selected_flags)),
+            "Quality selected quality contract has an invalid selected projection",
         )
-        and sum(reason_counts.values()) == issue_count
-        and isinstance(status_counts, dict)
-        and all(
-            isinstance(key, str)
-            and key
-            and isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 0
-            for key, value in status_counts.items()
+        require(
+            screening_status in SCREENING_QUALITY_STATUSES
+            and isinstance(screening_flags, list)
+            and (screening_status == "ok" or bool(screening_flags)),
+            "Quality selected quality contract has an invalid screening projection",
         )
-        and sum(status_counts.values()) == issue_count,
-        "Quality daily-audit reason/status counts are inconsistent",
-    )
-    require(
-        isinstance(affected_dates, list)
-        and all(_is_canonical_date(value) for value in affected_dates)
-        and affected_dates == sorted(set(affected_dates))
-        and type(report.get("affected_date_count")) is int
-        and report["affected_date_count"] == len(affected_dates),
-        "Quality daily-audit affected dates are inconsistent",
-    )
-    for market in markets:
-        daily = market["facts"].get("daily") or {}
-        if daily.get("retryable"):
-            require(
-                daily.get("action")
-                in {
-                    "operator_review_retry_queue",
-                    "operator_review_retry_and_manual_queues",
-                },
-                "Public quality retryable daily fact lacks an operator-only action",
+        normalized_selected_flags = [
+            _validate_selected_quality_flag(flag)
+            for flag in selected_flags
+        ]
+        normalized_screening_flags = [
+            _validate_screening_flag(flag)
+            for flag in screening_flags
+        ]
+        require(
+            selected_status == _quality_status_from_flags(
+                normalized_selected_flags
             )
+            and screening_status == _quality_status_from_flags(
+                normalized_screening_flags
+            ),
+            "Quality status does not match its data-health flags",
+        )
+
+        facts = row.get("facts")
+        market_type = row.get("market_type")
+        require(
+            market_type in {"cex", "dex"},
+            "Quality selected market type is invalid",
+        )
+        require(
+            isinstance(row.get("market_id"), str)
+            and row["market_id"].startswith("{}:".format(market_type)),
+            "Quality market identity/type is inconsistent",
+        )
+        require(
+            isinstance(facts, dict) and set(facts) == QUALITY_FACT_NAMES,
+            "Quality selected quality contract has missing or unknown fact families",
+        )
+        fact_flags_by_code: dict[str, dict[str, Any]] = {}
+        for fact_name in QUALITY_FACT_NAMES:
+            fact = facts[fact_name]
+            status = fact.get("status") if isinstance(fact, dict) else None
+            reason_code = fact.get("reason_code") if isinstance(fact, dict) else None
+            action = fact.get("action") if isinstance(fact, dict) else None
+            fact_flags = fact.get("quality_flags") if isinstance(fact, dict) else None
+            require(
+                isinstance(fact, dict)
+                and isinstance(status, str)
+                and 0 < len(status) <= 64
+                and SCREENING_QUALITY_CODE_PATTERN.fullmatch(status) is not None
+                and "reason_code" in fact
+                and (
+                    reason_code is None
+                    or (
+                        isinstance(reason_code, str)
+                        and 0 < len(reason_code) <= 64
+                        and SCREENING_QUALITY_CODE_PATTERN.fullmatch(reason_code)
+                        is not None
+                    )
+                )
+                and type(fact.get("retryable")) is bool
+                and "action" in fact
+                and (action is None or isinstance(action, str))
+                and isinstance(fact_flags, list),
+                "Quality selected quality contract has an invalid fact projection",
+            )
+            for flag in fact_flags:
+                normalized_flag = _validate_selected_quality_flag(flag)
+                prior = fact_flags_by_code.get(normalized_flag["code"])
+                require(
+                    prior is None or prior == normalized_flag,
+                    "Quality facts contain conflicting flag projections",
+                )
+                fact_flags_by_code[normalized_flag["code"]] = normalized_flag
+            rule = canonical_quality_fact_rule(
+                market_type,
+                fact_name,
+                status,
+                reason_code,
+            )
+            require(
+                rule is not None
+                and fact["retryable"] is rule.retryable,
+                "Quality fact does not use a canonical outcome/action tuple",
+            )
+            if fact_name == "daily":
+                daily_evidence_rows.append(
+                    _validate_daily_fact_evidence(
+                        fact,
+                        market_type=market_type,
+                        report_status=daily_report["status"],
+                    )
+                )
+                expected_action = fact.get("action")
+            else:
+                expected_action = canonical_quality_fact_action(
+                    market_type,
+                    fact_name,
+                    status,
+                    reason_code,
+                    fact["retryable"],
+                )
+            require(
+                action == expected_action,
+                "Quality fact does not use a canonical outcome/action tuple",
+            )
+        selected_flags_by_code: dict[str, dict[str, Any]] = {}
+        for normalized_flag in normalized_selected_flags:
+            code = normalized_flag["code"]
+            require(
+                code not in selected_flags_by_code,
+                "Quality selected flags contain duplicate codes",
+            )
+            selected_flags_by_code[code] = normalized_flag
+        require(
+            selected_flags_by_code == fact_flags_by_code,
+            "Quality selected flags differ from the fact flag projection",
+        )
+    published_status_counts: Counter[str] = Counter()
+    published_reason_counts: Counter[str] = Counter()
+    published_affected_dates: set[str] = set()
+    published_issue_count = 0
+    for evidence in daily_evidence_rows:
+        if evidence["mode"] != "published_daily_audit":
+            continue
+        published_issue_count += evidence["issue_count"]
+        published_status_counts.update(evidence["status_counts"])
+        published_reason_counts.update(evidence["reason_counts"])
+        published_affected_dates.update(evidence["affected_dates"])
+    require(
+        published_issue_count == daily_report["issue_count"]
+        and dict(sorted(published_status_counts.items()))
+        == daily_report["status_counts"]
+        and dict(sorted(published_reason_counts.items()))
+        == daily_report["reason_counts"]
+        and sorted(published_affected_dates)
+        == daily_report["affected_dates"],
+        "Quality daily fact evidence/action does not reconcile to the report",
+    )
 
 
 def _normalized_summary_counts(
@@ -496,6 +965,19 @@ def _is_canonical_date(value: Any) -> bool:
     except ValueError:
         return False
     return parsed.strftime("%Y-%m-%d") == value
+
+
+def _quality_status_from_flags(flags: list[dict[str, Any]]) -> str:
+    data_health = [
+        flag for flag in flags if flag.get("category") == "data_health"
+    ]
+    if any(flag.get("severity") == "critical" for flag in data_health):
+        return "critical"
+    if any(flag.get("severity") == "warning" for flag in data_health):
+        return "warning"
+    if data_health:
+        return "info"
+    return "ok"
 
 
 def _validate_screening_flag(flag: Any) -> dict[str, str]:
@@ -552,6 +1034,41 @@ def _validate_screening_flag(flag: Any) -> dict[str, str]:
         "category": category,
         "message": message,
     }
+
+
+def _validate_selected_quality_flag(flag: Any) -> dict[str, Any]:
+    """Validate the richer selected-window flag without trusting public text."""
+    require(isinstance(flag, dict), "Quality selected quality contract flag is invalid")
+    require(
+        set(flag) == SELECTED_QUALITY_FLAG_FIELDS,
+        "Quality selected quality contract flag has missing or unknown fields",
+    )
+    code = flag["code"]
+    severity = flag["severity"]
+    category = flag["category"]
+    message = flag["message"]
+    require(
+        isinstance(code, str)
+        and len(code) <= 64
+        and SCREENING_QUALITY_CODE_PATTERN.fullmatch(code) is not None
+        and severity in SCREENING_QUALITY_SEVERITIES
+        and category in SELECTED_QUALITY_CATEGORIES
+        and isinstance(message, str)
+        and message == message.strip()
+        and 0 < len(message) <= 240,
+        "Quality selected quality contract flag is invalid",
+    )
+    require(
+        not any(
+            unicodedata.category(character) in {"Cc", "Cf"}
+            for character in message
+        )
+        and RAW_URL_PATTERN.search(message) is None
+        and ABSOLUTE_POSIX_PATH_PATTERN.search(message) is None
+        and "\\" not in message,
+        "Quality selected quality contract flag exposes protected text",
+    )
+    return flag
 
 
 def validate_screening_quality_parity(
@@ -697,7 +1214,13 @@ def validate_execution(
     token: str,
     market_a: str,
     market_b: str,
+    expected_generation: str,
 ) -> None:
+    metadata = payload.get("metadata") or {}
+    require(
+        metadata.get("data_generation") == expected_generation,
+        "Summary and Execution generations differ",
+    )
     require(payload.get("token_symbol") == token, "Execution returned wrong Token")
     expected_scenarios = {
         (direction, notional)
@@ -1106,6 +1629,11 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         raw_max=args.token_raw_max,
         gzip_max=args.token_gzip_max,
     )
+    token_catalog_market_ids = {
+        str(market["market_id"])
+        for market in markets
+        if isinstance(market, dict)
+    }
 
     full_catalog, full_metrics = fetch_json(
         args.base_url,
@@ -1113,6 +1641,12 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         timeout=args.timeout,
     )
     metrics.append(full_metrics)
+    full_catalog_metadata = full_catalog.get("metadata")
+    require(
+        isinstance(full_catalog_metadata, dict)
+        and full_catalog_metadata.get("data_generation") == generation,
+        "Summary and full catalog generation differ",
+    )
     full_markets = full_catalog.get("markets")
     require(isinstance(full_markets, list), "Full audit catalog has no markets array")
     full_catalog_tokens: set[str] = set()
@@ -1157,6 +1691,15 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
     require(
         audited_market_pairs == full_market_pairs,
         "Screening Quality exact market inventory differs from the full catalog",
+    )
+    require(
+        token_catalog_market_ids
+        == {
+            market_id
+            for market_token, market_id in full_market_pairs
+            if market_token == token
+        },
+        "Token catalog inventory differs from the full audit catalog",
     )
 
     all_events, events_metrics = fetch_json(
@@ -1287,6 +1830,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         market_b=market_b,
         start=start,
         end=end,
+        expected_generation=generation,
     )
 
     quality, quality_metrics = fetch_json(
@@ -1314,6 +1858,19 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         token=token,
         market_a=market_a,
         market_b=market_b,
+        expected_generation=generation,
+    )
+
+    final_summary, final_summary_metrics = fetch_json(
+        args.base_url,
+        "/api/markets/summary",
+        timeout=args.timeout,
+    )
+    metrics.append(final_summary_metrics)
+    final_summary_metadata = final_summary.get("metadata") or {}
+    require(
+        final_summary_metadata.get("data_generation") == generation,
+        "Published data generation changed during release validation",
     )
 
     return {

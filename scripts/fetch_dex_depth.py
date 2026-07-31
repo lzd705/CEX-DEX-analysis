@@ -47,6 +47,12 @@ except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
 try:
+    from scripts.atomic_publication import atomic_replace_bundle, csv_payload
+    from scripts.bounded_snapshot_merge import (
+        merge_exact_market_snapshot,
+        require_aligned_depth_execution_lineage,
+        validate_exact_publication_scope,
+    )
     from scripts.execution_cost import (
         EXECUTION_COST_COLUMNS,
         EXECUTION_DIRECTIONS,
@@ -57,12 +63,24 @@ try:
         validate_execution_snapshot,
     )
     from scripts.publication_gate import (
+        CoverageRegressionError,
         bind_passing_coverage_report,
         enforce_publication_coverage,
         enforce_publication_coverage_bundle,
+        publication_rows_sha256,
         validate_passing_coverage_report,
     )
+    from scripts.quality_outcomes import (
+        normalize_dex_depth_source_outcome,
+        quality_outcome_resolution_state,
+    )
 except ModuleNotFoundError:
+    from atomic_publication import atomic_replace_bundle, csv_payload
+    from bounded_snapshot_merge import (
+        merge_exact_market_snapshot,
+        require_aligned_depth_execution_lineage,
+        validate_exact_publication_scope,
+    )
     from execution_cost import (
         EXECUTION_COST_COLUMNS,
         EXECUTION_DIRECTIONS,
@@ -73,10 +91,16 @@ except ModuleNotFoundError:
         validate_execution_snapshot,
     )
     from publication_gate import (
+        CoverageRegressionError,
         bind_passing_coverage_report,
         enforce_publication_coverage,
         enforce_publication_coverage_bundle,
+        publication_rows_sha256,
         validate_passing_coverage_report,
+    )
+    from quality_outcomes import (
+        normalize_dex_depth_source_outcome,
+        quality_outcome_resolution_state,
     )
 
 
@@ -110,6 +134,22 @@ EXECUTION_COVERAGE_POLICY = {
     **DEPTH_COVERAGE_POLICY,
     "thresholds": {
         **DEPTH_COVERAGE_POLICY["thresholds"],
+        "allow_no_eligible_candidate": True,
+    },
+}
+EXACT_DEPTH_COVERAGE_POLICY = {
+    **DEPTH_COVERAGE_POLICY,
+    "thresholds": {
+        **DEPTH_COVERAGE_POLICY["thresholds"],
+        "allow_no_eligible_candidate": True,
+        "minimum_candidate_usable_bps": 0,
+        "minimum_baseline_retention_bps": 10_000,
+    },
+}
+EXACT_EXECUTION_COVERAGE_POLICY = {
+    **EXACT_DEPTH_COVERAGE_POLICY,
+    "thresholds": {
+        **EXACT_DEPTH_COVERAGE_POLICY["thresholds"],
         "allow_no_eligible_candidate": True,
     },
 }
@@ -1704,6 +1744,7 @@ def collect_dex_depth_with_execution(
     raw_root: Path = DEFAULT_RAW_ROOT,
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
     rpc_factory: Callable[[str, str], RpcClient] = RpcClient,
+    allow_terminal_only: bool = False,
 ) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
     from datetime import datetime, timezone
 
@@ -1913,7 +1954,11 @@ def collect_dex_depth_with_execution(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    validate_snapshot(pools, rows)
+    validate_snapshot(
+        pools,
+        rows,
+        allow_terminal_only=allow_terminal_only,
+    )
     validate_execution_snapshot(
         [dex_market_id(pool) for pool in pools],
         execution_rows,
@@ -1928,6 +1973,7 @@ def collect_dex_depth(
     raw_root: Path = DEFAULT_RAW_ROOT,
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
     rpc_factory: Callable[[str, str], RpcClient] = RpcClient,
+    allow_terminal_only: bool = False,
 ) -> tuple[str, list[dict[str, str]]]:
     """Backward-compatible depth-only return shape."""
     snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
@@ -1935,6 +1981,7 @@ def collect_dex_depth(
         raw_root=raw_root,
         sleep_seconds=sleep_seconds,
         rpc_factory=rpc_factory,
+        allow_terminal_only=allow_terminal_only,
     )
     return snapshot_id, rows
 
@@ -1942,6 +1989,9 @@ def collect_dex_depth(
 def validate_snapshot(
     inventory: list[dict[str, str]],
     rows: list[dict[str, str]],
+    *,
+    allow_terminal_only: bool = False,
+    allow_no_observed: bool = False,
 ) -> None:
     expected = {
         (row["token_symbol"].upper(), *pool_key(row["chain"], row["pool_address"]))
@@ -1958,8 +2008,36 @@ def validate_snapshot(
     accepted = {"observed", "partial", "unsupported", "failed"}
     if any(row["status"] not in accepted for row in rows):
         raise ValueError("DEX depth snapshot contains an invalid status")
-    if not any(row["status"] in {"observed", "partial"} for row in rows):
-        raise ValueError("DEX depth snapshot contains no measured pools")
+    if allow_terminal_only and any(
+        quality_outcome_resolution_state(
+            *normalize_dex_depth_source_outcome(
+                row.get("status"),
+                error=row.get("error"),
+            )
+        ) not in {"observed", "confirmed_terminal_absence"}
+        for row in rows
+    ):
+        raise ValueError(
+            "DEX refresh is not a terminal non-retryable or resolved exact candidate"
+        )
+    if (
+        not allow_no_observed
+        and not any(row["status"] in {"observed", "partial"} for row in rows)
+    ):
+        if not allow_terminal_only:
+            raise ValueError("DEX depth snapshot contains no measured pools")
+        if any(
+            quality_outcome_resolution_state(
+                *normalize_dex_depth_source_outcome(
+                    row.get("status"),
+                    error=row.get("error"),
+                )
+            ) != "confirmed_terminal_absence"
+            for row in rows
+        ):
+            raise ValueError(
+                "DEX exact candidate is not a terminal non-retryable outcome"
+            )
     for row in rows:
         if row["status"] not in {"observed", "partial"}:
             continue
@@ -1980,6 +2058,62 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
         return []
     with path.open("r", newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def merge_exact_publication_bundle(
+    depth_rows: list[dict[str, str]],
+    execution_rows: list[dict[str, str]],
+    *,
+    target_market_id: str,
+    publish_dir: Path,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Merge one collected DEX pool into the validated full publication."""
+    baseline_depth = read_csv_rows(publish_dir / LATEST_FILENAME)
+    baseline_execution = read_csv_rows(
+        publish_dir / EXECUTION_LATEST_FILENAME
+    )
+    require_aligned_depth_execution_lineage(
+        baseline_depth,
+        baseline_execution,
+    )
+    require_aligned_depth_execution_lineage(depth_rows, execution_rows)
+    merged_depth = merge_exact_market_snapshot(
+        baseline_depth,
+        depth_rows,
+        target_market_id=target_market_id,
+        market_id_for_row=dex_market_id,
+        row_identity=dex_market_id,
+    )
+    merged_execution = merge_exact_market_snapshot(
+        baseline_execution,
+        execution_rows,
+        target_market_id=target_market_id,
+        market_id_for_row=lambda row: str(row.get("market_id") or ""),
+        row_identity=lambda row: (
+            str(row.get("market_id") or ""),
+            str(row.get("direction") or ""),
+            str(row.get("requested_notional_usd") or ""),
+        ),
+        rebind_source_snapshot_id=True,
+    )
+    if {row["snapshot_id"] for row in merged_depth} != {
+        row["snapshot_id"] for row in merged_execution
+    }:
+        raise ValueError(
+            "bounded DEX depth and execution publications are not coherent"
+        )
+    validate_snapshot(
+        baseline_depth,
+        merged_depth,
+        allow_no_observed=True,
+    )
+    expected_market_ids = {dex_market_id(row) for row in baseline_depth}
+    validate_execution_snapshot(
+        expected_market_ids,
+        merged_execution,
+        enforce_usd_price_timing=True,
+    )
+    return merged_depth, merged_execution
 
 
 def normalized_depth_gate_rows(
@@ -2089,12 +2223,178 @@ def execution_publication_coverage_gate(
     )
 
 
+def exact_depth_publication_coverage_gate(
+    rows: list[dict[str, str]],
+    publish_dir: Path,
+    *,
+    target_market_id: str,
+) -> dict[str, Any]:
+    latest_path = publish_dir / LATEST_FILENAME
+    baseline_rows = read_csv_rows(latest_path)
+    scope = validate_exact_publication_scope(
+        baseline_rows,
+        rows,
+        target_market_id=target_market_id,
+        market_id_for_row=dex_market_id,
+        row_identity=dex_market_id,
+    )
+    report = enforce_publication_coverage(
+        normalized_depth_gate_rows(rows),
+        normalized_depth_gate_rows(baseline_rows),
+        fact_family="dex_depth",
+        identity=lambda row: (
+            row.get("token_symbol", "").strip().upper(),
+            *pool_key(
+                row.get("chain", ""),
+                row.get("pool_address", ""),
+            ),
+        ),
+        usable_statuses={"observed", "partial"},
+        excluded_statuses={"unsupported"},
+        valid_statuses={"observed", "partial", "unsupported", "failed"},
+        allow_no_eligible_candidate=True,
+        minimum_candidate_usable_bps=0,
+        minimum_baseline_retention_bps=10_000,
+    )
+    target_rows = [
+        row for row in rows if dex_market_id(row) == target_market_id
+    ]
+    normalized_target_rows = normalized_depth_gate_rows(target_rows)
+    resolutions = {
+        quality_outcome_resolution_state(
+            *normalize_dex_depth_source_outcome(
+                row.get("status"),
+                error=row.get("error"),
+            )
+        )
+        for row in normalized_target_rows
+    }
+    report["candidate"]["identity_row_sha256"] = publication_rows_sha256(
+        rows,
+        identity=lambda row: (
+            row.get("token_symbol", "").strip().upper(),
+            *pool_key(
+                row.get("chain", ""),
+                row.get("pool_address", ""),
+            ),
+        ),
+    )
+    report.update(
+        {
+            "mode": "exact_target_recovery/v1",
+            "exact_target": {**scope, "resolutions": sorted(resolutions)},
+        }
+    )
+    if not target_rows or not resolutions.issubset(
+        {"observed", "confirmed_terminal_absence"}
+    ):
+        report["status"] = "rejected"
+        report["passed"] = False
+        report["reasons"] = list(
+            dict.fromkeys(
+                list(report.get("reasons") or [])
+                + ["exact_target_unresolved"]
+            )
+        )
+        raise CoverageRegressionError(report)
+    return bind_passing_coverage_report(
+        report,
+        fact_family="dex_depth",
+        baseline_path=latest_path,
+    )
+
+
+def exact_execution_publication_coverage_gate(
+    rows: list[dict[str, str]],
+    publish_dir: Path,
+    *,
+    target_market_id: str,
+) -> dict[str, Any]:
+    latest_path = publish_dir / EXECUTION_LATEST_FILENAME
+    baseline_rows = read_csv_rows(latest_path)
+    scope = validate_exact_publication_scope(
+        baseline_rows,
+        rows,
+        target_market_id=target_market_id,
+        market_id_for_row=lambda row: str(row.get("market_id") or ""),
+        row_identity=lambda row: (
+            str(row.get("market_id") or ""),
+            str(row.get("direction") or ""),
+            str(row.get("requested_notional_usd") or ""),
+        ),
+        rebound_fields=("snapshot_id", "source_snapshot_id"),
+    )
+    report = enforce_publication_coverage(
+        normalized_execution_gate_rows(rows),
+        normalized_execution_gate_rows(baseline_rows),
+        fact_family="dex_execution_cost",
+        identity=lambda row: (
+            row.get("market_id", "").strip(),
+            row.get("direction", "").strip(),
+            row.get("requested_notional_usd", "").strip(),
+        ),
+        usable_statuses={"observed", "partial"},
+        excluded_statuses={"unsupported"},
+        valid_statuses={"observed", "partial", "unsupported", "failed"},
+        allow_no_eligible_candidate=True,
+        minimum_candidate_usable_bps=0,
+        minimum_baseline_retention_bps=10_000,
+    )
+    report["candidate"]["identity_row_sha256"] = publication_rows_sha256(
+        rows,
+        identity=lambda row: (
+            row.get("market_id", "").strip(),
+            row.get("direction", "").strip(),
+            row.get("requested_notional_usd", "").strip(),
+        ),
+    )
+    report.update(
+        {
+            "mode": "exact_target_recovery/v1",
+            "exact_target": scope,
+        }
+    )
+    return bind_passing_coverage_report(
+        report,
+        fact_family="dex_execution_cost",
+        baseline_path=latest_path,
+    )
+
+
 def preflight_publication_bundle(
     depth_rows: list[dict[str, str]],
     execution_rows: list[dict[str, str]],
     publish_dir: Path,
+    *,
+    target_market_id: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Reject either coverage regression before writing either latest view."""
+    require_aligned_depth_execution_lineage(depth_rows, execution_rows)
+    if target_market_id is not None:
+        target = str(target_market_id).strip()
+        if not target:
+            raise ValueError("exact target market identity is empty")
+        return enforce_publication_coverage_bundle(
+            (
+                (
+                    "dex_depth",
+                    lambda: exact_depth_publication_coverage_gate(
+                        depth_rows,
+                        publish_dir,
+                        target_market_id=target,
+                    ),
+                ),
+                (
+                    "dex_execution_cost",
+                    lambda: exact_execution_publication_coverage_gate(
+                        execution_rows,
+                        publish_dir,
+                        target_market_id=target,
+                    ),
+                ),
+            ),
+            bundle="dex_depth_execution_exact",
+        )
     return enforce_publication_coverage_bundle(
         (
             (
@@ -2165,6 +2465,7 @@ def publish_snapshot(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     publish_dir: Path | None = None,
     preflight_report: dict[str, Any] | None = None,
+    history_rows_to_append: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     current_path = output_dir / CURRENT_FILENAME
@@ -2201,7 +2502,9 @@ def publish_snapshot(
         ): row
         for row in read_csv_rows(history_path)
     }
-    for row in rows:
+    for row in (
+        rows if history_rows_to_append is None else history_rows_to_append
+    ):
         merged[
             (
                 row["snapshot_id"],
@@ -2289,6 +2592,148 @@ def publish_execution_snapshot(
     return result
 
 
+def publish_exact_publication_bundle(
+    depth_rows: list[dict[str, str]],
+    execution_rows: list[dict[str, str]],
+    *,
+    target_market_id: str,
+    history_rows_to_append: list[dict[str, str]],
+    output_dir: Path,
+    publish_dir: Path,
+    preflight_reports: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Failure-atomically publish one bounded DEX depth/execution merge."""
+    require_aligned_depth_execution_lineage(depth_rows, execution_rows)
+    expected_market_ids = {
+        str(row.get("market_id") or "") for row in execution_rows
+    }
+    validate_execution_snapshot(
+        expected_market_ids,
+        execution_rows,
+        enforce_usd_price_timing=True,
+    )
+    depth_gate = validate_passing_coverage_report(
+        preflight_reports.get("dex_depth"),
+        fact_family="dex_depth",
+        candidate_rows=depth_rows,
+        identity=lambda row: (
+            row.get("token_symbol", "").strip().upper(),
+            *pool_key(
+                row.get("chain", ""),
+                row.get("pool_address", ""),
+            ),
+        ),
+        baseline_path=publish_dir / LATEST_FILENAME,
+        expected_policy=EXACT_DEPTH_COVERAGE_POLICY,
+    )
+    execution_gate = validate_passing_coverage_report(
+        preflight_reports.get("dex_execution_cost"),
+        fact_family="dex_execution_cost",
+        candidate_rows=execution_rows,
+        identity=lambda row: (
+            row.get("market_id", "").strip(),
+            row.get("direction", "").strip(),
+            row.get("requested_notional_usd", "").strip(),
+        ),
+        baseline_path=publish_dir / EXECUTION_LATEST_FILENAME,
+        expected_policy=EXACT_EXECUTION_COVERAGE_POLICY,
+    )
+    target = str(target_market_id or "").strip()
+    for report in (depth_gate, execution_gate):
+        exact_target = report.get("exact_target")
+        if (
+            report.get("mode") != "exact_target_recovery/v1"
+            or not isinstance(exact_target, dict)
+            or exact_target.get("market_id") != target
+        ):
+            raise ValueError("exact preflight report does not match target")
+    if (
+        depth_gate["exact_target"]["candidate_snapshot_id"]
+        != execution_gate["exact_target"]["candidate_snapshot_id"]
+    ):
+        raise ValueError("exact preflight reports do not share one generation")
+    published_target_rows = [
+        row for row in depth_rows if dex_market_id(row) == target
+    ]
+    if (
+        len(history_rows_to_append) != 1
+        or len(published_target_rows) != 1
+        or dex_market_id(history_rows_to_append[0]) != target
+        or str(history_rows_to_append[0].get("snapshot_id") or "")
+        != depth_gate["exact_target"]["candidate_snapshot_id"]
+        or history_rows_to_append[0] != published_target_rows[0]
+    ):
+        raise ValueError("exact history append does not match target publication")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    current_path = output_dir / CURRENT_FILENAME
+    execution_current_path = output_dir / EXECUTION_CURRENT_FILENAME
+    atomic_write_csv(current_path, depth_rows)
+    atomic_write_execution_csv(execution_current_path, execution_rows)
+
+    history_path = publish_dir / HISTORY_FILENAME
+    merged_history = {
+        (
+            row.get("snapshot_id", ""),
+            row.get("token_symbol", ""),
+            *pool_key(row.get("chain", ""), row.get("pool_address", "")),
+        ): row
+        for row in read_csv_rows(history_path)
+    }
+    for row in history_rows_to_append:
+        merged_history[
+            (
+                row["snapshot_id"],
+                row["token_symbol"],
+                *pool_key(row["chain"], row["pool_address"]),
+            )
+        ] = row
+    history_rows = sorted(
+        merged_history.values(),
+        key=lambda row: (
+            row.get("observed_at", ""),
+            row.get("token_symbol", ""),
+            row.get("chain", ""),
+            row.get("pool_address", ""),
+        ),
+    )
+    atomic_replace_bundle(
+        (
+            (history_path, csv_payload(DEX_DEPTH_COLUMNS, history_rows)),
+            (
+                publish_dir / LATEST_FILENAME,
+                csv_payload(DEX_DEPTH_COLUMNS, depth_rows),
+            ),
+            (
+                publish_dir / CURRENT_FILENAME,
+                csv_payload(DEX_DEPTH_COLUMNS, depth_rows),
+            ),
+            (
+                publish_dir / EXECUTION_LATEST_FILENAME,
+                csv_payload(EXECUTION_COST_COLUMNS, execution_rows),
+            ),
+        )
+    )
+    return (
+        {
+            "current_path": str(current_path),
+            "row_count": len(depth_rows),
+            "latest_path": str(publish_dir / LATEST_FILENAME),
+            "history_path": str(history_path),
+            "history_row_count": len(history_rows),
+            "publication_gate": depth_gate,
+        },
+        {
+            "execution_current_path": str(execution_current_path),
+            "execution_row_count": len(execution_rows),
+            "execution_latest_path": str(
+                publish_dir / EXECUTION_LATEST_FILENAME
+            ),
+            "publication_gate": execution_gate,
+        },
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect fixed-block DEX pool-state depth"
@@ -2305,6 +2750,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sleep-seconds", type=float, default=REQUEST_SLEEP_SECONDS)
     parser.add_argument("--tokens", help="Comma-separated token symbols")
     parser.add_argument("--chains", help="Comma-separated chain names")
+    parser.add_argument(
+        "--market-id",
+        help="One canonical DEX market identity for bounded collection",
+    )
+    parser.add_argument(
+        "--merge-publish",
+        action="store_true",
+        help="Merge one exact pool into an existing full publication",
+    )
     return parser.parse_args()
 
 
@@ -2330,16 +2784,30 @@ def main() -> None:
     pools = load_pool_inventory(args.tvl_csv)
     tokens = parse_filter(args.tokens, upper=True)
     chains = parse_filter(args.chains, upper=False)
+    market_id = str(args.market_id or "").strip()
     publish_dir = (
         args.publish_dir
         if args.publish_dir is not None
         else DEFAULT_PUBLISH_DIR if args.publish_local else None
     )
-    ensure_full_publish_scope(publish_dir is not None, tokens, chains)
+    if market_id and (tokens or chains):
+        raise ValueError("--market-id cannot be combined with other filters")
+    if args.merge_publish and (publish_dir is None or not market_id):
+        raise ValueError(
+            "--merge-publish requires --publish-dir and --market-id"
+        )
+    if publish_dir is not None and market_id and not args.merge_publish:
+        raise ValueError(
+            "filtered publication requires explicit --merge-publish"
+        )
+    if not args.merge_publish:
+        ensure_full_publish_scope(publish_dir is not None, tokens, chains)
     if tokens:
         pools = [row for row in pools if row["token_symbol"].upper() in tokens]
     if chains:
         pools = [row for row in pools if row["chain"].lower() in chains]
+    if market_id:
+        pools = [row for row in pools if dex_market_id(row) == market_id]
     if not pools:
         raise ValueError("No DEX pools match the requested filters")
 
@@ -2347,25 +2815,56 @@ def main() -> None:
         pools,
         raw_root=args.raw_root,
         sleep_seconds=max(0.0, args.sleep_seconds),
+        allow_terminal_only=args.merge_publish,
     )
+    collected_rows = rows
+    collected_execution_rows = execution_rows
+    if args.merge_publish:
+        assert publish_dir is not None
+        rows, execution_rows = merge_exact_publication_bundle(
+            rows,
+            execution_rows,
+            target_market_id=market_id,
+            publish_dir=publish_dir,
+        )
     publication_gates = (
-        preflight_publication_bundle(rows, execution_rows, publish_dir)
+        preflight_publication_bundle(
+            rows,
+            execution_rows,
+            publish_dir,
+            target_market_id=market_id if args.merge_publish else None,
+        )
         if publish_dir is not None
         else {}
     )
-    result = publish_snapshot(
-        rows,
-        output_dir=args.output_dir,
-        publish_dir=publish_dir,
-        preflight_report=publication_gates.get("dex_depth"),
-    )
-    execution_result = publish_execution_snapshot(
-        execution_rows,
-        expected_market_ids=[dex_market_id(pool) for pool in pools],
-        output_dir=args.output_dir,
-        publish_dir=publish_dir,
-        preflight_report=publication_gates.get("dex_execution_cost"),
-    )
+    if args.merge_publish:
+        assert publish_dir is not None
+        result, execution_result = publish_exact_publication_bundle(
+            rows,
+            execution_rows,
+            target_market_id=market_id,
+            history_rows_to_append=collected_rows,
+            output_dir=args.output_dir,
+            publish_dir=publish_dir,
+            preflight_reports=publication_gates,
+        )
+    else:
+        result = publish_snapshot(
+            rows,
+            output_dir=args.output_dir,
+            publish_dir=publish_dir,
+            preflight_report=publication_gates.get("dex_depth"),
+        )
+        execution_result = publish_execution_snapshot(
+            execution_rows,
+            expected_market_ids={
+                str(row.get("market_id") or "")
+                for row in execution_rows
+            },
+            output_dir=args.output_dir,
+            publish_dir=publish_dir,
+            preflight_report=publication_gates.get("dex_execution_cost"),
+        )
     depth_gate = result.pop("publication_gate", None)
     execution_gate = execution_result.pop("publication_gate", None)
     result.update(execution_result)
@@ -2375,6 +2874,10 @@ def main() -> None:
             "snapshot_id": snapshot_id,
             "token_count": len({row["token_symbol"] for row in rows}),
             "pool_count": len(rows),
+            "collected_pool_count": len(collected_rows),
+            "collected_execution_row_count": len(
+                collected_execution_rows
+            ),
             "status_counts": dict(counts),
             "execution_status_counts": execution_status_counts(
                 execution_rows

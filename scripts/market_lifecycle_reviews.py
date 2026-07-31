@@ -9,6 +9,7 @@ future missing candle.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import re
@@ -20,6 +21,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REVIEW_PATH = PROJECT_ROOT / "data/curated/market_lifecycle_reviews.json"
+TOKEN_CHAIN_CONFIG_PATH = PROJECT_ROOT / "config/token_chains.csv"
 REVIEW_SCHEMA = "market_lifecycle_reviews/v1"
 MAX_REVIEW_BYTES = 512 * 1024
 MAX_REVISION_COUNT = 1_000
@@ -105,6 +107,12 @@ IMMUTABLE_REVISION_FIELDS = (
     "market_type",
     "token_symbol",
     "issue_date",
+)
+TOKEN_CHAIN_CONFIG_FIELDS = (
+    "token_symbol",
+    "chain",
+    "contract_address",
+    "notes",
 )
 
 
@@ -205,6 +213,83 @@ def _normalized_evm_address(value: Any, *, field: str) -> str:
     if not isinstance(value, str) or not EVM_ADDRESS_PATTERN.fullmatch(value):
         raise LifecycleReviewError("{} is not an EVM pool address".format(field))
     return value.lower()
+
+
+def _trusted_token_contracts(path: Path) -> Dict[Tuple[str, str], str]:
+    try:
+        with Path(path).expanduser().resolve().open(
+            "r",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            reader = csv.DictReader(handle)
+            if tuple(reader.fieldnames or ()) != TOKEN_CHAIN_CONFIG_FIELDS:
+                raise LifecycleReviewError(
+                    "Trusted Token contract configuration has invalid columns"
+                )
+            rows = list(reader)
+    except (OSError, TypeError, ValueError) as error:
+        if isinstance(error, LifecycleReviewError):
+            raise
+        raise LifecycleReviewError(
+            "Trusted Token contract configuration cannot be read"
+        ) from error
+
+    contracts: Dict[Tuple[str, str], str] = {}
+    for position, row in enumerate(rows, start=2):
+        field = "token_chains.csv row {}".format(position)
+        if set(row) != set(TOKEN_CHAIN_CONFIG_FIELDS):
+            raise LifecycleReviewError("{} has invalid columns".format(field))
+        token = _canonical_token(
+            row.get("token_symbol"),
+            field=field + ".token_symbol",
+        )
+        chain_value = row.get("chain")
+        if not isinstance(chain_value, str):
+            raise LifecycleReviewError("{}.chain must be text".format(field))
+        chain = _canonical_lower_component(
+            chain_value,
+            field=field + ".chain",
+        )
+        contract = row.get("contract_address")
+        if (
+            not isinstance(contract, str)
+            or not contract
+            or contract != contract.strip()
+            or len(contract) > 128
+        ):
+            raise LifecycleReviewError(
+                "{}.contract_address is invalid".format(field)
+            )
+        key = (token, chain)
+        if key in contracts:
+            raise LifecycleReviewError(
+                "Trusted Token contract configuration contains duplicates"
+            )
+        contracts[key] = contract
+    return contracts
+
+
+def _geckoterminal_evm_token_id(
+    value: Any,
+    *,
+    chain: str,
+    field: str,
+) -> str:
+    if not isinstance(value, str):
+        raise LifecycleReviewError(
+            "{} must be a GeckoTerminal Token id".format(field)
+        )
+    source_chain, separator, source_address = value.partition("_")
+    if not separator or source_chain != chain:
+        raise LifecycleReviewError(
+            "{} does not match the reviewed network".format(field)
+        )
+    address = _normalized_evm_address(source_address, field=field + ".address")
+    normalized = "{}_{}".format(chain, address)
+    if value != normalized:
+        raise LifecycleReviewError("{} is not canonical".format(field))
+    return normalized
 
 
 def _parse_market_identity(
@@ -507,7 +592,8 @@ def _validate_dex_evidence(
     identity: Mapping[str, str],
     issue_date: str,
     review_id: str,
-) -> None:
+    trusted_token_contracts: Mapping[Tuple[str, str], str],
+) -> bool:
     checks = _checks_by_kind(
         source_checks,
         review_id=review_id,
@@ -549,6 +635,56 @@ def _validate_dex_evidence(
                 review_id
             )
         )
+    has_base_token = "base_token_id" in pool_observations
+    has_quote_token = "quote_token_id" in pool_observations
+    if has_base_token != has_quote_token:
+        raise LifecycleReviewError(
+            "{} pool Token identity evidence is incomplete".format(review_id)
+        )
+    token_identity_bound = has_base_token and has_quote_token
+    if token_identity_bound:
+        base_token_id = _geckoterminal_evm_token_id(
+            pool_observations.get("base_token_id"),
+            chain=chain,
+            field=review_id + ".pool.base_token_id",
+        )
+        quote_token_id = _geckoterminal_evm_token_id(
+            pool_observations.get("quote_token_id"),
+            chain=chain,
+            field=review_id + ".pool.quote_token_id",
+        )
+        if base_token_id == quote_token_id:
+            raise LifecycleReviewError(
+                "{} pool base and quote Token identities are identical".format(
+                    review_id
+                )
+            )
+        trusted_contract = trusted_token_contracts.get(
+            (identity["token"], chain)
+        )
+        if trusted_contract is None:
+            raise LifecycleReviewError(
+                "{} has no trusted Token contract identity for its network".format(
+                    review_id
+                )
+            )
+        normalized_trusted_contract = _normalized_evm_address(
+            trusted_contract,
+            field=review_id + ".trusted_token_contract",
+        )
+        if trusted_contract != normalized_trusted_contract:
+            raise LifecycleReviewError(
+                "{} trusted Token contract identity is not canonical".format(
+                    review_id
+                )
+            )
+        trusted_token_id = "{}_{}".format(chain, normalized_trusted_contract)
+        if trusted_token_id not in {base_token_id, quote_token_id}:
+            raise LifecycleReviewError(
+                "{} pool evidence does not contain the reviewed Token".format(
+                    review_id
+                )
+            )
 
     ohlcv_check = checks[DEX_OHLCV_SOURCE]
     ohlcv_url = str(ohlcv_check["url"])
@@ -616,9 +752,14 @@ def _validate_dex_evidence(
                 review_id
             )
         )
+    return bool(token_identity_bound)
 
 
-def _review_revision(value: Any) -> Dict[str, Any]:
+def _review_revision(
+    value: Any,
+    *,
+    trusted_token_contracts: Mapping[Tuple[str, str], str],
+) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise LifecycleReviewError("Lifecycle review revision must be an object")
     _require_exact_keys(value, REVISION_FIELDS, field="Lifecycle review revision")
@@ -838,6 +979,7 @@ def _review_revision(value: Any) -> Dict[str, Any]:
                 "{} contains evidence checked after review".format(review_id)
             )
 
+    dex_token_identity_bound = True
     if market_type == "cex":
         _validate_upbit_evidence(
             source_checks,
@@ -846,11 +988,12 @@ def _review_revision(value: Any) -> Dict[str, Any]:
             review_id=review_id,
         )
     else:
-        _validate_dex_evidence(
+        dex_token_identity_bound = _validate_dex_evidence(
             source_checks,
             identity=market_identity,
             issue_date=issue_date,
             review_id=review_id,
+            trusted_token_contracts=trusted_token_contracts,
         )
 
     return {
@@ -882,11 +1025,14 @@ def _review_revision(value: Any) -> Dict[str, Any]:
             maximum=2_000,
         ),
         "source_checks": source_checks,
+        "_dex_token_identity_bound": dex_token_identity_bound,
     }
 
 
 def load_lifecycle_reviews(
     path: Optional[Path] = DEFAULT_REVIEW_PATH,
+    *,
+    token_chain_path: Path = TOKEN_CHAIN_CONFIG_PATH,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     if path is None:
         return [], {
@@ -943,7 +1089,19 @@ def load_lifecycle_reviews(
     ):
         raise LifecycleReviewError("Lifecycle review count is inconsistent")
 
-    revisions = [_review_revision(item) for item in raw_reviews]
+    trusted_token_contracts: Dict[Tuple[str, str], str] = {}
+    if any(
+        isinstance(item, dict) and item.get("market_type") == "dex"
+        for item in raw_reviews
+    ):
+        trusted_token_contracts = _trusted_token_contracts(token_chain_path)
+    revisions = [
+        _review_revision(
+            item,
+            trusted_token_contracts=trusted_token_contracts,
+        )
+        for item in raw_reviews
+    ]
     if any(
         _utc_timestamp(str(revision["reviewed_at_utc"])) > generated_at
         for revision in revisions
@@ -999,7 +1157,19 @@ def load_lifecycle_reviews(
                     "{} review timestamps must increase".format(review_id)
                 )
             previous_reviewed_at = reviewed_at
-        latest.append(review_revisions[max(review_revisions)])
+        latest_revision = review_revisions[max(review_revisions)]
+        if (
+            latest_revision["review_status"] == "disposed"
+            and latest_revision["market_type"] == "dex"
+            and not latest_revision["_dex_token_identity_bound"]
+        ):
+            raise LifecycleReviewError(
+                "{} latest DEX evidence does not bind the reviewed Token".format(
+                    review_id
+                )
+            )
+        latest_revision.pop("_dex_token_identity_bound", None)
+        latest.append(latest_revision)
 
     active = [
         item for item in latest if item["review_status"] == "disposed"

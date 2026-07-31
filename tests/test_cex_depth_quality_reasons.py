@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from dashboard import server
 from scripts.execution_cost import EXECUTION_COST_COLUMNS
-from scripts.fetch_cex_depth import failed_execution_rows
+from scripts.fetch_cex_depth import DEPTH_COLUMNS_ALL, failed_execution_rows
+from scripts.quality_outcomes import quality_outcome_rule
 
 
 class SourceBookError(Exception):
@@ -92,6 +93,129 @@ def public_empty_book_execution_fact():
 
 
 class CexDepthQualityReasonTest(unittest.TestCase):
+    def test_failed_empty_book_is_normalized_before_catalog_and_summary_quality(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            cex_path = data_dir / server.CEX_FILENAME
+            dex_path = data_dir / server.DEX_FILENAME
+            depth_path = data_dir / server.CEX_DEPTH_FILENAME
+            write_csv(
+                cex_path,
+                [
+                    "date", "token_symbol", "exchange", "cex_symbol", "open",
+                    "high", "low", "close", "base_volume", "quote_volume_usd",
+                ],
+                [{
+                    "date": "2026-07-30", "token_symbol": "GMX",
+                    "exchange": "crypto_com", "cex_symbol": "GMX/USDT",
+                    "open": "1", "high": "1", "low": "1", "close": "1",
+                    "base_volume": "1", "quote_volume_usd": "1",
+                }],
+            )
+            write_csv(
+                dex_path,
+                [
+                    "date", "token_symbol", "chain", "dex", "pool_address",
+                    "pool_name", "open", "high", "low", "close",
+                    "dex_volume_usd", "pool_tvl_usd",
+                ],
+                [{
+                    "date": "2026-07-30", "token_symbol": "GMX",
+                    "chain": "eth", "dex": "uniswap", "pool_address": "0xpool",
+                    "pool_name": "GMX / USDC", "open": "1", "high": "1",
+                    "low": "1", "close": "1", "dex_volume_usd": "1",
+                    "pool_tvl_usd": "1",
+                }],
+            )
+            depth_row = {column: "" for column in DEPTH_COLUMNS_ALL}
+            depth_row.update({
+                "snapshot_id": "cex-depth-no-book-1",
+                "observed_at": "2026-07-30T00:00:00+00:00",
+                "request_started_at": "2026-07-30T00:00:00+00:00",
+                "response_received_at": "2026-07-30T00:00:01+00:00",
+                "token_symbol": "GMX",
+                "exchange": "crypto_com",
+                "cex_symbol": "GMX/USDT",
+                "source_instrument": "GMX_USDT",
+                "base_asset": "GMX",
+                "source_quote_asset": "USDT",
+                "quote_conversion_method": "USDT=USD proxy",
+                "depth_method": "midpoint_symmetric_quote_notional",
+                "source": "crypto.com public order-book API",
+                "source_endpoint": (
+                    "https://collector:secret@api.crypto.test:8443/v2/depth"
+                    "?api_key=private#raw"
+                ),
+                "raw_response_sha256": "a" * 64,
+                "status": "failed",
+                "reason_code": "source_no_two_sided_book",
+                "error": (
+                    "SourceBookError: /srv/private/collector.py returned an "
+                    "empty order-book side"
+                ),
+            })
+            write_csv(depth_path, DEPTH_COLUMNS_ALL, [depth_row])
+            environment = {
+                "MARKET_CEX_DATA": str(cex_path),
+                "MARKET_DEX_DATA": str(dex_path),
+                "MARKET_CEX_DEPTH_DATA": str(depth_path),
+            }
+            server.clear_runtime_caches()
+            try:
+                with patch.dict(server.os.environ, environment, clear=True):
+                    signature = server.api_source_signature()
+                    catalog = server._build_public_api_payload(
+                        "catalog", (), source_signature=signature
+                    )
+                    summary = server._build_public_api_payload(
+                        "summary", (), source_signature=signature
+                    )
+                    quality = server._build_public_api_payload(
+                        "quality", (("token", "GMX"),), source_signature=signature
+                    )
+            finally:
+                server.clear_runtime_caches()
+
+        catalog_market = next(
+            market for market in catalog["markets"]
+            if market["market_id"] == "cex:crypto_com:GMX/USDT"
+        )
+        summary_market = summary["tokens"][0]["primary_cex"]
+        quality_market = next(
+            market for market in quality["markets"]
+            if market["market_id"] == "cex:crypto_com:GMX/USDT"
+        )
+        depth_fact = quality_market["facts"]["depth"]
+
+        self.assertEqual(catalog_market["depth_status"], "source_no_observation")
+        self.assertEqual(catalog_market["quality_status"], "ok")
+        self.assertNotIn("depth_failed", catalog_market["quality_flags"])
+        self.assertNotIn("depth_error", catalog_market)
+        self.assertEqual(
+            catalog_market["depth_source_endpoint"],
+            "https://api.crypto.test:8443",
+        )
+        self.assertEqual(summary_market["depth_status"], "source_no_observation")
+        self.assertEqual(summary_market["depth_na_reason"], "source_no_two_sided_book")
+        self.assertEqual(summary_market["quality_status"], "ok")
+        self.assertNotIn("depth_failed", summary_market["quality_flags"])
+        self.assertEqual(depth_fact["status"], "source_no_observation")
+        self.assertEqual(depth_fact["reason"], "source_no_two_sided_book")
+        self.assertEqual(depth_fact["reason_code"], "source_no_two_sided_book")
+        self.assertFalse(depth_fact["retryable"])
+        self.assertIsNone(depth_fact["action"])
+        self.assertIsNotNone(
+            quality_outcome_rule(depth_fact["status"], depth_fact["reason_code"])
+        )
+        self.assertEqual(
+            catalog["metadata"]["data_generation"],
+            summary["metadata"]["data_generation"],
+        )
+        serialized = json.dumps({"catalog": catalog, "summary": summary, "quality": quality})
+        self.assertNotIn("/srv/private", serialized)
+        self.assertNotIn("collector:secret", serialized)
+        self.assertNotIn("api_key=private", serialized)
+
     def test_legacy_empty_book_is_a_non_retryable_source_outcome(self):
         reason = server.cex_depth_reason_code(
             {
@@ -215,6 +339,49 @@ class CexDepthQualityReasonTest(unittest.TestCase):
             flag["category"] == "data_health"
             for flag in fact["quality_flags"]
         ))
+        self.assertNotIn("errors", fact)
+
+    def test_invalid_cex_execution_outcome_remains_bounded_public_fact(self):
+        market_id = "cex:test:GMX/USDT"
+        raw_error = "SourceBookError: /srv/private crossed or locked book"
+        row = {
+            "market_id": market_id,
+            "market_type": "cex",
+            "status": "failed",
+            "status_reason": "source_invalid_order_book",
+            "error": raw_error,
+            "state_observed_at": "2026-07-30T00:00:00+00:00",
+            "observed_at": "2026-07-30T00:00:01+00:00",
+            "source": "fixture source",
+            "source_endpoint": "https://user:secret@example.test/private",
+            "calculation_method": "cex_fixture_walk",
+            "snapshot_id": "execution-1",
+            "source_snapshot_id": "depth-1",
+            "raw_response_sha256": "a" * 64,
+            "direction": "sell_token",
+            "requested_notional_usd": "1000",
+        }
+        fact = server._execution_quality_fact(
+            {"market_id": market_id, "market_type": "cex"},
+            {
+                "snapshot": {
+                    "by_market": {market_id: [row]},
+                    "observed_at": row["observed_at"],
+                },
+                "error_code": None,
+            },
+        )
+
+        self.assertEqual(
+            (fact["status"], fact["reason_code"]),
+            ("invalid", "source_invalid_order_book"),
+        )
+        self.assertFalse(fact["retryable"])
+        self.assertIsNotNone(
+            quality_outcome_rule(fact["status"], fact["reason_code"])
+        )
+        self.assertNotIn(raw_error, json.dumps(fact))
+        self.assertEqual(fact["source_endpoint"], "https://example.test")
 
     def test_unknown_depth_status_fails_closed_to_bounded_review_outcome(self):
         fact = server._depth_quality_fact({

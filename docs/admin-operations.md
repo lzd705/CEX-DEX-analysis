@@ -137,6 +137,14 @@ counts are real integers and affected dates are sorted, unique canonical UTC
 dates. Public flag messages containing a raw URL, protected POSIX path, any
 backslash path, or control marker fail preflight.
 
+Preflight also recomputes every selected fact's canonical
+`status/reason_code/retryable/action` tuple through the shared outcome table,
+reconstructs selected status and flags from the four fact families, and
+requires every Summary primary market to expose canonical TVL/depth status,
+N/A reason, and retryability. The single-Token catalog's exact Market-ID set
+must equal the same Token's subset of the full catalog; a non-empty but
+incomplete subset is a release failure.
+
 The report keeps data-quality states separate:
 
 - `hard_invalid`: duplicate primary keys; missing/invalid identities or dates;
@@ -317,21 +325,49 @@ Snapshot refresh is a separate Fact contract, not a shortcut through the daily
 SQLite postcheck. Before collection, the service reads and validates the exact
 canonical Market/Fact row and records its snapshot ID, complete publication
 SHA-256, observation time, status/reason, retryability, and publication
-generation. After collection it rereads the uncached publication and requires:
+generation. The collection command receives that canonical `market_id`; it
+does not expand the request to every venue carrying the Token. For DEX depth,
+the temporary GeckoTerminal price input is restricted to the same pool.
+
+An exact candidate is merged into the existing full latest inventory before
+publication. Depth requires the target to exist exactly once and all ten
+execution scenarios to match its baseline. TVL may insert exactly one
+cataloged target that is absent from the TVL baseline; no other family may use
+that insertion path. The merge preserves all non-target source-evidence fields
+and fails closed on a missing publication baseline, duplicate identity, schema
+drift, cross-market row, or incoherent depth/execution lineage. Only the target
+observation is appended to normalized history. `snapshot_id` identifies the
+new full latest-view publication generation; each row's own `observed_at`, raw
+hash, block/sequence, and endpoint retain the actual source-observation
+lineage. Exact recovery deliberately does not reuse the full 80%/90% absolute
+coverage floor: it instead requires 100% retention of prior usable facts, a
+resolved target, a complete-row sealed candidate, one common depth/execution
+generation, and history content identical to the published target. This lets
+operators repair a low-coverage baseline one market at a time without relaxing
+full-publication standards. After collection the service rereads the uncached
+publication and requires:
 
 1. the same requested Market and Fact identity;
 2. a valid new snapshot ID and different publication bytes;
 3. a producer-valid row and exact allowlisted status/reason pair;
-4. `observed`, valid measured `partial`, or a terminal non-retryable
-   `source_no_observation` / `unsupported` resolution.
+4. `observed`, or an exact terminal non-retryable
+   `source_no_observation` / `unsupported` resolution confirmed by the shared
+   quality-outcome resolver.
 
 An unchanged snapshot, an unrelated Market update, a retryable failure,
 unknown status/reason pair, invalid publication, or `needs_review` is
 unresolved even if the collector exits zero. `needs_review` is protected
 manual work; it is never confirmed absence, unsupported capability, or refresh
-success. For DEX depth, USD time-alignment warnings are evaluated only when a
-measured band and a declared time-sensitive conversion exist. Unsupported or
-failed `N/A` rows do not receive a synthetic temporal mismatch.
+success. A measured `partial` row also remains unresolved: a user retry cannot
+claim completion while the requested fact is incomplete, so exact public
+collectors reject it before publication. Immediately before the network call,
+the worker rereads retryability; if another collection already resolved the
+fact, the stale queued action ends as `already_resolved` without overwriting
+good data. If publication completes but later orchestration metadata fails, the
+job reports `partial` with `publication_committed=true` instead of claiming the
+files were untouched. For DEX depth, USD time-alignment warnings are evaluated
+only when a measured band and a declared time-sensitive conversion exist.
+Unsupported or failed `N/A` rows do not receive a synthetic temporal mismatch.
 
 ### One-shot MORPHO recovery gate
 

@@ -74,6 +74,12 @@ market-condition flags. Counts are compared exactly after zero-valued entries
 are removed. A non-OK status with no structured flag is a contract failure;
 the release checker does not invent a fallback reason. Any generation drift
 aborts the release instead of being retried as a count mismatch.
+Comparison and execution responses carry the same `data_generation`; release
+validation checks both against Summary and rereads Summary at the end to reject
+a mid-check source cutover. Quality outcome validation is also fact-specific:
+market type plus `daily`/`tvl`/`depth`/`execution` selects the canonical
+status, reason, retryability, and action contract. A globally known pair from a
+different family (for example observed pool TVL on a CEX market) is rejected.
 Summary `token_count` must equal its Token rows and
 `catalog_market_count` must equal their summed market counts. Those declared
 totals must equal the audited Quality totals and the full catalog; the full
@@ -212,6 +218,21 @@ snapshot identity change and the new exact Fact resolves to measured evidence
 or a valid terminal non-retryable source outcome. Exit code zero, an unrelated
 Market update, unchanged publication identity, retryable failure, or
 `needs_review` is not success.
+
+Public snapshot refresh is network-bounded by canonical `market_id`, not merely
+by Token. The one-market candidate is merged into a validated full latest view;
+non-target fact evidence is unchanged, target execution scenario keys must
+match the baseline exactly, and all rows share the resulting publication
+generation ID. Per-row observation timestamps and raw/block/sequence hashes,
+not the generation ID alone, remain the evidence of when each source was
+observed.
+
+TVL alone supports a safe one-row insertion when the canonical cataloged pool
+is absent from the latest TVL inventory. The worker rechecks retryability at
+execution time so an old queued request cannot downgrade a fact that another
+collection has already resolved. Exact public refresh publishes only observed
+or confirmed terminal outcomes; partial measurements remain unresolved and
+are rejected before publication.
 
 ## Explicit non-claims
 

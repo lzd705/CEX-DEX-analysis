@@ -137,6 +137,14 @@ def dex_review_payload():
                         "observations": {
                             "pool_address": pool,
                             "dex_id": "uniswap_v3_arbitrum",
+                            "base_token_id": (
+                                "arbitrum_"
+                                "0x9623063377ad1b27544c965ccd7342f7ea7e88c7"
+                            ),
+                            "quote_token_id": (
+                                "arbitrum_"
+                                "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+                            ),
                         },
                     },
                     {
@@ -211,9 +219,9 @@ class MarketLifecycleReviewTest(unittest.TestCase):
         self.assertEqual(metadata["status"], "accepted")
         self.assertEqual(
             metadata["generated_at_utc"],
-            "2026-07-30T03:23:13Z",
+            "2026-07-31T17:20:30Z",
         )
-        self.assertEqual(metadata["revision_count"], 2)
+        self.assertEqual(metadata["revision_count"], 3)
         self.assertEqual(metadata["active_disposition_count"], 2)
         self.assertEqual(
             {review["review_id"] for review in reviews},
@@ -228,6 +236,31 @@ class MarketLifecycleReviewTest(unittest.TestCase):
         )
         upbit = next(
             review for review in reviews if review["market_type"] == "cex"
+        )
+        grt = next(
+            review for review in reviews if review["market_type"] == "dex"
+        )
+        self.assertEqual(grt["revision"], 2)
+        grt_pool = next(
+            check
+            for check in grt["source_checks"]
+            if check["source_kind"] == "declared_dex_market_data_api"
+        )
+        self.assertEqual(
+            {
+                key: grt_pool["observations"][key]
+                for key in ("base_token_id", "quote_token_id")
+            },
+            {
+                "base_token_id": (
+                    "arbitrum_"
+                    "0x9623063377ad1b27544c965ccd7342f7ea7e88c7"
+                ),
+                "quote_token_id": (
+                    "arbitrum_"
+                    "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+                ),
+            },
         )
         inventory = next(
             check
@@ -760,6 +793,183 @@ class MarketLifecycleReviewTest(unittest.TestCase):
                         self.write_reviews(
                             payload,
                             "bad-dex-binding-{}.json".format(position),
+                        )
+                    )
+
+    def test_dex_pool_token_evidence_accepts_target_as_base_or_quote(self):
+        base_payload = dex_review_payload()
+        base_reviews, _ = load_lifecycle_reviews(
+            self.write_reviews(base_payload, "dex-target-base.json")
+        )
+        base_observations = base_reviews[0]["source_checks"][0][
+            "observations"
+        ]
+        self.assertEqual(
+            base_observations["base_token_id"],
+            "arbitrum_0x9623063377ad1b27544c965ccd7342f7ea7e88c7",
+        )
+
+        quote_payload = deepcopy(base_payload)
+        quote_observations = quote_payload["reviews"][0]["source_checks"][0][
+            "observations"
+        ]
+        quote_observations["base_token_id"], quote_observations[
+            "quote_token_id"
+        ] = (
+            quote_observations["quote_token_id"],
+            quote_observations["base_token_id"],
+        )
+        quote_reviews, _ = load_lifecycle_reviews(
+            self.write_reviews(quote_payload, "dex-target-quote.json")
+        )
+        self.assertEqual(
+            quote_reviews[0]["source_checks"][0]["observations"][
+                "quote_token_id"
+            ],
+            "arbitrum_0x9623063377ad1b27544c965ccd7342f7ea7e88c7",
+        )
+
+    def test_latest_dex_review_requires_both_pool_token_identities(self):
+        removals = (
+            ("base_token_id",),
+            ("quote_token_id",),
+            ("base_token_id", "quote_token_id"),
+        )
+        for position, removed_fields in enumerate(removals):
+            with self.subTest(removed_fields=removed_fields):
+                payload = dex_review_payload()
+                observations = payload["reviews"][0]["source_checks"][0][
+                    "observations"
+                ]
+                for field in removed_fields:
+                    observations.pop(field)
+                with self.assertRaisesRegex(
+                    LifecycleReviewError,
+                    "Token identity|reviewed Token",
+                ):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "missing-dex-token-identity-{}.json".format(
+                                position
+                            ),
+                        )
+                    )
+
+    def test_dex_exact_pool_with_wrong_reviewed_token_is_rejected(self):
+        payload = dex_review_payload()
+        review = payload["reviews"][0]
+        review["token_symbol"] = "AAVE"
+        review["market_id"] = review["market_id"].rsplit(":", 1)[0] + ":AAVE"
+
+        try:
+            load_lifecycle_reviews(
+                self.write_reviews(payload, "wrong-dex-token.json")
+            )
+        except LifecycleReviewError as error:
+            self.assertIn("reviewed Token", str(error))
+        else:
+            self.fail("exact pool evidence for another Token was accepted")
+
+    def test_dex_review_requires_trusted_chain_contract_configuration(self):
+        token_chain_path = self.root / "token-chains-without-grt.csv"
+        token_chain_path.write_text(
+            "token_symbol,chain,contract_address,notes\n"
+            "AAVE,arbitrum,"
+            "0xba5ddd1f9d7f570dc94a51479a000e3bce967196,"
+            "test fixture\n",
+            encoding="utf-8",
+        )
+        try:
+            load_lifecycle_reviews(
+                self.write_reviews(
+                    dex_review_payload(),
+                    "dex-missing-trusted-token.json",
+                ),
+                token_chain_path=token_chain_path,
+            )
+        except LifecycleReviewError as error:
+            self.assertIn("trusted Token contract identity", str(error))
+        except TypeError as error:
+            self.fail(
+                "validator cannot receive trusted Token configuration: {}".format(
+                    error
+                )
+            )
+        else:
+            self.fail("DEX review without trusted Token identity was accepted")
+
+    def test_dex_revision_cannot_rewrite_issue_market_type_market_or_date(self):
+        cases = (
+            ("reviewed_issue_id", "f" * 20),
+            ("issue_date", "2026-07-28"),
+            ("market_id", "other_pool"),
+            ("market_type", "cex"),
+        )
+        for position, (field, value) in enumerate(cases):
+            with self.subTest(field=field):
+                payload = dex_review_payload()
+                payload["generated_at_utc"] = "2026-07-30T05:00:00Z"
+                revision_2 = deepcopy(payload["reviews"][0])
+                revision_2["revision"] = 2
+                revision_2["supersedes_revision"] = 1
+                revision_2["reviewed_at_utc"] = "2026-07-30T04:00:00Z"
+                if field == "market_id":
+                    other_pool = "0x" + "2" * 40
+                    revision_2["market_id"] = (
+                        "dex:arbitrum:uniswap_v3_arbitrum:{}:GRT".format(
+                            other_pool
+                        )
+                    )
+                    pool_check, ohlcv_check = revision_2["source_checks"]
+                    pool_check["url"] = (
+                        "https://api.geckoterminal.com/api/v2/networks/"
+                        "arbitrum/pools/{}".format(other_pool)
+                    )
+                    pool_check["observations"]["pool_address"] = other_pool
+                    ohlcv_check["url"] = (
+                        "https://api.geckoterminal.com/api/v2/networks/"
+                        "arbitrum/pools/{}/ohlcv/day?aggregate=1&"
+                        "currency=usd&limit=30".format(other_pool)
+                    )
+                elif field == "market_type":
+                    revision_2["market_type"] = "cex"
+                    revision_2["market_id"] = "cex:upbit:GRT/USDT"
+                    revision_2["market_lifecycle"] = (
+                        "listed_quote_market_dormant"
+                    )
+                    revision_2["evidence_status"] = "primary_confirmed"
+                    revision_2["review_method"] = (
+                        "manual_primary_source_cross_check"
+                    )
+                    revision_2["source_checks"] = [
+                        {
+                            "source_kind": "official_exchange_ticker",
+                            "url": (
+                                "https://api.upbit.com/v1/ticker?"
+                                "markets=USDT-GRT"
+                            ),
+                            "http_status": 200,
+                            "response_sha256": "e" * 64,
+                            "checked_at_utc": "2026-07-30T03:59:00Z",
+                            "observations": {
+                                "market": "USDT-GRT",
+                                "last_trade_date_utc": "2026-07-22",
+                            },
+                        }
+                    ]
+                else:
+                    revision_2[field] = value
+                payload["reviews"].append(revision_2)
+                payload["review_count"] = 2
+                with self.assertRaisesRegex(
+                    LifecycleReviewError,
+                    "revision identity is immutable",
+                ):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "mutated-dex-identity-{}.json".format(position),
                         )
                     )
 

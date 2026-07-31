@@ -236,6 +236,96 @@ class CollectionCycleTest(unittest.TestCase):
             str(self.data_dir.resolve() / "raw/tvl"),
         )
 
+    def test_public_cex_depth_refresh_is_bound_to_one_canonical_market(self):
+        market_id = "cex:binance:AAVE/USDT"
+        commands = build_step_commands(
+            "cex_depth",
+            publish_local=True,
+            python_executable="python3",
+            data_dir=self.data_dir,
+            now=NOW,
+            market_id=market_id,
+        )
+
+        self.assertEqual([name for name, _ in commands], ["depth"])
+        command = commands[0][1]
+        self.assertEqual(
+            command[command.index("--market-id") + 1],
+            market_id,
+        )
+        self.assertIn("--merge-publish", command)
+        self.assertNotIn("--tokens", command)
+
+    def test_public_dex_depth_refresh_bounds_price_and_depth_to_one_pool(self):
+        market_id = (
+            "dex:eth:uniswap_v3:"
+            "0x1111111111111111111111111111111111111111:AAVE"
+        )
+        commands = build_step_commands(
+            "dex_depth",
+            publish_local=True,
+            python_executable="python3",
+            data_dir=self.data_dir,
+            now=NOW,
+            market_id=market_id,
+        )
+
+        self.assertEqual(
+            [name for name, _ in commands],
+            ["dex_price", "dex_depth"],
+        )
+        for _name, command in commands:
+            self.assertEqual(
+                command[command.index("--market-id") + 1],
+                market_id,
+            )
+        self.assertNotIn("--merge-publish", commands[0][1])
+        self.assertIn("--merge-publish", commands[1][1])
+
+    def test_public_tvl_refresh_is_bound_to_one_canonical_pool(self):
+        market_id = (
+            "dex:eth:uniswap_v3:"
+            "0x1111111111111111111111111111111111111111:AAVE"
+        )
+        commands = build_step_commands(
+            "tvl",
+            publish_local=True,
+            python_executable="python3",
+            data_dir=self.data_dir,
+            now=NOW,
+            market_id=market_id,
+        )
+
+        command = commands[0][1]
+        self.assertEqual(
+            command[command.index("--market-id") + 1],
+            market_id,
+        )
+        self.assertIn("--merge-publish", command)
+
+    def test_exact_market_scope_rejects_wrong_or_full_profiles(self):
+        with self.assertRaisesRegex(ValueError, "DEX market"):
+            build_step_commands(
+                "cex_depth",
+                publish_local=True,
+                data_dir=self.data_dir,
+                market_id="dex:eth:uniswap_v3:0xpool:AAVE",
+            )
+        with self.assertRaisesRegex(ValueError, "exact market"):
+            build_step_commands(
+                "full",
+                publish_local=True,
+                data_dir=self.data_dir,
+                market_id="cex:binance:AAVE/USDT",
+            )
+        with self.assertRaisesRegex(ValueError, "publishing"):
+            build_step_commands(
+                "tvl",
+                publish_local=False,
+                data_dir=self.data_dir,
+                market_id="dex:eth:uniswap_v3:0xpool:AAVE",
+            )
+
     def test_hourly_depth_refreshes_private_price_input_before_dex(self):
         commands = build_step_commands(
             "depth",
@@ -292,6 +382,40 @@ class CollectionCycleTest(unittest.TestCase):
             ["depth-1"],
         )
 
+    def test_snapshot_freshness_uses_oldest_inventory_observation(self):
+        write_csv(
+            self.data_dir / "dex_pool_tvl_latest.csv",
+            ["snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "tvl-2",
+                    "observed_at": "2026-07-26T00:00:00+00:00",
+                    "status": "observed",
+                },
+                {
+                    "snapshot_id": "tvl-2",
+                    "observed_at": "2026-07-27T11:59:00+00:00",
+                    "status": "observed",
+                },
+            ],
+        )
+
+        status = build_collection_status(self.data_dir, now=NOW)
+
+        self.assertEqual(
+            status["tvl_snapshot"]["observed_at"],
+            "2026-07-26T00:00:00+00:00",
+        )
+        self.assertEqual(
+            status["tvl_snapshot"]["observed_at_min"],
+            "2026-07-26T00:00:00+00:00",
+        )
+        self.assertEqual(
+            status["tvl_snapshot"]["observed_at_max"],
+            "2026-07-27T11:59:00+00:00",
+        )
+        self.assertEqual(status["freshness"]["dex_tvl"]["status"], "stale")
+
     def test_successful_cycle_writes_per_step_logs_and_latest_manifest(self):
         def runner(command, log_path):
             log_path.write_text("ok\n", encoding="utf-8")
@@ -314,6 +438,33 @@ class CollectionCycleTest(unittest.TestCase):
         self.assertEqual(result["steps"][0]["log_tail"], ["ok"])
         self.assertTrue(Path(result["manifest_path"]).exists())
         self.assertEqual(json.loads(latest.read_text())["status"], "succeeded")
+
+    def test_exact_market_cycle_defers_global_freshness_to_target_postcondition(self):
+        def runner(_command, log_path):
+            log_path.write_text("exact target published\n", encoding="utf-8")
+            return 0
+
+        result = run_collection_cycle(
+            "cex_depth",
+            publish_local=True,
+            data_dir=self.data_dir,
+            run_root=self.root / "exact-runs",
+            latest_status_path=self.root / "exact-latest.json",
+            lock_path=self.root / "exact.lock",
+            now=NOW,
+            market_id="cex:binance:AAVE/USDT",
+            step_runner=runner,
+        )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["steps"][0]["exit_code"], 0)
+        self.assertEqual(
+            result["steps"][0]["validation"],
+            {
+                "checked": False,
+                "reason": "non-publishing or bounded/manual refresh",
+            },
+        )
 
     def test_locked_cycle_does_not_leave_an_empty_run_directory(self):
         lock_path = self.root / "collection.lock"

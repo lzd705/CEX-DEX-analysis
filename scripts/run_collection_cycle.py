@@ -111,6 +111,9 @@ def snapshot_summary(path: Path) -> dict[str, Any] | None:
         rows = list(csv.DictReader(handle))
     if not rows:
         return None
+    observed_at_values = sorted(
+        row["observed_at"] for row in rows if row.get("observed_at")
+    )
     return {
         "snapshot_ids": sorted(
             {row["snapshot_id"] for row in rows if row.get("snapshot_id")}
@@ -122,9 +125,16 @@ def snapshot_summary(path: Path) -> dict[str, Any] | None:
                 if row.get("source_snapshot_id")
             }
         ),
-        "observed_at": max(
-            (row["observed_at"] for row in rows if row.get("observed_at")),
-            default=None,
+        # Full-inventory freshness is conservative. A bounded one-market
+        # refresh must not make every retained non-target row look current.
+        "observed_at": (
+            observed_at_values[0] if observed_at_values else None
+        ),
+        "observed_at_min": (
+            observed_at_values[0] if observed_at_values else None
+        ),
+        "observed_at_max": (
+            observed_at_values[-1] if observed_at_values else None
         ),
         "row_count": len(rows),
         "status_counts": dict(Counter(row.get("status") or "missing_status" for row in rows)),
@@ -284,12 +294,34 @@ def build_step_commands(
     start: str | None = None,
     end: str | None = None,
     tokens: list[str] | None = None,
+    market_id: str | None = None,
     full_rebuild: bool = False,
 ) -> list[tuple[str, list[str]]]:
     if profile not in PROFILE_STEPS:
         raise ValueError(f"Unknown collection profile: {profile}")
     if bool(start) != bool(end):
         raise ValueError("--start and --end must be provided together")
+    if market_id is not None:
+        market_id = market_id.strip()
+        if not market_id:
+            raise ValueError("--market-id cannot be blank")
+        if not publish_local:
+            raise ValueError("exact market refresh requires publishing")
+        if profile not in {"cex_depth", "dex_depth", "tvl"}:
+            raise ValueError(
+                "exact market refresh requires a single snapshot profile"
+            )
+        if tokens:
+            raise ValueError("exact market refresh cannot use a Token filter")
+        family = market_id.split(":", 1)[0].lower()
+        expected_family = "cex" if profile == "cex_depth" else "dex"
+        if family != expected_family:
+            raise ValueError(
+                "{} profile cannot refresh a {} market".format(
+                    expected_family.upper(),
+                    family.upper() or "unknown",
+                )
+            )
     data_dir = data_dir.expanduser().resolve()
     processed_dir = processed_dir_for(data_dir)
     dex_price_input = processed_dir / DEX_PRICE_INPUT.name
@@ -339,8 +371,12 @@ def build_step_commands(
                 "--raw-root",
                 str(raw_root / "tvl"),
             ]
+            if market_id is not None:
+                command.extend(["--market-id", market_id])
             if step == "tvl" and publish_local:
                 command.extend(["--publish-dir", str(data_dir)])
+                if market_id is not None:
+                    command.append("--merge-publish")
         elif step == "depth":
             command = [
                 python_executable,
@@ -354,8 +390,12 @@ def build_step_commands(
                 "--raw-root",
                 str(raw_root / "cex-depth"),
             ]
+            if market_id is not None:
+                command.extend(["--market-id", market_id])
             if publish_local:
                 command.extend(["--publish-dir", str(data_dir)])
+                if market_id is not None:
+                    command.append("--merge-publish")
         else:
             command = [
                 python_executable,
@@ -367,8 +407,12 @@ def build_step_commands(
                 "--raw-root",
                 str(raw_root / "dex-depth"),
             ]
+            if market_id is not None:
+                command.extend(["--market-id", market_id])
             if publish_local:
                 command.extend(["--publish-dir", str(data_dir)])
+                if market_id is not None:
+                    command.append("--merge-publish")
         commands.append((step, command))
     return commands
 
@@ -537,6 +581,7 @@ def run_collection_cycle(
     start: str | None = None,
     end: str | None = None,
     tokens: list[str] | None = None,
+    market_id: str | None = None,
     full_rebuild: bool = False,
     fail_fast: bool = False,
     dry_run: bool = False,
@@ -557,6 +602,7 @@ def run_collection_cycle(
         start=start,
         end=end,
         tokens=tokens,
+        market_id=market_id,
         full_rebuild=full_rebuild,
     )
     if dry_run:
@@ -647,8 +693,14 @@ def run_collection_cycle(
                 with log_path.open("a", encoding="utf-8") as log:
                     log.write(step_error + "\n")
             validation = None
-            should_validate = publish_local and name != "dex_price" and (
-                name != "daily" or (tokens is None and start is None and end is None)
+            should_validate = (
+                publish_local
+                and market_id is None
+                and name != "dex_price"
+                and (
+                    name != "daily"
+                    or (tokens is None and start is None and end is None)
+                )
             )
             if exit_code == 0 and should_validate:
                 post_step_status = build_collection_status(data_dir, now=started)
@@ -782,6 +834,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", help="Inclusive UTC date override for daily facts")
     parser.add_argument("--tokens", help="Comma-separated daily Token override")
     parser.add_argument(
+        "--market-id",
+        help="One canonical CEX/DEX market for a bounded snapshot refresh",
+    )
+    parser.add_argument(
         "--full-rebuild",
         action="store_true",
         help="Replace daily processed output instead of incremental upsert",
@@ -800,6 +856,7 @@ def main() -> None:
         start=args.start,
         end=args.end,
         tokens=parse_list(args.tokens),
+        market_id=args.market_id,
         full_rebuild=args.full_rebuild,
         fail_fast=args.fail_fast,
         dry_run=args.dry_run,

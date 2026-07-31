@@ -39,12 +39,20 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "spread_comparable_days": 20,
                 "primary_cex": {
                     "refresh_market_id": "cex:binance:AAVE/USDT",
+                    "depth_status": "observed",
+                    "depth_na_reason": "observed",
                     "depth_retryable": False,
+                    "tvl_status": "not_applicable",
+                    "tvl_na_reason": "cex_markets_do_not_have_pool_tvl",
                     "tvl_retryable": False,
                 },
                 "primary_dex": {
                     "refresh_market_id": "dex:eth:uniswap_v3:pool:AAVE",
+                    "depth_status": "collection_failed",
+                    "depth_na_reason": "source_unavailable",
                     "depth_retryable": True,
+                    "tvl_status": "collection_failed",
+                    "tvl_na_reason": "source_unavailable",
                     "tvl_retryable": True,
                 },
             }],
@@ -459,6 +467,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         }
         valid_quality_by_token = copy.deepcopy(quality_by_token)
         full_catalog = {
+            "metadata": {"data_generation": "generation-1"},
             "markets": [
                 {
                     "market_id": "cex:binance:AAVE/USDT",
@@ -496,13 +505,22 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "bundle_id": "a" * 24,
         }
         fetched_paths = []
+        summary_state = {"count": 0, "tail_generation": None}
 
         def fake_fetch(_base_url, path, *, timeout):
             fetched_paths.append(path)
             if path == "/health":
                 payload = {"status": "ok", "data_ready": True}
             elif path == "/api/markets/summary":
-                payload = summary
+                summary_state["count"] += 1
+                payload = copy.deepcopy(summary)
+                if (
+                    summary_state["count"] > 1
+                    and summary_state["tail_generation"] is not None
+                ):
+                    payload["metadata"]["data_generation"] = summary_state[
+                        "tail_generation"
+                    ]
             elif path == "/api/markets/catalog":
                 payload = full_catalog
             elif path.startswith("/api/markets/catalog?"):
@@ -532,6 +550,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             },
         ]
         def run_release(*, bypass_summary_validation=False):
+            summary_state["count"] = 0
             with ExitStack() as stack:
                 stack.enter_context(patch(
                     "scripts.check_dashboard_release.fetch_json",
@@ -582,11 +601,30 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         self.assertEqual(result["screening_quality_market_count"], 4)
         metric_paths = [row["path"] for row in result["requests"]]
         self.assertTrue(set(all_quality_paths).issubset(metric_paths))
+        self.assertEqual(
+            metric_paths.count("/api/markets/summary"),
+            2,
+        )
+
+        summary_state["tail_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "generation changed"):
+            run_release()
+        summary_state["tail_generation"] = None
 
         quality_by_token["UNI"]["metadata"]["data_generation"] = "generation-2"
         with self.assertRaisesRegex(ReleaseCheckError, "generation"):
             run_release()
         quality_by_token = copy.deepcopy(valid_quality_by_token)
+
+        full_catalog["metadata"]["data_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "full catalog generation"):
+            run_release()
+        full_catalog["metadata"]["data_generation"] = "generation-1"
+
+        missing_catalog_generation = full_catalog.pop("metadata")
+        with self.assertRaisesRegex(ReleaseCheckError, "full catalog generation"):
+            run_release()
+        full_catalog["metadata"] = missing_catalog_generation
 
         quality_by_token["UNI"]["markets"][0]["market_id"] = (
             quality_by_token["AAVE"]["markets"][0]["market_id"]
@@ -644,6 +682,11 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseCheckError, "parity market count"):
             run_release(bypass_summary_validation=True)
 
+        summary["metadata"]["catalog_market_count"] = 4
+        markets.pop()
+        with self.assertRaisesRegex(ReleaseCheckError, "Token catalog inventory"):
+            run_release()
+
     def test_summary_rejects_heavy_arrays_and_payload_budget_regression(self):
         summary = self.summary()
         token, start, end, generation = validate_summary(
@@ -688,6 +731,43 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             broken["tokens"][0]["primary_cex"].pop("depth_retryable")
             validate_summary(
                 broken,
+                self.metrics(),
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "N/A outcome"):
+            missing_reason = self.summary()
+            missing_reason["tokens"][0]["primary_cex"].pop(
+                "depth_na_reason"
+            )
+            validate_summary(
+                missing_reason,
+                self.metrics(),
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "N/A outcome"):
+            mismatched_outcome = self.summary()
+            mismatched_outcome["tokens"][0]["primary_dex"][
+                "depth_na_reason"
+            ] = "unsupported_protocol"
+            validate_summary(
+                mismatched_outcome,
+                self.metrics(),
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "N/A outcome"):
+            impossible_cex_tvl = self.summary()
+            impossible_cex_tvl["tokens"][0]["primary_cex"].update(
+                {
+                    "tvl_status": "observed",
+                    "tvl_na_reason": "observed",
+                    "tvl_retryable": False,
+                }
+            )
+            validate_summary(
+                impossible_cex_tvl,
                 self.metrics(),
                 raw_max=2000,
                 gzip_max=1000,
@@ -780,6 +860,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "market_a": {"market_id": market_a},
             "market_b": {"market_id": market_b},
             "metadata": {
+                "data_generation": "generation-1",
                 "start_date": "2026-01-01",
                 "end_date": "2026-01-31",
                 "comparison_days": 1,
@@ -794,7 +875,20 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             market_b=market_b,
             start="2026-01-01",
             end="2026-01-31",
+            expected_generation="generation-1",
         )
+        stale_comparison = copy.deepcopy(comparison)
+        stale_comparison["metadata"]["data_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "generations differ"):
+            validate_comparison(
+                stale_comparison,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                start="2026-01-01",
+                end="2026-01-31",
+                expected_generation="generation-1",
+            )
         with self.assertRaisesRegex(ReleaseCheckError, "no daily observations"):
             validate_comparison(
                 {**comparison, "observations": []},
@@ -803,13 +897,40 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 market_b=market_b,
                 start="2026-01-01",
                 end="2026-01-31",
+                expected_generation="generation-1",
             )
 
         quality_markets = [
             {
                 "market_id": market_id,
+                "market_type": (
+                    "cex" if market_id.startswith("cex:") else "dex"
+                ),
                 "token_symbol": "AAVE",
-                "facts": {"daily": {"status": "observed"}},
+                "quality_status": "ok",
+                "quality_flags": [],
+                "screening_quality_status": "ok",
+                "screening_quality_flags": [],
+                "facts": {
+                    fact_name: {
+                        "status": (
+                            "not_applicable"
+                            if market_id.startswith("cex:")
+                            and fact_name == "tvl"
+                            else "observed"
+                        ),
+                        "reason_code": (
+                            "cex_markets_do_not_have_pool_tvl"
+                            if market_id.startswith("cex:")
+                            and fact_name == "tvl"
+                            else "observed"
+                        ),
+                        "retryable": False,
+                        "action": None,
+                        "quality_flags": [],
+                    }
+                    for fact_name in ("daily", "tvl", "depth", "execution")
+                },
             }
             for market_id in (market_a, market_b)
         ]
@@ -841,6 +962,269 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             market_b=market_b,
             expected_generation="generation-1",
         )
+
+        spoofed_market_type = copy.deepcopy(quality)
+        spoofed_market_type["markets"][0]["market_type"] = "dex"
+        spoofed_market_type["markets"][0]["facts"]["tvl"].update(
+            {
+                "status": "observed",
+                "reason_code": "observed",
+                "retryable": False,
+                "action": None,
+            }
+        )
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "market identity/type",
+        ):
+            validate_quality(
+                spoofed_market_type,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        legacy_daily = copy.deepcopy(quality)
+        legacy_daily["markets"][0]["facts"]["daily"].update(
+            {
+                "status": "legacy_ohlcv_snapshot",
+                "reason_code": "legacy_ohlcv_snapshot",
+                "retryable": False,
+                "action": None,
+            }
+        )
+        with self.assertRaisesRegex(ReleaseCheckError, "canonical outcome"):
+            validate_quality(
+                legacy_daily,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        unsupported_without_fact_evidence = copy.deepcopy(quality)
+        unsupported_without_fact_evidence["metadata"][
+            "daily_quality_report"
+        ].update(
+            {
+                "selected_window_issue_count": 1,
+                "reason_code_counts": {"source_range_unavailable": 1},
+                "status_counts": {"unsupported": 1},
+                "affected_date_count": 1,
+                "affected_dates": ["2026-01-15"],
+            }
+        )
+        unsupported_without_fact_evidence["markets"][0]["facts"][
+            "daily"
+        ].update(
+            {
+                "status": "unsupported",
+                "reason_code": "source_range_unavailable",
+                "retryable": False,
+                "action": None,
+            }
+        )
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "daily.*(?:action|evidence)",
+        ):
+            validate_quality(
+                unsupported_without_fact_evidence,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        mixed_report = copy.deepcopy(quality)
+        mixed_report["metadata"]["daily_quality_report"].update(
+            {
+                "selected_window_issue_count": 2,
+                "reason_code_counts": {"network": 1, "not_listed": 1},
+                "status_counts": {
+                    "collection_failed": 1,
+                    "needs_review": 1,
+                },
+                "affected_date_count": 2,
+                "affected_dates": ["2026-01-15", "2026-01-16"],
+            }
+        )
+        mixed_daily = mixed_report["markets"][0]["facts"]["daily"]
+        mixed_daily.update(
+            {
+                "status": "collection_failed",
+                "reason_code": "multiple_daily_quality_reasons",
+                "retryable": True,
+                "action": "operator_review_retry_queue",
+            }
+        )
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "daily.*(?:action|evidence)",
+        ):
+            validate_quality(
+                mixed_report,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        mixed_daily.update(
+            {
+                "action": "operator_review_retry_and_manual_queues",
+                "daily_evidence_mode": "published_daily_audit",
+                "issue_status_counts": {
+                    "collection_failed": 1,
+                    "needs_review": 1,
+                },
+                "reason_code_counts": {
+                    "network": 1,
+                    "not_listed": 1,
+                },
+                "affected_date_count": 2,
+                "affected_dates": ["2026-01-15", "2026-01-16"],
+            }
+        )
+        validate_quality(
+            mixed_report,
+            token="AAVE",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation="generation-1",
+        )
+
+        impossible_cex_tvl = copy.deepcopy(quality)
+        impossible_cex_tvl["markets"][0]["facts"]["tvl"].update(
+            {
+                "status": "observed",
+                "reason_code": "observed",
+                "retryable": False,
+                "action": None,
+            }
+        )
+        with self.assertRaisesRegex(ReleaseCheckError, "canonical outcome"):
+            validate_quality(
+                impossible_cex_tvl,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        needs_review = copy.deepcopy(quality)
+        needs_review["markets"][0]["facts"]["depth"].update(
+            {
+                "status": "needs_review",
+                "reason_code": "not_listed",
+                "retryable": False,
+                "action": None,
+            }
+        )
+        with self.assertRaisesRegex(ReleaseCheckError, "canonical outcome"):
+            validate_quality(
+                needs_review,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+        needs_review["markets"][0]["facts"]["depth"][
+            "action"
+        ] = "operator_manual_review"
+        validate_quality(
+            needs_review,
+            token="AAVE",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation="generation-1",
+        )
+
+        invalid_tuple = copy.deepcopy(quality)
+        invalid_tuple["markets"][0]["facts"]["depth"].update(
+            {
+                "status": "unsupported",
+                "reason_code": "network",
+                "retryable": False,
+                "action": None,
+            }
+        )
+        with self.assertRaisesRegex(ReleaseCheckError, "canonical outcome"):
+            validate_quality(
+                invalid_tuple,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        critical_flag = {
+            "code": "depth_failed",
+            "severity": "critical",
+            "category": "data_health",
+            "message": "Depth collection failed validation.",
+            "observed_value": None,
+            "threshold": None,
+        }
+        status_drift = copy.deepcopy(quality)
+        status_drift["markets"][0]["quality_flags"] = [critical_flag]
+        status_drift["markets"][0]["facts"]["depth"][
+            "quality_flags"
+        ] = [copy.deepcopy(critical_flag)]
+        with self.assertRaisesRegex(ReleaseCheckError, "status.*flags"):
+            validate_quality(
+                status_drift,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        fact_flag_drift = copy.deepcopy(quality)
+        fact_flag_drift["markets"][0]["quality_status"] = "critical"
+        fact_flag_drift["markets"][0]["quality_flags"] = [critical_flag]
+        with self.assertRaisesRegex(ReleaseCheckError, "fact flag projection"):
+            validate_quality(
+                fact_flag_drift,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        selected_contract_mutations = {
+            "missing selected status": lambda row: row.pop("quality_status"),
+            "missing selected flags": lambda row: row.pop("quality_flags"),
+            "missing screening status": lambda row: row.pop(
+                "screening_quality_status"
+            ),
+            "missing screening flags": lambda row: row.pop(
+                "screening_quality_flags"
+            ),
+            "missing fact family": lambda row: row["facts"].pop("execution"),
+            "unknown fact family": lambda row: row["facts"].update(
+                {"funding": {"status": "observed"}}
+            ),
+            "fact without retryability": lambda row: row["facts"]["depth"].pop(
+                "retryable"
+            ),
+        }
+        for label, mutate in selected_contract_mutations.items():
+            with self.subTest(label=label):
+                invalid = copy.deepcopy(quality)
+                mutate(invalid["markets"][0])
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "selected quality contract",
+                ):
+                    validate_quality(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                    )
         stale_quality = copy.deepcopy(quality)
         stale_quality["metadata"]["data_generation"] = "generation-2"
         with self.assertRaisesRegex(ReleaseCheckError, "generations differ"):
@@ -943,6 +1327,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             ]
 
         execution = {
+            "metadata": {"data_generation": "generation-1"},
             "token_symbol": "AAVE",
             "market_a": {
                 "market": {"market_id": market_a},
@@ -960,7 +1345,18 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             token="AAVE",
             market_a=market_a,
             market_b=market_b,
+            expected_generation="generation-1",
         )
+        stale_execution = copy.deepcopy(execution)
+        stale_execution["metadata"]["data_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "generations differ"):
+            validate_execution(
+                stale_execution,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
         unsupported_execution = {
             **execution,
             "market_a": {
@@ -974,6 +1370,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 token="AAVE",
                 market_a=market_a,
                 market_b=market_b,
+                expected_generation="generation-1",
             )
 
     def event_payload(self):

@@ -9,6 +9,13 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from scripts.quality_outcomes import (
+    normalize_cex_source_outcome,
+    normalize_dex_depth_source_outcome,
+    normalize_tvl_source_outcome,
+    sanitize_public_source_endpoint,
+)
+
 
 CATALOG_VERSION = 2
 DAILY_GRAIN = "1 day, UTC"
@@ -249,7 +256,20 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
         "depth_status" if market_type == "cex" else "dex_depth_status",
         row.get("depth_status"),
     )
-    normalized_status = str(depth_status or "unavailable").lower()
+    if market_type == "cex":
+        normalized_status, _depth_reason_code = normalize_cex_source_outcome(
+            depth_status or "unavailable",
+            row.get("depth_reason_code"),
+            row.get("depth_error"),
+        )
+    else:
+        normalized_status, _depth_reason_code = (
+            normalize_dex_depth_source_outcome(
+                depth_status or "unavailable",
+                row.get("dex_depth_reason_code", row.get("depth_reason_code")),
+                row.get("dex_depth_error", row.get("depth_error")),
+            )
+        )
     if normalized_status in {
         "unsupported",
         "unsupported_protocol",
@@ -272,7 +292,7 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
                 observed_value=depth_status,
             )
         )
-    elif normalized_status in {"failed", "error"}:
+    elif normalized_status in {"failed", "error", "collection_failed"}:
         flags.append(
             _quality_flag(
                 "depth_failed",
@@ -885,6 +905,11 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Build a stable, source-described catalog from a full-window market payload."""
     markets: list[dict[str, Any]] = []
     for row in payload["cex_markets"]:
+        depth_status, depth_reason_code = normalize_cex_source_outcome(
+            row.get("depth_status") or "unavailable",
+            row.get("depth_reason_code"),
+            row.get("depth_error"),
+        )
         markets.append(
             {
                 "market_id": cex_market_id(row["venue"], row["instrument"]),
@@ -900,16 +925,18 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "price_quote_asset": PRICE_QUOTE_ASSET,
                 "source_quote_asset_label": source_quote_asset(row["instrument"]),
                 "source": f"{row['venue']} public daily OHLCV API",
-                "depth_status": row.get("depth_status"),
+                "depth_status": depth_status,
+                "depth_reason_code": depth_reason_code,
                 "depth_observed_at": row.get("depth_observed_at"),
                 "depth_method": row.get("depth_method"),
                 "depth_snapshot_id": row.get("depth_snapshot_id"),
                 "depth_source": row.get("depth_source"),
-                "depth_source_endpoint": row.get("depth_source_endpoint"),
+                "depth_source_endpoint": sanitize_public_source_endpoint(
+                    row.get("depth_source_endpoint")
+                ),
                 "depth_raw_response_sha256": row.get(
                     "depth_raw_response_sha256"
                 ),
-                "depth_error": row.get("depth_error"),
                 "depth_requires_usd_price_alignment": row.get(
                     "depth_requires_usd_price_alignment", False
                 ),
@@ -976,6 +1003,16 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
             }
         )
     for row in payload["dex_pools"]:
+        tvl_status, tvl_reason_code = normalize_tvl_source_outcome(
+            row.get("tvl_status") or "unavailable",
+            row.get("tvl_reason_code"),
+            row.get("tvl_error"),
+        )
+        depth_status, depth_reason_code = normalize_dex_depth_source_outcome(
+            row.get("dex_depth_status") or "unavailable",
+            row.get("dex_depth_reason_code"),
+            row.get("dex_depth_error"),
+        )
         markets.append(
             {
                 "market_id": dex_market_id(
@@ -1002,28 +1039,30 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "source_quote_asset_label": "USD (GeckoTerminal currency=usd)",
                 "source": "GeckoTerminal API v2 daily pool OHLCV",
                 "tvl_usd": row.get("tvl_usd"),
-                "tvl_status": row.get("tvl_status"),
+                "tvl_status": tvl_status,
+                "tvl_reason_code": tvl_reason_code,
                 "tvl_observed_at": row.get("tvl_observed_at"),
                 "tvl_method": row.get("tvl_method"),
                 "tvl_snapshot_id": row.get("tvl_snapshot_id"),
                 "tvl_source": row.get("tvl_source"),
-                "tvl_source_endpoint": row.get("tvl_source_endpoint"),
+                "tvl_source_endpoint": sanitize_public_source_endpoint(
+                    row.get("tvl_source_endpoint")
+                ),
                 "tvl_raw_response_sha256": row.get(
                     "tvl_raw_response_sha256"
                 ),
-                "tvl_error": row.get("tvl_error"),
-                "depth_status": row.get("dex_depth_status"),
+                "depth_status": depth_status,
+                "depth_reason_code": depth_reason_code,
                 "depth_observed_at": row.get("dex_depth_observed_at"),
                 "depth_method": row.get("dex_depth_method"),
                 "depth_snapshot_id": row.get("dex_depth_snapshot_id"),
                 "depth_source": row.get("dex_depth_source"),
-                "depth_source_endpoint": row.get(
-                    "dex_depth_source_endpoint"
+                "depth_source_endpoint": sanitize_public_source_endpoint(
+                    row.get("dex_depth_source_endpoint")
                 ),
                 "depth_raw_response_sha256": row.get(
                     "dex_depth_raw_response_sha256"
                 ),
-                "depth_error": row.get("dex_depth_error"),
                 "depth_protocol_model": row.get("dex_depth_protocol_model"),
                 "depth_block_number": row.get("dex_depth_block_number"),
                 "depth_block_timestamp": row.get(

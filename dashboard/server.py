@@ -50,10 +50,15 @@ try:
         market_series_statistics,
     )
     from scripts.quality_outcomes import (
+        canonical_quality_fact_action,
+        canonical_quality_fact_rule,
         cex_reason_code,
         normalize_cex_source_outcome,
-        project_dex_unsupported_error,
+        normalize_dex_depth_source_outcome,
+        normalize_execution_source_outcome,
+        normalize_tvl_source_outcome,
         quality_outcome_rule,
+        sanitize_public_source_endpoint,
     )
     from dashboard.public_actions import (
         PUBLIC_ACTION_PATHS,
@@ -95,10 +100,15 @@ except ModuleNotFoundError:
         market_series_statistics,
     )
     from scripts.quality_outcomes import (
+        canonical_quality_fact_action,
+        canonical_quality_fact_rule,
         cex_reason_code,
         normalize_cex_source_outcome,
-        project_dex_unsupported_error,
+        normalize_dex_depth_source_outcome,
+        normalize_execution_source_outcome,
+        normalize_tvl_source_outcome,
         quality_outcome_rule,
+        sanitize_public_source_endpoint,
     )
     from public_actions import (  # type: ignore[no-redef]
         PUBLIC_ACTION_PATHS,
@@ -139,6 +149,7 @@ from scripts.execution_cost import (
 )
 from dashboard.event_facts import (
     EventBundleError,
+    LIFECYCLES,
     build_event_payload,
     load_latest_event_rows,
 )
@@ -167,6 +178,11 @@ VENDOR_FILES = {
 }
 PUBLIC_DATA_UNAVAILABLE_MESSAGE = (
     "Market fact data is temporarily unavailable. Retry after the next refresh."
+)
+PUBLIC_DATA_VALIDATION_ERROR_CODE = "public_data_validation_failed"
+PUBLIC_DATA_VALIDATION_ERROR_MESSAGE = (
+    "Published market fact data failed validation. "
+    "Retry after the next refresh."
 )
 NON_RETRYABLE_CEX_DEPTH_REASON_CODES = {
     "source_no_two_sided_book",
@@ -216,6 +232,10 @@ PUBLIC_API_QUERY_FIELDS = {
 
 class SourceGenerationChanged(FileNotFoundError):
     """Signal temporary source unavailability across one response build."""
+
+
+class PublicClientRequestError(ValueError):
+    """A bounded public GET parameter error that is safe to return as HTTP 400."""
 
 ADMIN_STATIC_PATHS = {"/admin.html", "/admin.js", "/admin.css"}
 SPA_TOKEN_PAGES = {"markets", "compare", "liquidity", "events", "quality"}
@@ -274,7 +294,12 @@ def parse_iso_date(value: str | None) -> str | None:
     """Validate an optional ISO date and return its normalized form."""
     if not value:
         return None
-    return date.fromisoformat(value).isoformat()
+    try:
+        return date.fromisoformat(value).isoformat()
+    except (TypeError, ValueError) as error:
+        raise PublicClientRequestError(
+            "date must use YYYY-MM-DD"
+        ) from error
 
 
 def resolve_data_paths() -> tuple[Path, Path]:
@@ -743,6 +768,28 @@ def data_signature(paths: Iterable[Path]) -> SourceSignature:
     return tuple(signature)
 
 
+def _inventory_observed_at_bounds(
+    rows: Iterable[dict[str, Any]],
+    field: str = "observed_at",
+) -> tuple[str | None, str | None]:
+    """Return canonical UTC bounds across valid full-inventory timestamps."""
+    observed = []
+    for row in rows:
+        value = str(row.get(field) or "").strip()
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            continue
+        observed.append(parsed.astimezone(timezone.utc))
+    if not observed:
+        return None, None
+    return min(observed).isoformat(), max(observed).isoformat()
+
+
 @lru_cache(maxsize=8)
 def _load_tvl_snapshot_cached(
     path_text: str,
@@ -783,11 +830,16 @@ def _load_tvl_snapshot_cached(
         if key not in latest or row["observed_at"] > latest[key]["observed_at"]:
             latest[key] = row
     snapshot_ids = sorted({row["snapshot_id"] for row in rows if row.get("snapshot_id")})
+    observed_at_min, observed_at_max = _inventory_observed_at_bounds(
+        latest.values()
+    )
     return {
         "path": path,
         "rows": latest,
         "snapshot_ids": snapshot_ids,
-        "observed_at": max(row["observed_at"] for row in rows),
+        "observed_at": observed_at_min,
+        "observed_at_min": observed_at_min,
+        "observed_at_max": observed_at_max,
         "status_counts": {
             status: sum(row.get("status") == status for row in rows)
             for status in ("observed", "missing", "not_found", "failed")
@@ -800,13 +852,22 @@ def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict
     result = copy.deepcopy(payload)
     if tvl_path is None:
         for pool in result["dex_pools"]:
-            pool["tvl_status"] = "legacy_ohlcv_snapshot" if pool.get("tvl_usd") is not None else "unavailable"
+            pool["tvl_status"] = (
+                "legacy_ohlcv_snapshot"
+                if pool.get("tvl_usd") is not None
+                else "unavailable"
+            )
             pool["tvl_observed_at"] = None
             pool["tvl_method"] = "legacy_geckoterminal_reserve_in_usd"
             pool["tvl_snapshot_id"] = None
             pool["tvl_source"] = None
             pool["tvl_source_endpoint"] = None
             pool["tvl_raw_response_sha256"] = None
+            pool["tvl_reason_code"] = (
+                "legacy_ohlcv_snapshot"
+                if pool["tvl_status"] == "legacy_ohlcv_snapshot"
+                else "tvl_snapshot_unavailable"
+            )
             pool["tvl_error"] = None
         return result
 
@@ -833,15 +894,23 @@ def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict
             pool["tvl_source"] = None
             pool["tvl_source_endpoint"] = None
             pool["tvl_raw_response_sha256"] = None
+            pool["tvl_reason_code"] = "tvl_market_not_cataloged_in_snapshot"
             pool["tvl_error"] = None
             continue
         matched += 1
+        tvl_status, tvl_reason_code = normalize_tvl_source_outcome(
+            tvl_row.get("status"),
+            tvl_row.get("reason_code"),
+            tvl_row.get("error"),
+        )
         pool["tvl_usd"] = (
             parse_number(tvl_row.get("tvl_usd"))
             if tvl_row.get("status") == "observed"
             else None
         )
-        pool["tvl_status"] = tvl_row.get("status")
+        pool["tvl_source_status"] = tvl_row.get("status")
+        pool["tvl_status"] = tvl_status
+        pool["tvl_reason_code"] = tvl_reason_code
         pool["tvl_observed_at"] = tvl_row.get("observed_at") or None
         pool["tvl_method"] = tvl_row.get("tvl_method") or None
         pool["tvl_snapshot_id"] = tvl_row.get("snapshot_id") or None
@@ -858,6 +927,8 @@ def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict
     metadata["tvl_snapshot"] = {
         "snapshot_ids": snapshot["snapshot_ids"],
         "observed_at": snapshot["observed_at"],
+        "observed_at_min": snapshot["observed_at_min"],
+        "observed_at_max": snapshot["observed_at_max"],
         "pool_rows": len(snapshot["rows"]),
         "matched_market_rows": matched,
         "status_counts": snapshot["status_counts"],
@@ -929,11 +1000,16 @@ def _load_cex_depth_snapshot_cached(
         if key not in latest or row["response_received_at"] > latest[key]["response_received_at"]:
             latest[key] = row
     snapshot_ids = sorted({row["snapshot_id"] for row in rows if row.get("snapshot_id")})
+    observed_at_min, observed_at_max = _inventory_observed_at_bounds(
+        latest.values()
+    )
     return {
         "path": path,
         "rows": latest,
         "snapshot_ids": snapshot_ids,
-        "observed_at": max(row["observed_at"] for row in rows),
+        "observed_at": observed_at_min,
+        "observed_at_min": observed_at_min,
+        "observed_at_max": observed_at_max,
         "status_counts": {
             status: sum(row.get("status") == status for row in rows)
             for status in ("observed", "partial", "failed")
@@ -973,7 +1049,8 @@ def overlay_cex_depth_snapshot(
             market["depth_source"] = None
             market["depth_source_endpoint"] = None
             market["depth_raw_response_sha256"] = None
-            market["depth_reason_code"] = None
+            market["depth_reason_code"] = "depth_snapshot_unavailable"
+            market["depth_source_status"] = None
             market["depth_error"] = None
         result["metadata"]["cex_depth_note"] = (
             "CEX depth snapshot is unavailable. Daily volume is not used as a depth proxy."
@@ -1025,7 +1102,10 @@ def overlay_cex_depth_snapshot(
             market["depth_source"] = None
             market["depth_source_endpoint"] = None
             market["depth_raw_response_sha256"] = None
-            market["depth_reason_code"] = "not_cataloged_in_snapshot"
+            market["depth_reason_code"] = (
+                "depth_market_not_cataloged_in_snapshot"
+            )
+            market["depth_source_status"] = None
             market["depth_error"] = None
             for field in numeric_fields:
                 market[field] = None
@@ -1034,7 +1114,14 @@ def overlay_cex_depth_snapshot(
             continue
 
         matched += 1
-        market["depth_status"] = depth_row.get("status")
+        source_status = depth_row.get("status")
+        depth_status, depth_reason_code = normalize_cex_source_outcome(
+            source_status,
+            depth_row.get("reason_code"),
+            depth_row.get("error"),
+        )
+        market["depth_source_status"] = source_status
+        market["depth_status"] = depth_status
         market["depth_observed_at"] = depth_row.get("observed_at") or None
         market["depth_method"] = depth_row.get("depth_method") or None
         market["depth_snapshot_id"] = depth_row.get("snapshot_id") or None
@@ -1048,9 +1135,9 @@ def overlay_cex_depth_snapshot(
         market["depth_raw_response_sha256"] = (
             depth_row.get("raw_response_sha256") or None
         )
-        market["depth_reason_code"] = cex_depth_reason_code(depth_row)
+        market["depth_reason_code"] = depth_reason_code
         market["depth_error"] = depth_row.get("error") or None
-        observed = depth_row.get("status") in {"observed", "partial"}
+        observed = source_status in {"observed", "partial"}
         for field in numeric_fields:
             market[field] = parse_number(depth_row.get(field)) if observed else None
         for field in completeness_fields:
@@ -1065,6 +1152,8 @@ def overlay_cex_depth_snapshot(
     metadata["cex_depth_snapshot"] = {
         "snapshot_ids": snapshot["snapshot_ids"],
         "observed_at": snapshot["observed_at"],
+        "observed_at_min": snapshot["observed_at_min"],
+        "observed_at_max": snapshot["observed_at_max"],
         "market_rows": len(snapshot["rows"]),
         "matched_market_rows": matched,
         "status_counts": snapshot["status_counts"],
@@ -1145,11 +1234,16 @@ def _load_dex_depth_snapshot_cached(
     snapshot_ids = sorted(
         {row["snapshot_id"] for row in rows if row.get("snapshot_id")}
     )
+    observed_at_min, observed_at_max = _inventory_observed_at_bounds(
+        latest.values()
+    )
     return {
         "path": path,
         "rows": latest,
         "snapshot_ids": snapshot_ids,
-        "observed_at": max(row["observed_at"] for row in rows),
+        "observed_at": observed_at_min,
+        "observed_at_min": observed_at_min,
+        "observed_at_max": observed_at_max,
         "status_counts": dict(
             Counter(row.get("status") or "missing_status" for row in rows)
         ),
@@ -1171,6 +1265,7 @@ def overlay_dex_depth_snapshot(
             pool["dex_depth_source"] = None
             pool["dex_depth_source_endpoint"] = None
             pool["dex_depth_raw_response_sha256"] = None
+            pool["dex_depth_reason_code"] = "depth_snapshot_unavailable"
             pool["dex_depth_error"] = None
             pool["dex_depth_block_timestamp"] = None
             pool["dex_depth_usd_price_source_snapshot_id"] = None
@@ -1220,6 +1315,9 @@ def overlay_dex_depth_snapshot(
             pool["dex_depth_source"] = None
             pool["dex_depth_source_endpoint"] = None
             pool["dex_depth_raw_response_sha256"] = None
+            pool["dex_depth_reason_code"] = (
+                "depth_market_not_cataloged_in_snapshot"
+            )
             pool["dex_depth_error"] = None
             pool["dex_depth_block_timestamp"] = None
             pool["dex_depth_usd_price_source_snapshot_id"] = None
@@ -1234,7 +1332,14 @@ def overlay_dex_depth_snapshot(
             continue
 
         matched += 1
-        pool["dex_depth_status"] = depth_row.get("status")
+        source_status = depth_row.get("status")
+        depth_status, depth_reason_code = normalize_dex_depth_source_outcome(
+            source_status,
+            depth_row.get("reason_code"),
+            depth_row.get("error"),
+        )
+        pool["dex_depth_status"] = depth_status
+        pool["dex_depth_reason_code"] = depth_reason_code
         pool["dex_depth_observed_at"] = depth_row.get("observed_at") or None
         pool["dex_depth_method"] = depth_row.get("depth_method") or None
         pool["dex_depth_snapshot_id"] = depth_row.get("snapshot_id") or None
@@ -1276,7 +1381,6 @@ def overlay_dex_depth_snapshot(
         pool["depth_requires_usd_price_alignment"] = str(
             depth_row.get("depth_requires_usd_price_alignment") or ""
         ).strip().lower() in {"1", "true", "yes"}
-        source_status = depth_row.get("status")
         measured = (
             source_status in {"observed", "partial"}
             and (
@@ -1290,7 +1394,8 @@ def overlay_dex_depth_snapshot(
             and pool["depth_requires_usd_price_alignment"]
             and not price_timing["usable"]
         ):
-            pool["dex_depth_status"] = "failed"
+            pool["dex_depth_status"] = "collection_failed"
+            pool["dex_depth_reason_code"] = "source_unavailable"
             pool["dex_depth_error"] = price_timing["reason"]
         for field in numeric_fields:
             pool[field] = (
@@ -1308,6 +1413,8 @@ def overlay_dex_depth_snapshot(
     metadata["dex_depth_snapshot"] = {
         "snapshot_ids": snapshot["snapshot_ids"],
         "observed_at": snapshot["observed_at"],
+        "observed_at_min": snapshot["observed_at_min"],
+        "observed_at_max": snapshot["observed_at_max"],
         "pool_rows": len(snapshot["rows"]),
         "matched_market_rows": matched,
         "status_counts": snapshot["status_counts"],
@@ -1361,9 +1468,11 @@ def _build_market_payload_cached(
     default_start = (date.fromisoformat(effective_end) - timedelta(days=29)).isoformat()
     effective_start = parse_iso_date(start) or max(available_start, default_start)
     if effective_start > effective_end:
-        raise ValueError("start date must not be after end date")
+        raise PublicClientRequestError("start date must not be after end date")
     if effective_start < available_start or effective_end > available_end:
-        raise ValueError(f"date window must be within {available_start} and {available_end}")
+        raise PublicClientRequestError(
+            f"date window must be within {available_start} and {available_end}"
+        )
 
     full_catalog_window = (
         effective_start == available_start
@@ -1384,7 +1493,9 @@ def _build_market_payload_cached(
         full_catalog_window,
     )
     if not cex_markets and not dex_pools:
-        raise ValueError("No market observations exist in the selected time window")
+        raise PublicClientRequestError(
+            "No market observations exist in the selected time window"
+        )
 
     return {
         "metadata": {
@@ -1436,9 +1547,11 @@ def _build_database_payload_cached(
         default_start = (date.fromisoformat(effective_end) - timedelta(days=29)).isoformat()
         effective_start = parse_iso_date(start) or max(available_start, default_start)
         if effective_start > effective_end:
-            raise ValueError("start date must not be after end date")
+            raise PublicClientRequestError("start date must not be after end date")
         if effective_start < available_start or effective_end > available_end:
-            raise ValueError(f"date window must be within {available_start} and {available_end}")
+            raise PublicClientRequestError(
+                f"date window must be within {available_start} and {available_end}"
+            )
 
         cex_bounds_row = connection.execute(
             "SELECT MIN(date) AS available_start, MAX(date) AS available_end "
@@ -1504,7 +1617,9 @@ def _build_database_payload_cached(
         full_catalog_window,
     )
     if not cex_markets and not dex_pools:
-        raise ValueError("No market observations exist in the selected time window")
+        raise PublicClientRequestError(
+            "No market observations exist in the selected time window"
+        )
 
     return {
         "metadata": {
@@ -1554,7 +1669,7 @@ def execution_freshness_observed_at(path: Path | None) -> str | None:
         snapshot = load_execution_cost_snapshot(path)
     except (OSError, ValueError):
         return None
-    return snapshot.get("state_observed_at") if snapshot else None
+    return snapshot.get("state_observed_at_min") if snapshot else None
 
 
 def attach_freshness_metadata(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1690,7 +1805,10 @@ def _build_market_catalog_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]:
     return catalog_from_market_payload(_build_enriched_payload_cached(cache_key))
 
 
-def build_market_catalog() -> dict[str, Any]:
+def build_market_catalog(
+    *,
+    source_signature: SourceSignature | None = None,
+) -> dict[str, Any]:
     """Return every observed market plus the versioned fact contract."""
     with SOURCE_CACHE_GENERATION_LOCK:
         default_payload = build_market_payload()
@@ -1700,11 +1818,20 @@ def build_market_catalog() -> dict[str, Any]:
             metadata["available_end"],
         )
         catalog = _build_market_catalog_cached(cache_key)
+        generation_signature = (
+            source_signature
+            if source_signature is not None
+            else api_source_signature()
+        )
         return {
             **catalog,
             "metadata": {
                 **catalog["metadata"],
                 "freshness": metadata.get("freshness"),
+                "data_generation": _public_data_generation(
+                    catalog["metadata"],
+                    generation_signature,
+                ),
             },
         }
 
@@ -1890,6 +2017,7 @@ def catalog_summary_from_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
             ),
             "default_workspace_token": default_workspace_token,
             "freshness": metadata.get("freshness"),
+            "data_generation": metadata.get("data_generation"),
         },
         "tokens": [summary["token_symbol"] for summary in token_summaries],
         "token_summaries": token_summaries,
@@ -1903,10 +2031,12 @@ def token_catalog_from_catalog(
     """Return one exact Token's markets without pretending it is a global catalog."""
     token = (token_symbol or "").strip().upper()
     if not token:
-        raise ValueError("Token is required for a single-Token market catalog")
+        raise PublicClientRequestError(
+            "Token is required for a single-Token market catalog"
+        )
     catalog_tokens = set(catalog.get("tokens", []))
     if token not in catalog_tokens:
-        raise ValueError("Token is not cataloged")
+        raise PublicClientRequestError("Token is not cataloged")
     markets = []
     for market in catalog.get("markets", []):
         if market.get("token_symbol") != token:
@@ -2041,6 +2171,8 @@ def _compact_screener_market(
     }
     tvl_fact = _tvl_quality_fact(quality_market)
     depth_fact = _depth_quality_fact(quality_market)
+    compact["tvl_status"] = tvl_fact["status"]
+    compact["depth_status"] = depth_fact["status"]
     compact["tvl_retryable"] = tvl_fact["retryable"]
     compact["tvl_na_reason"] = tvl_fact.get("reason_code")
     compact["depth_retryable"] = depth_fact["retryable"]
@@ -2232,7 +2364,7 @@ def build_market_summary(
 ) -> dict[str, Any]:
     """Return one compact, window-aware response for the all-Token Screener."""
     payload = build_market_payload(start, end)
-    catalog = build_market_catalog()
+    catalog = build_market_catalog(source_signature=source_signature)
     generation_signature = (
         source_signature if source_signature is not None else api_source_signature()
     )
@@ -2285,7 +2417,10 @@ def build_token_market_catalog(
     allow_empty_window: bool = False,
 ) -> dict[str, Any]:
     """Return complete catalog facts plus compact selected-window metrics for one Token."""
-    token_catalog = token_catalog_from_catalog(build_market_catalog(), token_symbol)
+    token_catalog = token_catalog_from_catalog(
+        build_market_catalog(source_signature=source_signature),
+        token_symbol,
+    )
     try:
         window_payload = build_market_payload(start, end)
     except ValueError as error:
@@ -2370,9 +2505,11 @@ def validate_fact_window(
     default_start = (date.fromisoformat(effective_end) - timedelta(days=29)).isoformat()
     effective_start = parse_iso_date(start) or max(available_start, default_start)
     if effective_start > effective_end:
-        raise ValueError("start date must not be after end date")
+        raise PublicClientRequestError("start date must not be after end date")
     if effective_start < available_start or effective_end > available_end:
-        raise ValueError(f"date window must be within {available_start} and {available_end}")
+        raise PublicClientRequestError(
+            f"date window must be within {available_start} and {available_end}"
+        )
     return effective_start, effective_end
 
 
@@ -2476,15 +2613,21 @@ def build_market_comparison(
     market_b_id: str | None,
     start: str | None = None,
     end: str | None = None,
+    *,
+    source_signature: SourceSignature | None = None,
 ) -> dict[str, Any]:
     """Return aligned raw daily facts for two selected markets."""
     if not token_symbol or not market_a_id or not market_b_id:
-        raise ValueError("token, market_a, and market_b are required")
+        raise PublicClientRequestError(
+            "token, market_a, and market_b are required"
+        )
     token = token_symbol.upper()
     if market_a_id == market_b_id:
-        raise ValueError("market_a and market_b must be different")
+        raise PublicClientRequestError(
+            "market_a and market_b must be different"
+        )
 
-    catalog = build_market_catalog()
+    catalog = build_market_catalog(source_signature=source_signature)
     metadata = catalog["metadata"]
     effective_start, effective_end = validate_fact_window(
         start,
@@ -2500,7 +2643,9 @@ def build_market_comparison(
     market_a = markets.get(market_a_id)
     market_b = markets.get(market_b_id)
     if market_a is None or market_b is None:
-        raise ValueError("Selected market is not cataloged for the requested token")
+        raise PublicClientRequestError(
+            "Selected market is not cataloged for the requested token"
+        )
 
     rows_a = selected_market_rows(market_a, effective_start, effective_end)
     rows_b = selected_market_rows(market_b, effective_start, effective_end)
@@ -2529,6 +2674,7 @@ def build_market_comparison(
             "end_date": effective_end,
             "sources": metadata["sources"],
             "storage": metadata["storage"],
+            "data_generation": metadata["data_generation"],
             "comparison_days": len(comparable),
             "union_observation_days": len(observations),
         },
@@ -2571,11 +2717,10 @@ def _load_execution_cost_snapshot_cached(
                 EXECUTION_DIRECTIONS.index(row["direction"]),
             )
         )
-    state_times = [
-        row["state_observed_at"]
-        for row in rows
-        if row.get("state_observed_at")
-    ]
+    observed_at_min, observed_at_max = _inventory_observed_at_bounds(rows)
+    state_observed_at_min, state_observed_at_max = (
+        _inventory_observed_at_bounds(rows, "state_observed_at")
+    )
     return {
         "path": path,
         "rows": rows,
@@ -2590,11 +2735,12 @@ def _load_execution_cost_snapshot_cached(
                 if row.get("source_snapshot_id")
             }
         ),
-        "observed_at": max(
-            (row["observed_at"] for row in rows if row.get("observed_at")),
-            default=None,
-        ),
-        "state_observed_at": max(state_times, default=None),
+        "observed_at": observed_at_min,
+        "observed_at_min": observed_at_min,
+        "observed_at_max": observed_at_max,
+        "state_observed_at": state_observed_at_min,
+        "state_observed_at_min": state_observed_at_min,
+        "state_observed_at_max": state_observed_at_max,
         "market_count": len(by_market),
         "row_count": len(rows),
         "status_counts": dict(
@@ -2701,14 +2847,11 @@ def _execution_public_rows(
     for source_row, public_row in zip(rows, public_rows):
         if source_row.get("status") not in {"observed", "partial"}:
             continue
-        public_row["source_status"] = source_row.get("status")
-        public_row["source_status_reason"] = source_row.get("status_reason")
+        public_row["source_status"] = public_row.get("status")
+        public_row["source_status_reason"] = public_row.get("status_reason")
         public_row["status"] = "failed"
-        public_row["status_reason"] = str(timing["reason"])
-        public_row["error"] = (
-            "Execution values withheld because the required USD-price "
-            "observation is unavailable or more than two hours from market state."
-        )
+        public_row["status_reason"] = "execution_usd_price_time_mismatch"
+        public_row["error"] = None
         for field in RESULT_NUMERIC_COLUMNS:
             public_row[field] = None
     return public_rows
@@ -2723,7 +2866,11 @@ def _execution_snapshot_metadata(
         "snapshot_ids": snapshot["snapshot_ids"],
         "source_snapshot_ids": snapshot["source_snapshot_ids"],
         "observed_at": snapshot["observed_at"],
+        "observed_at_min": snapshot["observed_at_min"],
+        "observed_at_max": snapshot["observed_at_max"],
         "state_observed_at": snapshot["state_observed_at"],
+        "state_observed_at_min": snapshot["state_observed_at_min"],
+        "state_observed_at_max": snapshot["state_observed_at_max"],
         "market_count": snapshot["market_count"],
         "row_count": snapshot["row_count"],
         "status_counts": snapshot["status_counts"],
@@ -2735,14 +2882,20 @@ def build_execution_cost_comparison(
     token_symbol: str | None,
     market_a_id: str | None,
     market_b_id: str | None,
+    *,
+    source_signature: SourceSignature | None = None,
 ) -> dict[str, Any]:
     """Return source-backed fixed-notional facts for two exact catalog markets."""
     if not token_symbol or not market_a_id or not market_b_id:
-        raise ValueError("token, market_a, and market_b are required")
+        raise PublicClientRequestError(
+            "token, market_a, and market_b are required"
+        )
     if market_a_id == market_b_id:
-        raise ValueError("market_a and market_b must be different")
+        raise PublicClientRequestError(
+            "market_a and market_b must be different"
+        )
     token = token_symbol.upper()
-    catalog = build_market_catalog()
+    catalog = build_market_catalog(source_signature=source_signature)
     markets = {
         market["market_id"]: market
         for market in catalog["markets"]
@@ -2751,7 +2904,9 @@ def build_execution_cost_comparison(
     market_a = markets.get(market_a_id)
     market_b = markets.get(market_b_id)
     if market_a is None or market_b is None:
-        raise ValueError("Selected market is not cataloged for the requested token")
+        raise PublicClientRequestError(
+            "Selected market is not cataloged for the requested token"
+        )
 
     selected_market_types = {
         market_a["market_type"],
@@ -2825,6 +2980,7 @@ def build_execution_cost_comparison(
     return {
         "metadata": {
             "contract_version": EXECUTION_COST_CONTRACT_VERSION,
+            "data_generation": catalog["metadata"]["data_generation"],
             "notionals_usd": [int(value) for value in EXECUTION_NOTIONALS_USD],
             "directions": list(EXECUTION_DIRECTIONS),
             "notional_definition": NOTIONAL_DEFINITION,
@@ -3355,7 +3511,7 @@ def _quality_lineage(
         "status": status,
         "observed_at": observed_at,
         "source": source,
-        "source_endpoint": source_endpoint,
+        "source_endpoint": sanitize_public_source_endpoint(source_endpoint),
         "method": method,
         "reason": reason,
         "reason_code": reason_code or reason,
@@ -3364,6 +3520,81 @@ def _quality_lineage(
         "snapshot_id": snapshot_id,
         "dataset_sha256": dataset_sha256,
         "raw_response_sha256": raw_response_sha256,
+    }
+
+
+def _validated_public_quality_fact(
+    fact: dict[str, Any],
+    *,
+    market_type: str | None = None,
+    fact_name: str | None = None,
+) -> dict[str, Any]:
+    """Fail closed when a public status/reason/retryability tuple is invalid."""
+    normalized_fact = {
+        **fact,
+        "quality_flags": list(fact.get("quality_flags") or []),
+    }
+    rule = (
+        canonical_quality_fact_rule(
+            market_type,
+            fact_name,
+            normalized_fact.get("status"),
+            normalized_fact.get("reason_code"),
+        )
+        if market_type is not None and fact_name is not None
+        else quality_outcome_rule(
+            normalized_fact.get("status"),
+            normalized_fact.get("reason_code"),
+        )
+    )
+    if (
+        rule is not None
+        and normalized_fact.get("retryable") is rule.retryable
+    ):
+        if market_type is not None and fact_name is not None:
+            normalized_fact["action"] = canonical_quality_fact_action(
+                market_type,
+                fact_name,
+                normalized_fact.get("status"),
+                normalized_fact.get("reason_code"),
+                normalized_fact.get("retryable"),
+                daily_evidence_mode=normalized_fact.get(
+                    "daily_evidence_mode"
+                ),
+                manual_review_present=bool(
+                    (normalized_fact.get("issue_status_counts") or {}).get(
+                        "needs_review"
+                    )
+                ),
+            )
+        return normalized_fact
+    flags = normalized_fact["quality_flags"]
+    if not any(
+        flag.get("code") == "daily_quality_outcome_invalid"
+        for flag in flags
+        if isinstance(flag, dict)
+    ):
+        flags.append(
+            {
+                "code": "daily_quality_outcome_invalid",
+                "severity": "warning",
+                "category": "data_health",
+                "message": (
+                    "The public quality outcome failed its exact bounded "
+                    "status/reason contract and requires operator review."
+                ),
+                "observed_value": None,
+                "threshold": None,
+            }
+        )
+    return {
+        **normalized_fact,
+        "status": "needs_review",
+        "reason": "daily_quality_outcome_invalid",
+        "reason_code": "daily_quality_outcome_invalid",
+        "retryable": False,
+        "action": "operator_manual_review",
+        "quality_flags": flags,
     }
 
 
@@ -3502,7 +3733,7 @@ def _daily_quality_fact(
         reason = "missing_daily_observations_in_selected_window"
     else:
         status = "observed"
-        reason = None
+        reason = "observed"
     dataset_source = _dataset_source_for_market(
         metadata,
         market["market_type"],
@@ -3593,12 +3824,14 @@ def _tvl_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             "value_usd": None,
             "quality_flags": [],
         }
-    status = market.get("tvl_status") or "unavailable"
-    retryable = status in {
-        "failed",
-        "collection_failed",
-        "not_cataloged_in_snapshot",
-    }
+    status, reason_code = normalize_tvl_source_outcome(
+        market.get("tvl_status") or "unavailable",
+        market.get("tvl_reason_code"),
+        market.get("tvl_error"),
+    )
+    outcome = quality_outcome_rule(status, reason_code)
+    assert outcome is not None
+    retryable = outcome.retryable
     return {
         **_quality_lineage(
             status=status,
@@ -3606,8 +3839,8 @@ def _tvl_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             source=market.get("tvl_source"),
             source_endpoint=market.get("tvl_source_endpoint"),
             method=market.get("tvl_method"),
-            reason=market.get("tvl_error"),
-            reason_code=market.get("tvl_error"),
+            reason=reason_code,
+            reason_code=reason_code,
             retryable=retryable,
             action="retry_tvl_collection" if retryable else None,
             snapshot_id=market.get("tvl_snapshot_id"),
@@ -3628,45 +3861,15 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             market.get("depth_reason_code"),
             market.get("depth_error"),
         )
-        if (
-            status in {"failed", "error", "collection_failed"}
-            and reason_code is None
-        ):
-            status, reason_code = "collection_failed", "source_unavailable"
-        elif status not in {
-            "observed",
-            "partial",
-            "source_no_observation",
-            "unsupported",
-            "needs_review",
-            "invalid",
-            "collection_failed",
-            "unavailable",
-            "not_cataloged_in_snapshot",
-            "not_applicable",
-        }:
-            status, reason_code = "needs_review", "daily_quality_outcome_invalid"
-    elif raw_status == "unsupported":
-        status = "unsupported"
-        reason_code = project_dex_unsupported_error(market.get("depth_error"))
-        if reason_code is None:
-            reason_code = "unsupported_source"
-    elif raw_status in {"observed", "complete"}:
-        status, reason_code = "observed", "observed"
-    elif raw_status == "partial":
-        status, reason_code = "partial", "measurement_limit"
-    elif raw_status in {"failed", "error", "collection_failed"}:
-        status, reason_code = "collection_failed", "source_unavailable"
-    elif raw_status in {
-        "unavailable",
-        "not_cataloged_in_snapshot",
-        "not_applicable",
-    }:
-        status, reason_code = raw_status, None
     else:
-        status, reason_code = "needs_review", "daily_quality_outcome_invalid"
+        status, reason_code = normalize_dex_depth_source_outcome(
+            raw_status,
+            market.get("depth_reason_code"),
+            market.get("depth_error"),
+        )
     outcome = quality_outcome_rule(status, reason_code)
-    retryable = outcome.retryable if outcome is not None else False
+    assert outcome is not None
+    retryable = outcome.retryable
     temporal_alignment = {
         "state_observed_at": (
             market.get("depth_block_timestamp")
@@ -3713,6 +3916,8 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
                     "The source responded successfully but supplied no "
                     "two-sided executable order-book observation."
                 ),
+                "observed_value": None,
+                "threshold": None,
             }
         )
     timing_status = temporal_alignment["status"]
@@ -3903,21 +4108,55 @@ def _execution_quality_fact(
         }
 
     temporal_alignment = _execution_temporal_alignment(rows)
-    status_counts = Counter(
-        row.get("status") or "failed"
+    market_type = str(
+        market.get("market_type")
+        or _one_execution_value(rows, "market_type")
+        or ""
+    ).lower()
+    public_row_outcomes = [
+        normalize_execution_source_outcome(
+            market_type,
+            row.get("status"),
+            row.get("status_reason"),
+            row.get("error"),
+        )
         for row in rows
+    ]
+    status_counts = Counter(
+        status for status, _reason_code in public_row_outcomes
     )
-    status_priority = ("failed", "partial", "unsupported", "observed")
-    status = next(
-        candidate
-        for candidate in status_priority
-        if status_counts.get(candidate)
+    status_priority = (
+        "invalid",
+        "failed",
+        "collection_failed",
+        "needs_review",
+        "partial",
+        "unsupported",
+        "source_no_observation",
+        "observed",
+    )
+    has_invalid_public_outcome = any(
+        outcome == ("needs_review", "daily_quality_outcome_invalid")
+        for outcome in public_row_outcomes
+    )
+    status = (
+        "needs_review"
+        if has_invalid_public_outcome
+        else next(
+            candidate
+            for candidate in status_priority
+            if status_counts.get(candidate)
+        )
     )
     measured = bool(
         status_counts.get("observed") or status_counts.get("partial")
     )
     temporal_flags = []
-    if measured and not temporal_alignment["usable"]:
+    if (
+        measured
+        and not temporal_alignment["usable"]
+        and not has_invalid_public_outcome
+    ):
         status = "failed"
         temporal_flags.append(
             {
@@ -3952,8 +4191,7 @@ def _execution_quality_fact(
             }
         )
     reason_counts = Counter(
-        row.get("status_reason") or "missing_status_reason"
-        for row in rows
+        reason_code for _status, reason_code in public_row_outcomes
     )
     state_times = sorted(
         {
@@ -3969,43 +4207,42 @@ def _execution_quality_fact(
             if row.get("observed_at")
         }
     )
-    errors = sorted(
+    status_reasons = sorted(
         {
-            row["error"]
-            for row in rows
-            if row.get("error")
+            reason_code
+            for outcome_status, reason_code in public_row_outcomes
+            if outcome_status == status
         }
     )
     lineage_reason = (
-        temporal_alignment["reason"]
+        "execution_usd_price_time_mismatch"
         if measured and not temporal_alignment["usable"]
-        else (
-            sorted(reason_counts)[0]
-            if len(reason_counts) == 1
-            else "mixed_execution_status_reasons"
+        and not has_invalid_public_outcome
+        else status_reasons[0]
+        if len(status_reasons) == 1
+        else "multiple_daily_quality_reasons"
+        if status == "collection_failed"
+        and status_reasons
+        and all(
+            (
+                rule := quality_outcome_rule(status, reason_code)
+            ) is not None
+            and rule.retryable
+            for reason_code in status_reasons
         )
+        else "execution_calculation_failed"
+        if status == "failed"
+        else "daily_quality_outcome_invalid"
     )
-    market_type = str(
-        market.get("market_type") or _one_execution_value(rows, "market_type") or ""
-    ).lower()
-    if market_type == "cex":
-        public_status, public_reason_code = normalize_cex_source_outcome(
-            status,
-            lineage_reason,
-            errors[0] if len(errors) == 1 else None,
-        )
-        public_outcome = quality_outcome_rule(
-            public_status, public_reason_code
-        )
-        if public_outcome is not None:
-            status, lineage_reason = public_status, public_reason_code
-            retryable = public_outcome.retryable
-        else:
-            retryable = status == "failed"
-    else:
-        retryable = status == "failed"
+    status, lineage_reason = normalize_execution_source_outcome(
+        market_type,
+        status,
+        lineage_reason,
+    )
+    public_outcome = quality_outcome_rule(status, lineage_reason)
+    assert public_outcome is not None
+    retryable = public_outcome.retryable
     if status == "source_no_observation":
-        errors = []
         reason_counts = Counter({lineage_reason: sum(status_counts.values())})
         temporal_flags = [
             flag for flag in temporal_flags
@@ -4020,6 +4257,8 @@ def _execution_quality_fact(
                     "The source responded successfully but supplied no "
                     "two-sided executable order-book observation."
                 ),
+                "observed_value": None,
+                "threshold": None,
             }
         )
     return {
@@ -4055,7 +4294,6 @@ def _execution_quality_fact(
         "published_at": published_times[-1] if published_times else None,
         "status_counts": dict(sorted(status_counts.items())),
         "status_reason_counts": dict(sorted(reason_counts.items())),
-        "errors": errors,
         "scenario_count": len(rows),
         "directions": sorted(
             {row["direction"] for row in rows if row.get("direction")}
@@ -4080,11 +4318,11 @@ def build_market_quality(
 ) -> dict[str, Any]:
     """Return a fact-by-market quality inventory for one exact Token."""
     if not token_symbol:
-        raise ValueError("token is required")
+        raise PublicClientRequestError("token is required")
     token = token_symbol.strip().upper()
     normalized_scope = (scope or "all").strip().lower()
     if normalized_scope not in {"all", "selected"}:
-        raise ValueError("scope must be all or selected")
+        raise PublicClientRequestError("scope must be all or selected")
 
     catalog = build_token_market_catalog(
         token,
@@ -4098,18 +4336,20 @@ def build_market_quality(
         if market["token_symbol"] == token
     ]
     if not token_markets:
-        raise ValueError("Token is not cataloged")
+        raise PublicClientRequestError("Token is not cataloged")
     by_id = {market["market_id"]: market for market in token_markets}
     selected_ids: list[str] = []
     if normalized_scope == "selected":
         if not market_a_id or not market_b_id:
-            raise ValueError(
+            raise PublicClientRequestError(
                 "market_a and market_b are required for selected scope"
             )
         if market_a_id == market_b_id:
-            raise ValueError("market_a and market_b must be different")
+            raise PublicClientRequestError(
+                "market_a and market_b must be different"
+            )
         if market_a_id not in by_id or market_b_id not in by_id:
-            raise ValueError(
+            raise PublicClientRequestError(
                 "Selected market is not cataloged for the requested token"
             )
         selected_ids = [market_a_id, market_b_id]
@@ -4166,6 +4406,14 @@ def build_market_quality(
                 market,
                 execution_sources[market["market_type"]],
             ),
+        }
+        facts = {
+            name: _validated_public_quality_fact(
+                fact,
+                market_type=market["market_type"],
+                fact_name=name,
+            )
+            for name, fact in facts.items()
         }
         source_no_observation_facts = {
             name for name, fact in facts.items()
@@ -4521,45 +4769,124 @@ def api_freshness_bucket() -> int:
     return int(time.time() // API_FRESHNESS_CACHE_SECONDS)
 
 
+def _public_payload_projection(value: Any) -> Any:
+    """Recursively remove protected evidence and reduce endpoints to origins."""
+    if isinstance(value, dict):
+        projected = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if (
+                key_text in {"error", "errors"}
+                or key_text.endswith("_error")
+            ):
+                continue
+            if key_text == "endpoint" or key_text.endswith("_endpoint"):
+                projected[key] = sanitize_public_source_endpoint(item)
+            else:
+                projected[key] = _public_payload_projection(item)
+        return projected
+    if isinstance(value, list):
+        return [_public_payload_projection(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_public_payload_projection(item) for item in value)
+    return value
+
+
+def _validate_public_api_client_query(
+    route: str,
+    query: dict[str, str],
+) -> None:
+    """Reject only bounded client-input errors before reading publications."""
+    start = parse_iso_date(query.get("start"))
+    end = parse_iso_date(query.get("end"))
+    if start and end and start > end:
+        message = (
+            "end must be on or after start"
+            if route == "events"
+            else "start date must not be after end date"
+        )
+        raise PublicClientRequestError(message)
+    if route == "catalog" and "token" in query and not query["token"].strip():
+        raise PublicClientRequestError(
+            "Token is required for a single-Token market catalog"
+        )
+    if route in {"compare", "execution_cost"}:
+        if not all(query.get(field) for field in ("token", "market_a", "market_b")):
+            raise PublicClientRequestError(
+                "token, market_a, and market_b are required"
+            )
+        if query["market_a"] == query["market_b"]:
+            raise PublicClientRequestError(
+                "market_a and market_b must be different"
+            )
+    if route == "quality":
+        if not query.get("token"):
+            raise PublicClientRequestError("token is required")
+        scope = (query.get("scope") or "all").strip().lower()
+        if scope not in {"all", "selected"}:
+            raise PublicClientRequestError("scope must be all or selected")
+        if scope == "selected":
+            if not query.get("market_a") or not query.get("market_b"):
+                raise PublicClientRequestError(
+                    "market_a and market_b are required for selected scope"
+                )
+            if query["market_a"] == query["market_b"]:
+                raise PublicClientRequestError(
+                    "market_a and market_b must be different"
+                )
+    if route == "events":
+        lifecycle = (query.get("lifecycle") or "").strip().lower()
+        if lifecycle and lifecycle not in LIFECYCLES:
+            raise PublicClientRequestError(
+                "lifecycle must be one of " + ", ".join(sorted(LIFECYCLES))
+            )
+
+
 def _build_public_api_payload(
     route: str,
     query_items: tuple[tuple[str, str], ...],
     source_signature: SourceSignature | None = None,
 ) -> dict[str, Any]:
     query = dict(query_items)
+    _validate_public_api_client_query(route, query)
     if route == "catalog":
         if "token" in query:
-            return build_token_market_catalog(
+            payload = build_token_market_catalog(
                 query["token"],
                 query.get("start"),
                 query.get("end"),
                 source_signature=source_signature,
             )
-        return build_market_catalog()
-    if route == "summary":
-        return build_market_summary(
+        else:
+            payload = build_market_catalog(
+                source_signature=source_signature,
+            )
+    elif route == "summary":
+        payload = build_market_summary(
             query.get("start"),
             query.get("end"),
             source_signature=source_signature,
         )
-    if route == "market":
-        return build_market_payload(query.get("start"), query.get("end"))
-    if route == "compare":
-        return build_market_comparison(
+    elif route == "market":
+        payload = build_market_payload(query.get("start"), query.get("end"))
+    elif route == "compare":
+        payload = build_market_comparison(
             token_symbol=query.get("token"),
             market_a_id=query.get("market_a"),
             market_b_id=query.get("market_b"),
             start=query.get("start"),
             end=query.get("end"),
+            source_signature=source_signature,
         )
-    if route == "execution_cost":
-        return build_execution_cost_comparison(
+    elif route == "execution_cost":
+        payload = build_execution_cost_comparison(
             token_symbol=query.get("token"),
             market_a_id=query.get("market_a"),
             market_b_id=query.get("market_b"),
+            source_signature=source_signature,
         )
-    if route == "quality":
-        return build_market_quality(
+    elif route == "quality":
+        payload = build_market_quality(
             token_symbol=query.get("token"),
             scope=query.get("scope"),
             market_a_id=query.get("market_a"),
@@ -4567,14 +4894,16 @@ def _build_public_api_payload(
             start=query.get("start"),
             end=query.get("end"),
         )
-    if route == "events":
-        return build_event_facts(
+    elif route == "events":
+        payload = build_event_facts(
             token=query.get("token"),
             start=query.get("start"),
             end=query.get("end"),
             lifecycle=query.get("lifecycle"),
         )
-    raise ValueError(f"Unknown public API route: {route}")
+    else:
+        raise ValueError(f"Unknown public API route: {route}")
+    return _public_payload_projection(payload)
 
 
 @lru_cache(maxsize=SERIALIZED_RESPONSE_CACHE_SIZE)
@@ -4815,6 +5144,16 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             "gzip" in self.headers.get("Accept-Encoding", "").lower(),
         )
         self.send_encoded_json(body, compressed)
+
+    def send_public_data_validation_error(self) -> None:
+        """Return one fixed response for protected publication failures."""
+        self.send_json(
+            {
+                "code": PUBLIC_DATA_VALIDATION_ERROR_CODE,
+                "message": PUBLIC_DATA_VALIDATION_ERROR_MESSAGE,
+            },
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
 
     def read_json(self) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -5448,8 +5787,10 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            except ValueError as error:
+            except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except ValueError:
+                self.send_public_data_validation_error()
             return
         if parsed.path == "/api/markets/summary":
             query = parse_qs(parsed.query)
@@ -5460,8 +5801,10 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            except ValueError as error:
+            except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except ValueError:
+                self.send_public_data_validation_error()
             return
         if parsed.path == "/api/markets/compare":
             query = parse_qs(parsed.query)
@@ -5472,8 +5815,10 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            except ValueError as error:
+            except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except ValueError:
+                self.send_public_data_validation_error()
             return
         if parsed.path == "/api/markets/execution-cost":
             query = parse_qs(parsed.query)
@@ -5484,8 +5829,10 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            except ValueError as error:
+            except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except ValueError:
+                self.send_public_data_validation_error()
             return
         if parsed.path == "/api/markets/quality":
             query = parse_qs(parsed.query)
@@ -5496,8 +5843,10 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            except ValueError as error:
+            except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except ValueError:
+                self.send_public_data_validation_error()
             return
         if parsed.path == "/api/markets/events":
             query = parse_qs(parsed.query, keep_blank_values=True)
@@ -5516,8 +5865,10 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            except ValueError as error:
+            except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except ValueError:
+                self.send_public_data_validation_error()
             return
         if parsed.path == "/api/market":
             query = parse_qs(parsed.query)
@@ -5528,8 +5879,10 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            except ValueError as error:
+            except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except ValueError:
+                self.send_public_data_validation_error()
             return
         if parsed.path == "/api/admin/session":
             session = ADMIN_SERVICE.get_session(self.admin_session_token())

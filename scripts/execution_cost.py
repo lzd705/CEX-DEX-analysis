@@ -21,6 +21,17 @@ from math import ceil
 import re
 from typing import Any, Iterable
 
+try:
+    from scripts.quality_outcomes import (
+        normalize_execution_source_outcome,
+        sanitize_public_source_endpoint,
+    )
+except ModuleNotFoundError:
+    from quality_outcomes import (  # type: ignore[no-redef]
+        normalize_execution_source_outcome,
+        sanitize_public_source_endpoint,
+    )
+
 
 EXECUTION_COST_CONTRACT_VERSION = "1"
 EXECUTION_NOTIONALS_USD = (
@@ -1034,10 +1045,24 @@ def execution_api_rows(
     """
     result = []
     for row in rows:
+        public_status, public_reason = normalize_execution_source_outcome(
+            row.get("market_type"),
+            row.get("status"),
+            row.get("status_reason"),
+            row.get("error"),
+        )
         item = {}
         for column in EXECUTION_COST_COLUMNS:
             value = row.get(column)
-            if column == "requested_notional_usd":
+            if column == "error":
+                item[column] = None
+            elif column == "source_endpoint":
+                item[column] = sanitize_public_source_endpoint(value)
+            elif column == "status":
+                item[column] = public_status
+            elif column == "status_reason":
+                item[column] = public_reason
+            elif column == "requested_notional_usd":
                 item[column] = number_parser(value)
             elif column in RESULT_NUMERIC_COLUMNS:
                 item[column] = None if value in (None, "") else str(value)

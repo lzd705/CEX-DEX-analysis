@@ -37,9 +37,15 @@ from scripts.fetch_dex_depth import (
     encode_signed_word,
     execution_publication_coverage_gate,
     load_pool_inventory,
+    merge_exact_publication_bundle,
+    preflight_publication_bundle,
+    publish_exact_publication_bundle,
     protocol_model,
     publish_execution_snapshot,
     publish_snapshot,
+    terminal_execution_rows,
+    unsupported_row,
+    validate_snapshot as validate_depth_snapshot,
     v2_band_amounts,
     v2_exact_input_quote,
     v2_exact_output_quote,
@@ -71,6 +77,14 @@ def string_result(value):
     encoded = value.encode("utf-8")
     padded = encoded.hex().ljust(((len(encoded) + 31) // 32) * 64, "0")
     return "0x" + word(32) + word(len(encoded)) + padded
+
+
+def write_snapshot_rows(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 class FakeV2Rpc:
@@ -502,6 +516,354 @@ class DexDepthCollectionTest(unittest.TestCase):
         self.assertEqual(len(inventory), 1)
         self.assertEqual(inventory[0]["snapshot_id"], "tvl-2")
         self.assertEqual(inventory[0]["base_token_price_usd"], "101")
+
+    def test_exact_candidate_accepts_only_structural_unsupported_outcome(self):
+        terminal = unsupported_row(
+            self.pool,
+            snapshot_id="candidate-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            reason="unsupported_protocol:fixture",
+        )
+        with self.assertRaisesRegex(ValueError, "no measured"):
+            validate_depth_snapshot([self.pool], [terminal])
+        validate_depth_snapshot(
+            [self.pool],
+            [terminal],
+            allow_terminal_only=True,
+        )
+
+        retryable = {
+            **terminal,
+            "status": "failed",
+            "error": "RpcError: temporary source failure",
+        }
+        with self.assertRaisesRegex(ValueError, "terminal non-retryable"):
+            validate_depth_snapshot(
+                [self.pool],
+                [retryable],
+                allow_terminal_only=True,
+            )
+
+        partial = {
+            **terminal,
+            "status": "partial",
+            "error": "depth_truncated: fixture measurement limit",
+        }
+        with self.assertRaisesRegex(ValueError, "resolved exact candidate"):
+            validate_depth_snapshot(
+                [self.pool],
+                [partial],
+                allow_terminal_only=True,
+            )
+
+    def test_exact_pool_refresh_merges_without_collecting_other_pools(self):
+        other_pool = {
+            **self.pool,
+            "pool_address": "0x4444444444444444444444444444444444444444",
+            "pool_name": "AAVE / USDC second pool",
+        }
+        _baseline_id, baseline_depth, baseline_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool, other_pool],
+                raw_root=self.root / "raw-baseline",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        _candidate_id, candidate_depth, candidate_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-candidate",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        published = self.root / "local"
+        publish_snapshot(
+            baseline_depth,
+            output_dir=self.root / "processed",
+            publish_dir=published,
+        )
+        publish_execution_snapshot(
+            baseline_execution,
+            expected_market_ids={
+                row["market_id"] for row in baseline_execution
+            },
+            output_dir=self.root / "processed",
+            publish_dir=published,
+        )
+
+        merged_depth, merged_execution = merge_exact_publication_bundle(
+            candidate_depth,
+            candidate_execution,
+            target_market_id=(
+                "dex:eth:uniswap_v2:"
+                "0x3333333333333333333333333333333333333333:AAVE"
+            ),
+            publish_dir=published,
+        )
+
+        self.assertEqual(len(merged_depth), 2)
+        self.assertEqual(len(merged_execution), 20)
+        self.assertEqual(
+            {row["snapshot_id"] for row in merged_depth},
+            {candidate_depth[0]["snapshot_id"]},
+        )
+        other_after = next(
+            row
+            for row in merged_depth
+            if row["pool_address"] == other_pool["pool_address"]
+        )
+        other_before = next(
+            row
+            for row in baseline_depth
+            if row["pool_address"] == other_pool["pool_address"]
+        )
+        self.assertEqual(other_after["observed_at"], other_before["observed_at"])
+        self.assertEqual(
+            {row["source_snapshot_id"] for row in merged_execution},
+            {candidate_depth[0]["snapshot_id"]},
+        )
+
+        reports = preflight_publication_bundle(
+            merged_depth,
+            merged_execution,
+            published,
+            target_market_id=(
+                "dex:eth:uniswap_v2:"
+                "0x3333333333333333333333333333333333333333:AAVE"
+            ),
+        )
+        protected = [
+            published / HISTORY_FILENAME,
+            published / LATEST_FILENAME,
+            published / CURRENT_FILENAME,
+            published / EXECUTION_LATEST_FILENAME,
+        ]
+        originals = {path: path.read_bytes() for path in protected}
+        from scripts import atomic_publication
+
+        real_replace = atomic_publication.os.replace
+        for fail_at in range(1, len(protected) + 1):
+            calls = {"count": 0}
+
+            def fail_once(source, destination):
+                calls["count"] += 1
+                if calls["count"] == fail_at:
+                    raise OSError("injected publication failure")
+                return real_replace(source, destination)
+
+            with self.subTest(fail_at=fail_at), patch(
+                "scripts.atomic_publication.os.replace",
+                side_effect=fail_once,
+            ):
+                with self.assertRaises(OSError):
+                    publish_exact_publication_bundle(
+                        merged_depth,
+                        merged_execution,
+                        target_market_id=(
+                            "dex:eth:uniswap_v2:"
+                            "0x3333333333333333333333333333333333333333:AAVE"
+                        ),
+                        history_rows_to_append=candidate_depth,
+                        output_dir=self.root / "processed",
+                        publish_dir=published,
+                        preflight_reports=reports,
+                    )
+            self.assertEqual(
+                {path: path.read_bytes() for path in protected},
+                originals,
+            )
+
+        publish_exact_publication_bundle(
+            merged_depth,
+            merged_execution,
+            target_market_id=(
+                "dex:eth:uniswap_v2:"
+                "0x3333333333333333333333333333333333333333:AAVE"
+            ),
+            history_rows_to_append=candidate_depth,
+            output_dir=self.root / "processed",
+            publish_dir=published,
+            preflight_reports=reports,
+        )
+        with (published / HISTORY_FILENAME).open(
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            history = list(csv.DictReader(handle))
+        self.assertEqual(len(history), 3)
+
+    def test_exact_preflight_accepts_one_observed_repair_below_full_coverage_floor(self):
+        other_pool = {
+            **self.pool,
+            "token_symbol": "COMP",
+            "pool_address": "0x4444444444444444444444444444444444444444",
+            "pool_name": "COMP / USDC",
+        }
+        pools = [self.pool, other_pool]
+        baseline_depth = []
+        baseline_execution = []
+        for pool in pools:
+            failed_depth = unsupported_row(
+                pool,
+                snapshot_id="baseline-low",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+                reason="pool_state_collection_failed",
+            )
+            failed_depth.update(
+                {
+                    "protocol_model": "constant_product_v2",
+                    "status": "failed",
+                    "error": "RuntimeError: temporary RPC failure",
+                }
+            )
+            baseline_depth.append(failed_depth)
+            baseline_execution.extend(
+                terminal_execution_rows(
+                    pool,
+                    snapshot_id="baseline-low",
+                    request_started_at="2026-07-27T00:00:00+00:00",
+                    response_received_at="2026-07-27T00:00:01+00:00",
+                    protocol="constant_product_v2",
+                    status="failed",
+                    status_reason="pool_state_collection_failed",
+                    error="RuntimeError: temporary RPC failure",
+                )
+            )
+        _snapshot_id, candidate_depth, candidate_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-low-coverage-repair",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        published = self.root / "low-coverage-local"
+        write_snapshot_rows(
+            published / LATEST_FILENAME,
+            baseline_depth,
+        )
+        write_snapshot_rows(
+            published / EXECUTION_LATEST_FILENAME,
+            baseline_execution,
+        )
+        target_market_id = (
+            "dex:eth:uniswap_v2:"
+            "0x3333333333333333333333333333333333333333:AAVE"
+        )
+        merged_depth, merged_execution = merge_exact_publication_bundle(
+            candidate_depth,
+            candidate_execution,
+            target_market_id=target_market_id,
+            publish_dir=published,
+        )
+
+        try:
+            reports = preflight_publication_bundle(
+                merged_depth,
+                merged_execution,
+                published,
+                target_market_id=target_market_id,
+            )
+        except (CoverageRegressionError, TypeError) as error:
+            self.fail(
+                "exact DEX repair was rejected by the full-publication "
+                f"coverage boundary: {error}"
+            )
+
+        self.assertTrue(reports["dex_depth"]["passed"])
+        self.assertTrue(reports["dex_execution_cost"]["passed"])
+        self.assertEqual(
+            [row["status"] for row in merged_depth],
+            ["observed", "failed"],
+        )
+
+    def test_exact_preflight_accepts_confirmed_terminal_on_all_failed_baseline(self):
+        target_pool = {
+            **self.pool,
+            "chain": "solana",
+            "dex": "orca",
+            "pool_address": "solana-pool-address",
+        }
+        terminal_reason = "unsupported_chain:solana"
+        candidate_depth = [
+            unsupported_row(
+                target_pool,
+                snapshot_id="candidate-terminal",
+                request_started_at="2026-07-27T01:00:00+00:00",
+                response_received_at="2026-07-27T01:00:01+00:00",
+                reason=terminal_reason,
+            )
+        ]
+        candidate_execution = terminal_execution_rows(
+            target_pool,
+            snapshot_id="candidate-terminal",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            protocol="unsupported",
+            status="unsupported",
+            status_reason="unsupported_protocol_or_chain",
+            error=terminal_reason,
+        )
+        baseline_depth = [
+            {
+                **candidate_depth[0],
+                "snapshot_id": "baseline-failed",
+                "status": "failed",
+                "error": "RuntimeError: temporary RPC failure",
+            }
+        ]
+        baseline_execution = [
+            {
+                **row,
+                "snapshot_id": "baseline-failed",
+                "source_snapshot_id": "baseline-failed",
+                "status": "failed",
+                "status_reason": "pool_state_collection_failed",
+                "error": "RuntimeError: temporary RPC failure",
+            }
+            for row in candidate_execution
+        ]
+        validate_depth_snapshot(
+            [target_pool],
+            candidate_depth,
+            allow_terminal_only=True,
+        )
+        published = self.root / "terminal-local"
+        write_snapshot_rows(
+            published / LATEST_FILENAME,
+            baseline_depth,
+        )
+        write_snapshot_rows(
+            published / EXECUTION_LATEST_FILENAME,
+            baseline_execution,
+        )
+        target_market_id = "dex:solana:orca:solana-pool-address:AAVE"
+        try:
+            merged_depth, merged_execution = merge_exact_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                target_market_id=target_market_id,
+                publish_dir=published,
+            )
+            reports = preflight_publication_bundle(
+                merged_depth,
+                merged_execution,
+                published,
+                target_market_id=target_market_id,
+            )
+        except (CoverageRegressionError, TypeError, ValueError) as error:
+            self.fail(
+                "resolver-confirmed terminal DEX refresh was rejected: "
+                f"{error}"
+            )
+
+        self.assertTrue(reports["dex_depth"]["passed"])
+        self.assertTrue(reports["dex_execution_cost"]["passed"])
+        self.assertEqual(merged_depth[0]["status"], "unsupported")
 
     def test_collects_fixed_block_v2_depth_and_retains_raw_transcript(self):
         snapshot_id, rows, execution_rows = collect_dex_depth_with_execution(

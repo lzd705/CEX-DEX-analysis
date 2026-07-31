@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import math
 import os
 import stat
@@ -16,7 +17,9 @@ from typing import Any, Dict, Optional, Tuple
 from scripts.quality_outcomes import (
     cex_reason_code,
     normalize_cex_source_outcome,
-    project_dex_unsupported_error,
+    normalize_dex_depth_source_outcome,
+    normalize_tvl_source_outcome,
+    quality_outcome_resolution_state,
     quality_outcome_rule,
 )
 
@@ -25,6 +28,7 @@ MAX_PUBLICATION_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOT_ID_LENGTH = 128
 MAX_MARKET_ID_LENGTH = 512
 MAX_OUTCOME_LENGTH = 64
+DEPTH_BANDS_BPS = (10, 25, 50, 100)
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,7 @@ class SnapshotFactState:
     reason_code: Optional[str]
     retryable: bool
     publication_generation: str
+    target_fingerprint: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -142,7 +147,7 @@ def _timestamp(value: Any) -> str:
     return parsed.astimezone(timezone.utc).isoformat()
 
 
-def _finite_nonnegative(value: Any) -> None:
+def _finite_nonnegative(value: Any) -> float:
     text = _text(value, MAX_SNAPSHOT_ID_LENGTH)
     if not text:
         raise ValueError("observed snapshot value is blank")
@@ -152,9 +157,10 @@ def _finite_nonnegative(value: Any) -> None:
         raise ValueError("observed snapshot value is invalid") from error
     if not math.isfinite(number) or number < 0:
         raise ValueError("observed snapshot value is not finite and nonnegative")
+    return number
 
 
-def _finite(value: Any) -> None:
+def _finite(value: Any) -> float:
     text = _text(value, MAX_SNAPSHOT_ID_LENGTH)
     if not text:
         raise ValueError("observed snapshot value is blank")
@@ -164,6 +170,67 @@ def _finite(value: Any) -> None:
         raise ValueError("observed snapshot value is invalid") from error
     if not math.isfinite(number):
         raise ValueError("observed snapshot value is not finite")
+    return number
+
+
+def _numerically_equal(left: float, right: float) -> bool:
+    return math.isclose(left, right, rel_tol=1e-12, abs_tol=0.0)
+
+
+def _validate_nondecreasing_depth(numbers: Dict[str, float], sides: Tuple[str, ...]) -> None:
+    for side in sides:
+        previous = None
+        for band in DEPTH_BANDS_BPS:
+            current = numbers["{}_depth_{}bps_usd".format(side, band)]
+            if (
+                previous is not None
+                and current < previous
+                and not _numerically_equal(current, previous)
+            ):
+                raise ValueError("snapshot depth decreases across wider bands")
+            previous = current
+
+
+def _validate_depth_totals(
+    numbers: Dict[str, float], left_side: str, right_side: str
+) -> None:
+    for band in DEPTH_BANDS_BPS:
+        total = numbers["total_depth_{}bps_usd".format(band)]
+        sides = (
+            numbers["{}_depth_{}bps_usd".format(left_side, band)]
+            + numbers["{}_depth_{}bps_usd".format(right_side, band)]
+        )
+        if not _numerically_equal(total, sides):
+            raise ValueError("snapshot depth total is inconsistent with sides")
+
+
+def _validate_depth_completeness_status(
+    row: Dict[str, str], raw_status: str
+) -> Tuple[int, ...]:
+    flags = []
+    for band in DEPTH_BANDS_BPS:
+        text = _text(row.get("depth_{}bps_complete".format(band)), 4)
+        if text not in {"0", "1"}:
+            raise ValueError("snapshot completeness flag is invalid")
+        flags.append(int(text))
+    result = tuple(flags)
+    if raw_status in {"observed", "complete"} and any(flag != 1 for flag in result):
+        raise ValueError("observed snapshot depth is incomplete")
+    if raw_status == "partial" and all(flag == 1 for flag in result):
+        raise ValueError("partial snapshot depth is complete")
+    if any(wider > narrower for narrower, wider in zip(result, result[1:])):
+        raise ValueError("snapshot completeness recovers at a wider band")
+    return result
+
+
+def _validate_raw_response_sha256(value: Any, *, required: bool) -> None:
+    text = _text(value, 64)
+    if not text:
+        if required:
+            raise ValueError("snapshot source evidence hash is missing")
+        return
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise ValueError("snapshot source evidence hash is invalid")
 
 
 def _block_number(value: Any, *, required: bool = False) -> None:
@@ -305,6 +372,18 @@ def _row_identity(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
     return ("dex", chain, dex, address, token)
 
 
+def _target_fingerprint(row: Dict[str, str]) -> str:
+    payload = {
+        field: row.get(field, "")
+        for field in sorted(row)
+        if field != "snapshot_id"
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str, ...]:
     snapshot_id = _text(row.get("snapshot_id"), MAX_SNAPSHOT_ID_LENGTH)
     if not snapshot_id:
@@ -316,9 +395,17 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
     if family == "cex":
         if raw_status not in {"observed", "partial", "failed"}:
             raise ValueError("snapshot status is empty")
-        if _text(row.get("reason_code")).lower() and cex_reason_code(
-            row.get("reason_code"), row.get("error")
-        ) is None:
+        normalized_reason = cex_reason_code(row.get("reason_code"), row.get("error"))
+        if normalized_reason is not None:
+            if normalized_reason == "observed":
+                expected_status = "observed"
+            elif normalized_reason in {"source_level_limit", "measurement_limit"}:
+                expected_status = "partial"
+            else:
+                expected_status = "failed"
+            if raw_status != expected_status:
+                raise ValueError("snapshot CEX status and reason conflict")
+        if _text(row.get("reason_code")).lower() and normalized_reason is None:
             # A producer-provided unknown reason cannot be upgraded by status.
             status, reason = raw_status, None
         else:
@@ -326,11 +413,29 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
                 raw_status, row.get("reason_code"), row.get("error")
             )
         if raw_status in {"observed", "partial"}:
+            numbers = {}
             for field in _CEX_NUMBERS:
-                _finite_nonnegative(row.get(field))
-            for field in ("depth_10bps_complete", "depth_25bps_complete", "depth_50bps_complete", "depth_100bps_complete"):
-                if _text(row.get(field), 4) not in {"0", "1"}:
-                    raise ValueError("snapshot completeness flag is invalid")
+                numbers[field] = _finite_nonnegative(row.get(field))
+            best_bid = numbers["best_bid"]
+            best_ask = numbers["best_ask"]
+            if best_bid <= 0 or best_ask <= 0:
+                raise ValueError("snapshot CEX quotes must be positive")
+            if best_bid >= best_ask:
+                raise ValueError("snapshot CEX book is crossed or locked")
+            expected_midpoint = (best_bid + best_ask) / 2
+            expected_spread = best_ask - best_bid
+            if not (
+                _numerically_equal(numbers["midpoint"], expected_midpoint)
+                and _numerically_equal(numbers["spread_quote"], expected_spread)
+                and _numerically_equal(
+                    numbers["spread_bps"],
+                    expected_spread / expected_midpoint * 10_000,
+                )
+            ):
+                raise ValueError("snapshot CEX midpoint or spread is inconsistent")
+            _validate_nondecreasing_depth(numbers, ("bid", "ask", "total"))
+            _validate_depth_totals(numbers, "bid", "ask")
+            _validate_depth_completeness_status(row, raw_status)
         else:
             for field in _CEX_NUMBERS:
                 if _text(row.get(field)):
@@ -346,14 +451,15 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
             required=raw_status in {"observed", "complete", "partial"},
         )
         if raw_status in {"observed", "complete", "partial"}:
+            numbers = {}
             for field in _DEX_DEPTH_FACT_NUMBERS:
                 if field == "price_difference_bps":
-                    _finite(row.get(field))
+                    numbers[field] = _finite(row.get(field))
                 else:
-                    _finite_nonnegative(row.get(field))
-            for field in ("depth_10bps_complete", "depth_25bps_complete", "depth_50bps_complete", "depth_100bps_complete"):
-                if _text(row.get(field), 4) not in {"0", "1"}:
-                    raise ValueError("snapshot completeness flag is invalid")
+                    numbers[field] = _finite_nonnegative(row.get(field))
+            _validate_nondecreasing_depth(numbers, ("sell", "buy", "total"))
+            _validate_depth_totals(numbers, "sell", "buy")
+            _validate_depth_completeness_status(row, raw_status)
         else:
             for field in _DEX_DEPTH_FACT_NUMBERS:
                 if _text(row.get(field)):
@@ -361,29 +467,46 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
             for field in ("depth_10bps_complete", "depth_25bps_complete", "depth_50bps_complete", "depth_100bps_complete"):
                 if _text(row.get(field)):
                     raise ValueError("unmeasured snapshot row contains a completeness flag")
-        if raw_status in {"observed", "complete"}:
-            status, reason = "observed", "observed"
-        elif raw_status == "partial":
-            status, reason = "partial", "measurement_limit"
-        elif raw_status == "unsupported":
-            status, reason = "unsupported", project_dex_unsupported_error(row.get("error"))
-        else:
-            status, reason = raw_status, None
+        status, reason = normalize_dex_depth_source_outcome(
+            raw_status, error=row.get("error")
+        )
     else:
         if raw_status not in {"observed", "missing", "not_found", "failed"}:
             raise ValueError("snapshot status is invalid")
         if raw_status == "observed":
             _finite_nonnegative(row.get("tvl_usd"))
-            status, reason = "observed", "observed"
         elif raw_status in {"missing", "not_found", "failed"}:
             if _text(row.get("tvl_usd")):
                 raise ValueError("non-observed TVL must not contain a measured value")
-            status, reason = raw_status, None
-        else:
-            status, reason = raw_status, None
+        status, reason = normalize_tvl_source_outcome(
+            raw_status, error=row.get("error")
+        )
     _text(status)
     if reason is not None:
         _text(reason)
+    if family == "cex":
+        measured = raw_status in {"observed", "partial"}
+    elif fact_type == "depth":
+        measured = raw_status in {"observed", "complete", "partial"}
+    else:
+        measured = raw_status == "observed"
+    locally_classified_dex_unsupported = (
+        family == "dex"
+        and fact_type == "depth"
+        and raw_status == "unsupported"
+    )
+    requires_source_hash = (
+        measured
+        or (family == "dex" and fact_type == "depth" and raw_status == "failed")
+        or (
+            quality_outcome_resolution_state(status, reason)
+            == "confirmed_terminal_absence"
+            and not locally_classified_dex_unsupported
+        )
+    )
+    _validate_raw_response_sha256(
+        row.get("raw_response_sha256"), required=requires_source_hash
+    )
     return _row_identity(row, family, fact_type)
 
 
@@ -399,9 +522,21 @@ def _state_from_row(
 ) -> SnapshotFactState:
     generation = "{}:{}".format(dataset_sha256[:16], snapshot_id[:MAX_SNAPSHOT_ID_LENGTH])
     if row is None:
+        if fact_type == "tvl":
+            status, reason = normalize_tvl_source_outcome(
+                "not_cataloged_in_snapshot"
+            )
+            rule = quality_outcome_rule(status, reason)
+            retryable = rule.retryable if rule is not None else False
+        else:
+            status, reason, retryable = (
+                "not_cataloged_in_snapshot",
+                None,
+                False,
+            )
         return SnapshotFactState(
             market_id, fact_type, snapshot_id, dataset_sha256, None,
-            "not_cataloged_in_snapshot", None, False, generation,
+            status, reason, retryable, generation,
         )
     raw_status = _text(row.get("status")).lower()
     if family == "cex":
@@ -411,23 +546,19 @@ def _state_from_row(
         else:
             status, reason = normalize_cex_source_outcome(raw_status, row.get("reason_code"), row.get("error"))
     elif fact_type == "depth":
-        if raw_status in {"observed", "complete"}:
-            status, reason = "observed", "observed"
-        elif raw_status == "partial":
-            status, reason = "partial", "measurement_limit"
-        elif raw_status == "unsupported":
-            status, reason = "unsupported", project_dex_unsupported_error(row.get("error"))
-        else:
-            status, reason = raw_status, None
-    elif raw_status == "observed":
-        status, reason = "observed", "observed"
+        status, reason = normalize_dex_depth_source_outcome(
+            raw_status, error=row.get("error")
+        )
     else:
-        status, reason = raw_status, None
+        status, reason = normalize_tvl_source_outcome(
+            raw_status, error=row.get("error")
+        )
     rule = quality_outcome_rule(status, reason)
     return SnapshotFactState(
         market_id, fact_type, snapshot_id, dataset_sha256,
         _timestamp(row.get("observed_at")), status, reason,
         rule.retryable if rule is not None else False, generation,
+        _target_fingerprint(row),
     )
 
 
@@ -478,8 +609,22 @@ def evaluate_snapshot_refresh(
         )
     if before.dataset_sha256 == after.dataset_sha256 or before.snapshot_id == after.snapshot_id:
         return SnapshotRefreshResult.failure("snapshot_publication_unchanged", before=before, after=after)
+    if (
+        before.target_fingerprint is not None
+        and before.target_fingerprint == after.target_fingerprint
+    ):
+        return SnapshotRefreshResult.failure("snapshot_publication_unchanged", before=before, after=after)
     rule = quality_outcome_rule(after.status, after.reason_code)
-    if rule is not None and rule.terminal and not rule.retryable and after.retryable is rule.retryable:
+    resolution_state = quality_outcome_resolution_state(
+        after.status, after.reason_code
+    )
+    if (
+        rule is not None
+        and rule.terminal
+        and not rule.retryable
+        and after.retryable is rule.retryable
+        and resolution_state in {"observed", "confirmed_terminal_absence"}
+    ):
         return SnapshotRefreshResult.success(rule.resolution, before, after)
     return SnapshotRefreshResult.failure(
         "snapshot_target_unresolved", retryable=after.retryable, before=before, after=after

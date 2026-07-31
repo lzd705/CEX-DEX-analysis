@@ -173,9 +173,17 @@ Depth and execution coverage are preflighted as one publication bundle. A
 coverage regression in execution blocks the matching depth commit phase. CEX
 requires 90% current usable scenario coverage; supported DEX execution
 requires 80%; both retain at least 95% of comparable prior usable scenario
-identities. Expected DEX V3 `unsupported` scenarios are excluded. After
-preflight, each latest file is an atomic replacement, but the pair is not one
-cross-file transaction; see `collection-operations.md`.
+identities. Expected DEX V3 `unsupported` scenarios are excluded.
+Full-inventory publishes still replace the files separately. A canonical
+one-market retry stages and failure-atomically replaces the bounded
+depth/history/execution bundle for ordinary I/O exceptions, while deliberately
+making no crash-atomic multi-file claim; see `collection-operations.md`.
+
+For a canonical one-market retry, the candidate must contain the exact ten
+scenario keys already assigned to that market. The merge preserves every
+non-target scenario fact, rejects mixed source lineage, and publishes the full
+inventory under the new depth publication generation. No execution-history
+rows are synthesized for unchanged markets.
 
 This release deliberately publishes current/latest execution snapshots only.
 It does not build one unbounded hourly history CSV: at the current inventory

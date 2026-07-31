@@ -90,6 +90,25 @@ class SourceRangeUnavailable(RuntimeError):
     """The source endpoint cannot position its response over the requested range."""
 
 
+class UpbitRows(list):
+    """List-compatible rows retaining bounded candidate selection evidence."""
+
+    def __init__(self, rows, candidate_outcomes):
+        super().__init__(rows)
+        self.candidate_outcomes = [dict(item) for item in candidate_outcomes]
+
+
+class UpbitCandidateCollectionError(RuntimeError):
+    """No Upbit candidate produced rows and at least one candidate failed."""
+
+    def __init__(self, token_symbol, candidate_outcomes):
+        super().__init__(
+            "Upbit candidates did not produce usable rows for %s"
+            % str(token_symbol).strip().upper()
+        )
+        self.candidate_outcomes = [dict(item) for item in candidate_outcomes]
+
+
 def get_request_window(limit_days: int, start_date=None, end_date=None):
     """Return UTC [start, end) datetimes for a daily request."""
     if start_date is not None or end_date is not None:
@@ -209,6 +228,42 @@ def classify_attempt_error(error):
         "reason_code": reason,
         "http_status": http_status,
         "error": ATTEMPT_ERROR_MESSAGES[reason],
+    }
+
+
+def _upbit_source_instrument(market):
+    quote_asset, base_asset = str(market).split("-", 1)
+    return "{}/{}".format(base_asset.upper(), quote_asset.upper())
+
+
+def _upbit_candidate_outcome(
+    market,
+    *,
+    stage,
+    observation_count,
+    error=None,
+):
+    if error is None:
+        if observation_count:
+            status = "succeeded"
+            reason_code = "observed"
+        else:
+            status = "no_data"
+            reason_code = "no_candles"
+        http_status = None
+    else:
+        classified = classify_attempt_error(error)
+        status = "failed"
+        reason_code = classified["reason_code"]
+        http_status = classified["http_status"]
+    return {
+        "market": market,
+        "source_instrument": _upbit_source_instrument(market),
+        "stage": stage,
+        "status": status,
+        "reason_code": reason_code,
+        "http_status": http_status,
+        "observation_count": observation_count,
     }
 
 
@@ -1144,57 +1199,117 @@ def build_upbit_rows(
     end_date=None,
 ):
     """Fetch the preferred available Upbit market and convert volume to USD."""
-    last_error = None
+    candidate_outcomes = []
+    candidate_errors = []
 
     for market in make_upbit_market_candidates(cex_symbol):
         try:
             candles = fetch_upbit_candles(market, limit_days, end_date=end_date)
         except Exception as error:
-            last_error = error
+            candidate_errors.append(error)
+            candidate_outcomes.append(
+                _upbit_candidate_outcome(
+                    market,
+                    stage="candles",
+                    observation_count=0,
+                    error=error,
+                )
+            )
             continue
 
         if not candles:
+            candidate_outcomes.append(
+                _upbit_candidate_outcome(
+                    market,
+                    stage="candles",
+                    observation_count=0,
+                )
+            )
             continue
 
         quote_asset = market.split("-", 1)[0]
         quote_to_usd_by_date = {}
 
-        if quote_asset == "USDT":
+        try:
+            if quote_asset == "USDT":
+                for candle in candles:
+                    date = candle["candle_date_time_utc"][:10]
+                    quote_to_usd_by_date[date] = 1.0
+            elif quote_asset == "KRW":
+                reference_candles = fetch_upbit_candles(
+                    "KRW-USDT", limit_days, end_date=end_date
+                )
+
+                for reference in reference_candles:
+                    date = reference["candle_date_time_utc"][:10]
+                    krw_per_usdt = float(reference["trade_price"])
+
+                    if krw_per_usdt > 0:
+                        quote_to_usd_by_date[date] = 1.0 / krw_per_usdt
+                if not quote_to_usd_by_date:
+                    raise ValueError(
+                        "Upbit reference quote returned no usable conversions"
+                    )
+            else:
+                raise ValueError("Unsupported Upbit quote asset")
+
+            rows = []
+
             for candle in candles:
                 date = candle["candle_date_time_utc"][:10]
-                quote_to_usd_by_date[date] = 1.0
-        elif quote_asset == "KRW":
-            reference_candles = fetch_upbit_candles(
-                "KRW-USDT", limit_days, end_date=end_date
+                quote_to_usd = quote_to_usd_by_date.get(date)
+
+                if quote_to_usd is None:
+                    continue
+
+                row = convert_upbit_candle(candle, token_symbol, quote_to_usd)
+                row["source_instrument"] = row["cex_symbol"]
+                row["cex_symbol"] = cex_symbol.upper()
+                rows.append(row)
+
+            if not rows:
+                raise ValueError(
+                    "Upbit reference quote did not cover candidate candles"
+                )
+        except Exception as error:
+            candidate_errors.append(error)
+            candidate_outcomes.append(
+                _upbit_candidate_outcome(
+                    market,
+                    stage=(
+                        "quote_conversion"
+                        if quote_asset == "KRW"
+                        else "candles"
+                    ),
+                    observation_count=len(candles),
+                    error=error,
+                )
             )
-
-            for reference in reference_candles:
-                date = reference["candle_date_time_utc"][:10]
-                krw_per_usdt = float(reference["trade_price"])
-
-                if krw_per_usdt > 0:
-                    quote_to_usd_by_date[date] = 1.0 / krw_per_usdt
-        else:
             continue
 
-        rows = []
+        candidate_outcomes.append(
+            _upbit_candidate_outcome(
+                market,
+                stage="candles",
+                observation_count=len(rows),
+            )
+        )
+        return UpbitRows(rows, candidate_outcomes)
 
-        for candle in candles:
-            date = candle["candle_date_time_utc"][:10]
-            quote_to_usd = quote_to_usd_by_date.get(date)
-
-            if quote_to_usd is None:
-                continue
-
-            row = convert_upbit_candle(candle, token_symbol, quote_to_usd)
-            row["source_instrument"] = row["cex_symbol"]
-            row["cex_symbol"] = cex_symbol.upper()
-            rows.append(row)
-
-        if rows:
-            return rows
-
-    raise RuntimeError("Failed to fetch %s on Upbit" % token_symbol) from last_error
+    if candidate_errors:
+        selected_error = next(
+            (
+                error
+                for error in candidate_errors
+                if classify_attempt_error(error)["reason_code"] != "not_listed"
+            ),
+            candidate_errors[-1],
+        )
+        raise UpbitCandidateCollectionError(
+            token_symbol,
+            candidate_outcomes,
+        ) from selected_error
+    return UpbitRows([], candidate_outcomes)
 
 
 def fetch_exchange_rows(

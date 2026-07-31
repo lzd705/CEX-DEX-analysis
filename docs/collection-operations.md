@@ -244,6 +244,14 @@ structurally unsupported until exact integer swap math is implemented.
 | CEX depth and execution | 90% of current inventory/scenarios | 95% |
 | Supported DEX depth and execution | 80% of supported inventory/scenarios | 95% |
 
+These absolute floors apply only to a full-inventory refresh. An explicitly
+targeted `--merge-publish` recovery uses a separate fail-closed gate: the
+candidate may start below the aggregate floor, but it must retain 100% of all
+previously usable identities, preserve every non-target field, keep the exact
+inventory/scenario keys, and resolve the target to observed or a confirmed
+terminal outcome. This permits a damaged or even zero-observed baseline to be
+repaired one market at a time without weakening the full-refresh policy.
+
 Comparisons use only identities present in both the candidate and previous
 latest snapshot. Catalog additions enter the current absolute floor but do not
 weaken prior-retention math; catalog removals do not masquerade as collection
@@ -264,12 +272,16 @@ being replaced with broad failure rows. Passing and rejected structured
 reports are copied into `steps[].publication_gates` in the collection
 manifest.
 
-After a passing bundle preflight, depth/history and execution latest are still
+For a full-inventory publication, depth/history and execution latest remain
 separate atomic file replacements, not one cross-file transaction. An I/O or
 process failure after the commit phase begins is not rolled back across those
-files. The production runner lock serializes managed profiles; concurrent
-direct collector invocations with `--publish-local` are unsupported. Retained
-raw lineage and the run manifest make any interrupted publication diagnosable.
+files. A canonical one-market `--merge-publish` instead stages the bounded
+history/latest/current/execution bundle beside its destinations and restores
+every pre-call byte if an ordinary I/O exception interrupts replacement. This
+is failure-atomic error handling, not a claim of crash-atomic multi-file
+storage: power loss or process termination still requires manifest/hash-based
+diagnosis. The production runner lock serializes managed profiles; concurrent
+direct collector invocations with `--publish-local` are unsupported.
 
 The separate fact lifecycles remain explicit:
 
@@ -292,6 +304,42 @@ file. If the refresh step fails, DEX depth is recorded as
 A full collection manifest coordinates these publications but does not claim
 that the CSVs, histories, latest snapshots, and SQLite database form one
 multi-file transaction, or that all source APIs were observed at one instant.
+
+### Exact latest-fact refresh
+
+The public TVL/depth action uses only the single canonical Market selected by
+the API. `run_collection_cycle.py --market-id ...` forwards that identity to
+the relevant collector; CEX depth makes one venue-market request, TVL makes one
+pool request, and DEX depth refreshes the same pool's temporary USD-price input
+before reading one fixed-block pool state. `--merge-publish` is mandatory for a
+filtered publication and requires an existing full baseline.
+
+The collector replaces only the target rows inside that baseline. A CEX/DEX
+depth target also replaces its exact two-direction/five-notional execution
+scenario set. Non-target rows retain their source observation, raw hash, block
+or sequence, status, and values; only the common latest-view `snapshot_id` (and
+execution `source_snapshot_id`) is rebound to the new publication generation.
+Normalized depth/TVL history appends the collected target only, rather than a
+copy of the full inventory. This is a publication merge, not a claim that every
+market was observed simultaneously. The bounded public files are committed as
+one staged bundle for ordinary I/O failure handling. Fault-injection tests at
+every server-visible replacement require all old files to remain byte-identical
+on failure; this still does not claim crash-atomic multi-file semantics.
+
+The exact preflight seal binds every raw candidate field, not only identity and
+status. Commit revalidates the current baseline hash, the common
+depth/execution generation, the complete candidate-row fingerprint, and one
+history row that is field-for-field equal to the target row in latest. A
+preflight report cannot be reused after changing values, provenance, source
+hashes, status, or snapshot lineage.
+
+TVL is the only bounded fact family allowed to add an exact cataloged target
+that is missing from its latest snapshot. The candidate must be one canonical
+pool row with the existing schema; all prior rows remain unchanged apart from
+the shared publication-generation ID. Depth and execution never infer missing
+scenario keys. An exact public candidate must resolve through the shared table
+to `observed` or confirmed terminal absence before any public replacement;
+measured `partial` and retryable failures are rejected before commit.
 
 ## Freshness contract
 

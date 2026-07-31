@@ -38,6 +38,12 @@ except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
 try:
+    from scripts.atomic_publication import atomic_replace_bundle, csv_payload
+    from scripts.bounded_snapshot_merge import (
+        merge_exact_market_snapshot,
+        require_aligned_depth_execution_lineage,
+        validate_exact_publication_scope,
+    )
     from scripts.fetch_cex import (
         make_binance_symbol,
         make_bitget_symbol,
@@ -61,12 +67,23 @@ try:
         validate_execution_snapshot,
     )
     from scripts.publication_gate import (
+        CoverageRegressionError,
         bind_passing_coverage_report,
         enforce_publication_coverage,
         enforce_publication_coverage_bundle,
         validate_passing_coverage_report,
     )
+    from scripts.quality_outcomes import (
+        normalize_cex_source_outcome,
+        quality_outcome_resolution_state,
+    )
 except ModuleNotFoundError:
+    from atomic_publication import atomic_replace_bundle, csv_payload
+    from bounded_snapshot_merge import (
+        merge_exact_market_snapshot,
+        require_aligned_depth_execution_lineage,
+        validate_exact_publication_scope,
+    )
     from fetch_cex import (
         make_binance_symbol,
         make_bitget_symbol,
@@ -90,10 +107,15 @@ except ModuleNotFoundError:
         validate_execution_snapshot,
     )
     from publication_gate import (
+        CoverageRegressionError,
         bind_passing_coverage_report,
         enforce_publication_coverage,
         enforce_publication_coverage_bundle,
         validate_passing_coverage_report,
+    )
+    from quality_outcomes import (
+        normalize_cex_source_outcome,
+        quality_outcome_resolution_state,
     )
 
 
@@ -124,6 +146,14 @@ COVERAGE_POLICY = {
     "usable_statuses": ["observed", "partial"],
     "excluded_statuses": [],
     "valid_statuses": ["failed", "observed", "partial"],
+}
+EXACT_COVERAGE_POLICY = {
+    **COVERAGE_POLICY,
+    "thresholds": {
+        **COVERAGE_POLICY["thresholds"],
+        "minimum_candidate_usable_bps": 0,
+        "minimum_baseline_retention_bps": 10_000,
+    },
 }
 DEPTH_BANDS_BPS = (10, 25, 50, 100)
 REQUEST_SLEEP_SECONDS = 0.15
@@ -1174,6 +1204,7 @@ def collect_depth_with_execution(
     raw_root: Path = DEFAULT_RAW_ROOT,
     request: Callable[[str], tuple[Any, bytes]] = request_json,
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
+    allow_terminal_only: bool = False,
 ) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
     snapshot_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     snapshot_raw_dir = raw_root / snapshot_id
@@ -1327,7 +1358,11 @@ def collect_depth_with_execution(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    validate_snapshot(markets, rows)
+    validate_snapshot(
+        markets,
+        rows,
+        allow_terminal_only=allow_terminal_only,
+    )
     validate_execution_snapshot(
         [cex_market_id(market) for market in markets],
         execution_rows,
@@ -1341,6 +1376,7 @@ def collect_depth(
     raw_root: Path = DEFAULT_RAW_ROOT,
     request: Callable[[str], tuple[Any, bytes]] = request_json,
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
+    allow_terminal_only: bool = False,
 ) -> tuple[str, list[dict[str, str]]]:
     """Preserve the original depth-only return contract for existing callers."""
     snapshot_id, rows, _execution_rows = collect_depth_with_execution(
@@ -1348,6 +1384,7 @@ def collect_depth(
         raw_root=raw_root,
         request=request,
         sleep_seconds=sleep_seconds,
+        allow_terminal_only=allow_terminal_only,
     )
     return snapshot_id, rows
 
@@ -1355,6 +1392,9 @@ def collect_depth(
 def validate_snapshot(
     inventory: list[dict[str, str]],
     rows: list[dict[str, str]],
+    *,
+    allow_terminal_only: bool = False,
+    allow_no_observed: bool = False,
 ) -> None:
     expected = {
         (row["token_symbol"].upper(), row["exchange"].lower(), row["cex_symbol"].upper())
@@ -1372,8 +1412,38 @@ def validate_snapshot(
         raise ValueError("CEX depth snapshot contains an invalid status")
     if any(row.get("reason_code") not in CEX_DEPTH_REASON_CODES for row in rows):
         raise ValueError("CEX depth snapshot contains an invalid reason code")
-    if not any(row["status"] in {"observed", "partial"} for row in rows):
-        raise ValueError("CEX depth snapshot contains no observed order books")
+    if allow_terminal_only and any(
+        quality_outcome_resolution_state(
+            *normalize_cex_source_outcome(
+                row.get("status"),
+                row.get("reason_code"),
+                row.get("error"),
+            )
+        ) not in {"observed", "confirmed_terminal_absence"}
+        for row in rows
+    ):
+        raise ValueError(
+            "CEX refresh is not a terminal non-retryable or resolved exact candidate"
+        )
+    if (
+        not allow_no_observed
+        and not any(row["status"] in {"observed", "partial"} for row in rows)
+    ):
+        if not allow_terminal_only:
+            raise ValueError("CEX depth snapshot contains no observed order books")
+        if any(
+            quality_outcome_resolution_state(
+                *normalize_cex_source_outcome(
+                    row.get("status"),
+                    row.get("reason_code"),
+                    row.get("error"),
+                )
+            ) != "confirmed_terminal_absence"
+            for row in rows
+        ):
+            raise ValueError(
+                "CEX exact candidate is not a terminal non-retryable outcome"
+            )
     for row in rows:
         if row["status"] not in {"observed", "partial"}:
             continue
@@ -1391,6 +1461,60 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
         return []
     with path.open("r", newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def merge_exact_publication_bundle(
+    depth_rows: list[dict[str, str]],
+    execution_rows: list[dict[str, str]],
+    *,
+    target_market_id: str,
+    publish_dir: Path,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Merge one collected CEX market into the validated full publication."""
+    baseline_depth = read_csv_rows(publish_dir / LATEST_FILENAME)
+    baseline_execution = read_csv_rows(
+        publish_dir / EXECUTION_LATEST_FILENAME
+    )
+    require_aligned_depth_execution_lineage(
+        baseline_depth,
+        baseline_execution,
+    )
+    require_aligned_depth_execution_lineage(depth_rows, execution_rows)
+    merged_depth = merge_exact_market_snapshot(
+        baseline_depth,
+        depth_rows,
+        target_market_id=target_market_id,
+        market_id_for_row=cex_market_id,
+        row_identity=cex_market_id,
+    )
+    merged_execution = merge_exact_market_snapshot(
+        baseline_execution,
+        execution_rows,
+        target_market_id=target_market_id,
+        market_id_for_row=lambda row: str(row.get("market_id") or ""),
+        row_identity=lambda row: (
+            str(row.get("market_id") or ""),
+            str(row.get("direction") or ""),
+            str(row.get("requested_notional_usd") or ""),
+        ),
+        rebind_source_snapshot_id=True,
+    )
+    depth_snapshot_ids = {row["snapshot_id"] for row in merged_depth}
+    execution_snapshot_ids = {
+        row["snapshot_id"] for row in merged_execution
+    }
+    if depth_snapshot_ids != execution_snapshot_ids:
+        raise ValueError(
+            "bounded CEX depth and execution publications are not coherent"
+        )
+    validate_snapshot(
+        baseline_depth,
+        merged_depth,
+        allow_no_observed=True,
+    )
+    expected_market_ids = {cex_market_id(row) for row in baseline_depth}
+    validate_execution_snapshot(expected_market_ids, merged_execution)
+    return merged_depth, merged_execution
 
 
 def depth_publication_coverage_gate(
@@ -1449,12 +1573,154 @@ def execution_publication_coverage_gate(
     )
 
 
+def exact_depth_publication_coverage_gate(
+    rows: list[dict[str, str]],
+    publish_dir: Path,
+    *,
+    target_market_id: str,
+) -> dict[str, Any]:
+    latest_path = publish_dir / LATEST_FILENAME
+    baseline_rows = read_csv_rows(latest_path)
+    scope = validate_exact_publication_scope(
+        baseline_rows,
+        rows,
+        target_market_id=target_market_id,
+        market_id_for_row=cex_market_id,
+        row_identity=cex_market_id,
+    )
+    report = enforce_publication_coverage(
+        rows,
+        baseline_rows,
+        fact_family="cex_depth",
+        identity=lambda row: (
+            row.get("token_symbol", "").strip().upper(),
+            row.get("exchange", "").strip().lower(),
+            row.get("cex_symbol", "").strip().upper(),
+        ),
+        usable_statuses={"observed", "partial"},
+        valid_statuses={"observed", "partial", "failed"},
+        minimum_candidate_usable_bps=0,
+        minimum_baseline_retention_bps=10_000,
+    )
+    target_rows = [
+        row for row in rows if cex_market_id(row) == target_market_id
+    ]
+    resolutions = {
+        quality_outcome_resolution_state(
+            *normalize_cex_source_outcome(
+                row.get("status"),
+                row.get("reason_code"),
+                row.get("error"),
+            )
+        )
+        for row in target_rows
+    }
+    report.update(
+        {
+            "mode": "exact_target_recovery/v1",
+            "exact_target": {**scope, "resolutions": sorted(resolutions)},
+        }
+    )
+    if not target_rows or not resolutions.issubset(
+        {"observed", "confirmed_terminal_absence"}
+    ):
+        report["status"] = "rejected"
+        report["passed"] = False
+        report["reasons"] = list(
+            dict.fromkeys(
+                list(report.get("reasons") or [])
+                + ["exact_target_unresolved"]
+            )
+        )
+        raise CoverageRegressionError(report)
+    return bind_passing_coverage_report(
+        report,
+        fact_family="cex_depth",
+        baseline_path=latest_path,
+    )
+
+
+def exact_execution_publication_coverage_gate(
+    rows: list[dict[str, str]],
+    publish_dir: Path,
+    *,
+    target_market_id: str,
+) -> dict[str, Any]:
+    latest_path = publish_dir / EXECUTION_LATEST_FILENAME
+    baseline_rows = read_csv_rows(latest_path)
+    scope = validate_exact_publication_scope(
+        baseline_rows,
+        rows,
+        target_market_id=target_market_id,
+        market_id_for_row=lambda row: str(row.get("market_id") or ""),
+        row_identity=lambda row: (
+            str(row.get("market_id") or ""),
+            str(row.get("direction") or ""),
+            str(row.get("requested_notional_usd") or ""),
+        ),
+        rebound_fields=("snapshot_id", "source_snapshot_id"),
+    )
+    report = enforce_publication_coverage(
+        rows,
+        baseline_rows,
+        fact_family="cex_execution_cost",
+        identity=lambda row: (
+            row.get("market_id", "").strip(),
+            row.get("direction", "").strip(),
+            row.get("requested_notional_usd", "").strip(),
+        ),
+        usable_statuses={"observed", "partial"},
+        valid_statuses={"observed", "partial", "failed"},
+        minimum_candidate_usable_bps=0,
+        minimum_baseline_retention_bps=10_000,
+    )
+    report.update(
+        {
+            "mode": "exact_target_recovery/v1",
+            "exact_target": scope,
+        }
+    )
+    return bind_passing_coverage_report(
+        report,
+        fact_family="cex_execution_cost",
+        baseline_path=latest_path,
+    )
+
+
 def preflight_publication_bundle(
     depth_rows: list[dict[str, str]],
     execution_rows: list[dict[str, str]],
     publish_dir: Path,
+    *,
+    target_market_id: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Reject either coverage regression before writing either latest view."""
+    require_aligned_depth_execution_lineage(depth_rows, execution_rows)
+    if target_market_id is not None:
+        target = str(target_market_id).strip()
+        if not target:
+            raise ValueError("exact target market identity is empty")
+        return enforce_publication_coverage_bundle(
+            (
+                (
+                    "cex_depth",
+                    lambda: exact_depth_publication_coverage_gate(
+                        depth_rows,
+                        publish_dir,
+                        target_market_id=target,
+                    ),
+                ),
+                (
+                    "cex_execution_cost",
+                    lambda: exact_execution_publication_coverage_gate(
+                        execution_rows,
+                        publish_dir,
+                        target_market_id=target,
+                    ),
+                ),
+            ),
+            bundle="cex_depth_execution_exact",
+        )
     return enforce_publication_coverage_bundle(
         (
             (
@@ -1521,6 +1787,7 @@ def publish_snapshot(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     publish_dir: Path | None = None,
     preflight_report: dict[str, Any] | None = None,
+    history_rows_to_append: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     current_path = output_dir / CURRENT_FILENAME
@@ -1557,7 +1824,9 @@ def publish_snapshot(
         ): row
         for row in existing_history
     }
-    for row in rows:
+    for row in (
+        rows if history_rows_to_append is None else history_rows_to_append
+    ):
         merged[
             (
                 row["snapshot_id"],
@@ -1639,6 +1908,143 @@ def publish_execution_snapshot(
     return result
 
 
+def publish_exact_publication_bundle(
+    depth_rows: list[dict[str, str]],
+    execution_rows: list[dict[str, str]],
+    *,
+    target_market_id: str,
+    history_rows_to_append: list[dict[str, str]],
+    output_dir: Path,
+    publish_dir: Path,
+    preflight_reports: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Failure-atomically publish one bounded CEX depth/execution merge."""
+    require_aligned_depth_execution_lineage(depth_rows, execution_rows)
+    expected_market_ids = {
+        str(row.get("market_id") or "") for row in execution_rows
+    }
+    validate_execution_snapshot(expected_market_ids, execution_rows)
+    depth_gate = validate_passing_coverage_report(
+        preflight_reports.get("cex_depth"),
+        fact_family="cex_depth",
+        candidate_rows=depth_rows,
+        identity=lambda row: (
+            row.get("token_symbol", "").strip().upper(),
+            row.get("exchange", "").strip().lower(),
+            row.get("cex_symbol", "").strip().upper(),
+        ),
+        baseline_path=publish_dir / LATEST_FILENAME,
+        expected_policy=EXACT_COVERAGE_POLICY,
+    )
+    execution_gate = validate_passing_coverage_report(
+        preflight_reports.get("cex_execution_cost"),
+        fact_family="cex_execution_cost",
+        candidate_rows=execution_rows,
+        identity=lambda row: (
+            row.get("market_id", "").strip(),
+            row.get("direction", "").strip(),
+            row.get("requested_notional_usd", "").strip(),
+        ),
+        baseline_path=publish_dir / EXECUTION_LATEST_FILENAME,
+        expected_policy=EXACT_COVERAGE_POLICY,
+    )
+    target = str(target_market_id or "").strip()
+    for report in (depth_gate, execution_gate):
+        exact_target = report.get("exact_target")
+        if (
+            report.get("mode") != "exact_target_recovery/v1"
+            or not isinstance(exact_target, dict)
+            or exact_target.get("market_id") != target
+        ):
+            raise ValueError("exact preflight report does not match target")
+    if (
+        depth_gate["exact_target"]["candidate_snapshot_id"]
+        != execution_gate["exact_target"]["candidate_snapshot_id"]
+    ):
+        raise ValueError("exact preflight reports do not share one generation")
+    published_target_rows = [
+        row for row in depth_rows if cex_market_id(row) == target
+    ]
+    if (
+        len(history_rows_to_append) != 1
+        or len(published_target_rows) != 1
+        or cex_market_id(history_rows_to_append[0]) != target
+        or str(history_rows_to_append[0].get("snapshot_id") or "")
+        != depth_gate["exact_target"]["candidate_snapshot_id"]
+        or history_rows_to_append[0] != published_target_rows[0]
+    ):
+        raise ValueError("exact history append does not match target publication")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    current_path = output_dir / CURRENT_FILENAME
+    execution_current_path = output_dir / EXECUTION_CURRENT_FILENAME
+    atomic_write_csv(current_path, depth_rows)
+    atomic_write_execution_csv(execution_current_path, execution_rows)
+
+    history_path = publish_dir / HISTORY_FILENAME
+    merged_history = {
+        (
+            row.get("snapshot_id", ""),
+            row.get("token_symbol", ""),
+            row.get("exchange", ""),
+            row.get("cex_symbol", ""),
+        ): row
+        for row in read_csv_rows(history_path)
+    }
+    for row in history_rows_to_append:
+        merged_history[
+            (
+                row["snapshot_id"],
+                row["token_symbol"],
+                row["exchange"],
+                row["cex_symbol"],
+            )
+        ] = row
+    history_rows = sorted(
+        merged_history.values(),
+        key=lambda row: (
+            row.get("observed_at", ""),
+            row.get("token_symbol", ""),
+            row.get("exchange", ""),
+            row.get("cex_symbol", ""),
+        ),
+    )
+    atomic_replace_bundle(
+        (
+            (history_path, csv_payload(DEPTH_COLUMNS_ALL, history_rows)),
+            (
+                publish_dir / LATEST_FILENAME,
+                csv_payload(DEPTH_COLUMNS_ALL, depth_rows),
+            ),
+            (
+                publish_dir / CURRENT_FILENAME,
+                csv_payload(DEPTH_COLUMNS_ALL, depth_rows),
+            ),
+            (
+                publish_dir / EXECUTION_LATEST_FILENAME,
+                csv_payload(EXECUTION_COST_COLUMNS, execution_rows),
+            ),
+        )
+    )
+    return (
+        {
+            "current_path": str(current_path),
+            "row_count": len(depth_rows),
+            "latest_path": str(publish_dir / LATEST_FILENAME),
+            "history_path": str(history_path),
+            "history_row_count": len(history_rows),
+            "publication_gate": depth_gate,
+        },
+        {
+            "current_path": str(execution_current_path),
+            "row_count": len(execution_rows),
+            "status_counts": execution_status_counts(execution_rows),
+            "latest_path": str(publish_dir / EXECUTION_LATEST_FILENAME),
+            "publication_gate": execution_gate,
+        },
+    )
+
+
 def parse_list(value: str | None, *, upper: bool) -> list[str] | None:
     if not value:
         return None
@@ -1657,11 +2063,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT)
     parser.add_argument("--tokens", help="Comma-separated token symbols")
     parser.add_argument("--exchanges", help="Comma-separated exchange names")
+    parser.add_argument(
+        "--market-id",
+        help="One canonical CEX market identity for bounded collection",
+    )
     parser.add_argument("--publish-local", action="store_true")
     parser.add_argument(
         "--publish-dir",
         type=Path,
         help="Explicit runtime directory for an atomic publication",
+    )
+    parser.add_argument(
+        "--merge-publish",
+        action="store_true",
+        help="Merge one exact market into an existing full publication",
     )
     parser.add_argument("--sleep-seconds", type=float, default=REQUEST_SLEEP_SECONDS)
     return parser.parse_args()
@@ -1682,16 +2097,30 @@ def main() -> None:
     markets = load_cataloged_markets(args.database, args.cex_csv)
     tokens = set(parse_list(args.tokens, upper=True) or [])
     exchanges = set(parse_list(args.exchanges, upper=False) or [])
+    market_id = str(args.market_id or "").strip()
     publish_dir = (
         args.publish_dir
         if args.publish_dir is not None
         else DEFAULT_PUBLISH_DIR if args.publish_local else None
     )
-    ensure_full_publish_scope(publish_dir is not None, tokens, exchanges)
+    if market_id and (tokens or exchanges):
+        raise ValueError("--market-id cannot be combined with other filters")
+    if args.merge_publish and (publish_dir is None or not market_id):
+        raise ValueError(
+            "--merge-publish requires --publish-dir and --market-id"
+        )
+    if publish_dir is not None and market_id and not args.merge_publish:
+        raise ValueError(
+            "filtered publication requires explicit --merge-publish"
+        )
+    if not args.merge_publish:
+        ensure_full_publish_scope(publish_dir is not None, tokens, exchanges)
     if tokens:
         markets = [row for row in markets if row["token_symbol"] in tokens]
     if exchanges:
         markets = [row for row in markets if row["exchange"] in exchanges]
+    if market_id:
+        markets = [row for row in markets if cex_market_id(row) == market_id]
     if not markets:
         raise ValueError("No cataloged CEX markets match the requested filters")
 
@@ -1699,25 +2128,55 @@ def main() -> None:
         markets,
         raw_root=args.raw_root,
         sleep_seconds=max(0.0, args.sleep_seconds),
+        allow_terminal_only=args.merge_publish,
     )
+    collected_rows = rows
+    collected_execution_rows = execution_rows
+    if args.merge_publish:
+        assert publish_dir is not None
+        rows, execution_rows = merge_exact_publication_bundle(
+            rows,
+            execution_rows,
+            target_market_id=market_id,
+            publish_dir=publish_dir,
+        )
     publication_gates = (
-        preflight_publication_bundle(rows, execution_rows, publish_dir)
+        preflight_publication_bundle(
+            rows,
+            execution_rows,
+            publish_dir,
+            target_market_id=market_id if args.merge_publish else None,
+        )
         if publish_dir is not None
         else {}
     )
-    result = publish_snapshot(
-        rows,
-        output_dir=args.output_dir,
-        publish_dir=publish_dir,
-        preflight_report=publication_gates.get("cex_depth"),
-    )
-    execution_result = publish_execution_snapshot(
-        execution_rows,
-        output_dir=args.output_dir,
-        publish_dir=publish_dir,
-        expected_market_ids=[cex_market_id(market) for market in markets],
-        preflight_report=publication_gates.get("cex_execution_cost"),
-    )
+    if args.merge_publish:
+        assert publish_dir is not None
+        result, execution_result = publish_exact_publication_bundle(
+            rows,
+            execution_rows,
+            target_market_id=market_id,
+            history_rows_to_append=collected_rows,
+            output_dir=args.output_dir,
+            publish_dir=publish_dir,
+            preflight_reports=publication_gates,
+        )
+    else:
+        result = publish_snapshot(
+            rows,
+            output_dir=args.output_dir,
+            publish_dir=publish_dir,
+            preflight_report=publication_gates.get("cex_depth"),
+        )
+        execution_result = publish_execution_snapshot(
+            execution_rows,
+            output_dir=args.output_dir,
+            publish_dir=publish_dir,
+            expected_market_ids={
+                str(row.get("market_id") or "") for row in execution_rows
+            },
+            preflight_report=publication_gates.get("cex_execution_cost"),
+        )
     depth_gate = result.pop("publication_gate", None)
     execution_gate = execution_result.pop("publication_gate", None)
     result["execution_cost"] = execution_result
@@ -1731,6 +2190,10 @@ def main() -> None:
             "partial_count": sum(row["status"] == "partial" for row in rows),
             "failed_count": sum(row["status"] == "failed" for row in rows),
             "execution_cost_row_count": len(execution_rows),
+            "collected_market_count": len(collected_rows),
+            "collected_execution_cost_row_count": len(
+                collected_execution_rows
+            ),
             "execution_cost_status_counts": execution_status_counts(
                 execution_rows
             ),

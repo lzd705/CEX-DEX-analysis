@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from collections import Counter
+from datetime import datetime, timezone
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -22,6 +23,12 @@ from scripts.execution_cost import (
     execution_fact_row,
 )
 from scripts.market_database import build_database
+from scripts.quality_outcomes import quality_outcome_rule
+from scripts.check_dashboard_release import (
+    ResponseMetrics,
+    validate_quality,
+    validate_summary,
+)
 
 
 def write_csv(path, fieldnames, rows):
@@ -292,6 +299,175 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(server.parse_number("12.5"), 12.5)
         self.assertEqual(server.parse_number(12.5), 12.5)
 
+    def test_failed_tvl_and_dex_depth_use_same_bounded_retryable_outcome(self):
+        private_error = (
+            "PermissionError: /srv/private/facts.csv?credential=secret"
+        )
+        tvl = server._tvl_quality_fact({
+            "market_type": "dex",
+            "tvl_status": "failed",
+            "tvl_error": private_error,
+        })
+        depth = server._depth_quality_fact({
+            "market_type": "dex",
+            "depth_status": "failed",
+            "depth_error": private_error,
+        })
+
+        for fact in (tvl, depth):
+            with self.subTest(fact=fact):
+                self.assertEqual(fact["status"], "collection_failed")
+                self.assertEqual(fact["reason"], "source_unavailable")
+                self.assertEqual(fact["reason_code"], "source_unavailable")
+                self.assertTrue(fact["retryable"])
+                self.assertIsNotNone(
+                    quality_outcome_rule(fact["status"], fact["reason_code"])
+                )
+                self.assertNotIn(private_error, json.dumps(fact))
+
+        unavailable = server._depth_quality_fact({
+            "market_type": "cex",
+            "depth_status": "unavailable",
+        })
+        self.assertEqual(
+            (unavailable["status"], unavailable["reason_code"]),
+            ("unavailable", "depth_snapshot_unavailable"),
+        )
+        self.assertIsNotNone(
+            quality_outcome_rule(
+                unavailable["status"], unavailable["reason_code"]
+            )
+        )
+
+    def test_public_api_projection_recursively_removes_private_collector_evidence(self):
+        malicious_catalog = {
+            "metadata": {"catalog_version": 2, "data_generation": "generation"},
+            "markets": [{
+                "market_id": "cex:test:BTC/USDT",
+                "depth_error": "PermissionError: /srv/private/depth.csv",
+                "tvl_error": "C:\\service\\private\\tvl.csv",
+                "depth_source_endpoint": (
+                    "https://user:password@api.example.test:8443/v2/depth"
+                    "?api_key=raw-secret#collector"
+                ),
+                "quote_conversion_endpoint": (
+                    "https://fx-user:fx-secret@fx.example.test/v1/quote"
+                    "?access_token=private"
+                ),
+                "nested": {
+                    "errors": [
+                        "SourceException: /srv/private/collector.py",
+                    ],
+                    "source_endpoint": (
+                        "http://collector:credential@rpc.example.test/path/to/key"
+                    ),
+                },
+            }],
+        }
+        with patch.object(
+            server,
+            "build_market_catalog",
+            return_value=malicious_catalog,
+        ):
+            payload = server._build_public_api_payload(
+                "catalog",
+                (),
+                source_signature=(("/srv/private/facts.sqlite3", 1, 1),),
+            )
+
+        market = payload["markets"][0]
+        self.assertNotIn("depth_error", market)
+        self.assertNotIn("tvl_error", market)
+        self.assertNotIn("errors", market["nested"])
+        self.assertEqual(
+            market["depth_source_endpoint"],
+            "https://api.example.test:8443",
+        )
+        self.assertEqual(
+            market["quote_conversion_endpoint"],
+            "https://fx.example.test",
+        )
+        self.assertEqual(
+            market["nested"]["source_endpoint"],
+            "http://rpc.example.test",
+        )
+        serialized = json.dumps(payload)
+        for forbidden in (
+            "/srv/",
+            "C:\\\\service",
+            "user:password",
+            "collector:credential",
+            "fx-user:fx-secret",
+            "api_key=raw-secret",
+            "access_token=private",
+            "PermissionError",
+            "SourceException",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, serialized)
+
+    def test_public_get_endpoints_sanitize_internal_value_errors(self):
+        private_error = ValueError(
+            "/srv/private/book.csv?api_key=secret failed validation"
+        )
+        paths = (
+            "/api/markets/catalog?token=BTC",
+            "/api/markets/summary",
+            "/api/markets/compare?token=BTC&market_a=a&market_b=b",
+            "/api/markets/execution-cost?token=BTC&market_a=a&market_b=b",
+            "/api/markets/quality?token=BTC",
+            "/api/markets/events?token=BTC",
+            "/api/market",
+        )
+        expected = {
+            "code": "public_data_validation_failed",
+            "message": (
+                "Published market fact data failed validation. "
+                "Retry after the next refresh."
+            ),
+        }
+
+        for path in paths:
+            with self.subTest(path=path):
+                handler = object.__new__(server.MarketMonitorHandler)
+                handler.path = path
+                with patch.object(
+                    server.MarketMonitorHandler,
+                    "send_public_api",
+                    side_effect=private_error,
+                ), patch.object(
+                    server.MarketMonitorHandler,
+                    "send_json",
+                ) as send_json:
+                    handler.do_GET()
+
+                send_json.assert_called_once_with(expected, 503)
+                serialized = json.dumps(send_json.call_args.args[0])
+                self.assertNotIn("/srv/private", serialized)
+                self.assertNotIn("api_key", serialized)
+                self.assertNotIn("secret", serialized)
+
+    def test_public_get_keeps_safe_client_parameter_errors_at_400(self):
+        with self.assertRaises(server.PublicClientRequestError) as caught:
+            server._build_public_api_payload("compare", ())
+
+        handler = object.__new__(server.MarketMonitorHandler)
+        handler.path = "/api/markets/compare"
+        with patch.object(
+            server.MarketMonitorHandler,
+            "send_public_api",
+            side_effect=caught.exception,
+        ), patch.object(
+            server.MarketMonitorHandler,
+            "send_json",
+        ) as send_json:
+            handler.do_GET()
+
+        send_json.assert_called_once_with(
+            {"error": "token, market_a, and market_b are required"},
+            400,
+        )
+
     def test_screener_refresh_identity_is_canonical_and_retryability_is_server_owned(self):
         cex = server._compact_screener_market(
             {
@@ -320,14 +496,51 @@ class MarketMonitorServerTest(unittest.TestCase):
             cex["refresh_market_id"],
             "cex:binance:AAVE/USDT",
         )
-        self.assertTrue(cex["depth_retryable"])
+        self.assertEqual(
+            (
+                cex["tvl_status"],
+                cex["tvl_na_reason"],
+                cex["tvl_retryable"],
+            ),
+            (
+                "not_applicable",
+                "cex_markets_do_not_have_pool_tvl",
+                False,
+            ),
+        )
+        self.assertEqual(
+            (
+                cex["depth_status"],
+                cex["depth_na_reason"],
+                cex["depth_retryable"],
+            ),
+            ("collection_failed", "network", True),
+        )
         self.assertEqual(dex["market_id"], "0xAbC")
         self.assertEqual(
             dex["refresh_market_id"],
             "dex:eth:uniswap_v3:0xabc:AAVE",
         )
-        self.assertTrue(dex["tvl_retryable"])
-        self.assertFalse(dex["depth_retryable"])
+        self.assertEqual(
+            (
+                dex["tvl_status"],
+                dex["tvl_na_reason"],
+                dex["tvl_retryable"],
+            ),
+            (
+                "not_cataloged_in_snapshot",
+                "tvl_market_not_cataloged_in_snapshot",
+                True,
+            ),
+        )
+        self.assertEqual(
+            (
+                dex["depth_status"],
+                dex["depth_na_reason"],
+                dex["depth_retryable"],
+            ),
+            ("unsupported", "unsupported_protocol", False),
+        )
 
     def test_spread_summary_supports_latest_max_mean_and_median_ranking(self):
         summary = market_facts._common_price_comparison(
@@ -394,6 +607,306 @@ class MarketMonitorServerTest(unittest.TestCase):
             "2026-01-02",
         )
 
+    def test_bounded_target_refresh_keeps_full_inventory_freshness_conservative(self):
+        old_observed_at = "2026-07-01T00:00:00+00:00"
+        refreshed_observed_at = "2026-08-01T11:30:00+00:00"
+
+        tvl_columns = [
+            "snapshot_id",
+            "observed_at",
+            "token_symbol",
+            "chain",
+            "pool_address",
+            "tvl_usd",
+            "tvl_method",
+            "source",
+            "source_endpoint",
+            "raw_response_sha256",
+            "status",
+        ]
+        write_csv(
+            self.tvl_path,
+            tvl_columns,
+            [
+                {
+                    "snapshot_id": "tvl-merged-2",
+                    "observed_at": refreshed_observed_at,
+                    "token_symbol": "BTC",
+                    "chain": "eth",
+                    "pool_address": "0xpool",
+                    "tvl_usd": "5000",
+                    "tvl_method": "fixture",
+                    "source": "fixture",
+                    "source_endpoint": "https://example.test/new",
+                    "raw_response_sha256": "a" * 64,
+                    "status": "observed",
+                },
+                {
+                    "snapshot_id": "tvl-merged-2",
+                    "observed_at": old_observed_at,
+                    "token_symbol": "ETH",
+                    "chain": "eth",
+                    "pool_address": "0xoldpool",
+                    "tvl_usd": "1000",
+                    "tvl_method": "fixture",
+                    "source": "fixture",
+                    "source_endpoint": "https://example.test/old",
+                    "raw_response_sha256": "b" * 64,
+                    "status": "observed",
+                },
+            ],
+        )
+
+        def depth_row(columns, *, family, observed_at, identity):
+            row = {field: "" for field in columns}
+            row.update(
+                {
+                    "snapshot_id": "{}-merged-2".format(family),
+                    "observed_at": observed_at,
+                    "response_received_at": observed_at,
+                    "status": "failed",
+                    "error": "fixture failure",
+                    **identity,
+                }
+            )
+            return row
+
+        write_csv(
+            self.depth_path,
+            DEPTH_COLUMNS_ALL,
+            [
+                depth_row(
+                    DEPTH_COLUMNS_ALL,
+                    family="cex",
+                    observed_at=refreshed_observed_at,
+                    identity={
+                        "token_symbol": "BTC",
+                        "exchange": "binance",
+                        "cex_symbol": "BTC/USDT",
+                    },
+                ),
+                depth_row(
+                    DEPTH_COLUMNS_ALL,
+                    family="cex",
+                    observed_at=old_observed_at,
+                    identity={
+                        "token_symbol": "BTC",
+                        "exchange": "okx",
+                        "cex_symbol": "BTC/USDT",
+                    },
+                ),
+            ],
+        )
+        write_csv(
+            self.dex_depth_path,
+            DEX_DEPTH_COLUMNS,
+            [
+                depth_row(
+                    DEX_DEPTH_COLUMNS,
+                    family="dex",
+                    observed_at=refreshed_observed_at,
+                    identity={
+                        "token_symbol": "BTC",
+                        "chain": "eth",
+                        "dex": "uniswap",
+                        "pool_address": "0xpool",
+                    },
+                ),
+                depth_row(
+                    DEX_DEPTH_COLUMNS,
+                    family="dex",
+                    observed_at=old_observed_at,
+                    identity={
+                        "token_symbol": "ETH",
+                        "chain": "eth",
+                        "dex": "uniswap",
+                        "pool_address": "0xoldpool",
+                    },
+                ),
+            ],
+        )
+
+        def stamp_execution(rows, observed_at):
+            for row in rows:
+                row["observed_at"] = observed_at
+                row["request_started_at"] = observed_at
+                row["response_received_at"] = observed_at
+            return rows
+
+        cex_execution_rows = stamp_execution(
+            self.execution_rows(
+                "cex:binance:BTC/USDT",
+                "cex",
+                state_observed_at=refreshed_observed_at,
+            ),
+            refreshed_observed_at,
+        ) + stamp_execution(
+            self.execution_rows(
+                "cex:okx:BTC/USDT",
+                "cex",
+                state_observed_at=old_observed_at,
+                exchange="okx",
+                source_instrument="BTC-USDT",
+            ),
+            old_observed_at,
+        )
+        write_csv(
+            self.cex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            cex_execution_rows,
+        )
+        dex_execution_rows = stamp_execution(
+            self.execution_rows(
+                "dex:eth:uniswap:0xpool:BTC",
+                "dex",
+                state_observed_at=refreshed_observed_at,
+            ),
+            refreshed_observed_at,
+        )
+        old_dex_rows = self.execution_rows(
+            "dex:eth:sushiswap:0xoldpool:BTC",
+            "dex",
+            state_observed_at=old_observed_at,
+        )
+        for row in old_dex_rows:
+            row["dex"] = "sushiswap"
+            row["pool_address"] = "0xoldpool"
+        dex_execution_rows += stamp_execution(old_dex_rows, old_observed_at)
+        write_csv(
+            self.dex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            dex_execution_rows,
+        )
+
+        server.clear_runtime_caches()
+        try:
+            tvl = server._load_tvl_snapshot_cached(
+                str(self.tvl_path), server.data_signature([self.tvl_path])
+            )
+            cex_depth = server._load_cex_depth_snapshot_cached(
+                str(self.depth_path), server.data_signature([self.depth_path])
+            )
+            dex_depth = server._load_dex_depth_snapshot_cached(
+                str(self.dex_depth_path),
+                server.data_signature([self.dex_depth_path]),
+            )
+            cex_execution = server.load_execution_cost_snapshot(
+                self.cex_execution_path
+            )
+            dex_execution = server.load_execution_cost_snapshot(
+                self.dex_execution_path
+            )
+
+            for snapshot in (tvl, cex_depth, dex_depth):
+                with self.subTest(snapshot=snapshot["path"].name):
+                    self.assertEqual(snapshot["observed_at"], old_observed_at)
+                    self.assertEqual(
+                        snapshot["observed_at_min"], old_observed_at
+                    )
+                    self.assertEqual(
+                        snapshot["observed_at_max"], refreshed_observed_at
+                    )
+            for snapshot in (cex_execution, dex_execution):
+                with self.subTest(snapshot=snapshot["path"].name):
+                    self.assertEqual(snapshot["observed_at"], old_observed_at)
+                    self.assertEqual(
+                        snapshot["observed_at_min"], old_observed_at
+                    )
+                    self.assertEqual(
+                        snapshot["observed_at_max"], refreshed_observed_at
+                    )
+                    self.assertEqual(
+                        snapshot["state_observed_at"], old_observed_at
+                    )
+                    self.assertEqual(
+                        snapshot["state_observed_at_min"], old_observed_at
+                    )
+                    self.assertEqual(
+                        snapshot["state_observed_at_max"],
+                        refreshed_observed_at,
+                    )
+
+            cex_environment = {
+                **self.environment,
+                "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
+            }
+            with patch.dict(
+                server.os.environ, cex_environment, clear=True
+            ), patch(
+                "dashboard.freshness.utc_now",
+                return_value=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+            ):
+                market_payload = server.build_market_payload()
+                catalog = server.build_market_catalog()
+            cex_by_venue = {
+                market["venue"]: market
+                for market in market_payload["cex_markets"]
+            }
+            self.assertEqual(
+                cex_by_venue["binance"]["depth_observed_at"],
+                refreshed_observed_at,
+            )
+            self.assertEqual(
+                cex_by_venue["okx"]["depth_observed_at"],
+                old_observed_at,
+            )
+            self.assertEqual(
+                market_payload["metadata"]["freshness"]["cex_depth"][
+                    "status"
+                ],
+                "stale",
+            )
+            self.assertEqual(
+                catalog["metadata"]["cex_depth_snapshot"][
+                    "observed_at_min"
+                ],
+                old_observed_at,
+            )
+            self.assertEqual(
+                catalog["metadata"]["cex_depth_snapshot"][
+                    "observed_at_max"
+                ],
+                refreshed_observed_at,
+            )
+
+            payload = {
+                "metadata": {
+                    "source_date_ranges": {},
+                    "tvl_snapshot": tvl,
+                    "cex_depth_snapshot": cex_depth,
+                    "dex_depth_snapshot": dex_depth,
+                }
+            }
+            with patch.object(
+                server,
+                "resolve_cex_execution_cost_path",
+                return_value=self.cex_execution_path,
+            ), patch.object(
+                server,
+                "resolve_dex_execution_cost_path",
+                return_value=self.dex_execution_path,
+            ), patch(
+                "dashboard.freshness.utc_now",
+                return_value=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+            ):
+                freshness = server.attach_freshness_metadata(payload)[
+                    "metadata"
+                ]["freshness"]
+            for family in (
+                "dex_tvl",
+                "cex_depth",
+                "dex_depth",
+                "cex_execution",
+                "dex_execution",
+            ):
+                with self.subTest(family=family):
+                    self.assertEqual(freshness[family]["status"], "stale")
+                    self.assertEqual(
+                        freshness[family]["observed_at"], old_observed_at
+                    )
+        finally:
+            server.clear_runtime_caches()
+
     def test_point_in_time_tvl_snapshot_overlays_legacy_ohlcv_value(self):
         write_csv(
             self.tvl_path,
@@ -448,7 +961,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(catalog_pool["tvl_snapshot_id"], "tvl-snapshot-1")
         self.assertEqual(
             catalog_pool["tvl_source_endpoint"],
-            "https://example.test/pool",
+            "https://example.test",
         )
         self.assertEqual(
             catalog_pool["tvl_raw_response_sha256"],
@@ -528,7 +1041,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
         self.assertEqual(
             catalog_binance["depth_source_endpoint"],
-            "https://example.test/depth",
+            "https://example.test",
         )
         for band, bid, ask, total, complete in (
             (10, 0, 0, 0, True),
@@ -659,6 +1172,170 @@ class MarketMonitorServerTest(unittest.TestCase):
             },
         )
 
+    def test_selected_quality_producer_satisfies_release_contract(self):
+        market_a = "cex:binance:BTC/USDT"
+        market_b = "cex:okx:BTC/USDT"
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            quality = server.build_market_quality(
+                "BTC",
+                "selected",
+                market_a,
+                market_b,
+                "2026-01-01",
+                "2026-01-02",
+            )
+
+        validate_quality(
+            quality,
+            token="BTC",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation=quality["metadata"]["data_generation"],
+        )
+
+    def test_empty_cex_book_quality_producer_satisfies_v4_flag_contract(self):
+        depth_row = {field: "" for field in DEPTH_COLUMNS_ALL}
+        depth_row.update(
+            {
+                "snapshot_id": "empty-book-snapshot",
+                "observed_at": "2026-07-27T02:03:04+00:00",
+                "response_received_at": "2026-07-27T02:03:05+00:00",
+                "token_symbol": "BTC",
+                "exchange": "binance",
+                "cex_symbol": "BTC/USDT",
+                "source_instrument": "BTCUSDT",
+                "source_quote_asset": "USDT",
+                "quote_conversion_method": "USDT=USD proxy",
+                "depth_method": "midpoint_symmetric_quote_notional",
+                "source_endpoint": "https://example.test/depth",
+                "raw_response_sha256": "d" * 64,
+                "status": "failed",
+                "reason_code": "source_no_two_sided_book",
+            }
+        )
+        write_csv(self.depth_path, DEPTH_COLUMNS_ALL, [depth_row])
+        environment = {
+            **self.environment,
+            "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
+        }
+        market_a = "cex:binance:BTC/USDT"
+        market_b = "cex:okx:BTC/USDT"
+
+        with patch.dict(server.os.environ, environment, clear=True):
+            quality = server.build_market_quality(
+                "BTC",
+                "selected",
+                market_a,
+                market_b,
+                "2026-01-01",
+                "2026-01-02",
+            )
+
+        binance = next(
+            market
+            for market in quality["markets"]
+            if market["market_id"] == market_a
+        )
+        depth_fact = binance["facts"]["depth"]
+        self.assertEqual(depth_fact["status"], "source_no_observation")
+        source_flag = next(
+            flag
+            for flag in depth_fact["quality_flags"]
+            if flag["code"] == "depth_source_no_observation"
+        )
+        self.assertEqual(
+            set(source_flag),
+            {
+                "code",
+                "severity",
+                "category",
+                "message",
+                "observed_value",
+                "threshold",
+            },
+        )
+        self.assertIsNone(source_flag["observed_value"])
+        self.assertIsNone(source_flag["threshold"])
+        validate_quality(
+            quality,
+            token="BTC",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation=quality["metadata"]["data_generation"],
+        )
+
+    def test_fail_closed_quality_flag_has_stable_v4_shape(self):
+        fact = server._validated_public_quality_fact(
+            {
+                "status": "unknown_status",
+                "reason_code": "unknown_reason",
+                "retryable": True,
+                "quality_flags": [],
+            }
+        )
+
+        flag = fact["quality_flags"][0]
+        self.assertEqual(
+            set(flag),
+            {
+                "code",
+                "severity",
+                "category",
+                "message",
+                "observed_value",
+                "threshold",
+            },
+        )
+        self.assertIsNone(flag["observed_value"])
+        self.assertIsNone(flag["threshold"])
+
+    def test_compare_and_execution_producers_share_catalog_generation(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            source_signature = server.api_source_signature()
+            catalog = server.build_market_catalog(
+                source_signature=source_signature,
+            )
+            comparison = server.build_market_comparison(
+                "BTC",
+                "cex:binance:BTC/USDT",
+                "dex:eth:uniswap:0xpool:BTC",
+                "2026-01-01",
+                "2026-01-02",
+                source_signature=source_signature,
+            )
+            execution = server.build_execution_cost_comparison(
+                "BTC",
+                "cex:binance:BTC/USDT",
+                "dex:eth:uniswap:0xpool:BTC",
+                source_signature=source_signature,
+            )
+
+        self.assertEqual(
+            comparison["metadata"]["data_generation"],
+            catalog["metadata"]["data_generation"],
+        )
+        self.assertEqual(
+            execution["metadata"]["data_generation"],
+            catalog["metadata"]["data_generation"],
+        )
+
+    def test_summary_producer_satisfies_structured_na_release_contract(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            summary = server.build_market_summary()
+
+        validate_summary(
+            summary,
+            ResponseMetrics(
+                "/api/markets/summary",
+                0.0,
+                1,
+                1,
+                True,
+            ),
+            raw_max=10_000_000,
+            gzip_max=10_000_000,
+        )
+
     def test_screener_summary_is_compact_and_matches_full_fact_aggregates(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
             full_payload = server.build_market_payload()
@@ -703,11 +1380,33 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertGreater(compact["quality_alert_counts"].get("info", 0), 0)
         self.assertEqual(compact["primary_cex"]["market_type"], "cex")
         self.assertEqual(compact["primary_dex"]["market_type"], "dex")
+        self.assertEqual(
+            (
+                compact["primary_cex"]["tvl_status"],
+                compact["primary_cex"]["tvl_na_reason"],
+                compact["primary_cex"]["tvl_retryable"],
+            ),
+            (
+                "not_applicable",
+                "cex_markets_do_not_have_pool_tvl",
+                False,
+            ),
+        )
         self.assertNotIn("price_points", compact["primary_cex"])
         self.assertNotIn("price_points", compact["primary_dex"])
         for primary in (compact["primary_cex"], compact["primary_dex"]):
             self.assertIn("refresh_market_id", primary)
             self.assertIsInstance(primary["depth_retryable"], bool)
+            for fact_name in ("tvl", "depth"):
+                rule = quality_outcome_rule(
+                    primary[f"{fact_name}_status"],
+                    primary[f"{fact_name}_na_reason"],
+                )
+                self.assertIsNotNone(rule)
+                self.assertIs(
+                    primary[f"{fact_name}_retryable"],
+                    rule.retryable,
+                )
             for field in (
                 "first_observed_date",
                 "latest_observed_date",
@@ -1240,6 +1939,19 @@ class MarketMonitorServerTest(unittest.TestCase):
             payload["metadata"]["missing_value_rule"],
         )
 
+        for market in payload["markets"]:
+            for fact_name, fact in market["facts"].items():
+                with self.subTest(
+                    market_id=market["market_id"],
+                    fact_name=fact_name,
+                ):
+                    rule = quality_outcome_rule(
+                        fact["status"],
+                        fact["reason_code"],
+                    )
+                    self.assertIsNotNone(rule, fact)
+                    self.assertIs(fact["retryable"], rule.retryable)
+
     def test_quality_window_separates_prelisting_from_retryable_historical_gap(self):
         with self.cex_path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle, lineterminator="\n")
@@ -1569,7 +2281,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             quality["metadata"]["freshness"]["cex_execution"][
                 "observed_at"
             ],
-            "2026-01-02T00:00:30+00:00",
+            "2026-01-02T00:00:00+00:00",
         )
         self.assertEqual(
             quality["metadata"]["freshness"]["dex_execution"][
@@ -1614,6 +2326,129 @@ class MarketMonitorServerTest(unittest.TestCase):
             self.assertNotIn(str(private_path), serialized)
             self.assertNotIn("Permission denied", serialized)
             self.assertNotIn(missing_message, serialized)
+
+    def test_execution_quality_aggregates_multiple_retryable_cex_reasons(self):
+        market_id = "cex:binance:BTC/USDT"
+        network_rows = self.execution_rows(
+            market_id,
+            "cex",
+            state_observed_at="2026-01-02T00:00:00+00:00",
+            status="failed",
+            status_reason="network",
+        )
+        rate_limit_rows = self.execution_rows(
+            market_id,
+            "cex",
+            state_observed_at="2026-01-02T00:00:00+00:00",
+            status="failed",
+            status_reason="rate_limit",
+        )
+        source_state = {
+            "snapshot": {
+                "by_market": {
+                    market_id: network_rows[:5] + rate_limit_rows[:5],
+                },
+                "observed_at": "2026-01-02T00:02:00+00:00",
+            },
+            "error_code": None,
+        }
+
+        fact = server._execution_quality_fact(
+            {"market_id": market_id, "market_type": "cex"},
+            source_state,
+        )
+
+        self.assertEqual(fact["status"], "collection_failed")
+        self.assertEqual(
+            fact["reason_code"],
+            "multiple_daily_quality_reasons",
+        )
+        self.assertTrue(fact["retryable"])
+        self.assertEqual(fact["action"], "retry_execution_collection")
+        self.assertEqual(fact["status_counts"], {"collection_failed": 10})
+        self.assertEqual(
+            fact["status_reason_counts"],
+            {"network": 5, "rate_limit": 5},
+        )
+
+    def test_empty_cex_execution_book_uses_stable_v4_flag_shape(self):
+        market_id = "cex:binance:BTC/USDT"
+        rows = self.execution_rows(
+            market_id,
+            "cex",
+            state_observed_at="2026-01-02T00:00:00+00:00",
+            status="failed",
+            status_reason="source_no_two_sided_book",
+        )
+        fact = server._execution_quality_fact(
+            {"market_id": market_id, "market_type": "cex"},
+            {
+                "snapshot": {
+                    "by_market": {market_id: rows},
+                    "observed_at": "2026-01-02T00:02:00+00:00",
+                },
+                "error_code": None,
+            },
+        )
+
+        self.assertEqual(fact["status"], "source_no_observation")
+        flag = next(
+            flag
+            for flag in fact["quality_flags"]
+            if flag["code"] == "execution_source_no_observation"
+        )
+        self.assertEqual(
+            set(flag),
+            {
+                "code",
+                "severity",
+                "category",
+                "message",
+                "observed_value",
+                "threshold",
+            },
+        )
+        self.assertIsNone(flag["observed_value"])
+        self.assertIsNone(flag["threshold"])
+
+    def test_execution_quality_does_not_hide_an_illegal_tuple_in_retryable_rows(self):
+        market_id = "cex:binance:BTC/USDT"
+        rows = self.execution_rows(
+            market_id,
+            "cex",
+            state_observed_at="2026-01-02T00:00:00+00:00",
+            status="failed",
+            status_reason="network",
+        )
+        illegal_row = {
+            **rows[-1],
+            "status": "unexpected_status",
+            "status_reason": "network",
+        }
+        source_state = {
+            "snapshot": {
+                "by_market": {market_id: rows[:9] + [illegal_row]},
+                "observed_at": "2026-01-02T00:02:00+00:00",
+            },
+            "error_code": None,
+        }
+
+        fact = server._execution_quality_fact(
+            {"market_id": market_id, "market_type": "cex"},
+            source_state,
+        )
+
+        self.assertEqual(fact["status"], "needs_review")
+        self.assertEqual(
+            fact["reason_code"],
+            "daily_quality_outcome_invalid",
+        )
+        self.assertFalse(fact["retryable"])
+        self.assertIsNone(fact["action"])
+        self.assertEqual(
+            fact["status_counts"],
+            {"collection_failed": 9, "needs_review": 1},
+        )
 
     def test_quality_api_reports_partial_execution_without_cost_claim(self):
         binance_id = "cex:binance:BTC/USDT"
@@ -2082,7 +2917,11 @@ class MarketMonitorServerTest(unittest.TestCase):
         server._build_public_api_response_cached.cache_clear()
         payload = {"metadata": {}, "markets": []}
 
-        def slow_catalog():
+        def slow_catalog(*, source_signature=None):
+            self.assertEqual(
+                source_signature,
+                (("facts.sqlite3", 1, 100),),
+            )
             time.sleep(0.02)
             return payload
 

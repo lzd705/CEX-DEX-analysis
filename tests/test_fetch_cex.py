@@ -554,6 +554,176 @@ class FetchCexTests(unittest.TestCase):
             {"instrument": "AAVE/USDT", "source_instrument": "AAVE/KRW", "source_instrument_alias_validated": True},
         )
 
+    def test_upbit_empty_candidates_publish_terminal_no_candles_with_lineage(self):
+        with patch(
+            "scripts.fetch_cex.fetch_upbit_candles",
+            side_effect=[[], []],
+        ):
+            try:
+                rows = fetch_cex.build_upbit_rows(
+                    "AAVE",
+                    "AAVE/USDT",
+                    1,
+                    start_date="2026-07-28",
+                    end_date="2026-07-28",
+                )
+            except Exception as error:
+                self.fail(
+                    "successful empty Upbit candidates raised {!r}".format(
+                        error
+                    )
+                )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(
+            getattr(rows, "candidate_outcomes", None),
+            [
+                {
+                    "market": "KRW-AAVE",
+                    "source_instrument": "AAVE/KRW",
+                    "stage": "candles",
+                    "status": "no_data",
+                    "reason_code": "no_candles",
+                    "http_status": None,
+                    "observation_count": 0,
+                },
+                {
+                    "market": "USDT-AAVE",
+                    "source_instrument": "AAVE/USDT",
+                    "stage": "candles",
+                    "status": "no_data",
+                    "reason_code": "no_candles",
+                    "http_status": None,
+                    "observation_count": 0,
+                },
+            ],
+        )
+        attempt = cex_attempt_record(
+            "AAVE",
+            "upbit",
+            "AAVE/USDT",
+            rows=rows,
+            start_date="2026-07-28",
+            end_date="2026-07-28",
+        )
+        self.assertEqual(
+            {
+                key: attempt[key]
+                for key in (
+                    "instrument",
+                    "source_instrument",
+                    "source_instrument_alias_validated",
+                    "status",
+                    "outcome",
+                    "reason_code",
+                )
+            },
+            {
+                "instrument": "AAVE/USDT",
+                "source_instrument": None,
+                "source_instrument_alias_validated": False,
+                "status": "no_data",
+                "outcome": "no_candles",
+                "reason_code": "no_candles",
+            },
+        )
+
+    def test_upbit_technical_candidate_error_is_not_erased_by_empty_fallback(self):
+        source_error = urllib.error.HTTPError(
+            "https://source.example/candles",
+            503,
+            "Unavailable",
+            None,
+            None,
+        )
+        with patch(
+            "scripts.fetch_cex.fetch_upbit_candles",
+            side_effect=[source_error, []],
+        ):
+            with self.assertRaises(RuntimeError) as context:
+                fetch_cex.build_upbit_rows("AAVE", "AAVE/USDT", 1)
+
+        self.assertEqual(
+            getattr(context.exception, "candidate_outcomes", None),
+            [
+                {
+                    "market": "KRW-AAVE",
+                    "source_instrument": "AAVE/KRW",
+                    "stage": "candles",
+                    "status": "failed",
+                    "reason_code": "source_unavailable",
+                    "http_status": 503,
+                    "observation_count": 0,
+                },
+                {
+                    "market": "USDT-AAVE",
+                    "source_instrument": "AAVE/USDT",
+                    "stage": "candles",
+                    "status": "no_data",
+                    "reason_code": "no_candles",
+                    "http_status": None,
+                    "observation_count": 0,
+                },
+            ],
+        )
+        self.assertEqual(
+            classify_attempt_error(context.exception)["reason_code"],
+            "source_unavailable",
+        )
+
+    def test_upbit_reference_quote_failure_is_not_reclassified_as_absence(self):
+        candle = {
+            "market": "KRW-AAVE",
+            "candle_date_time_utc": "2026-07-28T00:00:00",
+            "opening_price": 100000,
+            "high_price": 110000,
+            "low_price": 90000,
+            "trade_price": 105000,
+            "candle_acc_trade_volume": 10,
+            "candle_acc_trade_price": 1050000,
+        }
+        reference_error = urllib.error.HTTPError(
+            "https://source.example/reference",
+            503,
+            "Unavailable",
+            None,
+            None,
+        )
+        with patch(
+            "scripts.fetch_cex.fetch_upbit_candles",
+            side_effect=[[candle], reference_error, []],
+        ):
+            with self.assertRaises(RuntimeError) as context:
+                fetch_cex.build_upbit_rows("AAVE", "AAVE/USDT", 1)
+
+        self.assertEqual(
+            getattr(context.exception, "candidate_outcomes", None),
+            [
+                {
+                    "market": "KRW-AAVE",
+                    "source_instrument": "AAVE/KRW",
+                    "stage": "quote_conversion",
+                    "status": "failed",
+                    "reason_code": "source_unavailable",
+                    "http_status": 503,
+                    "observation_count": 1,
+                },
+                {
+                    "market": "USDT-AAVE",
+                    "source_instrument": "AAVE/USDT",
+                    "stage": "candles",
+                    "status": "no_data",
+                    "reason_code": "no_candles",
+                    "http_status": None,
+                    "observation_count": 0,
+                },
+            ],
+        )
+        self.assertEqual(
+            classify_attempt_error(context.exception)["reason_code"],
+            "source_unavailable",
+        )
+
     def test_upbit_canonicalization_preserves_ldo_usdt_review_identity(self):
         candle = {
             "market": "KRW-LDO", "candle_date_time_utc": "2026-07-28T00:00:00",

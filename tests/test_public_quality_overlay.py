@@ -414,6 +414,54 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
         )
         self.assertEqual(mixed_market["quality_status"], "critical")
 
+    def test_multiple_manual_reasons_preserve_manual_review_contract(self):
+        self.write_report(
+            [
+                self.issue(
+                    "2026-01-04",
+                    "not_listed",
+                    "needs_review",
+                    False,
+                ),
+                self.issue(
+                    "2026-01-04",
+                    "source_rejected_request",
+                    "needs_review",
+                    False,
+                ),
+            ]
+        )
+
+        _payload, market = self.quality_for_day("2026-01-04")
+        fact = market["facts"]["daily"]
+        self.assertEqual(fact["status"], "needs_review")
+        self.assertEqual(
+            fact["reason_code"],
+            "multiple_daily_quality_reasons",
+        )
+        self.assertEqual(
+            fact["reason_code_counts"],
+            {"not_listed": 1, "source_rejected_request": 1},
+        )
+        self.assertFalse(fact["retryable"])
+        self.assertEqual(fact["action"], "operator_manual_review")
+
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            selected = server.build_market_quality(
+                "BTC",
+                scope="selected",
+                market_a_id="cex:binance:BTC/USDT",
+                market_b_id="dex:eth:uniswap:0xpool:BTC",
+                start="2026-01-04",
+                end="2026-01-04",
+            )
+        validate_quality(
+            selected,
+            token="BTC",
+            market_a="cex:binance:BTC/USDT",
+            market_b="dex:eth:uniswap:0xpool:BTC",
+        )
+
     def test_invalid_daily_outcome_contract_fails_closed_to_manual_review(self):
         cases = (
             ("unknown pair", "unknown_reason", "unsupported", False),

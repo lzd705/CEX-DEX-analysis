@@ -10,6 +10,7 @@ from scripts.execution_cost import (
     usd_price_timing,
     validate_execution_snapshot,
 )
+from scripts.quality_outcomes import quality_outcome_rule
 
 
 def common_fields(market_id="cex:test:UNI/USDT", *, measured=True):
@@ -624,6 +625,36 @@ class ExecutionCostContractTest(unittest.TestCase):
 
         self.assertEqual(parsed[0]["target_token_quantity"], huge)
         self.assertIsInstance(parsed[0]["quoted_execution_cost_bps"], str)
+
+    def test_api_rows_redact_collector_errors_and_normalize_public_outcome(self):
+        common = common_fields()
+        common["source_endpoint"] = (
+            "https://collector:secret@example.test:8443/private/depth"
+            "?api_key=raw#response"
+        )
+        failed = execution_fact_row(
+            common=common,
+            direction="sell_token",
+            requested_notional_usd=1000,
+            status="failed",
+            status_reason="SourceBookError: source returned no order book",
+            error="PermissionError: /srv/private/execution.json",
+        )
+
+        parsed = execution_api_rows(
+            [failed],
+            number_parser=lambda value: None if value in (None, "") else float(value),
+        )[0]
+
+        self.assertEqual(parsed["status"], "source_no_observation")
+        self.assertEqual(parsed["status_reason"], "source_no_order_book")
+        self.assertIsNotNone(
+            quality_outcome_rule(parsed["status"], parsed["status_reason"])
+        )
+        self.assertEqual(parsed["source_endpoint"], "https://example.test:8443")
+        self.assertIsNone(parsed["error"])
+        self.assertNotIn("/srv/private", str(parsed))
+        self.assertNotIn("collector:secret", str(parsed))
 
 
 if __name__ == "__main__":

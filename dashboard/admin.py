@@ -35,7 +35,10 @@ try:
         utc_now_text,
     )
     from scripts.fact_quality import cex_market, dex_market
-    from scripts.quality_outcomes import quality_outcome_rule
+    from scripts.quality_outcomes import (
+        quality_outcome_resolution_state,
+        quality_outcome_rule,
+    )
     from dashboard.snapshot_refresh import (
         evaluate_snapshot_refresh,
         read_snapshot_fact_state,
@@ -62,6 +65,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
         dex_market,
     )
     from scripts.quality_outcomes import (  # type: ignore[no-redef]
+        quality_outcome_resolution_state,
         quality_outcome_rule,
     )
     from dashboard.snapshot_refresh import (  # type: ignore[no-redef]
@@ -1611,8 +1615,7 @@ class AdminService:
             "--data-dir",
             str(self.data_dir),
         ]
-        if fact_type == "depth":
-            command.extend(["--tokens", job["token_symbol"]])
+        command.extend(["--market-id", job["market_id"]])
         try:
             before = read_snapshot_fact_state(self.data_dir, job)
         except (OSError, ValueError):
@@ -1627,6 +1630,47 @@ class AdminService:
                 result=None,
             )
             return
+        if not before.retryable:
+            resolution_state = quality_outcome_resolution_state(
+                before.status,
+                before.reason_code,
+            )
+            before_result = self._public_snapshot_state(before)
+            if resolution_state in {
+                "observed",
+                "confirmed_terminal_absence",
+            }:
+                self._set_job(
+                    job_id,
+                    status="succeeded",
+                    stage="complete",
+                    finished_at=utc_now().isoformat(),
+                    error=None,
+                    error_code=None,
+                    retryable=False,
+                    publication_committed=False,
+                    result={
+                        "before": before_result,
+                        "after": before_result,
+                        "outcome": "already_resolved",
+                    },
+                )
+            else:
+                self._fail_job(
+                    job_id,
+                    stage="verify_snapshot_before",
+                    error_code="snapshot_refresh_no_longer_retryable",
+                    message=(
+                        "The requested snapshot fact is no longer eligible "
+                        "for public refresh."
+                    ),
+                    retryable=False,
+                    status="partial",
+                    publication_committed=False,
+                    result={"before": before_result},
+                )
+            return
+        command_failed = False
         try:
             self._run_command(
                 command,
@@ -1635,17 +1679,10 @@ class AdminService:
                 timeout_seconds=PUBLIC_COMMAND_TIMEOUT_SECONDS,
             )
         except (OSError, subprocess.SubprocessError):
-            self._fail_job(
-                job_id,
-                stage=f"refresh_{profile}",
-                error_code="snapshot_refresh_failed",
-                message="The requested snapshot refresh failed.",
-                retryable=True,
-                status="partial",
-                publication_committed=False,
-                result=None,
-            )
-            return
+            # A collector can complete its failure-atomic publication and then
+            # fail while recording orchestration metadata. Always inspect the
+            # exact target before claiming that nothing was committed.
+            command_failed = True
         try:
             # The public server caches source snapshots independently of the
             # verifier; drop that generation before observing the post-state.
@@ -1656,9 +1693,17 @@ class AdminService:
         except (ImportError, OSError, ValueError):
             self._fail_job(
                 job_id,
-                stage="verify_snapshot_after",
-                error_code="snapshot_publication_unreadable",
-                message="The requested snapshot publication could not be verified.",
+                stage=(f"refresh_{profile}" if command_failed else "verify_snapshot_after"),
+                error_code=(
+                    "snapshot_refresh_failed"
+                    if command_failed
+                    else "snapshot_publication_unreadable"
+                ),
+                message=(
+                    "The requested snapshot refresh failed."
+                    if command_failed
+                    else "The requested snapshot publication could not be verified."
+                ),
                 retryable=True,
                 status="partial",
                 publication_committed=False,
@@ -1670,6 +1715,39 @@ class AdminService:
             "before": self._public_snapshot_state(before),
             "after": self._public_snapshot_state(after),
         }
+        if command_failed:
+            target_publication_changed = outcome.succeeded or (
+                before.dataset_sha256 != after.dataset_sha256
+                and before.snapshot_id != after.snapshot_id
+                and before.target_fingerprint != after.target_fingerprint
+            )
+            if not target_publication_changed:
+                self._fail_job(
+                    job_id,
+                    stage=f"refresh_{profile}",
+                    error_code="snapshot_refresh_failed",
+                    message="The requested snapshot refresh failed.",
+                    retryable=True,
+                    status="partial",
+                    publication_committed=False,
+                    result=result,
+                )
+                return
+            self._set_job(
+                job_id,
+                status="partial",
+                stage="verify_snapshot_after",
+                finished_at=utc_now().isoformat(),
+                error=(
+                    "The target publication changed before the refresh "
+                    "command reported a failure."
+                ),
+                error_code="snapshot_refresh_failed_after_publication",
+                retryable=outcome.retryable,
+                publication_committed=True,
+                result=result,
+            )
+            return
         if not outcome.succeeded:
             self._set_job(
                 job_id,
@@ -2099,9 +2177,8 @@ class AdminService:
             if (
                 rule is not None
                 and issue.get("retryable") is rule.retryable
-                and rule.terminal
-                and rule.resolution
-                in {"confirmed_absence", "confirmed_unsupported"}
+                and quality_outcome_resolution_state(status, reason)
+                == "confirmed_terminal_absence"
             ):
                 confirmed_absences.add(pair)
                 confirmed_absence_reasons[pair] = reason

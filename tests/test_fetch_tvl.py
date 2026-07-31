@@ -4,19 +4,27 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from dashboard.snapshot_refresh import (
+    evaluate_snapshot_refresh,
+    read_snapshot_fact_state,
+)
 from scripts.fetch_tvl import (
     CURRENT_FILENAME,
     HISTORY_FILENAME,
     LATEST_FILENAME,
     MAX_POOLS_PER_REQUEST,
     TVL_COLUMNS,
+    atomic_write_csv,
     chunks,
     collect_tvl,
     load_pools_from_csv,
     load_pools_from_database,
+    merge_exact_publication,
     multi_pool_url,
     pool_key,
+    publish_exact_snapshot,
     publish_snapshot,
     rows_from_payload,
     validate_snapshot,
@@ -211,6 +219,38 @@ class FetchTvlTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "coverage"):
             validate_snapshot([pool(), pool(token="AAVE", address="0xaave")], observed)
 
+    def test_exact_candidate_accepts_only_terminal_missing_or_not_found(self):
+        terminal = rows_from_payload(
+            [pool(address="0xMissing")],
+            {"data": [source_item(address="0xMissing", reserve=None)]},
+            snapshot_id="candidate-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "no observed"):
+            validate_snapshot([pool(address="0xMissing")], terminal)
+        validate_snapshot(
+            [pool(address="0xMissing")],
+            terminal,
+            allow_terminal_only=True,
+        )
+
+        retryable = [
+            {
+                **terminal[0],
+                "status": "failed",
+                "error": "URLError: temporary source failure",
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "terminal non-retryable"):
+            validate_snapshot(
+                [pool(address="0xMissing")],
+                retryable,
+                allow_terminal_only=True,
+            )
+
     def test_publish_appends_history_and_replaces_latest(self):
         first = rows_from_payload(
             [pool()],
@@ -247,6 +287,456 @@ class FetchTvlTest(unittest.TestCase):
         self.assertEqual(latest[0]["tvl_usd"], "200")
         self.assertEqual(current[0]["snapshot_id"], "snapshot-2")
         self.assertEqual(set(latest[0]), set(TVL_COLUMNS))
+
+    def test_exact_pool_merge_preserves_other_pool_and_appends_only_target_history(self):
+        pools = [pool(), pool(token="AAVE", address="0xAave")]
+        baseline = rows_from_payload(
+            pools,
+            {
+                "data": [
+                    source_item(address="0xPool", reserve="100"),
+                    source_item(address="0xAave", reserve="200"),
+                ]
+            },
+            snapshot_id="baseline-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        candidate = rows_from_payload(
+            [pools[1]],
+            {"data": [source_item(address="0xAave", reserve="250")]},
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+        target = "dex:eth:uniswap_v3:0xaave:AAVE"
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            publish_snapshot(
+                baseline,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+            merged = merge_exact_publication(
+                candidate,
+                target_market_id=target,
+                publish_dir=published,
+            )
+            publish_exact_snapshot(
+                merged,
+                target_market_id=target,
+                history_rows_to_append=candidate,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+            with (published / LATEST_FILENAME).open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                latest = list(csv.DictReader(handle))
+            with (published / HISTORY_FILENAME).open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                history = list(csv.DictReader(handle))
+
+        by_token = {row["token_symbol"]: row for row in latest}
+        self.assertEqual(by_token["AAVE"]["tvl_usd"], "250")
+        self.assertEqual(by_token["UNI"]["tvl_usd"], "100")
+        self.assertEqual(
+            {row["snapshot_id"] for row in latest},
+            {"candidate-2"},
+        )
+        self.assertEqual(len(history), 3)
+
+    def test_exact_pool_merge_can_insert_one_cataloged_missing_tvl_row(self):
+        baseline_pool = pool()
+        missing_pool = pool(token="AAVE", address="0xAave")
+        baseline = rows_from_payload(
+            [baseline_pool],
+            {"data": [source_item(address="0xPool", reserve="100")]},
+            snapshot_id="baseline-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        candidate = rows_from_payload(
+            [missing_pool],
+            {"data": [source_item(address="0xAave", reserve="250")]},
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            publish_snapshot(
+                baseline,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+            merged = merge_exact_publication(
+                candidate,
+                target_market_id="dex:eth:uniswap_v3:0xaave:AAVE",
+                publish_dir=published,
+            )
+            publish_exact_snapshot(
+                merged,
+                target_market_id="dex:eth:uniswap_v3:0xaave:AAVE",
+                history_rows_to_append=candidate,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+            with (published / LATEST_FILENAME).open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                latest = list(csv.DictReader(handle))
+            with (published / HISTORY_FILENAME).open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                history = list(csv.DictReader(handle))
+
+        self.assertEqual(len(merged), 2)
+        by_token = {row["token_symbol"]: row for row in merged}
+        self.assertEqual(by_token["UNI"]["tvl_usd"], "100")
+        self.assertEqual(by_token["AAVE"]["tvl_usd"], "250")
+        self.assertEqual(
+            {row["snapshot_id"] for row in merged},
+            {"candidate-2"},
+        )
+        self.assertEqual(len(latest), 2)
+        self.assertEqual(len(history), 2)
+
+    def test_exact_pool_publication_can_insert_terminal_absence_and_satisfy_postcondition(self):
+        baseline_pool = pool()
+        target_pool = pool(token="AAVE", address="0xAave")
+        target_market_id = "dex:eth:uniswap_v3:0xaave:AAVE"
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": target_market_id,
+            "fact_type": "tvl",
+        }
+        baseline = rows_from_payload(
+            [baseline_pool],
+            {"data": [source_item(address="0xPool", reserve="100")]},
+            snapshot_id="baseline-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        terminal_candidate = rows_from_payload(
+            [target_pool],
+            {"data": []},
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            publish_snapshot(
+                baseline,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+            before = read_snapshot_fact_state(published, request)
+            merged = merge_exact_publication(
+                terminal_candidate,
+                target_market_id=target_market_id,
+                publish_dir=published,
+            )
+            result = publish_exact_snapshot(
+                merged,
+                target_market_id=target_market_id,
+                history_rows_to_append=terminal_candidate,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+            after = read_snapshot_fact_state(published, request)
+            with (published / LATEST_FILENAME).open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                latest = list(csv.DictReader(handle))
+
+        postcondition = evaluate_snapshot_refresh(before, after)
+        self.assertEqual(terminal_candidate[0]["status"], "not_found")
+        self.assertTrue(postcondition.succeeded)
+        self.assertEqual(
+            postcondition.resolution,
+            "confirmed_absence",
+        )
+        self.assertEqual(result["publication_gate"]["mode"], "exact_target_recovery/v1")
+        by_token = {row["token_symbol"]: row for row in latest}
+        self.assertEqual(by_token["AAVE"]["status"], "not_found")
+        self.assertEqual(by_token["AAVE"]["tvl_usd"], "")
+        self.assertEqual(by_token["UNI"]["tvl_usd"], "100")
+
+    def test_exact_pool_publication_recovers_one_target_from_low_coverage_baseline(self):
+        pools = [pool(), pool(token="AAVE", address="0xAave")]
+        target_market_id = "dex:eth:uniswap_v3:0xaave:AAVE"
+        baseline = rows_from_payload(
+            pools,
+            {
+                "data": [
+                    source_item(address="0xPool", reserve="100"),
+                    source_item(address="0xAave", reserve="200"),
+                ]
+            },
+            snapshot_id="baseline-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        baseline[1].update(status="failed", tvl_usd="", error="source outage")
+        candidate = rows_from_payload(
+            [pools[1]],
+            {"data": [source_item(address="0xAave", reserve="250")]},
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            published.mkdir()
+            for filename in (LATEST_FILENAME, CURRENT_FILENAME):
+                atomic_write_csv(published / filename, baseline)
+            merged = merge_exact_publication(
+                candidate,
+                target_market_id=target_market_id,
+                publish_dir=published,
+            )
+            result = publish_exact_snapshot(
+                merged,
+                target_market_id=target_market_id,
+                history_rows_to_append=candidate,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+
+        self.assertTrue(result["publication_gate"]["passed"])
+        self.assertEqual(result["publication_gate"]["candidate"]["usable_bps"], 10000)
+        self.assertEqual(
+            result["publication_gate"]["thresholds"]["minimum_candidate_usable_bps"],
+            0,
+        )
+
+    def test_exact_pool_publication_resolves_terminal_on_all_failed_baseline(self):
+        target_pool = pool(token="AAVE", address="0xAave")
+        target_market_id = "dex:eth:uniswap_v3:0xaave:AAVE"
+        baseline = rows_from_payload(
+            [target_pool],
+            {"data": [source_item(address="0xAave", reserve="200")]},
+            snapshot_id="baseline-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        baseline[0].update(status="failed", tvl_usd="", error="source outage")
+        terminal_candidate = rows_from_payload(
+            [target_pool],
+            {"data": []},
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            published.mkdir()
+            for filename in (LATEST_FILENAME, CURRENT_FILENAME):
+                atomic_write_csv(published / filename, baseline)
+            merged = merge_exact_publication(
+                terminal_candidate,
+                target_market_id=target_market_id,
+                publish_dir=published,
+            )
+            result = publish_exact_snapshot(
+                merged,
+                target_market_id=target_market_id,
+                history_rows_to_append=terminal_candidate,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+
+        self.assertTrue(result["publication_gate"]["passed"])
+        self.assertEqual(merged[0]["status"], "not_found")
+        self.assertEqual(
+            result["publication_gate"]["exact_target"]["resolution"],
+            "confirmed_terminal_absence",
+        )
+
+    def test_exact_pool_publication_rolls_back_every_public_replace(self):
+        pools = [pool(), pool(token="AAVE", address="0xAave")]
+        baseline = rows_from_payload(
+            pools,
+            {
+                "data": [
+                    source_item(address="0xPool", reserve="100"),
+                    source_item(address="0xAave", reserve="200"),
+                ]
+            },
+            snapshot_id="baseline-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        candidate = rows_from_payload(
+            [pools[1]],
+            {"data": [source_item(address="0xAave", reserve="250")]},
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            output = root / "processed"
+            publish_snapshot(
+                baseline,
+                output_dir=output,
+                publish_dir=published,
+            )
+            merged = merge_exact_publication(
+                candidate,
+                target_market_id="dex:eth:uniswap_v3:0xaave:AAVE",
+                publish_dir=published,
+            )
+            protected = [
+                published / HISTORY_FILENAME,
+                published / LATEST_FILENAME,
+                published / CURRENT_FILENAME,
+            ]
+            originals = {path: path.read_bytes() for path in protected}
+
+            from scripts import atomic_publication
+
+            real_replace = atomic_publication.os.replace
+            for fail_at in range(1, len(protected) + 1):
+                calls = {"count": 0}
+
+                def fail_once(source, destination):
+                    calls["count"] += 1
+                    if calls["count"] == fail_at:
+                        raise OSError("injected publication failure")
+                    return real_replace(source, destination)
+
+                with self.subTest(fail_at=fail_at), patch(
+                    "scripts.atomic_publication.os.replace",
+                    side_effect=fail_once,
+                ):
+                    with self.assertRaises(OSError):
+                        publish_exact_snapshot(
+                            merged,
+                            target_market_id="dex:eth:uniswap_v3:0xaave:AAVE",
+                            history_rows_to_append=candidate,
+                            output_dir=output,
+                            publish_dir=published,
+                        )
+                self.assertEqual(
+                    {path: path.read_bytes() for path in protected},
+                    originals,
+                )
+
+    def test_terminal_absence_insert_rolls_back_every_public_replace(self):
+        baseline_pool = pool()
+        target_pool = pool(token="AAVE", address="0xAave")
+        target_market_id = "dex:eth:uniswap_v3:0xaave:AAVE"
+        baseline = rows_from_payload(
+            [baseline_pool],
+            {"data": [source_item(address="0xPool", reserve="100")]},
+            snapshot_id="baseline-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        candidate = rows_from_payload(
+            [target_pool],
+            {"data": []},
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            output = root / "processed"
+            publish_snapshot(
+                baseline,
+                output_dir=output,
+                publish_dir=published,
+            )
+            merged = merge_exact_publication(
+                candidate,
+                target_market_id=target_market_id,
+                publish_dir=published,
+            )
+            protected = [
+                published / HISTORY_FILENAME,
+                published / LATEST_FILENAME,
+                published / CURRENT_FILENAME,
+            ]
+            originals = {path: path.read_bytes() for path in protected}
+
+            from scripts import atomic_publication
+
+            real_replace = atomic_publication.os.replace
+            for fail_at in range(1, len(protected) + 1):
+                calls = {"count": 0}
+
+                def fail_once(source, destination):
+                    calls["count"] += 1
+                    if calls["count"] == fail_at:
+                        raise OSError("injected publication failure")
+                    return real_replace(source, destination)
+
+                with self.subTest(fail_at=fail_at), patch(
+                    "scripts.atomic_publication.os.replace",
+                    side_effect=fail_once,
+                ):
+                    with self.assertRaises(OSError):
+                        publish_exact_snapshot(
+                            merged,
+                            target_market_id=target_market_id,
+                            history_rows_to_append=candidate,
+                            output_dir=output,
+                            publish_dir=published,
+                        )
+                self.assertEqual(
+                    {path: path.read_bytes() for path in protected},
+                    originals,
+                )
 
     def test_coverage_regression_preserves_every_published_tvl_file(self):
         pools = [

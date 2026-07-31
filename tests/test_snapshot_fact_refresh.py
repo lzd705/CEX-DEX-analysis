@@ -47,11 +47,11 @@ def cex_row(**changes):
         "source_instrument": "USDT-AAVE",
         "source_quote_asset": "USDT",
         "quote_conversion_method": "USDT=USD proxy",
-        "best_bid": "1",
-        "best_ask": "1",
-        "midpoint": "1",
-        "spread_quote": "0",
-        "spread_bps": "0",
+        "best_bid": "99",
+        "best_ask": "101",
+        "midpoint": "100",
+        "spread_quote": "2",
+        "spread_bps": "200",
         "bid_depth_10bps_usd": "0",
         "ask_depth_10bps_usd": "0",
         "total_depth_10bps_usd": "0",
@@ -248,7 +248,9 @@ class SnapshotFactRefreshTest(unittest.TestCase):
                 str(admin.PROJECT_ROOT / "scripts/run_collection_cycle.py"),
             )
             self.assertIn("cex_depth", command)
-            self.assertEqual(command[-2:], ["--tokens", "AAVE"])
+            market_option = command.index("--market-id")
+            self.assertEqual(command[market_option + 1], job["market_id"])
+            self.assertNotIn("--tokens", command)
             set_job.assert_called_once()
             self.assertEqual(set_job.call_args.kwargs["status"], "partial")
             self.assertFalse(set_job.call_args.kwargs["publication_committed"])
@@ -263,8 +265,8 @@ class SnapshotFactRefreshTest(unittest.TestCase):
             service = AdminService(data_dir=root / "data", job_dir=root / "jobs")
             job = {
                 "token_symbol": "AAVE",
-                "market_id": "cex:binance:AAVE/USDT",
-                "market_type": "cex",
+                "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+                "market_type": "dex",
                 "fact_type": "depth",
             }
             before = state("s1", "a" * 64, "collection_failed", "network", retryable=True,
@@ -272,12 +274,17 @@ class SnapshotFactRefreshTest(unittest.TestCase):
             after = state("s2", "b" * 64, "observed", "observed",
                           market_id=job["market_id"])
             set_job = Mock()
-            with patch.object(service, "_run_command"), patch.object(
+            with patch.object(service, "_run_command") as run_command, patch.object(
                 admin, "read_snapshot_fact_state", side_effect=[before, after]
             ), patch("dashboard.server.clear_runtime_caches") as clear_caches, patch.object(
                 service, "_set_job", set_job
             ):
                 service._run_snapshot_refresh_job("job-1", job, root / "job.log")
+            command = run_command.call_args.args[0]
+            self.assertIn("dex_depth", command)
+            market_option = command.index("--market-id")
+            self.assertEqual(command[market_option + 1], job["market_id"])
+            self.assertNotIn("--tokens", command)
             clear_caches.assert_called_once_with()
             self.assertEqual(set_job.call_args.kwargs["status"], "succeeded")
             self.assertTrue(set_job.call_args.kwargs["publication_committed"])
@@ -317,6 +324,63 @@ class SnapshotFactRefreshTest(unittest.TestCase):
             self.assertEqual(fail_job.call_args.kwargs["status"], "partial")
             self.assertFalse(fail_job.call_args.kwargs["publication_committed"])
 
+    def test_nonzero_command_reports_a_target_publication_that_already_committed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = AdminService(data_dir=root / "data", job_dir=root / "jobs")
+            before = state(
+                "s1",
+                "a" * 64,
+                "collection_failed",
+                "network",
+                retryable=True,
+                market_id="cex:binance:AAVE/USDT",
+            )
+            after = state(
+                "s2",
+                "b" * 64,
+                "observed",
+                "observed",
+                market_id="cex:binance:AAVE/USDT",
+            )
+            set_job = Mock()
+            with patch.object(
+                service,
+                "_run_command",
+                side_effect=__import__("subprocess").CalledProcessError(1, ["x"]),
+            ), patch.object(
+                admin,
+                "read_snapshot_fact_state",
+                side_effect=[before, after],
+            ), patch(
+                "dashboard.server.clear_runtime_caches"
+            ), patch.object(
+                service,
+                "_set_job",
+                set_job,
+            ):
+                service._run_snapshot_refresh_job(
+                    "job-1",
+                    {
+                        "token_symbol": "AAVE",
+                        "market_id": "cex:binance:AAVE/USDT",
+                        "market_type": "cex",
+                        "fact_type": "depth",
+                    },
+                    root / "job.log",
+                )
+
+            self.assertEqual(set_job.call_args.kwargs["status"], "partial")
+            self.assertTrue(set_job.call_args.kwargs["publication_committed"])
+            self.assertEqual(
+                set_job.call_args.kwargs["error_code"],
+                "snapshot_refresh_failed_after_publication",
+            )
+            self.assertEqual(
+                set_job.call_args.kwargs["result"]["after"]["status"],
+                "observed",
+            )
+
     def test_before_read_failure_does_not_invoke_command(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -335,6 +399,44 @@ class SnapshotFactRefreshTest(unittest.TestCase):
             run_command.assert_not_called()
             self.assertEqual(fail_job.call_args.kwargs["status"], "partial")
             self.assertEqual(fail_job.call_args.kwargs["error_code"], "snapshot_publication_unreadable")
+
+    def test_worker_noops_when_queued_fact_has_already_resolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = AdminService(data_dir=root / "data", job_dir=root / "jobs")
+            run_command = Mock()
+            set_job = Mock()
+            resolved = state(
+                "s2",
+                "b" * 64,
+                "observed",
+                "observed",
+                retryable=False,
+                market_id="cex:binance:AAVE/USDT",
+            )
+            with patch.object(service, "_run_command", run_command), patch.object(
+                service, "_set_job", set_job
+            ), patch.object(
+                admin, "read_snapshot_fact_state", return_value=resolved
+            ):
+                service._run_snapshot_refresh_job(
+                    "job-1",
+                    {
+                        "token_symbol": "AAVE",
+                        "market_id": "cex:binance:AAVE/USDT",
+                        "market_type": "cex",
+                        "fact_type": "depth",
+                    },
+                    root / "job.log",
+                )
+
+            run_command.assert_not_called()
+            self.assertEqual(set_job.call_args.kwargs["status"], "succeeded")
+            self.assertFalse(set_job.call_args.kwargs["publication_committed"])
+            self.assertEqual(
+                set_job.call_args.kwargs["result"]["outcome"],
+                "already_resolved",
+            )
 
     def test_tvl_refresh_uses_published_tvl_profile_without_fake_token_filter(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -367,10 +469,98 @@ class SnapshotFactRefreshTest(unittest.TestCase):
 
             command = run_command.call_args.args[0]
             self.assertIn("tvl", command)
+            market_option = command.index("--market-id")
+            self.assertEqual(
+                command[market_option + 1],
+                "dex:eth:uniswap_v3:0xabc:AAVE",
+            )
             self.assertNotIn("--tokens", command)
 
 
 class SnapshotPostconditionTest(unittest.TestCase):
+    def test_missing_tvl_row_remains_retryable_for_safe_exact_insert(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "dex:eth:uniswap_v3:0xdef:AAVE",
+            "fact_type": "tvl",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            write_rows(
+                data_dir / "dex_pool_tvl_latest.csv",
+                [
+                    tvl_row(
+                        token_symbol="UNI",
+                        pool_address="0xabc",
+                    )
+                ],
+            )
+            result = read_snapshot_fact_state(data_dir, request)
+
+        self.assertEqual(result.status, "not_cataloged_in_snapshot")
+        self.assertEqual(
+            result.reason_code,
+            "tvl_market_not_cataloged_in_snapshot",
+        )
+        self.assertTrue(result.retryable)
+
+    def test_changed_non_target_row_does_not_refresh_unchanged_exact_target(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            publication = data_dir / "cex_depth_latest.csv"
+            write_rows(publication, [
+                cex_row(),
+                cex_row(token_symbol="UNI", cex_symbol="UNI/USDT"),
+            ])
+            before = read_snapshot_fact_state(data_dir, request)
+            write_rows(publication, [
+                cex_row(snapshot_id="cex-2"),
+                cex_row(
+                    snapshot_id="cex-2",
+                    token_symbol="UNI",
+                    cex_symbol="UNI/USDT",
+                    raw_response_sha256="b" * 64,
+                ),
+            ])
+            after = read_snapshot_fact_state(data_dir, request)
+
+        result = evaluate_snapshot_refresh(before, after)
+
+        self.assertNotEqual(before.dataset_sha256, after.dataset_sha256)
+        self.assertEqual(before.target_fingerprint, after.target_fingerprint)
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.error_code, "snapshot_publication_unchanged")
+
+    def test_changed_exact_target_evidence_refreshes_new_publication(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            publication = data_dir / "cex_depth_latest.csv"
+            write_rows(publication, [cex_row()])
+            before = read_snapshot_fact_state(data_dir, request)
+            write_rows(publication, [
+                cex_row(
+                    snapshot_id="cex-2",
+                    raw_response_sha256="b" * 64,
+                ),
+            ])
+            after = read_snapshot_fact_state(data_dir, request)
+
+        result = evaluate_snapshot_refresh(before, after)
+
+        self.assertNotEqual(before.target_fingerprint, after.target_fingerprint)
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.resolution, "observed")
+
     def test_unchanged_publication_is_not_success(self):
         before = state("s1", "a" * 64, "not_cataloged_in_snapshot", None)
         result = evaluate_snapshot_refresh(before, before)
@@ -427,16 +617,30 @@ class SnapshotPostconditionTest(unittest.TestCase):
         self.assertTrue(result.retryable)
 
     def test_new_exact_observation_succeeds(self):
-        result = evaluate_snapshot_refresh(
-            state("s1", "a" * 64, "not_cataloged_in_snapshot", None),
-            state("s2", "b" * 64, "observed", "observed"),
-        )
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            publication = data_dir / "cex_depth_latest.csv"
+            write_rows(publication, [
+                cex_row(token_symbol="UNI", cex_symbol="UNI/USDT"),
+            ])
+            before = read_snapshot_fact_state(data_dir, request)
+            write_rows(publication, [cex_row(snapshot_id="cex-2")])
+            after = read_snapshot_fact_state(data_dir, request)
+
+        result = evaluate_snapshot_refresh(before, after)
+
+        self.assertIsNone(before.target_fingerprint)
+        self.assertIsNotNone(after.target_fingerprint)
         self.assertTrue(result.succeeded)
         self.assertEqual(result.resolution, "observed")
 
     def test_only_allowlisted_terminal_outcomes_succeed(self):
         for status, reason in (
-            ("partial", "source_level_limit"),
             ("source_no_observation", "source_no_two_sided_book"),
             ("source_no_observation", "source_no_order_book"),
             ("unsupported", "unsupported_chain"),
@@ -448,6 +652,15 @@ class SnapshotPostconditionTest(unittest.TestCase):
                     state("s2", "b" * 64, status, reason),
                 )
                 self.assertTrue(result.succeeded)
+
+    def test_partial_outcome_does_not_resolve_refresh(self):
+        result = evaluate_snapshot_refresh(
+            state("s1", "a" * 64, "collection_failed", "network", retryable=True),
+            state("s2", "b" * 64, "partial", "source_level_limit"),
+        )
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.error_code, "snapshot_target_unresolved")
 
     def test_unknown_observed_or_partial_reason_fails_closed(self):
         for status in ("observed", "partial"):
@@ -481,6 +694,281 @@ class SnapshotFactReaderTest(unittest.TestCase):
                     self.read("cex_depth_latest.csv", {
                         "token_symbol": "AAVE", "market_id": "cex:upbit:AAVE/USDT", "fact_type": "depth",
                     }, [cex_row(best_bid=value)])
+
+    def test_rejects_locked_and_crossed_cex_books(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        for best_bid in ("101", "102"):
+            with self.subTest(best_bid=best_bid):
+                with self.assertRaises(ValueError):
+                    self.read(
+                        "cex_depth_latest.csv",
+                        request,
+                        [cex_row(best_bid=best_bid)],
+                    )
+
+    def test_rejects_zero_cex_best_bid_even_when_book_arithmetic_is_consistent(self):
+        with self.assertRaises(ValueError):
+            self.read(
+                "cex_depth_latest.csv",
+                {
+                    "token_symbol": "AAVE",
+                    "market_id": "cex:upbit:AAVE/USDT",
+                    "fact_type": "depth",
+                },
+                [cex_row(
+                    best_bid="0",
+                    best_ask="1",
+                    midpoint="0.5",
+                    spread_quote="1",
+                    spread_bps="20000",
+                )],
+            )
+
+    def test_rejects_inconsistent_cex_midpoint_and_spread_metrics(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        for field, value in (
+            ("midpoint", "99"),
+            ("spread_quote", "3"),
+            ("spread_bps", "201"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    self.read(
+                        "cex_depth_latest.csv",
+                        request,
+                        [cex_row(**{field: value})],
+                    )
+
+    def test_rejects_decreasing_cex_depth_bands(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        for side in ("bid", "ask", "total"):
+            changes = {
+                "{}_depth_10bps_usd".format(side): "2",
+                "{}_depth_25bps_usd".format(side): "1",
+                "{}_depth_50bps_usd".format(side): "1",
+                "{}_depth_100bps_usd".format(side): "1",
+            }
+            with self.subTest(side=side):
+                with self.assertRaises(ValueError):
+                    self.read(
+                        "cex_depth_latest.csv",
+                        request,
+                        [cex_row(**changes)],
+                    )
+
+    def test_rejects_cex_depth_totals_inconsistent_with_sides(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        row = cex_row(
+            bid_depth_10bps_usd="1",
+            bid_depth_25bps_usd="1",
+            bid_depth_50bps_usd="1",
+            bid_depth_100bps_usd="1",
+        )
+
+        with self.assertRaises(ValueError):
+            self.read("cex_depth_latest.csv", request, [row])
+
+    def test_rejects_depth_status_and_completeness_conflicts(self):
+        cex_request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        dex_request = {
+            "token_symbol": "AAVE",
+            "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+            "fact_type": "depth",
+        }
+        cases = (
+            (
+                "cex observed incomplete",
+                "cex_depth_latest.csv",
+                cex_request,
+                cex_row(depth_100bps_complete="0"),
+            ),
+            (
+                "cex partial complete",
+                "cex_depth_latest.csv",
+                cex_request,
+                cex_row(status="partial", reason_code="source_level_limit"),
+            ),
+            (
+                "dex observed incomplete",
+                "dex_depth_latest.csv",
+                dex_request,
+                dex_depth_row(depth_100bps_complete="0"),
+            ),
+            (
+                "dex partial complete",
+                "dex_depth_latest.csv",
+                dex_request,
+                dex_depth_row(status="partial"),
+            ),
+        )
+        for name, filename, request, row in cases:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    self.read(filename, request, [row])
+
+    def test_rejects_completeness_that_recovers_at_a_wider_band(self):
+        cases = (
+            (
+                "cex_depth_latest.csv",
+                {
+                    "token_symbol": "AAVE",
+                    "market_id": "cex:upbit:AAVE/USDT",
+                    "fact_type": "depth",
+                },
+                cex_row(
+                    status="partial",
+                    reason_code="source_level_limit",
+                    depth_10bps_complete="0",
+                    depth_25bps_complete="1",
+                    depth_50bps_complete="0",
+                    depth_100bps_complete="0",
+                ),
+            ),
+            (
+                "dex_depth_latest.csv",
+                {
+                    "token_symbol": "AAVE",
+                    "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+                    "fact_type": "depth",
+                },
+                dex_depth_row(
+                    status="partial",
+                    depth_10bps_complete="0",
+                    depth_25bps_complete="1",
+                    depth_50bps_complete="0",
+                    depth_100bps_complete="0",
+                ),
+            ),
+        )
+        for filename, request, row in cases:
+            with self.subTest(filename=filename):
+                with self.assertRaises(ValueError):
+                    self.read(filename, request, [row])
+
+    def test_requires_canonical_raw_hash_for_measured_and_terminal_source_rows(self):
+        cex_request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        dex_depth_request = {
+            "token_symbol": "AAVE",
+            "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+            "fact_type": "depth",
+        }
+        tvl_request = {**dex_depth_request, "fact_type": "tvl"}
+        cases = (
+            ("cex measured blank", "cex_depth_latest.csv", cex_request,
+             cex_row(raw_response_sha256="")),
+            ("cex measured nonhex", "cex_depth_latest.csv", cex_request,
+             cex_row(raw_response_sha256="g" * 64)),
+            ("cex terminal blank", "cex_depth_latest.csv", cex_request,
+             unmeasured(cex_row(
+                 status="failed",
+                 reason_code="source_no_order_book",
+                 raw_response_sha256="",
+             ), CEX_MEASURED)),
+            ("dex measured blank", "dex_depth_latest.csv", dex_depth_request,
+             dex_depth_row(raw_response_sha256="")),
+            ("dex failed blank", "dex_depth_latest.csv", dex_depth_request,
+             unmeasured(dex_depth_row(
+                 status="failed",
+                 raw_response_sha256="",
+             ), DEX_MEASURED)),
+            ("tvl measured blank", "dex_pool_tvl_latest.csv", tvl_request,
+             tvl_row(raw_response_sha256="")),
+            ("tvl terminal blank", "dex_pool_tvl_latest.csv", tvl_request,
+             tvl_row(status="not_found", tvl_usd="", raw_response_sha256="")),
+        )
+        for name, filename, request, row in cases:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    self.read(filename, request, [row])
+
+    def test_accepts_actual_locally_classified_dex_unsupported_row_without_hash(self):
+        from scripts.fetch_dex_depth import unsupported_row
+
+        row = unsupported_row(
+            {
+                "snapshot_id": "tvl-1",
+                "observed_at": "2026-07-31T11:59:00+00:00",
+                "response_received_at": "2026-07-31T11:59:00+00:00",
+                "token_symbol": "AAVE",
+                "chain": "eth",
+                "dex": "uniswap_v3",
+                "pool_address": "0xabc",
+                "source": "test",
+                "source_endpoint": "https://example.invalid",
+                "raw_response_sha256": "b" * 64,
+            },
+            snapshot_id="dex-1",
+            request_started_at="2026-07-31T12:00:00+00:00",
+            response_received_at="2026-07-31T12:00:01+00:00",
+            reason="unsupported_pool_model: test",
+        )
+
+        result = self.read(
+            "dex_depth_latest.csv",
+            {
+                "token_symbol": "AAVE",
+                "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+                "fact_type": "depth",
+            },
+            [row],
+        )
+
+        self.assertEqual(row["raw_response_sha256"], "")
+        self.assertEqual(result.status, "unsupported")
+        self.assertFalse(result.retryable)
+
+    def test_retryable_cex_and_tvl_failures_may_lack_source_hash(self):
+        cex = self.read(
+            "cex_depth_latest.csv",
+            {
+                "token_symbol": "AAVE",
+                "market_id": "cex:upbit:AAVE/USDT",
+                "fact_type": "depth",
+            },
+            [unmeasured(cex_row(
+                status="failed",
+                reason_code="network",
+                raw_response_sha256="",
+            ), CEX_MEASURED)],
+        )
+        tvl = self.read(
+            "dex_pool_tvl_latest.csv",
+            {
+                "token_symbol": "AAVE",
+                "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+                "fact_type": "tvl",
+            },
+            [tvl_row(status="failed", tvl_usd="", raw_response_sha256="")],
+        )
+
+        self.assertEqual(cex.status, "collection_failed")
+        self.assertTrue(cex.retryable)
+        self.assertEqual(tvl.status, "collection_failed")
+        self.assertTrue(tvl.retryable)
 
     def test_rejects_duplicate_target_non_target_and_normalized_identity(self):
         base = cex_row()
@@ -528,7 +1016,25 @@ class SnapshotFactReaderTest(unittest.TestCase):
                 CEX_MEASURED,
             )])
 
-    def test_fail_closed_family_normalization_and_tvl_error_redaction(self):
+    def test_rejects_conflicting_cex_raw_status_and_reason(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/USDT",
+            "fact_type": "depth",
+        }
+        rows = (
+            unmeasured(
+                cex_row(status="failed", reason_code="observed"),
+                CEX_MEASURED,
+            ),
+            cex_row(status="observed", reason_code="network"),
+        )
+        for row in rows:
+            with self.subTest(status=row["status"], reason_code=row["reason_code"]):
+                with self.assertRaises(ValueError):
+                    self.read("cex_depth_latest.csv", request, [row])
+
+    def test_fail_closed_cex_and_bounded_dex_tvl_normalization(self):
         cex = self.read("cex_depth_latest.csv", {
             "token_symbol": "AAVE", "market_id": "cex:upbit:AAVE/USDT", "fact_type": "depth",
         }, [unmeasured(cex_row(reason_code="unknown", status="failed"), CEX_MEASURED)])
@@ -536,12 +1042,16 @@ class SnapshotFactReaderTest(unittest.TestCase):
         dex = self.read("dex_depth_latest.csv", {
             "token_symbol": "AAVE", "market_id": "dex:eth:uniswap_v3:0xabc:AAVE", "fact_type": "depth",
         }, [unmeasured(dex_depth_row(status="unsupported", error="untrusted: secret"), DEX_MEASURED)])
-        self.assertIsNone(dex.reason_code)
+        self.assertEqual((dex.status, dex.reason_code), ("unsupported", "unsupported_source"))
+        self.assertNotIn("secret", repr(dex))
         tvl = self.read("dex_pool_tvl_latest.csv", {
             "token_symbol": "AAVE", "market_id": "dex:eth:uniswap_v3:0xabc:AAVE", "fact_type": "tvl",
         }, [tvl_row(status="failed", tvl_usd="", error="private endpoint failure")])
-        self.assertEqual(tvl.status, "failed")
-        self.assertIsNone(tvl.reason_code)
+        self.assertEqual(
+            (tvl.status, tvl.reason_code),
+            ("collection_failed", "source_unavailable"),
+        )
+        self.assertTrue(tvl.retryable)
         self.assertNotIn("private", repr(tvl))
 
     def test_dex_and_tvl_zero_are_valid_but_blank_observed_values_are_invalid(self):
@@ -558,6 +1068,60 @@ class SnapshotFactReaderTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.read("dex_pool_tvl_latest.csv", tvl_request, [tvl_row(tvl_usd="")])
 
+    def test_failed_tvl_uses_shared_retryable_outcome(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+            "fact_type": "tvl",
+        }
+        result = self.read(
+            "dex_pool_tvl_latest.csv",
+            request,
+            [tvl_row(status="failed", tvl_usd="", error="private failure")],
+        )
+
+        self.assertEqual(result.status, "collection_failed")
+        self.assertEqual(result.reason_code, "source_unavailable")
+        self.assertTrue(result.retryable)
+        self.assertNotIn("private", repr(result))
+
+    def test_rejects_decreasing_dex_depth_bands(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+            "fact_type": "depth",
+        }
+        for side in ("sell", "buy", "total"):
+            changes = {
+                "{}_depth_10bps_usd".format(side): "2",
+                "{}_depth_25bps_usd".format(side): "1",
+                "{}_depth_50bps_usd".format(side): "1",
+                "{}_depth_100bps_usd".format(side): "1",
+            }
+            with self.subTest(side=side):
+                with self.assertRaises(ValueError):
+                    self.read(
+                        "dex_depth_latest.csv",
+                        request,
+                        [dex_depth_row(**changes)],
+                    )
+
+    def test_rejects_dex_depth_totals_inconsistent_with_sides(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+            "fact_type": "depth",
+        }
+        row = dex_depth_row(
+            sell_depth_10bps_usd="0.00000000000000000001",
+            sell_depth_25bps_usd="0.00000000000000000001",
+            sell_depth_50bps_usd="0.00000000000000000001",
+            sell_depth_100bps_usd="0.00000000000000000001",
+        )
+
+        with self.assertRaises(ValueError):
+            self.read("dex_depth_latest.csv", request, [row])
+
     def test_producer_failed_dex_row_retains_block_provenance_but_no_measurements(self):
         request = {
             "token_symbol": "AAVE", "market_id": "dex:eth:uniswap_v3:0xabc:AAVE", "fact_type": "depth",
@@ -567,8 +1131,9 @@ class SnapshotFactReaderTest(unittest.TestCase):
             DEX_MEASURED,
         )
         after = self.read("dex_depth_latest.csv", request, [failed])
-        self.assertEqual(after.status, "failed")
-        self.assertIsNone(after.reason_code)
+        self.assertEqual(after.status, "collection_failed")
+        self.assertEqual(after.reason_code, "source_unavailable")
+        self.assertTrue(after.retryable)
         result = evaluate_snapshot_refresh(
             state("before", "a" * 64, "collection_failed", "network", retryable=True,
                   market_id=request["market_id"]),
@@ -576,6 +1141,7 @@ class SnapshotFactReaderTest(unittest.TestCase):
         )
         self.assertFalse(result.succeeded)
         self.assertEqual(result.error_code, "snapshot_target_unresolved")
+        self.assertTrue(result.retryable)
         for value in ("NaN", "-1.5"):
             with self.subTest(block_number=value):
                 invalid = unmeasured(dex_depth_row(status="failed", block_number=value), DEX_MEASURED)
@@ -600,6 +1166,8 @@ class SnapshotFactReaderTest(unittest.TestCase):
 
         def row_for(status, block_number):
             row = dex_depth_row(status=status, block_number=block_number)
+            if status == "partial":
+                row["depth_100bps_complete"] = "0"
             if status in {"failed", "unsupported"}:
                 row = unmeasured(row, DEX_MEASURED)
             return row

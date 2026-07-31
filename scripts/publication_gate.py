@@ -134,14 +134,14 @@ def validate_passing_coverage_report(
             )
         candidate = copied.get("candidate")
         expected_fingerprint = (
-            candidate.get("identity_status_sha256")
+            candidate.get("identity_row_sha256")
             if isinstance(candidate, Mapping)
             else None
         )
         if (
             not expected_fingerprint
             or expected_fingerprint
-            != _identity_status_sha256(indexed)
+            != _identity_row_sha256(indexed)
         ):
             raise ValueError(
                 "preflight coverage report does not match candidate rows"
@@ -364,6 +364,40 @@ def _identity_status_sha256(
     return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
 
 
+def _identity_row_sha256(
+    indexed: Mapping[Any, Mapping[str, Any]],
+) -> str:
+    """Fingerprint every published field, not only identity and status."""
+    entries = [
+        json.dumps(
+            [_display_key(key), dict(row)],
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        for key, row in indexed.items()
+    ]
+    entries.sort()
+    return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+
+
+def publication_rows_sha256(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    identity: Callable[[Mapping[str, Any]], Any],
+) -> str:
+    """Return the canonical complete-row fingerprint used by sealed reports."""
+    materialised, materialise_error = _materialise_rows(rows)
+    indexed, identity_errors = _index_rows(
+        materialised,
+        identity,
+        label="candidate",
+    )
+    if materialise_error or identity_errors:
+        raise ValueError("cannot fingerprint publication rows")
+    return _identity_row_sha256(indexed)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -559,6 +593,7 @@ def evaluate_publication_coverage(
                 candidate_usable_count, candidate_eligible_count
             ),
             "identity_status_sha256": None,
+            "identity_row_sha256": None,
             "absolute_check": "pending",
         },
         "baseline": {
@@ -567,6 +602,7 @@ def evaluate_publication_coverage(
             "status_counts": baseline_status_counts,
             "usable_count": baseline_usable_count,
             "identity_status_sha256": None,
+            "identity_row_sha256": None,
         },
         "comparison": {
             "common_identity_count": 0,
@@ -614,6 +650,9 @@ def evaluate_publication_coverage(
             report["candidate"][
                 "identity_status_sha256"
             ] = _identity_status_sha256(candidate_index)
+            report["candidate"][
+                "identity_row_sha256"
+            ] = _identity_row_sha256(candidate_index)
         except Exception as exc:
             report["errors"].append(
                 {
@@ -632,6 +671,9 @@ def evaluate_publication_coverage(
                 report["baseline"][
                     "identity_status_sha256"
                 ] = _identity_status_sha256(baseline_index)
+                report["baseline"][
+                    "identity_row_sha256"
+                ] = _identity_row_sha256(baseline_index)
             except Exception as exc:
                 report["errors"].append(
                     {

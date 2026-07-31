@@ -333,6 +333,29 @@ class PublicationCoverageGateTest(unittest.TestCase):
                 expected_policy=expected_policy,
             )
 
+    def test_reused_preflight_report_binds_every_candidate_field(self):
+        candidate = [row("a", venue="original")]
+        with tempfile.TemporaryDirectory() as directory_name:
+            report = bind_passing_coverage_report(
+                self.evaluate(candidate),
+                fact_family="test_depth",
+                baseline_path=Path(directory_name) / "latest.csv",
+            )
+            validate_passing_coverage_report(
+                report,
+                fact_family="test_depth",
+                candidate_rows=candidate,
+                identity=market_identity,
+            )
+            mutated = [{**candidate[0], "venue": "mutated"}]
+            with self.assertRaisesRegex(ValueError, "candidate rows"):
+                validate_passing_coverage_report(
+                    report,
+                    fact_family="test_depth",
+                    candidate_rows=mutated,
+                    identity=market_identity,
+                )
+
     def test_rejected_verdict_cannot_be_changed_into_passing_report(self):
         rejected = self.evaluate([row("a", "failed")])
         forged = deepcopy(rejected)

@@ -22,11 +22,14 @@ from scripts.fetch_cex_depth import (
     ensure_full_publish_scope,
     execution_rows_for_book,
     failed_execution_rows,
+    failure_row,
     load_markets_from_csv,
     load_markets_from_database,
+    merge_exact_publication_bundle,
     observed_row,
     parse_book,
     preflight_publication_bundle,
+    publish_exact_publication_bundle,
     publish_execution_snapshot,
     publish_snapshot,
     source_request,
@@ -73,11 +76,366 @@ def complete_book():
     }
 
 
+def write_snapshot_rows(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 class FetchCexDepthTest(unittest.TestCase):
     def test_filtered_collection_cannot_replace_published_inventory(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             ensure_full_publish_scope(True, {"UNI"}, set())
         ensure_full_publish_scope(False, {"UNI"}, {"binance"})
+
+    def test_exact_refresh_merges_one_market_without_collecting_other_markets(self):
+        markets = [
+            market(exchange="binance"),
+            market(exchange="okx"),
+        ]
+        baseline_depth = [
+            observed_row(
+                item,
+                complete_book(),
+                snapshot_id="baseline-1",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+            for item in markets
+        ]
+        baseline_execution = [
+            scenario
+            for item in markets
+            for scenario in execution_rows_for_book(
+                item,
+                complete_book(),
+                snapshot_id="baseline-1",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+        ]
+        fresh_book = complete_book()
+        fresh_book["bids"] = [
+            (Decimal("100"), Decimal("10")),
+            (Decimal("98"), Decimal("10")),
+        ]
+        fresh_book["asks"] = [
+            (Decimal("101"), Decimal("10")),
+            (Decimal("103"), Decimal("10")),
+        ]
+        fresh_book["raw"] = b'{"book":"fresh"}'
+        candidate_depth = [
+            observed_row(
+                markets[0],
+                fresh_book,
+                snapshot_id="candidate-2",
+                request_started_at="2026-07-27T01:00:00+00:00",
+                response_received_at="2026-07-27T01:00:01+00:00",
+            )
+        ]
+        candidate_execution = execution_rows_for_book(
+            markets[0],
+            fresh_book,
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            publish_snapshot(
+                baseline_depth,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+            publish_execution_snapshot(
+                baseline_execution,
+                expected_market_ids={
+                    "cex:binance:UNI/USDT",
+                    "cex:okx:UNI/USDT",
+                },
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+
+            merged_depth, merged_execution = merge_exact_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                target_market_id="cex:binance:UNI/USDT",
+                publish_dir=published,
+            )
+            mismatched_execution = [
+                {
+                    **row,
+                    "snapshot_id": "different-generation",
+                    "source_snapshot_id": "different-generation",
+                }
+                for row in merged_execution
+            ]
+            with self.assertRaisesRegex(ValueError, "same source"):
+                preflight_publication_bundle(
+                    merged_depth,
+                    mismatched_execution,
+                    published,
+                    target_market_id="cex:binance:UNI/USDT",
+                )
+            reports = preflight_publication_bundle(
+                merged_depth,
+                merged_execution,
+                published,
+                target_market_id="cex:binance:UNI/USDT",
+            )
+            with self.assertRaisesRegex(ValueError, "history append"):
+                publish_exact_publication_bundle(
+                    merged_depth,
+                    merged_execution,
+                    target_market_id="cex:binance:UNI/USDT",
+                    history_rows_to_append=[
+                        {**candidate_depth[0], "best_bid": "999"}
+                    ],
+                    output_dir=root / "processed",
+                    publish_dir=published,
+                    preflight_reports=reports,
+                )
+            protected = [
+                published / HISTORY_FILENAME,
+                published / LATEST_FILENAME,
+                published / CURRENT_FILENAME,
+                published / EXECUTION_LATEST_FILENAME,
+            ]
+            originals = {path: path.read_bytes() for path in protected}
+            from scripts import atomic_publication
+
+            real_replace = atomic_publication.os.replace
+            for fail_at in range(1, len(protected) + 1):
+                calls = {"count": 0}
+
+                def fail_once(source, destination):
+                    calls["count"] += 1
+                    if calls["count"] == fail_at:
+                        raise OSError("injected publication failure")
+                    return real_replace(source, destination)
+
+                with self.subTest(fail_at=fail_at), patch(
+                    "scripts.atomic_publication.os.replace",
+                    side_effect=fail_once,
+                ):
+                    with self.assertRaises(OSError):
+                        publish_exact_publication_bundle(
+                            merged_depth,
+                            merged_execution,
+                            target_market_id="cex:binance:UNI/USDT",
+                            history_rows_to_append=candidate_depth,
+                            output_dir=root / "processed",
+                            publish_dir=published,
+                            preflight_reports=reports,
+                        )
+                self.assertEqual(
+                    {path: path.read_bytes() for path in protected},
+                    originals,
+                )
+
+            publish_exact_publication_bundle(
+                merged_depth,
+                merged_execution,
+                target_market_id="cex:binance:UNI/USDT",
+                history_rows_to_append=candidate_depth,
+                output_dir=root / "processed",
+                publish_dir=published,
+                preflight_reports=reports,
+            )
+            with (published / HISTORY_FILENAME).open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                history = list(csv.DictReader(handle))
+
+        self.assertEqual(len(merged_depth), 2)
+        self.assertEqual(len(merged_execution), 20)
+        self.assertEqual(
+            {row["snapshot_id"] for row in merged_depth},
+            {"candidate-2"},
+        )
+        by_exchange = {row["exchange"]: row for row in merged_depth}
+        self.assertEqual(by_exchange["binance"]["best_bid"], "100")
+        self.assertEqual(
+            by_exchange["okx"]["best_bid"],
+            baseline_depth[1]["best_bid"],
+        )
+        self.assertEqual(
+            {row["source_snapshot_id"] for row in merged_execution},
+            {"candidate-2"},
+        )
+        self.assertEqual(len(history), 3)
+
+    def test_exact_preflight_accepts_one_observed_repair_below_full_coverage_floor(self):
+        markets = [
+            market(token="T0", symbol="T0/USDT"),
+            market(token="T1", symbol="T1/USDT"),
+        ]
+        baseline_depth = [
+            failure_row(
+                item,
+                snapshot_id="baseline-low",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+                error=ConnectionError("temporary venue failure"),
+                reason_code="network",
+            )
+            for item in markets
+        ]
+        baseline_execution = [
+            scenario
+            for item in markets
+            for scenario in failed_execution_rows(
+                item,
+                snapshot_id="baseline-low",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+                error=ConnectionError("temporary venue failure"),
+                status_reason="network",
+            )
+        ]
+        fresh_book = {**complete_book(), "source_instrument": "T0USDT"}
+        candidate_depth = [
+            observed_row(
+                markets[0],
+                fresh_book,
+                snapshot_id="candidate-repair",
+                request_started_at="2026-07-27T01:00:00+00:00",
+                response_received_at="2026-07-27T01:00:01+00:00",
+            )
+        ]
+        candidate_execution = execution_rows_for_book(
+            markets[0],
+            fresh_book,
+            snapshot_id="candidate-repair",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            published = Path(directory_name) / "local"
+            write_snapshot_rows(
+                published / LATEST_FILENAME,
+                baseline_depth,
+            )
+            write_snapshot_rows(
+                published / EXECUTION_LATEST_FILENAME,
+                baseline_execution,
+            )
+            target_market_id = "cex:binance:T0/USDT"
+            merged_depth, merged_execution = merge_exact_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                target_market_id=target_market_id,
+                publish_dir=published,
+            )
+
+            try:
+                reports = preflight_publication_bundle(
+                    merged_depth,
+                    merged_execution,
+                    published,
+                    target_market_id=target_market_id,
+                )
+            except (CoverageRegressionError, TypeError) as error:
+                self.fail(
+                    "exact CEX repair was rejected by the full-publication "
+                    f"coverage boundary: {error}"
+                )
+
+        self.assertTrue(reports["cex_depth"]["passed"])
+        self.assertTrue(reports["cex_execution_cost"]["passed"])
+        self.assertEqual(
+            [row["status"] for row in merged_depth],
+            ["observed", "failed"],
+        )
+
+    def test_exact_preflight_accepts_confirmed_terminal_on_all_failed_baseline(self):
+        target = market(token="T0", symbol="T0/USDT")
+        baseline_depth = [
+            failure_row(
+                target,
+                snapshot_id="baseline-failed",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+                error=ConnectionError("temporary venue failure"),
+                reason_code="network",
+            )
+        ]
+        baseline_execution = failed_execution_rows(
+            target,
+            snapshot_id="baseline-failed",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            error=ConnectionError("temporary venue failure"),
+            status_reason="network",
+        )
+        terminal_error = ValueError("empty order-book side")
+        candidate_depth = [
+            failure_row(
+                target,
+                snapshot_id="candidate-terminal",
+                request_started_at="2026-07-27T01:00:00+00:00",
+                response_received_at="2026-07-27T01:00:01+00:00",
+                error=terminal_error,
+                reason_code="source_no_two_sided_book",
+            )
+        ]
+        candidate_execution = failed_execution_rows(
+            target,
+            snapshot_id="candidate-terminal",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            error=terminal_error,
+            status_reason="source_no_two_sided_book",
+        )
+        validate_snapshot(
+            [target],
+            candidate_depth,
+            allow_terminal_only=True,
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            published = Path(directory_name) / "local"
+            write_snapshot_rows(
+                published / LATEST_FILENAME,
+                baseline_depth,
+            )
+            write_snapshot_rows(
+                published / EXECUTION_LATEST_FILENAME,
+                baseline_execution,
+            )
+            target_market_id = "cex:binance:T0/USDT"
+            try:
+                merged_depth, merged_execution = merge_exact_publication_bundle(
+                    candidate_depth,
+                    candidate_execution,
+                    target_market_id=target_market_id,
+                    publish_dir=published,
+                )
+                reports = preflight_publication_bundle(
+                    merged_depth,
+                    merged_execution,
+                    published,
+                    target_market_id=target_market_id,
+                )
+            except (CoverageRegressionError, TypeError, ValueError) as error:
+                self.fail(
+                    "resolver-confirmed terminal CEX refresh was rejected: "
+                    f"{error}"
+                )
+
+        self.assertTrue(reports["cex_depth"]["passed"])
+        self.assertTrue(reports["cex_execution_cost"]["passed"])
+        self.assertEqual(
+            merged_depth[0]["reason_code"],
+            "source_no_two_sided_book",
+        )
 
     def test_depth_metrics_known_answer_and_complete_bands(self):
         result = depth_metrics(
@@ -671,6 +1029,53 @@ class FetchCexDepthTest(unittest.TestCase):
         validate_snapshot([market()], [row])
         with self.assertRaisesRegex(ValueError, "coverage"):
             validate_snapshot([market(), market(token="AAVE", symbol="AAVE/USDT")], [row])
+
+    def test_exact_candidate_accepts_only_terminal_nonretryable_no_book(self):
+        terminal = failure_row(
+            market(),
+            snapshot_id="candidate-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            error=ValueError("empty order-book side"),
+            reason_code="source_no_two_sided_book",
+        )
+        with self.assertRaisesRegex(ValueError, "no observed"):
+            validate_snapshot([market()], [terminal])
+        validate_snapshot(
+            [market()],
+            [terminal],
+            allow_terminal_only=True,
+        )
+
+        retryable = {
+            **terminal,
+            "reason_code": "network",
+            "error": "URLError: temporary network failure",
+        }
+        with self.assertRaisesRegex(ValueError, "terminal non-retryable"):
+            validate_snapshot(
+                [market()],
+                [retryable],
+                allow_terminal_only=True,
+            )
+
+        partial = {
+            **observed_row(
+                market(),
+                complete_book(),
+                snapshot_id="candidate-2",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            ),
+            "status": "partial",
+            "reason_code": "source_level_limit",
+        }
+        with self.assertRaisesRegex(ValueError, "resolved exact candidate"):
+            validate_snapshot(
+                [market()],
+                [partial],
+                allow_terminal_only=True,
+            )
 
     def test_publish_appends_history_and_replaces_latest(self):
         first = observed_row(

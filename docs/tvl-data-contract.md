@@ -70,14 +70,25 @@ default, and honors 429 backoff before retrying.
 
 - Inventory contains the same Token/pool keys as the published market database.
 - Every current pool has exactly one status row.
-- At least one TVL fact is observed; a total source outage fails publication.
+- A full-inventory publication contains at least one observed TVL fact; a total
+  source outage fails the full publication. An exact one-pool recovery may
+  start from a zero-observed baseline only when the target becomes observed or
+  a resolver-confirmed terminal absence and every non-target fact is retained.
 - At least 80% of the current inventory is observed, and at least 95% of
   comparable previously observed pools remain observed; chain-cohort regression
   is also gated as documented in `collection-operations.md`.
 - Observed TVL is finite and non-negative.
 - Every successful batch has a retained raw response and SHA-256.
-- Repeated publication appends history and atomically replaces only the latest
-  view.
+- Repeated full publication appends history and atomically replaces its latest
+  view. A canonical one-pool retry stages history/latest/current together and
+  restores all prior bytes on any ordinary replacement exception; it is not a
+  crash-atomic multi-file guarantee.
+- A canonical one-pool retry collects only that pool, requires an existing
+  full baseline, appends only the target observation to history, and merges the
+  target into the complete latest inventory without changing any non-target
+  source-evidence field. Its exact gate does not require the repaired full
+  snapshot to immediately cross the full 80% floor; it instead requires 100%
+  retention of prior observations and a complete-row sealed target result.
 - The website exposes TVL observation time, method, status, and source lineage
   through its market payload and catalog.
 - DEX depth reads this snapshot only for pool inventory and token USD prices;
