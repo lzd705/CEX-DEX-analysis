@@ -127,6 +127,13 @@ Token and recomputes every market status and every flag severity. Token,
 generation, market count, unique market IDs, flag fields, and exact nonzero
 count dictionaries must agree; a non-OK market with no structured fallback
 flag or any mid-run generation drift fails the release.
+Summary's typed `token_count` and `catalog_market_count`, the accumulated
+all-Token Quality audit, and the full catalog must form one exact inventory.
+The full catalog must contain the same Token set and valid unique Market rows.
+Selected quality accepts exactly two distinct selected Market IDs; daily audit
+counts are real integers and affected dates are sorted, unique canonical UTC
+dates. Public flag messages containing a raw URL, protected POSIX path, any
+backslash path, or control marker fail preflight.
 
 The report keeps data-quality states separate:
 

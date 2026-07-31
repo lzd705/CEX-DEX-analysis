@@ -12,6 +12,7 @@ import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -77,6 +78,11 @@ PROTECTED_PATH_PATTERN = re.compile(
     r"|\b[a-z]:\\",
     flags=re.ASCII | re.IGNORECASE,
 )
+PROTECTED_POSIX_PREFIX_PATTERN = re.compile(
+    r"/(?:home|private|users)/",
+    flags=re.ASCII | re.IGNORECASE,
+)
+CANONICAL_DATE_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 FORBIDDEN_EVENT_RESULT_FIELDS = frozenset(
     {
         "impact",
@@ -231,6 +237,17 @@ def validate_summary(
         len(set(token_symbols)) == len(token_symbols),
         "Summary Token identities are not unique",
     )
+    require(
+        type(metadata.get("token_count")) is int
+        and metadata["token_count"] == len(tokens),
+        "Summary token_count does not match Token rows",
+    )
+    require(
+        type(metadata.get("catalog_market_count")) is int
+        and metadata["catalog_market_count"]
+        == sum(row["market_count"] for row in tokens),
+        "Summary catalog_market_count does not match Token market counts",
+    )
     require(isinstance(generation, str) and generation, "Summary generation is missing")
     require(isinstance(start, str) and start, "Summary start_date is missing")
     require(isinstance(end, str) and end, "Summary end_date is missing")
@@ -344,8 +361,13 @@ def validate_quality(
             metadata.get("data_generation") == expected_generation,
             "Summary and selected Quality generations differ",
         )
+    selected_market_ids = metadata.get("selected_market_ids")
     require(
-        set(metadata.get("selected_market_ids") or []) == expected_ids,
+        isinstance(selected_market_ids, list)
+        and len(selected_market_ids) == 2
+        and all(isinstance(market_id, str) for market_id in selected_market_ids)
+        and len(set(selected_market_ids)) == 2
+        and set(selected_market_ids) == expected_ids,
         "Quality metadata returned the wrong selected markets",
     )
     require(
@@ -401,7 +423,7 @@ def validate_quality(
     status_counts = report.get("status_counts")
     affected_dates = report.get("affected_dates")
     require(
-        isinstance(issue_count, int)
+        type(issue_count) is int
         and issue_count >= 0
         and isinstance(reason_counts, dict)
         and all(
@@ -427,8 +449,10 @@ def validate_quality(
     )
     require(
         isinstance(affected_dates, list)
+        and all(_is_canonical_date(value) for value in affected_dates)
         and affected_dates == sorted(set(affected_dates))
-        and report.get("affected_date_count") == len(affected_dates),
+        and type(report.get("affected_date_count")) is int
+        and report["affected_date_count"] == len(affected_dates),
         "Quality daily-audit affected dates are inconsistent",
     )
     for market in markets:
@@ -462,6 +486,19 @@ def _normalized_summary_counts(
         if count:
             normalized[key] = count
     return dict(sorted(normalized.items()))
+
+
+def _is_canonical_date(value: Any) -> bool:
+    if (
+        not isinstance(value, str)
+        or CANONICAL_DATE_PATTERN.fullmatch(value) is None
+    ):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%d") == value
 
 
 def _validate_screening_flag(flag: Any) -> dict[str, str]:
@@ -511,6 +548,11 @@ def _validate_screening_flag(flag: Any) -> dict[str, str]:
         PROTECTED_PATH_PATTERN.search(message) is None,
         "Quality screening flag message contains a protected path",
     )
+    require(
+        PROTECTED_POSIX_PREFIX_PATTERN.search(message) is None
+        and "\\" not in message,
+        "Quality screening flag message contains a protected path",
+    )
     return {
         "code": code,
         "severity": severity,
@@ -539,6 +581,10 @@ def validate_screening_quality_parity(
         and expected_generation == expected_generation.strip()
         and metadata.get("data_generation") == expected_generation,
         "Summary and screening Quality generation differ",
+    )
+    require(
+        metadata.get("scope") == "all",
+        "Screening Quality did not honor all scope",
     )
 
     require(isinstance(summary_row, dict), "Summary Token row is not an object")
@@ -577,6 +623,10 @@ def validate_screening_quality_parity(
         )
         require(market_id not in market_ids, "Quality market IDs are not unique")
         market_ids.add(market_id)
+        require(
+            market.get("token_symbol") == token,
+            "Quality market Token does not match Summary",
+        )
         screening_fields = {
             key
             for key in market
@@ -1009,6 +1059,26 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         screening_quality_parity_count += 1
         screening_quality_market_count += parity["market_count"]
 
+    summary_metadata = summary.get("metadata")
+    require(isinstance(summary_metadata, dict), "Summary metadata is invalid")
+    declared_token_count = summary_metadata.get("token_count")
+    declared_market_count = summary_metadata.get("catalog_market_count")
+    require(
+        type(declared_token_count) is int
+        and screening_quality_parity_count == declared_token_count,
+        "Screening parity Token count does not match Summary token_count",
+    )
+    require(
+        type(declared_market_count) is int
+        and screening_quality_market_count == declared_market_count,
+        "Screening parity market count does not match Summary catalog_market_count",
+    )
+    summary_token_set = {
+        row["token_symbol"]
+        for row in summary["tokens"]
+        if isinstance(row, dict) and isinstance(row.get("token_symbol"), str)
+    }
+
     catalog_path = "/api/markets/catalog?" + urlencode(
         {"token": token, "start": start, "end": end}
     )
@@ -1037,9 +1107,42 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
     metrics.append(full_metrics)
     full_markets = full_catalog.get("markets")
     require(isinstance(full_markets, list), "Full audit catalog has no markets array")
+    full_catalog_tokens: set[str] = set()
+    full_market_ids: set[str] = set()
+    for market in full_markets:
+        require(isinstance(market, dict), "Full audit catalog market is not an object")
+        market_token = market.get("token_symbol")
+        require(
+            isinstance(market_token, str)
+            and bool(market_token)
+            and market_token == market_token.strip().upper()
+            and market_token in summary_token_set,
+            "Full audit catalog market Token identity is invalid",
+        )
+        market_id = market.get("market_id")
+        require(
+            isinstance(market_id, str)
+            and bool(market_id)
+            and market_id == market_id.strip(),
+            "Full audit catalog market ID is invalid",
+        )
+        require(
+            market_id not in full_market_ids,
+            "Full audit catalog market IDs are not unique",
+        )
+        full_market_ids.add(market_id)
+        full_catalog_tokens.add(market_token)
     require(
-        len(full_markets) == summary["metadata"].get("catalog_market_count"),
+        full_catalog_tokens == summary_token_set,
+        "Full audit catalog Token inventory differs from Summary",
+    )
+    require(
+        len(full_markets) == declared_market_count,
         "Summary catalog count differs from the full audit catalog",
+    )
+    require(
+        screening_quality_market_count == len(full_markets),
+        "Screening parity market count differs from the full audit catalog",
     )
 
     all_events, events_metrics = fetch_json(

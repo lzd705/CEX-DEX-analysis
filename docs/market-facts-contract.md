@@ -74,6 +74,13 @@ market-condition flags. Counts are compared exactly after zero-valued entries
 are removed. A non-OK status with no structured flag is a contract failure;
 the release checker does not invent a fallback reason. Any generation drift
 aborts the release instead of being retried as a count mismatch.
+Summary `token_count` must equal its Token rows and
+`catalog_market_count` must equal their summed market counts. Those declared
+totals must equal the audited Quality totals and the full catalog; the full
+catalog must contain the same Token set, valid per-market Token identities, and
+unique nonempty market IDs. Selected quality accepts exactly two distinct
+selected IDs, real integer report counts, and sorted unique canonical
+`YYYY-MM-DD` affected dates.
 
 The optional `quality/daily-latest.json` also participates in that source
 signature. A missing, malformed, oversized, path-unsafe, wrong-schema, or

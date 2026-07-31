@@ -99,6 +99,11 @@ severity must reproduce the all-scope Data Quality rows for the same
 `data_generation`, Token, and unique Market inventory. The release gate checks
 every configured Token, counts every flag without deduplication or category
 filtering, and rejects generation drift or an unexplained non-OK status.
+Summary's declared Token/Market totals, the accumulated all-Token Quality
+totals, and the full catalog inventory must agree exactly; the full catalog
+must expose the same Token set and valid unique Market rows. The selected view
+must name exactly two distinct Markets and expose only sorted canonical UTC
+affected dates with real integer counts.
 
 DEX price-time alignment is shown only for measured depth: an observed,
 complete, or partial fixed-block row with at least one finite USD band and an

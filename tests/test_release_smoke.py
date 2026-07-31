@@ -28,6 +28,8 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "start_date": "2026-01-01",
                 "end_date": "2026-01-31",
                 "default_workspace_token": "AAVE",
+                "token_count": 1,
+                "catalog_market_count": 2,
             },
             "tokens": [{
                 "token_symbol": "AAVE",
@@ -56,11 +58,13 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "metadata": {
                 "contract_version": 4,
                 "data_generation": "generation-1",
+                "scope": "all",
             },
             "token_symbol": token,
             "markets": [
                 {
                     "market_id": f"cex:binance:{token}/USDT",
+                    "token_symbol": token,
                     "screening_quality_status": "ok",
                     "screening_quality_flags": [
                         {
@@ -75,6 +79,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 },
                 {
                     "market_id": f"dex:eth:uniswap_v3:pool:{token}",
+                    "token_symbol": token,
                     "screening_quality_status": "ok",
                     "screening_quality_flags": [],
                 },
@@ -159,6 +164,30 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "url message": {**valid_flag, "message": "See https://example.test"},
             "path message": {**valid_flag, "message": "Read /private/data/a.json"},
             "generic path message": {**valid_flag, "message": "Read /srv/app/a.json"},
+            "equals home path": {
+                **valid_flag,
+                "message": "error=/home/ugs/secret",
+            },
+            "uppercase home path": {
+                **valid_flag,
+                "message": "ERROR=/HOME/UGS/SECRET",
+            },
+            "colon private path": {
+                **valid_flag,
+                "message": "path:/private/tmp/x",
+            },
+            "bracket users path": {
+                **valid_flag,
+                "message": "Read [/Users/name/key]",
+            },
+            "unc path": {
+                **valid_flag,
+                "message": r"Read \\server\share\secret",
+            },
+            "backslash path": {
+                **valid_flag,
+                "message": r"Read home\ugs\secret",
+            },
             "control message": {**valid_flag, "message": "line one\nline two"},
             "unicode control message": {
                 **valid_flag,
@@ -177,8 +206,26 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                         expected_generation="generation-1",
                     )
 
+        safe_slash = self.screening_quality()
+        safe_slash["markets"][0]["screening_quality_flags"][0]["message"] = (
+            "CEX/DEX facts remain visible; measured values are not N/A."
+        )
+        validate_screening_quality_parity(
+            self.summary()["tokens"][0],
+            safe_slash,
+            expected_generation="generation-1",
+        )
+
     def test_screening_quality_rejects_bad_market_shapes_and_fallbacks(self):
         mutations = []
+
+        selected_scope = self.screening_quality()
+        selected_scope["metadata"]["scope"] = "selected"
+        mutations.append(("all scope", selected_scope))
+
+        missing_scope = self.screening_quality()
+        missing_scope["metadata"].pop("scope")
+        mutations.append(("all scope", missing_scope))
 
         missing_status = self.screening_quality()
         missing_status["markets"][0].pop("screening_quality_status")
@@ -222,6 +269,14 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         wrong_token["token_symbol"] = "UNI"
         mutations.append(("Token", wrong_token))
 
+        missing_market_token = self.screening_quality()
+        missing_market_token["markets"][0].pop("token_symbol")
+        mutations.append(("market Token", missing_market_token))
+
+        wrong_market_token = self.screening_quality()
+        wrong_market_token["markets"][0]["token_symbol"] = "UNI"
+        mutations.append(("market Token", wrong_market_token))
+
         for message, quality in mutations:
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ReleaseCheckError, message):
@@ -246,6 +301,15 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             validate_screening_quality_parity(
                 self.summary()["tokens"][0],
                 generation_first,
+                expected_generation="generation-1",
+            )
+
+        generation_before_scope = copy.deepcopy(selected_scope)
+        generation_before_scope["metadata"]["data_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "generation"):
+            validate_screening_quality_parity(
+                self.summary()["tokens"][0],
+                generation_before_scope,
                 expected_generation="generation-1",
             )
 
@@ -342,15 +406,36 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
 
     def test_release_fetches_all_token_quality_once_and_retains_metrics(self):
         summary = self.summary()
-        summary["metadata"]["catalog_market_count"] = 2
         second_row = copy.deepcopy(summary["tokens"][0])
         second_row["token_symbol"] = "UNI"
         summary["tokens"].append(second_row)
+        summary["metadata"]["token_count"] = 2
+        summary["metadata"]["catalog_market_count"] = 4
         quality_by_token = {
             token: self.screening_quality(token)
             for token in ("AAVE", "UNI")
         }
-        full_catalog = {"markets": [{"market_id": "a"}, {"market_id": "b"}]}
+        full_catalog = {
+            "markets": [
+                {
+                    "market_id": "cex:binance:AAVE/USDT",
+                    "token_symbol": "AAVE",
+                },
+                {
+                    "market_id": "dex:eth:uniswap_v3:pool:AAVE",
+                    "token_symbol": "AAVE",
+                },
+                {
+                    "market_id": "cex:binance:UNI/USDT",
+                    "token_symbol": "UNI",
+                },
+                {
+                    "market_id": "dex:eth:uniswap_v3:pool:UNI",
+                    "token_symbol": "UNI",
+                },
+            ],
+        }
+        valid_full_markets = copy.deepcopy(full_catalog["markets"])
         event = {
             "token_symbol": "AAVE",
             "time": {
@@ -403,18 +488,22 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "market_type": "dex",
             },
         ]
-        def run_release():
+        def run_release(*, bypass_summary_validation=False):
             with ExitStack() as stack:
                 stack.enter_context(patch(
                     "scripts.check_dashboard_release.fetch_json",
                     side_effect=fake_fetch,
                 ))
-                stack.enter_context(patch(
-                    "scripts.check_dashboard_release.validate_summary",
-                    return_value=(
-                        "AAVE", "2026-01-01", "2026-01-31", "generation-1"
-                    ),
-                ))
+                if bypass_summary_validation:
+                    stack.enter_context(patch(
+                        "scripts.check_dashboard_release.validate_summary",
+                        return_value=(
+                            "AAVE",
+                            "2026-01-01",
+                            "2026-01-31",
+                            "generation-1",
+                        ),
+                    ))
                 stack.enter_context(patch(
                     "scripts.check_dashboard_release.validate_token_catalog",
                     return_value=markets,
@@ -447,12 +536,41 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             {"AAVE", "UNI"},
         )
         self.assertEqual(result["screening_quality_parity_count"], 2)
+        self.assertEqual(result["screening_quality_market_count"], 4)
         metric_paths = [row["path"] for row in result["requests"]]
         self.assertTrue(set(all_quality_paths).issubset(metric_paths))
 
         quality_by_token["UNI"]["metadata"]["data_generation"] = "generation-2"
         with self.assertRaisesRegex(ReleaseCheckError, "generation"):
             run_release()
+        quality_by_token["UNI"]["metadata"]["data_generation"] = "generation-1"
+
+        missing_market_token = copy.deepcopy(valid_full_markets)
+        missing_market_token[0].pop("token_symbol")
+        full_catalog["markets"] = missing_market_token
+        with self.assertRaisesRegex(ReleaseCheckError, "market Token identity"):
+            run_release()
+
+        missing_token_catalog = copy.deepcopy(valid_full_markets)
+        for market in missing_token_catalog:
+            market["token_symbol"] = "AAVE"
+        full_catalog["markets"] = missing_token_catalog
+        with self.assertRaisesRegex(ReleaseCheckError, "Token inventory"):
+            run_release()
+
+        full_catalog["markets"] = copy.deepcopy(valid_full_markets[:3])
+        with self.assertRaisesRegex(ReleaseCheckError, "catalog count"):
+            run_release()
+
+        full_catalog["markets"] = copy.deepcopy(valid_full_markets)
+        summary["metadata"]["token_count"] = 1
+        with self.assertRaisesRegex(ReleaseCheckError, "parity Token count"):
+            run_release(bypass_summary_validation=True)
+        summary["metadata"]["token_count"] = 2
+
+        summary["metadata"]["catalog_market_count"] = 3
+        with self.assertRaisesRegex(ReleaseCheckError, "parity market count"):
+            run_release(bypass_summary_validation=True)
 
     def test_summary_rejects_heavy_arrays_and_payload_budget_regression(self):
         summary = self.summary()
@@ -505,12 +623,37 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseCheckError, "not unique"):
             duplicated = self.summary()
             duplicated["tokens"].append(copy.deepcopy(duplicated["tokens"][0]))
+            duplicated["metadata"]["token_count"] = 2
+            duplicated["metadata"]["catalog_market_count"] = 4
             validate_summary(
                 duplicated,
                 self.metrics(),
                 raw_max=2000,
                 gzip_max=1000,
             )
+
+        count_mutations = (
+            ("token_count", None),
+            ("token_count", True),
+            ("token_count", 2),
+            ("catalog_market_count", None),
+            ("catalog_market_count", True),
+            ("catalog_market_count", 1),
+        )
+        for field, value in count_mutations:
+            with self.subTest(field=field, value=value):
+                invalid = self.summary()
+                if value is None:
+                    invalid["metadata"].pop(field)
+                else:
+                    invalid["metadata"][field] = value
+                with self.assertRaisesRegex(ReleaseCheckError, field):
+                    validate_summary(
+                        invalid,
+                        self.metrics(),
+                        raw_max=2000,
+                        gzip_max=1000,
+                    )
 
     def test_token_catalog_rejects_cross_token_or_generation_mismatch(self):
         catalog = {
@@ -652,6 +795,67 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 market_a=market_a,
                 market_b=market_b,
             )
+
+        for selected_ids in (
+            [market_a, market_a, market_b],
+            [market_a, market_b, "cex:other:AAVE/USDT"],
+        ):
+            with self.subTest(selected_ids=selected_ids):
+                invalid = copy.deepcopy(quality)
+                invalid["metadata"]["selected_market_ids"] = selected_ids
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "wrong selected markets",
+                ):
+                    validate_quality(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                    )
+
+        bool_issue_count = copy.deepcopy(quality)
+        bool_issue_count["metadata"]["daily_quality_report"][
+            "selected_window_issue_count"
+        ] = False
+        with self.assertRaisesRegex(ReleaseCheckError, "reason/status counts"):
+            validate_quality(
+                bool_issue_count,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+            )
+
+        bool_date_count = copy.deepcopy(quality)
+        bool_date_count["metadata"]["daily_quality_report"][
+            "affected_date_count"
+        ] = False
+        with self.assertRaisesRegex(ReleaseCheckError, "affected dates"):
+            validate_quality(
+                bool_date_count,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+            )
+
+        for affected_date in (
+            "2026-02-30",
+            "2026-W01-1",
+            "2026-1-01",
+            "not-a-date",
+        ):
+            with self.subTest(affected_date=affected_date):
+                invalid = copy.deepcopy(quality)
+                report = invalid["metadata"]["daily_quality_report"]
+                report["affected_date_count"] = 1
+                report["affected_dates"] = [affected_date]
+                with self.assertRaisesRegex(ReleaseCheckError, "affected dates"):
+                    validate_quality(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                    )
 
         def execution_rows(market_id, status):
             return [
