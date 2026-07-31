@@ -3555,6 +3555,19 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
             and reason_code is None
         ):
             status, reason_code = "collection_failed", "source_unavailable"
+        elif status not in {
+            "observed",
+            "partial",
+            "source_no_observation",
+            "unsupported",
+            "needs_review",
+            "invalid",
+            "collection_failed",
+            "unavailable",
+            "not_cataloged_in_snapshot",
+            "not_applicable",
+        }:
+            status, reason_code = "needs_review", "daily_quality_outcome_invalid"
     elif raw_status == "unsupported":
         status = "unsupported"
         reason_code = project_dex_unsupported_error(market.get("depth_error"))
@@ -3566,8 +3579,14 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
         status, reason_code = "partial", "measurement_limit"
     elif raw_status in {"failed", "error", "collection_failed"}:
         status, reason_code = "collection_failed", "source_unavailable"
-    else:
+    elif raw_status in {
+        "unavailable",
+        "not_cataloged_in_snapshot",
+        "not_applicable",
+    }:
         status, reason_code = raw_status, None
+    else:
+        status, reason_code = "needs_review", "daily_quality_outcome_invalid"
     outcome = quality_outcome_rule(status, reason_code)
     retryable = outcome.retryable if outcome is not None else False
     temporal_alignment = {
@@ -3668,14 +3687,26 @@ def _depth_quality_fact(market: dict[str, Any]) -> dict[str, Any]:
         sell_prefix = "bid" if market_type == "cex" else "sell"
         buy_prefix = "ask" if market_type == "cex" else "buy"
         bands[str(band)] = {
-            "sell_token_usd": market.get(
-                f"{sell_prefix}_depth_{band}bps_usd"
+            "sell_token_usd": (
+                None if status == "source_no_observation" else market.get(
+                    f"{sell_prefix}_depth_{band}bps_usd"
+                )
             ),
-            "buy_token_usd": market.get(
-                f"{buy_prefix}_depth_{band}bps_usd"
+            "buy_token_usd": (
+                None if status == "source_no_observation" else market.get(
+                    f"{buy_prefix}_depth_{band}bps_usd"
+                )
             ),
-            "total_usd": market.get(f"total_depth_{band}bps_usd"),
-            "complete": bool(market.get(f"depth_{band}bps_complete")),
+            "total_usd": (
+                None if status == "source_no_observation" else market.get(
+                    f"total_depth_{band}bps_usd"
+                )
+            ),
+            "complete": (
+                False if status == "source_no_observation" else bool(
+                    market.get(f"depth_{band}bps_complete")
+                )
+            ),
         }
     return {
         **_quality_lineage(
@@ -3883,7 +3914,7 @@ def _execution_quality_fact(
         public_status, public_reason_code = normalize_cex_source_outcome(
             status,
             lineage_reason,
-            None,
+            errors[0] if len(errors) == 1 else None,
         )
         public_outcome = quality_outcome_rule(
             public_status, public_reason_code
@@ -3896,6 +3927,8 @@ def _execution_quality_fact(
     else:
         retryable = status == "failed"
     if status == "source_no_observation":
+        errors = []
+        reason_counts = Counter({lineage_reason: sum(status_counts.values())})
         temporal_flags = [
             flag for flag in temporal_flags
             if flag.get("category") != "data_health"
@@ -4067,6 +4100,15 @@ def build_market_quality(
                 and not (
                     "depth" in source_no_observation_facts
                     and flag.get("code") in {"depth_failed", "failed_depth"}
+                )
+                and not (
+                    "execution" in source_no_observation_facts
+                    and flag.get("code") in {
+                        "execution_failed",
+                        "failed_execution",
+                        "execution_calculation_failed",
+                        "execution_collection_failed",
+                    }
                 )
             )
         ]
