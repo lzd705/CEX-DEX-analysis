@@ -707,12 +707,102 @@ async function competingSummaryBeatsOlderCatalogRetry() {
   };
 }
 
+async function summaryFailureSurvivesCatalogRecovery() {
+  reset(OLD_START, "g1");
+  loadMarket = realLoadMarket;
+  loadTokenCatalog = realLoadTokenCatalog;
+  hideError(document.getElementById("global-error"));
+  document.getElementById("custom-window-toggle")
+    .setAttribute("aria-expanded", "true");
+  document.getElementById("custom-window-editor").hidden = false;
+  const customDraft = { start: "2026-07-20", end: "2026-07-21" };
+  setDraftTimeWindow(customDraft);
+
+  const pending = [];
+  global.fetch = (url, options = {}) => new Promise((resolve) => {
+    pending.push({ url, signal: options.signal, resolve });
+  });
+  const routeImplementation = applyRouteFromLocation;
+  const routeCompletions = [];
+  applyRouteFromLocation = (...args) => {
+    const completion = routeImplementation(...args);
+    routeCompletions.push(completion);
+    return completion;
+  };
+
+  const initialRoute = applyRouteFromLocation();
+  await Promise.resolve();
+  const applyCompletion = applyWindow(customDraft);
+  await Promise.resolve();
+  const summaryRequest = pending.find((request) => (
+    request.url.startsWith("/api/markets/summary?")
+  ));
+  summaryRequest.resolve({
+    ok: false,
+    status: 503,
+    json: async () => ({ error: "summary unavailable" }),
+  });
+  const applied = await applyCompletion;
+  await Promise.resolve();
+  const afterFailure = {
+    ...state(),
+    errorHidden: document.getElementById("global-error").hidden,
+    globalError: document.getElementById("global-error").textContent,
+    routeCompletions: routeCompletions.length,
+  };
+
+  const catalogRequests = pending.filter((request) => (
+    request.url.startsWith("/api/markets/catalog?")
+  ));
+  const catalogPayload = {
+    token_symbol: "BTC",
+    metadata: {
+      data_generation: "g1",
+      window_start: OLD_START,
+      window_end: END,
+    },
+    markets: [{ token_symbol: "BTC" }],
+  };
+  catalogRequests[1].resolve({
+    ok: true,
+    status: 200,
+    json: async () => catalogPayload,
+  });
+  const recovered = await routeCompletions[1];
+  const afterRecovery = {
+    ...state(),
+    errorHidden: document.getElementById("global-error").hidden,
+    globalError: document.getElementById("global-error").textContent,
+  };
+
+  catalogRequests[0].resolve({
+    ok: true,
+    status: 200,
+    json: async () => catalogPayload,
+  });
+  const initialApplied = await initialRoute;
+  return {
+    applied,
+    recovered,
+    initialApplied,
+    requestUrls: pending.map((request) => request.url),
+    afterFailure,
+    afterRecovery,
+    afterStaleCatalog: {
+      ...state(),
+      errorHidden: document.getElementById("global-error").hidden,
+      globalError: document.getElementById("global-error").textContent,
+    },
+  };
+}
+
 (async () => console.log(JSON.stringify({
   catalogFailure: await catalogFailure(),
   staleMismatch: await staleMismatch(),
   currentMismatch: await currentMismatch(),
   staleSuccess: await staleSuccess(),
   competingSummary: await competingSummaryBeatsOlderCatalogRetry(),
+  summaryFailureRecovery: await summaryFailureSurvivesCatalogRecovery(),
 })))();
 """,
             prelude="""
@@ -794,6 +884,47 @@ globalThis.MarketMonitorNavigation = {
             "catalogCount": 1,
             "payload": {"start": "2026-07-23", "end": "2026-07-29"},
         })
+        summary_failure = result["summaryFailureRecovery"]
+        self.assertFalse(summary_failure["applied"])
+        self.assertTrue(summary_failure["recovered"])
+        self.assertFalse(summary_failure["initialApplied"])
+        self.assertEqual(summary_failure["requestUrls"], [
+            "/api/markets/catalog?token=BTC&start=2026-06-30&end=2026-07-29",
+            "/api/markets/summary?start=2026-07-20&end=2026-07-21",
+            "/api/markets/catalog?token=BTC&start=2026-06-30&end=2026-07-29",
+        ])
+        expected_recovery_state = {
+            "payload": {"start": "2026-06-30", "end": "2026-07-29"},
+            "draft": {"start": "2026-07-20", "end": "2026-07-21"},
+            "summary": "30 Jun–29 Jul 2026 · 30 days",
+            "active": ["30"],
+            "editorHidden": False,
+            "expanded": "true",
+            "route": "/tokens/BTC/markets?start=2026-06-30&end=2026-07-29",
+            "visibleTokens": ["g1"],
+        }
+        self.assertEqual(summary_failure["afterFailure"], {
+            **expected_recovery_state,
+            "catalogMarker": None,
+            "activeCatalogKey": "",
+            "errorHidden": False,
+            "globalError": (
+                "summary unavailable The explicitly marked cached snapshot "
+                "remains visible."
+            ),
+            "routeCompletions": 2,
+        })
+        for checkpoint in ("afterRecovery", "afterStaleCatalog"):
+            self.assertEqual(summary_failure[checkpoint], {
+                **expected_recovery_state,
+                "catalogMarker": None,
+                "activeCatalogKey": "BTC|2026-06-30|2026-07-29|g1",
+                "errorHidden": False,
+                "globalError": (
+                    "summary unavailable The explicitly marked cached snapshot "
+                    "remains visible."
+                ),
+            })
 
     def test_summary_window_commit_uses_summary_as_the_only_transaction_boundary(self):
         self.maxDiff = None
@@ -867,6 +998,9 @@ const toggle = control();
 const form = control();
 const cancel = control();
 const summary = control();
+const factsToken = control({ value: "BTC" });
+const factsMarketA = control({ value: "cex:binance:BTC/USDT" });
+const factsMarketB = control({ value: "dex:uniswap:BTC/USDC" });
 const presets = ["7", "30", "90", "all"].map((days) => (
   control({ dataset: { days } })
 ));
@@ -884,6 +1018,9 @@ const elements = {
   "date-window-form": form,
   "cancel-window": cancel,
   "applied-window-summary": summary,
+  "facts-token": factsToken,
+  "facts-market-a": factsMarketA,
+  "facts-market-b": factsMarketB,
 };
 global.document = {
   getElementById(id) {
@@ -1002,6 +1139,7 @@ renderTable = () => {
   app.visibleTokens = [...app.payload.tokens];
 };
 updateRouteLinks = () => {};
+refreshWorkspacePageData = () => {};
 applyRouteFromLocation = async () => {
   catalogLaunches.push(routeUrl());
   return false;
@@ -1110,6 +1248,50 @@ bindEvents();
   await olderCompletion;
   const overlapping = visibleState(focusBefore);
 
+  reset({ draft: { start: "2026-07-22", end: "2026-07-29" } });
+  const oldMarketA = "cex:binance:BTC/USDT";
+  const newerMarketA = "cex:coinbase:BTC/USD";
+  const marketB = "dex:uniswap:BTC/USDC";
+  factsMarketA.value = oldMarketA;
+  factsMarketB.value = marketB;
+  app.route.state = {
+    marketA: oldMarketA,
+    marketB,
+    start: "2026-06-30",
+    end: "2026-07-29",
+  };
+  window.location.search = (
+    `?marketA=${encodeURIComponent(oldMarketA)}`
+    + `&marketB=${encodeURIComponent(marketB)}`
+    + "&start=2026-06-30&end=2026-07-29"
+  );
+  completion = trigger(form, "submit");
+  await Promise.resolve();
+  factsMarketA.value = newerMarketA;
+  await trigger(factsMarketA, "change");
+  const routeAfterQueryMutation = routeUrl();
+  respond(0, { ok: true, body: summaryPayload("2026-07-23", "2026-07-29") });
+  await completion;
+  const routeAfterSummary = routeUrl();
+  const committedQuery = Object.fromEntries(new URLSearchParams(window.location.search));
+
+  reset({ draft: { start: "2026-07-20", end: "2026-07-21" } });
+  hideError(document.getElementById("global-error"));
+  const staleFailureCompletion = trigger(form, "submit");
+  await Promise.resolve();
+  setDraftTimeWindow({ start: "2026-07-23", end: "2026-07-29" });
+  const latestCompletion = trigger(form, "submit");
+  await Promise.resolve();
+  respond(0, { ok: false, body: { error: "stale summary unavailable" } });
+  await staleFailureCompletion;
+  const staleFailure = {
+    catalogLaunches: [...catalogLaunches],
+    globalErrorHidden: document.getElementById("global-error").hidden,
+    globalError: document.getElementById("global-error").textContent,
+  };
+  respond(1, { ok: true, body: summaryPayload("2026-07-23", "2026-07-29") });
+  await latestCompletion;
+
   console.log(JSON.stringify({
     listenerCounts: {
       submit: form.listeners.submit?.length || 0,
@@ -1127,6 +1309,12 @@ bindEvents();
     ordinaryBeforeReady,
     initializingWorkspaceSuccess,
     overlapping,
+    queryOnlyMutation: {
+      routeAfterQueryMutation,
+      routeAfterSummary,
+      committedQuery,
+    },
+    staleFailure,
   }));
 })();
 """,
@@ -1137,8 +1325,12 @@ globalThis.MarketMonitorNavigation = {
       + `&end=${encodeURIComponent(filters.end || "")}`;
   },
   buildWorkspacePath(token, page, state) {
-    return `/tokens/${token}/${page}?start=${encodeURIComponent(state.start || "")}`
-      + `&end=${encodeURIComponent(state.end || "")}`;
+    const query = new URLSearchParams();
+    if (state.marketA) query.set("marketA", state.marketA);
+    if (state.marketB) query.set("marketB", state.marketB);
+    query.set("start", state.start || "");
+    query.set("end", state.end || "");
+    return `/tokens/${token}/${page}?${query.toString()}`;
   },
   parseRoute(pathname, search) {
     const params = new URLSearchParams(search);
@@ -1148,6 +1340,8 @@ globalThis.MarketMonitorNavigation = {
       token: parts[2] || "BTC",
       page: parts[3] || "markets",
       state: {
+        marketA: params.get("marketA") || "",
+        marketB: params.get("marketB") || "",
         start: params.get("start") || "",
         end: params.get("end") || "",
       },
@@ -1300,6 +1494,35 @@ globalThis.MarketMonitorNavigation = {
                 "/api/markets/summary?start=2026-07-20&end=2026-07-21",
                 "/api/markets/summary?start=2026-07-23&end=2026-07-29",
             ],
+        })
+        self.assertTrue(
+            result["queryOnlyMutation"]["routeAfterQueryMutation"].startswith(
+                "/tokens/BTC/markets?"
+            )
+        )
+        self.assertIn(
+            "marketA=cex%3Acoinbase%3ABTC%2FUSD",
+            result["queryOnlyMutation"]["routeAfterQueryMutation"],
+        )
+        self.assertTrue(
+            result["queryOnlyMutation"]["routeAfterSummary"].startswith(
+                "/tokens/BTC/markets?"
+            )
+        )
+        self.assertEqual(result["queryOnlyMutation"]["committedQuery"], {
+            "marketA": "cex:coinbase:BTC/USD",
+            "marketB": "dex:uniswap:BTC/USDC",
+            "start": "2026-07-23",
+            "end": "2026-07-29",
+        })
+        self.assertNotIn(
+            "cex%3Abinance%3ABTC%2FUSDT",
+            result["queryOnlyMutation"]["routeAfterSummary"],
+        )
+        self.assertEqual(result["staleFailure"], {
+            "catalogLaunches": [],
+            "globalErrorHidden": True,
+            "globalError": "",
         })
 
     def test_workspace_apply_commits_dates_to_original_route_before_missing_token_fallback(self):
@@ -2970,12 +3193,12 @@ console.log(JSON.stringify({
     def test_route_and_loading_contract_prevents_stale_window_or_permanent_loading(self):
         app_js = APP_PATH.read_text(encoding="utf-8")
         router = app_js[
-            app_js.index("async function applyRouteFromLocation()"):
+            app_js.index("async function applyRouteFromLocation("):
             app_js.index("function validateDateRange(")
         ]
         unavailable = app_js[
             app_js.index("function setWorkspaceDataUnavailable("):
-            app_js.index("async function applyRouteFromLocation()")
+            app_js.index("async function applyRouteFromLocation(")
         ]
         workspace_markets = app_js[
             app_js.index("function renderWorkspaceMarkets()"):
@@ -2987,6 +3210,7 @@ console.log(JSON.stringify({
         ]
 
         self.assertIn("if (app.marketController)", router)
+        self.assertIn("{ preserveWorkspaceError = false }", router)
         self.assertIn("invalidateMarketRequest();", router)
         self.assertIn('byId("export-csv").disabled = !app.payload;', router)
         self.assertIn("const loaded = await loadMarketForRoute(", router)

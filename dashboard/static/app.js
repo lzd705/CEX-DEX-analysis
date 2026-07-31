@@ -997,7 +997,12 @@ function invalidateRouteRequest() {
   return app.routeRequestId;
 }
 
-function setWorkspaceCatalogLoading(token, page, catalogKey = "") {
+function setWorkspaceCatalogLoading(
+  token,
+  page,
+  catalogKey = "",
+  { preserveGlobalError = false } = {},
+) {
   if (app.activeCatalogKey === catalogKey && app.catalog) return;
   app.catalog = null;
   app.activeCatalogToken = "";
@@ -1010,7 +1015,7 @@ function setWorkspaceCatalogLoading(token, page, catalogKey = "") {
   app.execution = null;
   app.eventFacts = null;
   app.quality = null;
-  hideError(byId("global-error"));
+  if (!preserveGlobalError) hideError(byId("global-error"));
   hideLiquidityTooltip();
   closeFactsMarketWarnings();
   renderFactsMarketWarning("a", null);
@@ -1169,7 +1174,7 @@ function setWorkspaceDataUnavailable(token, message) {
   updateRouteLinks();
 }
 
-async function applyRouteFromLocation() {
+async function applyRouteFromLocation({ preserveWorkspaceError = false } = {}) {
   if (!navigation) return false;
   if (app.marketController) {
     invalidateMarketRequest();
@@ -1208,7 +1213,12 @@ async function applyRouteFromLocation() {
     );
     setActiveAppView("workspace");
     setActiveWorkspacePage(route.page);
-    setWorkspaceCatalogLoading(provisionalToken, route.page, provisionalKey);
+    setWorkspaceCatalogLoading(
+      provisionalToken,
+      route.page,
+      provisionalKey,
+      { preserveGlobalError: preserveWorkspaceError },
+    );
   } else {
     setActiveAppView("screener");
     byId("time-toolbar").hidden = false;
@@ -1293,7 +1303,12 @@ async function applyRouteFromLocation() {
         );
         setActiveAppView("workspace");
         setActiveWorkspacePage(exactRoute.page);
-        setWorkspaceCatalogLoading(exactToken, exactRoute.page, catalogKey);
+        setWorkspaceCatalogLoading(
+          exactToken,
+          exactRoute.page,
+          catalogKey,
+          { preserveGlobalError: preserveWorkspaceError },
+        );
         try {
           if (!routeStillOwnsIntent()) return false;
           let catalog = cachedTokenCatalog(catalogKey);
@@ -5458,20 +5473,32 @@ async function applyWindow(candidate = draftTimeWindow()) {
       && applyRequestId === app.marketRequestId
       && locationUnchanged
     ) {
-      void applyRouteFromLocation();
+      void applyRouteFromLocation({ preserveWorkspaceError: true });
     }
     return false;
   }
   const applied = appliedTimeWindow();
   if (routeAtApply.kind === "workspace" && navigation) {
+    const latestRoute = navigation.parseRoute(
+      window.location.pathname,
+      window.location.search,
+    );
+    const routeForCommit = (
+      latestRoute.kind === "workspace"
+      && String(latestRoute.token || "").toUpperCase()
+        === String(routeAtApply.token || "").toUpperCase()
+      && latestRoute.page === routeAtApply.page
+    )
+      ? latestRoute
+      : routeAtApply;
     const state = {
-      ...(routeAtApply.state || {}),
+      ...(routeForCommit.state || {}),
       start: applied.start,
       end: applied.end,
     };
     const path = navigation.buildWorkspacePath(
-      routeAtApply.token,
-      routeAtApply.page,
+      routeForCommit.token,
+      routeForCommit.page,
       state,
     );
     window.history.replaceState({}, "", path);
