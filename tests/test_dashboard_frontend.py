@@ -82,7 +82,7 @@ class DashboardFrontendContractTest(unittest.TestCase):
 const summary = {
   metadata: {
     response_scope: "screener_summary",
-    summary_version: 1,
+    summary_version: 2,
     data_generation: "g1",
   },
   tokens: [{
@@ -90,6 +90,10 @@ const summary = {
     primary_cex: null,
     primary_dex: null,
   }],
+};
+const staleSummary = {
+  ...summary,
+  metadata: {...summary.metadata, summary_version: 1},
 };
 const legacy = {
   metadata: {},
@@ -99,12 +103,14 @@ const legacy = {
 };
 console.log(JSON.stringify({
   summary: isMarketPayload(summary),
+  staleSummary: isMarketPayload(staleSummary),
   legacy: isMarketPayload(legacy),
   missingAggregates: aggregateFacts({}, [], []),
 }));
 """
         )
         self.assertTrue(result["summary"])
+        self.assertFalse(result["staleSummary"])
         self.assertFalse(result["legacy"])
         self.assertEqual(
             result["missingAggregates"],
@@ -192,7 +198,7 @@ console.log(JSON.stringify({
   app.payload = {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 1,
+      summary_version: 2,
       data_generation: "g1",
     },
     tokens: [],
@@ -245,7 +251,7 @@ console.log(JSON.stringify({
   app.payload = {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 1,
+      summary_version: 2,
       data_generation: "g1",
     },
     tokens: [],

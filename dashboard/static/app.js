@@ -5045,7 +5045,7 @@ function isMarketPayload(payload) {
     payload
     && payload.metadata
     && payload.metadata.response_scope === "screener_summary"
-    && payload.metadata.summary_version === 1
+    && payload.metadata.summary_version === 2
     && typeof payload.metadata.data_generation === "string"
     && payload.metadata.data_generation.length > 0
     && Array.isArray(payload.tokens)
