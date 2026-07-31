@@ -426,225 +426,7 @@ globalThis.MarketMonitorNavigation = {
             },
         })
 
-    def test_bound_workspace_window_commands_use_real_apply_result(self):
-        result = run_app_javascript(
-            """
-function control({ value = "", hidden = false, dataset = {} } = {}) {
-  return {
-    value,
-    hidden,
-    dataset,
-    disabled: false,
-    textContent: "",
-    attributes: {},
-    listeners: {},
-    active: false,
-    focusCalls: 0,
-    classList: {
-      owner: null,
-      toggle(name, active) {
-        if (name === "active") this.owner.active = active;
-      },
-    },
-    addEventListener(type, listener) {
-      this.listeners[type] = this.listeners[type] || [];
-      this.listeners[type].push(listener);
-    },
-    setAttribute(name, value) { this.attributes[name] = value; },
-    getAttribute(name) { return this.attributes[name] || null; },
-    focus() { this.focusCalls += 1; },
-  };
-}
-async function trigger(target, type) {
-  for (const listener of target.listeners[type] || []) {
-    await listener({ preventDefault() {} });
-  }
-}
-function payload(start = "2026-06-30", end = "2026-07-29") {
-  return {
-    metadata: {
-      start_date: start,
-      end_date: end,
-      available_start: "2026-05-01",
-      available_end: "2026-07-29",
-      data_generation: "generation-a",
-    },
-    tokens: [{ token_symbol: "BTC" }],
-  };
-}
-const start = control();
-const end = control();
-const error = control({ hidden: true });
-const editor = control({ hidden: true });
-const toggle = control();
-const form = control();
-const cancel = control();
-const summary = control();
-const presets = ["7", "30", "90", "all"].map((days) => control({ dataset: { days } }));
-const genericControls = new Map();
-for (const item of [start, end, error, editor, toggle, form, cancel, summary, ...presets]) {
-  item.classList.owner = item;
-}
-toggle.setAttribute("aria-expanded", "false");
-const elements = {
-  "date-start": start,
-  "date-end": end,
-  "date-window-error": error,
-  "custom-window-editor": editor,
-  "custom-window-toggle": toggle,
-  "date-window-form": form,
-  "cancel-window": cancel,
-  "applied-window-summary": summary,
-};
-global.document = {
-  getElementById(id) {
-    if (elements[id]) return elements[id];
-    if (!genericControls.has(id)) genericControls.set(id, control());
-    return genericControls.get(id);
-  },
-  querySelectorAll(selector) {
-    if (selector === "[data-days]") return presets;
-    return [];
-  },
-  addEventListener() {},
-};
-global.window = {
-  location: { pathname: "/tokens/BTC/markets", search: "" },
-  history: { replaceState() {} },
-  addEventListener() {},
-  visualViewport: null,
-  matchMedia() { return { addEventListener() {} }; },
-  lucide: null,
-};
-globalThis.__workspaceRoute = () => ({
-  kind: "workspace",
-  token: "BTC",
-  page: "markets",
-  state: { start: start.value, end: end.value },
-});
-
-setActiveAppView = () => {};
-setActiveWorkspacePage = () => {};
-setWorkspaceCatalogLoading = () => {};
-setWorkspaceDataUnavailable = () => {};
-applyWorkspaceRoute = (route) => { app.route = route; };
-announceRoute = () => {};
-updateRouteLinks = () => {};
-canonicalizeCurrentRoute = () => {};
-replaceCurrentRoute = () => {};
-cachedTokenCatalog = () => null;
-
-let mode = "market-failure";
-loadMarket = async (loadedStart, loadedEnd) => {
-  if (mode === "market-failure") return false;
-  app.payload = payload(loadedStart, loadedEnd);
-  renderAppliedTimeWindowControls();
-  return true;
-};
-loadTokenCatalog = async () => {
-  if (mode === "catalog-failure") throw new Error("catalog unavailable");
-  return { metadata: {} };
-};
-
-app.payload = payload();
-app.route = globalThis.__workspaceRoute();
-app.routeReady = true;
-syncTimeWindowControls();
-const syncOriginal = syncTimeWindowControls;
-let syncCalls = 0;
-syncTimeWindowControls = () => {
-  syncCalls += 1;
-  syncOriginal();
-};
-bindEvents();
-
-openCustomWindowEditor();
-start.value = "2026-07-20";
-end.value = "2026-07-21";
-const customFailureSyncBefore = syncCalls;
-const customFailureFocusBefore = toggle.focusCalls;
-await trigger(form, "submit");
-const customFailure = {
-  syncCalls: syncCalls - customFailureSyncBefore,
-  editorHidden: editor.hidden,
-  expanded: toggle.getAttribute("aria-expanded"),
-  focusCalls: toggle.focusCalls - customFailureFocusBefore,
-  summary: summary.textContent,
-  active: presets.filter((button) => button.active).map((button) => button.dataset.days),
-  applied: appliedTimeWindow(),
-};
-
-app.payload = payload();
-syncOriginal();
-setCustomWindowOpen(true);
-mode = "catalog-failure";
-const presetFailureSyncBefore = syncCalls;
-await trigger(presets[0], "click");
-const presetFailure = {
-  syncCalls: syncCalls - presetFailureSyncBefore,
-  editorHidden: editor.hidden,
-  expanded: toggle.getAttribute("aria-expanded"),
-  summary: summary.textContent,
-  active: presets.filter((button) => button.active).map((button) => button.dataset.days),
-  applied: appliedTimeWindow(),
-};
-
-app.payload = payload();
-syncOriginal();
-openCustomWindowEditor();
-start.value = "2026-07-23";
-end.value = "2026-07-29";
-mode = "success";
-const successSyncBefore = syncCalls;
-const successFocusBefore = toggle.focusCalls;
-await trigger(form, "submit");
-const customSuccess = {
-  syncCalls: syncCalls - successSyncBefore,
-  editorHidden: editor.hidden,
-  expanded: toggle.getAttribute("aria-expanded"),
-  focusCalls: toggle.focusCalls - successFocusBefore,
-  summary: summary.textContent,
-  active: presets.filter((button) => button.active).map((button) => button.dataset.days),
-  applied: appliedTimeWindow(),
-};
-
-console.log(JSON.stringify({ customFailure, presetFailure, customSuccess }));
-""",
-            prelude="""
-globalThis.MarketMonitorNavigation = {
-  parseRoute() { return globalThis.__workspaceRoute(); },
-};
-""",
-        )
-        unchanged = {
-            "summary": "30 Jun–29 Jul 2026 · 30 days",
-            "active": ["30"],
-            "applied": {"start": "2026-06-30", "end": "2026-07-29"},
-        }
-        self.assertEqual(result["customFailure"], {
-            "syncCalls": 0,
-            "editorHidden": False,
-            "expanded": "true",
-            "focusCalls": 0,
-            **unchanged,
-        })
-        self.assertEqual(result["presetFailure"], {
-            "syncCalls": 0,
-            "editorHidden": False,
-            "expanded": "true",
-            **unchanged,
-        })
-        self.assertEqual(result["customSuccess"], {
-            "syncCalls": 1,
-            "editorHidden": True,
-            "expanded": "false",
-            "focusCalls": 1,
-            "summary": "23–29 Jul 2026 · 7 days",
-            "active": ["7"],
-            "applied": {"start": "2026-07-23", "end": "2026-07-29"},
-        })
-
-    def test_stale_workspace_window_keeps_newer_state_and_bound_editor(self):
+    def test_summary_window_commit_uses_summary_as_the_only_transaction_boundary(self):
         self.maxDiff = None
         result = run_app_javascript(
             """
@@ -655,6 +437,7 @@ function control({ value = "", hidden = false, dataset = {} } = {}) {
     dataset,
     disabled: false,
     textContent: "",
+    innerHTML: "",
     attributes: {},
     listeners: {},
     active: false,
@@ -664,31 +447,46 @@ function control({ value = "", hidden = false, dataset = {} } = {}) {
       toggle(name, active) {
         if (name === "active") this.owner.active = active;
       },
+      contains() { return false; },
     },
     addEventListener(type, listener) {
       this.listeners[type] = this.listeners[type] || [];
       this.listeners[type].push(listener);
     },
-    setAttribute(name, value) { this.attributes[name] = value; },
+    setAttribute(name, nextValue) { this.attributes[name] = nextValue; },
     getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
     focus() { this.focusCalls += 1; },
   };
 }
+
 async function trigger(target, type) {
   for (const listener of target.listeners[type] || []) {
     await listener({ preventDefault() {} });
   }
 }
-function payload(start, end) {
+
+function summaryPayload(start, end, generation = "generation-a") {
   return {
     metadata: {
+      response_scope: "screener_summary",
+      summary_version: 1,
+      data_generation: generation,
       start_date: start,
       end_date: end,
       available_start: "2026-05-01",
       available_end: "2026-07-29",
-      data_generation: "generation-a",
+      default_workspace_token: "BTC",
+      sources: [],
+      tvl_note: "TVL unavailable",
+      cex_depth_note: "CEX depth unavailable",
+      dex_depth_note: "DEX depth unavailable",
     },
-    tokens: [{ token_symbol: "BTC" }],
+    tokens: [{
+      token_symbol: "BTC",
+      primary_cex: null,
+      primary_dex: null,
+    }],
   };
 }
 
@@ -721,222 +519,471 @@ const elements = {
 global.document = {
   getElementById(id) {
     if (elements[id]) return elements[id];
-    if (!genericControls.has(id)) genericControls.set(id, control());
+    if (!genericControls.has(id)) {
+      const item = control();
+      item.classList.owner = item;
+      genericControls.set(id, item);
+    }
     return genericControls.get(id);
   },
+  querySelector() { return null; },
   querySelectorAll(selector) {
     if (selector === "[data-days]") return presets;
     return [];
   },
   addEventListener() {},
 };
+
+const routeWrites = [];
+const routeDrafts = [];
+const catalogLaunches = [];
+const requests = [];
 global.window = {
-  location: { pathname: "/tokens/BTC/markets", search: "" },
-  history: { replaceState() {} },
+  location: {
+    pathname: "/tokens/BTC/markets",
+    search: "?start=2026-06-30&end=2026-07-29",
+  },
+  history: {
+    replaceState(_state, _title, path) {
+      routeWrites.push(path);
+      routeDrafts.push(draftTimeWindow());
+      const [pathname, query = ""] = path.split("?");
+      global.window.location.pathname = pathname;
+      global.window.location.search = query ? `?${query}` : "";
+    },
+  },
   addEventListener() {},
   visualViewport: null,
   matchMedia() { return { addEventListener() {} }; },
+  localStorage: { setItem() {}, removeItem() {} },
   lucide: null,
 };
+global.fetch = (url) => new Promise((resolve) => {
+  requests.push({ url, resolve });
+});
 
-let routeWindow = { start: "2026-06-30", end: "2026-07-29" };
-globalThis.__workspaceRoute = () => ({
+function respond(index, { ok, body }) {
+  if (!requests[index]) return;
+  requests[index].resolve({
+    ok,
+    status: ok ? 200 : 503,
+    json: async () => body,
+  });
+}
+
+function routeUrl() {
+  return `${window.location.pathname}${window.location.search}`;
+}
+
+function pressedState() {
+  return Object.fromEntries(presets.map((button) => [
+    button.dataset.days,
+    button.getAttribute("aria-pressed"),
+  ]));
+}
+
+function visibleState(focusBefore = toggle.focusCalls) {
+  return {
+    payload: appliedTimeWindow(),
+    draft: draftTimeWindow(),
+    summary: summary.textContent,
+    active: presets.filter((button) => button.active).map((button) => button.dataset.days),
+    pressed: pressedState(),
+    editorHidden: editor.hidden,
+    expanded: toggle.getAttribute("aria-expanded"),
+    focusDelta: toggle.focusCalls - focusBefore,
+    route: routeUrl(),
+    routeWrites: [...routeWrites],
+    routeDrafts: [...routeDrafts],
+    requests: requests.map((request) => request.url),
+    catalogLaunches: [...catalogLaunches],
+  };
+}
+
+function reset({ draft, open = true } = {}) {
+  app.payload = summaryPayload("2026-06-30", "2026-07-29");
+  app.defaultPayload = null;
+  app.visibleTokens = [...app.payload.tokens];
+  app.catalog = null;
+  app.route = {
+    kind: "workspace",
+    token: "BTC",
+    page: "markets",
+    state: { start: "2026-06-30", end: "2026-07-29" },
+  };
+  app.routeReady = true;
+  app.marketRequestId = 0;
+  app.marketRequestWindowKey = "";
+  app.marketController = null;
+  window.location.pathname = "/tokens/BTC/markets";
+  window.location.search = "?start=2026-06-30&end=2026-07-29";
+  routeWrites.length = 0;
+  routeDrafts.length = 0;
+  catalogLaunches.length = 0;
+  requests.length = 0;
+  setDraftTimeWindow(draft || appliedTimeWindow());
+  editor.hidden = !open;
+  toggle.setAttribute("aria-expanded", String(open));
+  toggle.focusCalls = 0;
+  syncTimeWindowControls();
+}
+
+renderTable = () => {
+  app.visibleTokens = [...app.payload.tokens];
+};
+updateRouteLinks = () => {};
+applyRouteFromLocation = async () => {
+  catalogLaunches.push(routeUrl());
+  return false;
+};
+
+bindEvents();
+
+(async () => {
+  reset({ draft: { start: "2026-07-20", end: "2026-07-21" } });
+  let focusBefore = toggle.focusCalls;
+  let completion = trigger(form, "submit");
+  await Promise.resolve();
+  respond(0, { ok: false, body: { error: "summary unavailable" } });
+  await completion;
+  const customFailure = visibleState(focusBefore);
+
+  reset({ draft: { start: "2026-07-22", end: "2026-07-29" } });
+  focusBefore = toggle.focusCalls;
+  completion = trigger(form, "submit");
+  await Promise.resolve();
+  respond(0, { ok: true, body: summaryPayload("2026-07-23", "2026-07-29") });
+  await completion;
+  const customSuccess = visibleState(focusBefore);
+
+  reset({ draft: { start: "2026-07-10", end: "2026-07-11" } });
+  focusBefore = toggle.focusCalls;
+  completion = trigger(presets[0], "click");
+  await Promise.resolve();
+  respond(0, { ok: false, body: { error: "summary unavailable" } });
+  await completion;
+  const presetFailure = visibleState(focusBefore);
+
+  reset({ draft: { start: "2026-07-10", end: "2026-07-11" } });
+  focusBefore = toggle.focusCalls;
+  completion = trigger(presets[0], "click");
+  await Promise.resolve();
+  respond(0, { ok: true, body: summaryPayload("2026-07-23", "2026-07-29") });
+  await completion;
+  const presetSuccess = visibleState(focusBefore);
+
+  reset({ draft: { start: "2026-07-22", end: "2026-07-29" } });
+  focusBefore = toggle.focusCalls;
+  completion = trigger(form, "submit");
+  await Promise.resolve();
+  respond(0, {
+    ok: true,
+    body: summaryPayload("2026-07-23", "2026-07-29", "generation-b"),
+  });
+  await completion;
+  const generationSuccess = visibleState(focusBefore);
+
+  reset({ draft: { start: "2026-07-20", end: "2026-07-21" } });
+  focusBefore = toggle.focusCalls;
+  const olderCompletion = trigger(form, "submit");
+  await Promise.resolve();
+  setDraftTimeWindow({ start: "2026-07-23", end: "2026-07-29" });
+  const newerCompletion = trigger(form, "submit");
+  await Promise.resolve();
+  respond(1, { ok: true, body: summaryPayload("2026-07-23", "2026-07-29") });
+  await newerCompletion;
+  respond(0, { ok: true, body: summaryPayload("2026-07-20", "2026-07-21") });
+  await olderCompletion;
+  const overlapping = visibleState(focusBefore);
+
+  console.log(JSON.stringify({
+    listenerCounts: {
+      submit: form.listeners.submit?.length || 0,
+      presets: presets.map((button) => button.listeners.click?.length || 0),
+    },
+    customFailure,
+    customSuccess,
+    presetFailure,
+    presetSuccess,
+    generationSuccess,
+    overlapping,
+  }));
+})();
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  buildScreenerPath(filters) {
+    return `/screener?start=${encodeURIComponent(filters.start || "")}`
+      + `&end=${encodeURIComponent(filters.end || "")}`;
+  },
+  buildWorkspacePath(token, page, state) {
+    return `/tokens/${token}/${page}?start=${encodeURIComponent(state.start || "")}`
+      + `&end=${encodeURIComponent(state.end || "")}`;
+  },
+  parseRoute(pathname, search) {
+    const params = new URLSearchParams(search);
+    const parts = pathname.split("/");
+    return {
+      kind: "workspace",
+      token: parts[2] || "BTC",
+      page: parts[3] || "markets",
+      state: {
+        start: params.get("start") || "",
+        end: params.get("end") || "",
+      },
+    };
+  },
+};
+""",
+        )
+
+        old_applied = {
+            "payload": {"start": "2026-06-30", "end": "2026-07-29"},
+            "summary": "30 Jun–29 Jul 2026 · 30 days",
+            "active": ["30"],
+            "pressed": {
+                "7": "false",
+                "30": "true",
+                "90": "false",
+                "all": "false",
+            },
+            "route": (
+                "/tokens/BTC/markets?start=2026-06-30&end=2026-07-29"
+            ),
+        }
+        new_applied = {
+            "payload": {"start": "2026-07-23", "end": "2026-07-29"},
+            "draft": {"start": "2026-07-23", "end": "2026-07-29"},
+            "summary": "23–29 Jul 2026 · 7 days",
+            "active": ["7"],
+            "pressed": {
+                "7": "true",
+                "30": "false",
+                "90": "false",
+                "all": "false",
+            },
+            "editorHidden": True,
+            "expanded": "false",
+            "route": (
+                "/tokens/BTC/markets?start=2026-07-23&end=2026-07-29"
+            ),
+            "routeWrites": [
+                "/tokens/BTC/markets?start=2026-07-23&end=2026-07-29"
+            ],
+            "catalogLaunches": [
+                "/tokens/BTC/markets?start=2026-07-23&end=2026-07-29"
+            ],
+        }
+        self.assertEqual(result["listenerCounts"], {
+            "submit": 1,
+            "presets": [1, 1, 1, 1],
+        })
+        self.assertEqual(result["customFailure"], {
+            **old_applied,
+            "draft": {"start": "2026-07-20", "end": "2026-07-21"},
+            "editorHidden": False,
+            "expanded": "true",
+            "focusDelta": 0,
+            "routeWrites": [],
+            "routeDrafts": [],
+            "requests": [
+                "/api/markets/summary?start=2026-07-20&end=2026-07-21"
+            ],
+            "catalogLaunches": [],
+        })
+        self.assertEqual(result["customSuccess"], {
+            **new_applied,
+            "focusDelta": 1,
+            "routeDrafts": [
+                {"start": "2026-07-22", "end": "2026-07-29"}
+            ],
+            "requests": [
+                "/api/markets/summary?start=2026-07-22&end=2026-07-29"
+            ],
+        })
+        self.assertEqual(result["presetFailure"], {
+            **old_applied,
+            "draft": {"start": "2026-07-10", "end": "2026-07-11"},
+            "editorHidden": False,
+            "expanded": "true",
+            "focusDelta": 0,
+            "routeWrites": [],
+            "routeDrafts": [],
+            "requests": [
+                "/api/markets/summary?start=2026-07-23&end=2026-07-29"
+            ],
+            "catalogLaunches": [],
+        })
+        self.assertEqual(result["presetSuccess"], {
+            **new_applied,
+            "focusDelta": 0,
+            "routeDrafts": [
+                {"start": "2026-07-10", "end": "2026-07-11"}
+            ],
+            "requests": [
+                "/api/markets/summary?start=2026-07-23&end=2026-07-29"
+            ],
+        })
+        self.assertEqual(result["generationSuccess"], {
+            **new_applied,
+            "focusDelta": 1,
+            "routeDrafts": [
+                {"start": "2026-07-22", "end": "2026-07-29"}
+            ],
+            "requests": [
+                "/api/markets/summary?start=2026-07-22&end=2026-07-29"
+            ],
+        })
+        self.assertEqual(result["overlapping"], {
+            **new_applied,
+            "focusDelta": 1,
+            "routeDrafts": [
+                {"start": "2026-07-23", "end": "2026-07-29"}
+            ],
+            "requests": [
+                "/api/markets/summary?start=2026-07-20&end=2026-07-21",
+                "/api/markets/summary?start=2026-07-23&end=2026-07-29",
+            ],
+        })
+
+    def test_summary_window_commit_route_hydration_preserves_an_open_draft(self):
+        result = run_app_javascript(
+            """
+function control(dataset = {}) {
+  return {
+    value: "",
+    dataset,
+    hidden: false,
+    textContent: "",
+    innerHTML: "",
+    attributes: {},
+    active: false,
+    classList: {
+      owner: null,
+      toggle(name, active) {
+        if (name === "active") this.owner.active = active;
+      },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+
+const controls = new Map();
+const presets = ["7", "30", "90", "all"].map((days) => control({ days }));
+presets.forEach((item) => { item.classList.owner = item; });
+for (const id of [
+  "date-start",
+  "date-end",
+  "custom-window-toggle",
+  "applied-window-summary",
+]) {
+  const item = control();
+  item.classList.owner = item;
+  controls.set(id, item);
+}
+global.document = {
+  getElementById(id) {
+    if (!controls.has(id)) {
+      const item = control();
+      item.classList.owner = item;
+      controls.set(id, item);
+    }
+    return controls.get(id);
+  },
+  querySelectorAll(selector) {
+    return selector === "[data-days]" ? presets : [];
+  },
+};
+
+app.payload = {
+  metadata: {
+    start_date: "2026-06-30",
+    end_date: "2026-07-29",
+    available_start: "2026-05-01",
+    available_end: "2026-07-29",
+  },
+  tokens: [{ token_symbol: "BTC" }],
+};
+app.catalog = { markets: [] };
+app.pairSelections = {};
+app.route = {
+  kind: "workspace",
+  token: "BTC",
+  page: "markets",
+  state: { start: "2026-06-30", end: "2026-07-29" },
+};
+
+syncScreenerSortControls = () => {};
+renderTable = () => {};
+syncMarketPayloadForWindow = () => {};
+populateFactsMarkets = () => {};
+setActiveAppView = () => {};
+setActiveWorkspacePage = () => {};
+renderWorkspaceContext = () => {};
+renderWorkspaceMarkets = () => {};
+renderQualityFromCatalog = () => {};
+updateFactsContract = () => {};
+
+const toggle = controls.get("custom-window-toggle");
+const routeWindow = { start: "2026-07-10", end: "2026-07-11" };
+const customDraft = { start: "2026-07-20", end: "2026-07-21" };
+
+toggle.setAttribute("aria-expanded", "true");
+setDraftTimeWindow(customDraft);
+hydrateScreenerControls({
+  kind: "screener",
+  filters: { ...routeWindow },
+});
+const openScreener = draftTimeWindow();
+
+toggle.setAttribute("aria-expanded", "false");
+hydrateScreenerControls({
+  kind: "screener",
+  filters: { ...routeWindow },
+});
+const closedScreener = draftTimeWindow();
+
+toggle.setAttribute("aria-expanded", "true");
+setDraftTimeWindow(customDraft);
+applyWorkspaceRoute({
   kind: "workspace",
   token: "BTC",
   page: "markets",
   state: { ...routeWindow },
 });
+const openWorkspace = draftTimeWindow();
 
-setActiveAppView = () => {};
-setActiveWorkspacePage = () => {};
-setWorkspaceCatalogLoading = () => {};
-setWorkspaceDataUnavailable = () => {};
-announceRoute = () => {};
-updateRouteLinks = () => {};
-let canonicalizeHook = null;
-canonicalizeCurrentRoute = () => {
-  const hook = canonicalizeHook;
-  canonicalizeHook = null;
-  if (hook) hook();
-};
-replaceCurrentRoute = () => {};
-cachedTokenCatalog = () => null;
-applyWorkspaceRoute = (route) => {
-  app.route = route;
-  start.value = route.state.start;
-  end.value = route.state.end;
-  renderAppliedTimeWindowControls();
-};
+toggle.setAttribute("aria-expanded", "false");
+applyWorkspaceRoute({
+  kind: "workspace",
+  token: "BTC",
+  page: "markets",
+  state: { ...routeWindow },
+});
+const closedWorkspace = draftTimeWindow();
 
-let catalogCall = 0;
-let releaseOlderCatalog = null;
-loadTokenCatalog = async () => {
-  catalogCall += 1;
-  if (catalogCall === 1) {
-    return new Promise((resolve) => {
-      releaseOlderCatalog = () => resolve({ metadata: { window: "older" } });
-    });
-  }
-  return { metadata: { window: "newer" } };
-};
-loadMarket = async (loadedStart, loadedEnd) => {
-  app.payload = payload(loadedStart, loadedEnd);
-  app.visibleTokens = [{ token_symbol: "NEW" }];
-  start.value = loadedStart;
-  end.value = loadedEnd;
-  renderAppliedTimeWindowControls();
-  return true;
-};
-
-const realSync = syncTimeWindowControls;
-let syncCalls = 0;
-syncTimeWindowControls = () => {
-  syncCalls += 1;
-  realSync();
-};
-bindEvents();
-
-async function runInterleaving({ bound }) {
-  routeWindow = { start: "2026-06-30", end: "2026-07-29" };
-  app.payload = payload(routeWindow.start, routeWindow.end);
-  app.visibleTokens = [{ token_symbol: "OLD" }];
-  app.route = globalThis.__workspaceRoute();
-  app.routeReady = true;
-  app.routeRequestId = 0;
-  app.marketRequestId = 0;
-  app.marketController = null;
-  app.catalogController = null;
-  app.catalogsByToken.clear();
-  catalogCall = 0;
-  releaseOlderCatalog = null;
-  syncCalls = 0;
-  start.value = routeWindow.start;
-  end.value = routeWindow.end;
-  realSync();
-  setCustomWindowOpen(true);
-  toggle.focusCalls = 0;
-
-  const olderCompletion = bound
-    ? trigger(form, "submit")
-    : applyWindow();
-  if (!releaseOlderCatalog) throw new Error("The older catalog request did not start.");
-
-  routeWindow = { start: "2026-07-23", end: "2026-07-29" };
-  const newerApplied = await applyRouteFromLocation();
-  const syncCallsBeforeOlderCompletion = syncCalls;
-  const focusCallsBeforeOlderCompletion = toggle.focusCalls;
-  releaseOlderCatalog();
-  const olderApplied = await olderCompletion;
-
-  return {
-    newerApplied,
-    olderApplied: bound ? null : olderApplied,
-    payloadStart: app.payload.metadata.start_date,
-    visibleTokens: app.visibleTokens.map((token) => token.token_symbol),
-    draft: { start: start.value, end: end.value },
-    summary: summary.textContent,
-    active: presets.filter((button) => button.active).map((button) => button.dataset.days),
-    successOnlySyncCalls: syncCalls - syncCallsBeforeOlderCompletion,
-    editorHidden: editor.hidden,
-    expanded: toggle.getAttribute("aria-expanded"),
-    focusCalls: toggle.focusCalls - focusCallsBeforeOlderCompletion,
-  };
-}
-
-const direct = await runInterleaving({ bound: false });
-const bound = await runInterleaving({ bound: true });
-
-async function runResolvedSuccessGap({ bound }) {
-  routeWindow = { start: "2026-06-30", end: "2026-07-29" };
-  app.payload = payload(routeWindow.start, routeWindow.end);
-  app.visibleTokens = [{ token_symbol: "OLD" }];
-  app.route = globalThis.__workspaceRoute();
-  app.routeReady = true;
-  app.routeRequestId = 0;
-  app.marketRequestId = 0;
-  app.marketController = null;
-  app.catalogController = null;
-  app.catalogsByToken.clear();
-  syncCalls = 0;
-  start.value = routeWindow.start;
-  end.value = routeWindow.end;
-  realSync();
-  setCustomWindowOpen(true);
-  toggle.focusCalls = 0;
-  loadTokenCatalog = async () => ({ metadata: { window: "current" } });
-
-  let newerRoutePromise = null;
-  canonicalizeHook = () => {
-    queueMicrotask(() => {
-      routeWindow = { start: "2026-07-23", end: "2026-07-29" };
-      newerRoutePromise = applyRouteFromLocation();
-    });
-  };
-  const olderCompletion = bound
-    ? trigger(form, "submit")
-    : applyWindow();
-  const olderRouteRequestId = app.routeRequestId;
-  const olderApplied = await olderCompletion;
-  if (!newerRoutePromise) throw new Error("The newer route microtask did not start.");
-  const newerApplied = await newerRoutePromise;
-
-  return {
-    newerApplied,
-    olderApplied: bound ? null : olderApplied,
-    ownershipChanged: olderRouteRequestId !== app.routeRequestId,
-    payloadStart: app.payload.metadata.start_date,
-    visibleTokens: app.visibleTokens.map((token) => token.token_symbol),
-    draft: { start: start.value, end: end.value },
-    summary: summary.textContent,
-    active: presets.filter((button) => button.active).map((button) => button.dataset.days),
-    successOnlySyncCalls: syncCalls,
-    editorHidden: editor.hidden,
-    expanded: toggle.getAttribute("aria-expanded"),
-    focusCalls: toggle.focusCalls,
-  };
-}
-
-const resolvedDirect = await runResolvedSuccessGap({ bound: false });
-const resolvedBound = await runResolvedSuccessGap({ bound: true });
-console.log(JSON.stringify({ direct, bound, resolvedDirect, resolvedBound }));
+console.log(JSON.stringify({
+  openScreener,
+  closedScreener,
+  openWorkspace,
+  closedWorkspace,
+}));
 """,
             prelude="""
 globalThis.MarketMonitorNavigation = {
-  parseRoute() { return globalThis.__workspaceRoute(); },
+  validatePair() {
+    return { valid: false, errors: [], marketA: null, marketB: null };
+  },
 };
 """,
         )
-        newer_state = {
-            "newerApplied": True,
-            "payloadStart": "2026-07-23",
-            "visibleTokens": ["NEW"],
-            "draft": {"start": "2026-07-23", "end": "2026-07-29"},
-            "summary": "23–29 Jul 2026 · 7 days",
-            "active": ["7"],
-            "successOnlySyncCalls": 0,
-            "editorHidden": False,
-            "expanded": "true",
-            "focusCalls": 0,
-        }
         self.assertEqual(result, {
-            "direct": {
-                "olderApplied": False,
-                **newer_state,
-            },
-            "bound": {
-                "olderApplied": None,
-                **newer_state,
-            },
-            "resolvedDirect": {
-                "olderApplied": False,
-                "ownershipChanged": True,
-                **newer_state,
-            },
-            "resolvedBound": {
-                "olderApplied": None,
-                "ownershipChanged": True,
-                **newer_state,
-            },
+            "openScreener": {"start": "2026-07-20", "end": "2026-07-21"},
+            "closedScreener": {"start": "2026-07-10", "end": "2026-07-11"},
+            "openWorkspace": {"start": "2026-07-20", "end": "2026-07-21"},
+            "closedWorkspace": {"start": "2026-07-10", "end": "2026-07-11"},
         })
 
     def test_time_window_summary_and_active_state_use_applied_payload(self):
@@ -1235,261 +1282,6 @@ if (typeof openCustomWindowEditor !== "function") {
         })
         self.assertTrue(result["disabled"])
         self.assertTrue(result["enabled"])
-
-    def test_bound_time_window_commands_apply_only_after_success(self):
-        result = run_app_javascript(
-            """
-function control({ value = "", hidden = false, dataset = {} } = {}) {
-  return {
-    value,
-    hidden,
-    dataset,
-    disabled: false,
-    textContent: "",
-    attributes: {},
-    listeners: {},
-    active: false,
-    focused: false,
-    focusCalls: 0,
-    classList: {
-      owner: null,
-      toggle(name, active) {
-        if (name === "active") this.owner.active = active;
-      },
-    },
-    addEventListener(type, listener) {
-      this.listeners[type] = this.listeners[type] || [];
-      this.listeners[type].push(listener);
-    },
-    setAttribute(name, value) { this.attributes[name] = value; },
-    getAttribute(name) { return this.attributes[name] || null; },
-    focus() {
-      this.focused = true;
-      this.focusCalls += 1;
-    },
-  };
-}
-async function trigger(control, type, event = {}) {
-  for (const listener of control.listeners[type] || []) {
-    await listener({ preventDefault() {}, ...event });
-  }
-}
-const start = control();
-const end = control();
-const error = control({ hidden: true });
-const editor = control({ hidden: true });
-const toggle = control();
-const cancel = control();
-const form = control();
-const summary = control();
-const presets = ["7", "30", "90", "all"].map((days) => control({ dataset: { days } }));
-const genericControls = new Map();
-for (const item of [start, end, error, editor, toggle, cancel, form, summary, ...presets]) {
-  item.classList.owner = item;
-}
-toggle.setAttribute("aria-expanded", "false");
-const elements = {
-  "date-start": start,
-  "date-end": end,
-  "date-window-error": error,
-  "custom-window-editor": editor,
-  "custom-window-toggle": toggle,
-  "cancel-window": cancel,
-  "date-window-form": form,
-  "applied-window-summary": summary,
-};
-global.document = {
-  getElementById(id) {
-    if (elements[id]) return elements[id];
-    if (!genericControls.has(id)) genericControls.set(id, control());
-    return genericControls.get(id);
-  },
-  querySelectorAll(selector) {
-    if (selector === "[data-days]") return presets;
-    return [];
-  },
-  addEventListener() {},
-};
-global.window = {
-  addEventListener() {},
-  visualViewport: null,
-  matchMedia() { return { addEventListener() {} }; },
-};
-app.payload = {
-  metadata: {
-    start_date: "2026-06-30",
-    end_date: "2026-07-29",
-    available_start: "2026-05-01",
-    available_end: "2026-07-29",
-  },
-};
-app.route = { kind: "screener" };
-syncTimeWindowControls();
-let syncCalls = 0;
-const syncOriginal = syncTimeWindowControls;
-syncTimeWindowControls = () => {
-  syncCalls += 1;
-  syncOriginal();
-};
-bindEvents();
-
-await trigger(toggle, "click");
-start.value = "2026-07-20";
-end.value = "2026-07-21";
-showDateWindowError("Choose both dates.");
-await trigger(cancel, "click");
-const cancelled = {
-  start: start.value,
-  end: end.value,
-  errorHidden: error.hidden,
-  error: error.textContent,
-  startInvalid: start.getAttribute("aria-invalid"),
-  endInvalid: end.getAttribute("aria-invalid"),
-  editorHidden: editor.hidden,
-  expanded: toggle.getAttribute("aria-expanded"),
-  focus: toggle.focused,
-  focusCalls: toggle.focusCalls,
-};
-
-let applyCalls = 0;
-applyWindow = async () => {
-  applyCalls += 1;
-  app.payload.metadata.start_date = start.value;
-  app.payload.metadata.end_date = end.value;
-  return true;
-};
-await trigger(toggle, "click");
-const focusBeforeSuccessfulCustom = toggle.focusCalls;
-await trigger(form, "submit");
-const customSuccess = {
-  applyCalls,
-  syncCalls,
-  editorHidden: editor.hidden,
-  expanded: toggle.getAttribute("aria-expanded"),
-  focus: toggle.focused,
-  focusCalls: toggle.focusCalls - focusBeforeSuccessfulCustom,
-};
-
-applyWindow = async () => {
-  applyCalls += 1;
-  return false;
-};
-await trigger(toggle, "click");
-const syncBeforeFailedCustom = syncCalls;
-await trigger(form, "submit");
-const customFailure = {
-  applyCalls,
-  syncCalls: syncCalls - syncBeforeFailedCustom,
-  editorHidden: editor.hidden,
-  expanded: toggle.getAttribute("aria-expanded"),
-};
-
-app.payload.metadata.start_date = "2026-06-30";
-app.payload.metadata.end_date = "2026-07-29";
-syncOriginal();
-applyCalls = 0;
-const presetResults = [];
-for (const button of presets) {
-  const shouldSucceed = button.dataset.days !== "7";
-  applyWindow = async () => {
-    applyCalls += 1;
-    if (!shouldSucceed) return false;
-    app.payload.metadata.start_date = start.value;
-    app.payload.metadata.end_date = end.value;
-    return true;
-  };
-  setCustomWindowOpen(true);
-  const syncBefore = syncCalls;
-  await trigger(button, "click");
-  presetResults.push({
-    days: button.dataset.days,
-    applyCalls,
-    syncCalls: syncCalls - syncBefore,
-    editorHidden: editor.hidden,
-    expanded: toggle.getAttribute("aria-expanded"),
-    active: presets.filter((item) => item.active).map((item) => item.dataset.days),
-  });
-}
-console.log(JSON.stringify({
-  listenerCounts: {
-    submit: form.listeners.submit?.length || 0,
-    cancel: cancel.listeners.click?.length || 0,
-    custom: toggle.listeners.click?.length || 0,
-    presets: presets.map((button) => button.listeners.click?.length || 0),
-  },
-  cancelled,
-  customSuccess,
-  customFailure,
-  presetResults,
-}));
-"""
-        )
-        self.assertEqual(result["listenerCounts"], {
-            "submit": 1,
-            "cancel": 1,
-            "custom": 1,
-            "presets": [1, 1, 1, 1],
-        })
-        self.assertEqual(result["cancelled"], {
-            "start": "2026-06-30",
-            "end": "2026-07-29",
-            "errorHidden": True,
-            "error": "",
-            "startInvalid": "false",
-            "endInvalid": "false",
-            "editorHidden": True,
-            "expanded": "false",
-            "focus": True,
-            "focusCalls": 1,
-        })
-        self.assertEqual(result["customSuccess"], {
-            "applyCalls": 1,
-            "syncCalls": 1,
-            "editorHidden": True,
-            "expanded": "false",
-            "focus": True,
-            "focusCalls": 1,
-        })
-        self.assertEqual(result["customFailure"], {
-            "applyCalls": 2,
-            "syncCalls": 0,
-            "editorHidden": False,
-            "expanded": "true",
-        })
-        self.assertEqual(result["presetResults"], [
-            {
-                "days": "7",
-                "applyCalls": 1,
-                "syncCalls": 0,
-                "editorHidden": False,
-                "expanded": "true",
-                "active": ["30"],
-            },
-            {
-                "days": "30",
-                "applyCalls": 2,
-                "syncCalls": 1,
-                "editorHidden": True,
-                "expanded": "false",
-                "active": ["30"],
-            },
-            {
-                "days": "90",
-                "applyCalls": 3,
-                "syncCalls": 1,
-                "editorHidden": True,
-                "expanded": "false",
-                "active": ["all"],
-            },
-            {
-                "days": "all",
-                "applyCalls": 4,
-                "syncCalls": 1,
-                "editorHidden": True,
-                "expanded": "false",
-                "active": ["all"],
-            },
-        ])
 
     def test_expert_context_is_compact_but_remains_accessible(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
@@ -2124,11 +1916,14 @@ console.log(JSON.stringify(qualityFlagObjects({
             app_js.index("async function initialize()"):
             app_js.index('if (typeof document !== "undefined") initialize();')
         ]
+        primer = app_js[
+            app_js.index("function primeInitialRouteView(route)"):
+            app_js.index("async function initialize()")
+        ]
         self.assertIn("function primeInitialRouteView(route)", app_js)
         self.assertIn('setActiveAppView("workspace")', app_js)
         self.assertIn("setActiveWorkspacePage(route.page)", app_js)
-        self.assertIn('byId("date-start").value = window.start;', app_js)
-        self.assertIn('byId("date-end").value = window.end;', app_js)
+        self.assertIn("setDraftTimeWindow(window);", primer)
         self.assertLess(
             initializer.index("primeInitialRouteView(initialRoute)"),
             initializer.index("readDefaultMarketCache()"),
@@ -2316,7 +2111,7 @@ console.log(JSON.stringify({
 
         app_js = APP_PATH.read_text(encoding="utf-8")
         apply_window = app_js[
-            app_js.index("async function applyWindow()"):
+            app_js.index("async function applyWindow("):
             app_js.index("function persistSelectedPair()")
         ]
         invalid_branch = apply_window[
@@ -2415,43 +2210,6 @@ console.log(JSON.stringify({
         )
         self.assertEqual(result["fallback"], "Market data is unavailable.")
 
-    def test_workspace_window_change_reloads_matching_summary_and_catalog_in_order(self):
-        result = run_app_javascript(
-            """
-const start = { value: "2026-07-01", setAttribute() {} };
-const end = { value: "2026-07-29", setAttribute() {} };
-const error = { hidden: true, textContent: "" };
-global.document = {
-  getElementById(id) {
-    return {
-      "date-start": start,
-      "date-end": end,
-      "date-window-error": error,
-    }[id] || null;
-  },
-};
-app.payload = {
-  metadata: {
-    available_start: "2026-05-01",
-    available_end: "2026-07-29",
-  },
-};
-app.route = { kind: "workspace", page: "compare" };
-const steps = [];
-replaceCurrentRoute = () => { steps.push("route"); };
-applyRouteFromLocation = async () => {
-  steps.push("reload");
-  return true;
-};
-(async () => {
-  const applied = await applyWindow();
-  console.log(JSON.stringify({ applied, steps }));
-})();
-"""
-        )
-        self.assertTrue(result["applied"])
-        self.assertEqual(result["steps"], ["route", "reload"])
-
     def test_route_and_loading_contract_prevents_stale_window_or_permanent_loading(self):
         app_js = APP_PATH.read_text(encoding="utf-8")
         router = app_js[
@@ -2484,10 +2242,8 @@ applyRouteFromLocation = async () => {
         self.assertIn("formatRatio(row?.coverage_ratio)", workspace_markets)
         self.assertNotIn("formatRatio(market.coverage_ratio)", workspace_markets)
         self.assertIn('byId("export-csv").disabled = true;', loader)
-        self.assertIn(
-            'byId("date-start").value = app.payload.metadata.start_date;',
-            loader,
-        )
+        self.assertNotIn('byId("date-start").value =', loader)
+        self.assertIn("syncClosedDraftToApplied();", app_js)
 
     def test_screener_drill_down_preserves_the_rendered_summary_window(self):
         app_js = APP_PATH.read_text(encoding="utf-8")

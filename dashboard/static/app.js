@@ -562,6 +562,14 @@ function appliedTimeWindow() {
   };
 }
 
+function customWindowIsOpen() {
+  return byId("custom-window-toggle")?.getAttribute("aria-expanded") === "true";
+}
+
+function syncClosedDraftToApplied() {
+  if (!customWindowIsOpen()) setDraftTimeWindow(appliedTimeWindow());
+}
+
 function presetWindow(days) {
   const availableStart = app.payload?.metadata?.available_start || "";
   const availableEnd = app.payload?.metadata?.available_end || "";
@@ -800,8 +808,7 @@ function hydrateScreenerControls(route, { normalizeWindow = true } = {}) {
         start: route.filters?.start || "",
         end: route.filters?.end || "",
       };
-  byId("date-start").value = window.start;
-  byId("date-end").value = window.end;
+  if (!customWindowIsOpen()) setDraftTimeWindow(window);
   return window;
 }
 
@@ -878,8 +885,7 @@ function applyWorkspaceRoute(route) {
   }
 
   const window = compareRouteWindow(route);
-  byId("date-start").value = window.start;
-  byId("date-end").value = window.end;
+  if (!customWindowIsOpen()) setDraftTimeWindow(window);
   syncTimeWindowControls();
   syncMarketPayloadForWindow(window.start, window.end);
 
@@ -2925,9 +2931,8 @@ function updateMetadata() {
   start.max = metadata.available_end;
   end.min = metadata.available_start;
   end.max = metadata.available_end;
-  start.value = metadata.start_date;
-  end.value = metadata.end_date;
   syncTimeWindowControls();
+  syncClosedDraftToApplied();
   byId("available-range").textContent = `Available ${metadata.available_start} to ${metadata.available_end}`;
   const freshness = metadata.freshness;
   if (freshness) {
@@ -4886,7 +4891,10 @@ function clearDefaultMarketCache() {
   }
 }
 
-function displayMarket(payload, { cached = false } = {}) {
+function displayMarket(
+  payload,
+  { cached = false, refreshWorkspaceOnGenerationChange = true } = {},
+) {
   const previousGeneration = app.payload?.metadata?.data_generation;
   const nextGeneration = payload.metadata?.data_generation;
   const generationChanged = Boolean(
@@ -4947,7 +4955,12 @@ function displayMarket(payload, { cached = false } = {}) {
   ) {
     populateFactsMarkets({ preserve: true });
   }
-  if (generationChanged && app.routeReady && app.route?.kind === "workspace") {
+  if (
+    refreshWorkspaceOnGenerationChange
+    && generationChanged
+    && app.routeReady
+    && app.route?.kind === "workspace"
+  ) {
     void applyRouteFromLocation();
   }
 }
@@ -4991,7 +5004,11 @@ function clearMarketResult(message = "") {
   byId("export-csv").disabled = true;
 }
 
-async function loadMarket(start = "", end = "", { preserve = false } = {}) {
+async function loadMarket(
+  start = "",
+  end = "",
+  { preserve = false, refreshWorkspaceOnGenerationChange = true } = {},
+) {
   const requestId = invalidateMarketRequest();
   const dateError = validateDateRange(start, end);
   if (dateError) {
@@ -5021,7 +5038,7 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
       throw new Error("Screener summary failed its compact response contract.");
     }
     if (requestId !== app.marketRequestId) return false;
-    displayMarket(payload);
+    displayMarket(payload, { refreshWorkspaceOnGenerationChange });
     if (!start && !end) writeDefaultMarketCache(payload);
     hideStatus(byId("market-loading"));
     return true;
@@ -5034,9 +5051,6 @@ async function loadMarket(start = "", end = "", { preserve = false } = {}) {
       ? " The explicitly marked cached snapshot remains visible."
       : " No result is shown for the failed request.";
     if (preserve && app.payload) {
-      byId("date-start").value = app.payload.metadata.start_date;
-      byId("date-end").value = app.payload.metadata.end_date;
-      syncTimeWindowControls();
       byId("export-csv").disabled = false;
       showStatus(
         byId("market-status"),
@@ -5086,35 +5100,23 @@ function setPreset(days) {
   setDraftTimeWindow(presetWindow(days));
 }
 
-async function applyWindow() {
-  const { start, end } = draftTimeWindow();
+async function applyWindow(candidate = draftTimeWindow()) {
+  const { start, end } = candidate;
   const dateError = validateDateRange(start, end, { required: true });
   if (dateError) {
     showDateWindowError(dateError);
     return false;
   }
   showDateWindowError("");
-  if (app.route.kind === "workspace") {
-    const previousPayload = app.payload;
-    const previousVisibleTokens = app.visibleTokens;
-    replaceCurrentRoute();
-    const routeApplication = applyRouteFromLocation();
-    const routeRequestId = app.routeRequestId;
-    const applied = await routeApplication;
-    if (routeRequestId !== app.routeRequestId) return false;
-    if (!applied) {
-      app.payload = previousPayload;
-      app.visibleTokens = previousVisibleTokens;
-      byId("date-start").value = start;
-      byId("date-end").value = end;
-      renderAppliedTimeWindowControls();
-      return false;
-    }
-    return true;
-  }
-  const loaded = await loadMarket(start, end, { preserve: Boolean(app.payload) });
+  const routeKind = app.route.kind;
+  const loaded = await loadMarket(start, end, {
+    preserve: Boolean(app.payload),
+    refreshWorkspaceOnGenerationChange: false,
+  });
   if (!loaded) return false;
-  replaceCurrentRoute();
+  const applied = appliedTimeWindow();
+  replaceCurrentRoute({ window: applied });
+  if (routeKind === "workspace") void applyRouteFromLocation();
   return true;
 }
 
@@ -5303,8 +5305,9 @@ function bindEvents() {
   };
   byId("date-window-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const applied = await applyWindow();
+    const applied = await applyWindow(draftTimeWindow());
     if (applied) {
+      setDraftTimeWindow(appliedTimeWindow());
       syncTimeWindowControls();
       setCustomWindowOpen(false, { restoreFocus: true });
     }
@@ -5322,9 +5325,9 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-days]").forEach((button) => {
     button.addEventListener("click", async () => {
-      setPreset(button.dataset.days);
-      const applied = await applyWindow();
+      const applied = await applyWindow(presetWindow(button.dataset.days));
       if (applied) {
+        setDraftTimeWindow(appliedTimeWindow());
         syncTimeWindowControls();
         setCustomWindowOpen(false);
       }
@@ -5529,8 +5532,7 @@ function bindEvents() {
 function primeInitialRouteView(route) {
   if (route.kind === "workspace") {
     const window = compareRouteWindow(route);
-    byId("date-start").value = window.start;
-    byId("date-end").value = window.end;
+    setDraftTimeWindow(window);
     setActiveAppView("workspace");
     setActiveWorkspacePage(route.page);
     updateRouteLinks();
