@@ -778,6 +778,71 @@ class DexDepthCollectionTest(unittest.TestCase):
                 originals,
             )
 
+    def test_full_publication_bundle_rejects_resolved_private_public_path_overlap_before_write(self):
+        _baseline_id, baseline_depth, baseline_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-overlap-baseline",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        _candidate_id, candidate_depth, candidate_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-overlap-candidate",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+
+        for alias in ("same-directory", "dotdot-alias"):
+            with self.subTest(alias=alias):
+                published = self.root / f"overlap-{alias}-local"
+                publish_snapshot(
+                    baseline_depth,
+                    output_dir=self.root / f"overlap-{alias}-processed",
+                    publish_dir=published,
+                )
+                publish_execution_snapshot(
+                    baseline_execution,
+                    expected_market_ids={
+                        row["market_id"] for row in baseline_execution
+                    },
+                    output_dir=self.root / f"overlap-{alias}-processed",
+                    publish_dir=published,
+                )
+                reports = preflight_publication_bundle(
+                    candidate_depth,
+                    candidate_execution,
+                    published,
+                )
+                protected = [
+                    published / HISTORY_FILENAME,
+                    published / LATEST_FILENAME,
+                    published / CURRENT_FILENAME,
+                    published / EXECUTION_LATEST_FILENAME,
+                ]
+                originals = {path: path.read_bytes() for path in protected}
+                output_dir = (
+                    published
+                    if alias == "same-directory"
+                    else published / ".." / published.name
+                )
+
+                with self.assertRaisesRegex(ValueError, "overlap"):
+                    publish_full_publication_bundle(
+                        candidate_depth,
+                        candidate_execution,
+                        output_dir=output_dir,
+                        publish_dir=published,
+                        preflight_reports=reports,
+                    )
+                self.assertEqual(
+                    {path: path.read_bytes() for path in protected},
+                    originals,
+                )
+
     def test_exact_preflight_accepts_one_observed_repair_below_full_coverage_floor(self):
         other_pool = {
             **self.pool,

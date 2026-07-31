@@ -1917,6 +1917,20 @@ def publish_full_publication_bundle(
     preflight_reports: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Failure-atomically publish one full CEX depth/execution cohort."""
+    private_destinations = {
+        (output_dir / CURRENT_FILENAME).resolve(strict=False),
+        (output_dir / EXECUTION_CURRENT_FILENAME).resolve(strict=False),
+    }
+    public_destinations = {
+        (publish_dir / HISTORY_FILENAME).resolve(strict=False),
+        (publish_dir / LATEST_FILENAME).resolve(strict=False),
+        (publish_dir / CURRENT_FILENAME).resolve(strict=False),
+        (publish_dir / EXECUTION_LATEST_FILENAME).resolve(strict=False),
+    }
+    if private_destinations & public_destinations:
+        raise ValueError(
+            "private and public publication destinations overlap"
+        )
     require_aligned_depth_execution_lineage(depth_rows, execution_rows)
     expected_market_ids = {cex_market_id(row) for row in depth_rows}
     validate_execution_snapshot(expected_market_ids, execution_rows)
