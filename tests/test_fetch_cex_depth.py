@@ -272,6 +272,109 @@ class FetchCexDepthTest(unittest.TestCase):
         )
         self.assertEqual(len(history), 3)
 
+    def test_exact_publication_bundle_rejects_resolved_private_public_path_overlap_before_write(self):
+        markets = [
+            market(exchange="binance"),
+            market(exchange="okx"),
+        ]
+        baseline_depth = [
+            observed_row(
+                item,
+                complete_book(),
+                snapshot_id="baseline-1",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+            for item in markets
+        ]
+        baseline_execution = [
+            scenario
+            for item in markets
+            for scenario in execution_rows_for_book(
+                item,
+                complete_book(),
+                snapshot_id="baseline-1",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+        ]
+        candidate_depth = [
+            observed_row(
+                markets[0],
+                complete_book(),
+                snapshot_id="candidate-2",
+                request_started_at="2026-07-27T01:00:00+00:00",
+                response_received_at="2026-07-27T01:00:01+00:00",
+            )
+        ]
+        candidate_execution = execution_rows_for_book(
+            markets[0],
+            complete_book(),
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+        )
+
+        for alias in ("same-directory", "dotdot-alias"):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as directory_name:
+                root = Path(directory_name)
+                published = root / "local"
+                publish_snapshot(
+                    baseline_depth,
+                    output_dir=root / "processed",
+                    publish_dir=published,
+                )
+                publish_execution_snapshot(
+                    baseline_execution,
+                    expected_market_ids={
+                        "cex:binance:UNI/USDT",
+                        "cex:okx:UNI/USDT",
+                    },
+                    output_dir=root / "processed",
+                    publish_dir=published,
+                )
+                merged_depth, merged_execution = (
+                    merge_exact_publication_bundle(
+                        candidate_depth,
+                        candidate_execution,
+                        target_market_id="cex:binance:UNI/USDT",
+                        publish_dir=published,
+                    )
+                )
+                reports = preflight_publication_bundle(
+                    merged_depth,
+                    merged_execution,
+                    published,
+                    target_market_id="cex:binance:UNI/USDT",
+                )
+                protected = [
+                    published / HISTORY_FILENAME,
+                    published / LATEST_FILENAME,
+                    published / CURRENT_FILENAME,
+                    published / EXECUTION_LATEST_FILENAME,
+                ]
+                originals = {path: path.read_bytes() for path in protected}
+                output_dir = (
+                    published
+                    if alias == "same-directory"
+                    else published / ".." / published.name
+                )
+
+                with self.assertRaisesRegex(ValueError, "overlap"):
+                    publish_exact_publication_bundle(
+                        merged_depth,
+                        merged_execution,
+                        target_market_id="cex:binance:UNI/USDT",
+                        history_rows_to_append=candidate_depth,
+                        output_dir=output_dir,
+                        publish_dir=published,
+                        preflight_reports=reports,
+                    )
+                self.assertEqual(
+                    {path: path.read_bytes() for path in protected},
+                    originals,
+                )
+
     def test_full_publication_bundle_restores_every_public_destination_on_each_replace_failure(self):
         baseline_depth = [
             observed_row(
