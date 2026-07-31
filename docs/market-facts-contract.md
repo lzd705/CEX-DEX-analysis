@@ -19,11 +19,16 @@
   facts for the same exact market identities.
 - `GET /api/markets/quality?token=...&scope=...&start=...&end=...` returns
   selected-window daily quality plus independently timestamped TVL, depth, and
-  execution status for each exact market. Quality contract v3 overlays only a
-  bounded `fact_quality_report/v1` whose `publication.import_run_id` matches
-  the catalog's current SQLite import identity. The public projection exposes
-  allowlisted reason/status counts and affected UTC dates, never raw collector
-  errors, source paths, or protected review details.
+  execution status for each exact market. Quality contract v4 carries two
+  projections on every Market: selected-window `quality_status` /
+  `quality_flags`, and immutable Screener `screening_quality_status` /
+  `screening_quality_flags`. The latter reproduces the Summary row from the
+  same `data_generation`; it is not recomputed from the selected window.
+  Contract v4 also overlays only a bounded `fact_quality_report/v1` whose
+  `publication.import_run_id` matches the catalog's current SQLite import
+  identity. The public projection exposes allowlisted reason/status counts and
+  affected UTC dates, never raw collector errors, source paths, or protected
+  review details.
 
 `market_a` and `market_b` are exact `market_id` values returned by the catalog.
 They must be different and both must belong to the requested Token.
@@ -59,6 +64,16 @@ serialized-response generation as the full audit catalog. Token query values
 are stripped and uppercased before entering the cache key. A public,
 path-free `data_generation` hash lets the browser clear its bounded Token
 catalog cache whenever the published source generation changes.
+
+The release gate requires Quality contract v4 for every Summary Token. Each
+all-scope Quality response must have the exact Summary generation, Token, and
+market count, with unique nonempty market IDs. Status counts are recomputed
+from every `screening_quality_status`; alert counts include every structured
+flag severity, including informational, capability, measurement-limit, and
+market-condition flags. Counts are compared exactly after zero-valued entries
+are removed. A non-OK status with no structured flag is a contract failure;
+the release checker does not invent a fallback reason. Any generation drift
+aborts the release instead of being retried as a count mismatch.
 
 The optional `quality/daily-latest.json` also participates in that source
 signature. A missing, malformed, oversized, path-unsafe, wrong-schema, or
@@ -106,6 +121,12 @@ When `dex_depth_latest.csv` exists, DEX catalog entries expose fixed-block
 10/25/50/100 bps sell, buy, and total pool-state depth, protocol model, fee,
 block number, completeness, and source lineage. Unsupported protocols remain
 `null`. The exact contract is `docs/dex-depth-data-contract.md`.
+
+DEX USD price-time alignment flags are measured-only. They are evaluated only
+for an observed, complete, or partial DEX depth snapshot that contains at least
+one finite USD depth band and declares a conversion requiring temporal
+alignment. Unsupported, unavailable, failed, or not-cataloged depth cannot
+receive a price-time mismatch merely because its numeric depth is `null`.
 
 The independent execution-cost endpoint is backed by
 `cex_execution_cost_latest.csv` and `dex_execution_cost_latest.csv`. It never
@@ -156,6 +177,33 @@ the active-market retry rule. Capability limits (`unsupported`), partial
 measurements, observed market conditions, and data-health failures are not
 collapsed into one warning state.
 
+Daily attempt evidence is exact-market evidence. CEX matching requires
+`token_symbol × exchange × canonical instrument`; a validated source alias is
+additional lineage and never replaces the canonical instrument. DEX matching
+requires Token, chain, DEX adapter, and pool. Attempt IDs and UTC-aware
+completion times must be valid and unique, request windows bounded and exact,
+observed dates inside the window, and status/reason/outcome/count invariants
+consistent. The entire malformed ledger is ignored fail-closed, leaving the
+gap `missing_unexplained`; no partial identity match may assign a cause.
+
+A successful CEX source response with no usable two-sided book is normalized
+to non-retryable `source_no_observation/source_no_two_sided_book`. It remains
+`N/A`, retains bounded lineage, and is not turned into measured zero or a
+transport failure. Network, timeout, rate-limit, source-unavailable, parse,
+and validation outcomes remain retryable technical failures.
+
+Daily refresh and latest-snapshot refresh have separate postconditions. An
+ordinary daily refresh must publish one new matching SQLite/report identity,
+contain a successful row in the requested Token/window, and leave no retryable
+or hard-invalid issue there; an exact daily retry additionally resolves every
+requested market-date as observed or an allowlisted terminal outcome. A
+TVL/depth snapshot refresh instead compares the exact canonical Market and Fact
+before and after, and succeeds only when both the publication bytes and
+snapshot identity change and the new exact Fact resolves to measured evidence
+or a valid terminal non-retryable source outcome. Exit code zero, an unrelated
+Market update, unchanged publication identity, retryable failure, or
+`needs_review` is not success.
+
 ## Explicit non-claims
 
 The comparison input is daily aggregate OHLCV. It is not order-book depth,
@@ -165,6 +213,10 @@ collected CEX order-book fields retain their own point-in-time timestamps and
 must not be presented as daily history or guaranteed execution. Separately
 collected DEX pool-state fields are also point-in-time measurements and exclude
 gas, MEV, and post-block state changes.
+
+Funding Rate is fully outside this contract and release: there is no
+derivatives Market catalog, funding collector, funding Fact, placeholder
+field, quality projection, or dashboard control in this round.
 
 ## Known-answer fixtures
 

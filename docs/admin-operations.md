@@ -90,6 +90,17 @@ These endpoint bounds are not a parallel-request budget. Retry publications
 remain sequential under the collection lock and must reload the current
 quality-report lineage after every committed window.
 
+Collection-attempt ledgers are accepted only as whole, exact evidence. A CEX
+record binds Token, exchange, and canonical instrument; an Upbit or other
+source instrument is a separately validated alias, never an inferred
+replacement. A DEX record binds Token, chain, DEX adapter, and pool. IDs are
+nonempty and unique, completion times are UTC-aware, windows are canonical and
+bounded, observed dates stay inside the request, and status/reason/outcome
+counts must agree. Writers validate the same contract before atomic
+publication. If any record violates it, the consumer ignores the complete
+ledger and leaves affected gaps `missing_unexplained`; it does not salvage a
+broader Token/venue match or fabricate a source cause.
+
 Job state and server-only logs live under the selected runtime data directory
 at `admin/jobs/`.
 The public server opens `market_facts.sqlite3` read-only. Existing requests
@@ -108,6 +119,14 @@ dataset snapshot and import run, then published by a single-file atomic rename.
 `market_facts.sqlite3` remains the runtime data commit point; the CSV files,
 database, and quality report are prepared in the same private staging directory
 before any published file is replaced.
+
+The public Data Quality API is contract v4. It preserves selected-window
+`quality_*` and same-generation Screener `screening_quality_*` projections.
+Release preflight requests all-scope Quality exactly once for every Summary
+Token and recomputes every market status and every flag severity. Token,
+generation, market count, unique market IDs, flag fields, and exact nonzero
+count dictionaries must agree; a non-OK market with no structured fallback
+flag or any mid-run generation drift fails the release.
 
 The report keeps data-quality states separate:
 
@@ -157,6 +176,13 @@ Missing-row causes are evidence-based, not inferred from absence alone:
   `status=unsupported`, `reason_code=source_range_unavailable`, with no
   automatic retry or manual-review queue item. The missing value stays `N/A`
   and the coverage limitation remains visible as information.
+
+For point-in-time CEX depth/execution, a successful response without a usable
+two-sided book is likewise a terminal source outcome:
+`source_no_observation/source_no_two_sided_book`. It is non-retryable, remains
+`N/A`, and never becomes zero depth. Transport, rate-limit, source-unavailable,
+parse, and validation failures remain retryable and retain a bounded public
+reason rather than a raw exception.
 
 Only a ledger whose recorded CSV SHA-256 matches the staged candidate can
 change a missing issue from `missing_unexplained`. Accepted attempts and their
@@ -276,6 +302,39 @@ Explicit structural outcomes such as unsupported markets, `not_listed`, or
 `no_candles` are shown in the result's reason counts and are not relabelled as
 successful rows.
 
+### Latest TVL/depth snapshot completion
+
+Snapshot refresh is a separate Fact contract, not a shortcut through the daily
+SQLite postcheck. Before collection, the service reads and validates the exact
+canonical Market/Fact row and records its snapshot ID, complete publication
+SHA-256, observation time, status/reason, retryability, and publication
+generation. After collection it rereads the uncached publication and requires:
+
+1. the same requested Market and Fact identity;
+2. a valid new snapshot ID and different publication bytes;
+3. a producer-valid row and exact allowlisted status/reason pair;
+4. `observed`, valid measured `partial`, or a terminal non-retryable
+   `source_no_observation` / `unsupported` resolution.
+
+An unchanged snapshot, an unrelated Market update, a retryable failure,
+unknown status/reason pair, invalid publication, or `needs_review` is
+unresolved even if the collector exits zero. `needs_review` is protected
+manual work; it is never confirmed absence, unsupported capability, or refresh
+success. For DEX depth, USD time-alignment warnings are evaluated only when a
+measured band and a declared time-sensitive conversion exist. Unsupported or
+failed `N/A` rows do not receive a synthetic temporal mismatch.
+
+### One-shot MORPHO recovery gate
+
+The bounded MORPHO Upbit action is an operator release step, not a retry loop.
+It may run only after local tests, production-compatible checks, Quality v4
+all-Token parity, deployment health, and browser verification pass. Immediately
+before acting, refetch `cex:upbit:MORPHO/USDT` and its `depth` Fact. If it is no
+longer `retryable=true`, record `no action`. If still retryable, submit at most
+one bounded depth refresh; the exact snapshot postcondition above decides the
+result. Record pre/post publication and generation identities plus depth and
+execution status/reason changes. Do not repeat automatically after a failure.
+
 ## Add Token by contract
 
 The Admin page supports DEX-first runtime onboarding:
@@ -322,6 +381,14 @@ python3 scripts/fact_quality.py \
   --output /tmp/fact-quality.json \
   --fail-on-hard
 ```
+
+## Excluded data family
+
+Funding Rate is fully excluded from this release. Operations must not create a
+derivatives Market mapping, funding collection job, placeholder Fact, retry
+queue entry, or dashboard status for it. Numeric CEX account-tier fees, gas,
+transfer costs, and net-arbitrage outputs also remain outside this quality
+hardening procedure.
 
 ## Security boundary
 

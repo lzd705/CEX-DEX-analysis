@@ -91,6 +91,24 @@ only `cex:<venue>:<instrument>` or
 `dex:<chain>:<dex>:<pool>:<TOKEN>` identities. Unsupported methods,
 not-applicable Facts, and genuine observed zeroes never become refreshable.
 
+Data Quality contract v4 deliberately carries two same-publication views. The
+selected-window `quality_status` / `quality_flags` explain the current research
+window; `screening_quality_status` / `screening_quality_flags` preserve the
+exact Screener projection. Screener status chips and every structured flag
+severity must reproduce the all-scope Data Quality rows for the same
+`data_generation`, Token, and unique Market inventory. The release gate checks
+every configured Token, counts every flag without deduplication or category
+filtering, and rejects generation drift or an unexplained non-OK status.
+
+DEX price-time alignment is shown only for measured depth: an observed,
+complete, or partial fixed-block row with at least one finite USD band and an
+adapter-declared time-sensitive conversion. Unsupported, unavailable, failed,
+and not-cataloged depth stays `N/A` with its capability or source reason; it
+does not inherit a temporal mismatch. A CEX response with no usable two-sided
+book is the terminal non-retryable source outcome
+`source_no_observation/source_no_two_sided_book`, not zero depth and not a
+network failure.
+
 `/api/markets/compare` supplies the aligned daily observations used by both the
 chart and table. `/api/markets/events` reads the separately published Event
 Fact bundle and filters by Token, optional date interval, and lifecycle.
@@ -101,5 +119,7 @@ unknown (`excluded_unknown_account_tier`). Supported DEX V2 execution includes
 the pool swap fee in pool mechanics; this is not a claim about protocol
 treasury or revenue fee.
 
-Funding rates, numeric CEX account fees, gas, DEX V3 fixed-notional execution,
-and event-study outputs remain unsupported.
+Funding Rate is fully excluded: there is no derivatives catalog, funding
+collector, funding Fact, placeholder field, quality state, or UI control in
+this round. Numeric CEX account fees, gas, DEX V3 fixed-notional execution, and
+event-study outputs also remain unsupported.

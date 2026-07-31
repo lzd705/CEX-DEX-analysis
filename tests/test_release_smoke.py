@@ -1,12 +1,18 @@
+import argparse
+import copy
 import unittest
+from contextlib import ExitStack
+from unittest.mock import patch
 
 from scripts.check_dashboard_release import (
     ReleaseCheckError,
     ResponseMetrics,
+    release_check,
     validate_comparison,
     validate_events,
     validate_execution,
     validate_quality,
+    validate_screening_quality_parity,
     validate_summary,
     validate_token_catalog,
 )
@@ -44,6 +50,409 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
 
     def metrics(self, path="/api/markets/summary", raw=1000, wire=500):
         return ResponseMetrics(path, 1.0, wire, raw, True)
+
+    def screening_quality(self, token="AAVE"):
+        return {
+            "metadata": {
+                "contract_version": 4,
+                "data_generation": "generation-1",
+            },
+            "token_symbol": token,
+            "markets": [
+                {
+                    "market_id": f"cex:binance:{token}/USDT",
+                    "screening_quality_status": "ok",
+                    "screening_quality_flags": [
+                        {
+                            "code": "depth_unavailable",
+                            "severity": "info",
+                            "category": "availability",
+                            "message": (
+                                "No executable-depth observation is available."
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "market_id": f"dex:eth:uniswap_v3:pool:{token}",
+                    "screening_quality_status": "ok",
+                    "screening_quality_flags": [],
+                },
+            ],
+        }
+
+    def test_screening_quality_must_match_summary_counts(self):
+        summary_row = self.summary()["tokens"][0]
+        quality = self.screening_quality()
+        parity = validate_screening_quality_parity(
+            summary_row,
+            quality,
+            expected_generation="generation-1",
+        )
+        self.assertEqual(parity["market_count"], 2)
+        self.assertEqual(parity["status_counts"], {"ok": 2})
+        self.assertEqual(parity["alert_counts"], {"info": 1})
+
+        fallback = copy.deepcopy(quality)
+        fallback["markets"][0]["screening_quality_flags"] = []
+        fallback["markets"][0]["screening_quality_status"] = "warning"
+        with self.assertRaisesRegex(ReleaseCheckError, "fallback alert"):
+            validate_screening_quality_parity(
+                summary_row,
+                fallback,
+                expected_generation="generation-1",
+            )
+
+        status_mismatch = copy.deepcopy(quality)
+        status_mismatch["markets"][1]["screening_quality_status"] = "critical"
+        status_mismatch["markets"][1]["screening_quality_flags"] = [{
+            "code": "depth_failed",
+            "severity": "critical",
+            "category": "data_health",
+            "message": "The latest depth collection failed.",
+        }]
+        with self.assertRaisesRegex(ReleaseCheckError, "screening quality"):
+            validate_screening_quality_parity(
+                summary_row,
+                status_mismatch,
+                expected_generation="generation-1",
+            )
+
+        generation_mismatch = copy.deepcopy(quality)
+        generation_mismatch["metadata"]["data_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "generation"):
+            validate_screening_quality_parity(
+                summary_row,
+                generation_mismatch,
+                expected_generation="generation-1",
+            )
+
+    def test_screening_quality_requires_contract_v4_before_generation_checks(self):
+        quality = self.screening_quality()
+        quality["metadata"]["contract_version"] = 3
+        quality["metadata"]["data_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "contract v4"):
+            validate_screening_quality_parity(
+                self.summary()["tokens"][0],
+                quality,
+                expected_generation="generation-1",
+            )
+
+    def test_screening_quality_rejects_invalid_flag_contract(self):
+        valid_flag = self.screening_quality()["markets"][0][
+            "screening_quality_flags"
+        ][0]
+        cases = {
+            "missing field": {key: value for key, value in valid_flag.items()
+                              if key != "message"},
+            "unknown field": {**valid_flag, "source_url": "redacted"},
+            "bad severity": {**valid_flag, "severity": "error"},
+            "non-string severity": {**valid_flag, "severity": []},
+            "bad category": {**valid_flag, "category": "source_outcome"},
+            "non-string category": {**valid_flag, "category": []},
+            "bad code case": {**valid_flag, "code": "Depth_Unavailable"},
+            "bad code punctuation": {**valid_flag, "code": "depth-unavailable"},
+            "bad code unicode": {**valid_flag, "code": "dépth_unavailable"},
+            "long code": {**valid_flag, "code": "a" * 65},
+            "empty message": {**valid_flag, "message": ""},
+            "long message": {**valid_flag, "message": "x" * 241},
+            "url message": {**valid_flag, "message": "See https://example.test"},
+            "path message": {**valid_flag, "message": "Read /private/data/a.json"},
+            "generic path message": {**valid_flag, "message": "Read /srv/app/a.json"},
+            "control message": {**valid_flag, "message": "line one\nline two"},
+            "unicode control message": {
+                **valid_flag,
+                "message": "hidden\u200bmarker",
+            },
+            "non-dict flag": "depth_unavailable",
+        }
+        for label, flag in cases.items():
+            with self.subTest(label=label):
+                quality = self.screening_quality()
+                quality["markets"][0]["screening_quality_flags"] = [flag]
+                with self.assertRaises(ReleaseCheckError):
+                    validate_screening_quality_parity(
+                        self.summary()["tokens"][0],
+                        quality,
+                        expected_generation="generation-1",
+                    )
+
+    def test_screening_quality_rejects_bad_market_shapes_and_fallbacks(self):
+        mutations = []
+
+        missing_status = self.screening_quality()
+        missing_status["markets"][0].pop("screening_quality_status")
+        mutations.append(("screening quality fields", missing_status))
+
+        unknown_screening = self.screening_quality()
+        unknown_screening["markets"][0]["screening_quality_reasons"] = []
+        mutations.append(("unknown screening", unknown_screening))
+
+        bad_status = self.screening_quality()
+        bad_status["markets"][0]["screening_quality_status"] = "unknown"
+        mutations.append(("status", bad_status))
+
+        non_string_status = self.screening_quality()
+        non_string_status["markets"][0]["screening_quality_status"] = []
+        mutations.append(("status", non_string_status))
+
+        non_list_flags = self.screening_quality()
+        non_list_flags["markets"][0]["screening_quality_flags"] = {}
+        mutations.append(("flags", non_list_flags))
+
+        duplicate_ids = self.screening_quality()
+        duplicate_ids["markets"][1]["market_id"] = duplicate_ids["markets"][0][
+            "market_id"
+        ]
+        mutations.append(("unique", duplicate_ids))
+
+        empty_id = self.screening_quality()
+        empty_id["markets"][0]["market_id"] = ""
+        mutations.append(("market ID", empty_id))
+
+        whitespace_id = self.screening_quality()
+        whitespace_id["markets"][0]["market_id"] = " "
+        mutations.append(("market ID", whitespace_id))
+
+        wrong_count = self.screening_quality()
+        wrong_count["markets"].pop()
+        mutations.append(("market count", wrong_count))
+
+        wrong_token = self.screening_quality()
+        wrong_token["token_symbol"] = "UNI"
+        mutations.append(("Token", wrong_token))
+
+        for message, quality in mutations:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ReleaseCheckError, message):
+                    validate_screening_quality_parity(
+                        self.summary()["tokens"][0],
+                        quality,
+                        expected_generation="generation-1",
+                    )
+
+        info_status_without_flag = self.screening_quality()
+        info_status_without_flag["markets"][1]["screening_quality_status"] = "info"
+        with self.assertRaisesRegex(ReleaseCheckError, "fallback alert"):
+            validate_screening_quality_parity(
+                self.summary()["tokens"][0],
+                info_status_without_flag,
+                expected_generation="generation-1",
+            )
+
+        generation_first = copy.deepcopy(missing_status)
+        generation_first["metadata"]["data_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "generation"):
+            validate_screening_quality_parity(
+                self.summary()["tokens"][0],
+                generation_first,
+                expected_generation="generation-1",
+            )
+
+    def test_screening_quality_zero_counts_normalize_and_bool_counts_fail(self):
+        summary_row = copy.deepcopy(self.summary()["tokens"][0])
+        summary_row["quality_status_counts"] = {
+            "ok": 2,
+            "info": 0,
+            "warning": 0,
+            "critical": 0,
+        }
+        summary_row["quality_alert_counts"] = {
+            "info": 1,
+            "warning": 0,
+            "critical": 0,
+        }
+        validate_screening_quality_parity(
+            summary_row,
+            self.screening_quality(),
+            expected_generation="generation-1",
+        )
+
+        for field in ("quality_status_counts", "quality_alert_counts"):
+            with self.subTest(field=field):
+                invalid = copy.deepcopy(summary_row)
+                first_key = next(iter(invalid[field]))
+                invalid[field][first_key] = True
+                with self.assertRaisesRegex(ReleaseCheckError, "counts"):
+                    validate_screening_quality_parity(
+                        invalid,
+                        self.screening_quality(),
+                        expected_generation="generation-1",
+                    )
+
+        unknown_status = copy.deepcopy(summary_row)
+        unknown_status["quality_status_counts"]["degraded"] = 0
+        with self.assertRaisesRegex(ReleaseCheckError, "status counts"):
+            validate_screening_quality_parity(
+                unknown_status,
+                self.screening_quality(),
+                expected_generation="generation-1",
+            )
+        unknown_severity = copy.deepcopy(summary_row)
+        unknown_severity["quality_alert_counts"]["error"] = 0
+        with self.assertRaisesRegex(ReleaseCheckError, "alert counts"):
+            validate_screening_quality_parity(
+                unknown_severity,
+                self.screening_quality(),
+                expected_generation="generation-1",
+            )
+
+    def test_screening_quality_status_and_alert_mismatches_are_independent(self):
+        quality = self.screening_quality()
+
+        status_only = copy.deepcopy(self.summary()["tokens"][0])
+        status_only["quality_status_counts"] = {"ok": 1, "warning": 1}
+        with self.assertRaisesRegex(ReleaseCheckError, "status counts"):
+            validate_screening_quality_parity(
+                status_only,
+                quality,
+                expected_generation="generation-1",
+            )
+
+        alerts_only = copy.deepcopy(self.summary()["tokens"][0])
+        alerts_only["quality_alert_counts"] = {"warning": 1}
+        with self.assertRaisesRegex(ReleaseCheckError, "alert counts"):
+            validate_screening_quality_parity(
+                alerts_only,
+                quality,
+                expected_generation="generation-1",
+            )
+
+    def test_screening_quality_counts_every_flag_without_filtering_or_deduping(self):
+        quality = self.screening_quality()
+        info_flag = quality["markets"][0]["screening_quality_flags"][0]
+        quality["markets"][0]["screening_quality_flags"] = [
+            info_flag,
+            copy.deepcopy(info_flag),
+            {
+                "code": "wide_quoted_spread",
+                "severity": "warning",
+                "category": "market_condition",
+                "message": "Quoted CEX spread exceeds the quality threshold.",
+            },
+        ]
+        summary_row = copy.deepcopy(self.summary()["tokens"][0])
+        summary_row["quality_alert_counts"] = {"info": 2, "warning": 1}
+        parity = validate_screening_quality_parity(
+            summary_row,
+            quality,
+            expected_generation="generation-1",
+        )
+        self.assertEqual(parity["alert_counts"], {"info": 2, "warning": 1})
+
+    def test_release_fetches_all_token_quality_once_and_retains_metrics(self):
+        summary = self.summary()
+        summary["metadata"]["catalog_market_count"] = 2
+        second_row = copy.deepcopy(summary["tokens"][0])
+        second_row["token_symbol"] = "UNI"
+        summary["tokens"].append(second_row)
+        quality_by_token = {
+            token: self.screening_quality(token)
+            for token in ("AAVE", "UNI")
+        }
+        full_catalog = {"markets": [{"market_id": "a"}, {"market_id": "b"}]}
+        event = {
+            "token_symbol": "AAVE",
+            "time": {
+                "effective_date_start": "2026-01-10",
+                "effective_date_end": "2026-01-10",
+            },
+            "lifecycle": "occurred",
+        }
+        all_events = {
+            "coverage": {
+                "covered_tokens": ["AAVE", "UNI"],
+                "uncovered_tokens": [],
+                "covered_token_count": 2,
+            },
+            "bundle_id": "a" * 24,
+        }
+        fetched_paths = []
+
+        def fake_fetch(_base_url, path, *, timeout):
+            fetched_paths.append(path)
+            if path == "/health":
+                payload = {"status": "ok", "data_ready": True}
+            elif path == "/api/markets/summary":
+                payload = summary
+            elif path == "/api/markets/catalog":
+                payload = full_catalog
+            elif path.startswith("/api/markets/catalog?"):
+                payload = {"token_summary": {}}
+            elif path == "/api/markets/events":
+                payload = all_events
+            elif "scope=all" in path and path.startswith("/api/markets/quality?"):
+                token = "AAVE" if "token=AAVE" in path else "UNI"
+                payload = quality_by_token[token]
+            else:
+                payload = {}
+            return payload, self.metrics(path)
+
+        args = argparse.Namespace(
+            base_url="https://dashboard.test",
+            timeout=1.0,
+            summary_raw_max=2_000,
+            summary_gzip_max=1_000,
+            token_raw_max=2_000,
+            token_gzip_max=1_000,
+        )
+        markets = [
+            {"market_id": "cex:binance:AAVE/USDT", "market_type": "cex"},
+            {
+                "market_id": "dex:eth:uniswap_v3:pool:AAVE",
+                "market_type": "dex",
+            },
+        ]
+        def run_release():
+            with ExitStack() as stack:
+                stack.enter_context(patch(
+                    "scripts.check_dashboard_release.fetch_json",
+                    side_effect=fake_fetch,
+                ))
+                stack.enter_context(patch(
+                    "scripts.check_dashboard_release.validate_summary",
+                    return_value=(
+                        "AAVE", "2026-01-01", "2026-01-31", "generation-1"
+                    ),
+                ))
+                stack.enter_context(patch(
+                    "scripts.check_dashboard_release.validate_token_catalog",
+                    return_value=markets,
+                ))
+                stack.enter_context(patch(
+                    "scripts.check_dashboard_release.validate_events",
+                    return_value=[event],
+                ))
+                stack.enter_context(patch(
+                    "scripts.check_dashboard_release.validate_comparison"
+                ))
+                stack.enter_context(patch(
+                    "scripts.check_dashboard_release.validate_quality"
+                ))
+                stack.enter_context(patch(
+                    "scripts.check_dashboard_release.validate_execution"
+                ))
+                return release_check(args)
+
+        result = run_release()
+
+        all_quality_paths = [
+            path
+            for path in fetched_paths
+            if path.startswith("/api/markets/quality?") and "scope=all" in path
+        ]
+        self.assertEqual(len(all_quality_paths), 2)
+        self.assertEqual(
+            {path.split("token=")[1].split("&")[0] for path in all_quality_paths},
+            {"AAVE", "UNI"},
+        )
+        self.assertEqual(result["screening_quality_parity_count"], 2)
+        metric_paths = [row["path"] for row in result["requests"]]
+        self.assertTrue(set(all_quality_paths).issubset(metric_paths))
+
+        quality_by_token["UNI"]["metadata"]["data_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "generation"):
+            run_release()
 
     def test_summary_rejects_heavy_arrays_and_payload_budget_regression(self):
         summary = self.summary()
@@ -89,6 +498,15 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             broken["tokens"][0]["primary_cex"].pop("depth_retryable")
             validate_summary(
                 broken,
+                self.metrics(),
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "not unique"):
+            duplicated = self.summary()
+            duplicated["tokens"].append(copy.deepcopy(duplicated["tokens"][0]))
+            validate_summary(
+                duplicated,
                 self.metrics(),
                 raw_max=2000,
                 gzip_max=1000,
@@ -183,7 +601,8 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         quality = {
             "token_symbol": "AAVE",
             "metadata": {
-                "contract_version": 3,
+                "contract_version": 4,
+                "data_generation": "generation-1",
                 "scope": "selected",
                 "selected_market_ids": [market_a, market_b],
                 "daily_quality_report": {
@@ -205,7 +624,27 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             token="AAVE",
             market_a=market_a,
             market_b=market_b,
+            expected_generation="generation-1",
         )
+        stale_quality = copy.deepcopy(quality)
+        stale_quality["metadata"]["data_generation"] = "generation-2"
+        with self.assertRaisesRegex(ReleaseCheckError, "generations differ"):
+            validate_quality(
+                stale_quality,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+        v3_quality = copy.deepcopy(quality)
+        v3_quality["metadata"]["contract_version"] = 3
+        with self.assertRaisesRegex(ReleaseCheckError, "not v4"):
+            validate_quality(
+                v3_quality,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+            )
         with self.assertRaisesRegex(ReleaseCheckError, "both selected markets"):
             validate_quality(
                 {**quality, "markets": quality_markets[:1]},

@@ -7,7 +7,9 @@ import argparse
 import gzip
 import json
 import math
+import re
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
@@ -44,6 +46,37 @@ EVENT_EVIDENCE_STATUSES = frozenset(
     {"primary_confirmed", "cross_checked", "onchain_observed"}
 )
 EXPECTED_SUMMARY_VERSION = 2
+EXPECTED_QUALITY_CONTRACT_VERSION = 4
+SCREENING_QUALITY_STATUSES = frozenset({"ok", "info", "warning", "critical"})
+SCREENING_QUALITY_SEVERITIES = frozenset({"info", "warning", "critical"})
+SCREENING_QUALITY_CATEGORIES = frozenset(
+    {
+        "data_health",
+        "availability",
+        "capability",
+        "measurement_limit",
+        "market_condition",
+    }
+)
+SCREENING_QUALITY_FLAG_FIELDS = frozenset(
+    {"code", "severity", "category", "message"}
+)
+SCREENING_QUALITY_MARKET_FIELDS = frozenset(
+    {"screening_quality_status", "screening_quality_flags"}
+)
+SCREENING_QUALITY_CODE_PATTERN = re.compile(
+    r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z",
+    flags=re.ASCII,
+)
+RAW_URL_PATTERN = re.compile(
+    r"\b[a-z][a-z0-9+.-]*://|\bwww\.",
+    flags=re.ASCII | re.IGNORECASE,
+)
+PROTECTED_PATH_PATTERN = re.compile(
+    r"(?:^|[\s(\"'])/(?:[a-z0-9._-]+(?:/|\Z))"
+    r"|\b[a-z]:\\",
+    flags=re.ASCII | re.IGNORECASE,
+)
 FORBIDDEN_EVENT_RESULT_FIELDS = frozenset(
     {
         "impact",
@@ -119,13 +152,22 @@ def validate_summary(
         f"Summary version is not {EXPECTED_SUMMARY_VERSION}",
     )
     require(isinstance(tokens, list) and tokens, "Summary has no Token rows")
+    token_symbols: list[str] = []
     for row in tokens:
         require(isinstance(row, dict), "Summary Token row is not an object")
+        token_symbol = row.get("token_symbol")
+        require(
+            isinstance(token_symbol, str)
+            and bool(token_symbol)
+            and token_symbol == token_symbol.strip().upper(),
+            "Summary Token identity is invalid",
+        )
+        token_symbols.append(token_symbol)
         market_count = row.get("market_count")
         status_counts = row.get("quality_status_counts")
         alert_counts = row.get("quality_alert_counts")
         require(
-            isinstance(market_count, int) and market_count > 0,
+            type(market_count) is int and market_count > 0,
             "Summary Token market_count is invalid",
         )
         require(
@@ -151,7 +193,7 @@ def validate_summary(
             "Summary quality alert counts are invalid",
         )
         require(
-            isinstance(row.get("spread_comparable_days"), int)
+            type(row.get("spread_comparable_days")) is int
             and row["spread_comparable_days"] >= 0,
             "Summary spread comparable-day count is invalid",
         )
@@ -185,13 +227,14 @@ def validate_summary(
     start = metadata.get("start_date")
     end = metadata.get("end_date")
     token = metadata.get("default_workspace_token")
-    token_symbols = {
-        row.get("token_symbol") for row in tokens if isinstance(row, dict)
-    }
+    require(
+        len(set(token_symbols)) == len(token_symbols),
+        "Summary Token identities are not unique",
+    )
     require(isinstance(generation, str) and generation, "Summary generation is missing")
     require(isinstance(start, str) and start, "Summary start_date is missing")
     require(isinstance(end, str) and end, "Summary end_date is missing")
-    require(token in token_symbols, "Default workspace Token is absent from summary")
+    require(token in set(token_symbols), "Default workspace Token is absent from summary")
     return token, start, end, generation
 
 
@@ -284,6 +327,7 @@ def validate_quality(
     token: str,
     market_a: str,
     market_b: str,
+    expected_generation: str | None = None,
 ) -> None:
     metadata = payload.get("metadata") or {}
     markets = payload.get("markets")
@@ -291,10 +335,15 @@ def validate_quality(
     require(payload.get("token_symbol") == token, "Quality returned wrong Token")
     require(metadata.get("scope") == "selected", "Quality did not honor selected scope")
     require(
-        isinstance(metadata.get("contract_version"), int)
-        and metadata["contract_version"] >= 3,
-        "Quality contract does not include published daily-audit evidence",
+        type(metadata.get("contract_version")) is int
+        and metadata["contract_version"] == EXPECTED_QUALITY_CONTRACT_VERSION,
+        "Quality contract is not v4",
     )
+    if expected_generation is not None:
+        require(
+            metadata.get("data_generation") == expected_generation,
+            "Summary and selected Quality generations differ",
+        )
     require(
         set(metadata.get("selected_market_ids") or []) == expected_ids,
         "Quality metadata returned the wrong selected markets",
@@ -393,6 +442,193 @@ def validate_quality(
                 },
                 "Public quality retryable daily fact lacks an operator-only action",
             )
+
+
+def _normalized_summary_counts(
+    value: Any,
+    *,
+    allowed_keys: frozenset[str],
+    label: str,
+) -> dict[str, int]:
+    require(isinstance(value, dict), f"Summary {label} counts are invalid")
+    normalized: dict[str, int] = {}
+    for key, count in value.items():
+        require(
+            key in allowed_keys
+            and type(count) is int
+            and count >= 0,
+            f"Summary {label} counts are invalid",
+        )
+        if count:
+            normalized[key] = count
+    return dict(sorted(normalized.items()))
+
+
+def _validate_screening_flag(flag: Any) -> dict[str, str]:
+    require(isinstance(flag, dict), "Quality screening flag is not an object")
+    require(
+        set(flag) == SCREENING_QUALITY_FLAG_FIELDS,
+        "Quality screening flag has missing or unknown fields",
+    )
+    code = flag["code"]
+    require(
+        isinstance(code, str)
+        and len(code) <= 64
+        and SCREENING_QUALITY_CODE_PATTERN.fullmatch(code) is not None,
+        "Quality screening flag code is invalid",
+    )
+    severity = flag["severity"]
+    require(
+        isinstance(severity, str)
+        and severity in SCREENING_QUALITY_SEVERITIES,
+        "Quality screening flag severity is invalid",
+    )
+    category = flag["category"]
+    require(
+        isinstance(category, str)
+        and category in SCREENING_QUALITY_CATEGORIES,
+        "Quality screening flag category is invalid",
+    )
+    message = flag["message"]
+    require(
+        isinstance(message, str)
+        and message == message.strip()
+        and 0 < len(message) <= 240,
+        "Quality screening flag message is invalid",
+    )
+    require(
+        not any(
+            unicodedata.category(character) in {"Cc", "Cf"}
+            for character in message
+        ),
+        "Quality screening flag message contains a control marker",
+    )
+    require(
+        RAW_URL_PATTERN.search(message) is None,
+        "Quality screening flag message contains a raw URL",
+    )
+    require(
+        PROTECTED_PATH_PATTERN.search(message) is None,
+        "Quality screening flag message contains a protected path",
+    )
+    return {
+        "code": code,
+        "severity": severity,
+        "category": category,
+        "message": message,
+    }
+
+
+def validate_screening_quality_parity(
+    summary_row: dict[str, Any],
+    quality_payload: dict[str, Any],
+    expected_generation: str,
+) -> dict[str, Any]:
+    """Reproduce one Summary row from its same-generation Quality projection."""
+    require(isinstance(quality_payload, dict), "Quality payload is not an object")
+    metadata = quality_payload.get("metadata")
+    require(isinstance(metadata, dict), "Quality metadata is not an object")
+    require(
+        type(metadata.get("contract_version")) is int
+        and metadata["contract_version"] == EXPECTED_QUALITY_CONTRACT_VERSION,
+        "Quality contract v4 is required for screening parity",
+    )
+    require(
+        isinstance(expected_generation, str)
+        and bool(expected_generation)
+        and expected_generation == expected_generation.strip()
+        and metadata.get("data_generation") == expected_generation,
+        "Summary and screening Quality generation differ",
+    )
+
+    require(isinstance(summary_row, dict), "Summary Token row is not an object")
+    token = summary_row.get("token_symbol")
+    require(
+        isinstance(token, str) and bool(token) and token == token.strip(),
+        "Summary Token is invalid",
+    )
+    require(
+        quality_payload.get("token_symbol") == token,
+        "Quality returned the wrong Token for screening parity",
+    )
+    expected_market_count = summary_row.get("market_count")
+    require(
+        type(expected_market_count) is int and expected_market_count > 0,
+        "Summary market count is invalid",
+    )
+    markets = quality_payload.get("markets")
+    require(isinstance(markets, list), "Quality markets is not an array")
+    require(
+        len(markets) == expected_market_count,
+        "Quality market count does not match Summary",
+    )
+
+    market_ids: set[str] = set()
+    status_counts: Counter[str] = Counter()
+    alert_counts: Counter[str] = Counter()
+    for market in markets:
+        require(isinstance(market, dict), "Quality market is not an object")
+        market_id = market.get("market_id")
+        require(
+            isinstance(market_id, str)
+            and bool(market_id)
+            and market_id == market_id.strip(),
+            "Quality market ID is invalid",
+        )
+        require(market_id not in market_ids, "Quality market IDs are not unique")
+        market_ids.add(market_id)
+        screening_fields = {
+            key
+            for key in market
+            if isinstance(key, str) and key.startswith("screening_quality_")
+        }
+        require(
+            screening_fields == SCREENING_QUALITY_MARKET_FIELDS,
+            "Quality market has missing or unknown screening quality fields",
+        )
+        status = market["screening_quality_status"]
+        require(
+            isinstance(status, str)
+            and status in SCREENING_QUALITY_STATUSES,
+            "Quality screening status is invalid",
+        )
+        flags = market["screening_quality_flags"]
+        require(isinstance(flags, list), "Quality screening flags is not an array")
+        require(
+            status == "ok" or bool(flags),
+            "Quality non-OK status has no fallback alert",
+        )
+        status_counts[status] += 1
+        for raw_flag in flags:
+            flag = _validate_screening_flag(raw_flag)
+            alert_counts[flag["severity"]] += 1
+
+    expected_status_counts = _normalized_summary_counts(
+        summary_row.get("quality_status_counts"),
+        allowed_keys=SCREENING_QUALITY_STATUSES,
+        label="quality status",
+    )
+    expected_alert_counts = _normalized_summary_counts(
+        summary_row.get("quality_alert_counts"),
+        allowed_keys=SCREENING_QUALITY_SEVERITIES,
+        label="quality alert",
+    )
+    actual_status_counts = dict(sorted(status_counts.items()))
+    actual_alert_counts = dict(sorted(alert_counts.items()))
+    require(
+        actual_status_counts == expected_status_counts,
+        "Summary screening quality status counts do not match Quality",
+    )
+    require(
+        actual_alert_counts == expected_alert_counts,
+        "Summary screening quality alert counts do not match Quality",
+    )
+    return {
+        "token_symbol": token,
+        "market_count": len(markets),
+        "status_counts": actual_status_counts,
+        "alert_counts": actual_alert_counts,
+    }
 
 
 def _execution_scenario_key(row: dict[str, Any]) -> tuple[str, int] | None:
@@ -748,6 +984,31 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         gzip_max=args.summary_gzip_max,
     )
 
+    screening_quality_parity_count = 0
+    screening_quality_market_count = 0
+    for summary_row in summary["tokens"]:
+        quality_token = summary_row.get("token_symbol")
+        require(
+            isinstance(quality_token, str) and bool(quality_token),
+            "Summary Token is invalid for screening parity",
+        )
+        screening_quality_path = "/api/markets/quality?" + urlencode(
+            {"token": quality_token, "scope": "all"}
+        )
+        screening_quality, screening_quality_metrics = fetch_json(
+            args.base_url,
+            screening_quality_path,
+            timeout=args.timeout,
+        )
+        metrics.append(screening_quality_metrics)
+        parity = validate_screening_quality_parity(
+            summary_row,
+            screening_quality,
+            expected_generation=generation,
+        )
+        screening_quality_parity_count += 1
+        screening_quality_market_count += parity["market_count"]
+
     catalog_path = "/api/markets/catalog?" + urlencode(
         {"token": token, "start": start, "end": end}
     )
@@ -922,6 +1183,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         token=token,
         market_a=market_a,
         market_b=market_b,
+        expected_generation=generation,
     )
 
     execution, execution_metrics = fetch_json(
@@ -944,6 +1206,8 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "window": {"start": start, "end": end},
         "data_generation": generation,
         "token_count": len(summary["tokens"]),
+        "screening_quality_parity_count": screening_quality_parity_count,
+        "screening_quality_market_count": screening_quality_market_count,
         "catalog_market_count": len(full_markets),
         "event_count": len(event_rows),
         "event_covered_token_count": event_coverage["covered_token_count"],
