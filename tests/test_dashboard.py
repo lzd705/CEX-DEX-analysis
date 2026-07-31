@@ -881,19 +881,18 @@ class MarketMonitorServerTest(unittest.TestCase):
 
     def test_warm_default_market_summary_uses_current_cache_generation(self):
         source_signature = (("market_facts.sqlite3", 10, 20),)
-        with (
-            patch.object(
-                server,
-                "api_source_signature",
-                return_value=source_signature,
-            ),
-            patch.object(server, "api_freshness_bucket", return_value=12345),
+        with patch.object(
+            server,
+            "api_source_signature",
+            return_value=source_signature,
+        ), patch.object(
+            server, "api_freshness_bucket", return_value=12345
+        ), \
             patch.object(
                 server,
                 "_build_public_api_response_cached",
                 return_value=(b"{}", True),
-            ) as build_response,
-        ):
+            ) as build_response:
             server.warm_default_market_summary()
 
         build_response.assert_called_once_with(
@@ -909,22 +908,20 @@ class MarketMonitorServerTest(unittest.TestCase):
         http_server.serve_forever.side_effect = KeyboardInterrupt
         args = server.argparse.Namespace(host="127.0.0.1", port=8765, data_dir=None)
 
-        with (
-            patch.object(server, "parse_args", return_value=args),
-            patch.object(server, "ThreadingHTTPServer", return_value=http_server),
+        with patch.object(server, "parse_args", return_value=args), \
+            patch.object(server, "ThreadingHTTPServer", return_value=http_server), \
             patch.object(
                 server,
                 "api_source_signature",
                 return_value=source_signature,
-            ),
-            patch.object(server, "api_freshness_bucket", return_value=12345),
+            ), \
+            patch.object(server, "api_freshness_bucket", return_value=12345), \
             patch.object(
                 server,
                 "_build_public_api_response_cached",
                 side_effect=RuntimeError("private details"),
-            ) as build_response,
-            patch("builtins.print") as print_warning,
-        ):
+            ) as build_response, \
+            patch("builtins.print") as print_warning:
             server.main()
 
         build_response.assert_called_once_with(

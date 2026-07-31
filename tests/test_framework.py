@@ -1,4 +1,6 @@
 import ast
+import io
+import tokenize
 import unittest
 from pathlib import Path
 
@@ -6,7 +8,68 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def parenthesized_multi_context_with_lines(source):
+    """Return lines using the Python 3.10+ ``with (cm1, cm2)`` syntax."""
+    tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    lines = []
+
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.NAME or token.string != "with":
+            continue
+
+        next_index = index + 1
+        while tokens[next_index].type in {
+            tokenize.COMMENT,
+            tokenize.NL,
+            tokenize.NEWLINE,
+            tokenize.INDENT,
+            tokenize.DEDENT,
+        }:
+            next_index += 1
+        if tokens[next_index].string != "(":
+            continue
+
+        brackets = {"(": ")", "[": "]", "{": "}"}
+        bracket_stack = []
+        has_top_level_comma = False
+        for candidate in tokens[next_index:]:
+            if candidate.string in brackets:
+                bracket_stack.append(brackets[candidate.string])
+            elif bracket_stack and candidate.string == bracket_stack[-1]:
+                bracket_stack.pop()
+                if not bracket_stack:
+                    if has_top_level_comma:
+                        lines.append(token.start[0])
+                    break
+            elif candidate.string == "," and len(bracket_stack) == 1:
+                has_top_level_comma = True
+
+    return lines
+
+
 class FrameworkStructureTest(unittest.TestCase):
+    def test_parenthesized_multi_context_guard_distinguishes_single_context_expressions(self):
+        unsupported = "with (first_context, second_context):\n    pass\n"
+        supported = (
+            "with (path / filename).open() as stream:\n    pass\n"
+            "with (resources[first, second]).open() as stream:\n    pass\n"
+        )
+
+        self.assertEqual(parenthesized_multi_context_with_lines(unsupported), [1])
+        self.assertEqual(parenthesized_multi_context_with_lines(supported), [])
+
+    def test_python_sources_avoid_parenthesized_multi_context_with_syntax(self):
+        source_roots = ("dashboard", "deploy", "scripts", "tests")
+        violations = []
+        for source_root in source_roots:
+            for path in (PROJECT_ROOT / source_root).rglob("*.py"):
+                for line in parenthesized_multi_context_with_lines(
+                    path.read_text(encoding="utf-8")
+                ):
+                    violations.append(f"{path.relative_to(PROJECT_ROOT)}:{line}")
+
+        self.assertEqual(violations, [])
+
     def test_all_python_sources_parse_with_python_38_grammar(self):
         source_roots = ("dashboard", "deploy", "scripts", "tests")
         source_paths = sorted(
