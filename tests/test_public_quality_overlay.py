@@ -1,4 +1,5 @@
 import csv
+import copy
 import json
 import shutil
 import subprocess
@@ -9,7 +10,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dashboard import server
-from scripts.check_dashboard_release import validate_quality
+from scripts.check_dashboard_release import (
+    DAILY_FACT_EVIDENCE_FIELDS,
+    ReleaseCheckError,
+    validate_quality,
+)
 from scripts.fact_quality import build_report
 from scripts.market_database import build_database
 from scripts.quality_outcomes import quality_outcome_rule
@@ -461,6 +466,112 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
             market_a="cex:binance:BTC/USDT",
             market_b="dex:eth:uniswap:0xpool:BTC",
         )
+
+    def test_matched_report_binds_explicit_evidence_to_each_market(self):
+        self.write_report(
+            [
+                self.issue(
+                    "2026-01-01",
+                    "network",
+                    "collection_failed",
+                    True,
+                )
+            ]
+        )
+        market_a = "cex:binance:BTC/USDT"
+        market_b = "dex:eth:uniswap:0xpool:BTC"
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            selected = server.build_market_quality(
+                "BTC",
+                scope="selected",
+                market_a_id=market_a,
+                market_b_id=market_b,
+                start="2026-01-01",
+                end="2026-01-01",
+            )
+
+        report = selected["metadata"]["daily_quality_report"]
+        facts = {
+            market["market_id"]: market["facts"]["daily"]
+            for market in selected["markets"]
+        }
+        rollups = {
+            item["market_id"]: item
+            for item in report["market_issue_rollups"]
+        }
+        self.assertEqual(set(rollups), {market_a, market_b})
+        self.assertEqual(rollups[market_a]["issue_count"], 1)
+        self.assertEqual(rollups[market_b], {
+            "market_id": market_b,
+            "issue_count": 0,
+            "issue_outcome_counts": [],
+            "status_counts": {},
+            "reason_code_counts": {},
+            "affected_date_count": 0,
+            "affected_dates": [],
+            "evidence_mode": "published_daily_audit",
+            "fact_outcome": {
+                "status": "observed",
+                "reason_code": "observed",
+                "retryable": False,
+                "action": None,
+            },
+        })
+        self.assertEqual(
+            {
+                field: facts[market_b][field]
+                for field in DAILY_FACT_EVIDENCE_FIELDS
+            },
+            {
+                "daily_evidence_mode": "published_daily_audit",
+                "issue_status_counts": {},
+                "issue_outcome_counts": [],
+                "reason_code_counts": {},
+                "affected_date_count": 0,
+                "affected_dates": [],
+            },
+        )
+        validate_quality(
+            selected,
+            token="BTC",
+            market_a=market_a,
+            market_b=market_b,
+        )
+
+        for field in DAILY_FACT_EVIDENCE_FIELDS:
+            with self.subTest(omitted_field=field):
+                invalid = copy.deepcopy(selected)
+                invalid_market = next(
+                    market
+                    for market in invalid["markets"]
+                    if market["market_id"] == market_b
+                )
+                del invalid_market["facts"]["daily"][field]
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "daily fact evidence/action is incomplete",
+                ):
+                    validate_quality(
+                        invalid,
+                        token="BTC",
+                        market_a=market_a,
+                        market_b=market_b,
+                    )
+
+        wrong_market_binding = copy.deepcopy(selected)
+        wrong_market_binding["metadata"]["daily_quality_report"][
+            "market_issue_rollups"
+        ][0]["market_id"] = market_b
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "market rollups",
+        ):
+            validate_quality(
+                wrong_market_binding,
+                token="BTC",
+                market_a=market_a,
+                market_b=market_b,
+            )
 
     def test_invalid_daily_outcome_contract_fails_closed_to_manual_review(self):
         cases = (

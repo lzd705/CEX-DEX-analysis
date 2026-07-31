@@ -5,6 +5,7 @@ from contextlib import ExitStack
 from unittest.mock import patch
 
 from scripts.check_dashboard_release import (
+    DAILY_FACT_EVIDENCE_FIELDS,
     ReleaseCheckError,
     ResponseMetrics,
     release_check,
@@ -947,14 +948,45 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     "identity_status": "matched_current_import",
                     "schema": "fact_quality_report/v1",
                     "selected_window_issue_count": 0,
+                    "issue_outcome_counts": [],
                     "reason_code_counts": {},
                     "status_counts": {},
                     "affected_date_count": 0,
                     "affected_dates": [],
+                    "market_issue_rollups": [
+                        {
+                            "market_id": market_id,
+                            "issue_count": 0,
+                            "issue_outcome_counts": [],
+                            "reason_code_counts": {},
+                            "status_counts": {},
+                            "affected_date_count": 0,
+                            "affected_dates": [],
+                            "evidence_mode": "published_daily_audit",
+                            "fact_outcome": {
+                                "status": "observed",
+                                "reason_code": "observed",
+                                "retryable": False,
+                                "action": None,
+                            },
+                        }
+                        for market_id in (market_a, market_b)
+                    ],
                 },
             },
             "markets": quality_markets,
         }
+        for market in quality["markets"]:
+            market["facts"]["daily"].update(
+                {
+                    "daily_evidence_mode": "published_daily_audit",
+                    "issue_status_counts": {},
+                    "issue_outcome_counts": [],
+                    "reason_code_counts": {},
+                    "affected_date_count": 0,
+                    "affected_dates": [],
+                }
+            )
         validate_quality(
             quality,
             token="AAVE",
@@ -962,6 +994,44 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             market_b=market_b,
             expected_generation="generation-1",
         )
+
+        fallback = copy.deepcopy(quality)
+        fallback["metadata"]["daily_quality_report"] = {
+            "status": "unavailable",
+            "evidence_mode": "catalog_window_inference",
+            "identity_status": "not_verified",
+            "selected_window_issue_count": 0,
+            "reason_code_counts": {},
+            "status_counts": {},
+            "affected_date_count": 0,
+            "affected_dates": [],
+        }
+        for market in fallback["markets"]:
+            for field in DAILY_FACT_EVIDENCE_FIELDS:
+                market["facts"]["daily"].pop(field, None)
+        validate_quality(
+            fallback,
+            token="AAVE",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation="generation-1",
+        )
+
+        fallback_with_published_evidence = copy.deepcopy(fallback)
+        fallback_with_published_evidence["markets"][0]["facts"][
+            "daily"
+        ]["affected_dates"] = []
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "daily fact evidence/action mode is invalid",
+        ):
+            validate_quality(
+                fallback_with_published_evidence,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
 
         spoofed_market_type = copy.deepcopy(quality)
         spoofed_market_type["markets"][0]["market_type"] = "dex"
@@ -1009,10 +1079,44 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         ].update(
             {
                 "selected_window_issue_count": 1,
+                "issue_outcome_counts": [
+                    {
+                        "status": "unsupported",
+                        "reason_code": "source_range_unavailable",
+                        "count": 1,
+                    }
+                ],
                 "reason_code_counts": {"source_range_unavailable": 1},
                 "status_counts": {"unsupported": 1},
                 "affected_date_count": 1,
                 "affected_dates": ["2026-01-15"],
+            }
+        )
+        unsupported_without_fact_evidence["metadata"][
+            "daily_quality_report"
+        ]["market_issue_rollups"][0].update(
+            {
+                "issue_count": 1,
+                "issue_outcome_counts": [
+                    {
+                        "status": "unsupported",
+                        "reason_code": "source_range_unavailable",
+                        "count": 1,
+                    }
+                ],
+                "reason_code_counts": {
+                    "source_range_unavailable": 1,
+                },
+                "status_counts": {"unsupported": 1},
+                "affected_date_count": 1,
+                "affected_dates": ["2026-01-15"],
+                "evidence_mode": "published_daily_audit",
+                "fact_outcome": {
+                    "status": "unsupported",
+                    "reason_code": "source_range_unavailable",
+                    "retryable": False,
+                    "action": "operator_review_source_outcome",
+                },
             }
         )
         unsupported_without_fact_evidence["markets"][0]["facts"][
@@ -1041,6 +1145,18 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         mixed_report["metadata"]["daily_quality_report"].update(
             {
                 "selected_window_issue_count": 2,
+                "issue_outcome_counts": [
+                    {
+                        "status": "collection_failed",
+                        "reason_code": "network",
+                        "count": 1,
+                    },
+                    {
+                        "status": "needs_review",
+                        "reason_code": "not_listed",
+                        "count": 1,
+                    },
+                ],
                 "reason_code_counts": {"network": 1, "not_listed": 1},
                 "status_counts": {
                     "collection_failed": 1,
@@ -1048,6 +1164,42 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 },
                 "affected_date_count": 2,
                 "affected_dates": ["2026-01-15", "2026-01-16"],
+            }
+        )
+        mixed_report["metadata"]["daily_quality_report"][
+            "market_issue_rollups"
+        ][0].update(
+            {
+                "issue_count": 2,
+                "issue_outcome_counts": [
+                    {
+                        "status": "collection_failed",
+                        "reason_code": "network",
+                        "count": 1,
+                    },
+                    {
+                        "status": "needs_review",
+                        "reason_code": "not_listed",
+                        "count": 1,
+                    },
+                ],
+                "reason_code_counts": {
+                    "network": 1,
+                    "not_listed": 1,
+                },
+                "status_counts": {
+                    "collection_failed": 1,
+                    "needs_review": 1,
+                },
+                "affected_date_count": 2,
+                "affected_dates": ["2026-01-15", "2026-01-16"],
+                "evidence_mode": "published_daily_audit",
+                "fact_outcome": {
+                    "status": "collection_failed",
+                    "reason_code": "multiple_daily_quality_reasons",
+                    "retryable": True,
+                    "action": "operator_review_retry_and_manual_queues",
+                },
             }
         )
         mixed_daily = mixed_report["markets"][0]["facts"]["daily"]
@@ -1079,6 +1231,18 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     "collection_failed": 1,
                     "needs_review": 1,
                 },
+                "issue_outcome_counts": [
+                    {
+                        "status": "collection_failed",
+                        "reason_code": "network",
+                        "count": 1,
+                    },
+                    {
+                        "status": "needs_review",
+                        "reason_code": "not_listed",
+                        "count": 1,
+                    },
+                ],
                 "reason_code_counts": {
                     "network": 1,
                     "not_listed": 1,
@@ -1094,6 +1258,96 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             market_b=market_b,
             expected_generation="generation-1",
         )
+
+        impossible_marginals = copy.deepcopy(mixed_report)
+        impossible_report = impossible_marginals["metadata"][
+            "daily_quality_report"
+        ]
+        impossible_report["reason_code_counts"] = {"network": 2}
+        impossible_report["issue_outcome_counts"] = [
+            {
+                "status": "collection_failed",
+                "reason_code": "network",
+                "count": 1,
+            },
+            {
+                "status": "needs_review",
+                "reason_code": "not_listed",
+                "count": 1,
+            },
+        ]
+        impossible_rollup = impossible_report["market_issue_rollups"][0]
+        impossible_rollup["reason_code_counts"] = {"network": 2}
+        impossible_rollup["issue_outcome_counts"] = copy.deepcopy(
+            impossible_report["issue_outcome_counts"]
+        )
+        impossible_fact = impossible_marginals["markets"][0]["facts"][
+            "daily"
+        ]
+        impossible_fact["reason_code"] = "network"
+        impossible_fact["reason_code_counts"] = {"network": 2}
+        impossible_fact["issue_outcome_counts"] = copy.deepcopy(
+            impossible_report["issue_outcome_counts"]
+        )
+        impossible_rollup["fact_outcome"]["reason_code"] = "network"
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "outcome counts",
+        ):
+            validate_quality(
+                impossible_marginals,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        distinct_zero_outcomes = copy.deepcopy(quality)
+        first_daily = distinct_zero_outcomes["markets"][0]["facts"][
+            "daily"
+        ]
+        first_daily.update(
+            {
+                "status": "not_applicable",
+                "reason_code": (
+                    "selected_window_before_first_market_observation"
+                ),
+                "retryable": False,
+                "action": None,
+            }
+        )
+        distinct_zero_outcomes["metadata"]["daily_quality_report"][
+            "market_issue_rollups"
+        ][0]["fact_outcome"] = {
+            "status": "not_applicable",
+            "reason_code": "selected_window_before_first_market_observation",
+            "retryable": False,
+            "action": None,
+        }
+        validate_quality(
+            distinct_zero_outcomes,
+            token="AAVE",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation="generation-1",
+        )
+        swapped_zero_facts = copy.deepcopy(distinct_zero_outcomes)
+        facts_a = swapped_zero_facts["markets"][0]["facts"]
+        facts_b = swapped_zero_facts["markets"][1]["facts"]
+        facts_a["daily"], facts_b["daily"] = facts_b["daily"], facts_a[
+            "daily"
+        ]
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "market rollup",
+        ):
+            validate_quality(
+                swapped_zero_facts,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
 
         impossible_cex_tvl = copy.deepcopy(quality)
         impossible_cex_tvl["markets"][0]["facts"]["tvl"].update(

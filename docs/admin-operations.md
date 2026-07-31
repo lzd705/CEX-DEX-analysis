@@ -137,6 +137,15 @@ counts are real integers and affected dates are sorted, unique canonical UTC
 dates. Public flag messages containing a raw URL, protected POSIX path, any
 backslash path, or control marker fail preflight.
 
+A matched daily report must publish one `market_issue_rollups` row for every
+returned Market. Unaffected Markets still carry an explicit zero-count daily
+evidence bundle. Preflight compares each daily Fact with the rollup for its
+exact `market_id`, then compares the sum and date union with the report-level
+counts. Joint `(status, reason_code)` counts must reproduce both marginal count
+maps, so an impossible combination cannot pass. Aggregate equality alone is
+insufficient: missing evidence, a Fact moved without its Market-bound rollup,
+or inconsistent joint counts blocks deployment.
+
 Preflight also recomputes every selected fact's canonical
 `status/reason_code/retryable/action` tuple through the shared outcome table,
 reconstructs selected status and flags from the four fact families, and

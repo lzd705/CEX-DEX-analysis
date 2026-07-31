@@ -109,6 +109,14 @@ full catalog must also have identical `(token_symbol, market_id)` sets, without
 bare IDs reused across Tokens. The selected view must name exactly two distinct
 Markets and expose only sorted canonical UTC affected dates with real integer
 counts.
+Matched daily evidence is market-bound, not merely response-bound: every
+Market receives an explicit rollup and complete Fact evidence, including a
+zero-count bundle when no issue applies. The release gate validates the
+per-Market mode, canonical outcome, joint status/reason counts, and date
+mapping before accepting the aggregate report totals. This prevents ordinary
+projection bugs from silently reassigning a problem between Market A and
+Market B and rejects marginal count combinations that no real issue set could
+produce.
 
 DEX price-time alignment is shown only for measured depth: an observed,
 complete, or partial fixed-block row with at least one finite USD band and an

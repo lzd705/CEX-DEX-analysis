@@ -90,6 +90,20 @@ cannot be reused across Tokens. Selected quality accepts exactly two distinct
 selected IDs, real integer report counts, and sorted unique canonical
 `YYYY-MM-DD` affected dates.
 
+When the selected daily report identity is matched, evidence is also bound to
+each exact Market. `daily_quality_report.market_issue_rollups` contains one
+rollup for every returned Market, including explicit zero-count rollups for
+unaffected Markets. Every daily Fact carries the corresponding complete
+evidence bundle (`daily_evidence_mode`, joint status/reason outcomes, marginal
+counts, and affected dates). Each rollup also binds the canonical Fact outcome
+and evidence mode. Release validation reconciles each Fact to its own
+`market_id` rollup and then reconciles all rollups to the report totals.
+Omitting a zero bundle, moving a Fact without its exact Market rollup,
+duplicating a rollup, publishing impossible status/reason marginals, or
+preserving only the global totals is a release failure. This is a consistency
+gate over the public response, not a cryptographic attestation against a
+malicious server that fabricates both a Fact and its rollup together.
+
 The optional `quality/daily-latest.json` also participates in that source
 signature. A missing, malformed, oversized, path-unsafe, wrong-schema, or
 identity-mismatched report is ignored and the API labels its fallback as

@@ -3349,13 +3349,38 @@ def _daily_quality_issues_for_window(
     )
 
 
+def _daily_issue_outcome_counts(
+    issues: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    counts = Counter(
+        (issue["status"], issue["reason_code"])
+        for issue in issues
+    )
+    return [
+        {
+            "status": status,
+            "reason_code": reason_code,
+            "count": count,
+        }
+        for (status, reason_code), count in sorted(counts.items())
+    ]
+
+
 def _overlay_daily_quality_report(
     fact: dict[str, Any],
     issues: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
     issues = list(issues)
     if not issues:
-        return fact
+        return {
+            **fact,
+            "reason_code_counts": {},
+            "issue_status_counts": {},
+            "issue_outcome_counts": [],
+            "affected_dates": [],
+            "affected_date_count": 0,
+            "daily_evidence_mode": "published_daily_audit",
+        }
     status_counts = Counter(issue["status"] for issue in issues)
     reason_counts = Counter(issue["reason_code"] for issue in issues)
     affected_dates = sorted({issue["date"] for issue in issues})
@@ -3438,6 +3463,7 @@ def _overlay_daily_quality_report(
         "action": action,
         "reason_code_counts": dict(sorted(reason_counts.items())),
         "issue_status_counts": dict(sorted(status_counts.items())),
+        "issue_outcome_counts": _daily_issue_outcome_counts(issues),
         "affected_dates": affected_dates,
         "affected_date_count": len(affected_dates),
         "daily_evidence_mode": "published_daily_audit",
@@ -3454,7 +3480,7 @@ def _reconcile_daily_fact_without_report_issue(
         "backfill_pending",
         "missing_unexplained",
     }:
-        return fact
+        return _overlay_daily_quality_report(fact, [])
     flags = list(fact.get("quality_flags") or [])
     code = "daily_needs_review"
     message = (
@@ -3484,6 +3510,7 @@ def _reconcile_daily_fact_without_report_issue(
             "daily_audit_no_matching_issue": 1,
         },
         "issue_status_counts": {},
+        "issue_outcome_counts": [],
         "affected_dates": [],
         "affected_date_count": 0,
         "daily_evidence_mode": "catalog_report_reconciliation",
@@ -4553,9 +4580,61 @@ def build_market_quality(
     report_status_counts = Counter(
         issue["status"] for issue in selected_report_issues
     )
+    report_outcome_counts = _daily_issue_outcome_counts(
+        selected_report_issues
+    )
     report_affected_dates = sorted(
         {issue["date"] for issue in selected_report_issues}
     )
+    report_market_rollups = []
+    if quality_report_state["status"] == "matched":
+        daily_facts_by_market = {
+            market["market_id"]: market["facts"]["daily"]
+            for market in quality_markets
+        }
+        for market in token_markets:
+            market_issues = report_issues_by_market.get(
+                market["market_id"],
+                [],
+            )
+            market_status_counts = Counter(
+                issue["status"] for issue in market_issues
+            )
+            market_reason_counts = Counter(
+                issue["reason_code"] for issue in market_issues
+            )
+            market_affected_dates = sorted(
+                {issue["date"] for issue in market_issues}
+            )
+            daily_fact = daily_facts_by_market[market["market_id"]]
+            report_market_rollups.append(
+                {
+                    "market_id": market["market_id"],
+                    "issue_count": len(market_issues),
+                    "issue_outcome_counts": _daily_issue_outcome_counts(
+                        market_issues
+                    ),
+                    "reason_code_counts": dict(
+                        sorted(market_reason_counts.items())
+                    ),
+                    "status_counts": dict(
+                        sorted(market_status_counts.items())
+                    ),
+                    "affected_date_count": len(
+                        market_affected_dates
+                    ),
+                    "affected_dates": market_affected_dates,
+                    "evidence_mode": daily_fact[
+                        "daily_evidence_mode"
+                    ],
+                    "fact_outcome": {
+                        "status": daily_fact["status"],
+                        "reason_code": daily_fact["reason_code"],
+                        "retryable": daily_fact["retryable"],
+                        "action": daily_fact["action"],
+                    },
+                }
+            )
     return {
         "metadata": {
             "contract_version": QUALITY_CONTRACT_VERSION,
@@ -4583,6 +4662,11 @@ def build_market_quality(
                 "selected_window_issue_count": len(
                     selected_report_issues
                 ),
+                **(
+                    {"issue_outcome_counts": report_outcome_counts}
+                    if quality_report_state["status"] == "matched"
+                    else {}
+                ),
                 "reason_code_counts": dict(
                     sorted(report_reason_counts.items())
                 ),
@@ -4591,6 +4675,11 @@ def build_market_quality(
                 ),
                 "affected_date_count": len(report_affected_dates),
                 "affected_dates": report_affected_dates,
+                **(
+                    {"market_issue_rollups": report_market_rollups}
+                    if quality_report_state["status"] == "matched"
+                    else {}
+                ),
             },
             "freshness": catalog["metadata"].get("freshness"),
             "sources": catalog["metadata"].get("sources", []),

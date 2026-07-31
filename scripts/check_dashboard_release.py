@@ -96,6 +96,7 @@ DAILY_FACT_EVIDENCE_FIELDS = frozenset(
     {
         "daily_evidence_mode",
         "issue_status_counts",
+        "issue_outcome_counts",
         "reason_code_counts",
         "affected_date_count",
         "affected_dates",
@@ -475,7 +476,54 @@ def _normalized_daily_count_map(
     return dict(sorted(normalized.items()))
 
 
-def _validate_daily_quality_report(report: Any) -> dict[str, Any]:
+def _normalized_daily_outcome_counts(
+    value: Any,
+    *,
+    label: str,
+    market_type: str | None = None,
+) -> dict[tuple[str, str], int]:
+    require(isinstance(value, list), label)
+    normalized: dict[tuple[str, str], int] = {}
+    for item in value:
+        require(
+            isinstance(item, dict)
+            and set(item) == {"status", "reason_code", "count"}
+            and isinstance(item.get("status"), str)
+            and item["status"] in DAILY_QUALITY_STATUS_PRIORITY
+            and isinstance(item.get("reason_code"), str)
+            and SCREENING_QUALITY_CODE_PATTERN.fullmatch(
+                item["reason_code"]
+            )
+            is not None
+            and type(item.get("count")) is int
+            and item["count"] > 0,
+            label,
+        )
+        pair = (item["status"], item["reason_code"])
+        require(pair not in normalized, label)
+        families = (market_type,) if market_type else ("cex", "dex")
+        require(
+            any(
+                canonical_quality_fact_rule(
+                    family,
+                    "daily",
+                    pair[0],
+                    pair[1],
+                )
+                is not None
+                for family in families
+            ),
+            label,
+        )
+        normalized[pair] = item["count"]
+    return dict(sorted(normalized.items()))
+
+
+def _validate_daily_quality_report(
+    report: Any,
+    *,
+    expected_market_ids: set[str],
+) -> dict[str, Any]:
     require(
         isinstance(report, dict)
         and report.get("status")
@@ -525,11 +573,31 @@ def _validate_daily_quality_report(report: Any) -> dict[str, Any]:
         label="Quality daily-audit reason/status counts are inconsistent",
         allowed_keys=frozenset(DAILY_QUALITY_STATUS_PRIORITY),
     )
+    outcome_counts = (
+        _normalized_daily_outcome_counts(
+            report.get("issue_outcome_counts"),
+            label="Quality daily-audit outcome counts are invalid",
+        )
+        if status == "matched"
+        else {}
+    )
+    outcome_status_counts: Counter[str] = Counter()
+    outcome_reason_counts: Counter[str] = Counter()
+    for (outcome_status, outcome_reason), count in outcome_counts.items():
+        outcome_status_counts[outcome_status] += count
+        outcome_reason_counts[outcome_reason] += count
     require(
         sum(reason_counts.values()) == issue_count
         and sum(status_counts.values()) == issue_count,
         "Quality daily-audit reason/status counts are inconsistent",
     )
+    if status == "matched":
+        require(
+            dict(sorted(outcome_status_counts.items())) == status_counts
+            and dict(sorted(outcome_reason_counts.items()))
+            == reason_counts,
+            "Quality daily-audit outcome counts do not match its marginals",
+        )
     affected_dates = report.get("affected_dates")
     require(
         isinstance(affected_dates, list)
@@ -548,12 +616,129 @@ def _validate_daily_quality_report(report: Any) -> dict[str, Any]:
             and not affected_dates,
             "Quality fallback cannot claim published daily-audit issues",
         )
+        require(
+            "market_issue_rollups" not in report,
+            "Quality fallback cannot claim market-bound daily evidence",
+        )
+        require(
+            "issue_outcome_counts" not in report,
+            "Quality fallback cannot claim published outcome counts",
+        )
+        market_rollups: dict[str, dict[str, Any]] = {}
+    else:
+        raw_rollups = report.get("market_issue_rollups")
+        require(
+            isinstance(raw_rollups, list)
+            and len(raw_rollups) == len(expected_market_ids),
+            "Quality daily-audit market rollups are incomplete",
+        )
+        market_rollups = {}
+        rollup_status_counts: Counter[str] = Counter()
+        rollup_reason_counts: Counter[str] = Counter()
+        rollup_affected_dates: set[str] = set()
+        rollup_outcome_counts: Counter[tuple[str, str]] = Counter()
+        rollup_issue_count = 0
+        for rollup in raw_rollups:
+            require(
+                isinstance(rollup, dict)
+                and isinstance(rollup.get("market_id"), str)
+                and rollup["market_id"] in expected_market_ids
+                and rollup["market_id"] not in market_rollups,
+                "Quality daily-audit market rollups are invalid",
+            )
+            rollup_count = rollup.get("issue_count")
+            rollup_reasons = _normalized_daily_count_map(
+                rollup.get("reason_code_counts"),
+                label="Quality daily-audit market rollups are invalid",
+            )
+            rollup_statuses = _normalized_daily_count_map(
+                rollup.get("status_counts"),
+                label="Quality daily-audit market rollups are invalid",
+                allowed_keys=frozenset(DAILY_QUALITY_STATUS_PRIORITY),
+            )
+            rollup_outcomes = _normalized_daily_outcome_counts(
+                rollup.get("issue_outcome_counts"),
+                label="Quality daily-audit market rollup outcome counts are invalid",
+            )
+            rollup_outcome_statuses: Counter[str] = Counter()
+            rollup_outcome_reasons: Counter[str] = Counter()
+            for (outcome_status, outcome_reason), count in (
+                rollup_outcomes.items()
+            ):
+                rollup_outcome_statuses[outcome_status] += count
+                rollup_outcome_reasons[outcome_reason] += count
+            rollup_dates = rollup.get("affected_dates")
+            fact_outcome = rollup.get("fact_outcome")
+            require(
+                type(rollup_count) is int
+                and rollup_count >= 0
+                and sum(rollup_reasons.values()) == rollup_count
+                and sum(rollup_statuses.values()) == rollup_count
+                and dict(sorted(rollup_outcome_statuses.items()))
+                == rollup_statuses
+                and dict(sorted(rollup_outcome_reasons.items()))
+                == rollup_reasons
+                and isinstance(rollup_dates, list)
+                and all(_is_canonical_date(value) for value in rollup_dates)
+                and rollup_dates == sorted(set(rollup_dates))
+                and type(rollup.get("affected_date_count")) is int
+                and rollup["affected_date_count"] == len(rollup_dates)
+                and len(rollup_dates) <= rollup_count,
+                "Quality daily-audit market rollups are invalid",
+            )
+            require(
+                rollup.get("evidence_mode")
+                in {
+                    "published_daily_audit",
+                    "catalog_report_reconciliation",
+                }
+                and isinstance(fact_outcome, dict)
+                and set(fact_outcome)
+                == {"status", "reason_code", "retryable", "action"}
+                and isinstance(fact_outcome.get("status"), str)
+                and isinstance(fact_outcome.get("reason_code"), str)
+                and type(fact_outcome.get("retryable")) is bool
+                and (
+                    fact_outcome.get("action") is None
+                    or isinstance(fact_outcome.get("action"), str)
+                ),
+                "Quality daily-audit market rollup fact outcome is invalid",
+            )
+            normalized_rollup = {
+                "mode": rollup["evidence_mode"],
+                "issue_count": rollup_count,
+                "outcome_counts": rollup_outcomes,
+                "reason_counts": rollup_reasons,
+                "status_counts": rollup_statuses,
+                "affected_dates": rollup_dates,
+                "fact_outcome": fact_outcome,
+            }
+            market_rollups[rollup["market_id"]] = normalized_rollup
+            rollup_issue_count += rollup_count
+            rollup_reason_counts.update(rollup_reasons)
+            rollup_status_counts.update(rollup_statuses)
+            rollup_affected_dates.update(rollup_dates)
+            rollup_outcome_counts.update(rollup_outcomes)
+        require(
+            set(market_rollups) == expected_market_ids
+            and rollup_issue_count == issue_count
+            and dict(sorted(rollup_reason_counts.items())) == reason_counts
+            and dict(sorted(rollup_status_counts.items())) == status_counts
+            and sorted(rollup_affected_dates) == affected_dates,
+            "Quality daily-audit market rollups do not match the report",
+        )
+        require(
+            dict(sorted(rollup_outcome_counts.items())) == outcome_counts,
+            "Quality daily-audit market rollups do not match the report",
+        )
     return {
         "status": status,
         "issue_count": issue_count,
         "reason_counts": reason_counts,
         "status_counts": status_counts,
+        "outcome_counts": outcome_counts,
         "affected_dates": affected_dates,
+        "market_rollups": market_rollups,
     }
 
 
@@ -571,10 +756,20 @@ def _validate_daily_fact_evidence(
         field for field in DAILY_FACT_EVIDENCE_FIELDS if field in fact
     }
 
+    if report_status == "matched":
+        require(
+            present_evidence_fields == DAILY_FACT_EVIDENCE_FIELDS,
+            "Quality daily fact evidence/action is incomplete",
+        )
+    else:
+        require(
+            mode is None and not present_evidence_fields,
+            "Quality daily fact evidence/action mode is invalid",
+        )
+
     if mode == "published_daily_audit":
         require(
-            report_status == "matched"
-            and present_evidence_fields == DAILY_FACT_EVIDENCE_FIELDS,
+            report_status == "matched",
             "Quality daily fact evidence/action is incomplete",
         )
         status_counts = _normalized_daily_count_map(
@@ -588,15 +783,28 @@ def _validate_daily_fact_evidence(
             label="Quality daily fact evidence/action counts are invalid",
             require_positive_entries=True,
         )
+        outcome_counts = _normalized_daily_outcome_counts(
+            fact.get("issue_outcome_counts"),
+            label="Quality daily fact evidence/action outcome counts are invalid",
+            market_type=market_type,
+        )
+        outcome_status_counts: Counter[str] = Counter()
+        outcome_reason_counts: Counter[str] = Counter()
+        for (outcome_status, outcome_reason), count in (
+            outcome_counts.items()
+        ):
+            outcome_status_counts[outcome_status] += count
+            outcome_reason_counts[outcome_reason] += count
         issue_count = sum(status_counts.values())
         require(
-            issue_count > 0 and sum(reason_counts.values()) == issue_count,
+            sum(reason_counts.values()) == issue_count
+            and dict(sorted(outcome_status_counts.items())) == status_counts
+            and dict(sorted(outcome_reason_counts.items())) == reason_counts,
             "Quality daily fact evidence/action counts are inconsistent",
         )
         affected_dates = fact.get("affected_dates")
         require(
             isinstance(affected_dates, list)
-            and bool(affected_dates)
             and all(_is_canonical_date(value) for value in affected_dates)
             and affected_dates == sorted(set(affected_dates))
             and type(fact.get("affected_date_count")) is int
@@ -604,22 +812,45 @@ def _validate_daily_fact_evidence(
             and len(affected_dates) <= issue_count,
             "Quality daily fact evidence/action dates are inconsistent",
         )
-        require(
-            all(
-                any(
-                    canonical_quality_fact_rule(
-                        market_type,
-                        "daily",
-                        issue_status,
-                        issue_reason,
-                    )
-                    is not None
-                    for issue_status in status_counts
+        if issue_count == 0:
+            require(
+                not status_counts
+                and not reason_counts
+                and not affected_dates
+                and (status, reason_code) in DAILY_MATCHED_NO_ISSUE_OUTCOMES,
+                "Quality daily fact zero evidence/action is invalid",
+            )
+            try:
+                expected_action = canonical_quality_fact_action(
+                    market_type,
+                    "daily",
+                    status,
+                    reason_code,
+                    retryable,
+                    manual_review_present=False,
                 )
-                for issue_reason in reason_counts
-            ),
-            "Quality daily fact evidence/action reasons are impossible",
-        )
+            except ValueError as error:
+                raise ReleaseCheckError(
+                    "Quality daily fact zero evidence/action is invalid"
+                ) from error
+            require(
+                fact.get("action") == expected_action,
+                "Quality daily fact zero evidence/action is invalid",
+            )
+            return {
+                "mode": mode,
+                "issue_count": 0,
+                "status_counts": {},
+                "outcome_counts": {},
+                "reason_counts": {},
+                "affected_dates": [],
+                "fact_outcome": {
+                    "status": status,
+                    "reason_code": reason_code,
+                    "retryable": retryable,
+                    "action": fact.get("action"),
+                },
+            }
         expected_status = min(
             status_counts,
             key=lambda candidate: DAILY_QUALITY_STATUS_PRIORITY[candidate],
@@ -658,8 +889,15 @@ def _validate_daily_fact_evidence(
             "mode": mode,
             "issue_count": issue_count,
             "status_counts": status_counts,
+            "outcome_counts": outcome_counts,
             "reason_counts": reason_counts,
             "affected_dates": affected_dates,
+            "fact_outcome": {
+                "status": status,
+                "reason_code": reason_code,
+                "retryable": retryable,
+                "action": fact.get("action"),
+            },
         }
 
     if mode == "catalog_report_reconciliation":
@@ -667,6 +905,7 @@ def _validate_daily_fact_evidence(
             report_status == "matched"
             and present_evidence_fields == DAILY_FACT_EVIDENCE_FIELDS
             and fact.get("issue_status_counts") == {}
+            and fact.get("issue_outcome_counts") == []
             and fact.get("reason_code_counts")
             == {"daily_audit_no_matching_issue": 1}
             and fact.get("affected_date_count") == 0
@@ -681,14 +920,18 @@ def _validate_daily_fact_evidence(
             "mode": mode,
             "issue_count": 0,
             "status_counts": {},
+            "outcome_counts": {},
             "reason_counts": {},
             "affected_dates": [],
+            "fact_outcome": {
+                "status": status,
+                "reason_code": reason_code,
+                "retryable": retryable,
+                "action": fact.get("action"),
+            },
         }
 
-    require(
-        mode is None and not present_evidence_fields,
-        "Quality daily fact evidence/action mode is invalid",
-    )
+    require(report_status != "matched", "Quality daily fact evidence/action is incomplete")
     pair = (status, reason_code)
     allowed = (
         DAILY_MATCHED_NO_ISSUE_OUTCOMES
@@ -720,8 +963,15 @@ def _validate_daily_fact_evidence(
         "mode": None,
         "issue_count": 0,
         "status_counts": {},
+        "outcome_counts": {},
         "reason_counts": {},
         "affected_dates": [],
+        "fact_outcome": {
+            "status": status,
+            "reason_code": reason_code,
+            "retryable": retryable,
+            "action": fact.get("action"),
+        },
     }
 
 
@@ -737,7 +987,8 @@ def validate_quality(
     markets = payload.get("markets")
     expected_ids = {market_a, market_b}
     daily_report = _validate_daily_quality_report(
-        metadata.get("daily_quality_report")
+        metadata.get("daily_quality_report"),
+        expected_market_ids=expected_ids,
     )
     daily_evidence_rows: list[dict[str, Any]] = []
     require(payload.get("token_symbol") == token, "Quality returned wrong Token")
@@ -879,13 +1130,29 @@ def validate_quality(
                 "Quality fact does not use a canonical outcome/action tuple",
             )
             if fact_name == "daily":
-                daily_evidence_rows.append(
-                    _validate_daily_fact_evidence(
-                        fact,
-                        market_type=market_type,
-                        report_status=daily_report["status"],
-                    )
+                daily_evidence = _validate_daily_fact_evidence(
+                    fact,
+                    market_type=market_type,
+                    report_status=daily_report["status"],
                 )
+                if daily_report["status"] == "matched":
+                    require(
+                        {
+                            key: daily_evidence[key]
+                            for key in (
+                                "mode",
+                                "issue_count",
+                                "outcome_counts",
+                                "status_counts",
+                                "reason_counts",
+                                "affected_dates",
+                                "fact_outcome",
+                            )
+                        }
+                        == daily_report["market_rollups"][row["market_id"]],
+                        "Quality daily fact evidence/action does not match its market rollup",
+                    )
+                daily_evidence_rows.append(daily_evidence)
                 expected_action = fact.get("action")
             else:
                 expected_action = canonical_quality_fact_action(
@@ -913,6 +1180,7 @@ def validate_quality(
         )
     published_status_counts: Counter[str] = Counter()
     published_reason_counts: Counter[str] = Counter()
+    published_outcome_counts: Counter[tuple[str, str]] = Counter()
     published_affected_dates: set[str] = set()
     published_issue_count = 0
     for evidence in daily_evidence_rows:
@@ -921,6 +1189,7 @@ def validate_quality(
         published_issue_count += evidence["issue_count"]
         published_status_counts.update(evidence["status_counts"])
         published_reason_counts.update(evidence["reason_counts"])
+        published_outcome_counts.update(evidence["outcome_counts"])
         published_affected_dates.update(evidence["affected_dates"])
     require(
         published_issue_count == daily_report["issue_count"]
@@ -928,6 +1197,8 @@ def validate_quality(
         == daily_report["status_counts"]
         and dict(sorted(published_reason_counts.items()))
         == daily_report["reason_counts"]
+        and dict(sorted(published_outcome_counts.items()))
+        == daily_report["outcome_counts"]
         and sorted(published_affected_dates)
         == daily_report["affected_dates"],
         "Quality daily fact evidence/action does not reconcile to the report",
