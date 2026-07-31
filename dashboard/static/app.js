@@ -5084,13 +5084,17 @@ async function applyWindow() {
     const previousPayload = app.payload;
     const previousVisibleTokens = app.visibleTokens;
     replaceCurrentRoute();
-    const applied = await applyRouteFromLocation();
+    const routeApplication = applyRouteFromLocation();
+    const routeRequestId = app.routeRequestId;
+    const applied = await routeApplication;
     if (!applied) {
-      app.payload = previousPayload;
-      app.visibleTokens = previousVisibleTokens;
-      byId("date-start").value = start;
-      byId("date-end").value = end;
-      renderAppliedTimeWindowControls();
+      if (routeRequestId === app.routeRequestId) {
+        app.payload = previousPayload;
+        app.visibleTokens = previousVisibleTokens;
+        byId("date-start").value = start;
+        byId("date-end").value = end;
+        renderAppliedTimeWindowControls();
+      }
       return false;
     }
     return true;

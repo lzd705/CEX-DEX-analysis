@@ -384,6 +384,233 @@ globalThis.MarketMonitorNavigation = {
             "applied": {"start": "2026-07-23", "end": "2026-07-29"},
         })
 
+    def test_stale_workspace_window_keeps_newer_state_and_bound_editor(self):
+        self.maxDiff = None
+        result = run_app_javascript(
+            """
+function control({ value = "", hidden = false, dataset = {} } = {}) {
+  return {
+    value,
+    hidden,
+    dataset,
+    disabled: false,
+    textContent: "",
+    attributes: {},
+    listeners: {},
+    active: false,
+    focusCalls: 0,
+    classList: {
+      owner: null,
+      toggle(name, active) {
+        if (name === "active") this.owner.active = active;
+      },
+    },
+    addEventListener(type, listener) {
+      this.listeners[type] = this.listeners[type] || [];
+      this.listeners[type].push(listener);
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return this.attributes[name] || null; },
+    focus() { this.focusCalls += 1; },
+  };
+}
+async function trigger(target, type) {
+  for (const listener of target.listeners[type] || []) {
+    await listener({ preventDefault() {} });
+  }
+}
+function payload(start, end) {
+  return {
+    metadata: {
+      start_date: start,
+      end_date: end,
+      available_start: "2026-05-01",
+      available_end: "2026-07-29",
+      data_generation: "generation-a",
+    },
+    tokens: [{ token_symbol: "BTC" }],
+  };
+}
+
+const start = control();
+const end = control();
+const error = control({ hidden: true });
+const editor = control({ hidden: true });
+const toggle = control();
+const form = control();
+const cancel = control();
+const summary = control();
+const presets = ["7", "30", "90", "all"].map((days) => (
+  control({ dataset: { days } })
+));
+const genericControls = new Map();
+for (const item of [start, end, error, editor, toggle, form, cancel, summary, ...presets]) {
+  item.classList.owner = item;
+}
+toggle.setAttribute("aria-expanded", "false");
+const elements = {
+  "date-start": start,
+  "date-end": end,
+  "date-window-error": error,
+  "custom-window-editor": editor,
+  "custom-window-toggle": toggle,
+  "date-window-form": form,
+  "cancel-window": cancel,
+  "applied-window-summary": summary,
+};
+global.document = {
+  getElementById(id) {
+    if (elements[id]) return elements[id];
+    if (!genericControls.has(id)) genericControls.set(id, control());
+    return genericControls.get(id);
+  },
+  querySelectorAll(selector) {
+    if (selector === "[data-days]") return presets;
+    return [];
+  },
+  addEventListener() {},
+};
+global.window = {
+  location: { pathname: "/tokens/BTC/markets", search: "" },
+  history: { replaceState() {} },
+  addEventListener() {},
+  visualViewport: null,
+  matchMedia() { return { addEventListener() {} }; },
+  lucide: null,
+};
+
+let routeWindow = { start: "2026-06-30", end: "2026-07-29" };
+globalThis.__workspaceRoute = () => ({
+  kind: "workspace",
+  token: "BTC",
+  page: "markets",
+  state: { ...routeWindow },
+});
+
+setActiveAppView = () => {};
+setActiveWorkspacePage = () => {};
+setWorkspaceCatalogLoading = () => {};
+setWorkspaceDataUnavailable = () => {};
+announceRoute = () => {};
+updateRouteLinks = () => {};
+canonicalizeCurrentRoute = () => {};
+replaceCurrentRoute = () => {};
+cachedTokenCatalog = () => null;
+applyWorkspaceRoute = (route) => {
+  app.route = route;
+  start.value = route.state.start;
+  end.value = route.state.end;
+  renderAppliedTimeWindowControls();
+};
+
+let catalogCall = 0;
+let releaseOlderCatalog = null;
+loadTokenCatalog = async () => {
+  catalogCall += 1;
+  if (catalogCall === 1) {
+    return new Promise((resolve) => {
+      releaseOlderCatalog = () => resolve({ metadata: { window: "older" } });
+    });
+  }
+  return { metadata: { window: "newer" } };
+};
+loadMarket = async (loadedStart, loadedEnd) => {
+  app.payload = payload(loadedStart, loadedEnd);
+  app.visibleTokens = [{ token_symbol: "NEW" }];
+  start.value = loadedStart;
+  end.value = loadedEnd;
+  renderAppliedTimeWindowControls();
+  return true;
+};
+
+const realSync = syncTimeWindowControls;
+let syncCalls = 0;
+syncTimeWindowControls = () => {
+  syncCalls += 1;
+  realSync();
+};
+bindEvents();
+
+async function runInterleaving({ bound }) {
+  routeWindow = { start: "2026-06-30", end: "2026-07-29" };
+  app.payload = payload(routeWindow.start, routeWindow.end);
+  app.visibleTokens = [{ token_symbol: "OLD" }];
+  app.route = globalThis.__workspaceRoute();
+  app.routeReady = true;
+  app.routeRequestId = 0;
+  app.marketRequestId = 0;
+  app.marketController = null;
+  app.catalogController = null;
+  app.catalogsByToken.clear();
+  catalogCall = 0;
+  releaseOlderCatalog = null;
+  syncCalls = 0;
+  start.value = routeWindow.start;
+  end.value = routeWindow.end;
+  realSync();
+  setCustomWindowOpen(true);
+  toggle.focusCalls = 0;
+
+  const olderCompletion = bound
+    ? trigger(form, "submit")
+    : applyWindow();
+  if (!releaseOlderCatalog) throw new Error("The older catalog request did not start.");
+
+  routeWindow = { start: "2026-07-23", end: "2026-07-29" };
+  const newerApplied = await applyRouteFromLocation();
+  const syncCallsBeforeOlderCompletion = syncCalls;
+  const focusCallsBeforeOlderCompletion = toggle.focusCalls;
+  releaseOlderCatalog();
+  const olderApplied = await olderCompletion;
+
+  return {
+    newerApplied,
+    olderApplied: bound ? null : olderApplied,
+    payloadStart: app.payload.metadata.start_date,
+    visibleTokens: app.visibleTokens.map((token) => token.token_symbol),
+    draft: { start: start.value, end: end.value },
+    summary: summary.textContent,
+    active: presets.filter((button) => button.active).map((button) => button.dataset.days),
+    successOnlySyncCalls: syncCalls - syncCallsBeforeOlderCompletion,
+    editorHidden: editor.hidden,
+    expanded: toggle.getAttribute("aria-expanded"),
+    focusCalls: toggle.focusCalls - focusCallsBeforeOlderCompletion,
+  };
+}
+
+const direct = await runInterleaving({ bound: false });
+const bound = await runInterleaving({ bound: true });
+console.log(JSON.stringify({ direct, bound }));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  parseRoute() { return globalThis.__workspaceRoute(); },
+};
+""",
+        )
+        newer_state = {
+            "newerApplied": True,
+            "payloadStart": "2026-07-23",
+            "visibleTokens": ["NEW"],
+            "draft": {"start": "2026-07-23", "end": "2026-07-29"},
+            "summary": "23–29 Jul 2026 · 7 days",
+            "active": ["7"],
+            "successOnlySyncCalls": 0,
+            "editorHidden": False,
+            "expanded": "true",
+            "focusCalls": 0,
+        }
+        self.assertEqual(result, {
+            "direct": {
+                "olderApplied": False,
+                **newer_state,
+            },
+            "bound": {
+                "olderApplied": None,
+                **newer_state,
+            },
+        })
+
     def test_time_window_summary_and_active_state_use_applied_payload(self):
         result = run_app_javascript(
             """
