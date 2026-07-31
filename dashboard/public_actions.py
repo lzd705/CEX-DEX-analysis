@@ -33,6 +33,7 @@ PUBLIC_TOKEN_RESOLVE_PATH = "/api/actions/tokens/resolve"
 PUBLIC_TOKEN_ADD_PATH = "/api/actions/tokens"
 PUBLIC_QUALITY_RETRYABLE_PATH = "/api/actions/quality/retryable"
 PUBLIC_QUALITY_RETRY_PATH = "/api/actions/quality/retry"
+PUBLIC_FACT_REFRESH_PATH = "/api/actions/facts/refresh"
 PUBLIC_JOB_STATUS_PREFIX = "/api/actions/jobs/"
 PUBLIC_ACTION_PATHS = frozenset(
     {
@@ -40,6 +41,7 @@ PUBLIC_ACTION_PATHS = frozenset(
         PUBLIC_TOKEN_ADD_PATH,
         PUBLIC_QUALITY_RETRYABLE_PATH,
         PUBLIC_QUALITY_RETRY_PATH,
+        PUBLIC_FACT_REFRESH_PATH,
     }
 )
 
@@ -49,9 +51,11 @@ TOKEN_ACTION_PATHS = frozenset(
 QUALITY_ACTION_PATHS = frozenset(
     {PUBLIC_QUALITY_RETRYABLE_PATH, PUBLIC_QUALITY_RETRY_PATH}
 )
+FACT_ACTION_PATHS = frozenset({PUBLIC_FACT_REFRESH_PATH})
 
 PUBLIC_ADD_TOKEN_ACTOR = "public:add_token"
 PUBLIC_QUALITY_RETRY_ACTOR = "public:quality_retry"
+PUBLIC_FACT_REFRESH_ACTOR = "public:fact_refresh"
 PUBLIC_TOKEN_HISTORY_DAYS = 30
 MAX_RATE_LIMIT_BUCKETS = 4_096
 
@@ -122,6 +126,14 @@ ACTION_LIMITS: Mapping[str, ActionLimit] = {
         requested_by=PUBLIC_QUALITY_RETRY_ACTOR,
         job_type="retry_failed",
     ),
+    "fact_refresh": ActionLimit(
+        requests=6,
+        window_seconds=60 * 60,
+        concurrency_groups=("public_mutation",),
+        daily_job_budget=12,
+        requested_by=PUBLIC_FACT_REFRESH_ACTOR,
+        job_type="snapshot_refresh",
+    ),
     "job_status": ActionLimit(
         requests=60,
         window_seconds=60,
@@ -144,6 +156,7 @@ class PublicActionPolicy:
         *,
         add_token_enabled: bool | None = None,
         quality_retry_enabled: bool | None = None,
+        fact_refresh_enabled: bool | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         utc_now: Callable[[], datetime] | None = None,
     ) -> None:
@@ -156,6 +169,11 @@ class PublicActionPolicy:
             environment_flag("PUBLIC_QUALITY_RETRY_ENABLED")
             if quality_retry_enabled is None
             else quality_retry_enabled
+        )
+        self.fact_refresh_enabled = (
+            environment_flag("PUBLIC_FACT_REFRESH_ENABLED")
+            if fact_refresh_enabled is None
+            else fact_refresh_enabled
         )
         self._monotonic = monotonic
         self._utc_now = utc_now or (lambda: datetime.now(timezone.utc))
@@ -175,6 +193,8 @@ class PublicActionPolicy:
             return self.add_token_enabled
         if path in QUALITY_ACTION_PATHS:
             return self.quality_retry_enabled
+        if path in FACT_ACTION_PATHS:
+            return self.fact_refresh_enabled
         return False
 
     @staticmethod

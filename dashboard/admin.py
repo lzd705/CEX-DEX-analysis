@@ -1188,8 +1188,12 @@ class AdminService:
             request: dict[str, Any] = self.validate_job(payload)
         elif job_type == "retry_failed":
             request = self.validate_retry_job(payload)
+        elif job_type == "snapshot_refresh":
+            request = self.validate_snapshot_refresh_job(payload)
         else:
-            raise ValueError("job_type must be refresh or retry_failed")
+            raise ValueError(
+                "job_type must be refresh, retry_failed, or snapshot_refresh"
+            )
         job_id = secrets.token_hex(16)
         job = {
             "job_id": job_id,
@@ -1217,6 +1221,32 @@ class AdminService:
             response = dict(job)
         self._start_job_thread(job_id)
         return response
+
+    @staticmethod
+    def validate_snapshot_refresh_job(payload: dict[str, Any]) -> dict[str, Any]:
+        token = str(payload.get("token_symbol") or "").strip().upper()
+        market_id = str(payload.get("market_id") or "").strip()
+        fact_type = str(payload.get("fact_type") or "").strip().lower()
+        if not token or len(token) > 32:
+            raise ValueError("token_symbol is required")
+        if not market_id or len(market_id) > 512:
+            raise ValueError("market_id is required")
+        if fact_type not in {"tvl", "depth"}:
+            raise ValueError("fact_type must be tvl or depth")
+        if market_id.startswith("cex:"):
+            market_type = "cex"
+        elif market_id.startswith("dex:"):
+            market_type = "dex"
+        else:
+            raise ValueError("market_id must be a canonical CEX or DEX ID")
+        if fact_type == "tvl" and market_type != "dex":
+            raise ValueError("TVL refresh applies only to DEX markets")
+        return {
+            "token_symbol": token,
+            "market_id": market_id,
+            "market_type": market_type,
+            "fact_type": fact_type,
+        }
 
     def create_onboarding_job(
         self,
@@ -1562,6 +1592,69 @@ class AdminService:
                 ),
                 "quality_report": "quality/daily-latest.json",
                 **refresh_result,
+            },
+        )
+
+    def _run_snapshot_refresh_job(
+        self,
+        job_id: str,
+        job: dict[str, Any],
+        log_path: Path,
+    ) -> None:
+        fact_type = job["fact_type"]
+        market_type = job["market_type"]
+        profile = (
+            "tvl"
+            if fact_type == "tvl"
+            else "cex_depth"
+            if market_type == "cex"
+            else "dex_depth"
+        )
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts/run_collection_cycle.py"),
+            "--profile",
+            profile,
+            "--publish-local",
+            "--data-dir",
+            str(self.data_dir),
+        ]
+        if fact_type == "depth":
+            command.extend(["--tokens", job["token_symbol"]])
+        try:
+            self._run_command(
+                command,
+                log_path,
+                stage=f"refresh_{profile}",
+                timeout_seconds=PUBLIC_COMMAND_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError):
+            self._fail_job(
+                job_id,
+                stage=f"refresh_{profile}",
+                error_code="snapshot_refresh_failed",
+                message="The requested snapshot refresh failed.",
+                retryable=True,
+            )
+            return
+        self._set_job(
+            job_id,
+            status="succeeded",
+            stage="complete",
+            finished_at=utc_now().isoformat(),
+            error=None,
+            error_code=None,
+            retryable=False,
+            publication_committed=True,
+            result={
+                "fact_type": fact_type,
+                "market_id": job["market_id"],
+                "collection_profile": profile,
+                "publication_scope": (
+                    "all_published_dex_pools"
+                    if fact_type == "tvl"
+                    else "configured_markets_for_token"
+                ),
             },
         )
 
@@ -2378,6 +2471,8 @@ class AdminService:
                     log_path.write_text("", encoding="utf-8")
                     if job.get("job_type") == "token_onboarding":
                         self._run_onboarding_job(job_id, job, log_path)
+                    elif job.get("job_type") == "snapshot_refresh":
+                        self._run_snapshot_refresh_job(job_id, job, log_path)
                     else:
                         self._run_refresh_job(job_id, job, log_path)
                 except Exception:

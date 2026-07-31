@@ -44,8 +44,8 @@ class EventFrontendTest(unittest.TestCase):
         self.assertIn("/api/markets/events?", app)
         self.assertIn('rel="noopener noreferrer"', app)
         self.assertIn('page === "events"', app)
-        self.assertIn("five research pages", app)
-        self.assertNotIn("four research pages", app)
+        self.assertIn("four research pages", app)
+        self.assertNotIn("five research pages", app)
 
     def test_mobile_header_keeps_all_navigation_and_freshness_visible(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
@@ -68,14 +68,15 @@ class EventFrontendTest(unittest.TestCase):
         self.assertNotIn("overflow-x: auto", navigation_rule.group(1))
         self.assertIn("min-width: 0", navigation_link_rule.group(1))
         self.assertEqual(index.count('data-app-route="screener"'), 1)
-        self.assertEqual(index.count('data-app-route="workspace"'), 1)
+        self.assertEqual(index.count('data-app-route="markets"'), 1)
+        self.assertEqual(index.count('data-app-route="research"'), 1)
         self.assertNotIn('data-app-route="methodology"', index)
         self.assertIn("min-width: 0", freshness_rule.group(1))
         self.assertIn("overflow: visible", freshness_rule.group(1))
         self.assertIn("white-space: normal", freshness_rule.group(1))
         self.assertIn("#freshness { min-width: 0; overflow-wrap: anywhere; }", mobile)
-        self.assertIn("/styles.css?v=20260730-compact-screener-v1", index)
-        self.assertIn("/app.js?v=20260730-compact-screener-v1", index)
+        self.assertIn("/styles.css?v=20260731-spread-quality-v1", index)
+        self.assertIn("/app.js?v=20260731-spread-quality-v1", index)
 
     def test_event_route_round_trips_lifecycle_filter(self):
         node = shutil.which("node")

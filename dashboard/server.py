@@ -43,13 +43,17 @@ try:
         build_token_summaries as build_fact_token_summaries,
         catalog_contract,
         catalog_from_market_payload,
+        cex_market_id,
         compare_daily_rows,
+        dex_market_id,
         enrich_market_quality,
         market_series_statistics,
     )
     from dashboard.public_actions import (
         PUBLIC_ACTION_PATHS,
         PUBLIC_ADD_TOKEN_ACTOR,
+        PUBLIC_FACT_REFRESH_ACTOR,
+        PUBLIC_FACT_REFRESH_PATH,
         PUBLIC_JOB_STATUS_PREFIX,
         PUBLIC_QUALITY_RETRY_ACTOR,
         PUBLIC_QUALITY_RETRYABLE_PATH,
@@ -78,13 +82,17 @@ except ModuleNotFoundError:
         build_token_summaries as build_fact_token_summaries,
         catalog_contract,
         catalog_from_market_payload,
+        cex_market_id,
         compare_daily_rows,
+        dex_market_id,
         enrich_market_quality,
         market_series_statistics,
     )
     from public_actions import (  # type: ignore[no-redef]
         PUBLIC_ACTION_PATHS,
         PUBLIC_ADD_TOKEN_ACTOR,
+        PUBLIC_FACT_REFRESH_ACTOR,
+        PUBLIC_FACT_REFRESH_PATH,
         PUBLIC_JOB_STATUS_PREFIX,
         PUBLIC_QUALITY_RETRY_ACTOR,
         PUBLIC_QUALITY_RETRYABLE_PATH,
@@ -168,7 +176,7 @@ CEX_DEPTH_REASON_CODES = NON_RETRYABLE_CEX_DEPTH_REASON_CODES | {
 API_FRESHNESS_CACHE_SECONDS = 60
 LARGE_PAYLOAD_CACHE_SIZE = 8
 SERIALIZED_RESPONSE_CACHE_SIZE = 64
-CATALOG_SUMMARY_VERSION = 1
+CATALOG_SUMMARY_VERSION = 2
 SourceSignature = Tuple[Tuple[Any, ...], ...]
 PUBLIC_API_CACHE_LOCK = threading.RLock()
 SOURCE_CACHE_GENERATION_LOCK = threading.RLock()
@@ -1738,6 +1746,20 @@ def catalog_summary_from_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
         quality_status_counts = Counter(
             market["quality_status"] for market in token_markets
         )
+        quality_alert_counts: Counter[str] = Counter()
+        for market in token_markets:
+            details = [
+                detail
+                for detail in market.get("quality_flag_details") or []
+                if isinstance(detail, dict)
+                and detail.get("severity") in {"info", "warning", "critical"}
+            ]
+            if details:
+                quality_alert_counts.update(
+                    detail["severity"] for detail in details
+                )
+            elif market["quality_status"] in {"info", "warning", "critical"}:
+                quality_alert_counts[market["quality_status"]] += 1
         measured_depth_market_counts = Counter(
             market.get("market_type") or "unknown"
             for market in token_markets
@@ -1756,6 +1778,7 @@ def catalog_summary_from_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
                     "dex": measured_depth_market_counts.get("dex", 0),
                 },
                 "quality_status_counts": dict(sorted(quality_status_counts.items())),
+                "quality_alert_counts": dict(sorted(quality_alert_counts.items())),
             }
         )
 
@@ -1868,6 +1891,24 @@ def _payload_market_identity(
     return row.get("pool_address")
 
 
+def _canonical_screener_market_identity(
+    row: dict[str, Any],
+    market_type: str,
+) -> str | None:
+    """Return the exact catalog ID accepted by quality and refresh APIs."""
+    if market_type == "cex":
+        venue = row.get("venue")
+        instrument = row.get("instrument")
+        return cex_market_id(venue, instrument) if venue and instrument else None
+    venue = row.get("venue")
+    pool_address = row.get("pool_address")
+    token_symbol = row.get("token_symbol")
+    if not venue or " / " not in venue or not pool_address or not token_symbol:
+        return None
+    chain, dex = venue.split(" / ", 1)
+    return dex_market_id(chain, dex, pool_address, token_symbol)
+
+
 def _compact_screener_market(
     row: dict[str, Any] | None,
     market_type: str,
@@ -1877,11 +1918,31 @@ def _compact_screener_market(
     compact = {field: row.get(field) for field in SCREENER_MARKET_FIELDS}
     compact["market_type"] = market_type
     compact["market_id"] = _payload_market_identity(row, market_type)
+    compact["refresh_market_id"] = _canonical_screener_market_identity(
+        row,
+        market_type,
+    )
     compact["depth_status"] = (
         row.get("depth_status")
         if market_type == "cex"
         else row.get("dex_depth_status", row.get("depth_status"))
     )
+    quality_market = {
+        **row,
+        "market_type": market_type,
+        "depth_status": compact["depth_status"],
+        "depth_error": (
+            row.get("depth_error")
+            if market_type == "cex"
+            else row.get("dex_depth_error", row.get("depth_error"))
+        ),
+    }
+    tvl_fact = _tvl_quality_fact(quality_market)
+    depth_fact = _depth_quality_fact(quality_market)
+    compact["tvl_retryable"] = tvl_fact["retryable"]
+    compact["tvl_na_reason"] = tvl_fact.get("reason_code")
+    compact["depth_retryable"] = depth_fact["retryable"]
+    compact["depth_na_reason"] = depth_fact.get("reason_code")
     return compact
 
 
@@ -1982,6 +2043,7 @@ def market_summary_from_payload(
             )
         market_types = catalog_token.get("market_type_counts", {})
         quality_counts = catalog_token.get("quality_status_counts")
+        quality_alert_counts = catalog_token.get("quality_alert_counts") or {}
         market_count = catalog_token.get("market_count")
         if (
             not isinstance(market_count, int)
@@ -2010,6 +2072,18 @@ def market_summary_from_payload(
                 ),
                 "price_spread": token_summary.get("price_spread"),
                 "spread_date": token_summary.get("spread_date"),
+                "maximum_absolute_price_spread": token_summary.get(
+                    "maximum_absolute_price_spread"
+                ),
+                "mean_absolute_price_spread": token_summary.get(
+                    "mean_absolute_price_spread"
+                ),
+                "median_absolute_price_spread": token_summary.get(
+                    "median_absolute_price_spread"
+                ),
+                "spread_comparable_days": token_summary.get(
+                    "spread_comparable_days"
+                ),
                 "primary_cex_id": token_summary.get("primary_cex_id"),
                 "primary_dex_id": token_summary.get("primary_dex_id"),
                 "primary_cex": _compact_screener_market(primary_cex, "cex"),
@@ -2018,6 +2092,7 @@ def market_summary_from_payload(
                 "cex_market_count": market_types["cex"],
                 "dex_market_count": market_types["dex"],
                 "quality_status_counts": quality_counts,
+                "quality_alert_counts": quality_alert_counts,
             }
         )
 
@@ -2137,9 +2212,15 @@ def build_token_market_catalog(
     markets = []
     for market in token_catalog["markets"]:
         row = _payload_row_for_catalog_market(window_payload, market)
+        tvl_fact = _tvl_quality_fact(market)
+        depth_fact = _depth_quality_fact(market)
         markets.append(
             {
                 **market,
+                "tvl_retryable": tvl_fact["retryable"],
+                "tvl_na_reason": tvl_fact.get("reason_code"),
+                "depth_retryable": depth_fact["retryable"],
+                "depth_na_reason": depth_fact.get("reason_code"),
                 "window_metrics": (
                     {field: row.get(field) for field in WINDOW_MARKET_FIELDS}
                     if row is not None
@@ -4442,6 +4523,7 @@ def write_surface_enabled() -> bool:
         ADMIN_SERVICE.available
         or PUBLIC_ACTION_POLICY.add_token_enabled
         or PUBLIC_ACTION_POLICY.quality_retry_enabled
+        or PUBLIC_ACTION_POLICY.fact_refresh_enabled
     )
 
 
@@ -4702,6 +4784,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         if not (
             PUBLIC_ACTION_POLICY.add_token_enabled
             or PUBLIC_ACTION_POLICY.quality_retry_enabled
+            or PUBLIC_ACTION_POLICY.fact_refresh_enabled
         ):
             self.send_public_action_error(PUBLIC_ACTION_POLICY.disabled_error())
             return
@@ -4729,6 +4812,9 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         ) or (
             actor == PUBLIC_QUALITY_RETRY_ACTOR
             and PUBLIC_ACTION_POLICY.quality_retry_enabled
+        ) or (
+            actor == PUBLIC_FACT_REFRESH_ACTOR
+            and PUBLIC_ACTION_POLICY.fact_refresh_enabled
         )
         if not job or not actor_enabled:
             self.send_public_action_error(
@@ -4746,6 +4832,86 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         path: str,
         payload: dict[str, Any],
     ) -> None:
+        if path == PUBLIC_FACT_REFRESH_PATH:
+            try:
+                request = require_exact_string_fields(
+                    payload,
+                    {
+                        "token_symbol": 32,
+                        "market_id": 512,
+                        "fact_type": 16,
+                    },
+                )
+                request["token_symbol"] = request["token_symbol"].upper()
+                request["fact_type"] = request["fact_type"].lower()
+                if request["fact_type"] not in {"tvl", "depth"}:
+                    raise PublicActionError(
+                        "invalid_public_action_request",
+                        "fact_type must be tvl or depth",
+                    )
+                quality = build_market_quality(request["token_symbol"])
+                market = next(
+                    (
+                        item
+                        for item in quality["markets"]
+                        if item["market_id"] == request["market_id"]
+                    ),
+                    None,
+                )
+                fact = market and market.get("facts", {}).get(
+                    request["fact_type"]
+                )
+                if not market or not fact:
+                    raise PublicActionError(
+                        "fact_refresh_not_found",
+                        "The selected market fact is not cataloged",
+                        status=HTTPStatus.UNPROCESSABLE_ENTITY,
+                    )
+                if fact.get("retryable") is not True:
+                    raise PublicActionError(
+                        "fact_refresh_not_retryable",
+                        "The selected N/A is structural or already observed and cannot be refreshed",
+                        status=HTTPStatus.UNPROCESSABLE_ENTITY,
+                    )
+                with PUBLIC_ACTION_POLICY.permit(
+                    "fact_refresh",
+                    self.public_client_address(),
+                    service=ADMIN_SERVICE,
+                ):
+                    job = ADMIN_SERVICE.create_job(
+                        {
+                            **request,
+                            "job_type": "snapshot_refresh",
+                        },
+                        PUBLIC_FACT_REFRESH_ACTOR,
+                    )
+            except PublicActionError as error:
+                self.send_public_action_error(error)
+                return
+            except AdminJobBusyError:
+                self.send_public_action_error(
+                    PublicActionError(
+                        "refresh_job_busy",
+                        "Another collection job is already queued or running",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                        retry_after_seconds=30,
+                    )
+                )
+                return
+            except (KeyError, OSError, TypeError, ValueError):
+                self.send_public_action_error(
+                    PublicActionError(
+                        "fact_refresh_unavailable",
+                        "The requested fact refresh is temporarily unavailable",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                )
+                return
+            self.send_json(public_job(job), HTTPStatus.ACCEPTED)
+            return
+
         if path == PUBLIC_TOKEN_RESOLVE_PATH:
             try:
                 request = require_exact_string_fields(

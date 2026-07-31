@@ -4,10 +4,11 @@
 
 1. `Screener` is the cross-Token entry point. The global start/end, 7D, 30D,
    90D, and All controls apply only to daily facts.
-2. Selecting a Token opens one persistent workspace with five pages:
-   `Markets`, `Compare`, `Liquidity & Execution`, `Events`, and `Data Quality`.
+2. `Markets` is the Token-level market catalog and the only page that edits
+   Market A/B. `Token Research` then contains four peer pages: `Compare`,
+   `Liquidity & Execution`, `Events`, and `Data Quality`.
 3. Market A and Market B are exact market IDs for the selected Token and remain
-   in the URL while the user moves between those pages.
+   in the URL while the user moves between the four research pages.
 4. Shared definitions, source lineage, and snapshot timing live in the
    `Data Quality` page as a compact disclosure; there is no separate
    Methodology page.
@@ -35,6 +36,12 @@ collection cadence.
   from collection or validation failures.
 
 ## Spread placement
+
+In the Screener, cross-venue is a fixed context of each Spread ranking metric,
+not a fourth peer scope button. Latest absolute gap, maximum absolute gap,
+mean absolute gap, and median absolute gap are independently sortable over the
+selected UTC window. All four use the primary CEX/DEX pair and only common
+valid observation dates; missing comparisons remain null and rank last.
 
 Spread is not a property of either market alone. For the selected Token, Market
 A, Market B, and date window, each same-date comparison is:
@@ -75,6 +82,14 @@ for the selected window. It does not send every raw observation to the browser.
 Each venue/pool summary includes latest price, window return, daily log-return
 volatility, summed USD volume, observation-day count, and latest observation
 date. DEX summaries may also include the latest available TVL snapshot.
+
+Every table-level missing value is rendered as `N/A` with an adjacent
+information disclosure. TVL and depth show a user refresh action only when the
+server's quality contract marks the exact canonical market Fact as
+`retryable=true`. The public action is rate limited, job-budgeted, and accepts
+only `cex:<venue>:<instrument>` or
+`dex:<chain>:<dex>:<pool>:<TOKEN>` identities. Unsupported methods,
+not-applicable Facts, and genuine observed zeroes never become refreshable.
 
 `/api/markets/compare` supplies the aligned daily observations used by both the
 chart and table. `/api/markets/events` reads the separately published Event
