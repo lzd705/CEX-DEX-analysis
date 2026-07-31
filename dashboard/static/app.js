@@ -1231,7 +1231,10 @@ async function applyRouteFromLocation() {
               const refreshed = await loadMarket(
                 catalogWindow.start,
                 catalogWindow.end,
-                { preserve: true },
+                {
+                  preserve: true,
+                  refreshWorkspaceOnGenerationChange: false,
+                },
               );
               if (requestId !== app.routeRequestId) return false;
               if (

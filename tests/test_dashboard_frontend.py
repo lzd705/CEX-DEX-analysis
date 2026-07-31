@@ -473,8 +473,11 @@ function payload(start, generation) {
       response_scope: "screener_summary", summary_version: 1,
       data_generation: generation, start_date: start, end_date: END,
       available_start: "2026-05-01", available_end: END,
+      sources: [], tvl_note: "TVL unavailable",
+      cex_depth_note: "CEX depth unavailable",
+      dex_depth_note: "DEX depth unavailable",
     },
-    tokens: [{ token_symbol: "BTC" }],
+    tokens: [{ token_symbol: "BTC", primary_cex: null, primary_dex: null }],
   };
 }
 function writeApplied(start, generation, visible, catalog = null) {
@@ -526,6 +529,7 @@ updateRouteLinks = () => {};
 canonicalizeCurrentRoute = () => {};
 cachedTokenCatalog = () => null;
 applyWorkspaceRoute = (route) => { app.route = route; };
+const realLoadMarket = loadMarket;
 
 async function catalogFailure() {
   reset(NEW_START, "g2");
@@ -564,13 +568,13 @@ async function staleMismatch() {
 
 async function currentMismatch() {
   reset(OLD_START, "g1");
-  let marketLoads = 0;
+  const summaryRequests = [];
   const catalogKeys = [];
-  loadMarket = async (start) => {
-    marketLoads += 1;
-    writeApplied(start, "g2", "g2");
-    return true;
+  global.fetch = async (url) => {
+    summaryRequests.push(url);
+    return { ok: true, status: 200, json: async () => payload(OLD_START, "g2") };
   };
+  loadMarket = realLoadMarket;
   loadTokenCatalog = async (_token, _start, _end, _signal, cacheKey) => {
     catalogKeys.push(cacheKey);
     if (catalogKeys.length === 1) {
@@ -582,7 +586,7 @@ async function currentMismatch() {
   };
   const applied = await applyRouteFromLocation();
   return {
-    applied, marketLoads, catalogKeys,
+    applied, summaryRequests, catalogKeys, routeRequests: app.routeRequestId,
     catalogMarker: app.catalog?.marker || null,
     activeCatalogKey: app.activeCatalogKey,
   };
@@ -603,6 +607,9 @@ globalThis.MarketMonitorNavigation = {
       kind: "workspace", token: parts[2], page: parts[3],
       state: { start: params.get("start") || "", end: params.get("end") || "" },
     };
+  },
+  buildWorkspacePath(token, page, state) {
+    return `/tokens/${token}/${page}?start=${state.start || ""}&end=${state.end || ""}`;
   },
 };
 """,
@@ -641,11 +648,14 @@ globalThis.MarketMonitorNavigation = {
         })
         self.assertEqual(result["currentMismatch"], {
             "applied": True,
-            "marketLoads": 1,
+            "summaryRequests": [
+                "/api/markets/summary?start=2026-06-30&end=2026-07-29"
+            ],
             "catalogKeys": [
                 "BTC|2026-06-30|2026-07-29|g1",
                 "BTC|2026-06-30|2026-07-29|g2",
             ],
+            "routeRequests": 1,
             "catalogMarker": "g2",
             "activeCatalogKey": "BTC|2026-06-30|2026-07-29|g2",
         })
