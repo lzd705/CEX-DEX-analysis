@@ -847,9 +847,19 @@ def _load_tvl_snapshot_cached(
     }
 
 
+def _copy_payload_for_overlay(payload: dict[str, Any]) -> dict[str, Any]:
+    """Copy only the payload parts an overlay is allowed to mutate."""
+    return {
+        **payload,
+        "metadata": copy.deepcopy(payload["metadata"]),
+        "cex_markets": [market.copy() for market in payload["cex_markets"]],
+        "dex_pools": [pool.copy() for pool in payload["dex_pools"]],
+    }
+
+
 def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict[str, Any]:
     """Overlay current source-reported TVL without rewriting historical OHLCV."""
-    result = copy.deepcopy(payload)
+    result = _copy_payload_for_overlay(payload)
     if tvl_path is None:
         for pool in result["dex_pools"]:
             pool["tvl_status"] = (
@@ -1039,7 +1049,7 @@ def overlay_cex_depth_snapshot(
     depth_path: Path | None,
 ) -> dict[str, Any]:
     """Overlay current real order-book depth without rewriting daily OHLCV."""
-    result = copy.deepcopy(payload)
+    result = _copy_payload_for_overlay(payload)
     if depth_path is None:
         for market in result["cex_markets"]:
             market["depth_status"] = "unavailable"
@@ -1255,7 +1265,7 @@ def overlay_dex_depth_snapshot(
     depth_path: Path | None,
 ) -> dict[str, Any]:
     """Overlay fixed-block DEX pool-state depth without using TVL as a proxy."""
-    result = copy.deepcopy(payload)
+    result = _copy_payload_for_overlay(payload)
     if depth_path is None:
         for pool in result["dex_pools"]:
             pool["dex_depth_status"] = "unavailable"

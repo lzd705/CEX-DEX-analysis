@@ -567,6 +567,40 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertAlmostEqual(summary["median_absolute"], 0.02)
         self.assertEqual(summary["comparable_days"], 3)
 
+    def test_overlay_copy_shares_only_read_only_daily_series(self):
+        payload = {
+            "metadata": {"data_generation": "generation", "sources": []},
+            "cex_markets": [
+                {
+                    "market_id": "cex:binance:BTC/USDT",
+                    "price_points": [{"date": "2026-01-01", "price_usd": 100}],
+                }
+            ],
+            "dex_pools": [],
+            "tokens": [{"token_symbol": "BTC"}],
+        }
+
+        result = server._copy_payload_for_overlay(payload)
+
+        self.assertEqual(result, payload)
+        self.assertIsNot(result, payload)
+        self.assertIsNot(result["metadata"], payload["metadata"])
+        self.assertIsNot(result["cex_markets"][0], payload["cex_markets"][0])
+        self.assertIs(
+            result["cex_markets"][0]["price_points"],
+            payload["cex_markets"][0]["price_points"],
+        )
+
+        result["metadata"]["data_generation"] = "changed"
+        result["metadata"]["sources"].append({"path": "snapshot.csv"})
+        result["cex_markets"][0]["market_id"] = "changed"
+
+        self.assertEqual(payload["metadata"]["data_generation"], "generation")
+        self.assertEqual(payload["metadata"]["sources"], [])
+        self.assertEqual(
+            payload["cex_markets"][0]["market_id"], "cex:binance:BTC/USDT"
+        )
+
     def test_payload_contains_only_market_facts_and_token_level_spread(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
             payload = server.build_market_payload("2026-01-01", "2026-01-02")
