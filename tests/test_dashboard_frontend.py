@@ -98,6 +98,63 @@ console.log(JSON.stringify({
         self.assertTrue(result["customState"]["custom"])
         self.assertEqual(result["customState"]["pressed"], "true")
 
+    def test_full_short_available_range_activates_only_all_preset(self):
+        result = run_app_javascript(
+            """
+function control(dataset = {}) {
+  return {
+    dataset,
+    attributes: {},
+    textContent: "",
+    active: false,
+    classList: {
+      owner: null,
+      toggle(name, enabled) {
+        if (name === "active") this.owner.active = enabled;
+      },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+  };
+}
+const summary = control();
+const custom = control();
+summary.classList.owner = summary;
+custom.classList.owner = custom;
+const presets = ["7", "30", "90", "all"].map((days) => {
+  const button = control({ days });
+  button.classList.owner = button;
+  return button;
+});
+global.document = {
+  getElementById(id) {
+    return {
+      "applied-window-summary": summary,
+      "custom-window-toggle": custom,
+    }[id] || null;
+  },
+  querySelectorAll(selector) {
+    return selector === "[data-days]" ? presets : [];
+  },
+};
+app.payload = {
+  metadata: {
+    start_date: "2026-07-25",
+    end_date: "2026-07-29",
+    available_start: "2026-07-25",
+    available_end: "2026-07-29",
+  },
+};
+syncTimeWindowControls();
+console.log(JSON.stringify({
+  active: presets.filter((button) => button.active).map((button) => button.dataset.days),
+  pressed: presets.filter((button) => button.attributes["aria-pressed"] === "true")
+    .map((button) => button.dataset.days),
+}));
+"""
+        )
+        self.assertEqual(result["active"], ["all"])
+        self.assertEqual(result["pressed"], ["all"])
+
     def test_expert_context_is_compact_but_remains_accessible(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
         styles = STYLES_PATH.read_text(encoding="utf-8")

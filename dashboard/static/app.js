@@ -592,15 +592,24 @@ function formatAppliedWindowSummary(start, end) {
 
 function syncTimeWindowControls() {
   const { start, end } = appliedTimeWindow();
+  const allPreset = presetWindow("all");
+  const fullRangeActive = Boolean(
+    start
+    && end
+    && start === allPreset.start
+    && end === allPreset.end,
+  );
   let activePreset = "";
   document.querySelectorAll("[data-days]").forEach((button) => {
     const preset = presetWindow(button.dataset.days);
-    const active = Boolean(
-      start
-      && end
-      && start === preset.start
-      && end === preset.end,
-    );
+    const active = fullRangeActive
+      ? button.dataset.days === "all"
+      : Boolean(
+        start
+        && end
+        && start === preset.start
+        && end === preset.end,
+      );
     if (active) activePreset = button.dataset.days;
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
