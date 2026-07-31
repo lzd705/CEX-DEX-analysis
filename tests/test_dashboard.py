@@ -456,6 +456,25 @@ class MarketMonitorServerTest(unittest.TestCase):
                 with self.assertRaises(server.DepthExecutionCohortError):
                     self.cohort_validator()(metadata, snapshot, "cex")
 
+    def test_positive_cohort_inventory_rejects_all_null_observation_bounds(self):
+        for location in ("depth", "execution"):
+            with self.subTest(location=location):
+                metadata, snapshot = self.cohort_fixture()
+                target = (
+                    metadata["cex_depth_snapshot"]
+                    if location == "depth"
+                    else snapshot
+                )
+                for field in (
+                    "observed_at",
+                    "observed_at_min",
+                    "observed_at_max",
+                    "observation_span_seconds",
+                ):
+                    target[field] = None
+                with self.assertRaises(server.DepthExecutionCohortError):
+                    self.cohort_validator()(metadata, snapshot, "cex")
+
     def test_cohort_loaders_reject_malformed_or_naive_observation_timestamps(self):
         depth_fixtures = (
             (
@@ -495,7 +514,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             ),
         )
         for family, path, write_fixture, columns, loader in depth_fixtures:
-            for invalid_time in ("not-a-time", "2026-01-02T00:00:00"):
+            for invalid_time in ("", "not-a-time", "2026-01-02T00:00:00"):
                 with self.subTest(family=family, invalid_time=invalid_time):
                     write_fixture()
                     with path.open(newline="", encoding="utf-8") as handle:
@@ -507,7 +526,10 @@ class MarketMonitorServerTest(unittest.TestCase):
                         loader(str(path), server.data_signature([path]))
 
         for field in ("observed_at", "state_observed_at"):
-            for invalid_time in ("not-a-time", "2026-01-02T00:00:00"):
+            invalid_times = ("not-a-time", "2026-01-02T00:00:00")
+            if field == "observed_at":
+                invalid_times = ("", *invalid_times)
+            for invalid_time in invalid_times:
                 with self.subTest(field=field, invalid_time=invalid_time):
                     rows = self.execution_rows(
                         "cex:binance:BTC/USDT",
@@ -732,6 +754,59 @@ class MarketMonitorServerTest(unittest.TestCase):
             },
             503,
         )
+
+    def test_utc_normalization_overflow_is_controlled_for_get_and_health(self):
+        expected_get = {
+            "code": "public_data_validation_failed",
+            "message": (
+                "Published market fact data failed validation. "
+                "Retry after the next refresh."
+            ),
+        }
+        expected_health = {
+            "status": "degraded",
+            "data_ready": False,
+            "error": server.PUBLIC_DATA_UNAVAILABLE_MESSAGE,
+        }
+        for timestamp in (
+            "0001-01-01T00:00:00+23:59",
+            "9999-12-31T23:59:59-23:59",
+        ):
+            with self.subTest(timestamp=timestamp):
+                def parse_overflow(*_args, **_kwargs):
+                    return server._parse_cohort_timestamp(
+                        timestamp,
+                        "private cohort timestamp",
+                    )
+
+                with self.assertRaises(server.DepthExecutionCohortError):
+                    parse_overflow()
+
+                handler = object.__new__(server.MarketMonitorHandler)
+                handler.path = "/api/market"
+                with patch.object(
+                    server.MarketMonitorHandler,
+                    "send_public_api",
+                    side_effect=parse_overflow,
+                ), patch.object(
+                    server.MarketMonitorHandler,
+                    "send_json",
+                ) as send_json:
+                    handler.do_GET()
+                send_json.assert_called_once_with(expected_get, 503)
+
+                health_handler = object.__new__(server.MarketMonitorHandler)
+                health_handler.path = "/health"
+                with patch.object(
+                    server,
+                    "build_market_payload",
+                    side_effect=parse_overflow,
+                ), patch.object(
+                    server.MarketMonitorHandler,
+                    "send_json",
+                ) as send_json:
+                    health_handler.do_GET()
+                send_json.assert_called_once_with(expected_health, 503)
 
     def test_corrupt_depth_file_is_controlled_by_real_public_handlers(self):
         self.write_cex_depth_cohort(

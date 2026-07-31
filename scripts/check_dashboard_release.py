@@ -1479,10 +1479,40 @@ def _execution_scenario_key(row: dict[str, Any]) -> tuple[str, int] | None:
     return direction, int(notional)
 
 
+def _canonical_cohort_timestamp(
+    raw: Any,
+    label: str,
+    field: str,
+) -> datetime:
+    """Normalize one release timestamp inside a controlled error boundary."""
+    require(
+        isinstance(raw, str)
+        and bool(raw)
+        and raw == raw.strip(),
+        f"{label} {field} is invalid",
+    )
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ReleaseCheckError(
+                f"{label} {field} is not timezone-aware"
+            )
+        normalized = parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as error:
+        raise ReleaseCheckError(
+            f"{label} {field} is invalid"
+        ) from error
+    require(
+        normalized.isoformat() == raw,
+        f"{label} {field} is not canonical UTC",
+    )
+    return normalized
+
+
 def _validate_cohort_observation_metadata(
     value: dict[str, Any],
     label: str,
-) -> None:
+) -> tuple[datetime | None, datetime | None]:
     """Independently verify canonical cohort bounds and their exact span."""
     required = {
         "observed_at",
@@ -1500,7 +1530,7 @@ def _validate_cohort_observation_metadata(
     span = value.get("observation_span_seconds")
     if observed_at is None and observed_at_min is None and observed_at_max is None:
         require(span is None, f"{label} span has no observation bounds")
-        return
+        return None, None
     require(
         observed_at is not None
         and observed_at_min is not None
@@ -1508,33 +1538,17 @@ def _validate_cohort_observation_metadata(
         f"{label} observation bounds are incomplete",
     )
 
-    def canonical_timestamp(raw: Any, field: str) -> datetime:
-        require(
-            isinstance(raw, str)
-            and bool(raw)
-            and raw == raw.strip(),
-            f"{label} {field} is invalid",
-        )
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError as error:
-            raise ReleaseCheckError(
-                f"{label} {field} is invalid"
-            ) from error
-        require(
-            parsed.tzinfo is not None and parsed.utcoffset() is not None,
-            f"{label} {field} is not timezone-aware",
-        )
-        normalized = parsed.astimezone(timezone.utc)
-        require(
-            normalized.isoformat() == raw,
-            f"{label} {field} is not canonical UTC",
-        )
-        return normalized
-
-    first = canonical_timestamp(observed_at, "observed_at")
-    lower = canonical_timestamp(observed_at_min, "observed_at_min")
-    upper = canonical_timestamp(observed_at_max, "observed_at_max")
+    first = _canonical_cohort_timestamp(observed_at, label, "observed_at")
+    lower = _canonical_cohort_timestamp(
+        observed_at_min,
+        label,
+        "observed_at_min",
+    )
+    upper = _canonical_cohort_timestamp(
+        observed_at_max,
+        label,
+        "observed_at_max",
+    )
     require(first == lower, f"{label} observed_at is not the lower bound")
     expected_span = (upper - lower).total_seconds()
     require(expected_span >= 0, f"{label} observation bounds are reversed")
@@ -1545,6 +1559,7 @@ def _validate_cohort_observation_metadata(
         and span == expected_span,
         f"{label} observation span differs from its bounds",
     )
+    return lower, upper
 
 
 def validate_execution(
@@ -1645,13 +1660,15 @@ def validate_execution(
             and isinstance(lineage, dict),
             f"Execution {market_type.upper()} cohort metadata is missing",
         )
-        _validate_cohort_observation_metadata(
+        depth_lower, depth_upper = _validate_cohort_observation_metadata(
             depth,
             f"Execution {market_type.upper()} depth cohort",
         )
-        _validate_cohort_observation_metadata(
-            snapshot,
-            f"Execution {market_type.upper()} execution cohort",
+        execution_lower, execution_upper = (
+            _validate_cohort_observation_metadata(
+                snapshot,
+                f"Execution {market_type.upper()} execution cohort",
+            )
         )
 
         def one_id(value: Any, label: str) -> str:
@@ -1717,6 +1734,25 @@ def validate_execution(
             and execution_market_count == depth_market_count,
             f"Execution {market_type.upper()} cohort market counts differ",
         )
+        require(
+            depth_lower is not None
+            and depth_upper is not None
+            and execution_lower is not None
+            and execution_upper is not None,
+            f"Execution {market_type.upper()} positive cohort inventory "
+            "lacks observation bounds",
+        )
+        for index, row in enumerate(rows):
+            row_observed_at = _canonical_cohort_timestamp(
+                row.get("observed_at"),
+                f"Execution {market_type.upper()} selected row {index + 1}",
+                "observed_at",
+            )
+            require(
+                execution_lower <= row_observed_at <= execution_upper,
+                f"Execution {market_type.upper()} selected row observed_at "
+                "is outside declared full-inventory bounds",
+            )
         expected_lineage = {
             "market_type": market_type,
             "depth_snapshot_id": depth_snapshot_id,

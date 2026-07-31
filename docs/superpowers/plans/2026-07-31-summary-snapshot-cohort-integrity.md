@@ -83,6 +83,11 @@ the public rollback boundary.
   depth-consuming state, and independent release-checker counterexamples.
 - [x] Aligned the empty-book fixture with the real same-source failed depth row
   plus ten execution rows.
+- [x] Closed the final branch-review escape paths: fact-refresh POST cohort
+  failures now return a sanitized 503 without creating a job; UTC-normalization
+  overflow is typed at runtime and in release checks; every nonempty cohort row
+  requires a primary observation, and selected release rows are membership-
+  checked against full-inventory bounds without reconstructing their extrema.
 - Commits:
   - `a4f9b2d` — `fix(api): fail closed on snapshot cohort mismatch`
   - `9434f7e` — `fix(api): validate raw cohort evidence strictly`
@@ -105,6 +110,10 @@ the public rollback boundary.
 
 ## Local verification evidence
 
+- Fresh final branch-review repair verification: 130 focused tests and 781
+  complete-suite tests passed with 0 failures and 0 errors; the local Python
+  3.8 grammar compatibility, changed-file py_compile/import, and whitespace
+  gates also passed.
 - Fresh complete local suite at `1b14f2a`: 778 tests, 0 failures, 0 errors.
 - Python 3.8 grammar gate passed under the local compatibility test.
 - Local Python 3.13.5 py_compile/import checks passed for the changed

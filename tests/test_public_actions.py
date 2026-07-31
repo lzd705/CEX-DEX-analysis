@@ -1002,6 +1002,36 @@ class PublicActionHandlerTest(unittest.TestCase):
         self.assertEqual(legacy_status, server.HTTPStatus.UNPROCESSABLE_ENTITY)
         self.assertEqual(legacy_response["error_code"], "fact_refresh_not_found")
 
+    def test_fact_refresh_maps_invalid_cohort_to_sanitized_unavailable_response(self):
+        service = Mock()
+        handler = self.handler(
+            PUBLIC_FACT_REFRESH_PATH,
+            {
+                "token_symbol": "AAVE",
+                "market_id": "cex:binance:AAVE/USDT",
+                "fact_type": "depth",
+            },
+        )
+        policy = PublicActionPolicy(fact_refresh_enabled=True)
+        private_error = "private cohort path /srv/facts/depth.csv"
+
+        with patch.object(server, "PUBLIC_ACTION_POLICY", policy), patch.object(
+            server,
+            "ADMIN_SERVICE",
+            service,
+        ), patch.object(
+            server,
+            "build_market_quality",
+            side_effect=server.DepthExecutionCohortError(private_error),
+        ):
+            handler.do_POST()
+
+        service.create_job.assert_not_called()
+        response, status = handler.send_json.call_args.args[:2]
+        self.assertEqual(status, server.HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(response["error_code"], "fact_refresh_unavailable")
+        self.assertNotIn(private_error, str(response))
+
     def test_public_retry_maps_unapproved_window_to_stable_error(self):
         service = Mock()
         service.count_jobs_created_on.return_value = 0

@@ -1574,6 +1574,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 {
                     "market_id": market_id,
                     "token_symbol": "AAVE",
+                    "observed_at": "2026-01-02T00:00:07+00:00",
                     "direction": direction,
                     "requested_notional_usd": notional,
                     "status": status,
@@ -1706,6 +1707,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 {
                     "market_id": market_id,
                     "token_symbol": "AAVE",
+                    "observed_at": "2026-01-02T00:00:07+00:00",
                     "direction": direction,
                     "requested_notional_usd": notional,
                     "status": status,
@@ -1859,11 +1861,21 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
 
         bounds_counterexamples = (
             ("depth", "observed_at_min", "not-a-time"),
+            (
+                "depth",
+                "observed_at_min",
+                "0001-01-01T00:00:00+23:59",
+            ),
             ("depth", "observed_at_max", "2026-01-02T00:00:04"),
             ("depth", "observed_at", "2026-01-02T00:00:01+00:00"),
             ("depth", "observation_span_seconds", -1),
             ("depth", "observation_span_seconds", 5),
             ("execution", "observed_at_min", None),
+            (
+                "execution",
+                "observed_at_max",
+                "9999-12-31T23:59:59-23:59",
+            ),
             ("execution", "observation_span_seconds", True),
             ("execution", "observation_span_seconds", 5),
         )
@@ -1919,6 +1931,51 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             with self.subTest(row_field=field):
                 invalid = copy.deepcopy(payload)
                 invalid["market_a"]["rows"][0][field] = None
+                with self.assertRaises(ReleaseCheckError):
+                    validate_execution(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                        catalog_metadata=catalog_metadata,
+                    )
+
+        for location in ("depth", "execution"):
+            with self.subTest(all_null_bounds=location):
+                invalid_payload = copy.deepcopy(payload)
+                invalid_catalog = copy.deepcopy(catalog_metadata)
+                target = (
+                    invalid_catalog["cex_depth_snapshot"]
+                    if location == "depth"
+                    else invalid_payload["metadata"]["snapshots"]["cex"]
+                )
+                for field in (
+                    "observed_at",
+                    "observed_at_min",
+                    "observed_at_max",
+                    "observation_span_seconds",
+                ):
+                    target[field] = None
+                with self.assertRaises(ReleaseCheckError):
+                    validate_execution(
+                        invalid_payload,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                        catalog_metadata=invalid_catalog,
+                    )
+
+        for invalid_time in (
+            None,
+            "",
+            "not-a-time",
+            "2026-01-02T00:00:10+00:00",
+        ):
+            with self.subTest(row_observed_at=invalid_time):
+                invalid = copy.deepcopy(payload)
+                invalid["market_a"]["rows"][0]["observed_at"] = invalid_time
                 with self.assertRaises(ReleaseCheckError):
                     validate_execution(
                         invalid,

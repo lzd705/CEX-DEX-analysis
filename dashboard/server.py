@@ -813,26 +813,30 @@ def _parse_cohort_timestamp(
         )
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("timestamp is not timezone-aware")
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as error:
         raise DepthExecutionCohortError(
             f"{label} must be a timezone-aware ISO timestamp"
         ) from error
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise DepthExecutionCohortError(
-            f"{label} must be a timezone-aware ISO timestamp"
-        )
-    return parsed.astimezone(timezone.utc)
 
 
 def _cohort_observed_at_bounds(
     rows: Iterable[dict[str, Any]],
     field: str = "observed_at",
 ) -> tuple[str | None, str | None]:
-    """Return UTC bounds after validating every nonempty raw timestamp."""
+    """Return UTC bounds after validating required and present timestamps."""
     observed = []
     for index, row in enumerate(rows):
+        value = row.get(field)
+        if field == "observed_at" and value in (None, ""):
+            raise DepthExecutionCohortError(
+                f"Cohort row {index + 1} {field} must be a "
+                "timezone-aware ISO timestamp"
+            )
         parsed = _parse_cohort_timestamp(
-            row.get(field),
+            value,
             f"Cohort row {index + 1} {field}",
             empty_is_missing=True,
         )
@@ -3173,6 +3177,14 @@ def validate_depth_execution_cohort(
     ):
         raise DepthExecutionCohortError(
             f"{normalized_type.upper()} depth/execution market counts differ"
+        )
+    if (
+        depth.get("observed_at_min") is None
+        or snapshot.get("observed_at_min") is None
+    ):
+        raise DepthExecutionCohortError(
+            f"{normalized_type.upper()} positive cohort inventory lacks "
+            "observation bounds"
         )
     return {
         "market_type": normalized_type,
@@ -5901,7 +5913,13 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     )
                 )
                 return
-            except (KeyError, OSError, TypeError, ValueError):
+            except (
+                DepthExecutionCohortError,
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+            ):
                 self.send_public_action_error(
                     PublicActionError(
                         "fact_refresh_unavailable",
