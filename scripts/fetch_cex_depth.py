@@ -1908,6 +1908,113 @@ def publish_execution_snapshot(
     return result
 
 
+def publish_full_publication_bundle(
+    depth_rows: list[dict[str, str]],
+    execution_rows: list[dict[str, str]],
+    *,
+    output_dir: Path,
+    publish_dir: Path,
+    preflight_reports: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Failure-atomically publish one full CEX depth/execution cohort."""
+    require_aligned_depth_execution_lineage(depth_rows, execution_rows)
+    expected_market_ids = {cex_market_id(row) for row in depth_rows}
+    validate_execution_snapshot(expected_market_ids, execution_rows)
+    depth_gate = validate_passing_coverage_report(
+        preflight_reports.get("cex_depth"),
+        fact_family="cex_depth",
+        candidate_rows=depth_rows,
+        identity=lambda row: (
+            row.get("token_symbol", "").strip().upper(),
+            row.get("exchange", "").strip().lower(),
+            row.get("cex_symbol", "").strip().upper(),
+        ),
+        baseline_path=publish_dir / LATEST_FILENAME,
+        expected_policy=COVERAGE_POLICY,
+    )
+    execution_gate = validate_passing_coverage_report(
+        preflight_reports.get("cex_execution_cost"),
+        fact_family="cex_execution_cost",
+        candidate_rows=execution_rows,
+        identity=lambda row: (
+            row.get("market_id", "").strip(),
+            row.get("direction", "").strip(),
+            row.get("requested_notional_usd", "").strip(),
+        ),
+        baseline_path=publish_dir / EXECUTION_LATEST_FILENAME,
+        expected_policy=COVERAGE_POLICY,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    current_path = output_dir / CURRENT_FILENAME
+    execution_current_path = output_dir / EXECUTION_CURRENT_FILENAME
+    atomic_write_csv(current_path, depth_rows)
+    atomic_write_execution_csv(execution_current_path, execution_rows)
+
+    history_path = publish_dir / HISTORY_FILENAME
+    merged_history = {
+        (
+            row.get("snapshot_id", ""),
+            row.get("token_symbol", ""),
+            row.get("exchange", ""),
+            row.get("cex_symbol", ""),
+        ): row
+        for row in read_csv_rows(history_path)
+    }
+    for row in depth_rows:
+        merged_history[
+            (
+                row["snapshot_id"],
+                row["token_symbol"],
+                row["exchange"],
+                row["cex_symbol"],
+            )
+        ] = row
+    history_rows = sorted(
+        merged_history.values(),
+        key=lambda row: (
+            row.get("observed_at", ""),
+            row.get("token_symbol", ""),
+            row.get("exchange", ""),
+            row.get("cex_symbol", ""),
+        ),
+    )
+    atomic_replace_bundle(
+        (
+            (history_path, csv_payload(DEPTH_COLUMNS_ALL, history_rows)),
+            (
+                publish_dir / LATEST_FILENAME,
+                csv_payload(DEPTH_COLUMNS_ALL, depth_rows),
+            ),
+            (
+                publish_dir / CURRENT_FILENAME,
+                csv_payload(DEPTH_COLUMNS_ALL, depth_rows),
+            ),
+            (
+                publish_dir / EXECUTION_LATEST_FILENAME,
+                csv_payload(EXECUTION_COST_COLUMNS, execution_rows),
+            ),
+        )
+    )
+    return (
+        {
+            "current_path": str(current_path),
+            "row_count": len(depth_rows),
+            "latest_path": str(publish_dir / LATEST_FILENAME),
+            "history_path": str(history_path),
+            "history_row_count": len(history_rows),
+            "publication_gate": depth_gate,
+        },
+        {
+            "current_path": str(execution_current_path),
+            "row_count": len(execution_rows),
+            "status_counts": execution_status_counts(execution_rows),
+            "latest_path": str(publish_dir / EXECUTION_LATEST_FILENAME),
+            "publication_gate": execution_gate,
+        },
+    )
+
+
 def publish_exact_publication_bundle(
     depth_rows: list[dict[str, str]],
     execution_rows: list[dict[str, str]],
@@ -2161,21 +2268,25 @@ def main() -> None:
             publish_dir=publish_dir,
             preflight_reports=publication_gates,
         )
+    elif publish_dir is not None:
+        result, execution_result = publish_full_publication_bundle(
+            rows,
+            execution_rows,
+            output_dir=args.output_dir,
+            publish_dir=publish_dir,
+            preflight_reports=publication_gates,
+        )
     else:
         result = publish_snapshot(
             rows,
             output_dir=args.output_dir,
-            publish_dir=publish_dir,
-            preflight_report=publication_gates.get("cex_depth"),
         )
         execution_result = publish_execution_snapshot(
             execution_rows,
             output_dir=args.output_dir,
-            publish_dir=publish_dir,
             expected_market_ids={
                 str(row.get("market_id") or "") for row in execution_rows
             },
-            preflight_report=publication_gates.get("cex_execution_cost"),
         )
     depth_gate = result.pop("publication_gate", None)
     execution_gate = execution_result.pop("publication_gate", None)

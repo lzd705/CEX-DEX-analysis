@@ -2592,6 +2592,118 @@ def publish_execution_snapshot(
     return result
 
 
+def publish_full_publication_bundle(
+    depth_rows: list[dict[str, str]],
+    execution_rows: list[dict[str, str]],
+    *,
+    output_dir: Path,
+    publish_dir: Path,
+    preflight_reports: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Failure-atomically publish one full DEX depth/execution cohort."""
+    require_aligned_depth_execution_lineage(depth_rows, execution_rows)
+    expected_market_ids = {dex_market_id(row) for row in depth_rows}
+    validate_execution_snapshot(
+        expected_market_ids,
+        execution_rows,
+        enforce_usd_price_timing=True,
+    )
+    depth_gate = validate_passing_coverage_report(
+        preflight_reports.get("dex_depth"),
+        fact_family="dex_depth",
+        candidate_rows=normalized_depth_gate_rows(depth_rows),
+        identity=lambda row: (
+            row.get("token_symbol", "").strip().upper(),
+            *pool_key(
+                row.get("chain", ""),
+                row.get("pool_address", ""),
+            ),
+        ),
+        baseline_path=publish_dir / LATEST_FILENAME,
+        expected_policy=DEPTH_COVERAGE_POLICY,
+    )
+    execution_gate = validate_passing_coverage_report(
+        preflight_reports.get("dex_execution_cost"),
+        fact_family="dex_execution_cost",
+        candidate_rows=normalized_execution_gate_rows(execution_rows),
+        identity=lambda row: (
+            row.get("market_id", "").strip(),
+            row.get("direction", "").strip(),
+            row.get("requested_notional_usd", "").strip(),
+        ),
+        baseline_path=publish_dir / EXECUTION_LATEST_FILENAME,
+        expected_policy=EXECUTION_COVERAGE_POLICY,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    current_path = output_dir / CURRENT_FILENAME
+    execution_current_path = output_dir / EXECUTION_CURRENT_FILENAME
+    atomic_write_csv(current_path, depth_rows)
+    atomic_write_execution_csv(execution_current_path, execution_rows)
+
+    history_path = publish_dir / HISTORY_FILENAME
+    merged_history = {
+        (
+            row.get("snapshot_id", ""),
+            row.get("token_symbol", ""),
+            *pool_key(row.get("chain", ""), row.get("pool_address", "")),
+        ): row
+        for row in read_csv_rows(history_path)
+    }
+    for row in depth_rows:
+        merged_history[
+            (
+                row["snapshot_id"],
+                row["token_symbol"],
+                *pool_key(row["chain"], row["pool_address"]),
+            )
+        ] = row
+    history_rows = sorted(
+        merged_history.values(),
+        key=lambda row: (
+            row.get("observed_at", ""),
+            row.get("token_symbol", ""),
+            row.get("chain", ""),
+            row.get("pool_address", ""),
+        ),
+    )
+    atomic_replace_bundle(
+        (
+            (history_path, csv_payload(DEX_DEPTH_COLUMNS, history_rows)),
+            (
+                publish_dir / LATEST_FILENAME,
+                csv_payload(DEX_DEPTH_COLUMNS, depth_rows),
+            ),
+            (
+                publish_dir / CURRENT_FILENAME,
+                csv_payload(DEX_DEPTH_COLUMNS, depth_rows),
+            ),
+            (
+                publish_dir / EXECUTION_LATEST_FILENAME,
+                csv_payload(EXECUTION_COST_COLUMNS, execution_rows),
+            ),
+        )
+    )
+    return (
+        {
+            "current_path": str(current_path),
+            "row_count": len(depth_rows),
+            "latest_path": str(publish_dir / LATEST_FILENAME),
+            "history_path": str(history_path),
+            "history_row_count": len(history_rows),
+            "publication_gate": depth_gate,
+        },
+        {
+            "execution_current_path": str(execution_current_path),
+            "execution_row_count": len(execution_rows),
+            "execution_latest_path": str(
+                publish_dir / EXECUTION_LATEST_FILENAME
+            ),
+            "publication_gate": execution_gate,
+        },
+    )
+
+
 def publish_exact_publication_bundle(
     depth_rows: list[dict[str, str]],
     execution_rows: list[dict[str, str]],
@@ -2848,12 +2960,18 @@ def main() -> None:
             publish_dir=publish_dir,
             preflight_reports=publication_gates,
         )
+    elif publish_dir is not None:
+        result, execution_result = publish_full_publication_bundle(
+            rows,
+            execution_rows,
+            output_dir=args.output_dir,
+            publish_dir=publish_dir,
+            preflight_reports=publication_gates,
+        )
     else:
         result = publish_snapshot(
             rows,
             output_dir=args.output_dir,
-            publish_dir=publish_dir,
-            preflight_report=publication_gates.get("dex_depth"),
         )
         execution_result = publish_execution_snapshot(
             execution_rows,
@@ -2862,8 +2980,6 @@ def main() -> None:
                 for row in execution_rows
             },
             output_dir=args.output_dir,
-            publish_dir=publish_dir,
-            preflight_report=publication_gates.get("dex_execution_cost"),
         )
     depth_gate = result.pop("publication_gate", None)
     execution_gate = execution_result.pop("publication_gate", None)

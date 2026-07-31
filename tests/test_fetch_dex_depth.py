@@ -42,6 +42,7 @@ from scripts.fetch_dex_depth import (
     publish_exact_publication_bundle,
     protocol_model,
     publish_execution_snapshot,
+    publish_full_publication_bundle,
     publish_snapshot,
     terminal_execution_rows,
     unsupported_row,
@@ -694,6 +695,88 @@ class DexDepthCollectionTest(unittest.TestCase):
         ) as handle:
             history = list(csv.DictReader(handle))
         self.assertEqual(len(history), 3)
+
+    def test_full_publication_bundle_restores_every_public_destination_on_each_replace_failure(self):
+        _baseline_id, baseline_depth, baseline_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-full-baseline",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        _candidate_id, candidate_depth, candidate_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-full-candidate",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        published = self.root / "full-local"
+        publish_snapshot(
+            baseline_depth,
+            output_dir=self.root / "full-processed",
+            publish_dir=published,
+        )
+        publish_execution_snapshot(
+            baseline_execution,
+            expected_market_ids={
+                row["market_id"] for row in baseline_execution
+            },
+            output_dir=self.root / "full-processed",
+            publish_dir=published,
+        )
+        reports = preflight_publication_bundle(
+            candidate_depth,
+            candidate_execution,
+            published,
+        )
+        protected = [
+            published / HISTORY_FILENAME,
+            published / LATEST_FILENAME,
+            published / CURRENT_FILENAME,
+            published / EXECUTION_LATEST_FILENAME,
+        ]
+        originals = {path: path.read_bytes() for path in protected}
+        from scripts import atomic_publication
+
+        real_replace = atomic_publication.os.replace
+        for fail_at, failed_path in enumerate(protected, start=1):
+            public_calls = {"count": 0}
+            failed_destination = {"path": None}
+
+            def fail_public_replace(source, destination):
+                if Path(destination) in protected:
+                    public_calls["count"] += 1
+                    if public_calls["count"] == fail_at:
+                        failed_destination["path"] = Path(destination)
+                        raise OSError("injected full publication failure")
+                return real_replace(source, destination)
+
+            with self.subTest(
+                fail_at=fail_at,
+                destination=failed_path.name,
+            ), patch(
+                "scripts.atomic_publication.os.replace",
+                side_effect=fail_public_replace,
+            ):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "injected full publication failure",
+                ):
+                    publish_full_publication_bundle(
+                        candidate_depth,
+                        candidate_execution,
+                        output_dir=self.root / "full-processed",
+                        publish_dir=published,
+                        preflight_reports=reports,
+                    )
+            self.assertEqual(failed_destination["path"], failed_path)
+            self.assertEqual(
+                {path: path.read_bytes() for path in protected},
+                originals,
+            )
 
     def test_exact_preflight_accepts_one_observed_repair_below_full_coverage_floor(self):
         other_pool = {
