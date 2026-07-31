@@ -24,12 +24,21 @@ REVIEW_SCHEMA = "market_lifecycle_reviews/v1"
 MAX_REVIEW_BYTES = 512 * 1024
 MAX_REVISION_COUNT = 1_000
 MAX_SOURCE_CHECKS = 8
+MAX_INVENTORY_MARKET_CODES = 1_000
 REVIEW_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,95}$")
 ISSUE_ID_PATTERN = re.compile(r"^[0-9a-f]{20}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 TOKEN_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
+UPBIT_MARKET_CODE_PATTERN = re.compile(
+    r"^[A-Z0-9][A-Z0-9._]{0,31}-[A-Z0-9][A-Z0-9._]{0,31}$"
+)
 LOWER_COMPONENT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 EVM_ADDRESS_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
+UTC_TIMESTAMP_PATTERN = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+PRINTABLE_ASCII_URL_PATTERN = re.compile(r"^[\x21-\x7e]+$")
+UTC_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 ALLOWED_REVIEW_STATUSES = {"disposed", "withdrawn"}
 ALLOWED_MARKET_TYPES = {"cex", "dex"}
 ALLOWED_LIFECYCLES = {
@@ -147,22 +156,37 @@ def _iso_day(value: Any, *, field: str) -> str:
 
 
 def _iso_timestamp(value: Any, *, field: str) -> str:
-    text = _bounded_text(value, field=field, maximum=64)
-    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    if not isinstance(value, str) or not UTC_TIMESTAMP_PATTERN.fullmatch(value):
+        raise LifecycleReviewError(
+            "{} must use canonical UTC timestamp grammar".format(field)
+        )
     try:
-        parsed = datetime.fromisoformat(normalized)
+        parsed = datetime.strptime(value, UTC_TIMESTAMP_FORMAT)
     except ValueError as error:
         raise LifecycleReviewError(
-            "{} is not an ISO timestamp".format(field)
+            "{} is not a valid UTC timestamp".format(field)
         ) from error
-    if parsed.tzinfo is None:
-        raise LifecycleReviewError("{} must include a timezone".format(field))
-    return text
+    if parsed.strftime(UTC_TIMESTAMP_FORMAT) != value:
+        raise LifecycleReviewError("{} is not canonical".format(field))
+    return value
 
 
 def _utc_timestamp(value: str) -> datetime:
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-    return datetime.fromisoformat(normalized).astimezone(timezone.utc)
+    return datetime.strptime(value, UTC_TIMESTAMP_FORMAT).replace(
+        tzinfo=timezone.utc
+    )
+
+
+def _bounded_ascii_url(value: Any, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > 2_000
+        or not PRINTABLE_ASCII_URL_PATTERN.fullmatch(value)
+    ):
+        raise LifecycleReviewError(
+            "{} must be unchanged bounded printable ASCII".format(field)
+        )
+    return value
 
 
 def _canonical_token(value: Any, *, field: str) -> str:
@@ -248,6 +272,7 @@ def _parse_market_identity(
 
 
 def _safe_official_url(url: str, *, field: str):
+    _bounded_ascii_url(url, field=field)
     parsed = urlsplit(url)
     try:
         port = parsed.port
@@ -291,7 +316,7 @@ def _source_check(
     if not isinstance(value, dict):
         raise LifecycleReviewError("{} must be an object".format(field))
     _require_exact_keys(value, SOURCE_CHECK_FIELDS, field=field)
-    url = _bounded_text(value.get("url"), field=field + ".url", maximum=2_000)
+    url = _bounded_ascii_url(value.get("url"), field=field + ".url")
     _safe_official_url(url, field=field + ".url")
     http_status = value.get("http_status")
     if (
@@ -371,6 +396,23 @@ def _checks_by_kind(
     return by_kind
 
 
+def _upbit_market_codes(value: Any, *, field: str) -> List[str]:
+    if (
+        not isinstance(value, list)
+        or len(value) > MAX_INVENTORY_MARKET_CODES
+        or any(
+            not isinstance(code, str)
+            or not UPBIT_MARKET_CODE_PATTERN.fullmatch(code)
+            for code in value
+        )
+        or len(value) != len(set(value))
+    ):
+        raise LifecycleReviewError(
+            "{} must contain bounded unique canonical market codes".format(field)
+        )
+    return list(value)
+
+
 def _validate_upbit_evidence(
     source_checks: Sequence[Mapping[str, Any]],
     *,
@@ -436,14 +478,24 @@ def _validate_upbit_evidence(
         raise LifecycleReviewError(
             "{} inventory does not use the declared endpoint".format(review_id)
         )
-    present_codes = inventory["observations"].get("present_market_codes")
+    inventory_observations = inventory["observations"]
+    present_codes = _upbit_market_codes(
+        inventory_observations.get("present_market_codes"),
+        field=review_id + ".inventory.present_market_codes",
+    )
+    absent_codes: List[str] = []
+    if "absent_market_codes" in inventory_observations:
+        absent_codes = _upbit_market_codes(
+            inventory_observations.get("absent_market_codes"),
+            field=review_id + ".inventory.absent_market_codes",
+        )
     if (
-        not isinstance(present_codes, list)
-        or any(not isinstance(code, str) for code in present_codes)
-        or expected_market not in present_codes
+        expected_market not in present_codes
+        or expected_market in absent_codes
+        or set(present_codes).intersection(absent_codes)
     ):
         raise LifecycleReviewError(
-            "{} inventory does not include the exact target market".format(
+            "{} inventory has a contradictory exact target state".format(
                 review_id
             )
         )
@@ -597,14 +649,19 @@ def _review_revision(value: Any) -> Dict[str, Any]:
             raise LifecycleReviewError(
                 "{} revision 1 cannot supersede another revision".format(review_id)
             )
-    elif supersedes_revision != revision - 1:
-        raise LifecycleReviewError(
-            "{} revision {} must supersede revision {}".format(
-                review_id,
-                revision,
-                revision - 1,
+    else:
+        if (
+            not isinstance(supersedes_revision, int)
+            or isinstance(supersedes_revision, bool)
+            or supersedes_revision != revision - 1
+        ):
+            raise LifecycleReviewError(
+                "{} revision {} must supersede integer revision {}".format(
+                    review_id,
+                    revision,
+                    revision - 1,
+                )
             )
-        )
 
     reviewed_issue_id = value.get("reviewed_issue_id")
     if (
@@ -837,6 +894,7 @@ def load_lifecycle_reviews(
             "status": "disabled",
             "source_name": None,
             "sha256": None,
+            "generated_at_utc": None,
             "revision_count": 0,
             "active_disposition_count": 0,
         }
@@ -847,6 +905,7 @@ def load_lifecycle_reviews(
             "status": "absent",
             "source_name": path.name,
             "sha256": None,
+            "generated_at_utc": None,
             "revision_count": 0,
             "active_disposition_count": 0,
         }
@@ -868,18 +927,42 @@ def load_lifecycle_reviews(
     if not isinstance(payload, dict) or payload.get("schema") != REVIEW_SCHEMA:
         raise LifecycleReviewError("Lifecycle review schema is unsupported")
     _require_exact_keys(payload, ROOT_FIELDS, field="Lifecycle review file")
-    _iso_timestamp(payload.get("generated_at_utc"), field="generated_at_utc")
+    generated_at_utc = _iso_timestamp(
+        payload.get("generated_at_utc"),
+        field="generated_at_utc",
+    )
+    generated_at = _utc_timestamp(generated_at_utc)
     raw_reviews = payload.get("reviews")
+    review_count = payload.get("review_count")
     if (
         not isinstance(raw_reviews, list)
+        or not isinstance(review_count, int)
+        or isinstance(review_count, bool)
         or len(raw_reviews) > MAX_REVISION_COUNT
-        or payload.get("review_count") != len(raw_reviews)
+        or review_count != len(raw_reviews)
     ):
         raise LifecycleReviewError("Lifecycle review count is inconsistent")
 
     revisions = [_review_revision(item) for item in raw_reviews]
+    if any(
+        _utc_timestamp(str(revision["reviewed_at_utc"])) > generated_at
+        for revision in revisions
+    ):
+        raise LifecycleReviewError(
+            "Lifecycle review generation precedes a review revision"
+        )
     by_review_id: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    issue_lineages: Dict[str, str] = {}
     for revision in revisions:
+        reviewed_issue_id = str(revision["reviewed_issue_id"])
+        existing_lineage = issue_lineages.setdefault(
+            reviewed_issue_id,
+            str(revision["review_id"]),
+        )
+        if existing_lineage != revision["review_id"]:
+            raise LifecycleReviewError(
+                "Lifecycle reviewed_issue_id has forked review lineages"
+            )
         review_revisions = by_review_id.setdefault(revision["review_id"], {})
         if revision["revision"] in review_revisions:
             raise LifecycleReviewError(
@@ -931,6 +1014,7 @@ def load_lifecycle_reviews(
         "status": "accepted",
         "source_name": path.name,
         "sha256": hashlib.sha256(encoded).hexdigest(),
+        "generated_at_utc": generated_at_utc,
         "revision_count": len(revisions),
         "review_id_count": len(by_review_id),
         "active_disposition_count": len(active),

@@ -209,6 +209,10 @@ class MarketLifecycleReviewTest(unittest.TestCase):
         reviews, metadata = load_lifecycle_reviews(DEFAULT_REVIEW_PATH)
 
         self.assertEqual(metadata["status"], "accepted")
+        self.assertEqual(
+            metadata["generated_at_utc"],
+            "2026-07-30T03:23:13Z",
+        )
         self.assertEqual(metadata["revision_count"], 2)
         self.assertEqual(metadata["active_disposition_count"], 2)
         self.assertEqual(
@@ -531,12 +535,96 @@ class MarketLifecycleReviewTest(unittest.TestCase):
             )
 
         exact_inventory = deepcopy(payload)
-        inventory["observations"]["present_market_codes"] = ["USDT-AAVE"]
-        exact_inventory["reviews"][0]["source_checks"] = [inventory, ticker]
+        exact_inventory_check = deepcopy(inventory)
+        exact_inventory_check["observations"]["present_market_codes"] = [
+            "USDT-AAVE"
+        ]
+        exact_inventory_check["observations"]["absent_market_codes"] = [
+            "KRW-AAVE"
+        ]
+        exact_inventory["reviews"][0]["source_checks"] = [
+            exact_inventory_check,
+            ticker,
+        ]
         reviews, _ = load_lifecycle_reviews(
             self.write_reviews(exact_inventory, "exact-inventory.json")
         )
         self.assertEqual(len(reviews), 1)
+
+    def test_upbit_inventory_lists_are_bounded_canonical_unique_and_disjoint(self):
+        stale = self.baseline_stale_issue()
+        base = review_payload(stale)
+        ticker = base["reviews"][0]["source_checks"][0]
+        inventory = {
+            "source_kind": "official_exchange_market_inventory",
+            "url": "https://api.upbit.com/v1/market/all?is_details=true",
+            "http_status": 200,
+            "response_sha256": "d" * 64,
+            "checked_at_utc": "2026-07-30T01:58:00Z",
+            "observations": {
+                "present_market_codes": ["USDT-AAVE"],
+                "absent_market_codes": ["KRW-AAVE"],
+            },
+        }
+        cases = (
+            ("present-not-list", "present_market_codes", "USDT-AAVE"),
+            ("present-non-string", "present_market_codes", ["USDT-AAVE", 1]),
+            ("present-malformed", "present_market_codes", ["USDT-AAVE", "krw-AAVE"]),
+            ("present-duplicate", "present_market_codes", ["USDT-AAVE", "USDT-AAVE"]),
+            ("absent-not-list", "absent_market_codes", "KRW-AAVE"),
+            ("absent-non-string", "absent_market_codes", ["KRW-AAVE", 1]),
+            ("absent-malformed", "absent_market_codes", ["KRW/AAVE"]),
+            ("absent-duplicate", "absent_market_codes", ["KRW-AAVE", "KRW-AAVE"]),
+            ("target-contradiction", "absent_market_codes", ["USDT-AAVE"]),
+        )
+        for position, (label, field, value) in enumerate(cases):
+            with self.subTest(case=label):
+                payload = deepcopy(base)
+                invalid_inventory = deepcopy(inventory)
+                invalid_inventory["observations"][field] = value
+                payload["reviews"][0]["source_checks"] = [
+                    invalid_inventory,
+                    ticker,
+                ]
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "bad-inventory-list-{}.json".format(position),
+                        )
+                    )
+
+        overlapping = deepcopy(base)
+        overlapping_inventory = deepcopy(inventory)
+        overlapping_inventory["observations"]["present_market_codes"] = [
+            "USDT-AAVE",
+            "KRW-AAVE",
+        ]
+        overlapping_inventory["observations"]["absent_market_codes"] = [
+            "KRW-AAVE"
+        ]
+        overlapping["reviews"][0]["source_checks"] = [
+            overlapping_inventory,
+            ticker,
+        ]
+        with self.assertRaises(LifecycleReviewError):
+            load_lifecycle_reviews(
+                self.write_reviews(overlapping, "overlapping-inventory.json")
+            )
+
+        oversized = deepcopy(base)
+        oversized_inventory = deepcopy(inventory)
+        oversized_inventory["observations"]["present_market_codes"] = [
+            "USDT-AAVE"
+        ] + ["Q{:04d}-AAVE".format(index) for index in range(1_001)]
+        oversized["reviews"][0]["source_checks"] = [
+            oversized_inventory,
+            ticker,
+        ]
+        with self.assertRaises(LifecycleReviewError):
+            load_lifecycle_reviews(
+                self.write_reviews(oversized, "oversized-inventory.json")
+            )
 
     def test_evidence_must_be_checked_after_issue_day_completes(self):
         stale = self.baseline_stale_issue()
@@ -589,6 +677,12 @@ class MarketLifecycleReviewTest(unittest.TestCase):
             "https://user@api.upbit.com/v1/ticker?markets=USDT-AAVE",
             "https://api.upbit.com/v1/ticker?markets=USDT-AAVE&extra=1",
             "https://api.upbit.com/v1/ticker?markets=%55SDT-AAVE",
+            " https://api.upbit.com/v1/ticker?markets=USDT-AAVE",
+            "https://api.upbit.com/v1/ticker?markets=USDT-AAVE ",
+            "https://api.upbit.com/v1/ticker?markets=USDT-AAVE\n",
+            "https://api.upbit.com/v1/ticker?markets=USDT-AAVE\t",
+            "https://api.upbit.com/v1/ticker?markets=USDT-AAVE\x00",
+            "https://api.upbit.com/v1/ticker?markets=USDT-AAVE​",
         )
         for position, unsafe_url in enumerate(unsafe_urls):
             with self.subTest(url=unsafe_url):
@@ -726,6 +820,79 @@ class MarketLifecycleReviewTest(unittest.TestCase):
                         )
                     )
 
+    def test_review_count_and_supersedes_revision_require_real_integers(self):
+        stale = self.baseline_stale_issue()
+        for position, invalid_count in enumerate((True, 1.0)):
+            with self.subTest(review_count=invalid_count):
+                payload = review_payload(stale)
+                payload["review_count"] = invalid_count
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "invalid-review-count-{}.json".format(position),
+                        )
+                    )
+
+        for position, invalid_supersedes in enumerate((True, 1.0)):
+            with self.subTest(supersedes_revision=invalid_supersedes):
+                payload = review_payload(stale)
+                payload["generated_at_utc"] = "2026-07-30T03:00:00Z"
+                revision_2 = deepcopy(payload["reviews"][0])
+                revision_2["revision"] = 2
+                revision_2["supersedes_revision"] = invalid_supersedes
+                revision_2["reviewed_at_utc"] = "2026-07-30T03:00:00Z"
+                revision_2["source_checks"][0]["checked_at_utc"] = (
+                    "2026-07-30T02:59:00Z"
+                )
+                payload["reviews"].append(revision_2)
+                payload["review_count"] = 2
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "invalid-supersedes-{}.json".format(position),
+                        )
+                    )
+
+    def test_utc_fields_use_one_exact_portable_grammar(self):
+        stale = self.baseline_stale_issue()
+        cases = (
+            ("generated", "2026-07-30T02:00:00+00:00"),
+            ("generated", "2026-W31-4T02:00:00Z"),
+            ("reviewed", "2026-07-30 02:00:00Z"),
+            ("reviewed", "2026-07-30T02:00:00.000Z"),
+            ("checked", "2026-07-30T01:59:00+00:00"),
+            ("checked", "2026-07-30T01:59:00.000Z"),
+        )
+        for position, (location, timestamp) in enumerate(cases):
+            with self.subTest(location=location, timestamp=timestamp):
+                payload = review_payload(stale)
+                if location == "generated":
+                    payload["generated_at_utc"] = timestamp
+                elif location == "reviewed":
+                    payload["reviews"][0]["reviewed_at_utc"] = timestamp
+                else:
+                    payload["reviews"][0]["source_checks"][0][
+                        "checked_at_utc"
+                    ] = timestamp
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "invalid-utc-{}.json".format(position),
+                        )
+                    )
+
+    def test_generation_time_cannot_precede_a_review(self):
+        stale = self.baseline_stale_issue()
+        payload = review_payload(stale)
+        payload["generated_at_utc"] = "2026-07-30T01:59:59Z"
+        with self.assertRaises(LifecycleReviewError):
+            load_lifecycle_reviews(
+                self.write_reviews(payload, "generation-before-review.json")
+            )
+
     def test_market_type_lifecycle_evidence_and_method_must_agree(self):
         mutations = (
             ("market_lifecycle", "listed_quote_market_dormant"),
@@ -758,6 +925,7 @@ class MarketLifecycleReviewTest(unittest.TestCase):
         for position, (field, value) in enumerate(mutations.items()):
             with self.subTest(field=field):
                 payload = review_payload(stale)
+                payload["generated_at_utc"] = "2026-07-30T03:00:00Z"
                 revision_2 = deepcopy(payload["reviews"][0])
                 revision_2["revision"] = 2
                 revision_2["supersedes_revision"] = 1
@@ -805,6 +973,7 @@ class MarketLifecycleReviewTest(unittest.TestCase):
     def test_revision_may_update_evidence_note_or_withdraw_disposition(self):
         stale = self.baseline_stale_issue()
         payload = review_payload(stale)
+        payload["generated_at_utc"] = "2026-07-30T03:00:00Z"
         revision_2 = deepcopy(payload["reviews"][0])
         revision_2["revision"] = 2
         revision_2["supersedes_revision"] = 1
@@ -864,6 +1033,33 @@ class MarketLifecycleReviewTest(unittest.TestCase):
             load_lifecycle_reviews(
                 self.write_reviews(payload, "duplicate-active-issue.json")
             )
+
+    def test_reviewed_issue_id_has_one_lineage_across_entire_ledger(self):
+        stale = self.baseline_stale_issue()
+        for position, statuses in enumerate(
+            (("disposed", "withdrawn"), ("withdrawn", "withdrawn"))
+        ):
+            with self.subTest(statuses=statuses):
+                payload = review_payload(stale)
+                first = payload["reviews"][0]
+                second = deepcopy(first)
+                second["review_id"] = "aave-upbit-forked-review-chain"
+                second["disposition_note"] = "Forked issue lineage is invalid."
+                payload["reviews"].append(second)
+                payload["review_count"] = 2
+                for review, status in zip(payload["reviews"], statuses):
+                    review["review_status"] = status
+                    if status == "withdrawn":
+                        review["disposition_status"] = None
+                        review["disposition_reason_code"] = None
+                        review["market_lifecycle"] = None
+                with self.assertRaises(LifecycleReviewError):
+                    load_lifecycle_reviews(
+                        self.write_reviews(
+                            payload,
+                            "forked-issue-lineage-{}.json".format(position),
+                        )
+                    )
 
     def test_build_report_rejects_wrong_source_evidence_fail_closed(self):
         stale = self.baseline_stale_issue()
