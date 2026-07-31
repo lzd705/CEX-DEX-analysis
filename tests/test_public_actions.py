@@ -32,6 +32,37 @@ from dashboard.public_actions import (
 
 
 class PublicActionPolicyTest(unittest.TestCase):
+    def test_public_snapshot_job_result_exposes_only_bounded_snapshot_fields(self):
+        response = public_job({
+            "job_id": "job-1",
+            "job_type": "snapshot_refresh",
+            "status": "partial",
+            "error_code": "snapshot_publication_unreadable",
+            "result": {
+                "before": {
+                    "publication_generation": "a" * 16 + ":s1",
+                    "snapshot_id": "s1",
+                    "status": "collection_failed",
+                    "reason_code": "network",
+                    "observed_at": "2026-07-31T12:00:00+00:00",
+                    "path": "/private/secret.csv",
+                    "error": "private raw collection error",
+                },
+                "after": {
+                    "publication_generation": "b" * 16 + ":s2",
+                    "snapshot_id": "s2",
+                    "status": "observed",
+                    "reason_code": "observed",
+                    "observed_at": "2026-07-31T12:01:00+00:00",
+                    "raw_error": "private raw collection error",
+                },
+            },
+        })
+        summary = response["result_summary"]
+        self.assertEqual(summary["after"]["status"], "observed")
+        self.assertNotIn("path", summary["before"])
+        self.assertNotIn("error", summary["before"])
+        self.assertNotIn("raw_error", summary["after"])
     def test_feature_flags_are_independent_and_fail_closed(self):
         with patch.dict(os.environ, {}, clear=True):
             disabled = PublicActionPolicy()

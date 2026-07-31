@@ -36,6 +36,11 @@ try:
     )
     from scripts.fact_quality import cex_market, dex_market
     from scripts.quality_outcomes import quality_outcome_rule
+    from dashboard.snapshot_refresh import (
+        evaluate_snapshot_refresh,
+        read_snapshot_fact_state,
+        validate_snapshot_request,
+    )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     project_root = str(Path(__file__).resolve().parents[1])
     if project_root not in sys.path:
@@ -58,6 +63,11 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
     )
     from scripts.quality_outcomes import (  # type: ignore[no-redef]
         quality_outcome_rule,
+    )
+    from dashboard.snapshot_refresh import (  # type: ignore[no-redef]
+        evaluate_snapshot_refresh,
+        read_snapshot_fact_state,
+        validate_snapshot_request,
     )
 
 
@@ -1228,29 +1238,7 @@ class AdminService:
 
     @staticmethod
     def validate_snapshot_refresh_job(payload: dict[str, Any]) -> dict[str, Any]:
-        token = str(payload.get("token_symbol") or "").strip().upper()
-        market_id = str(payload.get("market_id") or "").strip()
-        fact_type = str(payload.get("fact_type") or "").strip().lower()
-        if not token or len(token) > 32:
-            raise ValueError("token_symbol is required")
-        if not market_id or len(market_id) > 512:
-            raise ValueError("market_id is required")
-        if fact_type not in {"tvl", "depth"}:
-            raise ValueError("fact_type must be tvl or depth")
-        if market_id.startswith("cex:"):
-            market_type = "cex"
-        elif market_id.startswith("dex:"):
-            market_type = "dex"
-        else:
-            raise ValueError("market_id must be a canonical CEX or DEX ID")
-        if fact_type == "tvl" and market_type != "dex":
-            raise ValueError("TVL refresh applies only to DEX markets")
-        return {
-            "token_symbol": token,
-            "market_id": market_id,
-            "market_type": market_type,
-            "fact_type": fact_type,
-        }
+        return validate_snapshot_request(payload)
 
     def create_onboarding_job(
         self,
@@ -1626,6 +1614,20 @@ class AdminService:
         if fact_type == "depth":
             command.extend(["--tokens", job["token_symbol"]])
         try:
+            before = read_snapshot_fact_state(self.data_dir, job)
+        except (OSError, ValueError):
+            self._fail_job(
+                job_id,
+                stage="verify_snapshot_before",
+                error_code="snapshot_publication_unreadable",
+                message="The requested snapshot publication could not be verified.",
+                retryable=True,
+                status="partial",
+                publication_committed=False,
+                result=None,
+            )
+            return
+        try:
             self._run_command(
                 command,
                 log_path,
@@ -1639,6 +1641,46 @@ class AdminService:
                 error_code="snapshot_refresh_failed",
                 message="The requested snapshot refresh failed.",
                 retryable=True,
+                status="partial",
+                publication_committed=False,
+                result=None,
+            )
+            return
+        try:
+            # The public server caches source snapshots independently of the
+            # verifier; drop that generation before observing the post-state.
+            from dashboard import server as dashboard_server
+
+            dashboard_server.clear_runtime_caches()
+            after = read_snapshot_fact_state(self.data_dir, job)
+        except (ImportError, OSError, ValueError):
+            self._fail_job(
+                job_id,
+                stage="verify_snapshot_after",
+                error_code="snapshot_publication_unreadable",
+                message="The requested snapshot publication could not be verified.",
+                retryable=True,
+                status="partial",
+                publication_committed=False,
+                result=None,
+            )
+            return
+        outcome = evaluate_snapshot_refresh(before, after)
+        result = {
+            "before": self._public_snapshot_state(before),
+            "after": self._public_snapshot_state(after),
+        }
+        if not outcome.succeeded:
+            self._set_job(
+                job_id,
+                status="partial",
+                stage="verify_snapshot_after",
+                finished_at=utc_now().isoformat(),
+                error="The requested snapshot fact remains unresolved.",
+                error_code=outcome.error_code or "snapshot_target_unresolved",
+                retryable=outcome.retryable,
+                publication_committed=False,
+                result=result,
             )
             return
         self._set_job(
@@ -1650,17 +1692,19 @@ class AdminService:
             error_code=None,
             retryable=False,
             publication_committed=True,
-            result={
-                "fact_type": fact_type,
-                "market_id": job["market_id"],
-                "collection_profile": profile,
-                "publication_scope": (
-                    "all_published_dex_pools"
-                    if fact_type == "tvl"
-                    else "configured_markets_for_token"
-                ),
-            },
+            result=result,
         )
+
+    @staticmethod
+    def _public_snapshot_state(state: Any) -> dict[str, Any]:
+        """Return the bounded, path- and raw-error-free job projection."""
+        return {
+            "publication_generation": state.publication_generation,
+            "snapshot_id": state.snapshot_id,
+            "status": state.status,
+            "reason_code": state.reason_code,
+            "observed_at": state.observed_at,
+        }
 
     def _refresh_publication_baseline(self) -> dict[str, str | None]:
         quality_import_run_id = None

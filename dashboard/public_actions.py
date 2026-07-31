@@ -476,6 +476,28 @@ def public_job(job: Mapping[str, Any]) -> dict[str, Any]:
     response = {field: job.get(field) for field in allowed if field in job}
     result = job.get("result")
     if isinstance(result, Mapping):
+        if job.get("job_type") == "snapshot_refresh":
+            snapshot_result = {}
+            for label in ("before", "after"):
+                state = result.get(label)
+                if not isinstance(state, Mapping):
+                    continue
+                allowed_state = {}
+                for field, maximum in (
+                    ("publication_generation", 256),
+                    ("snapshot_id", 128),
+                    ("status", 64),
+                    ("reason_code", 64),
+                    ("observed_at", 64),
+                ):
+                    value = state.get(field)
+                    if value is None or (isinstance(value, str) and len(value) <= maximum):
+                        allowed_state[field] = value
+                if allowed_state:
+                    snapshot_result[label] = allowed_state
+            if snapshot_result:
+                response["result_summary"] = snapshot_result
+            return response
         summary_fields = (
             "already_configured",
             "daily",
