@@ -1217,6 +1217,12 @@ def fetch_coinbase_candles(
 ):
     """Fetch daily candles from Coinbase."""
     start_time, end_time = get_request_window(limit_days, start_date, end_date)
+    if start_date is not None:
+        # Request one overlap day and retain the provider-bounded response.
+        # Coinbase may return buckets before the requested start and does not
+        # guarantee a caller-selected order; build_rows applies the canonical
+        # inclusive window before any row or attempt is published.
+        start_time -= timedelta(days=1)
     query = {
         "granularity": "86400",
         "start": start_time.isoformat(),
@@ -1229,7 +1235,34 @@ def fetch_coinbase_candles(
         encoded_query,
     )
 
-    return request_json(url)[:limit_days]
+    candles = request_json(url)
+    if start_date is not None:
+        return candles
+    return candles[:limit_days]
+
+
+def rows_in_requested_window(rows, start_date=None, end_date=None):
+    """Return only canonical UTC dates inside an explicit inclusive window."""
+
+    if start_date is None and end_date is None:
+        return rows
+    if start_date is None or end_date is None:
+        raise ValueError("start_date and end_date must be provided together")
+    start_day = date.fromisoformat(start_date)
+    end_day = date.fromisoformat(end_date)
+    bounded_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("CEX source row is not an object")
+        day_text = row.get("date")
+        if not isinstance(day_text, str):
+            raise ValueError("CEX source row date is not canonical")
+        row_day = date.fromisoformat(day_text)
+        if day_text != row_day.isoformat():
+            raise ValueError("CEX source row date is not canonical")
+        if start_day <= row_day <= end_day:
+            bounded_rows.append(row)
+    return bounded_rows
 
 
 def fetch_kraken_klines(pair: str, limit_days: int, start_date=None, end_date=None):
@@ -1644,6 +1677,7 @@ def build_rows(
                     start_date,
                     end_date,
                 )
+                rows = rows_in_requested_window(rows, start_date, end_date)
             except Exception as error:
                 print("Failed %s on %s: %s" % (token_symbol, exchange, error))
                 if attempt_records is not None:

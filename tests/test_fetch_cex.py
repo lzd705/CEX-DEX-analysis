@@ -253,7 +253,7 @@ class FetchCexTests(unittest.TestCase):
                 fetch_cex.fetch_coinbase_candles,
                 ("UNI-USD", 4, target_date, target_date),
                 [],
-                {"start": start_time.isoformat()},
+                {"start": (start_time - timedelta(days=1)).isoformat()},
                 "/products/UNI-USD/candles",
             ),
             (
@@ -338,6 +338,36 @@ class FetchCexTests(unittest.TestCase):
                 fetch_cex.fetch_htx_klines(
                     "uniusdt", 4, "2010-01-01", "2010-01-01"
                 )
+
+    def test_coinbase_full_overlap_response_reaches_window_bounding(self):
+        target_date = "2026-07-28"
+        target_timestamp = int(
+            datetime.strptime(target_date, "%Y-%m-%d")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+        candles = [
+            [target_timestamp - offset * 86_400, 1, 1, 1, 1, 1]
+            for offset in (2, 1, 0)
+        ]
+        attempts = []
+        with patch(
+            "scripts.fetch_cex.request_json",
+            return_value=candles,
+        ), patch.object(fetch_cex, "LIMIT_DAYS", 1), patch.object(
+            fetch_cex.time,
+            "sleep",
+        ):
+            rows = build_rows(
+                [{"token_symbol": "UNI", "cex_symbol": "UNI/USDT"}],
+                ["coinbase"],
+                attempt_records=attempts,
+                start_date=target_date,
+                end_date=target_date,
+            )
+
+        self.assertEqual([row["date"] for row in rows], [target_date])
+        self.assertEqual(attempts[0]["status"], "succeeded")
 
     def test_kraken_historical_response_does_not_drop_requested_first_row(self):
         target_date = (
@@ -439,6 +469,40 @@ class FetchCexTests(unittest.TestCase):
         self.assertEqual(rows, [row])
         self.assertEqual(attempts[0]["instrument"], "UNI/USD")
         self.assertEqual(attempts[0]["source_instrument"], "UNI/USD")
+
+    def test_build_rows_bounds_source_rows_to_the_requested_window(self):
+        attempts = []
+        rows = [
+            {
+                "date": day_text,
+                "token_symbol": "UNI",
+                "exchange": "kraken",
+                "cex_symbol": "UNI/USD",
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "base_volume": 1,
+                "quote_volume_usd": 1,
+                "source_instrument": "UNI/USD",
+            }
+            for day_text in ("2026-07-27", "2026-07-28", "2026-07-29")
+        ]
+        with patch(
+            "scripts.fetch_cex.fetch_exchange_rows",
+            return_value=rows,
+        ), patch.object(fetch_cex.time, "sleep"):
+            bounded = build_rows(
+                [{"token_symbol": "UNI", "cex_symbol": "UNI/USDT"}],
+                ["kraken"],
+                attempt_records=attempts,
+                start_date="2026-07-28",
+                end_date="2026-07-28",
+            )
+
+        self.assertEqual([row["date"] for row in bounded], ["2026-07-28"])
+        self.assertEqual(attempts[0]["status"], "succeeded")
+        self.assertEqual(attempts[0]["observed_dates"], ["2026-07-28"])
 
     def test_source_range_attempt_is_unsupported_not_network_failed(self):
         attempt = cex_attempt_record(
