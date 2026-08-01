@@ -4761,6 +4761,62 @@ console.log(JSON.stringify({ html: qualityBody.innerHTML, summary: filterSummary
         self.assertIn("Observed 75.0958%", result["html"])
         self.assertIn("minimum 80%", result["html"])
 
+    def test_lifecycle_only_daily_na_explains_absence_without_refresh(self):
+        result = run_app_javascript(
+            """
+const market = {
+  token_symbol: "CAKE",
+  market_id: "cex:crypto_com:CAKE/USDT",
+  market_type: "cex",
+  venue: "crypto_com",
+  instrument: "CAKE/USDT",
+  current_listing_reason_code: "instrument_absent_from_current_catalog",
+  current_listing_checked_at: "2026-08-01T07:22:59+00:00",
+};
+const reason = dailyMarketMissingReason(
+  market,
+  "No finite daily close is available for this market in the selected window.",
+);
+const html = naFactMarkup(reason, {
+  token: "CAKE",
+  marketId: market.market_id,
+  marketLabel: "CEX · crypto_com · CAKE/USDT",
+  factLabel: "daily close",
+});
+const staleReason = dailyMarketMissingReason({
+  current_listing_reason_code: "official_catalog_evidence_stale",
+  current_listing_checked_at: "2026-07-30T07:22:59+00:00",
+}, "fallback");
+const fallback = "No finite daily USD volume is available for this market in the selected window.";
+console.log(JSON.stringify({
+  reason,
+  html,
+  staleReason,
+  fallback: dailyMarketMissingReason({}, fallback),
+}));
+"""
+        )
+        self.assertIn("absent from the official current exchange catalog", result["reason"])
+        self.assertIn("N/A, not zero", result["reason"])
+        self.assertIn("2026-08-01", result["reason"])
+        self.assertIn('aria-label="N/A reason', result["html"])
+        self.assertNotIn("na-refresh-action", result["html"])
+        self.assertEqual(
+            result["fallback"],
+            "No finite daily USD volume is available for this market in the selected window.",
+        )
+        self.assertIn("evidence is older than 36 hours", result["staleReason"])
+        self.assertNotIn("absent from the official current exchange catalog", result["staleReason"])
+
+        app_js = APP_PATH.read_text(encoding="utf-8")
+        market_slice = app_js[
+            app_js.index("function renderWorkspaceMarkets()"):
+            app_js.index("function catalogQualityPayload()")
+        ]
+        self.assertEqual(market_slice.count("dailyMarketMissingReason("), 2)
+        self.assertIn("daily close", market_slice)
+        self.assertIn("daily USD volume", market_slice)
+
     def test_execution_na_disclosure_uses_canonical_scenario_reason(self):
         result = run_app_javascript(
             """

@@ -148,6 +148,7 @@ const DAILY_QUALITY_REASON_LABELS = {
   execution_snapshot_invalid: "Execution snapshot invalid",
   execution_market_not_cataloged_in_snapshot: "Market not included in the published execution snapshot",
   instrument_absent_from_current_catalog: "Instrument absent from the official current exchange catalog",
+  official_catalog_evidence_stale: "Official catalog evidence is older than 36 hours",
   unsupported_protocol_or_chain: "Execution not supported for this protocol or chain",
   unsupported_protocol: "Execution not supported for this protocol",
   unsupported_chain: "Execution not supported for this chain",
@@ -2068,6 +2069,20 @@ function snapshotMissingReason(market, fact, fallback) {
   return `${reason} Status: ${status}. ${lastAttempt}`;
 }
 
+function dailyMarketMissingReason(market, fallback) {
+  const reasonCode = market?.current_listing_reason_code;
+  if (![
+    "instrument_absent_from_current_catalog",
+    "official_catalog_evidence_stale",
+  ].includes(reasonCode)) return fallback;
+  const reason = DAILY_QUALITY_REASON_LABELS[reasonCode]
+    || reasonCode.replaceAll("_", " ");
+  const checked = market?.current_listing_checked_at
+    ? ` Official catalog checked ${formatUtcTimestamp(market.current_listing_checked_at)}.`
+    : " Official catalog check time is not published.";
+  return `${reason}. Current daily facts remain N/A, not zero.${checked}`;
+}
+
 function snapshotMarketContextLabel(market) {
   if (!market) return "";
   return [
@@ -2655,13 +2670,19 @@ function renderWorkspaceMarkets() {
           <td data-label="Window price">${finite(row?.price_usd)
             ? formatPrice(row.price_usd)
             : naFactMarkup(
-              "No finite daily close is available for this market in the selected window.",
+              dailyMarketMissingReason(
+                market,
+                "No finite daily close is available for this market in the selected window.",
+              ),
               { token, marketLabel: factsMarketLabel(market), factLabel: "daily close" },
             )}</td>
           <td data-label="Window volume">${finite(row?.volume_usd)
             ? formatCurrency(row.volume_usd)
             : naFactMarkup(
-              "No finite daily USD volume is available for this market in the selected window.",
+              dailyMarketMissingReason(
+                market,
+                "No finite daily USD volume is available for this market in the selected window.",
+              ),
               { token, marketLabel: factsMarketLabel(market), factLabel: "daily USD volume" },
             )}</td>
           <td data-label="TVL">${tvl}</td>
