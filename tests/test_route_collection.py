@@ -1,7 +1,19 @@
 import json
+from pathlib import Path
+import tempfile
 import unittest
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+import time
 from unittest.mock import patch
+
+from scripts.collect_route_cohort import (
+    collect_route_cohort,
+    collect_unique_route_legs,
+    main,
+    materialize_route_leg_rows,
+)
 
 
 class FakeClock:
@@ -172,6 +184,265 @@ class RpcClientIsolationTest(unittest.TestCase):
         self.assertEqual(first.method("test_first_again", []), "0x1")
         self.assertEqual(first.records[1]["request"]["id"], 2)
         self.assertEqual(len(second.records), 1)
+
+
+class RouteLegCollectionTests(unittest.TestCase):
+    def test_cli_dry_run_reads_and_validates_universe_without_collection_or_publication(self):
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [],
+            "routes": [],
+        }
+        with tempfile.TemporaryDirectory() as directory_name:
+            data_dir = Path(directory_name)
+            (data_dir / "route_universe.json").write_text(json.dumps(universe), encoding="utf-8")
+            result = main([
+                "--data-dir", str(data_dir), "--start", "2026-08-01",
+                "--end", "2026-08-01", "--tokens", "UNI", "--dry-run",
+            ])
+            self.assertEqual(result["candidate_source_generation"], "generation-a")
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(sorted(path.name for path in data_dir.iterdir()), ["route_universe.json"])
+            with self.assertRaisesRegex(RuntimeError, "Task 5"):
+                main(["--data-dir", str(data_dir), "--publish"])
+
+    def test_unique_route_legs_deduplicates_directional_route_references(self):
+        routes = [
+            {
+                "route_id": "route:UNI:cex:alpha:UNI/USDT->dex:eth:swap:0xpool:UNI:prepositioned_inventory",
+                "buy_market_id": "cex:alpha:UNI/USDT",
+                "sell_market_id": "dex:eth:swap:0xpool:UNI",
+            },
+            {
+                "route_id": "route:UNI:dex:eth:swap:0xpool:UNI->cex:alpha:UNI/USDT:prepositioned_inventory",
+                "buy_market_id": "dex:eth:swap:0xpool:UNI",
+                "sell_market_id": "cex:alpha:UNI/USDT",
+            },
+        ]
+
+        self.assertEqual(
+            collect_unique_route_legs(routes),
+            ["cex:alpha:UNI/USDT", "dex:eth:swap:0xpool:UNI"],
+        )
+
+    def test_materialize_route_leg_rows_retains_terminal_deadline_leg(self):
+        rows = materialize_route_leg_rows(
+            ["cex:alpha:UNI/USDT"],
+            {},
+            deadline_exceeded={"cex:alpha:UNI/USDT"},
+        )
+
+        self.assertEqual(
+            rows,
+            [{
+                "leg_id": "cex:alpha:UNI/USDT",
+                "market_id": "cex:alpha:UNI/USDT",
+                "status": "deadline_exceeded",
+                "available": False,
+                "reason_code": "route_deadline_exceeded",
+            }],
+        )
+
+    def test_collects_each_shared_leg_once_with_per_venue_limit(self):
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": "cex:alpha:UNI/USDT", "market_type": "cex", "exchange": "alpha"},
+                {"market_id": "cex:alpha:UNI/USDC", "market_type": "cex", "exchange": "alpha"},
+                {"market_id": "cex:beta:UNI/USDT", "market_type": "cex", "exchange": "beta"},
+            ],
+            "routes": [
+                {"token_symbol": "UNI", "buy_market_id": "cex:alpha:UNI/USDT", "sell_market_id": "cex:alpha:UNI/USDC", "route_mode": "prepositioned_inventory"},
+                {"token_symbol": "UNI", "buy_market_id": "cex:alpha:UNI/USDC", "sell_market_id": "cex:beta:UNI/USDT", "route_mode": "prepositioned_inventory"},
+            ],
+        }
+        active = {"alpha": 0, "beta": 0}
+        maximum = {"alpha": 0, "beta": 0}
+        started = []
+        lock = Lock()
+
+        def cex_collector(leg, **_kwargs):
+            venue = leg["exchange"]
+            with lock:
+                active[venue] += 1
+                maximum[venue] = max(maximum[venue], active[venue])
+                started.append(leg["market_id"])
+            try:
+                return {"status": "observed", "state_observed_at": "2026-08-01T12:00:00Z"}
+            finally:
+                with lock:
+                    active[venue] -= 1
+
+        result = collect_route_cohort(
+            universe,
+            cex_collector=cex_collector,
+            dex_collector=lambda *_args, **_kwargs: self.fail("unexpected DEX collection"),
+            max_workers=3,
+            cex_workers_per_venue=1,
+            executor_factory=ThreadPoolExecutor,
+        )
+
+        self.assertCountEqual(
+            started,
+            ["cex:alpha:UNI/USDC", "cex:alpha:UNI/USDT", "cex:beta:UNI/USDT"],
+        )
+        self.assertEqual(maximum, {"alpha": 1, "beta": 1})
+        self.assertEqual(
+            [row["market_id"] for row in result["legs"]],
+            ["cex:alpha:UNI/USDC", "cex:alpha:UNI/USDT", "cex:beta:UNI/USDT"],
+        )
+
+    def test_same_chain_dex_legs_receive_one_resolved_fixed_block(self):
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": "dex:eth:swap:0xone:UNI", "market_type": "dex", "chain": "eth"},
+                {"market_id": "dex:eth:swap:0xtwo:UNI", "market_type": "dex", "chain": "eth"},
+                {"market_id": "dex:arb:swap:0xthree:UNI", "market_type": "dex", "chain": "arb"},
+            ],
+            "routes": [
+                {"token_symbol": "UNI", "buy_market_id": "dex:eth:swap:0xone:UNI", "sell_market_id": "dex:eth:swap:0xtwo:UNI", "route_mode": "atomic_onchain"},
+            ],
+        }
+        resolved = []
+        received = {}
+
+        def resolve_block(chain, **_kwargs):
+            resolved.append(chain)
+            return {"block_number": 101 if chain == "eth" else 202, "block_timestamp": "2026-08-01T12:00:00Z"}
+
+        def dex_collector(leg, **kwargs):
+            received[leg["market_id"]] = (
+                kwargs["fixed_block_number"], kwargs["fixed_block_timestamp"],
+            )
+            return {"status": "observed", "state_observed_at": "2026-08-01T12:00:00Z"}
+
+        collect_route_cohort(
+            universe,
+            cex_collector=lambda *_args, **_kwargs: self.fail("unexpected CEX collection"),
+            dex_collector=dex_collector,
+            dex_block_resolver=resolve_block,
+            max_workers=3,
+        )
+
+        self.assertEqual(resolved, ["eth"])
+        self.assertEqual(received["dex:eth:swap:0xone:UNI"], (101, "2026-08-01T12:00:00Z"))
+        self.assertEqual(received["dex:eth:swap:0xtwo:UNI"], (101, "2026-08-01T12:00:00Z"))
+        self.assertNotIn("dex:arb:swap:0xthree:UNI", received)
+
+    def test_dex_collection_fails_closed_without_fixed_block_resolver(self):
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": "dex:eth:swap:0xone:UNI", "market_type": "dex"},
+                {"market_id": "dex:eth:swap:0xtwo:UNI", "market_type": "dex"},
+            ],
+            "routes": [
+                {"token_symbol": "UNI", "buy_market_id": "dex:eth:swap:0xone:UNI", "sell_market_id": "dex:eth:swap:0xtwo:UNI", "route_mode": "atomic_onchain"},
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "fixed block resolver"):
+            collect_route_cohort(
+                universe,
+                cex_collector=lambda *_args, **_kwargs: self.fail("unexpected CEX collection"),
+                dex_collector=lambda *_args, **_kwargs: self.fail("must not collect without a fixed block"),
+            )
+
+    def test_deadline_terminal_leg_only_makes_its_routes_unavailable(self):
+        from scripts.collection_deadline import CollectionDeadlineExceeded
+
+        good = "2026-08-01T12:00:00Z"
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": "cex:alpha:UNI/USDT", "market_type": "cex"},
+                {"market_id": "cex:beta:UNI/USDT", "market_type": "cex"},
+                {"market_id": "cex:gamma:UNI/USDT", "market_type": "cex"},
+            ],
+            "routes": [
+                {"token_symbol": "UNI", "buy_market_id": "cex:alpha:UNI/USDT", "sell_market_id": "cex:beta:UNI/USDT", "route_mode": "prepositioned_inventory"},
+                {"token_symbol": "UNI", "buy_market_id": "cex:alpha:UNI/USDT", "sell_market_id": "cex:gamma:UNI/USDT", "route_mode": "prepositioned_inventory"},
+            ],
+        }
+
+        def cex_collector(leg, **_kwargs):
+            if leg["market_id"] == "cex:beta:UNI/USDT":
+                raise CollectionDeadlineExceeded("collection deadline exceeded")
+            return {"status": "observed", "state_observed_at": good}
+
+        result = collect_route_cohort(
+            universe,
+            cex_collector=cex_collector,
+            dex_collector=lambda *_args, **_kwargs: self.fail("unexpected DEX collection"),
+        )
+
+        timing = {row["route_id"]: row for row in result["route_rows"]}
+        self.assertEqual(
+            timing["route:UNI:cex:alpha:UNI/USDT->cex:beta:UNI/USDT:prepositioned_inventory"]["reason_code"],
+            "route_deadline_exceeded",
+        )
+        self.assertEqual(
+            timing["route:UNI:cex:alpha:UNI/USDT->cex:gamma:UNI/USDT:prepositioned_inventory"]["timing_status"],
+            "within_sla",
+        )
+
+    def test_reverse_completion_orders_produce_identical_normalized_cohort(self):
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": "cex:alpha:UNI/USDT", "market_type": "cex"},
+                {"market_id": "cex:beta:UNI/USDT", "market_type": "cex"},
+            ],
+            "routes": [
+                {"token_symbol": "UNI", "buy_market_id": "cex:alpha:UNI/USDT", "sell_market_id": "cex:beta:UNI/USDT", "route_mode": "prepositioned_inventory"},
+            ],
+        }
+
+        def collect_with_delays(delays):
+            def cex_collector(leg, **_kwargs):
+                time.sleep(delays[leg["market_id"]])
+                return {"status": "observed", "state_observed_at": "2026-08-01T12:00:00Z"}
+
+            return collect_route_cohort(
+                universe,
+                cex_collector=cex_collector,
+                dex_collector=lambda *_args, **_kwargs: self.fail("unexpected DEX collection"),
+                max_workers=2,
+                target_observed_at="2026-08-01T12:00:00Z",
+            )
+
+        alpha_first = collect_with_delays({"cex:alpha:UNI/USDT": 0, "cex:beta:UNI/USDT": 0.02})
+        beta_first = collect_with_delays({"cex:alpha:UNI/USDT": 0.02, "cex:beta:UNI/USDT": 0})
+
+        self.assertEqual(alpha_first["legs"], beta_first["legs"])
+        self.assertEqual(alpha_first["route_rows"], beta_first["route_rows"])
+        self.assertEqual(alpha_first["fingerprint"], beta_first["fingerprint"])
+
+    def test_source_generation_change_during_collection_fails_closed(self):
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": "cex:alpha:UNI/USDT", "market_type": "cex"},
+                {"market_id": "cex:beta:UNI/USDT", "market_type": "cex"},
+            ],
+            "routes": [
+                {"token_symbol": "UNI", "buy_market_id": "cex:alpha:UNI/USDT", "sell_market_id": "cex:beta:UNI/USDT", "route_mode": "prepositioned_inventory"},
+            ],
+        }
+        current_generation = ["generation-a"]
+
+        def cex_collector(_leg, **_kwargs):
+            current_generation[0] = "generation-b"
+            return {"status": "observed", "state_observed_at": "2026-08-01T12:00:00Z"}
+
+        with self.assertRaisesRegex(ValueError, "candidate source generation changed"):
+            collect_route_cohort(
+                universe,
+                cex_collector=cex_collector,
+                dex_collector=lambda *_args, **_kwargs: self.fail("unexpected DEX collection"),
+                source_generation_reader=lambda: current_generation[0],
+            )
 
 
 if __name__ == "__main__":
