@@ -16,6 +16,7 @@ import time
 from unittest.mock import patch
 
 from scripts.collect_route_cohort import (
+    _safe_leg_projection,
     collect_route_cohort as _collect_route_cohort,
     collect_unique_route_legs,
     main,
@@ -407,6 +408,203 @@ class RouteLegCollectionTests(unittest.TestCase):
                 )
             self.assertEqual(source_reads, [])
             self.assertFalse(raw_root.exists())
+
+    def test_malformed_market_ids_fail_before_source_read_or_raw_creation(self):
+        valid_cex = "cex:beta:UNI/USDT"
+        invalid_ids = (
+            "cex::UNI/USDT",
+            "cex:alpha:UNI",
+            "cex:alpha:/USDT",
+            "cex:alpha:UNI/",
+            "cex:alpha:UNI//USDT",
+            "cex:alpha:UNI/US DT",
+            "cex:alpha:../USDT",
+            "dex::swap:0xpool:UNI",
+            "dex:eth::0xpool:UNI",
+            "dex:eth:swap::UNI",
+            "dex:eth:swap:0xpool:",
+            "dex:eth:swap:0xpool",
+            "dex:eth:swap:..:UNI",
+            "dex:eth:swap:0xpool:UNI/USDT",
+            "dex:eth:swap:0xAbC:UNI",
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            for index, market_id in enumerate(invalid_ids):
+                source_reads = []
+                raw_root = root / str(index)
+                market_type = "dex" if market_id.startswith("dex:") else "cex"
+                selected_leg = {
+                    "market_id": market_id,
+                    "market_type": market_type,
+                }
+                universe = {
+                    "candidate_source_generation": "generation-a",
+                    "selected_legs": [
+                        selected_leg,
+                        {
+                            "market_id": valid_cex,
+                            "market_type": "cex",
+                        },
+                    ],
+                    "routes": [
+                        _strict_route(
+                            "UNI",
+                            market_id,
+                            valid_cex,
+                            "prepositioned_inventory",
+                        )
+                    ],
+                }
+                with self.subTest(market_id=market_id):
+                    with self.assertRaisesRegex(
+                        ValueError, "route leg identity is invalid"
+                    ):
+                        _collect_route_cohort(
+                            universe,
+                            cex_collector=lambda *_args, **_kwargs: self.fail(
+                                "invalid identity must not collect"
+                            ),
+                            dex_collector=lambda *_args, **_kwargs: self.fail(
+                                "invalid identity must not collect"
+                            ),
+                            dex_block_resolver=lambda *_args, **_kwargs: self.fail(
+                                "invalid identity must not resolve"
+                            ),
+                            raw_root=raw_root,
+                            executor_factory=ThreadPoolExecutor,
+                            source_generation_reader=lambda: (
+                                source_reads.append("read") or "input-a"
+                            ),
+                            expected_source_generation="input-a",
+                        )
+                    self.assertEqual(source_reads, [])
+                    self.assertFalse(raw_root.exists())
+
+    def test_selected_identity_fields_must_match_canonical_market_id(self):
+        left = "cex:alpha:UNI/USDT"
+        right = "dex:eth:swap:0xpool:UNI"
+        cases = (
+            (left, "cex", {"exchange": "beta"}),
+            (left, "cex", {"exchange": " alpha "}),
+            (left, "cex", {"cex_symbol": "AAVE/USDT"}),
+            (left, "cex", {"cex_symbol": " UNI/USDT "}),
+            (left, "cex", {"token_symbol": "AAVE"}),
+            (left, "cex", {"token_symbol": " UNI "}),
+            (right, "dex", {"chain": "arb"}),
+            (right, "dex", {"chain": " eth "}),
+            (right, "dex", {"dex": "other"}),
+            (right, "dex", {"dex": " swap "}),
+            (right, "dex", {"pool_address": "0xother"}),
+            (right, "dex", {"pool_address": " 0xpool "}),
+            (right, "dex", {"token_symbol": "AAVE"}),
+            (right, "dex", {"token_symbol": " UNI "}),
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            for index, (market_id, market_type, conflicting) in enumerate(cases):
+                source_reads = []
+                raw_root = root / str(index)
+                universe = {
+                    "candidate_source_generation": "generation-a",
+                    "selected_legs": [
+                        {
+                            "market_id": market_id,
+                            "market_type": market_type,
+                            **conflicting,
+                        },
+                        {
+                            "market_id": "cex:beta:UNI/USDT",
+                            "market_type": "cex",
+                        },
+                    ],
+                    "routes": [
+                        _strict_route(
+                            "UNI",
+                            market_id,
+                            "cex:beta:UNI/USDT",
+                            "prepositioned_inventory",
+                        )
+                    ],
+                }
+                with self.subTest(market_id=market_id, conflicting=conflicting):
+                    with self.assertRaisesRegex(
+                        ValueError, "route leg identity is invalid"
+                    ):
+                        _collect_route_cohort(
+                            universe,
+                            cex_collector=lambda *_args, **_kwargs: self.fail(
+                                "identity conflict must not collect"
+                            ),
+                            dex_collector=lambda *_args, **_kwargs: self.fail(
+                                "identity conflict must not collect"
+                            ),
+                            dex_block_resolver=lambda *_args, **_kwargs: self.fail(
+                                "identity conflict must not resolve"
+                            ),
+                            raw_root=raw_root,
+                            executor_factory=ThreadPoolExecutor,
+                            source_generation_reader=lambda: (
+                                source_reads.append("read") or "input-a"
+                            ),
+                            expected_source_generation="input-a",
+                        )
+                    self.assertEqual(source_reads, [])
+                    self.assertFalse(raw_root.exists())
+
+    def test_dex_pool_identity_accepts_publication_maximum_length(self):
+        pool = "P" + ("a" * 255)
+        dex_market = "dex:eth:swap:{}:UNI".format(pool)
+        cex_market = "cex:beta:UNI/USDT"
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {
+                    "market_id": dex_market,
+                    "market_type": "dex",
+                    "chain": "eth",
+                    "dex": "swap",
+                    "pool_address": pool,
+                    "token_symbol": "UNI",
+                },
+                {"market_id": cex_market, "market_type": "cex"},
+            ],
+            "routes": [
+                _strict_route(
+                    "UNI", dex_market, cex_market, "prepositioned_inventory"
+                )
+            ],
+        }
+
+        def dex_observation(_leg, *, raw_path, fixed_block_number,
+                            fixed_block_timestamp, **_kwargs):
+            raw_path.write_bytes(b"long pool raw")
+            return {
+                "status": "observed",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+                "block_number": str(fixed_block_number),
+                "block_timestamp": fixed_block_timestamp,
+            }
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            try:
+                result = _collect_route_cohort(
+                    universe,
+                    cex_collector=_write_observed_raw,
+                    dex_collector=dex_observation,
+                    dex_block_resolver=lambda *_args, **_kwargs: {
+                        "block_number": 123,
+                        "block_timestamp": "2026-08-01T12:00:00Z",
+                    },
+                    raw_root=Path(directory_name),
+                    executor_factory=ThreadPoolExecutor,
+                    source_generation_reader=lambda: "input-a",
+                    expected_source_generation="input-a",
+                )
+            except ValueError as error:
+                self.fail("maximum-length canonical pool was rejected: {}".format(error))
+
+        self.assertTrue(all(row["status"] == "observed" for row in result["legs"]))
 
     def test_fixed_block_lineage_is_strict_and_future_safe(self):
         left = "dex:eth:swap:0xone:UNI"
@@ -816,6 +1014,504 @@ class RouteLegCollectionTests(unittest.TestCase):
                         )
             self.assertEqual(list(target.iterdir()), [])
 
+    def test_raw_root_rejects_caller_controlled_symlink_ancestor(self):
+        universe = _strict_cex_universe()
+        source_reads = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            target = root / "target"
+            target.mkdir()
+            alias = root / "caller-alias"
+            alias.symlink_to(target, target_is_directory=True)
+            raw_root = alias / "raw"
+            with self.assertRaisesRegex(ValueError, "raw_root.*symlink"):
+                _collect_route_cohort(
+                    universe,
+                    cex_collector=_write_observed_raw,
+                    dex_collector=lambda *_args, **_kwargs: None,
+                    raw_root=raw_root,
+                    executor_factory=ThreadPoolExecutor,
+                    source_generation_reader=lambda: (
+                        source_reads.append("read") or "input-a"
+                    ),
+                    expected_source_generation="input-a",
+                )
+            self.assertFalse((target / "raw").exists())
+        self.assertEqual(source_reads, [])
+
+    def test_symlinked_stage_directory_cannot_import_external_evidence(self):
+        universe = _strict_cex_universe()
+        external_raw = b"EXTERNAL_STAGE_EVIDENCE_SENTINEL"
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            external = root / "external"
+            external.mkdir()
+            (external / "response.json").write_bytes(external_raw)
+            displaced = root / "displaced-original-stage"
+
+            def collector(leg, *, raw_path, **_kwargs):
+                if leg["market_id"].startswith("cex:alpha:"):
+                    raw_path.parent.rename(displaced)
+                    raw_path.parent.symlink_to(
+                        external, target_is_directory=True
+                    )
+                    return {
+                        "status": "observed",
+                        "state_observed_at": "2026-08-01T12:00:00Z",
+                        "raw_response_sha256": hashlib.sha256(
+                            external_raw
+                        ).hexdigest(),
+                    }
+                return _write_observed_raw(leg, raw_path=raw_path)
+
+            result = _collect_route_cohort(
+                universe,
+                cex_collector=collector,
+                dex_collector=lambda *_args, **_kwargs: None,
+                raw_root=root / "raw",
+                max_workers=1,
+                executor_factory=ThreadPoolExecutor,
+                source_generation_reader=lambda: "input-a",
+                expected_source_generation="input-a",
+            )
+
+            alpha = next(
+                row for row in result["legs"]
+                if row["market_id"].startswith("cex:alpha:")
+            )
+            self.assertEqual(alpha["status"], "failed")
+            self.assertEqual(
+                alpha["reason_code"], "raw_evidence_path_unsafe"
+            )
+            self.assertEqual(
+                (external / "response.json").read_bytes(), external_raw
+            )
+            accepted = root / "raw" / result["raw_evidence_run_id"] / "accepted"
+            self.assertEqual(len(list(accepted.iterdir())), 1)
+            self.assertTrue(all(not path.is_symlink() for path in accepted.iterdir()))
+
+    def test_swapped_real_stage_directory_is_not_promoted(self):
+        universe = _strict_cex_universe()
+        replacement_raw = b"REAL_DIRECTORY_SWAP_SENTINEL"
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            replacement = root / "replacement-stage"
+            replacement.mkdir()
+            (replacement / "response.json").write_bytes(replacement_raw)
+            displaced = root / "original-stage"
+
+            def collector(leg, *, raw_path, **_kwargs):
+                if leg["market_id"].startswith("cex:alpha:"):
+                    raw_path.parent.rename(displaced)
+                    replacement.rename(raw_path.parent)
+                    return {
+                        "status": "observed",
+                        "state_observed_at": "2026-08-01T12:00:00Z",
+                        "raw_response_sha256": hashlib.sha256(
+                            replacement_raw
+                        ).hexdigest(),
+                    }
+                return _write_observed_raw(leg, raw_path=raw_path)
+
+            result = _collect_route_cohort(
+                universe,
+                cex_collector=collector,
+                dex_collector=lambda *_args, **_kwargs: None,
+                raw_root=root / "raw",
+                max_workers=1,
+                executor_factory=ThreadPoolExecutor,
+                source_generation_reader=lambda: "input-a",
+                expected_source_generation="input-a",
+            )
+
+            alpha = next(
+                row for row in result["legs"]
+                if row["market_id"].startswith("cex:alpha:")
+            )
+            self.assertEqual(alpha["status"], "failed")
+            self.assertEqual(
+                alpha["reason_code"], "raw_evidence_path_unsafe"
+            )
+            accepted = root / "raw" / result["raw_evidence_run_id"] / "accepted"
+            self.assertEqual(len(list(accepted.iterdir())), 1)
+
+    def test_swapped_accepted_root_cannot_export_staged_evidence(self):
+        universe = _strict_cex_universe()
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            external = root / "external-accepted"
+            external.mkdir()
+            displaced = root / "original-accepted"
+
+            def collector(leg, *, raw_path, **_kwargs):
+                if leg["market_id"].startswith("cex:alpha:"):
+                    accepted = raw_path.parents[2] / "accepted"
+                    accepted.rename(displaced)
+                    accepted.symlink_to(external, target_is_directory=True)
+                return _write_observed_raw(leg, raw_path=raw_path)
+
+            result = _collect_route_cohort(
+                universe,
+                cex_collector=collector,
+                dex_collector=lambda *_args, **_kwargs: None,
+                raw_root=root / "raw",
+                max_workers=1,
+                executor_factory=ThreadPoolExecutor,
+                source_generation_reader=lambda: "input-a",
+                expected_source_generation="input-a",
+            )
+
+            self.assertTrue(all(
+                row["status"] == "failed"
+                and row["reason_code"] == "raw_evidence_path_unsafe"
+                for row in result["legs"]
+            ))
+            self.assertEqual(list(external.iterdir()), [])
+
+    def test_accepted_root_swap_between_guard_and_rename_cannot_export_evidence(self):
+        universe = _strict_cex_universe()
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            raw_root = root / "raw"
+            external = root / "external-accepted"
+            external.mkdir()
+            displaced = root / "original-accepted"
+            swapped = []
+
+            def swap_then_rename(
+                source_name,
+                destination_name,
+                *,
+                source_directory_fd,
+                destination_directory_fd,
+            ):
+                if not swapped:
+                    accepted = raw_root / "stable-run" / "accepted"
+                    accepted.rename(displaced)
+                    accepted.symlink_to(external, target_is_directory=True)
+                    swapped.append(True)
+                return os.rename(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=source_directory_fd,
+                    dst_dir_fd=destination_directory_fd,
+                )
+
+            with patch(
+                "scripts.collect_route_cohort._rename_directory_entry",
+                side_effect=swap_then_rename,
+            ):
+                result = _collect_route_cohort(
+                    universe,
+                    cex_collector=_write_observed_raw,
+                    dex_collector=lambda *_args, **_kwargs: None,
+                    raw_root=raw_root,
+                    snapshot_id="stable-run",
+                    max_workers=1,
+                    executor_factory=ThreadPoolExecutor,
+                    source_generation_reader=lambda: "input-a",
+                    expected_source_generation="input-a",
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual(list(external.iterdir()), [])
+            self.assertFalse(
+                (raw_root / "stable-run" / "accepted").is_symlink()
+            )
+            self.assertTrue(all(
+                row["status"] == "failed"
+                and row["reason_code"] == "raw_evidence_path_unsafe"
+                for row in result["legs"]
+            ))
+
+    def test_rollback_exchanges_staging_collision_before_clearing_swapped_accepted(self):
+        universe = _strict_cex_universe()
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            raw_root = root / "raw"
+            external_accepted = root / "external-accepted"
+            attacked = []
+
+            def promote_then_swap_and_collide(
+                source_name,
+                destination_name,
+                *,
+                source_directory_fd,
+                destination_directory_fd,
+            ):
+                result = os.rename(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=source_directory_fd,
+                    dst_dir_fd=destination_directory_fd,
+                )
+                if not attacked:
+                    accepted = raw_root / "stable-run" / "accepted"
+                    accepted.rename(external_accepted)
+                    accepted.symlink_to(
+                        external_accepted,
+                        target_is_directory=True,
+                    )
+                    os.symlink(
+                        str(root / "attacker-controlled"),
+                        source_name,
+                        dir_fd=source_directory_fd,
+                    )
+                    attacked.append(source_name)
+                return result
+
+            with patch(
+                "scripts.collect_route_cohort._rename_directory_entry",
+                side_effect=promote_then_swap_and_collide,
+            ):
+                result = _collect_route_cohort(
+                    universe,
+                    cex_collector=_write_observed_raw,
+                    dex_collector=lambda *_args, **_kwargs: None,
+                    raw_root=raw_root,
+                    snapshot_id="stable-run",
+                    max_workers=1,
+                    executor_factory=ThreadPoolExecutor,
+                    source_generation_reader=lambda: "input-a",
+                    expected_source_generation="input-a",
+                )
+
+            self.assertTrue(attacked)
+            self.assertEqual(list(external_accepted.iterdir()), [])
+            run_dir = raw_root / "stable-run"
+            self.assertFalse((run_dir / "accepted").is_symlink())
+            recovered = run_dir / "staging" / attacked[0]
+            self.assertTrue(recovered.is_dir())
+            self.assertFalse(recovered.is_symlink())
+            self.assertEqual(
+                (recovered / "response.json").read_bytes(),
+                b"observed raw",
+            )
+            self.assertTrue(all(
+                row["status"] == "failed"
+                and row["reason_code"] == "raw_evidence_path_unsafe"
+                for row in result["legs"]
+            ))
+
+    def test_rollback_exchange_failure_hard_fails_after_descriptor_cleanup(self):
+        universe = _strict_cex_universe()
+        returned = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            raw_root = root / "raw"
+            external_accepted = root / "external-accepted"
+            attacked = []
+
+            def promote_then_swap_and_collide(
+                source_name,
+                destination_name,
+                *,
+                source_directory_fd,
+                destination_directory_fd,
+            ):
+                result = os.rename(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=source_directory_fd,
+                    dst_dir_fd=destination_directory_fd,
+                )
+                if not attacked:
+                    accepted = raw_root / "stable-run" / "accepted"
+                    accepted.rename(external_accepted)
+                    accepted.symlink_to(
+                        external_accepted,
+                        target_is_directory=True,
+                    )
+                    os.symlink(
+                        str(root / "attacker-controlled"),
+                        source_name,
+                        dir_fd=source_directory_fd,
+                    )
+                    attacked.append(source_name)
+                return result
+
+            descriptors_before = len(os.listdir("/dev/fd"))
+            with patch(
+                "scripts.collect_route_cohort._rename_directory_entry",
+                side_effect=promote_then_swap_and_collide,
+            ), patch(
+                "scripts.collect_route_cohort._exchange_directory_entries",
+                side_effect=OSError("injected exchange failure"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^raw evidence rollback could not be verified$",
+                ):
+                    returned.append(_collect_route_cohort(
+                        universe,
+                        cex_collector=_write_observed_raw,
+                        dex_collector=lambda *_args, **_kwargs: None,
+                        raw_root=raw_root,
+                        snapshot_id="stable-run",
+                        max_workers=1,
+                        executor_factory=ThreadPoolExecutor,
+                        source_generation_reader=lambda: "input-a",
+                        expected_source_generation="input-a",
+                    ))
+            self.assertEqual(len(os.listdir("/dev/fd")), descriptors_before)
+            self.assertEqual(returned, [])
+
+    def test_rollback_quarantine_failure_hard_fails_after_descriptor_cleanup(self):
+        universe = _strict_cex_universe()
+        returned = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            raw_root = root / "raw"
+            external_accepted = root / "external-accepted"
+            attacked = []
+
+            def fail_quarantine_after_collision(
+                source_name,
+                destination_name,
+                *,
+                source_directory_fd,
+                destination_directory_fd,
+            ):
+                if destination_name.startswith(".rejected-"):
+                    raise OSError("injected quarantine failure")
+                result = os.rename(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=source_directory_fd,
+                    dst_dir_fd=destination_directory_fd,
+                )
+                if not attacked:
+                    accepted = raw_root / "stable-run" / "accepted"
+                    accepted.rename(external_accepted)
+                    accepted.symlink_to(
+                        external_accepted,
+                        target_is_directory=True,
+                    )
+                    os.symlink(
+                        str(root / "attacker-controlled"),
+                        source_name,
+                        dir_fd=source_directory_fd,
+                    )
+                    attacked.append(source_name)
+                return result
+
+            descriptors_before = len(os.listdir("/dev/fd"))
+            with patch(
+                "scripts.collect_route_cohort._rename_directory_entry",
+                side_effect=fail_quarantine_after_collision,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^raw evidence rollback could not be verified$",
+                ):
+                    returned.append(_collect_route_cohort(
+                        universe,
+                        cex_collector=_write_observed_raw,
+                        dex_collector=lambda *_args, **_kwargs: None,
+                        raw_root=raw_root,
+                        snapshot_id="stable-run",
+                        max_workers=1,
+                        executor_factory=ThreadPoolExecutor,
+                        source_generation_reader=lambda: "input-a",
+                        expected_source_generation="input-a",
+                    ))
+            self.assertEqual(len(os.listdir("/dev/fd")), descriptors_before)
+            self.assertEqual(returned, [])
+
+    def test_rollback_state_verification_failure_hard_fails_after_descriptor_cleanup(self):
+        universe = _strict_cex_universe()
+        returned = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            descriptors_before = len(os.listdir("/dev/fd"))
+            with patch(
+                "scripts.collect_route_cohort._post_promotion_failure",
+                return_value="raw_evidence_hash_mismatch",
+            ), patch(
+                "scripts.collect_route_cohort._rollback_state_is_safe",
+                return_value=False,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^raw evidence rollback could not be verified$",
+                ):
+                    returned.append(_collect_route_cohort(
+                        universe,
+                        cex_collector=_write_observed_raw,
+                        dex_collector=lambda *_args, **_kwargs: None,
+                        raw_root=Path(directory_name),
+                        snapshot_id="stable-run",
+                        max_workers=1,
+                        executor_factory=ThreadPoolExecutor,
+                        source_generation_reader=lambda: "input-a",
+                        expected_source_generation="input-a",
+                    ))
+            self.assertEqual(len(os.listdir("/dev/fd")), descriptors_before)
+            self.assertEqual(returned, [])
+
+    def test_post_promotion_raw_tamper_is_rejected_and_rolled_back(self):
+        universe = _strict_cex_universe()
+
+        def tampering_rename(
+            source_name,
+            destination_name,
+            *,
+            source_directory_fd,
+            destination_directory_fd,
+        ):
+            result = os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=source_directory_fd,
+                dst_dir_fd=destination_directory_fd,
+            )
+            promoted_descriptor = os.open(
+                destination_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=destination_directory_fd,
+            )
+            try:
+                response_descriptor = os.open(
+                    "response.json",
+                    os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+                    dir_fd=promoted_descriptor,
+                )
+                try:
+                    os.write(
+                        response_descriptor,
+                        b"POST_PROMOTION_TAMPER_SENTINEL",
+                    )
+                finally:
+                    os.close(response_descriptor)
+            finally:
+                os.close(promoted_descriptor)
+            return result
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            with patch(
+                "scripts.collect_route_cohort._rename_directory_entry",
+                side_effect=tampering_rename,
+            ):
+                result = _collect_route_cohort(
+                    universe,
+                    cex_collector=_write_observed_raw,
+                    dex_collector=lambda *_args, **_kwargs: None,
+                    raw_root=root,
+                    max_workers=1,
+                    executor_factory=ThreadPoolExecutor,
+                    source_generation_reader=lambda: "input-a",
+                    expected_source_generation="input-a",
+                )
+
+            self.assertTrue(all(
+                row["status"] == "failed"
+                and row["reason_code"] == "raw_evidence_hash_mismatch"
+                for row in result["legs"]
+            ))
+            run_dir = root / result["raw_evidence_run_id"]
+            self.assertEqual(list((run_dir / "accepted").iterdir()), [])
+            self.assertEqual(len(list((run_dir / "staging").iterdir())), 2)
+
     def test_missing_or_mismatched_raw_evidence_cannot_be_accepted(self):
         universe = _strict_cex_universe()
 
@@ -987,7 +1683,7 @@ class RouteLegCollectionTests(unittest.TestCase):
                     )
             self.assertFalse((data_dir / "raw").exists())
 
-    def test_authoritative_identity_conflict_and_returned_identity_mismatch_fail_closed(self):
+    def test_selected_identity_conflict_and_returned_identity_mismatch_fail_closed(self):
         universe = {
             "candidate_source_generation": "candidate-a",
             "selected_legs": [
@@ -1005,9 +1701,13 @@ class RouteLegCollectionTests(unittest.TestCase):
             (data_dir / "route_universe.json").write_text(
                 json.dumps(_complete_test_routes(universe)), encoding="utf-8"
             )
-            with patch("scripts.collect_route_cohort.load_cataloged_markets", return_value=inventory):
-                with self.assertRaisesRegex(ValueError, "conflicts with authoritative inventory"):
+            with patch(
+                "scripts.collect_route_cohort.load_cataloged_markets",
+                return_value=inventory,
+            ) as load_catalog:
+                with self.assertRaisesRegex(ValueError, "route leg identity is invalid"):
                     main(["--data-dir", str(data_dir)], cex_collector=lambda *_args, **_kwargs: self.fail("must not collect"))
+                load_catalog.assert_not_called()
 
         direct = {**universe, "selected_legs": [{**row, "token_symbol": "UNI"} for row in universe["selected_legs"]]}
         result = collect_route_cohort(
@@ -1018,6 +1718,64 @@ class RouteLegCollectionTests(unittest.TestCase):
             expected_source_generation="input-a",
         )
         self.assertTrue(all(row["reason_code"] == "collector_identity_mismatch" for row in result["legs"]))
+
+    def test_partial_dex_collector_pool_identity_is_case_sensitive(self):
+        cex_market = "cex:alpha:UNI/USDT"
+        dex_market = "dex:sol:orca:PoolCase:UNI"
+        universe = {
+            "candidate_source_generation": "candidate-a",
+            "selected_legs": [
+                {
+                    "market_id": cex_market,
+                    "market_type": "cex",
+                    "exchange": "alpha",
+                },
+                {
+                    "market_id": dex_market,
+                    "market_type": "dex",
+                    "chain": "sol",
+                    "dex": "orca",
+                    "pool_address": "PoolCase",
+                    "token_symbol": "UNI",
+                },
+            ],
+            "routes": [
+                _strict_route(
+                    "UNI",
+                    cex_market,
+                    dex_market,
+                    "prepositioned_inventory",
+                )
+            ],
+        }
+        fixed_timestamp = "2026-08-01T12:00:00Z"
+
+        result = collect_route_cohort(
+            universe,
+            cex_collector=_write_observed_raw,
+            dex_collector=lambda _leg, **_kwargs: {
+                "status": "partial",
+                "state_observed_at": fixed_timestamp,
+                "block_number": 123,
+                "block_timestamp": fixed_timestamp,
+                "pool_address": "poolcase",
+            },
+            dex_block_resolver=lambda *_args, **_kwargs: {
+                "block_number": 123,
+                "block_timestamp": fixed_timestamp,
+            },
+            source_generation_reader=lambda: "input-a",
+            expected_source_generation="input-a",
+        )
+
+        dex_leg = next(
+            row for row in result["legs"] if row["market_id"] == dex_market
+        )
+        self.assertEqual(dex_leg["status"], "failed")
+        self.assertEqual(
+            dex_leg["reason_code"],
+            "collector_identity_mismatch",
+        )
 
     def test_blocked_worker_does_not_keep_subprocess_alive_past_deadline(self):
         code = textwrap.dedent(
@@ -1242,6 +2000,185 @@ class RouteLegCollectionTests(unittest.TestCase):
         self.assertEqual(result["legs"][0]["source_endpoint"], "https://example.test/depth")
         self.assertNotIn("credential", result["legs"][0])
 
+    def test_safe_leg_projection_recursively_drops_non_json_objects(self):
+        value = {
+            "safe": {
+                "items": [
+                    "keep",
+                    Path("/PRIVATE_PATH_SENTINEL"),
+                    ValueError("PRIVATE_EXCEPTION_SENTINEL"),
+                    object(),
+                    float("nan"),
+                    ("tuple-value",),
+                ],
+                "url": (
+                    "https://user:pass@example.test/path?"
+                    "api_key=PRIVATE_QUERY_SENTINEL#fragment"
+                ),
+            }
+        }
+
+        projected = _safe_leg_projection(value)
+
+        self.assertEqual(projected, {
+            "safe": {
+                "items": ["keep", ["tuple-value"]],
+                "url": "https://example.test/path",
+            }
+        })
+        json.dumps(projected, allow_nan=False)
+
+    def test_safe_leg_projection_drops_local_paths_and_path_like_keys(self):
+        value = {
+            "safe": "retained",
+            "absolute": "/private/tmp/PRIVATE_ABSOLUTE_PATH_SENTINEL.json",
+            "home": "~/PRIVATE_HOME_PATH_SENTINEL.json",
+            "unc": r"\\server\share\PRIVATE_UNC_PATH_SENTINEL.json",
+            "drive": r"C:\Users\name\PRIVATE_DRIVE_PATH_SENTINEL.json",
+            "file_uri": "file:///private/tmp/PRIVATE_FILE_URI_SENTINEL.json",
+            "artifact_path": "relative/PRIVATE_PATH_KEY_SENTINEL.json",
+            "nested": [{"cachePath": "PRIVATE_PATH_KEY_SENTINEL"}],
+        }
+
+        projected = _safe_leg_projection(value)
+
+        self.assertEqual(projected, {"safe": "retained", "nested": [{}]})
+        encoded = json.dumps(projected, allow_nan=False)
+        for sentinel in (
+            "PRIVATE_ABSOLUTE_PATH_SENTINEL",
+            "PRIVATE_HOME_PATH_SENTINEL",
+            "PRIVATE_UNC_PATH_SENTINEL",
+            "PRIVATE_DRIVE_PATH_SENTINEL",
+            "PRIVATE_FILE_URI_SENTINEL",
+            "PRIVATE_PATH_KEY_SENTINEL",
+        ):
+            self.assertNotIn(sentinel, encoded)
+
+    def test_safe_leg_projection_rejects_non_http_credentials_and_parent_paths(self):
+        projected = _safe_leg_projection({
+            "endpoint": (
+                "wss://user:PRIVATE_PASS@example.test/ws?"
+                "token=PRIVATE_TOKEN#PRIVATE_FRAGMENT"
+            ),
+            "database": (
+                "postgres://user:PRIVATE_DB_PASS@example.test/market?"
+                "sslkey=PRIVATE_SSL_KEY"
+            ),
+            "private_key": "PRIVATE_KEY_SENTINEL",
+            "provenance": "../PRIVATE_PARENT/secret.json",
+            "windows_parent": r"..\PRIVATE_WINDOWS_PARENT\secret.json",
+            "middle_parent": "safe/../PRIVATE_MIDDLE_PARENT/secret.json",
+            "middle_dot": r"safe\.\PRIVATE_MIDDLE_DOT\secret.json",
+            "opaque_wss": (
+                "wss:user:PRIVATE_OPAQUE_WSS@example.test/ws?"
+                "token=PRIVATE_OPAQUE_WSS_TOKEN"
+            ),
+            "opaque_postgres": (
+                "postgres:user:PRIVATE_OPAQUE_DB@example.test/market?"
+                "sslkey=PRIVATE_OPAQUE_DB_KEY"
+            ),
+            "opaque_https": (
+                "https:user:PRIVATE_OPAQUE_HTTPS@example.test/depth?"
+                "token=PRIVATE_OPAQUE_HTTPS_TOKEN"
+            ),
+            "market_symbol": "UNI/USDT",
+            "market_id": "dex:sol:orca:PoolCase:UNI",
+        })
+
+        self.assertEqual(projected, {
+            "market_symbol": "UNI/USDT",
+            "market_id": "dex:sol:orca:PoolCase:UNI",
+        })
+        encoded = json.dumps(projected, allow_nan=False)
+        for sentinel in (
+            "PRIVATE_PASS",
+            "PRIVATE_TOKEN",
+            "PRIVATE_FRAGMENT",
+            "PRIVATE_DB_PASS",
+            "PRIVATE_SSL_KEY",
+            "PRIVATE_KEY_SENTINEL",
+            "PRIVATE_PARENT",
+            "PRIVATE_WINDOWS_PARENT",
+            "PRIVATE_MIDDLE_PARENT",
+            "PRIVATE_MIDDLE_DOT",
+            "PRIVATE_OPAQUE_WSS",
+            "PRIVATE_OPAQUE_WSS_TOKEN",
+            "PRIVATE_OPAQUE_DB",
+            "PRIVATE_OPAQUE_DB_KEY",
+            "PRIVATE_OPAQUE_HTTPS",
+            "PRIVATE_OPAQUE_HTTPS_TOKEN",
+        ):
+            self.assertNotIn(sentinel, encoded)
+
+    def test_nested_leg_provenance_is_secret_free_and_json_safe(self):
+        universe = _strict_cex_universe()
+
+        def collector(_leg, **_kwargs):
+            return {
+                "status": "observed",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+                "provenance": {
+                    "api_key": "PRIVATE_API_KEY_SENTINEL",
+                    "Authorization": "Bearer PRIVATE_AUTH_SENTINEL",
+                    "safe_label": "retained",
+                    "cache_path": "relative/PRIVATE_PATH_KEY_SENTINEL.json",
+                    "local_source": "/private/tmp/PRIVATE_PATH_VALUE_SENTINEL.json",
+                    "nested": [
+                        {
+                            "endpoint": (
+                                "https://user:pass@example.test/depth?"
+                                "token=PRIVATE_QUERY_SENTINEL"
+                            ),
+                            "token": "PRIVATE_TOKEN_SENTINEL",
+                        },
+                        (
+                            "https://user:pass@example.test/tuple?"
+                            "api_key=PRIVATE_TUPLE_SENTINEL",
+                            {"safe": "value", "secret": "PRIVATE_SECRET_SENTINEL"},
+                        ),
+                    ],
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            result = collect_route_cohort(
+                universe,
+                cex_collector=collector,
+                dex_collector=lambda *_args, **_kwargs: None,
+                raw_root=Path(directory_name),
+                source_generation_reader=lambda: "input-a",
+                expected_source_generation="input-a",
+            )
+
+        self.assertEqual(result["legs"][0]["provenance"], {
+            "safe_label": "retained",
+            "nested": [
+                {"endpoint": "https://example.test/depth"},
+                [
+                    "https://example.test/tuple",
+                    {"safe": "value"},
+                ],
+            ],
+        })
+        encoded = json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        for sentinel in (
+            "PRIVATE_API_KEY_SENTINEL",
+            "PRIVATE_AUTH_SENTINEL",
+            "PRIVATE_QUERY_SENTINEL",
+            "PRIVATE_TOKEN_SENTINEL",
+            "PRIVATE_TUPLE_SENTINEL",
+            "PRIVATE_SECRET_SENTINEL",
+            "PRIVATE_PATH_KEY_SENTINEL",
+            "PRIVATE_PATH_VALUE_SENTINEL",
+            "user:pass@",
+        ):
+            self.assertNotIn(sentinel, encoded)
+
     def test_live_cli_resolves_exact_cex_inventory_and_runs_without_publish(self):
         universe = {
             "candidate_source_generation": "generation-a",
@@ -1346,11 +2283,12 @@ class RouteLegCollectionTests(unittest.TestCase):
             with patch(
                 "scripts.collect_route_cohort.load_cataloged_markets",
                 return_value=inventory,
-            ):
+            ) as load_catalog:
                 with self.assertRaisesRegex(
-                    ValueError, "conflicts with authoritative inventory"
+                    ValueError, "route leg identity is invalid"
                 ):
                     main(["--data-dir", str(data_dir), "--dry-run"])
+                load_catalog.assert_not_called()
 
             universe["selected_legs"][0]["token_symbol"] = "UNI"
             universe_path.write_text(

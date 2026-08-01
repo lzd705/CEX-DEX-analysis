@@ -138,8 +138,18 @@ The Task 4 command reads `<data-dir>/route_universe.json` and accepts
 the universe's `selection_window`; they are not informational arguments.
 Every route must supply the exact non-empty ID produced by
 `canonical_route_id`, and each selected leg's declared `market_type` must agree
-with its `market_id` prefix. These identity failures occur before generation
-reads or raw directory creation. Malformed or duplicate routes, invalid token
+with its `market_id` prefix. A CEX leg ID is exactly
+`cex:<venue>:<BASE>/<QUOTE>`: venue is lower-case ASCII identifier text and the
+two symbols are upper-case ASCII identifier text. A DEX leg ID is exactly
+`dex:<chain>:<dex>:<pool>:<TOKEN>`: chain and DEX are lower-case ASCII
+identifier text, Token is upper-case ASCII identifier text, and pool matches
+`[A-Za-z0-9][A-Za-z0-9._-]{0,255}`. A pool beginning `0x` must be entirely
+lower-case. Every supplied selected-leg identity field must itself be a
+non-empty string without leading or trailing whitespace, must agree with the
+ID after its declared case normalization, and `pool_address` must agree
+exactly. A missing collector identity cannot make a malformed requested ID
+valid. These identity failures occur before generation reads or raw directory
+creation. Malformed or duplicate routes, invalid token
 filters, non-finite/non-positive deadlines, and invalid worker limits fail
 before collection. `--dry-run`
 performs the same read-only full-universe, authoritative-inventory, and stable
@@ -152,7 +162,10 @@ authoritative CEX catalog and every selected canonical DEX ID against the TVL
 pool inventory. Authoritative identity fields win during binding; any conflict
 with a selected universe identity, missing identity, or duplicate inventory ID
 fails closed. Collector rows are checked against the requested canonical
-identity, including any partial identity fields they return. The CEX and DEX
+identity, including any partial identity fields they return. A returned DEX
+`pool_address` is always compared as exact case-sensitive text, including for
+non-EVM identifiers; only the requested canonical-ID boundary applies the
+lower-case `0x` rule. The CEX and DEX
 adapters invoke the Task 3 one-leg primitives using only their declared
 arguments; the DEX adapter receives the common fixed block number and block
 timestamp, never a target-time pseudo-argument.
@@ -169,10 +182,39 @@ Workers write under
 `staging/`. An `observed` or `partial` row, and any row claiming
 `raw_response_sha256`, requires a regular `response.json`. The parent hashes
 the exact file; a claimed hash must match, while an omitted hash is filled with
-the computed value and bound into the cohort. Missing or mismatched evidence
+the computed value and bound into the cohort. The caller-controlled raw-root
+ancestry may not contain symlinks. The known macOS `/tmp` and `/var` system
+aliases are first canonicalized to `/private/tmp` and `/private/var`; no other
+ancestor alias is accepted. Root, run, staging, accepted, and per-market stage
+directories must be real directories and remain bound to their original
+device/inode identities. Before promotion, `response.json` is checked with
+`lstat`, opened without following a final symlink where the platform supports
+it, and its open descriptor and final path are rechecked as the same regular
+file. The run, staging, accepted, and promoted stage identities are then bound
+to already-open directory descriptors. Promotion is a descriptor-relative,
+atomic no-replace rename (`RENAME_EXCL` on Darwin or `RENAME_NOREPLACE` on
+Linux); a platform without that primitive fails closed. It never resolves a
+new staging or accepted parent path after the final guard. Missing, mismatched,
+symlinked, escaped, or directory-swapped evidence
 becomes a terminal leg and never moves to `accepted/`. Only a completed,
 identity-valid, within-deadline, evidence-valid observation moves to
-`accepted/`, and only after the final input-generation check. A worker that
+`accepted/`, and only after the final input-generation check. Immediately
+after promotion, the accepted entry, its still-open directory, response
+identity, and response hash are revalidated through the same descriptors. A
+failed check is rolled back through those descriptors without following a
+swapped path. If an untrusted same-name staging entry blocks rollback, Darwin
+`RENAME_SWAP` or Linux `RENAME_EXCHANGE` atomically returns the evidence inode
+to its identity-bound staging name; the displaced entry is then recoverably
+moved to a unique staging quarantine name. The caller verifies the rollback
+result, the still-open stage inode, the real nonsymlink staging entry, and the
+absence of that entry from accepted. A successful rollback preserves the
+original per-market terminal failure. If the rollback exchange, quarantine, or
+final-state verification fails, the collector closes the entry and raw-run
+descriptors and then hard-fails the entire collection with
+`raw evidence rollback could not be verified`; it returns no terminal cohort or
+other publishable result. A swapped
+`run/accepted` symlink is unlinked relative to the verified run descriptor and
+is never used as a destination. A worker that
 returns or writes after the deadline remains in staging and cannot mutate
 accepted evidence.
 
@@ -191,8 +233,18 @@ different start/deadline times and run IDs; with those invocation inputs held
 fixed, completion order does not affect normalized rows or fingerprints. A
 fixed DEX observation must echo its resolved block number and timestamp; a mismatch becomes the retained
 terminal reason `fixed_block_lineage_mismatch`. Leg projections exclude raw
-paths, exception traces, and credential-like fields before the future bundle
-boundary; endpoints retain only scheme, host, and path. The cohort ID and
+paths, exception traces, and credential-like fields recursively through nested
+mappings, lists, and tuples before the future bundle boundary. HTTP(S)
+endpoints retain only scheme, host, port, and path; userinfo, query, and
+fragment are removed, while hierarchical or opaque non-HTTP credential-bearing
+URLs and malformed opaque HTTP(S) forms are dropped. Path objects, path-like
+keys, absolute, home-relative, UNC, Windows-drive, and `file:` path strings,
+plus any string whose slash- or backslash-delimited segments contain `.` or
+`..`, are dropped. Ordinary symbols such as `UNI/USDT` and canonical market
+IDs remain valid. Non-finite numbers, custom objects, and other non-JSON values
+are also dropped. A final canonical-JSON and recursive unsafe-evidence scan
+fails closed before returning a projected leg.
+The cohort ID and
 fingerprint hash all of those declared logical fields, including the canonical
 collection timestamps and SLA/selection lineage, so a later bundle can detect
 metadata conflicts without consulting mutable sources.

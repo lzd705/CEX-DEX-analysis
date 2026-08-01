@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 import argparse
+import ctypes
 from datetime import datetime, timedelta, timezone
+import errno
 import hashlib
 import json
 import math
 import multiprocessing
 from multiprocessing.connection import wait as wait_for_connections
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 from queue import Queue
 import re
+import stat
+import sys
 from threading import Lock, Thread, current_thread, enumerate as enumerate_threads
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -386,20 +390,106 @@ def _canonical_fingerprint(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _market_type(leg: Mapping[str, Any]) -> str:
+_CEX_MARKET_ID = re.compile(
+    r"cex:([a-z0-9][a-z0-9._-]{0,63}):"
+    r"([A-Z0-9][A-Z0-9._-]{0,63})/"
+    r"([A-Z0-9][A-Z0-9._-]{0,63})\Z",
+    flags=re.ASCII,
+)
+_DEX_MARKET_ID = re.compile(
+    r"dex:([a-z0-9][a-z0-9._-]{0,63}):"
+    r"([a-z0-9][a-z0-9._-]{0,127}):"
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,255}):"
+    r"([A-Z0-9][A-Z0-9._-]{0,63})\Z",
+    flags=re.ASCII,
+)
+
+
+def _selected_identity_field_matches(
+    leg: Mapping[str, Any],
+    key: str,
+    expected: str,
+    *,
+    normalization: str,
+) -> bool:
+    if key not in leg:
+        return True
+    supplied = leg.get(key)
+    if (
+        not isinstance(supplied, str)
+        or not supplied
+        or supplied != supplied.strip()
+    ):
+        return False
+    if normalization == "lower":
+        return supplied.strip().lower() == expected
+    if normalization == "upper":
+        return supplied.strip().upper() == expected
+    return supplied.strip() == expected
+
+
+def _canonical_leg_identity(leg: Mapping[str, Any]) -> Dict[str, str]:
     declared = leg.get("market_type")
     market_id = leg.get("market_id")
-    if isinstance(market_id, str) and market_id.startswith("cex:"):
+    if not isinstance(market_id, str):
+        raise ValueError("route leg identity is invalid")
+    cex_match = _CEX_MARKET_ID.fullmatch(market_id)
+    dex_match = _DEX_MARKET_ID.fullmatch(market_id)
+    if cex_match is not None:
         inferred = "cex"
-    elif isinstance(market_id, str) and market_id.startswith("dex:"):
+        exchange, base, quote = cex_match.groups()
+        identity = {
+            "market_type": inferred,
+            "exchange": exchange,
+            "cex_symbol": "{}/{}".format(base, quote),
+            "token_symbol": base,
+        }
+        comparisons = (
+            ("exchange", exchange, "lower"),
+            ("cex_symbol", identity["cex_symbol"], "upper"),
+            ("token_symbol", base, "upper"),
+        )
+    elif dex_match is not None:
         inferred = "dex"
+        chain, dex, pool, token = dex_match.groups()
+        if pool.startswith("0x") and pool != pool.lower():
+            raise ValueError("route leg identity is invalid")
+        identity = {
+            "market_type": inferred,
+            "chain": chain,
+            "dex": dex,
+            "pool_address": pool,
+            "token_symbol": token,
+        }
+        comparisons = (
+            ("chain", chain, "lower"),
+            ("dex", dex, "lower"),
+            ("pool_address", pool, "exact"),
+            ("token_symbol", token, "upper"),
+        )
+    elif market_id.startswith(("cex:", "dex:")):
+        raise ValueError("route leg identity is invalid")
     else:
         raise ValueError("route leg market type is invalid")
     if declared not in (None, "", "cex", "dex"):
         raise ValueError("route leg market type is invalid")
     if declared not in (None, "") and declared != inferred:
         raise ValueError("route leg market type does not match market_id")
-    return inferred
+    if any(
+        not _selected_identity_field_matches(
+            leg,
+            key,
+            expected,
+            normalization=normalization,
+        )
+        for key, expected, normalization in comparisons
+    ):
+        raise ValueError("route leg identity is invalid")
+    return identity
+
+
+def _market_type(leg: Mapping[str, Any]) -> str:
+    return _canonical_leg_identity(leg)["market_type"]
 
 
 def _utc_now() -> datetime:
@@ -428,10 +518,10 @@ def _utc_datetime(value: Any, *, field: str) -> datetime:
 
 
 def _source_key(leg: Mapping[str, Any]) -> Tuple[str, str]:
-    market_id = str(leg["market_id"])
-    if _market_type(leg) == "cex":
-        return "cex", str(leg.get("exchange") or market_id.split(":", 2)[1]).lower()
-    return "dex", str(leg.get("chain") or market_id.split(":", 3)[1]).lower()
+    identity = _canonical_leg_identity(leg)
+    if identity["market_type"] == "cex":
+        return "cex", identity["exchange"]
+    return "dex", identity["chain"]
 
 
 def _terminal_for_chain(
@@ -490,10 +580,18 @@ def _collector_identity_matches(
     for key in identity_fields:
         if requested_leg.get(key) not in (None, ""):
             expected[key] = requested_leg[key]
-        if row.get(key) not in (None, "") and _normal_identity_value(
-            market_type, key, row[key]
-        ) != _normal_identity_value(market_type, key, expected[key]):
-            return False
+        supplied_value = row.get(key)
+        if supplied_value not in (None, ""):
+            if key == "pool_address":
+                if (
+                    not isinstance(supplied_value, str)
+                    or supplied_value != expected[key]
+                ):
+                    return False
+            elif _normal_identity_value(
+                market_type, key, supplied_value
+            ) != _normal_identity_value(market_type, key, expected[key]):
+                return False
     try:
         if market_type == "cex" and all(
             row.get(key) not in (None, "") for key in ("exchange", "cex_symbol")
@@ -509,20 +607,201 @@ def _collector_identity_matches(
     return True
 
 
+_DROP_PROJECTION = object()
+
+
+def _sensitive_projection_key(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", value.lower())
+    if normalized == "path" or normalized.endswith("path"):
+        return True
+    if normalized in {
+        "auth",
+        "authorization",
+        "bearer",
+        "credential",
+        "error",
+        "exception",
+        "password",
+        "privatekey",
+        "rawpath",
+        "secret",
+        "signature",
+        "token",
+        "traceback",
+    }:
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "accesstoken",
+            "apikey",
+            "authorization",
+            "credential",
+            "password",
+            "refreshtoken",
+            "secret",
+            "signature",
+        )
+    )
+
+
+_WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]", flags=re.ASCII)
+
+
+def _unsafe_projection_string(value: str) -> bool:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return True
+    if value == "~" or re.match(r"^~[^/\\]*[/\\]", value):
+        return True
+    if value.startswith(("./", "../", ".\\", "..\\")):
+        return True
+    if any(segment in {".", ".."} for segment in re.split(r"[/\\]", value)):
+        return True
+    return (
+        os.path.isabs(value)
+        or value.startswith("\\")
+        or _WINDOWS_DRIVE_PATH.match(value) is not None
+        or value.lower().startswith("file:")
+    )
+
+
+def _safe_url_projection(value: str) -> Any:
+    try:
+        value.encode("utf-8")
+        parsed = urlsplit(value)
+    except (UnicodeEncodeError, ValueError):
+        return _DROP_PROJECTION
+    scheme = parsed.scheme.lower()
+    if scheme in {"http", "https"}:
+        if not parsed.netloc:
+            return _DROP_PROJECTION
+    elif parsed.scheme and (
+        parsed.netloc
+        or "://" in value
+        or "@" in parsed.path
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+    ):
+        return _DROP_PROJECTION
+    if scheme not in {"http", "https"}:
+        return value
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return _DROP_PROJECTION
+    if not hostname:
+        return _DROP_PROJECTION
+    safe_host = "[{}]".format(hostname) if ":" in hostname else hostname
+    if port is not None:
+        safe_host = "{}:{}".format(safe_host, port)
+    return urlunsplit(
+        (scheme, safe_host, parsed.path, "", "")
+    )
+
+
+def _safe_projection_value(
+    value: Any,
+    *,
+    seen: Set[int],
+    depth: int,
+) -> Any:
+    if depth > 32:
+        return _DROP_PROJECTION
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _DROP_PROJECTION
+    if isinstance(value, str):
+        if _unsafe_projection_string(value):
+            return _DROP_PROJECTION
+        return _safe_url_projection(value)
+    if isinstance(value, (PurePath, BaseException, bytes, bytearray)):
+        return _DROP_PROJECTION
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            return _DROP_PROJECTION
+        seen.add(identity)
+        projected = {}
+        try:
+            items = list(value.items())
+        except Exception:
+            seen.remove(identity)
+            return _DROP_PROJECTION
+        for key, nested in items:
+            if not isinstance(key, str) or _sensitive_projection_key(key):
+                continue
+            safe_key = _safe_url_projection(key)
+            if safe_key is _DROP_PROJECTION or safe_key != key:
+                continue
+            safe_nested = _safe_projection_value(
+                nested,
+                seen=seen,
+                depth=depth + 1,
+            )
+            if safe_nested is not _DROP_PROJECTION:
+                projected[key] = safe_nested
+        seen.remove(identity)
+        return projected
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in seen:
+            return _DROP_PROJECTION
+        seen.add(identity)
+        projected_items = []
+        for nested in value:
+            safe_nested = _safe_projection_value(
+                nested,
+                seen=seen,
+                depth=depth + 1,
+            )
+            if safe_nested is not _DROP_PROJECTION:
+                projected_items.append(safe_nested)
+        seen.remove(identity)
+        return projected_items
+    return _DROP_PROJECTION
+
+
+def _projection_contains_unsafe_evidence(value: Any) -> bool:
+    if value is None or isinstance(value, (bool, int)):
+        return False
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, str):
+        if _unsafe_projection_string(value):
+            return True
+        sanitized = _safe_url_projection(value)
+        return sanitized is _DROP_PROJECTION or sanitized != value
+    if isinstance(value, list):
+        return any(_projection_contains_unsafe_evidence(item) for item in value)
+    if isinstance(value, Mapping):
+        return any(
+            not isinstance(key, str)
+            or _sensitive_projection_key(key)
+            or _projection_contains_unsafe_evidence(nested)
+            for key, nested in value.items()
+        )
+    return True
+
+
 def _safe_leg_projection(row: Mapping[str, Any]) -> Dict[str, Any]:
-    """Keep fact fields while excluding path, secret, and exception payloads."""
-    forbidden = {"raw_path", "error", "exception", "traceback", "password", "api_key", "authorization", "token", "secret", "credential", "access_token", "access-token", "bearer", "signature"}
-    projected = {}
-    for key, value in row.items():
-        lowered = key.lower()
-        if lowered in forbidden or any(
-            marker in lowered for marker in ("password", "api_key", "authorization", "secret", "credential", "access_token", "bearer", "signature")
-        ):
-            continue
-        if lowered in {"source_endpoint", "endpoint"} and isinstance(value, str):
-            parsed = urlsplit(value)
-            value = urlunsplit((parsed.scheme, parsed.hostname or "", parsed.path, "", ""))
-        projected[key] = value
+    """Recursively retain only JSON-safe facts with no secret-bearing fields."""
+    projected = _safe_projection_value(row, seen=set(), depth=0)
+    if not isinstance(projected, dict):
+        return {}
+    try:
+        json.dumps(
+            projected,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return {}
+    if _projection_contains_unsafe_evidence(projected):
+        return {}
     return projected
 
 
@@ -538,38 +817,645 @@ def _run_id(value: Optional[str], wall_time: datetime) -> str:
     return "{}-{}".format(prefix, uuid.uuid4().hex)
 
 
-def _raw_run_directory(raw_root: Path, run_id: str) -> Tuple[Path, Path]:
-    if os.path.lexists(str(raw_root)) and raw_root.is_symlink():
-        raise ValueError("raw_root must not be a symlink")
+class _UnsafeRawEvidence(ValueError):
+    pass
+
+
+def _canonical_raw_path(value: Path) -> Path:
+    absolute = Path(os.path.abspath(os.fspath(value)))
+    parts = absolute.parts
+    if len(parts) > 1 and parts[1] in {"tmp", "var"}:
+        alias = Path("/") / parts[1]
+        expected = Path("/private") / parts[1]
+        if alias.is_symlink() and Path(os.path.realpath(str(alias))) == expected:
+            return expected.joinpath(*parts[2:])
+    return absolute
+
+
+def _reject_symlink_ancestry(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            metadata = os.lstat(str(current))
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise ValueError("raw_root ancestry is invalid") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("raw_root ancestry must not contain a symlink")
+        if current != path and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("raw_root ancestry is invalid")
+
+
+def _directory_identity(path: Path) -> Tuple[int, int]:
+    try:
+        metadata = os.lstat(str(path))
+    except OSError as error:
+        raise _UnsafeRawEvidence("raw evidence directory is unavailable") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _UnsafeRawEvidence("raw evidence path is not a real directory")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _require_directory_identity(
+    path: Path, expected: Tuple[int, int]
+) -> None:
+    if _directory_identity(path) != expected:
+        raise _UnsafeRawEvidence("raw evidence directory identity changed")
+
+
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _descriptor_directory_identity(
+    descriptor: int,
+    expected: Tuple[int, int],
+) -> None:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise _UnsafeRawEvidence(
+            "raw evidence directory descriptor is unavailable"
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != expected
+    ):
+        raise _UnsafeRawEvidence(
+            "raw evidence directory descriptor identity changed"
+        )
+
+
+def _directory_entry_metadata(
+    parent_descriptor: int,
+    name: str,
+) -> Any:
+    try:
+        return os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise _UnsafeRawEvidence(
+            "raw evidence directory entry is unavailable"
+        ) from error
+
+
+def _directory_entry_identity(
+    parent_descriptor: int,
+    name: str,
+) -> Tuple[int, int]:
+    metadata = _directory_entry_metadata(parent_descriptor, name)
+    if metadata is None:
+        raise _UnsafeRawEvidence(
+            "raw evidence directory entry is unavailable"
+        )
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _UnsafeRawEvidence(
+            "raw evidence directory entry is not a real directory"
+        )
+    return metadata.st_dev, metadata.st_ino
+
+
+def _open_directory_entry(
+    parent_descriptor: int,
+    name: str,
+    expected: Tuple[int, int],
+) -> int:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise _UnsafeRawEvidence("raw evidence directory entry is invalid")
+    if _directory_entry_identity(parent_descriptor, name) != expected:
+        raise _UnsafeRawEvidence(
+            "raw evidence directory entry identity changed"
+        )
+    try:
+        descriptor = os.open(
+            name,
+            _directory_open_flags(),
+            dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        raise _UnsafeRawEvidence(
+            "raw evidence directory entry could not be opened safely"
+        ) from error
+    try:
+        _descriptor_directory_identity(descriptor, expected)
+        if _directory_entry_identity(parent_descriptor, name) != expected:
+            raise _UnsafeRawEvidence(
+                "raw evidence directory entry identity changed"
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_raw_run_descriptors(
+    staging: Path,
+    accepted: Path,
+    guards: Mapping[str, Tuple[int, int]],
+) -> Dict[str, int]:
+    _require_raw_run_guards(staging, accepted, guards)
+    run_dir = staging.parent
+    try:
+        run_descriptor = os.open(str(run_dir), _directory_open_flags())
+    except OSError as error:
+        raise _UnsafeRawEvidence(
+            "raw evidence run directory could not be opened safely"
+        ) from error
+    descriptors = {"run": run_descriptor}
+    try:
+        _descriptor_directory_identity(run_descriptor, guards["run"])
+        descriptors["staging"] = _open_directory_entry(
+            run_descriptor,
+            "staging",
+            guards["staging"],
+        )
+        descriptors["accepted"] = _open_directory_entry(
+            run_descriptor,
+            "accepted",
+            guards["accepted"],
+        )
+        _require_raw_run_guards(staging, accepted, guards)
+        return descriptors
+    except BaseException:
+        for descriptor in reversed(list(descriptors.values())):
+            os.close(descriptor)
+        raise
+
+
+def _close_raw_run_descriptors(descriptors: Mapping[str, int]) -> None:
+    for key in ("accepted", "staging", "run"):
+        descriptor = descriptors.get(key)
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _atomic_directory_entry_operation(
+    source_name: str,
+    destination_name: str,
+    *,
+    source_directory_fd: int,
+    destination_directory_fd: int,
+    darwin_flags: int,
+    linux_flags: int,
+    unsupported_message: str,
+    destination_exists_message: Optional[str] = None,
+) -> None:
+    for name in (source_name, destination_name):
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise _UnsafeRawEvidence("raw evidence directory entry is invalid")
+    for descriptor in (source_directory_fd, destination_directory_fd):
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError as error:
+            raise _UnsafeRawEvidence(
+                "raw evidence directory descriptor is unavailable"
+            ) from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise _UnsafeRawEvidence(
+                "raw evidence directory descriptor is invalid"
+            )
+
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source_name)
+    destination_bytes = os.fsencode(destination_name)
+    if sys.platform == "darwin":
+        try:
+            operation = library.renameatx_np
+        except AttributeError as error:
+            raise _UnsafeRawEvidence(unsupported_message) from error
+        operation.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        operation.restype = ctypes.c_int
+        arguments = (
+            source_directory_fd,
+            source_bytes,
+            destination_directory_fd,
+            destination_bytes,
+            darwin_flags,
+        )
+    elif sys.platform.startswith("linux"):
+        try:
+            operation = library.renameat2
+        except AttributeError as error:
+            raise _UnsafeRawEvidence(unsupported_message) from error
+        operation.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        operation.restype = ctypes.c_int
+        arguments = (
+            source_directory_fd,
+            source_bytes,
+            destination_directory_fd,
+            destination_bytes,
+            linux_flags,
+        )
+    else:
+        raise _UnsafeRawEvidence(unsupported_message)
+
+    ctypes.set_errno(0)
+    if operation(*arguments) == 0:
+        return
+    error_number = ctypes.get_errno()
+    if (
+        destination_exists_message is not None
+        and error_number in {errno.EEXIST, errno.ENOTEMPTY}
+    ):
+        raise _UnsafeRawEvidence(destination_exists_message)
+    if error_number in {errno.ENOSYS, errno.ENOTSUP}:
+        raise _UnsafeRawEvidence(unsupported_message)
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def _rename_directory_entry(
+    source_name: str,
+    destination_name: str,
+    *,
+    source_directory_fd: int,
+    destination_directory_fd: int,
+) -> None:
+    """Atomically rename a directory entry without replacing a destination."""
+    _atomic_directory_entry_operation(
+        source_name,
+        destination_name,
+        source_directory_fd=source_directory_fd,
+        destination_directory_fd=destination_directory_fd,
+        darwin_flags=0x00000004,  # Darwin RENAME_EXCL
+        linux_flags=1,  # Linux RENAME_NOREPLACE
+        unsupported_message="atomic raw evidence promotion is unsupported",
+        destination_exists_message="raw evidence destination already exists",
+    )
+
+
+def _exchange_directory_entries(
+    source_name: str,
+    destination_name: str,
+    *,
+    source_directory_fd: int,
+    destination_directory_fd: int,
+) -> None:
+    """Atomically exchange two entries without resolving either parent path."""
+    _atomic_directory_entry_operation(
+        source_name,
+        destination_name,
+        source_directory_fd=source_directory_fd,
+        destination_directory_fd=destination_directory_fd,
+        darwin_flags=0x00000002,  # Darwin RENAME_SWAP
+        linux_flags=2,  # Linux RENAME_EXCHANGE
+        unsupported_message="atomic raw evidence rollback is unsupported",
+    )
+
+
+def _raw_run_directory(
+    raw_root: Path, run_id: str
+) -> Tuple[Path, Path, Dict[str, Tuple[int, int]]]:
+    raw_root = _canonical_raw_path(raw_root)
+    _reject_symlink_ancestry(raw_root)
     raw_root.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestry(raw_root)
+    root_identity = _directory_identity(raw_root)
     run_dir = raw_root / run_id
     run_dir.mkdir(exist_ok=False)
     staging = run_dir / "staging"
     accepted = run_dir / "accepted"
     staging.mkdir()
     accepted.mkdir()
-    return staging, accepted
+    guards = {
+        "root": root_identity,
+        "run": _directory_identity(run_dir),
+        "staging": _directory_identity(staging),
+        "accepted": _directory_identity(accepted),
+    }
+    return staging, accepted, guards
 
 
-def _raw_evidence_failure(
-    row: Mapping[str, Any], stage_dir: Path
-) -> Optional[str]:
+def _require_raw_run_guards(
+    staging: Path,
+    accepted: Path,
+    guards: Mapping[str, Tuple[int, int]],
+) -> None:
+    root = staging.parent.parent
+    run_dir = staging.parent
+    if accepted.parent != run_dir or accepted.name != "accepted":
+        raise _UnsafeRawEvidence("raw evidence accepted path is invalid")
+    if staging.name != "staging":
+        raise _UnsafeRawEvidence("raw evidence staging path is invalid")
+    try:
+        _reject_symlink_ancestry(root)
+    except ValueError as error:
+        raise _UnsafeRawEvidence("raw evidence ancestry changed") from error
+    _require_directory_identity(root, guards["root"])
+    _require_directory_identity(run_dir, guards["run"])
+    _require_directory_identity(staging, guards["staging"])
+    _require_directory_identity(accepted, guards["accepted"])
+
+
+def _read_regular_file(path: Path) -> Tuple[bytes, Tuple[int, int]]:
+    try:
+        before = os.lstat(str(path))
+    except FileNotFoundError as error:
+        raise FileNotFoundError("raw evidence is missing") from error
+    except OSError as error:
+        raise _UnsafeRawEvidence("raw evidence path is unavailable") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise _UnsafeRawEvidence("raw evidence is not a real regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as error:
+        raise _UnsafeRawEvidence("raw evidence could not be opened safely") from error
+    try:
+        opened = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != identity
+        ):
+            raise _UnsafeRawEvidence("raw evidence identity changed")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            payload = handle.read()
+        after = os.lstat(str(path))
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or (after.st_dev, after.st_ino) != identity
+        ):
+            raise _UnsafeRawEvidence("raw evidence identity changed")
+        return payload, identity
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+) -> Tuple[bytes, Tuple[int, int]]:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise _UnsafeRawEvidence("raw evidence filename is invalid")
+    try:
+        before = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise FileNotFoundError("raw evidence is missing") from error
+    except OSError as error:
+        raise _UnsafeRawEvidence("raw evidence path is unavailable") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise _UnsafeRawEvidence("raw evidence is not a real regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(
+            name,
+            flags,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as error:
+        raise _UnsafeRawEvidence(
+            "raw evidence could not be opened safely"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != identity
+        ):
+            raise _UnsafeRawEvidence("raw evidence identity changed")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            payload = handle.read()
+        after = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or (after.st_dev, after.st_ino) != identity
+        ):
+            raise _UnsafeRawEvidence("raw evidence identity changed")
+        return payload, identity
+    except FileNotFoundError as error:
+        raise _UnsafeRawEvidence("raw evidence identity changed") from error
+    finally:
+        os.close(descriptor)
+
+
+def _validated_raw_evidence(
+    row: Mapping[str, Any],
+    stage_dir: Path,
+    stage_identity: Tuple[int, int],
+    staging_root: Path,
+    accepted_root: Path,
+    guards: Mapping[str, Tuple[int, int]],
+) -> Tuple[Optional[str], Optional[str], Optional[Tuple[int, int]]]:
     claimed = row.get("raw_response_sha256")
     requires_raw = str(row.get("status") or "") in {"observed", "partial"}
     requires_raw = requires_raw or claimed not in (None, "")
+    try:
+        _require_raw_run_guards(staging_root, accepted_root, guards)
+        if stage_dir.parent != staging_root:
+            raise _UnsafeRawEvidence("raw evidence stage escaped staging")
+        _require_directory_identity(stage_dir, stage_identity)
+    except _UnsafeRawEvidence:
+        return "raw_evidence_path_unsafe", None, None
     if not requires_raw:
-        return None
+        return None, None, None
     raw_path = stage_dir / "response.json"
-    if raw_path.is_symlink() or not raw_path.is_file():
-        return "raw_evidence_missing"
-    actual = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    try:
+        payload, response_identity = _read_regular_file(raw_path)
+    except FileNotFoundError:
+        return "raw_evidence_missing", None, None
+    except _UnsafeRawEvidence:
+        return "raw_evidence_path_unsafe", None, None
+    actual = hashlib.sha256(payload).hexdigest()
     if claimed not in (None, "") and (
         not isinstance(claimed, str)
         or not re.fullmatch(r"[0-9a-f]{64}", claimed)
         or claimed != actual
     ):
+        return "raw_evidence_hash_mismatch", None, None
+    return None, actual, response_identity
+
+
+def _post_promotion_failure(
+    entry_name: str,
+    entry_descriptor: int,
+    stage_identity: Tuple[int, int],
+    response_identity: Tuple[int, int],
+    expected_sha256: str,
+    staging_root: Path,
+    accepted_root: Path,
+    guards: Mapping[str, Tuple[int, int]],
+    descriptors: Mapping[str, int],
+) -> Optional[str]:
+    try:
+        _descriptor_directory_identity(descriptors["run"], guards["run"])
+        _descriptor_directory_identity(
+            descriptors["staging"], guards["staging"]
+        )
+        _descriptor_directory_identity(
+            descriptors["accepted"], guards["accepted"]
+        )
+        _descriptor_directory_identity(entry_descriptor, stage_identity)
+        if _directory_entry_identity(
+            descriptors["accepted"], entry_name
+        ) != stage_identity:
+            raise _UnsafeRawEvidence("accepted evidence identity changed")
+        payload, actual_response_identity = _read_regular_file_at(
+            entry_descriptor,
+            "response.json",
+        )
+        if actual_response_identity != response_identity:
+            raise _UnsafeRawEvidence("accepted response identity changed")
+        _require_raw_run_guards(staging_root, accepted_root, guards)
+    except (FileNotFoundError, _UnsafeRawEvidence):
+        return "raw_evidence_path_unsafe"
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
         return "raw_evidence_hash_mismatch"
     return None
+
+
+def _rollback_promoted_evidence(
+    entry_name: str,
+    stage_identity: Tuple[int, int],
+    descriptors: Mapping[str, int],
+) -> bool:
+    accepted_metadata = _directory_entry_metadata(
+        descriptors["accepted"], entry_name
+    )
+    staging_metadata = _directory_entry_metadata(
+        descriptors["staging"], entry_name
+    )
+
+    def is_stage(metadata: Any) -> bool:
+        return bool(
+            metadata is not None
+            and stat.S_ISDIR(metadata.st_mode)
+            and (metadata.st_dev, metadata.st_ino) == stage_identity
+        )
+
+    if is_stage(staging_metadata):
+        if is_stage(accepted_metadata):
+            raise _UnsafeRawEvidence(
+                "raw evidence rollback has duplicate stage identity"
+            )
+    elif staging_metadata is None:
+        if not is_stage(accepted_metadata):
+            raise _UnsafeRawEvidence(
+                "accepted evidence is unavailable for rollback"
+            )
+        _rename_directory_entry(
+            entry_name,
+            entry_name,
+            source_directory_fd=descriptors["accepted"],
+            destination_directory_fd=descriptors["staging"],
+        )
+    else:
+        if not is_stage(accepted_metadata):
+            raise _UnsafeRawEvidence(
+                "accepted evidence is unavailable for rollback"
+            )
+        _exchange_directory_entries(
+            entry_name,
+            entry_name,
+            source_directory_fd=descriptors["accepted"],
+            destination_directory_fd=descriptors["staging"],
+        )
+
+    displaced = _directory_entry_metadata(
+        descriptors["accepted"], entry_name
+    )
+    if displaced is not None:
+        quarantine_name = ".rejected-{}-{}".format(
+            entry_name,
+            uuid.uuid4().hex,
+        )
+        _rename_directory_entry(
+            entry_name,
+            quarantine_name,
+            source_directory_fd=descriptors["accepted"],
+            destination_directory_fd=descriptors["staging"],
+        )
+
+    return _rollback_state_is_safe(
+        entry_name,
+        stage_identity,
+        descriptors,
+    )
+
+
+def _rollback_state_is_safe(
+    entry_name: str,
+    stage_identity: Tuple[int, int],
+    descriptors: Mapping[str, int],
+) -> bool:
+    staging_metadata = _directory_entry_metadata(
+        descriptors["staging"], entry_name
+    )
+    accepted_metadata = _directory_entry_metadata(
+        descriptors["accepted"], entry_name
+    )
+    return bool(
+        staging_metadata is not None
+        and stat.S_ISDIR(staging_metadata.st_mode)
+        and (staging_metadata.st_dev, staging_metadata.st_ino) == stage_identity
+        and accepted_metadata is None
+    )
+
+
+def _clear_unsafe_accepted_alias(
+    descriptors: Mapping[str, int],
+    expected_identity: Tuple[int, int],
+) -> None:
+    """Remove only a swapped symlink at run/accepted; never follow it."""
+    try:
+        metadata = os.stat(
+            "accepted",
+            dir_fd=descriptors["run"],
+            follow_symlinks=False,
+        )
+    except OSError:
+        return
+    if (
+        stat.S_ISDIR(metadata.st_mode)
+        and (metadata.st_dev, metadata.st_ino) == expected_identity
+    ):
+        return
+    if not stat.S_ISLNK(metadata.st_mode):
+        return
+    try:
+        os.unlink("accepted", dir_fd=descriptors["run"])
+    except OSError:
+        return
 
 
 def _validated_fixed_block(
@@ -649,9 +1535,8 @@ def collect_route_cohort(
         raise ValueError("DEX fixed block resolver is required")
     if raw_root is None:
         raise ValueError("raw_root is required")
-    root = Path(raw_root)
-    if os.path.lexists(str(root)) and root.is_symlink():
-        raise ValueError("raw_root must not be a symlink")
+    root = _canonical_raw_path(Path(raw_root))
+    _reject_symlink_ancestry(root)
     if root.exists() and not root.is_dir():
         raise ValueError("raw_root must be a directory")
     if executor_factory is _ForkProcessExecutor:
@@ -674,8 +1559,14 @@ def collect_route_cohort(
         target_observed_at if target_observed_at is not None else wall_start_utc,
         field="target_observed_at",
     )
-    active_deadline = deadline or CollectionDeadline.for_duration(duration)
-    remaining_at_start = active_deadline.remaining_seconds()
+    if deadline is None:
+        active_deadline = CollectionDeadline.for_duration(duration)
+        # The declared duration is part of the logical cohort input.  Do not
+        # bind scheduler call overhead into the immutable wall-clock metadata.
+        remaining_at_start = duration
+    else:
+        active_deadline = deadline
+        remaining_at_start = active_deadline.remaining_seconds()
     collection_deadline_at = _canonical_utc(
         wall_start_utc + timedelta(seconds=remaining_at_start),
         field="collection_deadline_at",
@@ -684,7 +1575,9 @@ def collect_route_cohort(
         collection_deadline_at, field="collection_deadline_at"
     )
     run_id = _run_id(snapshot_id, wall_start_utc)
-    staging_root, accepted_root = _raw_run_directory(root, run_id)
+    staging_root, accepted_root, raw_run_guards = _raw_run_directory(
+        root, run_id
+    )
     terminal_reasons: Dict[str, str] = {}
     expired: Set[str] = set()
     fixed_blocks: Dict[str, Mapping[str, Any]] = {}
@@ -718,22 +1611,43 @@ def collect_route_cohort(
     source_index = 0
     active_by_source: Dict[Tuple[str, str], int] = {}
     completed: Dict[str, Mapping[str, Any]] = {}
-    completed_stage_dirs: Dict[str, Path] = {}
+    completed_stage_dirs: Dict[
+        str, Tuple[Path, Tuple[int, int]]
+    ] = {}
     futures: Dict[Any, Tuple[str, Tuple[str, str]]] = {}
 
-    def raw_paths(market_id: str) -> Tuple[Path, Path]:
+    def raw_paths(
+        market_id: str,
+    ) -> Tuple[Path, Path, Tuple[int, int]]:
+        _require_raw_run_guards(
+            staging_root, accepted_root, raw_run_guards
+        )
         name = hashlib.sha256(market_id.encode("utf-8")).hexdigest()
         stage_dir = staging_root / name
         stage_dir.mkdir(exist_ok=False)
-        return stage_dir / "response.json", stage_dir
+        stage_identity = _directory_identity(stage_dir)
+        _require_raw_run_guards(
+            staging_root, accepted_root, raw_run_guards
+        )
+        if stage_dir.parent != staging_root:
+            raise _UnsafeRawEvidence("raw evidence stage escaped staging")
+        return stage_dir / "response.json", stage_dir, stage_identity
 
     def collect_one(
         market_id: str,
-    ) -> Tuple[str, Optional[Mapping[str, Any]], Optional[str], Optional[Path]]:
+    ) -> Tuple[
+        str,
+        Optional[Mapping[str, Any]],
+        Optional[str],
+        Optional[Path],
+        Optional[Tuple[int, int]],
+    ]:
         leg = legs_by_market[market_id]
         kind, source = _source_key(leg)
-        raw_path, stage_dir = raw_paths(market_id)
+        stage_dir = None
+        stage_identity = None
         try:
+            raw_path, stage_dir, stage_identity = raw_paths(market_id)
             active_deadline.require_remaining()
             if kind == "cex":
                 row = _row_from_collector(cex_collector(
@@ -750,20 +1664,52 @@ def collect_route_cohort(
                 ))
                 if (str(row.get("block_number")) != str(block["block_number"])
                         or str(row.get("block_timestamp") or "") != str(block.get("block_timestamp") or "")):
-                    return market_id, None, "fixed_block_lineage_mismatch", stage_dir
+                    return (
+                        market_id,
+                        None,
+                        "fixed_block_lineage_mismatch",
+                        stage_dir,
+                        stage_identity,
+                    )
                 row = {
                     **dict(row),
                     "fixed_block_number": str(block["block_number"]),
                     "fixed_block_timestamp": str(block.get("block_timestamp") or ""),
                 }
             if not _collector_identity_matches(market_id, kind, leg, row):
-                return market_id, None, "collector_identity_mismatch", stage_dir
+                return (
+                    market_id,
+                    None,
+                    "collector_identity_mismatch",
+                    stage_dir,
+                    stage_identity,
+                )
             active_deadline.require_remaining()
-            return market_id, row, None, stage_dir
+            return market_id, row, None, stage_dir, stage_identity
+        except _UnsafeRawEvidence:
+            return (
+                market_id,
+                None,
+                "raw_evidence_path_unsafe",
+                stage_dir,
+                stage_identity,
+            )
         except CollectionDeadlineExceeded:
-            return market_id, None, "route_deadline_exceeded", stage_dir
+            return (
+                market_id,
+                None,
+                "route_deadline_exceeded",
+                stage_dir,
+                stage_identity,
+            )
         except Exception:
-            return market_id, None, "collection_failed", stage_dir
+            return (
+                market_id,
+                None,
+                "collection_failed",
+                stage_dir,
+                stage_identity,
+            )
 
     def resolve_one(
         chain: str,
@@ -873,15 +1819,24 @@ def collect_route_cohort(
                         if dex_key not in source_order:
                             source_order.append(dex_key)
                 else:
-                    returned_id, row, reason, stage_dir = future.result()
+                    (
+                        returned_id,
+                        row,
+                        reason,
+                        stage_dir,
+                        stage_identity,
+                    ) = future.result()
                     if reason == "route_deadline_exceeded":
                         expired.add(returned_id)
                     elif reason:
                         terminal_reasons[returned_id] = reason
                     elif row is not None:
                         completed[returned_id] = row
-                        if stage_dir is not None:
-                            completed_stage_dirs[returned_id] = stage_dir
+                        if stage_dir is not None and stage_identity is not None:
+                            completed_stage_dirs[returned_id] = (
+                                stage_dir,
+                                stage_identity,
+                            )
             submit_fairly()
     finally:
         for future, (item, key) in futures.items():
@@ -924,24 +1879,129 @@ def collect_route_cohort(
                 completed.pop(market_id, None)
                 completed_stage_dirs.pop(market_id, None)
             fixed_blocks.pop(chain, None)
-    for market_id in sorted(completed_stage_dirs):
-        stage_dir = completed_stage_dirs[market_id]
-        row = completed[market_id]
-        raw_failure = _raw_evidence_failure(row, stage_dir)
-        if raw_failure is not None:
-            terminal_reasons[market_id] = raw_failure
+    try:
+        raw_run_descriptors = _open_raw_run_descriptors(
+            staging_root,
+            accepted_root,
+            raw_run_guards,
+        )
+    except _UnsafeRawEvidence:
+        raw_run_descriptors = None
+        for market_id in completed_stage_dirs:
+            terminal_reasons[market_id] = "raw_evidence_path_unsafe"
             completed.pop(market_id, None)
-            continue
-        raw_path = stage_dir / "response.json"
-        if raw_path.is_file() and row.get("raw_response_sha256") in (None, ""):
-            completed[market_id] = {
-                **dict(row),
-                "raw_response_sha256": hashlib.sha256(
-                    raw_path.read_bytes()
-                ).hexdigest(),
-            }
-        if stage_dir.exists():
-            stage_dir.replace(accepted_root / stage_dir.name)
+    if raw_run_descriptors is not None:
+        try:
+            for market_id in sorted(completed_stage_dirs):
+                stage_dir, stage_identity = completed_stage_dirs[market_id]
+                row = completed[market_id]
+                (
+                    raw_failure,
+                    actual_sha256,
+                    response_identity,
+                ) = _validated_raw_evidence(
+                    row,
+                    stage_dir,
+                    stage_identity,
+                    staging_root,
+                    accepted_root,
+                    raw_run_guards,
+                )
+                if raw_failure is not None:
+                    if raw_failure == "raw_evidence_path_unsafe":
+                        _clear_unsafe_accepted_alias(
+                            raw_run_descriptors,
+                            raw_run_guards["accepted"],
+                        )
+                    terminal_reasons[market_id] = raw_failure
+                    completed.pop(market_id, None)
+                    continue
+                if actual_sha256 is None or response_identity is None:
+                    continue
+                if row.get("raw_response_sha256") in (None, ""):
+                    completed[market_id] = {
+                        **dict(row),
+                        "raw_response_sha256": actual_sha256,
+                    }
+                entry_name = stage_dir.name
+                entry_descriptor = None
+                try:
+                    _require_raw_run_guards(
+                        staging_root, accepted_root, raw_run_guards
+                    )
+                    entry_descriptor = _open_directory_entry(
+                        raw_run_descriptors["staging"],
+                        entry_name,
+                        stage_identity,
+                    )
+                    _rename_directory_entry(
+                        entry_name,
+                        entry_name,
+                        source_directory_fd=raw_run_descriptors["staging"],
+                        destination_directory_fd=raw_run_descriptors["accepted"],
+                    )
+                except (OSError, _UnsafeRawEvidence):
+                    _clear_unsafe_accepted_alias(
+                        raw_run_descriptors,
+                        raw_run_guards["accepted"],
+                    )
+                    terminal_reasons[market_id] = "raw_evidence_path_unsafe"
+                    completed.pop(market_id, None)
+                    if entry_descriptor is not None:
+                        os.close(entry_descriptor)
+                    continue
+                try:
+                    post_failure = _post_promotion_failure(
+                        entry_name,
+                        entry_descriptor,
+                        stage_identity,
+                        response_identity,
+                        actual_sha256,
+                        staging_root,
+                        accepted_root,
+                        raw_run_guards,
+                        raw_run_descriptors,
+                    )
+                    if post_failure is not None:
+                        rollback_error = None
+                        try:
+                            rollback_succeeded = _rollback_promoted_evidence(
+                                entry_name,
+                                stage_identity,
+                                raw_run_descriptors,
+                            )
+                            _descriptor_directory_identity(
+                                entry_descriptor,
+                                stage_identity,
+                            )
+                            if (
+                                not rollback_succeeded
+                                or not _rollback_state_is_safe(
+                                    entry_name,
+                                    stage_identity,
+                                    raw_run_descriptors,
+                                )
+                            ):
+                                raise _UnsafeRawEvidence(
+                                    "raw evidence rollback could not be verified"
+                                )
+                        except (OSError, _UnsafeRawEvidence) as error:
+                            rollback_error = error
+                        finally:
+                            _clear_unsafe_accepted_alias(
+                                raw_run_descriptors,
+                                raw_run_guards["accepted"],
+                            )
+                        if rollback_error is not None:
+                            raise _UnsafeRawEvidence(
+                                "raw evidence rollback could not be verified"
+                            ) from rollback_error
+                        terminal_reasons[market_id] = post_failure
+                        completed.pop(market_id, None)
+                finally:
+                    os.close(entry_descriptor)
+        finally:
+            _close_raw_run_descriptors(raw_run_descriptors)
     fixed_blocks_by_market = {}
     for market_id in market_ids:
         leg = legs_by_market[market_id]
