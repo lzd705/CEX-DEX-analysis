@@ -84,45 +84,79 @@ selected legs, routes, canonical JSON bytes, or that SHA-256.
 `scripts.collect_route_cohort.collect_unique_route_legs()` resolves the unique
 canonical market IDs referenced by a route universe in lexical order.
 `collect_route_cohort()` schedules each such leg once, with a process-wide
-`max_workers` cap, a semaphore of `cex_workers_per_venue` for each CEX venue,
-and a semaphore of `dex_workers_per_chain` for each DEX chain. Completion
-order is not evidence: normalized leg rows, route timing rows, and the cohort
-fingerprint are sorted by canonical identity.
+`max_workers` cap, an active-work cap of `cex_workers_per_venue` for each CEX
+venue, and an active-work cap of `dex_workers_per_chain` for each DEX chain.
+Completion order is not evidence: normalized leg rows, route timing rows, and
+the cohort fingerprint are sorted by canonical identity.
 
-Before any pool work, a DEX cohort requires a fixed-block resolver, called once
-per referenced chain. Every pool collector on that chain receives exactly its
-resolved `fixed_block_number` and `fixed_block_timestamp`. The orchestrator
-passes the shared monotonic deadline through to every resolver and leg
-collector. A `CollectionDeadlineExceeded` result always becomes a retained
-terminal leg row with `status = deadline_exceeded`, `available = false`, and
-`reason_code = route_deadline_exceeded`; it is never omitted. Consequently,
-only routes containing that leg classify as deadline-exceeded.
+Before any pool work on a chain, a DEX cohort requires one fixed-block resolver
+for that chain. Resolver jobs share the same fair scheduler as CEX collection,
+so a slow or hung resolver cannot postpone all CEX work or consume every worker.
+Every pool collector on the resolved chain receives exactly its common
+`fixed_block_number` and `fixed_block_timestamp`. The orchestrator passes one
+shared monotonic deadline through to every resolver and leg collector. It uses
+daemon workers backed by `Future` objects, so an uncooperative transport that
+ignores that deadline cannot keep the CLI process alive. A resolver or leg
+`CollectionDeadlineExceeded` always becomes a retained terminal leg row with
+`status = deadline_exceeded`, `available = false`, and
+`reason_code = route_deadline_exceeded`; it is never mislabeled as a generic
+failure or omitted. Consequently, only routes containing that leg classify as
+deadline-exceeded.
 
-The universe's `candidate_source_generation` is checked before work starts and
-again before the normalized cohort is returned. A changed generation raises
-`ValueError("candidate source generation changed")`, preventing facts collected
-against a moving candidate set from reaching a later publication boundary.
+Collection is bound to two separate generations. The universe's original
+`candidate_source_generation` is preserved as candidate lineage. The CLI also
+computes `collection_input_generation` as the canonical SHA-256 of the entire
+validated route universe, the exact requested token filter, and the exact
+authoritative inventory rows for the selected legs. It recomputes that complete
+input before work and after work; a mismatch raises
+`ValueError("collection input generation changed")`. Direct callers must supply
+both the expected value and a reader that can reproduce it. Thus changing an
+inventory fact without changing `candidate_source_generation` still rejects
+the cohort.
 
 The Task 4 command reads `<data-dir>/route_universe.json` and accepts
 `--data-dir`, `--start`, `--end`, `--tokens`, `--deadline-seconds`,
 `--max-workers`, `--cex-workers-per-venue`, and `--dex-workers-per-chain`.
-`--dry-run` only parses and validates that universe: it performs no network
+`--start` and `--end`, when supplied, must equal the corresponding values in
+the universe's `selection_window`; they are not informational arguments.
+Malformed or duplicate routes, invalid token filters, non-finite/non-positive
+deadlines, and invalid worker limits fail before collection. `--dry-run`
+performs the same read-only full-universe, authoritative-inventory, and stable
+`collection_input_generation` validation as live mode. It performs no network
 calls, creates no raw artifacts, and publishes nothing. `--publish` fails
 explicitly until Task 5 owns immutable bundle publication.
 
 Live CLI collection resolves every selected canonical CEX ID against the
 authoritative CEX catalog and every selected canonical DEX ID against the TVL
-pool inventory. It never reconstructs a symbol, exchange, or pool from a
-display label. A missing or duplicate resolved identity fails closed. The CEX
-and DEX adapters invoke the Task 3 one-leg primitives using only their declared
+pool inventory. Authoritative identity fields win during binding; any conflict
+with a selected universe identity, missing identity, or duplicate inventory ID
+fails closed. Collector rows are checked against the requested canonical
+identity, including any partial identity fields they return. The CEX and DEX
+adapters invoke the Task 3 one-leg primitives using only their declared
 arguments; the DEX adapter receives the common fixed block number and block
 timestamp, never a target-time pseudo-argument.
 
+Each invocation owns one collision-safe raw evidence directory below
+`<raw-root>/<raw_evidence_run_id>/`. Caller-supplied snapshot IDs are restricted
+to a bounded path-safe identifier and an existing run directory is never
+reused. Default IDs combine canonical UTC wall time with a UUID, so two calls
+in the same clock tick remain distinct. Market identities are represented only
+by SHA-256 directory names, never interpolated into paths. Workers write under
+`staging/`; only a completed, identity-valid, within-deadline observation is
+moved to `accepted/`, and only after the final input-generation check. A worker
+that returns or writes after the deadline remains in staging and cannot mutate
+accepted evidence.
+
 The returned `route_cohort_collection/v1` declares a deterministic
-`route_cohort_id`, canonical `target_observed_at`,
-`collection_started_at`, `collection_deadline_at`, `skew_sla_seconds = "60"`,
+`route_cohort_id`, `raw_evidence_run_id`, canonical `target_observed_at`,
+actual wall-clock `collection_started_at`, active monotonic-deadline-derived
+`collection_deadline_at`, `skew_sla_seconds = "60"`,
 `route_age_sla_seconds = "120"`, candidate generation, selected-window/notional
-lineage, normalized legs, and route timing rows. A fixed DEX observation must
+lineage, complete collection-input generation/source state, normalized legs,
+and route timing rows. Target timestamps with a numeric offset are canonicalized
+to UTC. Separate invocations may intentionally have different start/deadline
+times and run IDs; with those invocation inputs held fixed, completion order
+does not affect normalized rows or fingerprints. A fixed DEX observation must
 echo its resolved block number and timestamp; a mismatch becomes the retained
 terminal reason `fixed_block_lineage_mismatch`. Leg projections exclude raw
 paths, exception traces, and credential-like fields before the future bundle
