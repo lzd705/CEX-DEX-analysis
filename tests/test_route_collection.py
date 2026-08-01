@@ -1,5 +1,8 @@
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
+import multiprocessing
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -8,16 +11,103 @@ import textwrap
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Lock
+from threading import Event, Lock, Thread as TestThread, enumerate as enumerate_threads
 import time
 from unittest.mock import patch
 
 from scripts.collect_route_cohort import (
-    collect_route_cohort,
+    collect_route_cohort as _collect_route_cohort,
     collect_unique_route_legs,
     main,
     materialize_route_leg_rows,
 )
+
+
+_TEST_RAW_DIRECTORY = tempfile.TemporaryDirectory(prefix="route-cohort-tests-")
+
+
+def _complete_test_routes(universe):
+    normalized = dict(universe)
+    normalized["routes"] = []
+    for source in universe.get("routes", []):
+        route = dict(source)
+        if not route.get("route_id") and all(
+            isinstance(route.get(key), str)
+            for key in (
+                "token_symbol", "buy_market_id", "sell_market_id", "route_mode"
+            )
+        ):
+            route["route_id"] = "route:{}:{}->{}:{}".format(
+                route["token_symbol"],
+                route["buy_market_id"],
+                route["sell_market_id"],
+                route["route_mode"],
+            )
+        normalized["routes"].append(route)
+    return normalized
+
+
+def _raw_writing_fake(collector):
+    def wrapped(*args, **kwargs):
+        value = collector(*args, **kwargs)
+        row = value[0] if isinstance(value, tuple) and len(value) == 2 else value
+        raw_path = kwargs.get("raw_path")
+        if (
+            isinstance(row, dict)
+            and row.get("status") in {"observed", "partial"}
+            and isinstance(raw_path, Path)
+            and not raw_path.exists()
+        ):
+            raw_path.write_bytes(b"test raw evidence")
+        return value
+
+    return wrapped
+
+
+def collect_route_cohort(universe, *args, **kwargs):
+    """Keep stateful unit fakes in-process and give every test isolated raw."""
+    kwargs.setdefault("raw_root", Path(_TEST_RAW_DIRECTORY.name))
+    kwargs.setdefault("executor_factory", ThreadPoolExecutor)
+    if "cex_collector" in kwargs:
+        kwargs["cex_collector"] = _raw_writing_fake(kwargs["cex_collector"])
+    if "dex_collector" in kwargs:
+        kwargs["dex_collector"] = _raw_writing_fake(kwargs["dex_collector"])
+    return _collect_route_cohort(_complete_test_routes(universe), *args, **kwargs)
+
+
+def _strict_route(token, buy_market_id, sell_market_id, route_mode):
+    return {
+        "route_id": "route:{}:{}->{}:{}".format(
+            token, buy_market_id, sell_market_id, route_mode
+        ),
+        "token_symbol": token,
+        "buy_market_id": buy_market_id,
+        "sell_market_id": sell_market_id,
+        "route_mode": route_mode,
+    }
+
+
+def _strict_cex_universe():
+    alpha = "cex:alpha:UNI/USDT"
+    beta = "cex:beta:UNI/USDT"
+    return {
+        "candidate_source_generation": "generation-a",
+        "selected_legs": [
+            {"market_id": alpha, "market_type": "cex", "exchange": "alpha"},
+            {"market_id": beta, "market_type": "cex", "exchange": "beta"},
+        ],
+        "routes": [
+            _strict_route("UNI", alpha, beta, "prepositioned_inventory")
+        ],
+    }
+
+
+def _write_observed_raw(_leg, *, raw_path, **_kwargs):
+    raw_path.write_bytes(b"observed raw")
+    return {
+        "status": "observed",
+        "state_observed_at": "2026-08-01T12:00:00Z",
+    }
 
 
 class FakeClock:
@@ -191,6 +281,634 @@ class RpcClientIsolationTest(unittest.TestCase):
 
 
 class RouteLegCollectionTests(unittest.TestCase):
+    def test_completion_time_rejects_future_observations_and_is_retained(self):
+        universe = _strict_cex_universe()
+        wall_times = iter([
+            datetime(2026, 8, 1, 12, tzinfo=timezone.utc),
+            datetime(2026, 8, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ])
+
+        def future_observation(_leg, *, raw_path, **_kwargs):
+            raw_path.write_bytes(b"future")
+            return {
+                "status": "observed",
+                "state_observed_at": "2099-01-01T00:00:00Z",
+            }
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            result = _collect_route_cohort(
+                universe,
+                cex_collector=future_observation,
+                dex_collector=lambda *_args, **_kwargs: None,
+                raw_root=Path(directory_name),
+                executor_factory=ThreadPoolExecutor,
+                wall_clock=lambda: next(wall_times),
+                source_generation_reader=lambda: "input-a",
+                expected_source_generation="input-a",
+            )
+
+        self.assertEqual(
+            result["collection_completed_at"], "2026-08-01T12:00:01Z"
+        )
+        route = result["route_rows"][0]
+        self.assertEqual(route["validated_at"], result["collection_completed_at"])
+        self.assertEqual(route["timing_status"], "unavailable")
+        self.assertEqual(route["reason_code"], "invalid_state_timestamp")
+
+    def test_collection_completion_time_is_bound_into_both_hashes(self):
+        from scripts.collection_deadline import CollectionDeadline
+
+        universe = _strict_cex_universe()
+        start = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+
+        def collect_once(raw_root, completed_at):
+            wall_times = iter([start, completed_at])
+            monotonic = FakeClock()
+            return _collect_route_cohort(
+                universe,
+                cex_collector=_write_observed_raw,
+                dex_collector=lambda *_args, **_kwargs: None,
+                raw_root=raw_root,
+                snapshot_id="same-run",
+                executor_factory=ThreadPoolExecutor,
+                deadline=CollectionDeadline.for_duration(
+                    1, clock=monotonic.monotonic, sleeper=monotonic.sleep
+                ),
+                wall_clock=lambda: next(wall_times),
+                source_generation_reader=lambda: "input-a",
+                expected_source_generation="input-a",
+            )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            first = collect_once(
+                root / "first",
+                datetime(2026, 8, 1, 12, 0, 1, tzinfo=timezone.utc),
+            )
+            second = collect_once(
+                root / "second",
+                datetime(2026, 8, 1, 12, 0, 2, tzinfo=timezone.utc),
+            )
+
+        self.assertNotEqual(first["route_cohort_id"], second["route_cohort_id"])
+        self.assertNotEqual(first["fingerprint"], second["fingerprint"])
+
+    def test_exact_route_id_is_required_before_source_reads_or_raw_work(self):
+        canonical = _strict_cex_universe()
+        invalid_routes = [
+            {key: value for key, value in canonical["routes"][0].items() if key != "route_id"},
+            {**canonical["routes"][0], "route_id": ""},
+            {**canonical["routes"][0], "route_id": "route:not-canonical"},
+        ]
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            for index, route in enumerate(invalid_routes):
+                source_reads = []
+                raw_root = root / str(index)
+                with self.subTest(route_id=route.get("route_id")):
+                    with self.assertRaisesRegex(
+                        ValueError, "route_id must be canonical"
+                    ):
+                        _collect_route_cohort(
+                            {**canonical, "routes": [route]},
+                            cex_collector=_write_observed_raw,
+                            dex_collector=lambda *_args, **_kwargs: None,
+                            raw_root=raw_root,
+                            executor_factory=ThreadPoolExecutor,
+                            source_generation_reader=lambda: (
+                                source_reads.append("read") or "input-a"
+                            ),
+                            expected_source_generation="input-a",
+                        )
+                    self.assertEqual(source_reads, [])
+                    self.assertFalse(raw_root.exists())
+
+    def test_selected_market_type_must_match_market_id_before_source_read(self):
+        universe = _strict_cex_universe()
+        universe["selected_legs"][0]["market_type"] = "dex"
+        source_reads = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            raw_root = Path(directory_name) / "raw"
+            with self.assertRaisesRegex(ValueError, "market type.*market_id"):
+                _collect_route_cohort(
+                    universe,
+                    cex_collector=_write_observed_raw,
+                    dex_collector=lambda *_args, **_kwargs: None,
+                    dex_block_resolver=lambda *_args, **_kwargs: {
+                        "block_number": 1,
+                        "block_timestamp": "2026-08-01T11:59:59Z",
+                    },
+                    raw_root=raw_root,
+                    executor_factory=ThreadPoolExecutor,
+                    source_generation_reader=lambda: (
+                        source_reads.append("read") or "input-a"
+                    ),
+                    expected_source_generation="input-a",
+                )
+            self.assertEqual(source_reads, [])
+            self.assertFalse(raw_root.exists())
+
+    def test_fixed_block_lineage_is_strict_and_future_safe(self):
+        left = "dex:eth:swap:0xone:UNI"
+        right = "dex:eth:swap:0xtwo:UNI"
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": left, "market_type": "dex", "chain": "eth"},
+                {"market_id": right, "market_type": "dex", "chain": "eth"},
+            ],
+            "routes": [_strict_route("UNI", left, right, "atomic_onchain")],
+        }
+        invalid = [
+            {"block_number": 0, "block_timestamp": "2026-08-01T11:59:59Z"},
+            {"block_number": -1, "block_timestamp": "2026-08-01T11:59:59Z"},
+            {"block_number": True, "block_timestamp": "2026-08-01T11:59:59Z"},
+            {"block_number": 1, "block_timestamp": ""},
+            {"block_number": 1, "block_timestamp": "not-a-time"},
+            {"block_number": 1, "block_timestamp": "2099-01-01T00:00:00Z"},
+        ]
+
+        def dex_observation(_leg, *, raw_path, fixed_block_number,
+                            fixed_block_timestamp, **_kwargs):
+            raw_path.write_bytes(b"dex raw")
+            return {
+                "status": "observed",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+                "block_number": str(fixed_block_number),
+                "block_timestamp": fixed_block_timestamp,
+            }
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            for index, lineage in enumerate(invalid):
+                calls = []
+                with self.subTest(lineage=lineage):
+                    result = _collect_route_cohort(
+                        universe,
+                        cex_collector=lambda *_args, **_kwargs: None,
+                        dex_collector=lambda *args, **kwargs: (
+                            calls.append("called")
+                            or dex_observation(*args, **kwargs)
+                        ),
+                        dex_block_resolver=lambda *_args, value=lineage, **_kwargs: value,
+                        raw_root=root / str(index),
+                        executor_factory=ThreadPoolExecutor,
+                        wall_clock=lambda: datetime(
+                            2026, 8, 1, 12, tzinfo=timezone.utc
+                        ),
+                        source_generation_reader=lambda: "input-a",
+                        expected_source_generation="input-a",
+                    )
+                    self.assertEqual(calls, [])
+                    self.assertTrue(all(
+                        row["reason_code"] == "fixed_block_unavailable"
+                        for row in result["legs"]
+                    ))
+
+    def test_terminal_dex_leg_retains_normalized_resolved_block_lineage(self):
+        left = "dex:eth:swap:0xone:UNI"
+        right = "dex:eth:swap:0xtwo:UNI"
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": left, "market_type": "dex", "chain": "eth"},
+                {"market_id": right, "market_type": "dex", "chain": "eth"},
+            ],
+            "routes": [_strict_route("UNI", left, right, "atomic_onchain")],
+        }
+        with tempfile.TemporaryDirectory() as directory_name:
+            result = _collect_route_cohort(
+                universe,
+                cex_collector=lambda *_args, **_kwargs: None,
+                dex_collector=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    ValueError("collection failed")
+                ),
+                dex_block_resolver=lambda *_args, **_kwargs: {
+                    "block_number": 123,
+                    "block_timestamp": "2026-08-01T20:00:00+08:00",
+                },
+                raw_root=Path(directory_name),
+                executor_factory=ThreadPoolExecutor,
+                wall_clock=lambda: datetime(
+                    2026, 8, 1, 12, 0, 1, tzinfo=timezone.utc
+                ),
+                source_generation_reader=lambda: "input-a",
+                expected_source_generation="input-a",
+            )
+
+        self.assertTrue(all(row["status"] == "failed" for row in result["legs"]))
+        self.assertTrue(all(
+            row["fixed_block_number"] == "123"
+            and row["fixed_block_timestamp"] == "2026-08-01T12:00:00Z"
+            for row in result["legs"]
+        ))
+
+    def test_hung_resolvers_cannot_consume_reserved_cex_capacity(self):
+        cex_one = "cex:alpha:UNI/USDT"
+        cex_two = "cex:alpha:UNI/USDC"
+        dex_one = "dex:arb:swap:0xone:UNI"
+        dex_two = "dex:eth:swap:0xtwo:UNI"
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": cex_one, "market_type": "cex", "exchange": "alpha"},
+                {"market_id": cex_two, "market_type": "cex", "exchange": "alpha"},
+                {"market_id": dex_one, "market_type": "dex", "chain": "arb"},
+                {"market_id": dex_two, "market_type": "dex", "chain": "eth"},
+            ],
+            "routes": [
+                _strict_route(
+                    "UNI", cex_one, cex_two, "prepositioned_inventory"
+                ),
+                _strict_route("UNI", dex_one, dex_two, "research_only"),
+            ],
+        }
+        gates = {"arb": Event(), "eth": Event()}
+        started = []
+
+        def hung_resolver(chain, **_kwargs):
+            gates[chain].wait()
+
+        def cex_observation(leg, **_kwargs):
+            started.append(leg["market_id"])
+            return {
+                "status": "observed",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+            }
+
+        result = collect_route_cohort(
+            universe,
+            cex_collector=cex_observation,
+            dex_collector=lambda *_args, **_kwargs: None,
+            dex_block_resolver=hung_resolver,
+            max_workers=2,
+            cex_workers_per_venue=1,
+            deadline_seconds=0.05,
+            source_generation_reader=lambda: "input-a",
+            expected_source_generation="input-a",
+        )
+        for gate in gates.values():
+            gate.set()
+
+        self.assertEqual(len(started), 2)
+        self.assertEqual(set(started), {cex_one, cex_two})
+        self.assertTrue(all(
+            row["status"] == "observed"
+            for row in result["legs"] if row["market_id"].startswith("cex:")
+        ))
+
+    def test_one_worker_finishes_all_cex_work_before_any_resolver(self):
+        cex_one = "cex:alpha:UNI/USDT"
+        cex_two = "cex:alpha:UNI/USDC"
+        dex_one = "dex:eth:swap:0xone:UNI"
+        dex_two = "dex:eth:swap:0xtwo:UNI"
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {"market_id": cex_one, "market_type": "cex", "exchange": "alpha"},
+                {"market_id": cex_two, "market_type": "cex", "exchange": "alpha"},
+                {"market_id": dex_one, "market_type": "dex", "chain": "eth"},
+                {"market_id": dex_two, "market_type": "dex", "chain": "eth"},
+            ],
+            "routes": [
+                _strict_route(
+                    "UNI", cex_one, cex_two, "prepositioned_inventory"
+                ),
+                _strict_route("UNI", dex_one, dex_two, "atomic_onchain"),
+            ],
+        }
+        gate = Event()
+        starts = []
+
+        def cex_observation(leg, **_kwargs):
+            starts.append(leg["market_id"])
+            return {
+                "status": "observed",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+            }
+
+        result = collect_route_cohort(
+            universe,
+            cex_collector=cex_observation,
+            dex_collector=lambda *_args, **_kwargs: None,
+            dex_block_resolver=lambda *_args, **_kwargs: gate.wait(),
+            max_workers=1,
+            cex_workers_per_venue=1,
+            deadline_seconds=0.05,
+            source_generation_reader=lambda: "input-a",
+            expected_source_generation="input-a",
+        )
+        gate.set()
+
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(set(starts), {cex_one, cex_two})
+        self.assertTrue(all(
+            row["status"] == "observed"
+            for row in result["legs"] if row["market_id"].startswith("cex:")
+        ))
+
+    def test_repeated_blocked_default_calls_leave_no_workers_or_processes(self):
+        universe = _strict_cex_universe()
+        baseline_processes = {process.pid for process in multiprocessing.active_children()}
+        baseline_threads = {
+            thread.ident
+            for thread in enumerate_threads()
+            if thread.name.startswith("route-cohort-")
+        }
+        with tempfile.TemporaryDirectory() as directory_name:
+            raw_root = Path(directory_name)
+            for _index in range(3):
+                gate = multiprocessing.get_context("fork").Event()
+
+                def blocked_collector(*_args, **_kwargs):
+                    gate.wait()
+
+                result = _collect_route_cohort(
+                    universe,
+                    cex_collector=blocked_collector,
+                    dex_collector=lambda *_args, **_kwargs: None,
+                    raw_root=raw_root,
+                    max_workers=1,
+                    deadline_seconds=0.03,
+                    source_generation_reader=lambda: "input-a",
+                    expected_source_generation="input-a",
+                )
+                self.assertTrue(all(
+                    row["status"] == "deadline_exceeded"
+                    for row in result["legs"]
+                ))
+
+        time.sleep(0.05)
+        self.assertEqual(
+            {process.pid for process in multiprocessing.active_children()},
+            baseline_processes,
+        )
+        self.assertEqual(
+            {
+                thread.ident
+                for thread in enumerate_threads()
+                if thread.name.startswith("route-cohort-")
+            },
+            baseline_threads,
+        )
+
+    def test_default_process_executor_creates_no_monitor_threads(self):
+        universe = _strict_cex_universe()
+        with tempfile.TemporaryDirectory() as directory_name:
+            with patch(
+                "scripts.collect_route_cohort.Thread",
+                side_effect=AssertionError("process executor created a thread"),
+            ):
+                result = _collect_route_cohort(
+                    universe,
+                    cex_collector=_write_observed_raw,
+                    dex_collector=lambda *_args, **_kwargs: None,
+                    raw_root=Path(directory_name),
+                    source_generation_reader=lambda: "input-a",
+                    expected_source_generation="input-a",
+                )
+
+        self.assertTrue(all(row["status"] == "observed" for row in result["legs"]))
+
+    def test_multithreaded_caller_fails_before_source_read_raw_or_fork(self):
+        universe = _strict_cex_universe()
+        gate = Event()
+        caller_thread = TestThread(
+            target=gate.wait,
+            name="unrelated-caller-thread",
+        )
+        caller_thread.start()
+        source_reads = []
+        baseline_processes = {
+            process.pid for process in multiprocessing.active_children()
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory_name:
+                raw_root = Path(directory_name) / "raw"
+                with self.assertRaisesRegex(RuntimeError, "single-threaded"):
+                    _collect_route_cohort(
+                        universe,
+                        cex_collector=_write_observed_raw,
+                        dex_collector=lambda *_args, **_kwargs: None,
+                        raw_root=raw_root,
+                        source_generation_reader=lambda: (
+                            source_reads.append("read") or "input-a"
+                        ),
+                        expected_source_generation="input-a",
+                    )
+                self.assertFalse(raw_root.exists())
+        finally:
+            gate.set()
+            caller_thread.join(timeout=1)
+
+        self.assertEqual(source_reads, [])
+        self.assertEqual(
+            {process.pid for process in multiprocessing.active_children()},
+            baseline_processes,
+        )
+
+    def test_default_fork_path_is_clean_under_deprecation_warnings_as_errors(self):
+        code = textwrap.dedent(
+            """
+            from pathlib import Path
+            import tempfile
+            import time
+            from scripts.collect_route_cohort import collect_route_cohort
+
+            left = 'cex:alpha:UNI/USDT'
+            right = 'cex:beta:UNI/USDT'
+            universe = {
+                'candidate_source_generation': 'generation-a',
+                'selected_legs': [
+                    {'market_id': left, 'market_type': 'cex'},
+                    {'market_id': right, 'market_type': 'cex'},
+                ],
+                'routes': [{
+                    'route_id': 'route:UNI:{}->{}:prepositioned_inventory'.format(left, right),
+                    'token_symbol': 'UNI',
+                    'buy_market_id': left,
+                    'sell_market_id': right,
+                    'route_mode': 'prepositioned_inventory',
+                }],
+            }
+
+            def collect(_leg, *, raw_path, **_kwargs):
+                time.sleep(0.1)
+                raw_path.write_bytes(b'raw')
+                return {
+                    'status': 'observed',
+                    'state_observed_at': '2026-08-01T12:00:00Z',
+                }
+
+            result = collect_route_cohort(
+                universe,
+                cex_collector=collect,
+                dex_collector=lambda *_args, **_kwargs: None,
+                raw_root=Path(tempfile.mkdtemp()),
+                source_generation_reader=lambda: 'input-a',
+                expected_source_generation='input-a',
+            )
+            assert all(row['status'] == 'observed' for row in result['legs'])
+            print('ok')
+            """
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-W",
+                "error::DeprecationWarning",
+                "-c",
+                code,
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            text=True,
+            capture_output=True,
+            timeout=2,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "ok")
+
+    def test_direct_collection_requires_explicit_raw_root_without_artifacts(self):
+        universe = _strict_cex_universe()
+        source_reads = []
+        previous_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory_name:
+            temporary_cwd = Path(directory_name)
+            os.chdir(str(temporary_cwd))
+            try:
+                with self.assertRaisesRegex(ValueError, "raw_root is required"):
+                    _collect_route_cohort(
+                        universe,
+                        cex_collector=_write_observed_raw,
+                        dex_collector=lambda *_args, **_kwargs: None,
+                        executor_factory=ThreadPoolExecutor,
+                        source_generation_reader=lambda: (
+                            source_reads.append("read") or "input-a"
+                        ),
+                        expected_source_generation="input-a",
+                    )
+            finally:
+                os.chdir(str(previous_cwd))
+            self.assertFalse((temporary_cwd / "data").exists())
+        self.assertEqual(source_reads, [])
+
+    def test_raw_root_rejects_existing_and_broken_symlinks(self):
+        universe = _strict_cex_universe()
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            target = root / "target"
+            target.mkdir()
+            existing_link = root / "existing-link"
+            broken_link = root / "broken-link"
+            existing_link.symlink_to(target, target_is_directory=True)
+            broken_link.symlink_to(root / "missing", target_is_directory=True)
+            for raw_root in (existing_link, broken_link):
+                with self.subTest(raw_root=raw_root.name):
+                    with self.assertRaisesRegex(ValueError, "raw_root.*symlink"):
+                        _collect_route_cohort(
+                            universe,
+                            cex_collector=_write_observed_raw,
+                            dex_collector=lambda *_args, **_kwargs: None,
+                            raw_root=raw_root,
+                            executor_factory=ThreadPoolExecutor,
+                            source_generation_reader=lambda: "input-a",
+                            expected_source_generation="input-a",
+                        )
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_missing_or_mismatched_raw_evidence_cannot_be_accepted(self):
+        universe = _strict_cex_universe()
+
+        def missing_raw(_leg, **_kwargs):
+            return {
+                "status": "observed",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+            }
+
+        def mismatched_raw(_leg, *, raw_path, **_kwargs):
+            raw_path.write_bytes(b"actual")
+            return {
+                "status": "observed",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+                "raw_response_sha256": "0" * 64,
+            }
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            for name, collector, reason in (
+                ("missing", missing_raw, "raw_evidence_missing"),
+                ("mismatch", mismatched_raw, "raw_evidence_hash_mismatch"),
+            ):
+                with self.subTest(name=name):
+                    result = _collect_route_cohort(
+                        universe,
+                        cex_collector=collector,
+                        dex_collector=lambda *_args, **_kwargs: None,
+                        raw_root=root / name,
+                        executor_factory=ThreadPoolExecutor,
+                        source_generation_reader=lambda: "input-a",
+                        expected_source_generation="input-a",
+                    )
+                    self.assertTrue(all(
+                        row["status"] == "failed" and row["reason_code"] == reason
+                        for row in result["legs"]
+                    ))
+                    run_dir = root / name / result["raw_evidence_run_id"]
+                    self.assertEqual(list((run_dir / "accepted").iterdir()), [])
+
+    def test_live_main_returns_only_the_fingerprint_bound_cohort(self):
+        universe = _strict_cex_universe()
+        inventory = [
+            {"token_symbol": "UNI", "exchange": "alpha", "cex_symbol": "UNI/USDT"},
+            {"token_symbol": "UNI", "exchange": "beta", "cex_symbol": "UNI/USDT"},
+        ]
+
+        def cex_observation(_market, *, raw_path, **_kwargs):
+            raw = b"cli raw"
+            raw_path.write_bytes(raw)
+            return {
+                "status": "observed",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+                "raw_response_sha256": hashlib.sha256(raw).hexdigest(),
+            }, []
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            data_dir = Path(directory_name)
+            (data_dir / "route_universe.json").write_text(
+                json.dumps(universe), encoding="utf-8"
+            )
+            with patch(
+                "scripts.collect_route_cohort.load_cataloged_markets",
+                return_value=inventory,
+            ):
+                result = main(
+                    ["--data-dir", str(data_dir), "--deadline-seconds", "1"],
+                    cex_collector=cex_observation,
+                    executor_factory=ThreadPoolExecutor,
+                )
+
+        self.assertNotIn("dry_run", result)
+        self.assertNotIn("universe_path", result)
+        without_hashes = {
+            key: value
+            for key, value in result.items()
+            if key not in {"route_cohort_id", "fingerprint"}
+        }
+        expected_id = "cohort:" + hashlib.sha256(json.dumps(
+            without_hashes,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        self.assertEqual(result["route_cohort_id"], expected_id)
+        expected_fingerprint = hashlib.sha256(json.dumps(
+            {**without_hashes, "route_cohort_id": expected_id},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        self.assertEqual(result["fingerprint"], expected_fingerprint)
+
     def test_cli_recomputes_full_input_generation_and_rejects_inventory_mutation(self):
         universe = {
             "candidate_source_generation": "candidate-a",
@@ -208,7 +926,9 @@ class RouteLegCollectionTests(unittest.TestCase):
         mutated = [{**row, "observed_at": "2026-08-01T00:00:01Z"} for row in first]
         with tempfile.TemporaryDirectory() as directory_name:
             data_dir = Path(directory_name)
-            (data_dir / "route_universe.json").write_text(json.dumps(universe), encoding="utf-8")
+            (data_dir / "route_universe.json").write_text(
+                json.dumps(_complete_test_routes(universe)), encoding="utf-8"
+            )
             with patch(
                 "scripts.collect_route_cohort.load_cataloged_markets",
                 side_effect=[first, mutated],
@@ -248,7 +968,10 @@ class RouteLegCollectionTests(unittest.TestCase):
             data_dir = Path(directory_name)
             with patch(
                 "scripts.collect_route_cohort._load_universe_for_cli",
-                side_effect=[universe, mutated],
+                side_effect=[
+                    _complete_test_routes(universe),
+                    _complete_test_routes(mutated),
+                ],
             ), patch(
                 "scripts.collect_route_cohort.load_cataloged_markets",
                 return_value=inventory,
@@ -279,7 +1002,9 @@ class RouteLegCollectionTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory_name:
             data_dir = Path(directory_name)
-            (data_dir / "route_universe.json").write_text(json.dumps(universe), encoding="utf-8")
+            (data_dir / "route_universe.json").write_text(
+                json.dumps(_complete_test_routes(universe)), encoding="utf-8"
+            )
             with patch("scripts.collect_route_cohort.load_cataloged_markets", return_value=inventory):
                 with self.assertRaisesRegex(ValueError, "conflicts with authoritative inventory"):
                     main(["--data-dir", str(data_dir)], cex_collector=lambda *_args, **_kwargs: self.fail("must not collect"))
@@ -297,7 +1022,9 @@ class RouteLegCollectionTests(unittest.TestCase):
     def test_blocked_worker_does_not_keep_subprocess_alive_past_deadline(self):
         code = textwrap.dedent(
             """
+            from pathlib import Path
             from threading import Event
+            import tempfile
             from scripts.collect_route_cohort import collect_route_cohort
             universe = {
                 'candidate_source_generation': 'candidate-a',
@@ -305,13 +1032,14 @@ class RouteLegCollectionTests(unittest.TestCase):
                     {'market_id': 'cex:alpha:UNI/USDT', 'market_type': 'cex'},
                     {'market_id': 'cex:beta:UNI/USDT', 'market_type': 'cex'},
                 ],
-                'routes': [{'token_symbol': 'UNI', 'buy_market_id': 'cex:alpha:UNI/USDT', 'sell_market_id': 'cex:beta:UNI/USDT', 'route_mode': 'prepositioned_inventory'}],
+                'routes': [{'route_id': 'route:UNI:cex:alpha:UNI/USDT->cex:beta:UNI/USDT:prepositioned_inventory', 'token_symbol': 'UNI', 'buy_market_id': 'cex:alpha:UNI/USDT', 'sell_market_id': 'cex:beta:UNI/USDT', 'route_mode': 'prepositioned_inventory'}],
             }
             gate = Event()
             result = collect_route_cohort(
                 universe, deadline_seconds=0.05,
                 cex_collector=lambda *_args, **_kwargs: gate.wait(),
                 dex_collector=lambda *_args, **_kwargs: None,
+                raw_root=Path(tempfile.mkdtemp()),
                 source_generation_reader=lambda: 'input-a',
                 expected_source_generation='input-a',
             )
@@ -531,17 +1259,24 @@ class RouteLegCollectionTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory_name:
             data_dir = Path(directory_name)
-            (data_dir / "route_universe.json").write_text(json.dumps(universe), encoding="utf-8")
+            (data_dir / "route_universe.json").write_text(
+                json.dumps(_complete_test_routes(universe)), encoding="utf-8"
+            )
             calls = []
 
             def cex_primitive(market, *, snapshot_id, raw_path, deadline):
                 calls.append(market)
+                raw_path.write_bytes(b"cli inventory raw")
                 return ({"status": "observed", "state_observed_at": "2026-08-01T12:00:00Z"}, [])
 
             with patch("scripts.collect_route_cohort.load_cataloged_markets", return_value=inventory):
-                result = main(["--data-dir", str(data_dir), "--deadline-seconds", "1"], cex_collector=cex_primitive)
+                result = main(
+                    ["--data-dir", str(data_dir), "--deadline-seconds", "1"],
+                    cex_collector=cex_primitive,
+                    executor_factory=ThreadPoolExecutor,
+                )
 
-        self.assertFalse(result["dry_run"])
+        self.assertNotIn("dry_run", result)
         self.assertEqual(
             sorted(
                 ({key: row[key] for key in ("token_symbol", "exchange", "cex_symbol")} for row in calls),
@@ -566,7 +1301,9 @@ class RouteLegCollectionTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory_name:
             data_dir = Path(directory_name)
-            (data_dir / "route_universe.json").write_text(json.dumps(universe), encoding="utf-8")
+            (data_dir / "route_universe.json").write_text(
+                json.dumps(_complete_test_routes(universe)), encoding="utf-8"
+            )
             inventory = [
                 {
                     "token_symbol": leg["token_symbol"],
@@ -603,7 +1340,9 @@ class RouteLegCollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory_name:
             data_dir = Path(directory_name)
             universe_path = data_dir / "route_universe.json"
-            universe_path.write_text(json.dumps(universe), encoding="utf-8")
+            universe_path.write_text(
+                json.dumps(_complete_test_routes(universe)), encoding="utf-8"
+            )
             with patch(
                 "scripts.collect_route_cohort.load_cataloged_markets",
                 return_value=inventory,
@@ -614,7 +1353,9 @@ class RouteLegCollectionTests(unittest.TestCase):
                     main(["--data-dir", str(data_dir), "--dry-run"])
 
             universe["selected_legs"][0]["token_symbol"] = "UNI"
-            universe_path.write_text(json.dumps(universe), encoding="utf-8")
+            universe_path.write_text(
+                json.dumps(_complete_test_routes(universe)), encoding="utf-8"
+            )
             with patch(
                 "scripts.collect_route_cohort.load_cataloged_markets",
                 return_value=inventory[:1],
@@ -640,7 +1381,9 @@ class RouteLegCollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory_name:
             data_dir = Path(directory_name)
             universe_path = data_dir / "route_universe.json"
-            universe_path.write_text(json.dumps(universe), encoding="utf-8")
+            universe_path.write_text(
+                json.dumps(_complete_test_routes(universe)), encoding="utf-8"
+            )
             with self.assertRaisesRegex(ValueError, "selection_window"):
                 main([
                     "--data-dir", str(data_dir), "--start", "2026-07-31",

@@ -90,15 +90,32 @@ Completion order is not evidence: normalized leg rows, route timing rows, and
 the cohort fingerprint are sorted by canonical identity.
 
 Before any pool work on a chain, a DEX cohort requires one fixed-block resolver
-for that chain. Resolver jobs share the same fair scheduler as CEX collection,
-so a slow or hung resolver cannot postpone all CEX work or consume every worker.
-Every pool collector on the resolved chain receives exactly its common
-`fixed_block_number` and `fixed_block_timestamp`. The orchestrator passes one
-shared monotonic deadline through to every resolver and leg collector. It uses
-daemon workers backed by `Future` objects, so an uncooperative transport that
-ignores that deadline cannot keep the CLI process alive. A resolver or leg
-`CollectionDeadlineExceeded` always becomes a retained terminal leg row with
-`status = deadline_exceeded`, `available = false`, and
+for that chain. Resolver and DEX jobs share the fair scheduler with CEX
+collection, but all active non-CEX work is capped at `max_workers - 1` while
+any CEX work remains. With one worker, every CEX leg becomes terminal before a
+resolver starts. Thus a slow resolver or pool call cannot occupy the slot
+reserved for same-venue CEX legs.
+
+Production collection requires Unix `fork` and fails closed when that process
+isolation is unavailable. Each resolver or collector runs in its own inherited
+child process and returns through a one-way pipe and standard `Future`.
+Shutdown sends TERM, joins, escalates to KILL when necessary, joins again, and
+closes every pipe. The parent main thread polls those pipes directly; the
+process executor creates no monitor threads. It also rejects a caller that is
+already multithreaded before source reads or raw creation, rather than risking
+an unsafe fork. Consequently, an uncooperative transport is killable and
+repeated deadline calls leave neither child processes nor route-cohort threads
+behind. In-process thread executors are an explicit test-only injection for
+shared fake clocks and state.
+
+Every pool collector on a resolved chain receives exactly its common positive,
+non-boolean integer `fixed_block_number` and non-empty canonical UTC
+`fixed_block_timestamp`. Malformed lineage and a timestamp later than the
+collection deadline reject before pool calls; lineage later than the actual
+`collection_completed_at` is rejected again before raw promotion. Valid fixed
+block lineage is retained even when its pool leg becomes terminal. A resolver
+or leg `CollectionDeadlineExceeded` always becomes a retained terminal leg row
+with `status = deadline_exceeded`, `available = false`, and
 `reason_code = route_deadline_exceeded`; it is never mislabeled as a generic
 failure or omitted. Consequently, only routes containing that leg classify as
 deadline-exceeded.
@@ -119,8 +136,12 @@ The Task 4 command reads `<data-dir>/route_universe.json` and accepts
 `--max-workers`, `--cex-workers-per-venue`, and `--dex-workers-per-chain`.
 `--start` and `--end`, when supplied, must equal the corresponding values in
 the universe's `selection_window`; they are not informational arguments.
-Malformed or duplicate routes, invalid token filters, non-finite/non-positive
-deadlines, and invalid worker limits fail before collection. `--dry-run`
+Every route must supply the exact non-empty ID produced by
+`canonical_route_id`, and each selected leg's declared `market_type` must agree
+with its `market_id` prefix. These identity failures occur before generation
+reads or raw directory creation. Malformed or duplicate routes, invalid token
+filters, non-finite/non-positive deadlines, and invalid worker limits fail
+before collection. `--dry-run`
 performs the same read-only full-universe, authoritative-inventory, and stable
 `collection_input_generation` validation as live mode. It performs no network
 calls, creates no raw artifacts, and publishes nothing. `--publish` fails
@@ -139,31 +160,46 @@ timestamp, never a target-time pseudo-argument.
 Each invocation owns one collision-safe raw evidence directory below
 `<raw-root>/<raw_evidence_run_id>/`. Caller-supplied snapshot IDs are restricted
 to a bounded path-safe identifier and an existing run directory is never
-reused. Default IDs combine canonical UTC wall time with a UUID, so two calls
-in the same clock tick remain distinct. Market identities are represented only
-by SHA-256 directory names, never interpolated into paths. Workers write under
-`staging/`; only a completed, identity-valid, within-deadline observation is
-moved to `accepted/`, and only after the final input-generation check. A worker
-that returns or writes after the deadline remains in staging and cannot mutate
+reused. Direct API callers must supply `raw_root`; there is no repository-local
+fallback. Existing and broken symlink roots are rejected before source reads or
+artifact creation. Default IDs combine canonical UTC wall time with a UUID, so
+two calls in the same clock tick remain distinct. Market identities are
+represented only by SHA-256 directory names, never interpolated into paths.
+Workers write under
+`staging/`. An `observed` or `partial` row, and any row claiming
+`raw_response_sha256`, requires a regular `response.json`. The parent hashes
+the exact file; a claimed hash must match, while an omitted hash is filled with
+the computed value and bound into the cohort. Missing or mismatched evidence
+becomes a terminal leg and never moves to `accepted/`. Only a completed,
+identity-valid, within-deadline, evidence-valid observation moves to
+`accepted/`, and only after the final input-generation check. A worker that
+returns or writes after the deadline remains in staging and cannot mutate
 accepted evidence.
 
 The returned `route_cohort_collection/v1` declares a deterministic
 `route_cohort_id`, `raw_evidence_run_id`, canonical `target_observed_at`,
 actual wall-clock `collection_started_at`, active monotonic-deadline-derived
-`collection_deadline_at`, `skew_sla_seconds = "60"`,
+`collection_deadline_at`, truthful canonical `collection_completed_at`,
+`skew_sla_seconds = "60"`,
 `route_age_sla_seconds = "120"`, candidate generation, selected-window/notional
 lineage, complete collection-input generation/source state, normalized legs,
-and route timing rows. Target timestamps with a numeric offset are canonicalized
-to UTC. Separate invocations may intentionally have different start/deadline
-times and run IDs; with those invocation inputs held fixed, completion order
-does not affect normalized rows or fingerprints. A fixed DEX observation must
-echo its resolved block number and timestamp; a mismatch becomes the retained
+and route timing rows. Every route timing candidate and returned route row uses
+that completion instant as `validated_at`; a leg state timestamp after it
+classifies as `invalid_state_timestamp`. Target timestamps with a numeric
+offset are canonicalized to UTC. Separate invocations may intentionally have
+different start/deadline times and run IDs; with those invocation inputs held
+fixed, completion order does not affect normalized rows or fingerprints. A
+fixed DEX observation must echo its resolved block number and timestamp; a mismatch becomes the retained
 terminal reason `fixed_block_lineage_mismatch`. Leg projections exclude raw
 paths, exception traces, and credential-like fields before the future bundle
 boundary; endpoints retain only scheme, host, and path. The cohort ID and
 fingerprint hash all of those declared logical fields, including the canonical
 collection timestamps and SLA/selection lineage, so a later bundle can detect
 metadata conflicts without consulting mutable sources.
+
+Live `main()` returns exactly this fingerprint-bound mapping. It does not append
+`dry_run`, absolute universe paths, or any other post-fingerprint field. Dry-run
+is a separate validation result and retains `dry_run = true`.
 
 ## Exact timestamp arithmetic
 
@@ -203,8 +239,9 @@ different identifier. Identical buy and sell canonical market IDs are rejected
 with `ValueError("route candidate legs must be directional")` by
 `canonical_route_id`, `classify_route_timing`, and
 `validate_route_cohort_rows`; no public entry point may emit a same-market
-route. A candidate may carry `route_id` only when it equals this canonical
-value.
+route. A collected route candidate must carry `route_id`, and it must equal
+this canonical value exactly; missing and empty IDs are not inferred at the
+collection boundary.
 
 Each route leg must provide a non-empty `leg_id` and `market_id`. A leg is
 explicitly unavailable only when `available` is `false` or its `status` (or

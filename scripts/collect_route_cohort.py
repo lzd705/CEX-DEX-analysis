@@ -8,10 +8,13 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
+import multiprocessing
+from multiprocessing.connection import wait as wait_for_connections
+import os
 from pathlib import Path
 from queue import Queue
 import re
-from threading import Lock, Thread
+from threading import Lock, Thread, current_thread, enumerate as enumerate_threads
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 import uuid
@@ -104,6 +107,198 @@ class _DaemonFutureExecutor:
                 thread.join()
 
 
+def _run_process_call(
+    connection: Any,
+    function: Callable[..., Any],
+    args: Tuple[Any, ...],
+) -> None:
+    """Run one inherited callable and return only a value or a generic failure."""
+    try:
+        try:
+            payload = ("result", function(*args))
+        except BaseException:
+            payload = ("error", "route collection worker failed")
+        try:
+            connection.send(payload)
+        except BaseException:
+            try:
+                connection.send(("error", "route collection worker failed"))
+            except BaseException:
+                pass
+    finally:
+        connection.close()
+
+
+def _require_single_threaded_fork() -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        raise RuntimeError("fork process isolation is unavailable")
+    caller = current_thread()
+    if any(
+        thread is not caller and thread.is_alive()
+        for thread in enumerate_threads()
+    ):
+        raise RuntimeError(
+            "fork process isolation requires a single-threaded caller"
+        )
+
+
+class _ForkProcessExecutor:
+    """Killable Unix-process executor for deadline-bound collector calls.
+
+    The collector functions are intentionally inherited through ``fork``.  This
+    keeps the production boundary killable without imposing a picklability
+    contract on the existing collector closures.  Tests that need shared
+    in-process state inject ``ThreadPoolExecutor`` explicitly.
+    """
+
+    def __init__(self, max_workers: int) -> None:
+        _require_single_threaded_fork()
+        if type(max_workers) is not int or max_workers < 1:
+            raise ValueError("max_workers must be positive")
+        self._context = multiprocessing.get_context("fork")
+        self._max_workers = max_workers
+        self._closed = False
+        self._lock = Lock()
+        self._records: Dict[Future, Dict[str, Any]] = {}
+        self._sequence = 0
+
+    def submit(self, function: Callable[..., Any], *args: Any) -> Future:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("executor is shut down")
+            _require_single_threaded_fork()
+            live = sum(
+                1 for record in self._records.values()
+                if record["process"].is_alive()
+            )
+            if live >= self._max_workers:
+                raise RuntimeError("executor worker limit exceeded")
+            future = Future()
+            if not future.set_running_or_notify_cancel():  # pragma: no cover
+                return future
+            receive, send = self._context.Pipe(duplex=False)
+            process = self._context.Process(
+                target=_run_process_call,
+                args=(send, function, tuple(args)),
+                name="route-cohort-process-{}".format(self._sequence + 1),
+            )
+            process.daemon = True
+            try:
+                process.start()
+            except BaseException:
+                receive.close()
+                send.close()
+                future.set_exception(
+                    RuntimeError("route collection process could not start")
+                )
+                return future
+            send.close()
+            self._sequence += 1
+            record: Dict[str, Any] = {
+                "process": process,
+                "connection": receive,
+            }
+            self._records[future] = record
+            return future
+
+    @staticmethod
+    def _reap_process(process: Any) -> None:
+        process.join(timeout=0.1)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=0.25)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=0.25)
+
+    def _finish(self, future: Future, record: Mapping[str, Any]) -> None:
+        process = record["process"]
+        connection = record["connection"]
+        try:
+            try:
+                kind, value = connection.recv()
+            except (EOFError, OSError, ValueError):
+                kind, value = "error", "route collection worker terminated"
+            self._reap_process(process)
+            if future.done():
+                return
+            if kind == "result":
+                future.set_result(value)
+            else:
+                future.set_exception(RuntimeError(str(value)))
+        finally:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def wait_for_any(
+        self,
+        futures: Iterable[Future],
+        timeout: Optional[float],
+    ) -> Set[Future]:
+        """Poll result pipes in the calling thread and complete ready futures."""
+        targets = list(futures)
+        done = {future for future in targets if future.done()}
+        if done:
+            return done
+        with self._lock:
+            by_connection = {
+                record["connection"]: (future, record)
+                for future, record in self._records.items()
+                if future in targets and not future.done()
+            }
+        if not by_connection:
+            return set()
+        ready = wait_for_connections(list(by_connection), timeout=timeout)
+        for connection in ready:
+            future, record = by_connection[connection]
+            self._finish(future, record)
+            done.add(future)
+        return done
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Terminate, reap, and close every child even when ``wait`` is false."""
+        del wait  # cleanup is mandatory for the production isolation boundary
+        with self._lock:
+            self._closed = True
+            records = list(self._records.values())
+        for record in records:
+            process = record["process"]
+            if process.is_alive():
+                process.terminate()
+        for record in records:
+            record["process"].join(timeout=0.25)
+        for record in records:
+            process = record["process"]
+            if process.is_alive():
+                process.kill()
+        for record in records:
+            record["process"].join(timeout=0.25)
+        for record in records:
+            try:
+                record["connection"].close()
+            except OSError:
+                pass
+        with self._lock:
+            pending_futures = [
+                future for future in self._records if not future.done()
+            ]
+        for future in pending_futures:
+            future.set_exception(
+                RuntimeError("route collection worker terminated")
+            )
+        survivors = [
+            record["process"].pid
+            for record in records
+            if record["process"].is_alive()
+        ]
+        if survivors:
+            raise RuntimeError("route collection process cleanup failed")
+        with self._lock:
+            self._records.clear()
+
+
 def collect_unique_route_legs(
     routes: Iterable[Mapping[str, Any]],
 ) -> List[str]:
@@ -133,8 +328,8 @@ def _validated_routes(
             route_id = canonical_route_id(route)
         except ValueError as error:
             raise ValueError("route candidate is invalid") from error
-        if route.get("route_id") not in (None, "", route_id):
-            raise ValueError("route candidate is invalid")
+        if route.get("route_id") != route_id:
+            raise ValueError("route_id must be canonical")
         if route_id in route_ids:
             raise ValueError("duplicate route candidate")
         route_ids.add(route_id)
@@ -148,15 +343,16 @@ def materialize_route_leg_rows(
     *,
     deadline_exceeded: Optional[Set[str]] = None,
     terminal_reasons: Optional[Mapping[str, str]] = None,
-) -> List[dict[str, Any]]:
+    fixed_blocks_by_market: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """Normalize collected facts, retaining every requested terminal leg."""
     expired = deadline_exceeded or set()
     reasons = terminal_reasons or {}
+    lineage = fixed_blocks_by_market or {}
     rows = []
     for market_id in sorted(set(market_ids)):
         if market_id in expired or market_id in reasons:
-            rows.append(
-                {
+            row = {
                     "leg_id": market_id,
                     "market_id": market_id,
                     "status": (
@@ -170,11 +366,15 @@ def materialize_route_leg_rows(
                         market_id, "route_deadline_exceeded"
                     ),
                 }
-            )
+            if market_id in lineage:
+                row.update(lineage[market_id])
+            rows.append(row)
             continue
         row = dict(collected_rows.get(market_id, {}))
         row["leg_id"] = market_id
         row["market_id"] = market_id
+        if market_id in lineage:
+            row.update(lineage[market_id])
         rows.append(row)
     return rows
 
@@ -189,13 +389,17 @@ def _canonical_fingerprint(value: Mapping[str, Any]) -> str:
 def _market_type(leg: Mapping[str, Any]) -> str:
     declared = leg.get("market_type")
     market_id = leg.get("market_id")
-    if declared in ("cex", "dex"):
-        return str(declared)
     if isinstance(market_id, str) and market_id.startswith("cex:"):
-        return "cex"
-    if isinstance(market_id, str) and market_id.startswith("dex:"):
-        return "dex"
-    raise ValueError("route leg market type is invalid")
+        inferred = "cex"
+    elif isinstance(market_id, str) and market_id.startswith("dex:"):
+        inferred = "dex"
+    else:
+        raise ValueError("route leg market type is invalid")
+    if declared not in (None, "", "cex", "dex"):
+        raise ValueError("route leg market type is invalid")
+    if declared not in (None, "") and declared != inferred:
+        raise ValueError("route leg market type does not match market_id")
+    return inferred
 
 
 def _utc_now() -> datetime:
@@ -215,6 +419,12 @@ def _canonical_utc(value: Any, *, field: str) -> str:
     if parsed.tzinfo is None:
         raise ValueError("{} is invalid".format(field))
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _utc_datetime(value: Any, *, field: str) -> datetime:
+    return datetime.fromisoformat(
+        _canonical_utc(value, field=field).replace("Z", "+00:00")
+    )
 
 
 def _source_key(leg: Mapping[str, Any]) -> Tuple[str, str]:
@@ -329,6 +539,8 @@ def _run_id(value: Optional[str], wall_time: datetime) -> str:
 
 
 def _raw_run_directory(raw_root: Path, run_id: str) -> Tuple[Path, Path]:
+    if os.path.lexists(str(raw_root)) and raw_root.is_symlink():
+        raise ValueError("raw_root must not be a symlink")
     raw_root.mkdir(parents=True, exist_ok=True)
     run_dir = raw_root / run_id
     run_dir.mkdir(exist_ok=False)
@@ -337,6 +549,50 @@ def _raw_run_directory(raw_root: Path, run_id: str) -> Tuple[Path, Path]:
     staging.mkdir()
     accepted.mkdir()
     return staging, accepted
+
+
+def _raw_evidence_failure(
+    row: Mapping[str, Any], stage_dir: Path
+) -> Optional[str]:
+    claimed = row.get("raw_response_sha256")
+    requires_raw = str(row.get("status") or "") in {"observed", "partial"}
+    requires_raw = requires_raw or claimed not in (None, "")
+    if not requires_raw:
+        return None
+    raw_path = stage_dir / "response.json"
+    if raw_path.is_symlink() or not raw_path.is_file():
+        return "raw_evidence_missing"
+    actual = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    if claimed not in (None, "") and (
+        not isinstance(claimed, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", claimed)
+        or claimed != actual
+    ):
+        return "raw_evidence_hash_mismatch"
+    return None
+
+
+def _validated_fixed_block(
+    resolved: Any,
+    *,
+    latest_allowed: datetime,
+) -> Dict[str, Any]:
+    if not isinstance(resolved, Mapping):
+        raise ValueError("invalid fixed block")
+    number = resolved.get("block_number")
+    timestamp = resolved.get("block_timestamp")
+    if type(number) is not int or number <= 0:
+        raise ValueError("invalid fixed block")
+    if not isinstance(timestamp, str) or not timestamp:
+        raise ValueError("invalid fixed block")
+    normalized = _canonical_utc(timestamp, field="fixed block timestamp")
+    parsed = _utc_datetime(normalized, field="fixed block timestamp")
+    if parsed > latest_allowed.astimezone(timezone.utc):
+        raise ValueError("invalid fixed block")
+    return {
+        "block_number": number,
+        "block_timestamp": normalized,
+    }
 
 
 def collect_route_cohort(
@@ -355,7 +611,7 @@ def collect_route_cohort(
     expected_source_generation: Optional[str] = None,
     raw_root: Optional[Path] = None,
     snapshot_id: Optional[str] = None,
-    executor_factory: Callable[..., Any] = _DaemonFutureExecutor,
+    executor_factory: Callable[..., Any] = _ForkProcessExecutor,
     wall_clock: Callable[[], datetime] = _utc_now,
 ) -> Dict[str, Any]:
     """Collect one fair, bounded cohort; late or incomplete legs stay terminal."""
@@ -368,12 +624,6 @@ def collect_route_cohort(
             or not isinstance(routes, list)):
         raise ValueError("route universe is invalid")
     routes = _validated_routes(routes)
-    if source_generation_reader is None or not isinstance(expected_source_generation, str) or not expected_source_generation:
-        raise ValueError(
-            "collection input generation reader is required, and expected value is required"
-        )
-    if source_generation_reader() != expected_source_generation:
-        raise ValueError("collection input generation changed")
     try:
         duration = float(deadline_seconds)
     except (TypeError, ValueError) as error:
@@ -397,21 +647,43 @@ def collect_route_cohort(
     has_dex = any(_market_type(legs_by_market[item]) == "dex" for item in market_ids)
     if has_dex and dex_block_resolver is None:
         raise ValueError("DEX fixed block resolver is required")
+    if raw_root is None:
+        raise ValueError("raw_root is required")
+    root = Path(raw_root)
+    if os.path.lexists(str(root)) and root.is_symlink():
+        raise ValueError("raw_root must not be a symlink")
+    if root.exists() and not root.is_dir():
+        raise ValueError("raw_root must be a directory")
+    if executor_factory is _ForkProcessExecutor:
+        _require_single_threaded_fork()
+    if source_generation_reader is None or not isinstance(
+        expected_source_generation, str
+    ) or not expected_source_generation:
+        raise ValueError(
+            "collection input generation reader is required, and expected value is required"
+        )
+    if source_generation_reader() != expected_source_generation:
+        raise ValueError("collection input generation changed")
 
     wall_start = wall_clock()
     collection_started_at = _canonical_utc(wall_start, field="collection_started_at")
+    wall_start_utc = _utc_datetime(
+        collection_started_at, field="collection_started_at"
+    )
     target = _canonical_utc(
-        target_observed_at if target_observed_at is not None else wall_start,
+        target_observed_at if target_observed_at is not None else wall_start_utc,
         field="target_observed_at",
     )
     active_deadline = deadline or CollectionDeadline.for_duration(duration)
     remaining_at_start = active_deadline.remaining_seconds()
     collection_deadline_at = _canonical_utc(
-        wall_start + timedelta(seconds=remaining_at_start),
+        wall_start_utc + timedelta(seconds=remaining_at_start),
         field="collection_deadline_at",
     )
-    root = raw_root or Path("data/raw/route-cohort")
-    run_id = _run_id(snapshot_id, wall_start)
+    wall_deadline_utc = _utc_datetime(
+        collection_deadline_at, field="collection_deadline_at"
+    )
+    run_id = _run_id(snapshot_id, wall_start_utc)
     staging_root, accepted_root = _raw_run_directory(root, run_id)
     terminal_reasons: Dict[str, str] = {}
     expired: Set[str] = set()
@@ -499,12 +771,12 @@ def collect_route_cohort(
         try:
             active_deadline.require_remaining()
             resolved = dex_block_resolver(chain, deadline=active_deadline)
-            if not isinstance(resolved, Mapping) or not isinstance(
-                resolved.get("block_number"), int
-            ):
-                raise ValueError("invalid fixed block")
+            normalized = _validated_fixed_block(
+                resolved,
+                latest_allowed=wall_deadline_utc,
+            )
             active_deadline.require_remaining()
-            return chain, dict(resolved), None
+            return chain, normalized, None
         except CollectionDeadlineExceeded:
             return chain, None, "route_deadline_exceeded"
         except Exception:
@@ -519,6 +791,23 @@ def collect_route_cohort(
             return dex_workers_per_chain
         return 1
 
+    def cex_work_outstanding() -> bool:
+        return any(
+            key[0] == "cex" and (items or active_by_source.get(key, 0))
+            for key, items in pending_by_source.items()
+        )
+
+    def non_cex_capacity_available() -> bool:
+        active_non_cex = sum(
+            count
+            for key, count in active_by_source.items()
+            if key[0] != "cex"
+        )
+        capacity = max_workers
+        if cex_work_outstanding():
+            capacity -= 1
+        return active_non_cex < capacity
+
     def submit_fairly() -> None:
         nonlocal source_index
         progressed = True
@@ -528,7 +817,11 @@ def collect_route_cohort(
                 key = source_order[source_index % len(source_order)]
                 source_index += 1
                 limit = source_limit(key)
-                if pending_by_source[key] and active_by_source.get(key, 0) < limit:
+                if (
+                    pending_by_source[key]
+                    and active_by_source.get(key, 0) < limit
+                    and (key[0] == "cex" or non_cex_capacity_available())
+                ):
                     item = pending_by_source[key].pop(0)
                     future = executor.submit(
                         resolve_one if key[0] == "resolver" else collect_one,
@@ -544,7 +837,15 @@ def collect_route_cohort(
             remaining = active_deadline.remaining_seconds()
             if remaining <= 0:
                 break
-            done, _not_done = wait(list(futures), timeout=remaining, return_when=FIRST_COMPLETED)
+            process_wait = getattr(executor, "wait_for_any", None)
+            if callable(process_wait):
+                done = process_wait(list(futures), remaining)
+            else:
+                done, _not_done = wait(
+                    list(futures),
+                    timeout=remaining,
+                    return_when=FIRST_COMPLETED,
+                )
             if not done:
                 break
             for future in done:
@@ -599,13 +900,64 @@ def collect_route_cohort(
 
     if source_generation_reader() != expected_source_generation:
         raise ValueError("collection input generation changed")
+    collection_completed_at = _canonical_utc(
+        wall_clock(), field="collection_completed_at"
+    )
+    completed_wall_utc = _utc_datetime(
+        collection_completed_at, field="collection_completed_at"
+    )
+    if completed_wall_utc < wall_start_utc:
+        raise ValueError("collection_completed_at is before collection_started_at")
+    for chain, block in list(fixed_blocks.items()):
+        block_time = _utc_datetime(
+            block["block_timestamp"], field="fixed block timestamp"
+        )
+        if block_time > completed_wall_utc:
+            _terminal_for_chain(
+                legs_by_market,
+                market_ids,
+                chain,
+                "fixed_block_unavailable",
+                terminal_reasons,
+            )
+            for market_id in dex_by_chain[chain]:
+                completed.pop(market_id, None)
+                completed_stage_dirs.pop(market_id, None)
+            fixed_blocks.pop(chain, None)
     for market_id in sorted(completed_stage_dirs):
         stage_dir = completed_stage_dirs[market_id]
+        row = completed[market_id]
+        raw_failure = _raw_evidence_failure(row, stage_dir)
+        if raw_failure is not None:
+            terminal_reasons[market_id] = raw_failure
+            completed.pop(market_id, None)
+            continue
+        raw_path = stage_dir / "response.json"
+        if raw_path.is_file() and row.get("raw_response_sha256") in (None, ""):
+            completed[market_id] = {
+                **dict(row),
+                "raw_response_sha256": hashlib.sha256(
+                    raw_path.read_bytes()
+                ).hexdigest(),
+            }
         if stage_dir.exists():
             stage_dir.replace(accepted_root / stage_dir.name)
+    fixed_blocks_by_market = {}
+    for market_id in market_ids:
+        leg = legs_by_market[market_id]
+        if _market_type(leg) != "dex":
+            continue
+        chain = _source_key(leg)[1]
+        if chain in fixed_blocks:
+            block = fixed_blocks[chain]
+            fixed_blocks_by_market[market_id] = {
+                "fixed_block_number": str(block["block_number"]),
+                "fixed_block_timestamp": str(block["block_timestamp"]),
+            }
     legs = materialize_route_leg_rows(
         market_ids, completed, deadline_exceeded=expired,
         terminal_reasons=terminal_reasons,
+        fixed_blocks_by_market=fixed_blocks_by_market,
     )
     legs = [
         _safe_leg_projection({
@@ -621,7 +973,10 @@ def collect_route_cohort(
     rows_by_market = {row["market_id"]: row for row in legs}
     route_rows = []
     for route in routes:
-        candidate = dict(route)
+        candidate = {
+            **dict(route),
+            "validated_at": collection_completed_at,
+        }
         buy_market_id = candidate.get("buy_market_id")
         sell_market_id = candidate.get("sell_market_id")
         if buy_market_id not in rows_by_market or sell_market_id not in rows_by_market:
@@ -645,6 +1000,7 @@ def collect_route_cohort(
         "raw_evidence_run_id": run_id,
         "target_observed_at": target,
         "collection_started_at": collection_started_at,
+        "collection_completed_at": collection_completed_at,
         "collection_deadline_at": collection_deadline_at,
         "skew_sla_seconds": "60",
         "route_age_sla_seconds": "120",
@@ -874,13 +1230,13 @@ def main(
     cex_collector: Callable[..., Any] = collect_cex_market_observation,
     dex_collector: Callable[..., Any] = collect_dex_pool_observation,
     dex_block_resolver: Callable[..., Mapping[str, Any]] = _default_dex_block_resolver,
+    executor_factory: Callable[..., Any] = _ForkProcessExecutor,
 ) -> Dict[str, Any]:
     """Run live bounded collection; Task 5 remains the only publisher."""
     args = parse_args(argv)
     tokens = _validate_cli_values(args)
     if args.publish:
         raise RuntimeError("--publish is unavailable until Task 5 immutable publication")
-    universe_path = args.data_dir / "route_universe.json"
     resolved, expected_generation = _load_cli_collection_inputs(
         args.data_dir,
         tokens,
@@ -922,8 +1278,9 @@ def main(
         max_workers=args.max_workers,
         cex_workers_per_venue=args.cex_workers_per_venue,
         dex_workers_per_chain=args.dex_workers_per_chain,
+        executor_factory=executor_factory,
     )
-    return {**result, "dry_run": False, "universe_path": str(universe_path)}
+    return result
 
 
 if __name__ == "__main__":  # pragma: no cover - command line wrapper
