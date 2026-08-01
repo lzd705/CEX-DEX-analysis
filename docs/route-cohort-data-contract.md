@@ -41,8 +41,12 @@ route:{token_symbol}:{buy_market_id}->{sell_market_id}:{route_mode}
 ```
 
 The arrow is directional: reversing the buy and sell market IDs produces a
-different identifier. A candidate may carry `route_id` only when it equals
-this canonical value.
+different identifier. Identical buy and sell canonical market IDs are rejected
+with `ValueError("route candidate legs must be directional")` by
+`canonical_route_id`, `classify_route_timing`, and
+`validate_route_cohort_rows`; no public entry point may emit a same-market
+route. A candidate may carry `route_id` only when it equals this canonical
+value.
 
 Each route leg must provide a non-empty `leg_id` and `market_id`. A leg is
 explicitly unavailable only when `available` is `false` or its `status` (or

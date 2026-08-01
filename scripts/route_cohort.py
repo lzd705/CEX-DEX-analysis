@@ -49,6 +49,8 @@ def canonical_route_id(candidate: Mapping[str, Any]) -> str:
         or route_mode != route_mode.strip()
     ):
         raise ValueError("route candidate identity is invalid")
+    if buy_market_id == sell_market_id:
+        raise ValueError("route candidate legs must be directional")
     return "route:{}:{}->{}:{}".format(
         token_symbol, buy_market_id, sell_market_id, route_mode
     )
@@ -102,8 +104,6 @@ def validate_route_cohort_rows(
         route_id = canonical_route_id(candidate)
         if candidate.get("route_id") not in (None, "", route_id):
             raise ValueError("route candidate ID is not canonical")
-        if candidate["buy_market_id"] == candidate["sell_market_id"]:
-            raise ValueError("route candidate legs must be directional")
         candidate_id = candidate.get("candidate_id")
         if candidate_id is None or candidate_id == "":
             candidate_id = route_id

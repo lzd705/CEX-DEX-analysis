@@ -268,6 +268,22 @@ class RouteCohortIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "route candidate ID is invalid"):
             validate_route_cohort_rows([route], [buy_leg, sell_leg])
 
+    def test_public_route_entry_points_reject_same_market_candidates(self):
+        route = candidate(sell_market_id="cex:alpha:UNI/USDT")
+        buy_leg = leg("buy-1", route["buy_market_id"], "2026-08-01T12:00:00Z")
+        sell_leg = leg(
+            "sell-1", route["sell_market_id"], "2026-08-01T12:00:01Z"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "route candidate legs must be directional"
+        ):
+            canonical_route_id(route)
+        with self.assertRaisesRegex(
+            ValueError, "route candidate legs must be directional"
+        ):
+            classify_route_timing(route, buy_leg, sell_leg)
+
 
 if __name__ == "__main__":
     unittest.main()
