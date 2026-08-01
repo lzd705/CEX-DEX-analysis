@@ -242,6 +242,64 @@ class FixedBlockV2Rpc(FakeV2Rpc):
         return super().eth_calls(to, data_values, block_tag)
 
 
+class ActualV2Transport:
+    def __init__(self, *, after_batch=None):
+        self.calls = []
+        self.after_batch = after_batch
+
+    def __call__(
+        self,
+        _url,
+        payload,
+        *,
+        deadline=None,
+        timeout_seconds=None,
+        max_retries=None,
+    ):
+        self.calls.append(
+            {
+                "payload": payload,
+                "deadline": deadline,
+                "timeout_seconds": timeout_seconds,
+                "max_retries": max_retries,
+            }
+        )
+        if isinstance(payload, list):
+            response = [self._response(item) for item in payload]
+            if self.after_batch is not None:
+                self.after_batch()
+        else:
+            response = self._response(payload)
+        return response, json.dumps(response, sort_keys=True).encode("utf-8")
+
+    @staticmethod
+    def _response(payload):
+        target = "0x1111111111111111111111111111111111111111"
+        quote = "0x2222222222222222222222222222222222222222"
+        if payload["method"] != "eth_call":
+            result = "0x1"
+        else:
+            call = payload["params"][0]
+            selector = call["data"]
+            if selector == SELECTOR_TOKEN0:
+                result = address_result(target)
+            elif selector == SELECTOR_TOKEN1:
+                result = address_result(quote)
+            elif selector == SELECTOR_GET_RESERVES:
+                result = uint_result(100 * 10**18, 10_000 * 10**6, 0)
+            elif selector == SELECTOR_DECIMALS:
+                result = uint_result(18 if call["to"] == target else 6)
+            elif selector == SELECTOR_SYMBOL:
+                result = string_result("AAVE" if call["to"] == target else "USDC")
+            else:
+                raise AssertionError(selector)
+        return {
+            "jsonrpc": "2.0",
+            "id": payload["id"],
+            "result": result,
+        }
+
+
 class DexDepthMathTest(unittest.TestCase):
     def test_filtered_collection_cannot_replace_published_inventory(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
@@ -2153,7 +2211,14 @@ class DexDepthCollectionTest(unittest.TestCase):
         clock = Clock()
         transport_calls = []
 
-        def transport(_url, payload):
+        def transport(
+            _url,
+            payload,
+            *,
+            deadline=None,
+            timeout_seconds=None,
+            max_retries=None,
+        ):
             transport_calls.append(payload)
             if isinstance(payload, list):
                 clock.now = 2.0
@@ -2191,6 +2256,126 @@ class DexDepthCollectionTest(unittest.TestCase):
 
         self.assertEqual(len(transport_calls), 1)
         self.assertIsInstance(transport_calls[0], list)
+
+    def test_supplied_production_client_propagates_effective_route_deadline(self):
+        from scripts.collection_deadline import CollectionDeadline
+        from scripts.fetch_dex_depth import RpcClient, collect_dex_pool_observation
+
+        transport = ActualV2Transport()
+        client = RpcClient(
+            "eth",
+            "https://rpc.example.test",
+            request=transport,
+            timeout_seconds=9,
+            max_retries=2,
+        )
+        route_deadline = CollectionDeadline.for_duration(30)
+
+        row, execution_rows = collect_dex_pool_observation(
+            self.pool,
+            snapshot_id="propagated-route-deadline",
+            raw_path=self.root / "propagated-route-deadline.json",
+            client=client,
+            fixed_block_number=123,
+            fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+            deadline=route_deadline,
+        )
+
+        self.assertEqual(row["status"], "observed")
+        self.assertEqual(len(execution_rows), 10)
+        self.assertTrue(transport.calls)
+        self.assertTrue(
+            all(call["deadline"] is route_deadline for call in transport.calls)
+        )
+        self.assertEqual(
+            {call["timeout_seconds"] for call in transport.calls},
+            {9},
+        )
+        self.assertEqual(
+            {call["max_retries"] for call in transport.calls},
+            {2},
+        )
+
+    def test_success_restores_unbound_client_and_later_call_ignores_route_deadline(self):
+        from scripts.collection_deadline import CollectionDeadline
+        from scripts.fetch_dex_depth import RpcClient, collect_dex_pool_observation
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = Clock()
+        transport = ActualV2Transport()
+        client = RpcClient(
+            "eth",
+            "https://rpc.example.test",
+            request=transport,
+        )
+        route_deadline = CollectionDeadline.for_duration(
+            1,
+            clock=clock.monotonic,
+            sleeper=lambda seconds: None,
+        )
+        row, _execution_rows = collect_dex_pool_observation(
+            self.pool,
+            snapshot_id="scoped-route-deadline",
+            raw_path=self.root / "scoped-route-deadline.json",
+            client=client,
+            fixed_block_number=123,
+            fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+            deadline=route_deadline,
+        )
+
+        self.assertEqual(row["status"], "observed")
+        self.assertIsNone(client.deadline)
+        self.assertIsNone(client._call_deadline)
+        clock.now = 2.0
+        self.assertEqual(client.method("ordinary_later_call", []), "0x1")
+        self.assertIsNone(transport.calls[-1]["deadline"])
+
+    def test_exception_restores_supplied_clients_preexisting_deadline(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+        from scripts.fetch_dex_depth import RpcClient, collect_dex_pool_observation
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = Clock()
+        preexisting_deadline = CollectionDeadline.for_duration(300)
+        route_deadline = CollectionDeadline.for_duration(
+            1,
+            clock=clock.monotonic,
+            sleeper=lambda seconds: None,
+        )
+        transport = ActualV2Transport(after_batch=lambda: setattr(clock, "now", 2.0))
+        client = RpcClient(
+            "eth",
+            "https://rpc.example.test",
+            request=transport,
+            deadline=preexisting_deadline,
+        )
+
+        with self.assertRaises(CollectionDeadlineExceeded):
+            collect_dex_pool_observation(
+                self.pool,
+                snapshot_id="restore-after-exception",
+                raw_path=self.root / "restore-after-exception.json",
+                client=client,
+                fixed_block_number=123,
+                fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+                deadline=route_deadline,
+            )
+
+        self.assertIs(client.deadline, preexisting_deadline)
+        self.assertIs(client._call_deadline, preexisting_deadline)
 
 
 if __name__ == "__main__":

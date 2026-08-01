@@ -536,10 +536,11 @@ class RpcClient:
         self._next_id = 1
 
     def _send(self, payload: Any) -> Any:
-        if self._call_deadline is not None:
-            self._call_deadline.require_remaining()
+        effective_deadline = self._call_deadline or self.deadline
+        if effective_deadline is not None:
+            effective_deadline.require_remaining()
         if (
-            self.deadline is None
+            effective_deadline is None
             and self.timeout_seconds == 30
             and self.max_retries == MAX_RETRIES
         ):
@@ -548,7 +549,7 @@ class RpcClient:
             response, raw = self.request(
                 self.url,
                 payload,
-                deadline=self.deadline,
+                deadline=effective_deadline,
                 timeout_seconds=self.timeout_seconds,
                 max_retries=self.max_retries,
             )
@@ -633,22 +634,28 @@ class _DeadlineBoundRpcClient:
     def __init__(self, client: RpcClient, deadline: CollectionDeadline) -> None:
         self._client = client
         self._deadline = deadline
-        if isinstance(client, RpcClient):
-            client._call_deadline = deadline
         self.records = client.records
         self.endpoint = client.endpoint
 
-    def block_number(self) -> int:
+    def _call(self, operation: Callable[..., Any], *args: Any) -> Any:
         self._deadline.require_remaining()
-        return self._client.block_number()
+        if not isinstance(self._client, RpcClient):
+            return operation(*args)
+        previous_deadline = self._client._call_deadline
+        self._client._call_deadline = self._deadline
+        try:
+            return operation(*args)
+        finally:
+            self._client._call_deadline = previous_deadline
+
+    def block_number(self) -> int:
+        return self._call(self._client.block_number)
 
     def block(self, block_tag: str) -> dict[str, Any]:
-        self._deadline.require_remaining()
-        return self._client.block(block_tag)
+        return self._call(self._client.block, block_tag)
 
     def eth_calls(self, to: str, data_values: list[str], block_tag: str) -> list[str]:
-        self._deadline.require_remaining()
-        return self._client.eth_calls(to, data_values, block_tag)
+        return self._call(self._client.eth_calls, to, data_values, block_tag)
 
 
 def words(hex_data: str) -> list[str]:
