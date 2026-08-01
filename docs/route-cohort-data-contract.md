@@ -154,8 +154,9 @@ filters, non-finite/non-positive deadlines, and invalid worker limits fail
 before collection. `--dry-run`
 performs the same read-only full-universe, authoritative-inventory, and stable
 `collection_input_generation` validation as live mode. It performs no network
-calls, creates no raw artifacts, and publishes nothing. `--publish` fails
-explicitly until Task 5 owns immutable bundle publication.
+calls, creates no raw artifacts, and publishes nothing. The Task 4 CLI still
+fails explicitly on `--publish`; Task 5 exposes the separate immutable-core
+publisher, while later orchestration owns wiring the two boundaries together.
 
 Live CLI collection resolves every selected canonical CEX ID against the
 authoritative CEX catalog and every selected canonical DEX ID against the TVL
@@ -252,6 +253,140 @@ metadata conflicts without consulting mutable sources.
 Live `main()` returns exactly this fingerprint-bound mapping. It does not append
 `dry_run`, absolute universe paths, or any other post-fingerprint field. Dry-run
 is a separate validation result and retains `dry_run = true`.
+
+## Immutable core publication
+
+`scripts.route_publication` owns the private, source-and-timing-only core
+publication boundary. For the default production root, one normalized cohort
+is published below its content-derived identity with exactly five files:
+
+```text
+data/local/routes/core/
+├── bundles/
+│   └── <route_cohort_id>/
+│       ├── manifest.json
+│       ├── route_candidates.csv
+│       ├── route_cohort.sqlite3
+│       ├── route_legs.csv
+│       └── route_timing.csv
+└── latest.json
+```
+
+No extra or missing bundle entry is valid. Candidate, leg, and timing rows are
+normalized into canonical identity order before encoding. CSV headers and
+projections are fixed, each `row_json` value is canonical JSON, and SQLite is
+built from the same normalized mapping with fixed tables, indexes, pragmas,
+and row order. Consequently, shuffling input rows cannot change any of the
+five output files, the manifest hash, or the pointer payload for the same
+logical cohort. An existing `<route_cohort_id>` directory is immutable and is
+never overwritten or reused.
+
+The manifest identifies `route_cohort_core/v1` and records the cohort ID and
+fingerprint, both source generations, raw-evidence run, collection timestamps,
+SLAs, selection window, requested notionals, exact candidate/leg/timing counts,
+timing-status counts, and observation bounds. For each of the four non-manifest
+artifacts it records schema, row count, a physical `sha256` of the exact bytes,
+and a `logical_sha256`. The three CSV logical hashes bind their schema and
+decoded logical rows; the SQLite logical hash binds its schema and the complete
+normalized cohort. The manifest does not self-hash. Instead, the private
+pointer carries the physical SHA-256 of the exact `manifest.json` bytes.
+
+Validation requires exact parity, not merely compatible counts. Every CSV
+projection must reconstruct its `row_json`; CSV candidate, leg, and timing
+inventories must equal their corresponding SQLite inventories; and all three
+must equal the respective `routes`, `legs`, and `route_rows` members of the
+cohort mapping stored in SQLite metadata. The validator
+recomputes every logical and physical hash and reconstructs the complete
+manifest for exact equality. SQLite must also retain its exact column types,
+primary keys, `NOT NULL` constraints, foreign key, indexes, `WITHOUT ROWID`
+tables, application ID, user version, page size, foreign-key check, and
+integrity result. A well-formed manifest cannot legitimize divergent CSV or
+SQLite content.
+
+Publication revalidates the Task 4 lineage rather than trusting a serialized
+row. Top-level collection timestamps, every non-empty leg state timestamp,
+route `validated_at`, and DEX fixed-block timestamps must be canonical UTC text
+ending in `Z`; equal instants written with numeric offsets are rejected at this
+boundary. Collection completion cannot precede collection start, the deadline
+cannot precede the start, and the target cannot exceed the deadline. Each leg
+state timestamp is no later than collection completion, and every route
+`validated_at` equals that completion timestamp before timing classification
+is recomputed. A DEX fixed-block number and timestamp are either both absent or
+both present; observed or partial DEX legs require them, CEX legs cannot carry
+them, and all DEX legs on one chain either have no lineage or share one exact
+positive block number and timestamp. The fixed-block timestamp cannot exceed
+the earlier of collection completion and deadline.
+
+Expected source failures remain data, not bundle corruption. A structurally
+valid cohort containing `unsupported`, `failed`, or `deadline_exceeded` legs
+and `unavailable` route timing may be published, including a retained
+`raw_evidence_path_unsafe` terminal reason. Status, availability, reason, raw
+hash, fixed-block lineage, and recomputed timing must still agree exactly.
+Thus a terminal route does not suppress healthy routes or invalidate the core,
+while malformed identity, unsafe evidence, enum drift, incomplete pairs, or
+inconsistent classification fails the whole publication.
+
+The filesystem transaction is descriptor-relative and fail closed. The core,
+bundle root, hidden staging directory, final directory, and files are bound to
+opened directory or file descriptors and stable device/inode identities.
+Caller-controlled symlink ancestry is rejected; final components are opened
+without following symlinks where supported. Files are created exclusively,
+written and fsynced through the staging directory descriptor. The complete
+stage is validated and fsynced, then moved on the same filesystem with an
+atomic no-replace directory rename (`RENAME_EXCL` on Darwin or
+`RENAME_NOREPLACE` on Linux). A platform without a supported no-replace
+primitive fails closed.
+
+After the no-replace rename, publication verifies the final directory entry,
+fsyncs the bundle root, and performs a complete validation of the final bundle
+before touching the pointer. Validation starts from the exact five-name
+inventory, opens every file once relative to the bundle descriptor, and keeps
+all five descriptors open. After all CSV, SQLite, manifest, lineage, and hash
+checks, it rechecks the exact inventory and every directory entry, rereads the
+same open descriptors, and requires unchanged bytes, hashes, inode identity,
+size, mode, ownership, link count, and stable timestamps/flags. It then checks
+the inventory and entries once more and verifies the final bundle directory
+identity. A directory or file swap at any point therefore prevents pointer
+publication.
+
+The only pointer this module creates or replaces is the private core pointer
+`data/local/routes/core/latest.json` (or `<core_root>/latest.json` for an
+explicit test root). Its exact schema binds `route_cohort_id`,
+`bundle_stage = route_cohort_core/v1`, and the physical manifest hash. Pointer
+writers take an advisory exclusive lock on the verified core directory
+descriptor, create and fsync a private temporary file, and call descriptor-
+relative `os.replace` for `latest.json`.
+
+POSIX rename durability defines the pointer failure contract. Before
+`os.replace` succeeds, a validation, temporary-write, lock-acquisition, or
+replace failure leaves an existing pointer A exactly intact. Once
+`os.replace` succeeds, B is visible and publication never compensates by
+restoring A or unlinking B. A subsequent directory-fsync or diagnostic failure
+raises `pointer state uncertain`; it leaves whichever valid B or concurrent C
+is currently present. After a successful directory fsync, publication rereads
+the pointer and returns only if both its exact bytes and stable file metadata
+still match the owned B snapshot. A concurrent C instead causes
+`pointer state uncertain` and remains untouched. A lock-release failure after
+an otherwise successful commit is reported explicitly; when another pointer
+error is already active, lock release cannot mask that primary error, and the
+outer descriptor close releases the advisory lock.
+
+`load_latest_route_cohort()` resolves only this private pointer. It validates
+the pointer schema and path-safe cohort ID, requires the exact manifest hash,
+performs the full bundle validation above, then verifies that the pointer,
+bundle root, and core root did not change during the read. It never constructs
+a stable-looking cohort from mutable CSV or SQLite files independently.
+
+The public complete pointer `data/local/routes/latest.json` and public
+`data/local/routes/bundles/` are not core artifacts. Task 5 neither creates nor
+replaces them, does not invent empty cost or opportunity files, and does not
+make the API consume a core-only cohort. Route-core participation in a later
+release remains optional by default: an absent private core pointer makes no
+route-cohort claim and does not alter public output. If a release opts into
+route-core validation, any present pointer must pass the complete contract; an
+explicit require-route-cohort mode must fail when it is absent or invalid.
+Normal terminal legs and unavailable route timing remain valid release input
+and are not, by themselves, a release failure.
 
 ## Exact timestamp arithmetic
 
