@@ -2769,6 +2769,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         }
         review = {
             "market_id": "cex:crypto_com:GMX/USDT",
+            "market_type": "cex",
             "token_symbol": "GMX",
             "exchange": "crypto_com",
             "instrument": "GMX/USDT",
@@ -2776,7 +2777,10 @@ class MarketMonitorServerTest(unittest.TestCase):
             "reason_code": "instrument_absent_from_current_catalog",
             "checked_at_utc": "2026-08-01T03:10:02+00:00",
             "source_url": "https://api.crypto.com/exchange/v1/public/get-instruments",
+            "http_status": 200,
             "response_sha256": "9" * 64,
+            "inventory_count": 1_000,
+            "instrument_present": False,
         }
 
         result = server.overlay_cex_instrument_lifecycle(
@@ -2835,6 +2839,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         market_id = f"cex:crypto_com:{token}/USDT"
         return {
             "market_id": market_id,
+            "market_type": "cex",
             "token_symbol": token,
             "exchange": "crypto_com",
             "instrument": f"{token}/USDT",
@@ -2844,7 +2849,10 @@ class MarketMonitorServerTest(unittest.TestCase):
             "source_url": (
                 "https://api.crypto.com/exchange/v1/public/get-instruments"
             ),
+            "http_status": 200,
             "response_sha256": "9" * 64,
+            "inventory_count": 919,
+            "instrument_present": False,
         }
 
     def lifecycle_evidence(self, reviews):
@@ -2852,7 +2860,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         return {
             "checked_at_utc": reviews[0]["checked_at_utc"],
             "response_sha256": reviews[0]["response_sha256"],
-            "inventory_count": 919,
+            "inventory_count": reviews[0]["inventory_count"],
             "configured_market_count": len(market_ids),
             "configured_market_ids_sha256": (
                 server.configured_market_ids_sha256(market_ids)
@@ -2929,6 +2937,66 @@ class MarketMonitorServerTest(unittest.TestCase):
             196,
         )
 
+    def test_selected_window_preserves_historical_lifecycle_lineage(self):
+        with self.cex_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            for token, close in (("GMX", "10"), ("RAY", "2")):
+                writer.writerow([
+                    "2026-01-01",
+                    token,
+                    "crypto_com",
+                    f"{token}/USDT",
+                    "",
+                    "",
+                    "",
+                    close,
+                    "",
+                    "100",
+                ])
+
+        freshness_bucket = int(
+            datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc).timestamp()
+            // server.API_FRESHNESS_CACHE_SECONDS
+        )
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, self.environment, clear=True):
+                payload = server.build_market_payload(
+                    "2026-01-02",
+                    "2026-01-02",
+                    _freshness_bucket=freshness_bucket,
+                )
+        finally:
+            server.clear_runtime_caches()
+
+        by_id = {
+            server.cex_market_id(market["venue"], market["instrument"]): market
+            for market in payload["cex_markets"]
+        }
+        for token in ("GMX", "RAY"):
+            with self.subTest(token=token):
+                market = by_id[f"cex:crypto_com:{token}/USDT"]
+                self.assertEqual(market["historical_observation_count"], 1)
+                self.assertEqual(
+                    market["historical_first_observed_date"],
+                    "2026-01-01",
+                )
+                self.assertEqual(
+                    market["historical_latest_observed_date"],
+                    "2026-01-01",
+                )
+                self.assertIsNone(market["observation_count"])
+                self.assertIsNone(market["first_observed_date"])
+                self.assertIsNone(market["latest_observed_date"])
+                self.assertEqual(market["price_points"], [])
+
+        for token in ("CAKE", "EIGEN", "ETHFI", "JTO", "MORPHO"):
+            with self.subTest(token=token):
+                market = by_id[f"cex:crypto_com:{token}/USDT"]
+                self.assertEqual(market["historical_observation_count"], 0)
+                self.assertIsNone(market["historical_first_observed_date"])
+                self.assertIsNone(market["historical_latest_observed_date"])
+
     def test_lifecycle_review_rejects_mismatched_identity(self):
         review = self.crypto_com_lifecycle_review("CAKE")
 
@@ -2939,6 +3007,49 @@ class MarketMonitorServerTest(unittest.TestCase):
                 lifecycle_evidence=self.lifecycle_evidence([review]),
                 now=datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc),
             )
+
+    def test_explicit_lifecycle_injection_rejects_malformed_review_contract(self):
+        original = self.crypto_com_lifecycle_review("CAKE")
+        original_key = original["market_id"]
+        base_evidence = self.lifecycle_evidence([original])
+        cases = []
+
+        review = {**original, "market_id": "cex:crypto_com:EIGEN/USDT"}
+        cases.append(("internal market ID", {original_key: review}, base_evidence))
+
+        review = {**original, "token_symbol": "EIGEN"}
+        cases.append(("token/base", {original_key: review}, base_evidence))
+
+        review = {**original, "current_listing_status": "currently_listed"}
+        cases.append(("outcome status", {original_key: review}, base_evidence))
+
+        review = {**original, "reason_code": "not_listed"}
+        cases.append(("outcome reason", {original_key: review}, base_evidence))
+
+        evidence = {**base_evidence, "checked_at_utc": "2026-08-01T07:23:00+00:00"}
+        cases.append(("root timestamp", {original_key: original}, evidence))
+
+        evidence = {**base_evidence, "response_sha256": "8" * 64}
+        cases.append(("root response hash", {original_key: original}, evidence))
+
+        evidence = {**base_evidence, "inventory_count": 920}
+        cases.append(("root inventory count", {original_key: original}, evidence))
+
+        evidence = {**base_evidence, "configured_market_count": 0}
+        cases.append(("configured count", {original_key: original}, evidence))
+
+        evidence = {**base_evidence, "configured_market_ids_sha256": "8" * 64}
+        cases.append(("configured hash", {original_key: original}, evidence))
+
+        for label, reviews, evidence in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    server.overlay_cex_instrument_lifecycle(
+                        {"metadata": {}, "cex_markets": [], "dex_pools": []},
+                        reviews,
+                        lifecycle_evidence=evidence,
+                        now=datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc),
+                    )
 
     def test_stale_lifecycle_review_materializes_needs_review_market(self):
         review = self.crypto_com_lifecycle_review("CAKE")
@@ -3075,6 +3186,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         }
         review = {
             "market_id": "cex:crypto_com:GMX/USDT",
+            "market_type": "cex",
             "token_symbol": "GMX",
             "exchange": "crypto_com",
             "instrument": "GMX/USDT",
@@ -3082,7 +3194,10 @@ class MarketMonitorServerTest(unittest.TestCase):
             "reason_code": "instrument_absent_from_current_catalog",
             "checked_at_utc": "2026-07-29T00:00:00+00:00",
             "source_url": "https://api.crypto.com/exchange/v1/public/get-instruments",
+            "http_status": 200,
             "response_sha256": "9" * 64,
+            "inventory_count": 1_000,
+            "instrument_present": False,
         }
 
         result = server.overlay_cex_instrument_lifecycle(
@@ -3119,6 +3234,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             "response_sha256": "9" * 64,
             "inventory_count": 1_000,
             "configured_market_count": 30,
+            "configured_market_ids_sha256": "9" * 64,
         }
 
         result = server.overlay_cex_instrument_lifecycle(
@@ -3395,6 +3511,7 @@ class MarketMonitorServerTest(unittest.TestCase):
     def test_lifecycle_manifest_applies_catalog_policy_when_window_has_no_row(self):
         review = {
             "market_id": "cex:crypto_com:GMX/USDT",
+            "market_type": "cex",
             "token_symbol": "GMX",
             "exchange": "crypto_com",
             "instrument": "GMX/USDT",
@@ -3402,13 +3519,19 @@ class MarketMonitorServerTest(unittest.TestCase):
             "reason_code": "instrument_absent_from_current_catalog",
             "checked_at_utc": "2026-08-01T03:10:02+00:00",
             "source_url": "https://api.crypto.com/exchange/v1/public/get-instruments",
+            "http_status": 200,
             "response_sha256": "9" * 64,
+            "inventory_count": 1_000,
+            "instrument_present": False,
         }
         evidence = {
             "checked_at_utc": review["checked_at_utc"],
             "response_sha256": review["response_sha256"],
             "inventory_count": 1_000,
             "configured_market_count": 1,
+            "configured_market_ids_sha256": server.configured_market_ids_sha256(
+                [review["market_id"]]
+            ),
         }
 
         result = server.overlay_cex_instrument_lifecycle(
@@ -3427,7 +3550,12 @@ class MarketMonitorServerTest(unittest.TestCase):
         payload = {"metadata": {}, "cex_markets": [], "dex_pools": []}
         calls = []
 
-        def project(source_payload, *, now=None):
+        def project(
+            source_payload,
+            *,
+            historical_cex_inventory=None,
+            now=None,
+        ):
             calls.append(now)
             return {
                 **source_payload,
@@ -3437,10 +3565,28 @@ class MarketMonitorServerTest(unittest.TestCase):
             }
 
         server._build_lifecycle_payload_cached.cache_clear()
+        cache_key = (
+            None,
+            None,
+            "",
+            "cex.csv",
+            "dex.csv",
+            (("daily", 1, 1),),
+            "",
+            (),
+            "",
+            (),
+            "",
+            (),
+        )
         with patch.object(
             server,
             "_build_enriched_payload_cached",
             return_value=payload,
+        ), patch.object(
+            server,
+            "_load_cex_historical_lineage_cached",
+            return_value={},
         ), patch.object(
             server,
             "overlay_cex_instrument_lifecycle",
@@ -3450,8 +3596,8 @@ class MarketMonitorServerTest(unittest.TestCase):
             "finalize_fact_contract",
             side_effect=lambda value: value,
         ):
-            fresh = server._build_lifecycle_payload_cached(("same",), 100)
-            stale = server._build_lifecycle_payload_cached(("same",), 200)
+            fresh = server._build_lifecycle_payload_cached(cache_key, 100)
+            stale = server._build_lifecycle_payload_cached(cache_key, 200)
 
         self.assertEqual(fresh["lifecycle_projection"], "fresh")
         self.assertEqual(stale["lifecycle_projection"], "stale")

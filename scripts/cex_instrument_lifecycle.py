@@ -123,7 +123,8 @@ def _validate_source_url(exchange, value):
     return value
 
 
-def _validate_review(review):
+def validate_cex_instrument_lifecycle_review(review):
+    """Validate one complete absence review independently of its manifest."""
     if not isinstance(review, dict) or set(review) != REVIEW_FIELDS:
         raise ValueError("CEX lifecycle review has missing or unknown fields")
     exchange = review["exchange"]
@@ -311,7 +312,7 @@ def load_cex_instrument_lifecycle_manifest(path):
         raise ValueError("CEX lifecycle reviews exceed configured inventory")
     by_market = {}
     for raw_review in reviews:
-        review = _validate_review(raw_review)
+        review = validate_cex_instrument_lifecycle_review(raw_review)
         if (
             review["checked_at_utc"] != checked_at
             or review["response_sha256"] != response_sha256

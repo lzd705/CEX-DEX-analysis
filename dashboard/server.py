@@ -157,6 +157,7 @@ from scripts.execution_cost import (
 from scripts.cex_instrument_lifecycle import (
     configured_market_ids_sha256,
     load_cex_instrument_lifecycle_manifest,
+    validate_cex_instrument_lifecycle_review,
 )
 from scripts.collect_cex_instrument_lifecycle import (
     load_configured_crypto_com_markets,
@@ -790,6 +791,71 @@ def rows_in_window(path: Path, start_date: str, end_date: str) -> list[dict[str,
     ]
 
 
+def _cex_historical_lineage_from_rows(
+    rows: Iterable[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Return canonical CEX identity/count/date lineage from all daily rows."""
+    identities: dict[str, tuple[str, str, str]] = {}
+    observed_dates: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        token = row.get("token_symbol")
+        exchange = row.get("exchange")
+        instrument = row.get("cex_symbol")
+        market_id = cex_market_id(exchange, instrument)
+        identities[market_id] = (token, exchange, instrument)
+        day = row.get("date")
+        close = parse_number(row.get("close"))
+        if (
+            isinstance(day, str)
+            and parse_iso_date(day) is not None
+            and close is not None
+            and close > 0
+        ):
+            observed_dates[market_id].add(day)
+
+    inventory = {}
+    for market_id, (token, exchange, instrument) in identities.items():
+        dates = sorted(observed_dates[market_id])
+        inventory[market_id] = {
+            "token_symbol": token,
+            "market": "cex",
+            "venue": exchange,
+            "instrument": instrument,
+            "observation_count": len(dates),
+            "observation_days": len(dates),
+            "first_observed_date": dates[0] if dates else None,
+            "latest_observed_date": dates[-1] if dates else None,
+            "latest_date": dates[-1] if dates else None,
+        }
+    return inventory
+
+
+@lru_cache(maxsize=LARGE_PAYLOAD_CACHE_SIZE)
+def _load_cex_historical_lineage_cached(
+    database_path_text: str,
+    cex_path_text: str,
+    _signature: SourceSignature,
+) -> dict[str, dict[str, Any]]:
+    """Load the full-history CEX identity inventory once per source generation."""
+    if database_path_text:
+        connection = connect_database(Path(database_path_text))
+        try:
+            rows = (
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT date, token_symbol, exchange, cex_symbol, close
+                    FROM cex_market_daily
+                    ORDER BY date, token_symbol, exchange, cex_symbol
+                    """
+                )
+            )
+            return _cex_historical_lineage_from_rows(rows)
+        finally:
+            connection.close()
+    return _cex_historical_lineage_from_rows(iter_csv(Path(cex_path_text)))
+
+
 def latest_non_null(rows: list[dict[str, Any]], field: str) -> float | None:
     for row in sorted(rows, key=lambda item: item["date"], reverse=True):
         value = parse_number(row.get(field))
@@ -1203,6 +1269,7 @@ def current_cex_facts_withheld(market: dict[str, Any]) -> bool:
 def _lifecycle_only_cex_market(
     market_id: str,
     review: dict[str, Any],
+    historical_lineage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     token = review.get("token_symbol")
     exchange = review.get("exchange")
@@ -1213,9 +1280,13 @@ def _lifecycle_only_cex_market(
     ):
         raise ValueError("CEX lifecycle review identity is incomplete")
     expected_market_id = cex_market_id(exchange, instrument)
-    if exchange != "crypto_com" or expected_market_id != market_id:
+    if (
+        exchange != "crypto_com"
+        or expected_market_id != market_id
+        or review.get("market_id") != market_id
+    ):
         raise ValueError("CEX lifecycle review identity does not match the market")
-    return {
+    seed = {
         "token_symbol": token,
         "market": "cex",
         "venue": exchange,
@@ -1224,6 +1295,99 @@ def _lifecycle_only_cex_market(
         "observation_days": 0,
         "price_points": [],
     }
+    if historical_lineage is None:
+        return seed
+    if (
+        historical_lineage.get("token_symbol") != token
+        or historical_lineage.get("venue") != exchange
+        or historical_lineage.get("instrument") != instrument
+    ):
+        raise ValueError("CEX historical lineage identity does not match the market")
+    observation_count = historical_lineage.get("observation_count")
+    if (
+        isinstance(observation_count, bool)
+        or not isinstance(observation_count, int)
+        or observation_count < 0
+    ):
+        raise ValueError("CEX historical lineage observation count is invalid")
+    seed.update({
+        "observation_count": observation_count,
+        "observation_days": observation_count,
+        "first_observed_date": historical_lineage.get(
+            "first_observed_date"
+        ),
+        "latest_observed_date": historical_lineage.get(
+            "latest_observed_date"
+        ),
+        "latest_date": historical_lineage.get("latest_date"),
+    })
+    return seed
+
+
+def _validate_explicit_lifecycle_injection(
+    reviews: dict[str, dict[str, Any]],
+    lifecycle_evidence: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Validate direct review injection with manifest-equivalent guarantees."""
+    if not isinstance(reviews, dict):
+        raise ValueError("CEX lifecycle reviews must be keyed by market ID")
+    validated_reviews = {}
+    for market_id, raw_review in reviews.items():
+        review = validate_cex_instrument_lifecycle_review(raw_review)
+        if market_id != review["market_id"]:
+            raise ValueError("CEX lifecycle review identity does not match the market")
+        validated_reviews[market_id] = review
+
+    if not isinstance(lifecycle_evidence, dict):
+        raise ValueError("CEX lifecycle root evidence is invalid")
+    checked_at_text = lifecycle_evidence.get("checked_at_utc")
+    checked_at = parse_rfc3339_utc(checked_at_text)
+    if checked_at.isoformat() != checked_at_text:
+        raise ValueError("CEX lifecycle root timestamp is invalid")
+    response_sha256 = lifecycle_evidence.get("response_sha256")
+    if (
+        not isinstance(response_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", response_sha256)
+    ):
+        raise ValueError("CEX lifecycle root response hash is invalid")
+    inventory_count = lifecycle_evidence.get("inventory_count")
+    configured_market_count = lifecycle_evidence.get(
+        "configured_market_count"
+    )
+    if (
+        isinstance(inventory_count, bool)
+        or not isinstance(inventory_count, int)
+        or inventory_count <= 0
+    ):
+        raise ValueError("CEX lifecycle root inventory count is invalid")
+    if (
+        isinstance(configured_market_count, bool)
+        or not isinstance(configured_market_count, int)
+        or configured_market_count <= 0
+        or len(validated_reviews) > configured_market_count
+    ):
+        raise ValueError("CEX lifecycle configured market count is invalid")
+    configured_hash = lifecycle_evidence.get("configured_market_ids_sha256")
+    if (
+        not isinstance(configured_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", configured_hash)
+    ):
+        raise ValueError("CEX lifecycle configured market hash is invalid")
+    if (
+        validated_reviews
+        and configured_market_count == len(validated_reviews)
+        and configured_hash
+        != configured_market_ids_sha256(validated_reviews)
+    ):
+        raise ValueError("CEX lifecycle configured market hash is inconsistent")
+    for review in validated_reviews.values():
+        if (
+            review["checked_at_utc"] != checked_at_text
+            or review["response_sha256"] != response_sha256
+            or review["inventory_count"] != inventory_count
+        ):
+            raise ValueError("CEX lifecycle review evidence differs from root")
+    return validated_reviews
 
 
 def overlay_cex_instrument_lifecycle(
@@ -1231,6 +1395,7 @@ def overlay_cex_instrument_lifecycle(
     reviews: dict[str, dict[str, Any]] | None = None,
     *,
     lifecycle_evidence: dict[str, Any] | None = None,
+    historical_cex_inventory: dict[str, dict[str, Any]] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Withhold stale current facts for officially absent CEX instruments.
@@ -1283,39 +1448,43 @@ def overlay_cex_instrument_lifecycle(
                 "configured_market_ids_sha256"
             ],
         }
-    elif lifecycle_evidence is None:
-        checked_times = sorted(
-            {
-                review["checked_at_utc"]
+    else:
+        if not isinstance(reviews, dict) or not reviews:
+            if lifecycle_evidence is None:
+                raise ValueError("CEX lifecycle review root evidence is missing")
+        elif lifecycle_evidence is None:
+            checked_times = sorted({
+                review.get("checked_at_utc")
+                for review in reviews.values()
+            })
+            response_hashes = sorted({
+                review.get("response_sha256")
+                for review in reviews.values()
+            })
+            inventory_counts = {
+                review.get("inventory_count")
                 for review in reviews.values()
             }
-        )
-        response_hashes = sorted(
-            {
-                review["response_sha256"]
-                for review in reviews.values()
+            if (
+                len(checked_times) != 1
+                or len(response_hashes) != 1
+                or len(inventory_counts) != 1
+            ):
+                raise ValueError("CEX lifecycle review root evidence is inconsistent")
+            lifecycle_evidence = {
+                "checked_at_utc": checked_times[0],
+                "response_sha256": response_hashes[0],
+                "inventory_count": next(iter(inventory_counts)),
+                "configured_market_count": len(reviews),
+                "configured_market_ids_sha256": configured_market_ids_sha256(
+                    reviews
+                ),
             }
+        assert lifecycle_evidence is not None
+        reviews = _validate_explicit_lifecycle_injection(
+            reviews,
+            lifecycle_evidence,
         )
-        if len(checked_times) != 1 or len(response_hashes) != 1:
-            raise ValueError("CEX lifecycle review root evidence is inconsistent")
-        inventory_counts = {
-            review.get("inventory_count")
-            for review in reviews.values()
-            if review.get("inventory_count") is not None
-        }
-        lifecycle_evidence = {
-            "checked_at_utc": checked_times[0],
-            "response_sha256": response_hashes[0],
-            "inventory_count": (
-                next(iter(inventory_counts))
-                if len(inventory_counts) == 1
-                else len(reviews)
-            ),
-            "configured_market_count": len(reviews),
-            "configured_market_ids_sha256": configured_market_ids_sha256(
-                reviews
-            ) if reviews else None,
-        }
     assert lifecycle_evidence is not None
     root_checked_at_text = lifecycle_evidence["checked_at_utc"]
     root_checked_at = parse_rfc3339_utc(root_checked_at_text)
@@ -1342,7 +1511,11 @@ def overlay_cex_instrument_lifecycle(
         if market_id in existing_market_ids:
             continue
         result["cex_markets"].append(
-            _lifecycle_only_cex_market(market_id, reviews[market_id])
+            _lifecycle_only_cex_market(
+                market_id,
+                reviews[market_id],
+                (historical_cex_inventory or {}).get(market_id),
+            )
         )
         existing_market_ids.add(market_id)
     for market in result["cex_markets"]:
@@ -2493,8 +2666,23 @@ def _build_lifecycle_payload_cached(
         freshness_bucket * API_FRESHNESS_CACHE_SECONDS,
         tz=timezone.utc,
     )
+    (
+        _start,
+        _end,
+        database_path_text,
+        cex_path_text,
+        _dex_path_text,
+        daily_signature,
+        *_snapshot_keys,
+    ) = cache_key
+    historical_cex_inventory = _load_cex_historical_lineage_cached(
+        database_path_text,
+        cex_path_text,
+        daily_signature,
+    )
     payload = overlay_cex_instrument_lifecycle(
         _build_enriched_payload_cached(cache_key),
+        historical_cex_inventory=historical_cex_inventory,
         now=reference_time,
     )
     payload = attach_configured_cex_identity_metadata(payload)
@@ -6217,6 +6405,7 @@ def clear_runtime_caches() -> None:
             _load_dex_depth_snapshot_cached,
             _load_execution_cost_snapshot_cached,
             _load_daily_quality_report_cached,
+            _load_cex_historical_lineage_cached,
             _build_market_payload_cached,
             _build_database_payload_cached,
             _build_enriched_payload_cached,
@@ -6245,6 +6434,7 @@ def ensure_source_cache_generation(
             _load_cex_depth_snapshot_cached,
             _load_dex_depth_snapshot_cached,
             _load_execution_cost_snapshot_cached,
+            _load_cex_historical_lineage_cached,
             _build_market_payload_cached,
             _build_database_payload_cached,
             _build_enriched_payload_cached,
