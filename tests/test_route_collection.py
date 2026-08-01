@@ -22,6 +22,7 @@ from scripts.collect_route_cohort import (
     main,
     materialize_route_leg_rows,
 )
+from scripts.route_publication import load_latest_route_cohort
 
 
 _TEST_RAW_DIRECTORY = tempfile.TemporaryDirectory(prefix="route-cohort-tests-")
@@ -1861,10 +1862,32 @@ class RouteLegCollectionTests(unittest.TestCase):
                 ["late"],
             )
 
+    def test_supplied_executor_fairness_regression_exits_cleanly(self):
+        target = (
+            "tests.test_route_collection.RouteLegCollectionTests."
+            "test_resolver_is_scheduled_fairly_with_cex_collection"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-m", "unittest", target],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            text=True,
+            capture_output=True,
+            timeout=2,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_resolver_is_scheduled_fairly_with_cex_collection(self):
         cex_started = Event()
         resolver_started = Event()
         resolver_gate = Event()
+        resolver_finished = Event()
+
+        def release_resolver():
+            resolver_gate.set()
+            self.assertTrue(resolver_finished.wait(timeout=0.5))
+
+        self.addCleanup(release_resolver)
         cex_saw_resolver = []
         universe = {
             "candidate_source_generation": "candidate-a",
@@ -1882,6 +1905,7 @@ class RouteLegCollectionTests(unittest.TestCase):
         def resolver(_chain, **_kwargs):
             resolver_started.set()
             resolver_gate.wait()
+            resolver_finished.set()
 
         def collect_cex(*_args, **_kwargs):
             cex_started.set()
@@ -2222,6 +2246,80 @@ class RouteLegCollectionTests(unittest.TestCase):
             sorted(inventory, key=lambda row: row["exchange"]),
         )
 
+    def test_live_cli_publish_writes_only_validated_core_pointer(self):
+        universe = _strict_cex_universe()
+        universe["selection_window"] = {
+            "start": "2026-07-25",
+            "end": "2026-08-01",
+        }
+        universe["requested_notionals_usd"] = [
+            1000,
+            5000,
+            10000,
+            50000,
+            100000,
+        ]
+        for route in universe["routes"]:
+            route.update(
+                {
+                    "route_class": "candidate",
+                    "settlement_reason": None,
+                    "requested_notionals_usd": [
+                        1000,
+                        5000,
+                        10000,
+                        50000,
+                        100000,
+                    ],
+                    "candidate_source_generation": "generation-a",
+                }
+            )
+        inventory = [
+            {
+                "token_symbol": "UNI",
+                "exchange": exchange,
+                "cex_symbol": "UNI/USDT",
+            }
+            for exchange in ("alpha", "beta")
+        ]
+
+        def observed_with_snapshot(_leg, *, snapshot_id, raw_path, **_kwargs):
+            raw_path.write_bytes(b"published route raw")
+            return {
+                "status": "observed",
+                "snapshot_id": snapshot_id,
+                "state_observed_at": "2026-08-01T12:00:00Z",
+            }
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            data_dir = Path(directory_name)
+            (data_dir / "route_universe.json").write_text(
+                json.dumps(universe), encoding="utf-8"
+            )
+
+            with patch(
+                "scripts.collect_route_cohort.load_cataloged_markets",
+                return_value=inventory,
+            ):
+                result = main(
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--deadline-seconds",
+                        "1",
+                        "--publish",
+                    ],
+                    cex_collector=observed_with_snapshot,
+                    executor_factory=ThreadPoolExecutor,
+                )
+
+            loaded = load_latest_route_cohort(data_dir / "routes/core")
+            self.assertEqual(
+                loaded["manifest"]["route_cohort_id"],
+                result["route_cohort_id"],
+            )
+            self.assertFalse((data_dir / "routes/latest.json").exists())
+
     def test_dry_run_applies_tokens_and_rejects_invalid_worker_values(self):
         universe = {
             "candidate_source_generation": "generation-a",
@@ -2253,9 +2351,15 @@ class RouteLegCollectionTests(unittest.TestCase):
                 "scripts.collect_route_cohort.load_cataloged_markets",
                 return_value=inventory,
             ):
-                result = main(["--data-dir", str(data_dir), "--tokens", "UNI", "--dry-run"])
+                result = main([
+                    "--data-dir", str(data_dir),
+                    "--tokens", "UNI",
+                    "--dry-run", "--publish",
+                ])
             self.assertEqual((result["selected_leg_count"], result["route_count"]), (2, 1))
             self.assertEqual(len(result["collection_input_generation"]), 64)
+            self.assertFalse((data_dir / "raw").exists())
+            self.assertFalse((data_dir / "routes/core/latest.json").exists())
             with self.assertRaisesRegex(ValueError, "worker limits"):
                 main(["--data-dir", str(data_dir), "--max-workers", "0", "--dry-run"])
 
@@ -2568,8 +2672,6 @@ class RouteLegCollectionTests(unittest.TestCase):
                     "--end", "2026-08-01", "--tokens", "UNI", "--dry-run",
                 ])
             self.assertEqual(sorted(path.name for path in data_dir.iterdir()), ["route_universe.json"])
-            with self.assertRaisesRegex(RuntimeError, "Task 5"):
-                main(["--data-dir", str(data_dir), "--publish"])
 
     def test_unique_route_legs_deduplicates_directional_route_references(self):
         routes = [

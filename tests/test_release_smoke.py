@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dashboard import server
+import scripts.check_dashboard_release as release_checker
 from scripts.check_dashboard_release import (
     DAILY_FACT_EVIDENCE_FIELDS,
     ReleaseCheckError,
@@ -30,6 +31,194 @@ from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_SOURCES
 
 
 class DashboardReleaseSmokeTest(unittest.TestCase):
+    def test_route_core_pointer_absence_is_optional_but_can_be_required(self):
+        validator = getattr(
+            release_checker,
+            "validate_route_cohort_release",
+            None,
+        )
+        self.assertTrue(callable(validator))
+        with tempfile.TemporaryDirectory() as directory_name:
+            data_root = Path(directory_name)
+            core_root = data_root / "routes/core"
+            orphan = data_root / "routes/bundles/orphan"
+            orphan.mkdir(parents=True)
+            (orphan / "manifest.json").write_text("{}", encoding="utf-8")
+            (data_root / "routes/latest.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                validator(core_root, required=False),
+                {
+                    "status": "unavailable",
+                    "reason": "core_pointer_absent",
+                },
+            )
+            with self.assertRaisesRegex(
+                ReleaseCheckError,
+                "required route cohort.*unavailable",
+            ):
+                validator(core_root, required=True)
+
+    def test_present_invalid_route_core_pointer_fails_even_when_optional(self):
+        with tempfile.TemporaryDirectory() as directory_name:
+            core_root = Path(directory_name) / "routes/core"
+            core_root.mkdir(parents=True)
+            (core_root / "latest.json").write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ReleaseCheckError,
+                "route cohort core validation failed",
+            ):
+                release_checker.validate_route_cohort_release(
+                    core_root,
+                    required=False,
+                )
+
+    def test_optional_route_pointer_probe_fails_on_permission_or_io_error(self):
+        from scripts.route_publication import publish_route_cohort_bundle
+        from tests.test_route_publication import _cohort
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            core_root = Path(directory_name) / "routes/core"
+            publish_route_cohort_bundle(_cohort(), core_root=core_root)
+
+            for error in (
+                PermissionError("route pointer denied"),
+                OSError("route pointer I/O failure"),
+            ):
+                with self.subTest(error=type(error).__name__):
+                    with patch(
+                        "scripts.check_dashboard_release.Path.lstat",
+                        side_effect=error,
+                    ):
+                        with self.assertRaisesRegex(
+                            ReleaseCheckError,
+                            "route cohort core pointer cannot be inspected",
+                        ):
+                            release_checker.validate_route_cohort_release(
+                                core_root,
+                                required=False,
+                            )
+
+    def test_route_release_rejects_a_tampered_pointed_bundle(self):
+        from scripts.route_publication import publish_route_cohort_bundle
+        from tests.test_route_publication import _cohort
+
+        cohort = _cohort()
+        with tempfile.TemporaryDirectory() as directory_name:
+            core_root = Path(directory_name) / "routes/core"
+            publish_route_cohort_bundle(cohort, core_root=core_root)
+            route_legs = (
+                core_root
+                / "bundles"
+                / cohort["route_cohort_id"]
+                / "route_legs.csv"
+            )
+            with route_legs.open("ab") as handle:
+                handle.write(b"\n")
+
+            with self.assertRaisesRegex(
+                ReleaseCheckError,
+                "route cohort core validation failed.*checksum",
+            ):
+                release_checker.validate_route_cohort_release(
+                    core_root,
+                    required=False,
+                )
+
+    def test_route_release_accepts_valid_terminal_unavailable_bundle(self):
+        from scripts.route_publication import publish_route_cohort_bundle
+        from tests.test_route_publication import _cohort, _rehash
+
+        cohort = _cohort()
+        cohort["legs"][0].update(
+            {
+                "status": "deadline_exceeded",
+                "available": False,
+                "reason_code": "route_deadline_exceeded",
+            }
+        )
+        for row in cohort["route_rows"]:
+            row.update(
+                {
+                    "skew_seconds": None,
+                    "timing_status": "unavailable",
+                    "reason_code": "route_deadline_exceeded",
+                }
+            )
+        cohort = _rehash(cohort)
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            core_root = Path(directory_name) / "routes/core"
+            publish_route_cohort_bundle(cohort, core_root=core_root)
+
+            result = release_checker.validate_route_cohort_release(
+                core_root,
+                required=True,
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "status": "validated",
+                "reason": None,
+                "route_cohort_id": cohort["route_cohort_id"],
+                "timing_status_counts": {
+                    "outside_sla": 0,
+                    "unavailable": 2,
+                    "within_sla": 0,
+                },
+            },
+        )
+
+    def test_release_cli_parses_required_route_cohort_flag(self):
+        with patch(
+            "sys.argv",
+            ["check_dashboard_release.py", "--require-route-cohort"],
+        ):
+            args = release_checker.parse_args()
+
+        self.assertTrue(args.require_route_cohort)
+
+    def test_release_checks_required_route_core_before_remote_requests(self):
+        args = argparse.Namespace(
+            base_url="https://dashboard.test",
+            timeout=1.0,
+            require_route_cohort=True,
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.dict(
+                        release_checker.os.environ,
+                        {"MARKET_DATA_DIR": directory_name},
+                    )
+                )
+                route_validator = stack.enter_context(
+                    patch(
+                        "scripts.check_dashboard_release.validate_route_cohort_release",
+                        side_effect=ReleaseCheckError("required route sentinel"),
+                    )
+                )
+                fetch_json = stack.enter_context(
+                    patch("scripts.check_dashboard_release.fetch_json")
+                )
+
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "required route sentinel",
+                ):
+                    release_check(args)
+
+            route_validator.assert_called_once_with(
+                Path(directory_name) / "routes/core",
+                required=True,
+            )
+            fetch_json.assert_not_called()
+
     def test_public_asset_check_excludes_protected_admin_bundle(self):
         self.assertIn("actions.css", STATIC_ASSET_FILENAMES)
         self.assertIn("actions.js", STATIC_ASSET_FILENAMES)
@@ -1082,6 +1271,13 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
 
         self.assertEqual(result["application_sha"], "a" * 40)
         self.assertEqual(result["asset_sha"], "b" * 64)
+        self.assertEqual(
+            result["route_cohort"],
+            {
+                "status": "unavailable",
+                "reason": "core_pointer_absent",
+            },
+        )
         self.assertEqual(
             validator_calls["comparison"].kwargs[
                 "expected_comparison_generation"

@@ -8,12 +8,14 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -32,6 +34,10 @@ try:
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
     )
+    from scripts.route_publication import (
+        DEFAULT_ROUTE_CORE_ROOT,
+        load_latest_route_cohort,
+    )
     from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from cex_instrument_lifecycle import configured_market_ids_sha256
@@ -41,6 +47,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
     )
+    from route_publication import DEFAULT_ROUTE_CORE_ROOT, load_latest_route_cohort
     from static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
 
 
@@ -64,6 +71,51 @@ MAX_STATIC_ASSET_BYTES = 4 * 1024 * 1024
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ReleaseCheckError(message)
+
+
+def validate_route_cohort_release(
+    core_root: Path,
+    *,
+    required: bool,
+) -> dict[str, Any]:
+    """Validate the one private route-core pointer when it is available."""
+    pointer_path = Path(core_root) / "latest.json"
+    try:
+        pointer_path.lstat()
+    except FileNotFoundError:
+        if required:
+            raise ReleaseCheckError(
+                "required route cohort pointer is unavailable"
+            )
+        return {
+            "status": "unavailable",
+            "reason": "core_pointer_absent",
+        }
+    except OSError as error:
+        raise ReleaseCheckError(
+            "route cohort core pointer cannot be inspected: {}".format(error)
+        ) from error
+    try:
+        loaded = load_latest_route_cohort(Path(core_root))
+    except (OSError, ValueError) as error:
+        raise ReleaseCheckError(
+            "route cohort core validation failed: {}".format(error)
+        ) from error
+    manifest = loaded["manifest"]
+    return {
+        "status": "validated",
+        "reason": None,
+        "route_cohort_id": manifest["route_cohort_id"],
+        "timing_status_counts": dict(manifest["timing_status_counts"]),
+    }
+
+
+def configured_route_core_root() -> Path:
+    """Return the private route-core root used by collection operations."""
+    configured_data_root = os.environ.get("MARKET_DATA_DIR")
+    if configured_data_root:
+        return Path(configured_data_root).expanduser() / "routes/core"
+    return DEFAULT_ROUTE_CORE_ROOT
 
 
 def validate_release_health(
@@ -2957,6 +3009,10 @@ def validate_events(
 
 
 def release_check(args: argparse.Namespace) -> dict[str, Any]:
+    route_cohort_validation = validate_route_cohort_release(
+        configured_route_core_root(),
+        required=getattr(args, "require_route_cohort", False),
+    )
     metrics: list[ResponseMetrics] = []
     health, health_metrics = fetch_json(
         args.base_url,
@@ -3431,6 +3487,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "event_count": len(event_rows),
         "event_covered_token_count": event_coverage["covered_token_count"],
         "event_bundle_id": all_events["bundle_id"],
+        "route_cohort": route_cohort_validation,
         "requests": [
             {
                 "path": item.path,
@@ -3459,6 +3516,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-asset-sha",
         help="Require /health to report this exact deployed frontend asset SHA",
+    )
+    parser.add_argument(
+        "--require-route-cohort",
+        action="store_true",
+        help="Fail unless the immutable core route cohort pointer is available and valid",
     )
     return parser.parse_args()
 

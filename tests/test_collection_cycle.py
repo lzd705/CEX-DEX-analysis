@@ -11,6 +11,7 @@ from scripts.run_collection_cycle import (
     build_collection_status,
     build_step_commands,
     configured_data_dir,
+    parse_args,
     processed_dir_for,
     publication_gates_from_log,
     resolve_incremental_window,
@@ -220,6 +221,250 @@ class CollectionCycleTest(unittest.TestCase):
             )
         )
         self.assertIn("--tvl-csv", commands[-1][1])
+
+    def test_routes_profile_builds_one_bounded_publish_command(self):
+        commands = build_step_commands(
+            "routes",
+            publish_local=True,
+            python_executable="python3",
+            data_dir=self.data_dir,
+            start="2026-07-01",
+            end="2026-07-30",
+            tokens=["AAVE", "UNI"],
+            deadline_seconds=45.5,
+        )
+
+        self.assertEqual(
+            commands,
+            [
+                (
+                    "routes",
+                    [
+                        "python3",
+                        str(
+                            Path(__file__).resolve().parents[1]
+                            / "scripts/collect_route_cohort.py"
+                        ),
+                        "--data-dir",
+                        str(self.data_dir.resolve()),
+                        "--start",
+                        "2026-07-01",
+                        "--end",
+                        "2026-07-30",
+                        "--tokens",
+                        "AAVE,UNI",
+                        "--deadline-seconds",
+                        "45.5",
+                        "--publish",
+                    ],
+                )
+            ],
+        )
+
+    def test_routes_dry_run_forwards_deadline_without_enabling_publish(self):
+        result = run_collection_cycle(
+            "routes",
+            publish_local=False,
+            data_dir=self.data_dir,
+            now=NOW,
+            start="2026-07-01",
+            end="2026-07-30",
+            tokens=["AAVE"],
+            deadline_seconds=12.5,
+            dry_run=True,
+        )
+
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(len(result["commands"]), 1)
+        command = result["commands"][0]["command"]
+        self.assertEqual(
+            command[command.index("--deadline-seconds") + 1],
+            "12.5",
+        )
+        self.assertNotIn("--publish", command)
+
+    def test_routes_profile_rejects_nonpositive_or_nonfinite_deadline(self):
+        for deadline_seconds in (0, -1, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(deadline_seconds=deadline_seconds):
+                with self.assertRaisesRegex(ValueError, "deadline"):
+                    build_step_commands(
+                        "routes",
+                        publish_local=False,
+                        data_dir=self.data_dir,
+                        deadline_seconds=deadline_seconds,
+                    )
+
+    def test_collection_cli_parses_routes_deadline(self):
+        with patch(
+            "sys.argv",
+            [
+                "run_collection_cycle.py",
+                "--profile",
+                "routes",
+                "--deadline-seconds",
+                "17.5",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.profile, "routes")
+        self.assertEqual(args.deadline_seconds, 17.5)
+
+    def test_routes_cycle_accepts_terminal_unavailable_report(self):
+        def runner(_command, log_path):
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "route_cohort_collection/v1",
+                        "route_cohort_id": "cohort:" + "a" * 64,
+                        "route_rows": [
+                            {
+                                "route_id": "route:deadline",
+                                "timing_status": "unavailable",
+                                "reason_code": "route_deadline_exceeded",
+                            },
+                            {
+                                "route_id": "route:unsupported",
+                                "timing_status": "unavailable",
+                                "reason_code": "execution_adapter_unsupported",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return 0
+
+        result = run_collection_cycle(
+            "routes",
+            publish_local=False,
+            data_dir=self.data_dir,
+            run_root=self.root / "route-runs",
+            latest_status_path=self.root / "route-latest.json",
+            lock_path=self.root / "route.lock",
+            now=NOW,
+            deadline_seconds=5,
+            step_runner=runner,
+        )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(
+            result["steps"][0]["timing_status_counts"],
+            {"outside_sla": 0, "unavailable": 2, "within_sla": 0},
+        )
+
+    def test_routes_cycle_fails_when_zero_exit_has_no_valid_report(self):
+        invalid_reports = (
+            "",
+            "not-json",
+            json.dumps({"schema": "route_cohort_collection/v1"}),
+            json.dumps(
+                {
+                    "schema": "route_cohort_collection/v1",
+                    "route_cohort_id": "cohort:" + "a" * 64,
+                    "route_rows": [
+                        {
+                            "route_id": "route:bad",
+                            "timing_status": "within_sla",
+                            "reason_code": "route_deadline_exceeded",
+                        }
+                    ],
+                }
+            ),
+        )
+        for index, report in enumerate(invalid_reports):
+            with self.subTest(report_index=index):
+                def runner(_command, log_path, report=report):
+                    log_path.write_text(report, encoding="utf-8")
+                    return 0
+
+                result = run_collection_cycle(
+                    "routes",
+                    publish_local=False,
+                    data_dir=self.data_dir,
+                    run_root=self.root / "invalid-route-runs" / str(index),
+                    latest_status_path=self.root / "invalid-route-latest.json",
+                    lock_path=self.root / "invalid-route.lock",
+                    now=NOW,
+                    step_runner=runner,
+                )
+
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["steps"][0]["exit_code"], 3)
+                self.assertIn(
+                    "Route cohort report validation failed",
+                    result["steps"][0]["error"],
+                )
+
+    def test_routes_cycle_persists_failure_for_non_scalar_json_fields(self):
+        def malformed_report(field, value):
+            payload = {
+                "schema": "route_cohort_collection/v1",
+                "route_cohort_id": "cohort:" + "a" * 64,
+                "route_rows": [
+                    {
+                        "route_id": "route:bad-shape",
+                        "timing_status": "within_sla",
+                        "reason_code": None,
+                    }
+                ],
+            }
+            if field == "route_row":
+                payload["route_rows"][0] = value
+            elif field in payload:
+                payload[field] = value
+            else:
+                payload["route_rows"][0][field] = value
+            return json.dumps(payload)
+
+        invalid_fields = (
+            ("schema", []),
+            ("route_cohort_id", {}),
+            ("route_rows", True),
+            ("route_row", []),
+            ("route_id", True),
+            ("timing_status", []),
+            ("timing_status", {}),
+            ("timing_status", True),
+            ("reason_code", []),
+            ("reason_code", {}),
+            ("reason_code", True),
+        )
+        for index, (field, value) in enumerate(invalid_fields):
+            with self.subTest(field=field, value=value):
+                report = malformed_report(field, value)
+
+                def runner(_command, log_path, report=report):
+                    log_path.write_text(report, encoding="utf-8")
+                    return 0
+
+                latest_status_path = (
+                    self.root / "malformed-route-latest" / f"{index}.json"
+                )
+                result = run_collection_cycle(
+                    "routes",
+                    publish_local=False,
+                    data_dir=self.data_dir,
+                    run_root=self.root / "malformed-route-runs" / str(index),
+                    latest_status_path=latest_status_path,
+                    lock_path=self.root / "malformed-route.lock",
+                    now=NOW,
+                    step_runner=runner,
+                )
+
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["steps"][0]["exit_code"], 3)
+                self.assertIn(
+                    "Route cohort report validation failed",
+                    result["steps"][0]["error"],
+                )
+                self.assertTrue(Path(result["manifest_path"]).is_file())
+                self.assertEqual(
+                    json.loads(latest_status_path.read_text(encoding="utf-8"))[
+                        "status"
+                    ],
+                    "failed",
+                )
 
     def test_scheduled_daily_profile_includes_only_active_runtime_tokens(self):
         runtime_records = [

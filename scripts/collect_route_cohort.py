@@ -29,6 +29,7 @@ try:
         CollectionDeadlineExceeded,
     )
     from scripts.route_cohort import canonical_route_id, classify_route_timing
+    from scripts.route_publication import publish_route_cohort_bundle
     from scripts.fetch_cex_depth import (
         cex_market_id,
         collect_cex_market_observation,
@@ -45,6 +46,7 @@ try:
 except ModuleNotFoundError:
     from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
     from route_cohort import canonical_route_id, classify_route_timing
+    from route_publication import publish_route_cohort_bundle
     from fetch_cex_depth import (
         cex_market_id,
         collect_cex_market_observation,
@@ -2292,11 +2294,9 @@ def main(
     dex_block_resolver: Callable[..., Mapping[str, Any]] = _default_dex_block_resolver,
     executor_factory: Callable[..., Any] = _ForkProcessExecutor,
 ) -> Dict[str, Any]:
-    """Run live bounded collection; Task 5 remains the only publisher."""
+    """Run bounded collection and optionally publish through the Task 5 boundary."""
     args = parse_args(argv)
     tokens = _validate_cli_values(args)
-    if args.publish:
-        raise RuntimeError("--publish is unavailable until Task 5 immutable publication")
     resolved, expected_generation = _load_cli_collection_inputs(
         args.data_dir,
         tokens,
@@ -2340,6 +2340,11 @@ def main(
         dex_workers_per_chain=args.dex_workers_per_chain,
         executor_factory=executor_factory,
     )
+    if args.publish:
+        publish_route_cohort_bundle(
+            result,
+            core_root=args.data_dir / "routes/core",
+        )
     return result
 
 

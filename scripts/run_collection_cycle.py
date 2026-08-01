@@ -20,6 +20,7 @@ import csv
 import fcntl
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -55,6 +56,7 @@ PROFILE_STEPS = {
     "depth": ("depth", "dex_price", "dex_depth"),
     "cex_depth": ("depth",),
     "dex_depth": ("dex_price", "dex_depth"),
+    "routes": ("routes",),
 }
 LIFECYCLE_FILENAME = "cex_instrument_lifecycle.json"
 LIFECYCLE_FRESHNESS_SECONDS = 36 * 60 * 60
@@ -69,6 +71,18 @@ SNAPSHOT_FILENAMES = {
     "dex_depth": "dex_depth_latest.csv",
     "cex_execution_cost": "cex_execution_cost_latest.csv",
     "dex_execution_cost": "dex_execution_cost_latest.csv",
+}
+ROUTE_TIMING_STATUS_REASONS = {
+    "within_sla": {None},
+    "outside_sla": {"snapshot_skew_exceeded"},
+    "unavailable": {
+        "route_deadline_exceeded",
+        "execution_adapter_unsupported",
+        "buy_leg_unavailable",
+        "sell_leg_unavailable",
+        "invalid_state_timestamp",
+        "route_mode_not_executable",
+    },
 }
 
 
@@ -394,6 +408,7 @@ def build_step_commands(
     start: str | None = None,
     end: str | None = None,
     tokens: list[str] | None = None,
+    deadline_seconds: float = 60.0,
     market_id: str | None = None,
     full_rebuild: bool = False,
 ) -> list[tuple[str, list[str]]]:
@@ -401,6 +416,10 @@ def build_step_commands(
         raise ValueError(f"Unknown collection profile: {profile}")
     if bool(start) != bool(end):
         raise ValueError("--start and --end must be provided together")
+    if profile == "routes" and (
+        not math.isfinite(deadline_seconds) or deadline_seconds <= 0
+    ):
+        raise ValueError("routes deadline_seconds must be finite and positive")
     if market_id is not None:
         market_id = market_id.strip()
         if not market_id:
@@ -476,6 +495,22 @@ def build_step_commands(
             command.extend(["--data-dir", str(data_dir)])
             if publish_local:
                 command.append("--publish-local")
+        elif step == "routes":
+            command = [
+                python_executable,
+                str(PROJECT_ROOT / "scripts/collect_route_cohort.py"),
+                "--data-dir",
+                str(data_dir),
+            ]
+            if start and end:
+                command.extend(["--start", start, "--end", end])
+            if tokens:
+                command.extend(["--tokens", ",".join(tokens)])
+            command.extend(
+                ["--deadline-seconds", format(deadline_seconds, "g")]
+            )
+            if publish_local:
+                command.append("--publish")
         elif step in {"tvl", "dex_price"}:
             command = [
                 python_executable,
@@ -640,6 +675,55 @@ def log_tail(path: Path, lines: int = 20) -> list[str]:
     return path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
 
 
+def route_timing_status_counts_from_log(path: Path) -> dict[str, int]:
+    """Validate one route CLI report and return complete terminal counts."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError("route cohort report is missing or invalid JSON") from error
+    if type(payload) is not dict or payload.get("schema") != (
+        "route_cohort_collection/v1"
+    ):
+        raise ValueError("route cohort report schema is invalid")
+    route_cohort_id = payload.get("route_cohort_id")
+    fingerprint = (
+        route_cohort_id[len("cohort:") :]
+        if type(route_cohort_id) is str and route_cohort_id.startswith("cohort:")
+        else ""
+    )
+    if len(fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in fingerprint
+    ):
+        raise ValueError("route cohort report identity is invalid")
+    rows = payload.get("route_rows")
+    if type(rows) is not list or not rows:
+        raise ValueError("route cohort timing report is missing")
+    counts: Counter[str] = Counter()
+    route_ids = set()
+    for row in rows:
+        if type(row) is not dict:
+            raise ValueError("route cohort timing row is invalid")
+        route_id = row.get("route_id")
+        status = row.get("timing_status")
+        reason = row.get("reason_code")
+        if (
+            type(route_id) is not str
+            or not route_id
+            or route_id in route_ids
+            or type(status) is not str
+            or (reason is not None and type(reason) is not str)
+            or status not in ROUTE_TIMING_STATUS_REASONS
+            or reason not in ROUTE_TIMING_STATUS_REASONS[status]
+        ):
+            raise ValueError("route cohort timing status/reason is invalid")
+        route_ids.add(route_id)
+        counts[status] += 1
+    return {
+        status: counts.get(status, 0)
+        for status in sorted(ROUTE_TIMING_STATUS_REASONS)
+    }
+
+
 def publication_gates_from_log(path: Path) -> dict[str, Any]:
     """Extract collector publication-gate evidence for the run manifest."""
     if not path.exists():
@@ -706,6 +790,7 @@ def run_collection_cycle(
     start: str | None = None,
     end: str | None = None,
     tokens: list[str] | None = None,
+    deadline_seconds: float = 60.0,
     market_id: str | None = None,
     full_rebuild: bool = False,
     fail_fast: bool = False,
@@ -727,6 +812,7 @@ def run_collection_cycle(
         start=start,
         end=end,
         tokens=tokens,
+        deadline_seconds=deadline_seconds,
         market_id=market_id,
         full_rebuild=full_rebuild,
     )
@@ -805,6 +891,7 @@ def run_collection_cycle(
                 continue
             print(f"[collection] starting {name}: {' '.join(command)}", flush=True)
             step_error = None
+            timing_status_counts = None
             try:
                 exit_code = step_runner(command, log_path)
             except KeyboardInterrupt:
@@ -817,11 +904,23 @@ def run_collection_cycle(
                 step_error = f"{type(error).__name__}: {error}"
                 with log_path.open("a", encoding="utf-8") as log:
                     log.write(step_error + "\n")
+            if exit_code == 0 and name == "routes":
+                try:
+                    timing_status_counts = route_timing_status_counts_from_log(
+                        log_path
+                    )
+                except ValueError as error:
+                    exit_code = 3
+                    step_error = (
+                        "Route cohort report validation failed: {}".format(error)
+                    )
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write("\n" + step_error + "\n")
             validation = None
             should_validate = (
                 publish_local
                 and market_id is None
-                and name != "dex_price"
+                and name not in {"dex_price", "routes"}
                 and (
                     name != "daily"
                     or (tokens is None and start is None and end is None)
@@ -927,6 +1026,8 @@ def run_collection_cycle(
                 "error": step_error,
                 "validation": validation,
             }
+            if timing_status_counts is not None:
+                result["timing_status_counts"] = timing_status_counts
             step_results.append(result)
             if exit_code != 0 and (fail_fast or exit_code == 130):
                 break
@@ -998,9 +1099,21 @@ def parse_args() -> argparse.Namespace:
         default=configured_data_dir(),
         help="Runtime snapshot directory (defaults to MARKET_DATA_DIR)",
     )
-    parser.add_argument("--start", help="Inclusive UTC date override for daily facts")
-    parser.add_argument("--end", help="Inclusive UTC date override for daily facts")
-    parser.add_argument("--tokens", help="Comma-separated daily Token override")
+    parser.add_argument(
+        "--start", help="Inclusive UTC date override for daily facts or routes"
+    )
+    parser.add_argument(
+        "--end", help="Inclusive UTC date override for daily facts or routes"
+    )
+    parser.add_argument(
+        "--tokens", help="Comma-separated daily or route Token override"
+    )
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=60.0,
+        help="Finite positive collection deadline for the routes profile",
+    )
     parser.add_argument(
         "--market-id",
         help="One canonical CEX/DEX market for a bounded snapshot refresh",
@@ -1024,6 +1137,7 @@ def main() -> None:
         start=args.start,
         end=args.end,
         tokens=parse_list(args.tokens),
+        deadline_seconds=args.deadline_seconds,
         market_id=args.market_id,
         full_rebuild=args.full_rebuild,
         fail_fast=args.fail_fast,
