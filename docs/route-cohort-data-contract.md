@@ -21,10 +21,20 @@ the skew from `2026-08-01T12:00:00.000000000Z` to
 `2026-08-01T12:01:00.000000000Z` is exactly `Decimal("60.000000000")` and
 passes a 60-second SLA; `60.000000001` does not.
 
+Timestamp arithmetic uses an operation-local Decimal precision derived from
+the inputs, not the process-wide Decimal context. Arbitrarily long RFC 3339
+fractions remain exact: `60.0000000000000000001` remains distinct from 60 and
+does not pass the SLA.
+
 ## Candidate and leg identity
 
-A route candidate must provide non-empty `token_symbol`, `buy_market_id`,
-`sell_market_id`, and `route_mode`. `canonical_route_id(candidate)` returns:
+A route candidate must provide canonical strings for `token_symbol`,
+`buy_market_id`, `sell_market_id`, and `route_mode`; identity is never coerced
+with `str()`. Token symbols are upper-case identifier text; market IDs have no
+surrounding whitespace and begin `cex:` or `dex:`; route modes are lower-case
+underscore identifiers. Missing, empty, non-string, or noncanonical values
+raise `ValueError("route candidate identity is invalid")`.
+`canonical_route_id(candidate)` returns:
 
 ```text
 route:{token_symbol}:{buy_market_id}->{sell_market_id}:{route_mode}
@@ -42,8 +52,10 @@ timestamps are timestamp failures, not an implicit unavailable-leg state.
 `validate_route_cohort_rows(candidates, legs)` rejects duplicate directed
 candidates, duplicate non-empty `candidate_id` values, same-market routes, a
 non-canonical supplied route ID, duplicate leg IDs, and incomplete leg
-identity. It raises a stable `ValueError` category rather than silently
-deduplicating data.
+identity. A supplied `candidate_id` must be a canonical string; including an
+unhashable value raises `ValueError("route candidate ID is invalid")` rather
+than leaking a Python `TypeError`. The validator never silently deduplicates
+data.
 
 ## Timing classification
 

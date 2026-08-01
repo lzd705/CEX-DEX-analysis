@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
 
@@ -35,15 +35,22 @@ def exact_rfc3339_epoch_seconds(value: str) -> Decimal:
     whole_seconds = delta.days * 86_400 + delta.seconds
     fraction = matched.group("fraction") or ""
     if fraction:
-        return Decimal(whole_seconds) + Decimal("0." + fraction)
+        with localcontext() as context:
+            context.prec = len(str(abs(whole_seconds))) + len(fraction) + 1
+            return Decimal(whole_seconds) + Decimal("0." + fraction)
     return Decimal(whole_seconds)
 
 
 def exact_timestamp_skew_seconds(left: str, right: str) -> Decimal:
     """Return the exact absolute RFC 3339 timestamp skew in seconds."""
-    return abs(
-        exact_rfc3339_epoch_seconds(left) - exact_rfc3339_epoch_seconds(right)
-    )
+    left_epoch = exact_rfc3339_epoch_seconds(left)
+    right_epoch = exact_rfc3339_epoch_seconds(right)
+    with localcontext() as context:
+        context.prec = max(
+            len(left_epoch.as_tuple().digits),
+            len(right_epoch.as_tuple().digits),
+        ) + 1
+        return abs(left_epoch - right_epoch)
 
 
 def parse_rfc3339_utc(value: str) -> datetime:

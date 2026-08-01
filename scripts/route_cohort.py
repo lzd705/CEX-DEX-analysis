@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Any, Iterable, Mapping
 
 try:
@@ -17,17 +18,37 @@ except ModuleNotFoundError:
     )
 
 
+_TOKEN_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9._-]*\Z")
+_ROUTE_MODE = re.compile(r"[a-z][a-z0-9_]*\Z")
+
+
 def canonical_route_id(candidate: Mapping[str, Any]) -> str:
     """Return a direction-preserving route identifier."""
     try:
-        token_symbol = str(candidate["token_symbol"])
-        buy_market_id = str(candidate["buy_market_id"])
-        sell_market_id = str(candidate["sell_market_id"])
-        route_mode = str(candidate["route_mode"])
+        token_symbol = candidate["token_symbol"]
+        buy_market_id = candidate["buy_market_id"]
+        sell_market_id = candidate["sell_market_id"]
+        route_mode = candidate["route_mode"]
     except (KeyError, TypeError) as error:
-        raise ValueError("route candidate identity is incomplete") from error
-    if not all((token_symbol, buy_market_id, sell_market_id, route_mode)):
-        raise ValueError("route candidate identity is incomplete")
+        raise ValueError("route candidate identity is invalid") from error
+    if not all(
+        isinstance(value, str)
+        for value in (token_symbol, buy_market_id, sell_market_id, route_mode)
+    ):
+        raise ValueError("route candidate identity is invalid")
+    if (
+        not _TOKEN_SYMBOL.fullmatch(token_symbol)
+        or token_symbol != token_symbol.strip()
+        or any(
+            not market_id
+            or market_id != market_id.strip()
+            or not market_id.startswith(("cex:", "dex:"))
+            for market_id in (buy_market_id, sell_market_id)
+        )
+        or not _ROUTE_MODE.fullmatch(route_mode)
+        or route_mode != route_mode.strip()
+    ):
+        raise ValueError("route candidate identity is invalid")
     return "route:{}:{}->{}:{}".format(
         token_symbol, buy_market_id, sell_market_id, route_mode
     )
@@ -83,7 +104,14 @@ def validate_route_cohort_rows(
             raise ValueError("route candidate ID is not canonical")
         if candidate["buy_market_id"] == candidate["sell_market_id"]:
             raise ValueError("route candidate legs must be directional")
-        candidate_id = candidate.get("candidate_id") or route_id
+        candidate_id = candidate.get("candidate_id")
+        if candidate_id is None or candidate_id == "":
+            candidate_id = route_id
+        elif (
+            not isinstance(candidate_id, str)
+            or candidate_id != candidate_id.strip()
+        ):
+            raise ValueError("route candidate ID is invalid")
         if route_id in route_ids or candidate_id in candidate_ids:
             raise ValueError("duplicate route candidate")
         route_ids.add(route_id)
