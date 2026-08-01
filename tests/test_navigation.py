@@ -295,6 +295,18 @@ console.log(JSON.stringify({
             """
 const cases = {
   spread: navigation.parseRoute("/screener", "?sort=spread&scope=cex"),
+  spreadMax: navigation.parseRoute(
+    "/screener",
+    "?sort=spread_max&scope=dex",
+  ),
+  spreadMean: navigation.parseRoute(
+    "/screener",
+    "?sort=spread_mean&scope=combined",
+  ),
+  spreadMedian: navigation.parseRoute(
+    "/screener",
+    "?sort=spread_median&scope=cex",
+  ),
   return: navigation.parseRoute("/screener", "?sort=return&scope=combined"),
   volatility: navigation.parseRoute(
     "/screener",
@@ -307,6 +319,13 @@ console.log(JSON.stringify(cases));
         )
         self.assertEqual(result["spread"]["filters"]["sort"], "spread")
         self.assertEqual(result["spread"]["filters"]["scope"], "cross")
+        for key, field in (
+            ("spreadMax", "spread_max"),
+            ("spreadMean", "spread_mean"),
+            ("spreadMedian", "spread_median"),
+        ):
+            self.assertEqual(result[key]["filters"]["sort"], field)
+            self.assertEqual(result[key]["filters"]["scope"], "cross")
         self.assertEqual(result["return"]["filters"]["scope"], "cex")
         self.assertEqual(result["volatility"]["filters"]["scope"], "cex")
         self.assertEqual(result["dexTvl"]["filters"]["scope"], "dex")

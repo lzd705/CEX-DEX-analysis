@@ -260,6 +260,36 @@ class QualityOutcomeRuleTest(unittest.TestCase):
             "operator_review_source_outcome",
         )
 
+    def test_daily_status_aggregation_never_drops_a_retry_queue(self):
+        aggregate = self.required_helper(
+            "aggregate_daily_quality_status"
+        )
+        cases = (
+            (
+                {"needs_review": 1, "backfill_pending": 1},
+                "backfill_pending",
+            ),
+            (
+                {"needs_review": 1, "collection_failed": 1},
+                "collection_failed",
+            ),
+            (
+                {"collection_failed": 1, "backfill_pending": 1},
+                "collection_failed",
+            ),
+            (
+                {"needs_review": 2, "source_no_observation": 1},
+                "needs_review",
+            ),
+        )
+        for status_counts, expected in cases:
+            with self.subTest(status_counts=status_counts):
+                self.assertEqual(aggregate(status_counts), expected)
+        for invalid in ({}, {"unknown": 1}):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    aggregate(invalid)
+
     def test_tvl_normalizer_preserves_bounded_terminal_absence(self):
         normalize_tvl_source_outcome = self.required_helper(
             "normalize_tvl_source_outcome"

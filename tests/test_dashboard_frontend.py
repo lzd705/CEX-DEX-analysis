@@ -2880,6 +2880,68 @@ console.log(JSON.stringify({ observed, unavailable }));
             },
         )
 
+    def test_all_symmetric_gap_metrics_sort_both_directions_with_missing_last(self):
+        result = run_app_javascript(
+            """
+const sortField = { value: "spread" };
+global.document = {
+  getElementById(id) {
+    return id === "sort-field" ? sortField : null;
+  },
+};
+const fields = {
+  spread: "absolute_price_gap",
+  spread_max: "maximum_absolute_price_spread",
+  spread_mean: "mean_absolute_price_spread",
+  spread_median: "median_absolute_price_spread",
+};
+function token(symbol, property, value) {
+  return {
+    token_symbol: symbol,
+    absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+    [property]: value,
+  };
+}
+const orders = {};
+Object.entries(fields).forEach(([field, property]) => {
+  sortField.value = field;
+  const rows = [
+    token("TIE_B", property, 0.2),
+    token("MISSING", property, null),
+    token("HIGH", property, 0.3),
+    token("LOW", property, 0.1),
+    token("TIE_A", property, 0.2),
+  ];
+  app.sortDirection = "asc";
+  const ascending = [...rows]
+    .sort(compareScreenerTokens)
+    .map((row) => row.token_symbol);
+  app.sortDirection = "desc";
+  const descending = [...rows]
+    .sort(compareScreenerTokens)
+    .map((row) => row.token_symbol);
+  orders[field] = { ascending, descending };
+});
+console.log(JSON.stringify(orders));
+"""
+        )
+
+        for field in (
+            "spread",
+            "spread_max",
+            "spread_mean",
+            "spread_median",
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(
+                    result[field]["ascending"],
+                    ["LOW", "TIE_A", "TIE_B", "HIGH", "MISSING"],
+                )
+                self.assertEqual(
+                    result[field]["descending"],
+                    ["HIGH", "TIE_A", "TIE_B", "LOW", "MISSING"],
+                )
+
     def test_workspace_heading_distinguishes_markets_from_token_research(self):
         result = run_app_javascript(
             """
@@ -2923,20 +2985,83 @@ console.log(JSON.stringify({ markets, research }));
         result = run_app_javascript(
             """
 console.log(JSON.stringify({
-  spread: SCREENER_SORT_DEFINITIONS.spread,
+  spread: ["spread", "spread_max", "spread_mean", "spread_median"].map(
+    (field) => SCREENER_SORT_DEFINITIONS[field],
+  ),
   returns: SCREENER_SORT_DEFINITIONS.return,
   volatility: SCREENER_SORT_DEFINITIONS.volatility,
   tvl: SCREENER_SORT_DEFINITIONS.dex_tvl,
 }));
 """
         )
-        self.assertEqual(result["spread"]["allowedScopes"], ["cross"])
-        self.assertEqual(result["spread"]["defaultScope"], "cross")
+        for definition in result["spread"]:
+            self.assertEqual(definition["allowedScopes"], ["cross"])
+            self.assertEqual(definition["defaultScope"], "cross")
         self.assertNotIn("combined", result["returns"]["allowedScopes"])
         self.assertEqual(result["returns"]["defaultScope"], "cex")
         self.assertNotIn("combined", result["volatility"]["allowedScopes"])
         self.assertEqual(result["volatility"]["defaultScope"], "cex")
         self.assertEqual(result["tvl"]["allowedScopes"], ["dex"])
+
+    def test_all_symmetric_gap_metrics_render_fixed_cross_venue_scope(self):
+        result = run_app_javascript(
+            """
+const sortField = { value: "spread" };
+const scopeGroup = { hidden: false };
+const fixedChip = { hidden: true, textContent: "" };
+const rankHeading = { textContent: "", title: "" };
+const scopeButtons = ["combined", "cex", "dex"].map((scope) => ({
+  dataset: { scope },
+  textContent: scope,
+  hidden: false,
+  disabled: false,
+  attributes: {},
+  classList: { toggle() {} },
+  setAttribute(name, value) { this.attributes[name] = String(value); },
+}));
+global.document = {
+  getElementById(id) {
+    return {
+      "sort-field": sortField,
+      "sort-scope-buttons": scopeGroup,
+      "sort-scope-fixed": fixedChip,
+      "rank-value-heading": rankHeading,
+    }[id] || null;
+  },
+  querySelectorAll(selector) {
+    return selector === "[data-scope]" ? scopeButtons : [];
+  },
+};
+const states = {};
+["spread", "spread_max", "spread_mean", "spread_median"].forEach((field) => {
+  sortField.value = field;
+  app.scope = "cex";
+  app.sortDirection = "desc";
+  syncScreenerSortControls();
+  states[field] = {
+    scope: app.scope,
+    groupHidden: scopeGroup.hidden,
+    chipHidden: fixedChip.hidden,
+    chipText: fixedChip.textContent,
+    buttonsHidden: scopeButtons.map((button) => button.hidden),
+    heading: rankHeading.textContent,
+  };
+});
+console.log(JSON.stringify(states));
+"""
+        )
+
+        for field, state in result.items():
+            with self.subTest(field=field):
+                self.assertEqual(state["scope"], "cross")
+                self.assertTrue(state["groupHidden"])
+                self.assertFalse(state["chipHidden"])
+                self.assertEqual(
+                    state["chipText"],
+                    "Cross-venue · Primary CEX ↔ DEX",
+                )
+                self.assertEqual(state["buttonsHidden"], [True, True, True])
+                self.assertIn("Cross-venue", state["heading"])
 
     def test_cross_venue_is_metric_context_and_missing_facts_explain_recovery(self):
         index = INDEX_PATH.read_text(encoding="utf-8")

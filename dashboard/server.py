@@ -51,6 +51,7 @@ try:
         market_series_statistics,
     )
     from scripts.quality_outcomes import (
+        aggregate_daily_quality_status,
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
         cex_reason_code,
@@ -101,6 +102,7 @@ except ModuleNotFoundError:
         market_series_statistics,
     )
     from scripts.quality_outcomes import (
+        aggregate_daily_quality_status,
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
         cex_reason_code,
@@ -4331,10 +4333,7 @@ def _overlay_daily_quality_report(
     status_counts = Counter(issue["status"] for issue in issues)
     reason_counts = Counter(issue["reason_code"] for issue in issues)
     affected_dates = sorted({issue["date"] for issue in issues})
-    status = min(
-        status_counts,
-        key=lambda candidate: DAILY_QUALITY_STATUS_PRIORITY[candidate],
-    )
+    status = aggregate_daily_quality_status(status_counts)
     retryable = any(issue["retryable"] for issue in issues)
     has_manual_review = bool(status_counts.get("needs_review"))
     if retryable and has_manual_review:

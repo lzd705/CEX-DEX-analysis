@@ -6,6 +6,32 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 
+_DAILY_QUALITY_STATUS_PRIORITY = {
+    "collection_failed": 0,
+    "needs_review": 1,
+    "backfill_pending": 2,
+    "source_no_observation": 3,
+    "unsupported": 4,
+}
+_DAILY_RETRYABLE_STATUSES = frozenset(
+    {"collection_failed", "backfill_pending"}
+)
+
+
+def aggregate_daily_quality_status(status_counts):
+    """Preserve a retryable daily issue when manual review also exists."""
+
+    statuses = set(status_counts or {})
+    if not statuses or not statuses.issubset(_DAILY_QUALITY_STATUS_PRIORITY):
+        raise ValueError("daily quality statuses are invalid")
+    retryable_statuses = statuses & _DAILY_RETRYABLE_STATUSES
+    candidates = retryable_statuses or statuses
+    return min(
+        candidates,
+        key=lambda status: _DAILY_QUALITY_STATUS_PRIORITY[status],
+    )
+
+
 @dataclass(frozen=True)
 class QualityOutcomeRule:
     retryable: bool

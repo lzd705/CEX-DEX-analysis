@@ -28,6 +28,7 @@ try:
         cex_market_ids_sha256,
     )
     from scripts.quality_outcomes import (
+        aggregate_daily_quality_status,
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
     )
@@ -35,6 +36,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from cex_instrument_lifecycle import configured_market_ids_sha256
     from token_registry import canonical_cex_market_ids, cex_market_ids_sha256
     from quality_outcomes import (
+        aggregate_daily_quality_status,
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
     )
@@ -1296,10 +1298,12 @@ def _validate_daily_fact_evidence(
                     "action": fact.get("action"),
                 },
             }
-        expected_status = min(
-            status_counts,
-            key=lambda candidate: DAILY_QUALITY_STATUS_PRIORITY[candidate],
-        )
+        try:
+            expected_status = aggregate_daily_quality_status(status_counts)
+        except ValueError as error:
+            raise ReleaseCheckError(
+                "Quality daily fact status aggregation is invalid"
+            ) from error
         expected_reason = (
             next(iter(reason_counts))
             if len(reason_counts) == 1

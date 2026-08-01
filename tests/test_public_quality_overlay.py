@@ -467,6 +467,81 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
             market_b="dex:eth:uniswap:0xpool:BTC",
         )
 
+    def test_manual_review_and_backfill_preserve_retry_and_manual_queues(self):
+        self.write_report(
+            [
+                self.issue(
+                    "2026-01-04",
+                    "not_listed",
+                    "needs_review",
+                    False,
+                ),
+                self.issue(
+                    "2026-01-04",
+                    "missing_unexplained",
+                    "backfill_pending",
+                    True,
+                ),
+            ]
+        )
+
+        market_a = "cex:binance:BTC/USDT"
+        market_b = "dex:eth:uniswap:0xpool:BTC"
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            selected = server.build_market_quality(
+                "BTC",
+                scope="selected",
+                market_a_id=market_a,
+                market_b_id=market_b,
+                start="2026-01-04",
+                end="2026-01-04",
+            )
+        market = next(
+            row for row in selected["markets"]
+            if row["market_id"] == market_a
+        )
+        fact = market["facts"]["daily"]
+
+        self.assertEqual(fact["status"], "backfill_pending")
+        self.assertEqual(
+            fact["reason_code"],
+            "multiple_daily_quality_reasons",
+        )
+        self.assertTrue(fact["retryable"])
+        self.assertEqual(
+            fact["action"],
+            "operator_review_retry_and_manual_queues",
+        )
+        self.assertEqual(
+            fact["issue_status_counts"],
+            {"backfill_pending": 1, "needs_review": 1},
+        )
+        self.assertEqual(
+            fact["reason_code_counts"],
+            {"missing_unexplained": 1, "not_listed": 1},
+        )
+        self.assertEqual(
+            fact["issue_outcome_counts"],
+            [
+                {
+                    "status": "backfill_pending",
+                    "reason_code": "missing_unexplained",
+                    "count": 1,
+                },
+                {
+                    "status": "needs_review",
+                    "reason_code": "not_listed",
+                    "count": 1,
+                },
+            ],
+        )
+        validate_quality(
+            selected,
+            token="BTC",
+            market_a=market_a,
+            market_b=market_b,
+        )
+
     def test_matched_report_binds_explicit_evidence_to_each_market(self):
         self.write_report(
             [
