@@ -102,6 +102,116 @@ request.  They remain excluded and null rather than being assumed to be zero.
 The fields are named `quoted_execution_cost_*`; they must not be described as
 realized or all-in cost.
 
+## Route cost-component facts
+
+The fixed-notional contract above remains unchanged. Route evaluation uses a
+separate `execution_cost_component/v1` fact contract implemented by
+`scripts.execution_cost_components`. It records the provenance and strictness
+of each route-specific cost without redefining a quoted execution shortfall as
+an all-in cost.
+
+### Grain and identity
+
+One component row has the fixed key:
+
+```text
+cohort_id × opportunity_id × leg × component_type
+```
+
+`opportunity_id` identifies one directed route and requested-notional scenario.
+Every row for that opportunity must retain the same positive
+`requested_notional_usd` and positive common `target_token_quantity`. `leg` is
+exactly `buy`, `sell`, or `route`; buy and sell rows retain their canonical
+market ID and direction, while a route-level row has a blank market ID and the
+direction `route`. Duplicate component keys and conflicting leg/scenario
+identity reject the inventory. The row schema is closed: missing or additional
+columns, non-string schema keys, unknown legs/directions, and a leg whose market
+or direction changes within one opportunity all fail with a controlled contract
+error.
+
+The required strict component inventory is:
+
+```text
+venue_taker_fee
+pool_swap_fee
+network_gas
+router_or_integrator_fee
+token_transfer_tax
+rebalancing_or_transfer
+```
+
+Every kind must be represented, including a proven `not_applicable` row when
+the route contract establishes that the cost does not apply. Absence is not a
+zero. `mev_buffer` is an optional research-scenario component and is never
+required to complete the strict inventory.
+
+### Numeric and evidence contract
+
+All stored quantities, USD amounts, and bps rates are canonical base-10
+strings. Binary floating-point input, negative values, non-finite values, zero
+notional, and zero Token quantity are rejected. A numeric component must retain
+both `amount_usd` and `rate_bps`, with this exact identity:
+
+```text
+amount_usd × 10,000
+  = rate_bps × requested_notional_usd
+```
+
+Its non-empty `basis` states the calculation or applicability proof. The exact
+requested notional is therefore the bps denominator; no implicit capital basis
+is allowed. Validation and aggregation decompose every finite Decimal into its
+integer coefficient and base-10 exponent. Equality and sums use arbitrary-
+precision integer arithmetic, not the process Decimal context or an arbitrary
+fixed precision. Lowering the caller's Decimal precision therefore cannot make
+an approximate rate pass or truncate a large aggregate.
+
+Allowed component value statuses are:
+
+```text
+measured authenticated quoted bounded_estimate assumed
+not_applicable unavailable unsupported failed stale
+```
+
+`measured`, `authenticated`, and `quoted` values require a timezone-aware RFC
+3339 observation time and a lowercase 64-hex source-record SHA-256.
+Authenticated and quoted evidence additionally requires a `valid_until` later
+than its observation time. `bounded_estimate` and `assumed` are always strict
+ineligible. `unavailable`, `unsupported`, `failed`, and `stale` are also strict
+ineligible, require a stable reason code, and contain null amount/rate fields.
+A proven `not_applicable` row is strict eligible but contains no numeric zero.
+
+`mev_buffer` is narrower than the general status inventory. It may be
+`bounded_estimate`, `assumed`, or a non-numeric terminal status only. It may
+never be `measured`, `authenticated`, `quoted`, or `not_applicable`, is always
+strict ineligible, and is excluded defensively from the strict total. When
+explicit assumptions are enabled, a numeric MEV buffer contributes only to the
+scenario total.
+
+Pool swap fees are already part of the exact DEX leg quote. A numeric
+`pool_swap_fee` row must therefore set `embedded_in_leg_quote = true`; no other
+component may do so. Aggregation records that evidence but excludes the amount
+from every non-embedded additive total, preventing the fee from being charged
+twice.
+
+### Aggregation
+
+`aggregate_cost_components(rows, include_assumptions)` accepts one opportunity
+and returns exact Decimal strings or null:
+
+- `strict_amount_usd` is present only when all six required kinds have strict
+  evidence or proven non-applicability;
+- `scenario_amount_usd` may also use `bounded_estimate` and `assumed` rows only
+  when `include_assumptions` is true;
+- `missing_required_kinds` and `scenario_missing_required_kinds` name every
+  incomplete kind;
+- `completeness` and `scenario_completeness` are explicitly `complete` or
+  `incomplete`.
+
+An incomplete aggregate has a null total even when some known component rows
+are numeric. This prevents a partial sum from being presented as an all-in
+route cost. A complete all-`not_applicable` inventory may produce a calculated
+aggregate zero; that differs from converting absent evidence to zero.
+
 ## Long-form grain and identity
 
 One row is one:
