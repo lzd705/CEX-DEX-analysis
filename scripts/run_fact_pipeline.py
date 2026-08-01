@@ -76,6 +76,41 @@ def _counter_dict(values: Sequence[str]) -> Dict[str, int]:
     return dict(sorted(Counter(values).items()))
 
 
+def _is_retirable_legacy_upbit_alias(attempt: Mapping[str, Any]) -> bool:
+    """Recognize the one historical alias shape that must never be carried.
+
+    Older collectors recorded a successful configured ``TOKEN/USDT`` Upbit
+    attempt while sourcing ``TOKEN/KRW``.  The current collector correctly
+    rejects every cross-instrument alias.  During a one-time append/migration,
+    however, the old published report still has to pass its lineage and summary
+    checks before that already-successful evidence can be discarded.
+
+    Keep this predicate deliberately exact.  It is not an alias allow-list for
+    collection: matching rows are normalized only for report validation and
+    are then excluded from carry-forward evidence.
+    """
+
+    token = attempt.get("token_symbol")
+    return (
+        attempt.get("market_type") == "cex"
+        and isinstance(token, str)
+        and bool(token)
+        and token == token.strip().upper()
+        and attempt.get("exchange") == "upbit"
+        and attempt.get("instrument") == "{}/USDT".format(token)
+        and attempt.get("source_instrument") == "{}/KRW".format(token)
+        and attempt.get("source_instrument_alias_validated") is True
+        and attempt.get("status") == "succeeded"
+        and attempt.get("outcome") == "observed"
+        and attempt.get("reason_code") == "observed"
+        and attempt.get("chain") is None
+        and attempt.get("dex") is None
+        and attempt.get("pool_address") is None
+        and attempt.get("http_status") is None
+        and attempt.get("error") is None
+    )
+
+
 def _published_lineage(data_dir: Path) -> Dict[str, Any]:
     database_path = data_dir / DATABASE_FILENAME
     if not database_path.exists():
@@ -195,12 +230,25 @@ def load_append_attempt_evidence(data_dir: Path) -> Dict[str, list[Dict[str, Any
             if market_type not in grouped_raw:
                 raise ValueError("quality collection attempt has invalid market type")
             grouped_raw[str(market_type)].append(attempt)
+        validation_attempts: Dict[str, list[Mapping[str, Any]]] = {
+            "cex": [],
+            "dex": [],
+        }
+        for market_type, attempts in grouped_raw.items():
+            for attempt in attempts:
+                if _is_retirable_legacy_upbit_alias(attempt):
+                    validation_attempt = dict(attempt)
+                    validation_attempt["source_instrument"] = attempt["instrument"]
+                    validation_attempt["source_instrument_alias_validated"] = False
+                    validation_attempts[market_type].append(validation_attempt)
+                else:
+                    validation_attempts[market_type].append(attempt)
         normalized = {
             market_type: normalize_collection_attempts(
                 attempts,
                 market_type=market_type,
             )
-            for market_type, attempts in grouped_raw.items()
+            for market_type, attempts in validation_attempts.items()
         }
 
         raw_attempt_sources = report.get("attempt_sources")

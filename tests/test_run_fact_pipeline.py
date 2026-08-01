@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from collections import Counter
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -129,6 +130,27 @@ def dex_attempt(
 
 
 class RunFactPipelineTest(unittest.TestCase):
+    @staticmethod
+    def rewrite_quality_attempt_summaries(report):
+        attempts = report["collection_attempts"]
+        report["collection_attempt_summary"]["attempt_count"] = len(attempts)
+        report["collection_attempt_summary"]["status_counts"] = dict(
+            sorted(Counter(item["status"] for item in attempts).items())
+        )
+        report["collection_attempt_summary"]["reason_code_counts"] = dict(
+            sorted(Counter(item["reason_code"] for item in attempts).items())
+        )
+        for source in report["attempt_sources"]:
+            source_attempts = [
+                item
+                for item in attempts
+                if item["market_type"] == source["market_type"]
+            ]
+            source["attempt_count"] = len(source_attempts)
+            source["reason_counts"] = dict(
+                sorted(Counter(item["reason_code"] for item in source_attempts).items())
+            )
+
     def publish_gap_fixture(
         self,
         root,
@@ -527,6 +549,100 @@ class RunFactPipelineTest(unittest.TestCase):
                     ("dex", "no_candles", "source_no_observation"),
                 },
             )
+
+    def test_append_retires_only_legacy_successful_upbit_krw_alias_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _source, data_dir = self.publish_gap_fixture(root)
+            report_path = data_dir / run_fact_pipeline.QUALITY_REPORT_PATH
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            original_cex_failure = next(
+                item
+                for item in report["collection_attempts"]
+                if item["market_type"] == "cex"
+            )
+            dex_failure = next(
+                item
+                for item in report["collection_attempts"]
+                if item["market_type"] == "dex"
+            )
+            legacy = dict(original_cex_failure)
+            legacy.update(
+                attempt_id=dex_failure["attempt_id"],
+                exchange="upbit",
+                instrument="UNI/USDT",
+                source_instrument="UNI/KRW",
+                source_instrument_alias_validated=True,
+                status="succeeded",
+                outcome="observed",
+                reason_code="observed",
+                observed_dates=["2026-07-02"],
+                observed_day_count=1,
+                error=None,
+                http_status=None,
+            )
+            report["collection_attempts"].append(legacy)
+            self.rewrite_quality_attempt_summaries(report)
+            report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+            carried = run_fact_pipeline.load_append_attempt_evidence(data_dir)
+
+            self.assertEqual(len(carried["cex"]), 1)
+            self.assertEqual(carried["cex"][0]["attempt_id"], original_cex_failure["attempt_id"])
+            self.assertEqual(len(carried["dex"]), 1)
+            self.assertEqual(carried["dex"][0]["attempt_id"], dex_failure["attempt_id"])
+
+    def test_append_rejects_nonexact_legacy_upbit_alias_variants(self):
+        variants = {
+            "exchange": {"exchange": "Upbit"},
+            "status": {
+                "status": "failed",
+                "outcome": "request_failed",
+                "reason_code": "network",
+                "observed_dates": [],
+                "observed_day_count": 0,
+                "error": "The source request failed while collecting daily candles.",
+            },
+            "source_quote": {"source_instrument": "UNI/BTC"},
+            "configured_quote": {"instrument": "UNI/USD"},
+            "token": {"token_symbol": "AAVE"},
+            "validation_flag": {"source_instrument_alias_validated": False},
+            "non_boolean_validation_flag": {
+                "source_instrument_alias_validated": 1,
+            },
+            "cex_shape": {"chain": "eth"},
+            "success_shape": {"http_status": 200},
+        }
+        for name, updates in variants.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _source, data_dir = self.publish_gap_fixture(root)
+                report_path = data_dir / run_fact_pipeline.QUALITY_REPORT_PATH
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                legacy = next(
+                    item
+                    for item in report["collection_attempts"]
+                    if item["market_type"] == "cex"
+                )
+                legacy.update(
+                    exchange="upbit",
+                    instrument="UNI/USDT",
+                    source_instrument="UNI/KRW",
+                    source_instrument_alias_validated=True,
+                    status="succeeded",
+                    outcome="observed",
+                    reason_code="observed",
+                    observed_dates=["2026-07-02"],
+                    observed_day_count=1,
+                    error=None,
+                    http_status=None,
+                )
+                legacy.update(updates)
+                self.rewrite_quality_attempt_summaries(report)
+                report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+
+                with self.assertRaises(run_fact_pipeline.CarryForwardEvidenceError):
+                    run_fact_pipeline.load_append_attempt_evidence(data_dir)
 
     def test_overlapping_new_attempt_replaces_only_the_intersecting_old_window(self):
         old_attempt = cex_attempt(
