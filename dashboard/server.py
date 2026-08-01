@@ -39,6 +39,7 @@ try:
     )
     from dashboard.freshness import build_source_freshness
     from dashboard.market_facts import (
+        LIFECYCLE_QUALITY_FLAG_MESSAGES,
         MARKET_QUALITY_THRESHOLDS,
         attach_explicit_dex_counts,
         build_token_summaries as build_fact_token_summaries,
@@ -91,6 +92,7 @@ except ModuleNotFoundError:
     )
     from freshness import build_source_freshness
     from market_facts import (
+        LIFECYCLE_QUALITY_FLAG_MESSAGES,
         MARKET_QUALITY_THRESHOLDS,
         attach_explicit_dex_counts,
         build_token_summaries as build_fact_token_summaries,
@@ -2563,14 +2565,7 @@ SCREENING_QUALITY_FLAG_CODES = frozenset(
     }
 )
 SCREENING_QUALITY_FLAG_MESSAGES = {
-    "inactive_cex_instrument": (
-        "The instrument was absent from the official current exchange catalog; "
-        "historical rows are withheld from current facts."
-    ),
-    "stale_cex_lifecycle_evidence": (
-        "The official instrument-catalog evidence is older than 36 hours; "
-        "current facts remain withheld until the listing state is rechecked."
-    ),
+    **LIFECYCLE_QUALITY_FLAG_MESSAGES,
     "depth_unavailable": "No executable-depth observation is available.",
     "depth_unsupported": "Executable depth is unsupported for this market.",
     "depth_partial": (

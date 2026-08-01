@@ -49,6 +49,16 @@ QUALITY_FLAG_CATEGORIES = {
     "wide_quoted_spread": "market_condition",
     "low_daily_coverage": "data_health",
 }
+LIFECYCLE_QUALITY_FLAG_MESSAGES = {
+    "inactive_cex_instrument": (
+        "The instrument was absent from the official current exchange catalog; "
+        "historical rows are withheld from current facts."
+    ),
+    "stale_cex_lifecycle_evidence": (
+        "The official instrument-catalog evidence is older than 36 hours; "
+        "current facts remain withheld until the listing state is rechecked."
+    ),
+}
 CEX_CURRENT_FACT_WITHHELD_STATUSES = frozenset(
     {
         "absent_from_official_current_catalog",
@@ -269,11 +279,7 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
             _quality_flag(
                 "inactive_cex_instrument",
                 "critical",
-                (
-                    "This instrument was absent from the official current "
-                    "exchange catalog at the recorded check. Historical rows "
-                    "are withheld from current facts; no delisting date is inferred."
-                ),
+                LIFECYCLE_QUALITY_FLAG_MESSAGES["inactive_cex_instrument"],
                 observed_value=row.get("current_listing_checked_at"),
                 threshold="present_in_official_current_catalog",
             )
@@ -287,11 +293,9 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
             _quality_flag(
                 "stale_cex_lifecycle_evidence",
                 "critical",
-                (
-                    "Current facts remain withheld because the last official "
-                    "instrument-catalog check is older than the freshness "
-                    "contract. The listing state is unknown until rechecked."
-                ),
+                LIFECYCLE_QUALITY_FLAG_MESSAGES[
+                    "stale_cex_lifecycle_evidence"
+                ],
                 observed_value=row.get("current_listing_checked_at"),
                 threshold="official_catalog_check_within_36_hours",
             )

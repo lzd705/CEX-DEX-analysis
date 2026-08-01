@@ -2934,8 +2934,16 @@ class MarketMonitorServerTest(unittest.TestCase):
                     for flag in execution["quality_flags"]
                     if flag["code"] == expected_code
                 )
+                selected_flag = next(
+                    flag
+                    for flag in server.enrich_market_quality(market)[
+                        "quality_flag_details"
+                    ]
+                    if flag["code"] == expected_code
+                )
 
                 self.assertEqual(daily_flag, execution_flag)
+                self.assertEqual(daily_flag, selected_flag)
 
     def test_configured_upbit_identity_metadata_is_hash_bound_and_propagates_to_catalog(self):
         attach = getattr(
