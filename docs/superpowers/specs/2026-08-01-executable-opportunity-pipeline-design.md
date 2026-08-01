@@ -112,6 +112,7 @@ Every run declares:
 - `target_observed_at` in canonical UTC;
 - `collection_started_at` and `collection_deadline_at`;
 - `skew_sla_seconds = 60`;
+- `route_age_sla_seconds = 120`;
 - the exact candidate-universe generation.
 
 Unique route legs are collected in parallel around the target time:
@@ -139,6 +140,10 @@ skew_seconds = abs(buy_state_epoch - sell_state_epoch)
 The calculation preserves fractional seconds with Decimal or integer epoch
 units. `60.000000` seconds passes; any value greater than 60 seconds fails.
 Missing, naive, malformed, or unreasonably future timestamps fail the route.
+The public API also compares the newest leg time with its current response
+clock. A cohort older than 120 seconds remains auditable but is strict
+unavailable with `cohort_stale`; bounded skew alone cannot make old quotes
+executable.
 
 ### Route isolation
 
@@ -148,6 +153,7 @@ the route with no opportunity values and one stable reason:
 - `route_deadline_exceeded`;
 - `buy_leg_unavailable` or `sell_leg_unavailable`;
 - `snapshot_skew_exceeded`;
+- `cohort_stale`;
 - `invalid_state_timestamp`;
 - `execution_adapter_unsupported`;
 - `cost_components_incomplete`;
@@ -281,12 +287,35 @@ data/local/routes/bundles/<route_cohort_id>/
 The manifest hashes every file and records schema versions, candidate source
 generation, collection deadline, route/status counts, observation bounds,
 cost-completeness counts, adapter versions, and the exact fee-profile
-generation. `data/local/routes/latest.json` is replaced only after the entire
-bundle validates. The API reads through that pointer and never assembles a
-stable-looking route from mutable CEX and DEX latest files.
+generation. Route-core preflight bundles live below
+`data/local/routes/core/bundles/` and use the private
+`data/local/routes/core/latest.json` pointer. The public complete pointer,
+`data/local/routes/latest.json`, is replaced only after all leg, cost, and
+opportunity files validate. The API reads only the complete pointer and never
+assembles a stable-looking route from either a core-only bundle or mutable CEX
+and DEX latest files.
 
 The existing daily, TVL, depth, and execution publications remain unchanged.
 Raw route transcripts use bounded retention and content hashes.
+
+Strict `prepositioned_inventory` eligibility also consumes a private,
+read-only inventory evidence profile. It proves the available quote asset on
+the buy venue and net Token quantity on the sell venue, retains observation
+and expiry times plus an opaque profile hash, and never publishes account or
+wallet identity. Missing, stale, or insufficient evidence yields
+`inventory_unavailable` or `inventory_insufficient`; it is never inferred from
+market depth.
+
+The first release does not call independent DEX leg quotes atomic. A DEX–DEX
+route remains a Research Estimate with
+`atomic_route_simulation_unavailable` until one route-composition adapter
+builds and simulates the complete two-leg calldata at the cohort block,
+including allowance, native-value, router-fee, gas, and final-output evidence.
+
+The production route timer runs every two minutes under the existing
+collection lock. A missed or failed cycle leaves the last validated bundle in
+place with its real timestamp; it never extends freshness or rewrites an old
+cohort as current.
 
 ## 6. API and dashboard
 
