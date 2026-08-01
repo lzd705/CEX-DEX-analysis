@@ -47,7 +47,10 @@ except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
 try:
-    from scripts.collection_deadline import CollectionDeadline
+    from scripts.collection_deadline import (
+        CollectionDeadline,
+        CollectionDeadlineExceeded,
+    )
     from scripts.atomic_publication import atomic_replace_bundle, csv_payload
     from scripts.bounded_snapshot_merge import (
         merge_exact_market_snapshot,
@@ -77,7 +80,7 @@ try:
     )
     from scripts.timestamp_contract import validate_observation_bounds
 except ModuleNotFoundError:
-    from collection_deadline import CollectionDeadline
+    from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
     from atomic_publication import atomic_replace_bundle, csv_payload
     from bounded_snapshot_merge import (
         merge_exact_market_snapshot,
@@ -486,6 +489,8 @@ def http_json_rpc(
                 raw = response.read()
                 return json.loads(raw.decode("utf-8")), raw
         except urllib.error.HTTPError as error:
+            if deadline is not None:
+                deadline.require_remaining()
             retryable = error.code == 429 or 500 <= error.code < 600
             if not retryable or attempt + 1 >= max_retries:
                 raise
@@ -496,6 +501,8 @@ def http_json_rpc(
             else:
                 time.sleep(delay)
         except urllib.error.URLError:
+            if deadline is not None:
+                deadline.require_remaining()
             if attempt + 1 >= max_retries:
                 raise
             delay = max(1.0, 2 ** attempt)
@@ -522,12 +529,15 @@ class RpcClient:
         self.endpoint = sanitize_endpoint(url)
         self.request = request
         self.deadline = deadline
+        self._call_deadline = deadline
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.records: list[dict[str, Any]] = []
         self._next_id = 1
 
     def _send(self, payload: Any) -> Any:
+        if self._call_deadline is not None:
+            self._call_deadline.require_remaining()
         if (
             self.deadline is None
             and self.timeout_seconds == 30
@@ -615,6 +625,30 @@ class RpcClient:
                     raise RpcError(f"eth_call failed: {response_item}")
                 results.append(response_item["result"])
             return results
+
+
+class _DeadlineBoundRpcClient:
+    """Check a deadline before each call while preserving client-owned state."""
+
+    def __init__(self, client: RpcClient, deadline: CollectionDeadline) -> None:
+        self._client = client
+        self._deadline = deadline
+        if isinstance(client, RpcClient):
+            client._call_deadline = deadline
+        self.records = client.records
+        self.endpoint = client.endpoint
+
+    def block_number(self) -> int:
+        self._deadline.require_remaining()
+        return self._client.block_number()
+
+    def block(self, block_tag: str) -> dict[str, Any]:
+        self._deadline.require_remaining()
+        return self._client.block(block_tag)
+
+    def eth_calls(self, to: str, data_values: list[str], block_tag: str) -> list[str]:
+        self._deadline.require_remaining()
+        return self._client.eth_calls(to, data_values, block_tag)
 
 
 def words(hex_data: str) -> list[str]:
@@ -1795,6 +1829,8 @@ def collect_dex_pool_observation(
     deadline: CollectionDeadline | None = None,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Collect one DEX pool with isolated client state unless one is supplied."""
+    if deadline is not None:
+        deadline.require_remaining()
     request_started_at = utc_now_text()
     protocol, unsupported_reason = protocol_model(
         pool["dex"],
@@ -1847,14 +1883,19 @@ def collect_dex_pool_observation(
             client = rpc_factory(chain, rpc_url)
         else:
             client = rpc_factory(chain, rpc_url, deadline=deadline)
-    record_start = len(client.records)
+    active_client = (
+        _DeadlineBoundRpcClient(client, deadline)
+        if deadline is not None
+        else client
+    )
+    record_start = len(active_client.records)
     block_number = fixed_block_number
     block_timestamp = fixed_block_timestamp
     try:
         if block_number is None:
-            block_number = client.block_number()
+            block_number = active_client.block_number()
         if not block_timestamp:
-            block = client.block(hex(block_number))
+            block = active_client.block(hex(block_number))
             returned_number = block.get("number")
             if returned_number is not None:
                 normalized_number = (
@@ -1870,7 +1911,7 @@ def collect_dex_pool_observation(
             snapshot_id=snapshot_id,
             block_number=block_number,
             block_timestamp=block_timestamp,
-            client=client,
+            client=active_client,
             request_started_at=request_started_at,
             raw_response_sha256="",
             protocol=protocol,
@@ -1878,20 +1919,22 @@ def collect_dex_pool_observation(
         transcript = raw_transcript_bytes(
             pool=pool,
             block_number=block_number,
-            endpoint=client.endpoint,
-            records=client.records[record_start:],
+            endpoint=active_client.endpoint,
+            records=active_client.records[record_start:],
         )
         raw_path.write_bytes(transcript)
         raw_hash = hashlib.sha256(transcript).hexdigest()
         row["raw_response_sha256"] = raw_hash
         for execution_row in pool_execution_rows:
             execution_row["raw_response_sha256"] = raw_hash
+    except CollectionDeadlineExceeded:
+        raise
     except Exception as error:
         transcript = raw_transcript_bytes(
             pool=pool,
             block_number=block_number,
-            endpoint=client.endpoint,
-            records=client.records[record_start:],
+            endpoint=active_client.endpoint,
+            records=active_client.records[record_start:],
             error=error,
         )
         raw_path.write_bytes(transcript)
@@ -1915,7 +1958,7 @@ def collect_dex_pool_observation(
                     else ""
                 ),
                 "usd_price_freshness_status": price_timing["status"],
-                "source_endpoint": client.endpoint,
+                "source_endpoint": active_client.endpoint,
                 "raw_response_sha256": raw_hash,
                 "status": "failed",
                 "error": f"{type(error).__name__}: {error}",
@@ -1937,7 +1980,7 @@ def collect_dex_pool_observation(
             error=f"{type(error).__name__}: {error}",
             block_number=block_number,
             block_timestamp=block_timestamp,
-            source_endpoint=client.endpoint,
+            source_endpoint=active_client.endpoint,
             raw_response_sha256=raw_hash,
         )
     return row, pool_execution_rows

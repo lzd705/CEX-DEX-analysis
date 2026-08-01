@@ -1699,7 +1699,7 @@ class DexDepthCollectionTest(unittest.TestCase):
             (self.root / "processed" / EXECUTION_CURRENT_FILENAME).exists()
         )
 
-    def test_one_pool_primitive_matches_full_collector_rows_and_transcript_hash(self):
+    def test_one_pool_primitive_matches_independent_golden_rows_and_transcript_hash(self):
         from scripts.fetch_dex_depth import collect_dex_pool_observation
 
         timestamp = "2026-08-01T12:00:00+00:00"
@@ -1707,35 +1707,328 @@ class DexDepthCollectionTest(unittest.TestCase):
             "scripts.fetch_dex_depth.utc_now_text",
             return_value=timestamp,
         ):
-            snapshot_id, full_depth, full_execution = (
-                collect_dex_depth_with_execution(
-                    [self.pool],
-                    raw_root=self.root / "full",
-                    sleep_seconds=0,
-                    rpc_factory=FakeV2Rpc,
-                )
-            )
             one_depth, one_execution = collect_dex_pool_observation(
                 self.pool,
-                snapshot_id=snapshot_id,
+                snapshot_id="golden-dex-1",
                 raw_path=self.root / "one.json",
                 rpc_factory=FakeV2Rpc,
             )
 
-        full_raw = (
-            self.root
-            / "full"
-            / snapshot_id
-            / "001-eth-AAVE-uniswap_v2.json"
-        ).read_bytes()
         one_raw = (self.root / "one.json").read_bytes()
-        self.assertEqual(one_depth, full_depth[0])
-        self.assertEqual(one_execution, full_execution)
-        self.assertEqual(len(one_execution), 10)
-        self.assertEqual(one_raw, full_raw)
+        expected_raw = """{
+  "block_number": 123,
+  "pool": {
+    "chain": "eth",
+    "dex": "uniswap_v2",
+    "pool_address": "0x3333333333333333333333333333333333333333",
+    "token_symbol": "AAVE"
+  },
+  "records": [
+    {
+      "request": "block",
+      "response": "0x7b"
+    },
+    {
+      "request": {
+        "block": "0x7b",
+        "method": "eth_getBlockByNumber"
+      },
+      "response": {
+        "number": "0x7b",
+        "timestamp": "0x65920080"
+      }
+    },
+    {
+      "request": {
+        "block": "0x7b",
+        "data": [
+          "0x0dfe1681",
+          "0xd21220a7",
+          "0x0902f1ac"
+        ],
+        "to": "0x3333333333333333333333333333333333333333"
+      },
+      "response": "fixture"
+    },
+    {
+      "request": {
+        "block": "0x7b",
+        "data": [
+          "0x313ce567",
+          "0x95d89b41"
+        ],
+        "to": "0x1111111111111111111111111111111111111111"
+      },
+      "response": "fixture"
+    },
+    {
+      "request": {
+        "block": "0x7b",
+        "data": [
+          "0x313ce567",
+          "0x95d89b41"
+        ],
+        "to": "0x2222222222222222222222222222222222222222"
+      },
+      "response": "fixture"
+    }
+  ],
+  "source_endpoint": "https://rpc.example.test"
+}
+""".encode("utf-8")
+        expected_depth = {
+            "snapshot_id": "golden-dex-1",
+            "observed_at": timestamp,
+            "request_started_at": timestamp,
+            "response_received_at": timestamp,
+            "token_symbol": "AAVE",
+            "chain": "eth",
+            "dex": "uniswap_v2",
+            "pool_address": "0x3333333333333333333333333333333333333333",
+            "pool_name": "AAVE / USDC",
+            "protocol_model": "constant_product_v2",
+            "block_number": "123",
+            "block_timestamp": "2024-01-01T00:00:00+00:00",
+            "target_token_address": "0x1111111111111111111111111111111111111111",
+            "target_token_position": "token0",
+            "token0_address": "0x1111111111111111111111111111111111111111",
+            "token0_symbol": "AAVE",
+            "token0_decimals": "18",
+            "token0_price_usd": "100",
+            "token1_address": "0x2222222222222222222222222222222222222222",
+            "token1_symbol": "USDC",
+            "token1_decimals": "6",
+            "token1_price_usd": "1",
+            "fee_bps": "30",
+            "pool_state_price_usd": "100",
+            "source_target_price_usd": "100",
+            "price_difference_bps": "0",
+            "usd_price_source_snapshot_id": "tvl-1",
+            "usd_price_observed_at": "2024-01-01T00:00:01+00:00",
+            "usd_price_skew_seconds": "1",
+            "usd_price_freshness_status": "current",
+            "usd_price_source": "",
+            "usd_price_source_endpoint": "",
+            "usd_price_raw_response_sha256": "",
+            "sell_depth_10bps_usd": "5.001250625390898642739388842",
+            "buy_depth_10bps_usd": "5.013792000611482680624751255",
+            "total_depth_10bps_usd": "10.0150426260023813233641401",
+            "depth_10bps_complete": "1",
+            "sell_depth_25bps_usd": "12.50782228091054210980883597",
+            "buy_depth_25bps_usd": "12.52978661022353445196196004",
+            "total_depth_25bps_usd": "25.03760889113407656177079601",
+            "depth_25bps_complete": "1",
+            "sell_depth_50bps_usd": "25.03132836999833417305888293",
+            "buy_depth_50bps_usd": "25.04395976099365634841449471",
+            "total_depth_50bps_usd": "50.07528813099199052147337764",
+            "depth_50bps_complete": "1",
+            "sell_depth_100bps_usd": "50.12562893380045265520178999",
+            "buy_depth_100bps_usd": "50.02569821553688086185046415",
+            "total_depth_100bps_usd": "100.1513271493373335170522541",
+            "depth_100bps_complete": "1",
+            "depth_method": "fixed_block_pool_state_marginal_price_band",
+            "source": "fixed-block EVM JSON-RPC eth_call",
+            "source_endpoint": "https://rpc.example.test",
+            "raw_response_sha256": (
+                "12c58bcfaf4d3a935b8234b035c6627e"
+                "2387f7e1d1a36dd0e3b1b29496ddbbc0"
+            ),
+            "status": "observed",
+            "error": "",
+        }
+        expected_common = {
+            "snapshot_id": "golden-dex-1",
+            "source_snapshot_id": "golden-dex-1",
+            "contract_version": "1",
+            "calculation_method": "fixed_block_pool_state_exact_target_quantity_v1",
+            "observed_at": timestamp,
+            "state_observed_at": "2024-01-01T00:00:00+00:00",
+            "request_started_at": timestamp,
+            "response_received_at": timestamp,
+            "market_id": (
+                "dex:eth:uniswap_v2:"
+                "0x3333333333333333333333333333333333333333:AAVE"
+            ),
+            "market_type": "dex",
+            "token_symbol": "AAVE",
+            "exchange": "",
+            "cex_symbol": "",
+            "source_instrument": "",
+            "base_asset": "",
+            "source_quote_asset": "",
+            "chain": "eth",
+            "dex": "uniswap_v2",
+            "pool_address": "0x3333333333333333333333333333333333333333",
+            "block_number": "123",
+            "block_timestamp": "2024-01-01T00:00:00+00:00",
+            "protocol_model": "constant_product_v2",
+            "target_token_address": "0x1111111111111111111111111111111111111111",
+            "target_token_decimals": "18",
+            "quote_token_address": "0x2222222222222222222222222222222222222222",
+            "quote_token_decimals": "6",
+            "notional_definition": (
+                "target Token quantity valued at the snapshot pre-trade "
+                "reference price"
+            ),
+            "reference_price_method": "pre_fee_pool_state_marginal_price",
+            "reference_price_quote_per_token": "100",
+            "quote_to_usd": "1",
+            "reference_price_usd_per_token": "100",
+            "usd_price_source_snapshot_id": "tvl-1",
+            "usd_price_observed_at": "2024-01-01T00:00:01+00:00",
+            "fee_status": "included_protocol_fee",
+            "fee_rate_bps": "30",
+            "fee_amount_usd": "",
+            "usd_conversion_status": "observed_inventory_token_price",
+            "excluded_costs": (
+                "gas,router_fee,token_transfer_tax,MEV,post_block_state_changes"
+            ),
+            "source": "fixed-block EVM JSON-RPC pool state",
+            "source_endpoint": "https://rpc.example.test",
+            "source_sequence": "123",
+            "raw_response_sha256": (
+                "12c58bcfaf4d3a935b8234b035c6627e"
+                "2387f7e1d1a36dd0e3b1b29496ddbbc0"
+            ),
+            "error": "",
+        }
+        expected_scenarios = [
+            {
+                "direction": "sell_token", "requested_notional_usd": "1000",
+                "reference_notional_usd": "1000", "target_token_quantity": "10",
+                "filled_token_quantity": "10", "fill_ratio": "1",
+                "quote_amount": "906.610893", "quote_amount_usd": "906.610893",
+                "filled_vwap_quote_per_token": "90.6610893",
+                "filled_vwap_usd_per_token": "90.6610893",
+                "quoted_execution_cost_usd": "93.389107",
+                "quoted_execution_cost_bps": "933.89107",
+                "levels_or_ticks_consumed": "1",
+                "ending_marginal_price_quote_per_token": "82.6671737",
+                "status": "observed", "status_reason": "full_target_quantity_filled",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "1000",
+                "reference_notional_usd": "1000", "target_token_quantity": "10",
+                "filled_token_quantity": "10", "fill_ratio": "1",
+                "quote_amount": "1114.454475", "quote_amount_usd": "1114.454475",
+                "filled_vwap_quote_per_token": "111.4454475",
+                "filled_vwap_usd_per_token": "111.4454475",
+                "quoted_execution_cost_usd": "114.454475",
+                "quoted_execution_cost_bps": "1144.54475",
+                "levels_or_ticks_consumed": "1",
+                "ending_marginal_price_quote_per_token": "123.49393861111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+                "status": "observed", "status_reason": "full_target_quantity_filled",
+            },
+            {
+                "direction": "sell_token", "requested_notional_usd": "5000",
+                "reference_notional_usd": "5000", "target_token_quantity": "50",
+                "filled_token_quantity": "50", "fill_ratio": "1",
+                "quote_amount": "3326.659993", "quote_amount_usd": "3326.659993",
+                "filled_vwap_quote_per_token": "66.53319986",
+                "filled_vwap_usd_per_token": "66.53319986",
+                "quoted_execution_cost_usd": "1673.340007",
+                "quoted_execution_cost_bps": "3346.680014",
+                "levels_or_ticks_consumed": "1",
+                "ending_marginal_price_quote_per_token": "44.48893338",
+                "status": "observed", "status_reason": "full_target_quantity_filled",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "5000",
+                "reference_notional_usd": "5000", "target_token_quantity": "50",
+                "filled_token_quantity": "50", "fill_ratio": "1",
+                "quote_amount": "10030.090271", "quote_amount_usd": "10030.090271",
+                "filled_vwap_quote_per_token": "200.60180542",
+                "filled_vwap_usd_per_token": "200.60180542",
+                "quoted_execution_cost_usd": "5030.090271",
+                "quoted_execution_cost_bps": "10060.180542",
+                "levels_or_ticks_consumed": "1",
+                "ending_marginal_price_quote_per_token": "400.60180542",
+                "status": "observed", "status_reason": "full_target_quantity_filled",
+            },
+            {
+                "direction": "sell_token", "requested_notional_usd": "10000",
+                "reference_notional_usd": "10000", "target_token_quantity": "100",
+                "filled_token_quantity": "100", "fill_ratio": "1",
+                "quote_amount": "4992.488733", "quote_amount_usd": "4992.488733",
+                "filled_vwap_quote_per_token": "49.92488733",
+                "filled_vwap_usd_per_token": "49.92488733",
+                "quoted_execution_cost_usd": "5007.511267",
+                "quoted_execution_cost_bps": "5007.511267",
+                "levels_or_ticks_consumed": "1",
+                "ending_marginal_price_quote_per_token": "25.037556335",
+                "status": "observed", "status_reason": "full_target_quantity_filled",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "10000",
+                "reference_notional_usd": "10000", "target_token_quantity": "100",
+                "filled_token_quantity": "", "fill_ratio": "",
+                "quote_amount": "", "quote_amount_usd": "",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "levels_or_ticks_consumed": "",
+                "ending_marginal_price_quote_per_token": "",
+                "status": "partial", "status_reason": "full_pool_reserve_insufficient",
+            },
+            {
+                "direction": "sell_token", "requested_notional_usd": "50000",
+                "reference_notional_usd": "50000", "target_token_quantity": "500",
+                "filled_token_quantity": "500", "fill_ratio": "1",
+                "quote_amount": "8329.156223", "quote_amount_usd": "8329.156223",
+                "filled_vwap_quote_per_token": "16.658312446",
+                "filled_vwap_usd_per_token": "16.658312446",
+                "quoted_execution_cost_usd": "41670.843777",
+                "quoted_execution_cost_bps": "8334.1687554",
+                "levels_or_ticks_consumed": "1",
+                "ending_marginal_price_quote_per_token": "2.7847396283333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+                "status": "observed", "status_reason": "full_target_quantity_filled",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "50000",
+                "reference_notional_usd": "50000", "target_token_quantity": "500",
+                "filled_token_quantity": "", "fill_ratio": "",
+                "quote_amount": "", "quote_amount_usd": "",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "levels_or_ticks_consumed": "",
+                "ending_marginal_price_quote_per_token": "",
+                "status": "partial", "status_reason": "full_pool_reserve_insufficient",
+            },
+            {
+                "direction": "sell_token", "requested_notional_usd": "100000",
+                "reference_notional_usd": "100000", "target_token_quantity": "1000",
+                "filled_token_quantity": "1000", "fill_ratio": "1",
+                "quote_amount": "9088.422971", "quote_amount_usd": "9088.422971",
+                "filled_vwap_quote_per_token": "9.088422971",
+                "filled_vwap_usd_per_token": "9.088422971",
+                "quoted_execution_cost_usd": "90911.577029",
+                "quoted_execution_cost_bps": "9091.1577029",
+                "levels_or_ticks_consumed": "1",
+                "ending_marginal_price_quote_per_token": "0.82870639",
+                "status": "observed", "status_reason": "full_target_quantity_filled",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "100000",
+                "reference_notional_usd": "100000", "target_token_quantity": "1000",
+                "filled_token_quantity": "", "fill_ratio": "",
+                "quote_amount": "", "quote_amount_usd": "",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "levels_or_ticks_consumed": "",
+                "ending_marginal_price_quote_per_token": "",
+                "status": "partial", "status_reason": "full_pool_reserve_insufficient",
+            },
+        ]
+        expected_execution = [
+            {**expected_common, **scenario}
+            for scenario in expected_scenarios
+        ]
+
+        self.assertEqual(one_depth, expected_depth)
+        self.assertEqual(one_execution, expected_execution)
+        self.assertEqual(one_raw, expected_raw)
         self.assertEqual(
             one_depth["raw_response_sha256"],
-            full_depth[0]["raw_response_sha256"],
+            "12c58bcfaf4d3a935b8234b035c6627e2387f7e1d1a36dd0e3b1b29496ddbbc0",
         )
 
     def test_one_pool_fixed_block_and_client_transcript_are_isolated(self):
@@ -1776,6 +2069,128 @@ class DexDepthCollectionTest(unittest.TestCase):
             self.assertEqual(block_requests, ["0x1c8"])
             self.assertTrue(state_block_tags)
             self.assertEqual(set(state_block_tags), {"0x1c8"})
+
+    def test_one_pool_primitive_rejects_expired_supplied_client_before_rpc(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        client = FakeV2Rpc("eth", "https://rpc.example.test")
+        raw_path = self.root / "expired-client.json"
+        with self.assertRaisesRegex(
+            CollectionDeadlineExceeded,
+            "^collection deadline exceeded$",
+        ):
+            collect_dex_pool_observation(
+                self.pool,
+                snapshot_id="expired-dex",
+                raw_path=raw_path,
+                client=client,
+                deadline=CollectionDeadline.for_duration(0),
+            )
+
+        self.assertEqual(client.records, [])
+        self.assertFalse(raw_path.exists())
+
+    def test_supplied_client_deadline_is_checked_between_rpc_calls(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = Clock()
+
+        class ExpiringV2Rpc(FakeV2Rpc):
+            def block_number(self):
+                result = super().block_number()
+                clock.now = 2.0
+                return result
+
+        client = ExpiringV2Rpc("eth", "https://rpc.example.test")
+        raw_path = self.root / "mid-sequence-expiry.json"
+        deadline = CollectionDeadline.for_duration(
+            1,
+            clock=clock.monotonic,
+            sleeper=lambda seconds: None,
+        )
+        with self.assertRaisesRegex(
+            CollectionDeadlineExceeded,
+            "^collection deadline exceeded$",
+        ):
+            collect_dex_pool_observation(
+                self.pool,
+                snapshot_id="mid-sequence-expiry",
+                raw_path=raw_path,
+                client=client,
+                deadline=deadline,
+            )
+
+        self.assertEqual(client.records, [{"request": "block", "response": "0x7b"}])
+        self.assertFalse(raw_path.exists())
+
+    def test_production_supplied_client_rechecks_before_batch_fallback_rpc(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+        from scripts.fetch_dex_depth import RpcClient, collect_dex_pool_observation
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = Clock()
+        transport_calls = []
+
+        def transport(_url, payload):
+            transport_calls.append(payload)
+            if isinstance(payload, list):
+                clock.now = 2.0
+                return [], b"[]"
+            response = {
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": "0x0",
+            }
+            return response, json.dumps(response).encode("utf-8")
+
+        client = RpcClient(
+            "eth",
+            "https://rpc.example.test",
+            request=transport,
+        )
+        deadline = CollectionDeadline.for_duration(
+            1,
+            clock=clock.monotonic,
+            sleeper=lambda seconds: None,
+        )
+        with self.assertRaisesRegex(
+            CollectionDeadlineExceeded,
+            "^collection deadline exceeded$",
+        ):
+            collect_dex_pool_observation(
+                self.pool,
+                snapshot_id="batch-fallback-expiry",
+                raw_path=self.root / "batch-fallback-expiry.json",
+                client=client,
+                fixed_block_number=123,
+                fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+                deadline=deadline,
+            )
+
+        self.assertEqual(len(transport_calls), 1)
+        self.assertIsInstance(transport_calls[0], list)
 
 
 if __name__ == "__main__":

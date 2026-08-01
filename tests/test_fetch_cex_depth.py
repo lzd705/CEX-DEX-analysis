@@ -1823,16 +1823,14 @@ class FetchCexDepthTest(unittest.TestCase):
 
         self.assertFalse(current_exists)
 
-    def test_one_market_primitive_matches_full_collector_rows_and_raw_hash(self):
+    def test_one_market_primitive_matches_independent_golden_rows_and_raw_hash(self):
         from scripts.fetch_cex_depth import collect_cex_market_observation
 
-        response = json.dumps(
-            {
-                "bids": [["99.99", "2"], ["98.9", "5"]],
-                "asks": [["100.01", "3"], ["101.1", "7"]],
-                "lastUpdateId": 123,
-            }
-        ).encode("utf-8")
+        response = (
+            b'{"bids": [["99.99", "2"], ["98.9", "5"]], '
+            b'"asks": [["100.01", "3"], ["101.1", "7"]], '
+            b'"lastUpdateId": 123}'
+        )
 
         def fake_request(_url):
             return json.loads(response), response
@@ -1844,34 +1842,304 @@ class FetchCexDepthTest(unittest.TestCase):
                 "scripts.fetch_cex_depth.utc_now_text",
                 return_value=timestamp,
             ):
-                snapshot_id, full_depth, full_execution = (
-                    collect_depth_with_execution(
-                        [market()],
-                        raw_root=root / "full",
-                        request=fake_request,
-                        sleep_seconds=0,
-                    )
-                )
                 one_depth, one_execution = collect_cex_market_observation(
                     market(),
-                    snapshot_id=snapshot_id,
+                    snapshot_id="golden-cex-1",
                     raw_path=root / "one.json",
                     request=fake_request,
                 )
-
-            full_raw = (
-                root / "full" / snapshot_id / "001-binance-UNI.json"
-            ).read_bytes()
             one_raw = (root / "one.json").read_bytes()
 
-        self.assertEqual(one_depth, full_depth[0])
-        self.assertEqual(one_execution, full_execution)
-        self.assertEqual(len(one_execution), 10)
-        self.assertEqual(one_raw, full_raw)
+        expected_depth = {
+            "snapshot_id": "golden-cex-1",
+            "observed_at": timestamp,
+            "request_started_at": timestamp,
+            "response_received_at": timestamp,
+            "token_symbol": "UNI",
+            "exchange": "binance",
+            "cex_symbol": "UNI/USDT",
+            "source_instrument": "UNIUSDT",
+            "base_asset": "UNI",
+            "source_quote_asset": "USDT",
+            "quote_to_usd": "1",
+            "quote_conversion_method": "USDT=USD proxy",
+            "quote_conversion_endpoint": "",
+            "quote_conversion_response_sha256": "",
+            "best_bid": "99.99",
+            "best_ask": "100.01",
+            "midpoint": "100.00",
+            "spread_quote": "0.02",
+            "spread_bps": "2.0000",
+            "bid_levels_returned": "2",
+            "ask_levels_returned": "2",
+            "requested_level_limit": "100",
+            "full_book_reported": "0",
+            "bid_depth_10bps_usd": "199.98",
+            "ask_depth_10bps_usd": "300.03",
+            "total_depth_10bps_usd": "500.01",
+            "depth_10bps_complete": "1",
+            "bid_depth_25bps_usd": "199.98",
+            "ask_depth_25bps_usd": "300.03",
+            "total_depth_25bps_usd": "500.01",
+            "depth_25bps_complete": "1",
+            "bid_depth_50bps_usd": "199.98",
+            "ask_depth_50bps_usd": "300.03",
+            "total_depth_50bps_usd": "500.01",
+            "depth_50bps_complete": "1",
+            "bid_depth_100bps_usd": "199.98",
+            "ask_depth_100bps_usd": "300.03",
+            "total_depth_100bps_usd": "500.01",
+            "depth_100bps_complete": "1",
+            "depth_method": "midpoint_symmetric_quote_notional",
+            "source": "binance public spot order-book API",
+            "source_endpoint": (
+                "https://data-api.binance.vision/api/v3/depth?"
+                "symbol=UNIUSDT&limit=100"
+            ),
+            "source_sequence": "123",
+            "raw_response_sha256": (
+                "13b278c40ce93553f2c0edec997d4c37"
+                "d3e9c1a665dd9a4bed9ebca6f3a6064a"
+            ),
+            "status": "observed",
+            "reason_code": "observed",
+            "error": "",
+        }
+        expected_common = {
+            "snapshot_id": "golden-cex-1",
+            "source_snapshot_id": "golden-cex-1",
+            "contract_version": "1",
+            "calculation_method": "normalized_order_book_level_walk",
+            "observed_at": timestamp,
+            "state_observed_at": timestamp,
+            "request_started_at": timestamp,
+            "response_received_at": timestamp,
+            "market_id": "cex:binance:UNI/USDT",
+            "market_type": "cex",
+            "token_symbol": "UNI",
+            "exchange": "binance",
+            "cex_symbol": "UNI/USDT",
+            "source_instrument": "UNIUSDT",
+            "base_asset": "UNI",
+            "source_quote_asset": "USDT",
+            "chain": "",
+            "dex": "",
+            "pool_address": "",
+            "block_number": "",
+            "block_timestamp": "",
+            "protocol_model": "",
+            "target_token_address": "",
+            "target_token_decimals": "",
+            "quote_token_address": "",
+            "quote_token_decimals": "",
+            "notional_definition": (
+                "target Token quantity valued at the snapshot pre-trade "
+                "reference price"
+            ),
+            "reference_price_method": "order_book_midpoint",
+            "reference_price_quote_per_token": "100",
+            "quote_to_usd": "1",
+            "reference_price_usd_per_token": "100",
+            "usd_price_source_snapshot_id": "",
+            "usd_price_observed_at": "",
+            "levels_or_ticks_consumed": "2",
+            "fee_status": "excluded_unknown_account_tier",
+            "fee_rate_bps": "",
+            "fee_amount_usd": "",
+            "usd_conversion_status": "proxy_usdt_equals_usd",
+            "excluded_costs": "taker_fee,lot_size,latency",
+            "source": "binance public spot order-book API",
+            "source_endpoint": (
+                "https://data-api.binance.vision/api/v3/depth?"
+                "symbol=UNIUSDT&limit=100"
+            ),
+            "source_sequence": "123",
+            "raw_response_sha256": (
+                "13b278c40ce93553f2c0edec997d4c37"
+                "d3e9c1a665dd9a4bed9ebca6f3a6064a"
+            ),
+            "error": "",
+        }
+        expected_scenarios = [
+            {
+                "direction": "sell_token", "requested_notional_usd": "1000",
+                "reference_notional_usd": "1000", "target_token_quantity": "10",
+                "filled_token_quantity": "7", "fill_ratio": "0.7",
+                "quote_amount": "694.48", "quote_amount_usd": "694.48",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "ending_marginal_price_quote_per_token": "98.9",
+                "status": "partial", "status_reason": "source_level_limit",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "1000",
+                "reference_notional_usd": "1000", "target_token_quantity": "10",
+                "filled_token_quantity": "10", "fill_ratio": "1",
+                "quote_amount": "1007.73", "quote_amount_usd": "1007.73",
+                "filled_vwap_quote_per_token": "100.773",
+                "filled_vwap_usd_per_token": "100.773",
+                "quoted_execution_cost_usd": "7.73",
+                "quoted_execution_cost_bps": "77.3",
+                "ending_marginal_price_quote_per_token": "101.1",
+                "status": "observed", "status_reason": "target_filled",
+            },
+            {
+                "direction": "sell_token", "requested_notional_usd": "5000",
+                "reference_notional_usd": "5000", "target_token_quantity": "50",
+                "filled_token_quantity": "7", "fill_ratio": "0.14",
+                "quote_amount": "694.48", "quote_amount_usd": "694.48",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "ending_marginal_price_quote_per_token": "98.9",
+                "status": "partial", "status_reason": "source_level_limit",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "5000",
+                "reference_notional_usd": "5000", "target_token_quantity": "50",
+                "filled_token_quantity": "10", "fill_ratio": "0.2",
+                "quote_amount": "1007.73", "quote_amount_usd": "1007.73",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "ending_marginal_price_quote_per_token": "101.1",
+                "status": "partial", "status_reason": "source_level_limit",
+            },
+            {
+                "direction": "sell_token", "requested_notional_usd": "10000",
+                "reference_notional_usd": "10000", "target_token_quantity": "100",
+                "filled_token_quantity": "7", "fill_ratio": "0.07",
+                "quote_amount": "694.48", "quote_amount_usd": "694.48",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "ending_marginal_price_quote_per_token": "98.9",
+                "status": "partial", "status_reason": "source_level_limit",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "10000",
+                "reference_notional_usd": "10000", "target_token_quantity": "100",
+                "filled_token_quantity": "10", "fill_ratio": "0.1",
+                "quote_amount": "1007.73", "quote_amount_usd": "1007.73",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "ending_marginal_price_quote_per_token": "101.1",
+                "status": "partial", "status_reason": "source_level_limit",
+            },
+            {
+                "direction": "sell_token", "requested_notional_usd": "50000",
+                "reference_notional_usd": "50000", "target_token_quantity": "500",
+                "filled_token_quantity": "7", "fill_ratio": "0.014",
+                "quote_amount": "694.48", "quote_amount_usd": "694.48",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "ending_marginal_price_quote_per_token": "98.9",
+                "status": "partial", "status_reason": "source_level_limit",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "50000",
+                "reference_notional_usd": "50000", "target_token_quantity": "500",
+                "filled_token_quantity": "10", "fill_ratio": "0.02",
+                "quote_amount": "1007.73", "quote_amount_usd": "1007.73",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "ending_marginal_price_quote_per_token": "101.1",
+                "status": "partial", "status_reason": "source_level_limit",
+            },
+            {
+                "direction": "sell_token", "requested_notional_usd": "100000",
+                "reference_notional_usd": "100000", "target_token_quantity": "1000",
+                "filled_token_quantity": "7", "fill_ratio": "0.007",
+                "quote_amount": "694.48", "quote_amount_usd": "694.48",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "ending_marginal_price_quote_per_token": "98.9",
+                "status": "partial", "status_reason": "source_level_limit",
+            },
+            {
+                "direction": "buy_token", "requested_notional_usd": "100000",
+                "reference_notional_usd": "100000", "target_token_quantity": "1000",
+                "filled_token_quantity": "10", "fill_ratio": "0.01",
+                "quote_amount": "1007.73", "quote_amount_usd": "1007.73",
+                "filled_vwap_quote_per_token": "", "filled_vwap_usd_per_token": "",
+                "quoted_execution_cost_usd": "", "quoted_execution_cost_bps": "",
+                "ending_marginal_price_quote_per_token": "101.1",
+                "status": "partial", "status_reason": "source_level_limit",
+            },
+        ]
+        expected_execution = [
+            {**expected_common, **scenario}
+            for scenario in expected_scenarios
+        ]
+
+        self.assertEqual(one_depth, expected_depth)
+        self.assertEqual(one_execution, expected_execution)
+        self.assertEqual(one_raw, response)
         self.assertEqual(
             one_depth["raw_response_sha256"],
-            hashlib.sha256(response).hexdigest(),
+            "13b278c40ce93553f2c0edec997d4c37d3e9c1a665dd9a4bed9ebca6f3a6064a",
         )
+
+    def test_one_market_primitive_propagates_expired_deadline_before_request(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+        from scripts.fetch_cex_depth import collect_cex_market_observation
+
+        deadline = CollectionDeadline.for_duration(0)
+        with tempfile.TemporaryDirectory() as directory_name:
+            raw_path = Path(directory_name) / "expired.json"
+            with patch("urllib.request.urlopen") as urlopen:
+                with self.assertRaisesRegex(
+                    CollectionDeadlineExceeded,
+                    "^collection deadline exceeded$",
+                ):
+                    collect_cex_market_observation(
+                        market(),
+                        snapshot_id="expired-cex",
+                        raw_path=raw_path,
+                        deadline=deadline,
+                    )
+
+            self.assertFalse(raw_path.exists())
+        urlopen.assert_not_called()
+
+    def test_upbit_candidate_does_not_wrap_mid_request_deadline_exhaustion(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+        from scripts.fetch_cex_depth import collect_cex_market_observation
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = Clock()
+        deadline = CollectionDeadline.for_duration(
+            1,
+            clock=clock.monotonic,
+            sleeper=lambda seconds: None,
+        )
+
+        def expiring_request(_url, *, deadline):
+            clock.now = 2.0
+            deadline.require_remaining()
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            raw_path = Path(directory_name) / "expired-upbit.json"
+            with self.assertRaisesRegex(
+                CollectionDeadlineExceeded,
+                "^collection deadline exceeded$",
+            ):
+                collect_cex_market_observation(
+                    market(exchange="upbit"),
+                    snapshot_id="expired-upbit",
+                    raw_path=raw_path,
+                    request=expiring_request,
+                    deadline=deadline,
+                )
+            self.assertFalse(raw_path.exists())
 
 
 if __name__ == "__main__":

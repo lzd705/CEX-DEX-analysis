@@ -38,7 +38,10 @@ except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
 try:
-    from scripts.collection_deadline import CollectionDeadline
+    from scripts.collection_deadline import (
+        CollectionDeadline,
+        CollectionDeadlineExceeded,
+    )
     from scripts.atomic_publication import atomic_replace_bundle, csv_payload
     from scripts.bounded_snapshot_merge import (
         merge_exact_market_snapshot,
@@ -84,7 +87,7 @@ try:
         validate_observation_bounds,
     )
 except ModuleNotFoundError:
-    from collection_deadline import CollectionDeadline
+    from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
     from atomic_publication import atomic_replace_bundle, csv_payload
     from bounded_snapshot_merge import (
         merge_exact_market_snapshot,
@@ -470,6 +473,8 @@ def request_json(
                 raw = response.read()
                 return json.loads(raw.decode("utf-8")), raw
         except urllib.error.HTTPError as error:
+            if deadline is not None:
+                deadline.require_remaining()
             retryable = error.code == 429 or 500 <= error.code < 600
             if not retryable or attempt + 1 >= max_retries:
                 raise
@@ -480,6 +485,8 @@ def request_json(
             else:
                 time.sleep(delay)
         except urllib.error.URLError:
+            if deadline is not None:
+                deadline.require_remaining()
             if attempt + 1 >= max_retries:
                 raise
             delay = max(2.0, 2 ** attempt)
@@ -773,6 +780,8 @@ def upbit_book(
         try:
             payload, raw = request(url)
             parsed = parse_book("upbit", payload, requested_instrument=market)
+        except CollectionDeadlineExceeded:
+            raise
         except Exception as error:
             candidate_error = (
                 error
@@ -834,6 +843,8 @@ def upbit_book(
             )
             result["quote_conversion_raw"] = fx_raw
             return result
+        except CollectionDeadlineExceeded:
+            raise
         except Exception as error:
             candidate_errors.append(SourceBookError(
                 f"Failed KRW quote conversion: {error}",
@@ -1258,6 +1269,8 @@ def collect_cex_market_observation(
     deadline: CollectionDeadline | None = None,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Collect one CEX market without owning orchestration or publication."""
+    if deadline is not None:
+        deadline.require_remaining()
     request_started_at = utc_now_text()
     effective_request = request
     if deadline is not None:
@@ -1303,6 +1316,8 @@ def collect_cex_market_observation(
                 raw_response_sha256=hashlib.sha256(book["raw"]).hexdigest(),
                 status_reason="execution_calculation_failed",
             )
+    except CollectionDeadlineExceeded:
+        raise
     except Exception as error:
         response_received_at = utc_now_text()
         reason_code = depth_failure_reason_code(error)

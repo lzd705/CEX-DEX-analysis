@@ -1,5 +1,6 @@
 import json
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 
@@ -106,6 +107,71 @@ class CollectionDeadlineTest(unittest.TestCase):
 
         self.assertEqual(clock.sleeps, [1.25])
         self.assertEqual(deadline.remaining_seconds(), 0.0)
+
+    def test_final_transport_failure_is_replaced_by_deadline_exhaustion(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+        from scripts.fetch_cex_depth import request_json
+        from scripts.fetch_dex_depth import http_json_rpc
+
+        for request_call in (
+            lambda deadline: request_json(
+                "https://example.test/book",
+                deadline=deadline,
+                max_retries=1,
+            ),
+            lambda deadline: http_json_rpc(
+                "https://example.test/rpc",
+                {"jsonrpc": "2.0", "id": 1, "method": "test", "params": []},
+                deadline=deadline,
+                max_retries=1,
+            ),
+        ):
+            clock = FakeClock()
+            deadline = CollectionDeadline.for_duration(
+                1,
+                clock=clock.monotonic,
+                sleeper=clock.sleep,
+            )
+
+            def expire_then_fail(*_args, **_kwargs):
+                clock.now = 2
+                raise urllib.error.URLError("transport timed out")
+
+            with patch("urllib.request.urlopen", side_effect=expire_then_fail):
+                with self.assertRaisesRegex(
+                    CollectionDeadlineExceeded,
+                    "^collection deadline exceeded$",
+                ):
+                    request_call(deadline)
+
+
+class RpcClientIsolationTest(unittest.TestCase):
+    def test_production_clients_start_at_one_and_keep_independent_records(self):
+        from scripts.fetch_dex_depth import RpcClient
+
+        def transport(_url, payload):
+            response = {
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": "0x1",
+            }
+            return response, json.dumps(response, sort_keys=True).encode("utf-8")
+
+        first = RpcClient("eth", "https://rpc.example.test", request=transport)
+        second = RpcClient("eth", "https://rpc.example.test", request=transport)
+
+        self.assertEqual(first.method("test_first", []), "0x1")
+        self.assertEqual(second.method("test_second", []), "0x1")
+        self.assertEqual(first.records[0]["request"]["id"], 1)
+        self.assertEqual(second.records[0]["request"]["id"], 1)
+        self.assertIsNot(first.records, second.records)
+
+        self.assertEqual(first.method("test_first_again", []), "0x1")
+        self.assertEqual(first.records[1]["request"]["id"], 2)
+        self.assertEqual(len(second.records), 1)
 
 
 if __name__ == "__main__":
