@@ -18,10 +18,18 @@ fetches facts nor writes or publishes a bundle.
 per Token. A selected catalog row must have a canonical `market_id`, its
 declared `market_type` prefix, a non-empty Token symbol, a timezone-aware
 `observed_at`, a non-withheld lifecycle, a supported adapter, and one observed
-depth row with a valid timezone-aware `state_observed_at` and positive
-`total_depth_100bps_usd`. Lifecycle-withheld/inactive identities, missing or
-failed books, unsupported adapters, and invalid source-time rows therefore do
-not enter strict route generation.
+depth row with a valid timezone-aware `state_observed_at`, positive
+`total_depth_100bps_usd`, and both positive directional 100-bps values. CEX
+requires `bid_depth_100bps_usd` and `ask_depth_100bps_usd`; DEX requires
+`buy_depth_100bps_usd` and `sell_depth_100bps_usd`. A total-depth value never
+proves a two-sided book. Lifecycle-withheld/inactive identities, missing,
+one-sided, or failed books, unsupported adapters, and invalid source-time rows
+therefore do not enter strict route generation.
+
+Catalog identities are a fail-closed input boundary: any duplicate non-empty
+canonical `market_id`, even when the duplicate rows conflict or would
+otherwise be unusable, raises `ValueError("duplicate canonical market ID")`.
+The selector never applies last-write-wins behavior to catalog rows.
 
 `execution_capability_by_market()` derives `proved` capability only when both
 `buy_token` and `sell_token` have current `observed` execution rows. Its

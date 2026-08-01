@@ -35,6 +35,16 @@ def depth(market_id, amount, **overrides):
         "state_observed_at": OBSERVED_AT,
         "total_depth_100bps_usd": str(amount),
     }
+    if market_id.startswith("cex:"):
+        row.update({
+            "bid_depth_100bps_usd": str(amount),
+            "ask_depth_100bps_usd": str(amount),
+        })
+    else:
+        row.update({
+            "buy_depth_100bps_usd": str(amount),
+            "sell_depth_100bps_usd": str(amount),
+        })
     row.update(overrides)
     return row
 
@@ -128,6 +138,69 @@ class RouteUniverseSelectionTests(unittest.TestCase):
                     "dex_24h_usd", "dex_tvl_usd",
                 },
             )
+
+    def test_selection_requires_positive_two_sided_depth_for_each_market_type(self):
+        cex_valid = "cex:valid:UNI/USDT"
+        dex_valid = "dex:eth:swap:0xvalid:UNI"
+        excluded = (
+            (
+                "cex:zero-ask:UNI/USDT",
+                "cex",
+                {"bid_depth_100bps_usd": "50", "ask_depth_100bps_usd": "0"},
+            ),
+            (
+                "cex:zero-bid:UNI/USDT",
+                "cex",
+                {"bid_depth_100bps_usd": "0", "ask_depth_100bps_usd": "50"},
+            ),
+            (
+                "dex:eth:swap:0xzero-sell:UNI",
+                "dex",
+                {"buy_depth_100bps_usd": "50", "sell_depth_100bps_usd": "0"},
+            ),
+            (
+                "dex:eth:swap:0xzero-buy:UNI",
+                "dex",
+                {"buy_depth_100bps_usd": "0", "sell_depth_100bps_usd": "50"},
+            ),
+        )
+        catalog = [market(cex_valid, "cex"), market(dex_valid, "dex")]
+        catalog.extend(market(market_id, market_type) for market_id, market_type, _ in excluded)
+        depths = [depth(cex_valid, 100), depth(dex_valid, 100)]
+        depths.extend(depth(market_id, 100, **overrides) for market_id, _market_type, overrides in excluded)
+        execution_rows = []
+        for row in catalog:
+            execution_rows.extend(execution(row["market_id"], 1000))
+
+        selected = select_route_legs(
+            catalog, depths, execution_rows, [], [], [],
+            selection_window={"start": "2026-08-01", "end": "2026-08-01"},
+            candidate_source_generation="catalog-sha-two-sided",
+        )
+
+        self.assertEqual(
+            [row["market_id"] for row in selected], [cex_valid, dex_valid]
+        )
+
+    def test_conflicting_duplicate_catalog_market_ids_fail_closed_independent_of_order(self):
+        market_id = "cex:duplicate:UNI/USDT"
+        catalog = [
+            market(market_id, "cex", token_symbol="UNI"),
+            market(market_id, "cex", token_symbol="AAVE"),
+        ]
+        depths = [depth(market_id, 100)]
+        execution_rows = execution(market_id, 1000)
+
+        for seed in range(10):
+            shuffled = copy.deepcopy(catalog)
+            random.Random(seed).shuffle(shuffled)
+            with self.subTest(seed=seed):
+                with self.assertRaisesRegex(ValueError, "duplicate canonical market ID"):
+                    select_route_legs(
+                        shuffled, depths, execution_rows, [], [], [],
+                        selection_window={"start": "2026-08-01", "end": "2026-08-01"},
+                        candidate_source_generation="catalog-sha-duplicate",
+                    )
 
     def test_execution_capability_requires_current_two_direction_observed_capacity(self):
         market_id = "cex:venue:UNI/USDT"

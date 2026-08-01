@@ -160,10 +160,23 @@ def _current_depth_by_market(
         market_id = _market_id(row)
         amount = _positive_decimal(row.get("total_depth_100bps_usd"))
         timestamp = row.get("state_observed_at")
+        if market_id is not None and market_id.startswith("cex:"):
+            directional_amounts = (
+                _positive_decimal(row.get("bid_depth_100bps_usd")),
+                _positive_decimal(row.get("ask_depth_100bps_usd")),
+            )
+        elif market_id is not None and market_id.startswith("dex:"):
+            directional_amounts = (
+                _positive_decimal(row.get("buy_depth_100bps_usd")),
+                _positive_decimal(row.get("sell_depth_100bps_usd")),
+            )
+        else:
+            directional_amounts = (None, None)
         if (
             market_id is None
             or str(row.get("status") or "") != "observed"
             or amount is None
+            or any(value is None for value in directional_amounts)
             or not _valid_timestamp(timestamp)
         ):
             continue
@@ -237,7 +250,14 @@ def select_route_legs(
     dex_volumes = _latest_current_numeric(dex_volume_rows, "volume_24h_usd")
     dex_tvls = _latest_current_numeric(tvl_rows, "tvl_usd")
     candidates = {}
+    catalog_market_ids = set()
     for row in catalog:
+        if isinstance(row, Mapping):
+            market_id = _market_id(row)
+            if market_id is not None:
+                if market_id in catalog_market_ids:
+                    raise ValueError("duplicate canonical market ID")
+                catalog_market_ids.add(market_id)
         if not isinstance(row, Mapping) or not _candidate_is_usable(row):
             continue
         market_id = _market_id(row)
