@@ -13,6 +13,7 @@ from scripts.check_dashboard_release import (
     ReleaseCheckError,
     ResponseMetrics,
     STATIC_ASSET_FILENAMES,
+    _validate_daily_fact_evidence,
     fetch_static_asset_bundle,
     release_check,
     validate_comparison,
@@ -1692,6 +1693,57 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 gzip_max=1000,
             )
 
+    def test_cex_lifecycle_fallback_requires_exact_flag_and_rejects_dex(self):
+        for status, reason_code, action, flag_code in (
+            (
+                "source_no_observation",
+                "instrument_absent_from_current_catalog",
+                "operator_review_source_outcome",
+                "inactive_cex_instrument",
+            ),
+            (
+                "needs_review",
+                "official_catalog_evidence_stale",
+                "operator_manual_review",
+                "stale_cex_lifecycle_evidence",
+            ),
+        ):
+            fact = {
+                "status": status,
+                "reason_code": reason_code,
+                "retryable": False,
+                "action": action,
+                "quality_flags": [{"code": flag_code}],
+            }
+            with self.subTest(cex_lifecycle_fallback=reason_code):
+                evidence = _validate_daily_fact_evidence(
+                    fact,
+                    market_type="cex",
+                    report_status="unavailable",
+                )
+                self.assertEqual(evidence["mode"], None)
+                self.assertEqual(evidence["issue_count"], 0)
+
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "lacks required published evidence/action",
+                ):
+                    _validate_daily_fact_evidence(
+                        {**fact, "quality_flags": []},
+                        market_type="cex",
+                        report_status="unavailable",
+                    )
+
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "lacks required published evidence/action",
+                ):
+                    _validate_daily_fact_evidence(
+                        fact,
+                        market_type="dex",
+                        report_status="unavailable",
+                    )
+
     def test_expert_endpoint_validators_reject_empty_or_unmeasured_results(self):
         market_a = "cex:binance:AAVE/USDT"
         market_b = "dex:eth:uniswap_v3:pool:AAVE"
@@ -2019,6 +2071,132 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         ):
             validate_quality(
                 unsupported_without_fact_evidence,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
+        for (
+            lifecycle_status,
+            lifecycle_reason,
+            lifecycle_action,
+            lifecycle_flag_code,
+        ) in (
+            (
+                "source_no_observation",
+                "instrument_absent_from_current_catalog",
+                "operator_review_source_outcome",
+                "inactive_cex_instrument",
+            ),
+            (
+                "needs_review",
+                "official_catalog_evidence_stale",
+                "operator_manual_review",
+                "stale_cex_lifecycle_evidence",
+            ),
+        ):
+            with self.subTest(
+                lifecycle_without_daily_issue=lifecycle_reason,
+            ):
+                lifecycle_only = copy.deepcopy(quality)
+                lifecycle_flag = {
+                    "code": lifecycle_flag_code,
+                    "severity": "critical",
+                    "category": "data_health",
+                    "message": "Official CEX catalog evidence withholds current facts.",
+                    "observed_value": "2026-01-16T00:00:00+00:00",
+                    "threshold": "present_and_current_official_catalog_evidence",
+                }
+                lifecycle_only["markets"][0]["facts"]["daily"].update(
+                    {
+                        "status": lifecycle_status,
+                        "reason_code": lifecycle_reason,
+                        "retryable": False,
+                        "action": lifecycle_action,
+                        "quality_flags": [lifecycle_flag],
+                    }
+                )
+                lifecycle_only["markets"][0].update(
+                    {
+                        "quality_status": "critical",
+                        "quality_flags": [lifecycle_flag],
+                    }
+                )
+                lifecycle_only["metadata"]["daily_quality_report"][
+                    "market_issue_rollups"
+                ][0]["fact_outcome"] = {
+                    "status": lifecycle_status,
+                    "reason_code": lifecycle_reason,
+                    "retryable": False,
+                    "action": lifecycle_action,
+                }
+
+                validate_quality(
+                    lifecycle_only,
+                    token="AAVE",
+                    market_a=market_a,
+                    market_b=market_b,
+                    expected_generation="generation-1",
+                )
+
+                missing_lifecycle_flag = copy.deepcopy(lifecycle_only)
+                missing_lifecycle_flag["markets"][0]["facts"]["daily"][
+                    "quality_flags"
+                ] = []
+                missing_lifecycle_flag["markets"][0].update(
+                    {"quality_status": "ok", "quality_flags": []}
+                )
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "zero evidence/action",
+                ):
+                    validate_quality(
+                        missing_lifecycle_flag,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                    )
+
+        dex_lifecycle = copy.deepcopy(quality)
+        dex_lifecycle_flag = {
+            "code": "inactive_cex_instrument",
+            "severity": "critical",
+            "category": "data_health",
+            "message": "Official CEX catalog evidence withholds current facts.",
+            "observed_value": "2026-01-16T00:00:00+00:00",
+            "threshold": "present_and_current_official_catalog_evidence",
+        }
+        dex_lifecycle["markets"][1]["facts"]["daily"].update(
+            {
+                "status": "source_no_observation",
+                "reason_code": "instrument_absent_from_current_catalog",
+                "retryable": False,
+                "action": "operator_review_source_outcome",
+                "quality_flags": [dex_lifecycle_flag],
+            }
+        )
+        dex_lifecycle["markets"][1].update(
+            {
+                "quality_status": "critical",
+                "quality_flags": [dex_lifecycle_flag],
+            }
+        )
+        dex_lifecycle["metadata"]["daily_quality_report"][
+            "market_issue_rollups"
+        ][1]["fact_outcome"] = {
+            "status": "source_no_observation",
+            "reason_code": "instrument_absent_from_current_catalog",
+            "retryable": False,
+            "action": "operator_review_source_outcome",
+        }
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "zero evidence/action",
+        ):
+            validate_quality(
+                dex_lifecycle,
                 token="AAVE",
                 market_a=market_a,
                 market_b=market_b,

@@ -203,6 +203,16 @@ DAILY_MATCHED_NO_ISSUE_OUTCOMES = frozenset(
         ("needs_review", "daily_quality_outcome_invalid"),
     }
 )
+CEX_DAILY_LIFECYCLE_NO_REPORT_ISSUE_FLAGS = {
+    (
+        "source_no_observation",
+        "instrument_absent_from_current_catalog",
+    ): "inactive_cex_instrument",
+    (
+        "needs_review",
+        "official_catalog_evidence_stale",
+    ): "stale_cex_lifecycle_evidence",
+}
 DAILY_FALLBACK_OUTCOMES = frozenset(
     set(DAILY_MATCHED_NO_ISSUE_OUTCOMES)
     | {
@@ -1195,6 +1205,20 @@ def _validate_daily_fact_evidence(
     present_evidence_fields = {
         field for field in DAILY_FACT_EVIDENCE_FIELDS if field in fact
     }
+    lifecycle_pair = (status, reason_code)
+    expected_lifecycle_flag = (
+        CEX_DAILY_LIFECYCLE_NO_REPORT_ISSUE_FLAGS.get(lifecycle_pair)
+        if market_type == "cex"
+        else None
+    )
+    has_cex_lifecycle_evidence = bool(
+        expected_lifecycle_flag
+        and any(
+            isinstance(flag, dict)
+            and flag.get("code") == expected_lifecycle_flag
+            for flag in fact.get("quality_flags", [])
+        )
+    )
 
     if report_status == "matched":
         require(
@@ -1257,7 +1281,10 @@ def _validate_daily_fact_evidence(
                 not status_counts
                 and not reason_counts
                 and not affected_dates
-                and (status, reason_code) in DAILY_MATCHED_NO_ISSUE_OUTCOMES,
+                and (
+                    lifecycle_pair in DAILY_MATCHED_NO_ISSUE_OUTCOMES
+                    or has_cex_lifecycle_evidence
+                ),
                 "Quality daily fact zero evidence/action is invalid",
             )
             try:
@@ -1381,7 +1408,7 @@ def _validate_daily_fact_evidence(
         else DAILY_FALLBACK_OUTCOMES
     )
     require(
-        pair in allowed,
+        pair in allowed or has_cex_lifecycle_evidence,
         "Quality daily fact lacks required published evidence/action",
     )
     try:
