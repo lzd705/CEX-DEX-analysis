@@ -1536,8 +1536,8 @@ class MarketMonitorServerTest(unittest.TestCase):
         with patch.dict(server.os.environ, self.environment, clear=True):
             payload = server.build_market_payload("2026-01-01", "2026-01-02")
 
-        self.assertEqual(payload["metadata"]["token_count"], 1)
-        self.assertEqual(len(payload["cex_markets"]), 2)
+        self.assertEqual(payload["metadata"]["token_count"], 8)
+        self.assertEqual(len(payload["cex_markets"]), 9)
         self.assertEqual(len(payload["dex_pools"]), 1)
         self.assertEqual(payload["dex_pools"][0]["instrument"], "WBTC / USDC 0.25%")
         self.assertNotIn("factor_results", payload)
@@ -2217,13 +2217,23 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn("exact venue market identity", normalization_note)
         self.assertIn("USD, USDT, and KRW", normalization_note)
         self.assertIn("never relabeled", normalization_note)
-        self.assertEqual(catalog["tokens"], ["BTC"])
+        self.assertEqual(
+            catalog["tokens"],
+            ["BTC", "CAKE", "EIGEN", "ETHFI", "GMX", "JTO", "MORPHO", "RAY"],
+        )
         market_ids = {market["market_id"] for market in catalog["markets"]}
         self.assertEqual(
             market_ids,
             {
                 "cex:binance:BTC/USDT",
                 "cex:okx:BTC/USDT",
+                "cex:crypto_com:CAKE/USDT",
+                "cex:crypto_com:EIGEN/USDT",
+                "cex:crypto_com:ETHFI/USDT",
+                "cex:crypto_com:GMX/USDT",
+                "cex:crypto_com:JTO/USDT",
+                "cex:crypto_com:MORPHO/USDT",
+                "cex:crypto_com:RAY/USDT",
                 "dex:eth:uniswap:0xpool:BTC",
             },
         )
@@ -2449,7 +2459,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertNotIn("markets", summary)
         self.assertNotIn("cex_markets", summary)
         self.assertNotIn("dex_pools", summary)
-        self.assertEqual(len(summary["tokens"]), 1)
+        self.assertEqual(len(summary["tokens"]), 8)
         self.assertEqual(
             summary["metadata"]["data_generation"],
             token_catalog["metadata"]["data_generation"],
@@ -2821,6 +2831,234 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertFalse(depth_fact["retryable"])
         self.assertIsNone(depth_fact["bands_bps"]["10"]["total_usd"])
 
+    def crypto_com_lifecycle_review(self, token):
+        market_id = f"cex:crypto_com:{token}/USDT"
+        return {
+            "market_id": market_id,
+            "token_symbol": token,
+            "exchange": "crypto_com",
+            "instrument": f"{token}/USDT",
+            "current_listing_status": "absent_from_official_current_catalog",
+            "reason_code": "instrument_absent_from_current_catalog",
+            "checked_at_utc": "2026-08-01T07:22:59+00:00",
+            "source_url": (
+                "https://api.crypto.com/exchange/v1/public/get-instruments"
+            ),
+            "response_sha256": "9" * 64,
+        }
+
+    def lifecycle_evidence(self, reviews):
+        market_ids = [review["market_id"] for review in reviews]
+        return {
+            "checked_at_utc": reviews[0]["checked_at_utc"],
+            "response_sha256": reviews[0]["response_sha256"],
+            "inventory_count": 919,
+            "configured_market_count": len(market_ids),
+            "configured_market_ids_sha256": (
+                server.configured_market_ids_sha256(market_ids)
+            ),
+        }
+
+    def test_lifecycle_review_materializes_zero_history_market(self):
+        review = self.crypto_com_lifecycle_review("CAKE")
+        evidence = self.lifecycle_evidence([review])
+
+        result = server.overlay_cex_instrument_lifecycle(
+            {"metadata": {}, "cex_markets": [], "dex_pools": []},
+            {review["market_id"]: review},
+            lifecycle_evidence=evidence,
+            now=datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(len(result["cex_markets"]), 1)
+        market = result["cex_markets"][0]
+        self.assertEqual(market["token_symbol"], "CAKE")
+        self.assertEqual(market["venue"], "crypto_com")
+        self.assertEqual(market["instrument"], "CAKE/USDT")
+        self.assertEqual(market["historical_observation_count"], 0)
+        self.assertIsNone(market["observation_count"])
+        self.assertEqual(market["price_points"], [])
+        self.assertIsNone(market["price_usd"])
+        self.assertIsNone(market["volume_usd"])
+        for field in (
+            "window_return",
+            "daily_volatility",
+            "spread_bps",
+            "total_depth_10bps_usd",
+            "total_depth_25bps_usd",
+            "total_depth_50bps_usd",
+            "total_depth_100bps_usd",
+        ):
+            self.assertIsNone(market[field])
+        self.assertEqual(
+            market["current_listing_reason_code"],
+            "instrument_absent_from_current_catalog",
+        )
+        self.assertEqual(market["current_listing_source"], review["source_url"])
+        self.assertEqual(
+            market["current_listing_response_sha256"],
+            review["response_sha256"],
+        )
+        self.assertEqual(market["depth_status"], "source_no_observation")
+
+    def test_lifecycle_review_does_not_duplicate_observed_market(self):
+        review = self.crypto_com_lifecycle_review("GMX")
+        payload = {
+            "metadata": {},
+            "cex_markets": [{
+                "token_symbol": "GMX",
+                "market": "cex",
+                "venue": "crypto_com",
+                "instrument": "GMX/USDT",
+                "observation_count": 196,
+                "price_points": [{"date": "2026-07-30", "price_usd": 10.0}],
+            }],
+            "dex_pools": [],
+        }
+
+        result = server.overlay_cex_instrument_lifecycle(
+            payload,
+            {review["market_id"]: review},
+            lifecycle_evidence=self.lifecycle_evidence([review]),
+            now=datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(len(result["cex_markets"]), 1)
+        self.assertEqual(
+            result["cex_markets"][0]["historical_observation_count"],
+            196,
+        )
+
+    def test_lifecycle_review_rejects_mismatched_identity(self):
+        review = self.crypto_com_lifecycle_review("CAKE")
+
+        with self.assertRaisesRegex(ValueError, "identity does not match"):
+            server.overlay_cex_instrument_lifecycle(
+                {"metadata": {}, "cex_markets": [], "dex_pools": []},
+                {"cex:crypto_com:EIGEN/USDT": review},
+                lifecycle_evidence=self.lifecycle_evidence([review]),
+                now=datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc),
+            )
+
+    def test_stale_lifecycle_review_materializes_needs_review_market(self):
+        review = self.crypto_com_lifecycle_review("CAKE")
+
+        result = server.overlay_cex_instrument_lifecycle(
+            {"metadata": {}, "cex_markets": [], "dex_pools": []},
+            {review["market_id"]: review},
+            lifecycle_evidence=self.lifecycle_evidence([review]),
+            now=datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc),
+        )
+
+        market = result["cex_markets"][0]
+        self.assertEqual(
+            market["current_listing_status"],
+            "official_catalog_evidence_stale",
+        )
+        self.assertEqual(market["depth_status"], "needs_review")
+        self.assertEqual(market["historical_observation_count"], 0)
+
+    def test_lifecycle_projection_identity_is_independent_of_selected_window(self):
+        review = self.crypto_com_lifecycle_review("CAKE")
+        evidence = self.lifecycle_evidence([review])
+        payload = {"cex_markets": [], "dex_pools": []}
+
+        first_window = server.overlay_cex_instrument_lifecycle(
+            {**payload, "metadata": {"window_start": "2026-07-01", "window_end": "2026-07-01"}},
+            {review["market_id"]: review},
+            lifecycle_evidence=evidence,
+            now=datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc),
+        )
+        second_window = server.overlay_cex_instrument_lifecycle(
+            {**payload, "metadata": {"window_start": "2026-07-31", "window_end": "2026-07-31"}},
+            {review["market_id"]: review},
+            lifecycle_evidence=evidence,
+            now=datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            {server.cex_market_id(market["venue"], market["instrument"])
+             for market in first_window["cex_markets"]},
+            {server.cex_market_id(market["venue"], market["instrument"])
+             for market in second_window["cex_markets"]},
+        )
+
+    def test_lifecycle_only_market_is_critical_without_affecting_rankings(self):
+        payload = {
+            "metadata": {
+                "available_start": "2026-07-31",
+                "available_end": "2026-07-31",
+                "source_date_ranges": {},
+                "sources": [],
+                "storage": "sqlite",
+            },
+            "cex_markets": [{
+                "token_symbol": "CAKE",
+                "market": "cex",
+                "venue": "binance",
+                "instrument": "CAKE/USDT",
+                "price_usd": 1.0,
+                "volume_usd": 100.0,
+                "coverage_ratio": 1.0,
+                "observation_count": 1,
+                "observation_days": 1,
+                "requested_window_days": 1,
+                "price_points": [{"date": "2026-07-31", "price_usd": 1.0}],
+                "depth_status": "observed",
+            }],
+            "dex_pools": [],
+        }
+        review = self.crypto_com_lifecycle_review("CAKE")
+        evidence = self.lifecycle_evidence([review])
+
+        projected = server.overlay_cex_instrument_lifecycle(
+            payload,
+            {review["market_id"]: review},
+            lifecycle_evidence=evidence,
+            now=datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc),
+        )
+        finalized = server.finalize_fact_contract(projected)
+        catalog = market_facts.catalog_from_market_payload(finalized)
+        catalog_summary = server.catalog_summary_from_catalog(catalog)
+
+        crypto = next(
+            market for market in catalog["markets"]
+            if market["market_id"] == "cex:crypto_com:CAKE/USDT"
+        )
+        self.assertEqual(crypto["quality_status"], "critical")
+        self.assertIn("inactive_cex_instrument", crypto["quality_flags"])
+        self.assertEqual(crypto["historical_observation_count"], 0)
+        self.assertIsNone(crypto["observation_days"])
+        self.assertEqual(catalog_summary["metadata"]["market_count"], 2)
+        self.assertEqual(finalized["tokens"][0]["primary_cex_id"], "binance|CAKE/USDT")
+        self.assertEqual(finalized["tokens"][0]["aggregate_cex_volume_usd"], 100.0)
+        self.assertEqual(
+            evidence["configured_market_ids_sha256"],
+            server.configured_market_ids_sha256({crypto["market_id"]}),
+        )
+
+        facts = {
+            "daily": server._daily_quality_fact(
+                crypto,
+                {"window_start": "2026-07-01", "window_end": "2026-07-31"},
+            ),
+            "depth": server._depth_quality_fact(crypto),
+            "execution": server._execution_quality_fact(
+                crypto,
+                {"snapshot": None, "error_code": None},
+            ),
+        }
+        for fact in facts.values():
+            self.assertEqual(
+                fact["reason_code"],
+                "instrument_absent_from_current_catalog",
+            )
+            self.assertFalse(fact["retryable"])
+            self.assertTrue(any(
+                flag["code"] == "inactive_cex_instrument"
+                for flag in fact["quality_flags"]
+            ))
+
     def test_stale_lifecycle_evidence_stays_withheld_but_no_longer_claims_current_absence(self):
         payload = {
             "metadata": {},
@@ -3183,7 +3421,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         lifecycle = result["metadata"]["cex_instrument_lifecycle"]
         self.assertEqual(lifecycle["absence_market_count"], 1)
         self.assertEqual(lifecycle["applied_market_count"], 1)
-        self.assertEqual(lifecycle["withheld_payload_market_count"], 0)
+        self.assertEqual(lifecycle["withheld_payload_market_count"], 1)
 
     def test_lifecycle_projection_cache_reclassifies_unchanged_evidence_after_ttl(self):
         payload = {"metadata": {}, "cex_markets": [], "dex_pools": []}
@@ -3288,7 +3526,10 @@ class MarketMonitorServerTest(unittest.TestCase):
         response_tokens = {
             token_summary["token_symbol"] for token_summary in summary["tokens"]
         }
-        self.assertEqual(response_tokens, {"BTC"})
+        self.assertEqual(
+            response_tokens,
+            {"BTC", "CAKE", "EIGEN", "ETHFI", "GMX", "JTO", "MORPHO", "RAY"},
+        )
         self.assertEqual(summary["metadata"]["default_workspace_token"], "BTC")
         self.assertIn(
             summary["metadata"]["default_workspace_token"],
@@ -4488,8 +4729,8 @@ class MarketMonitorServerTest(unittest.TestCase):
 
             second = server.build_market_payload("2026-01-01", "2026-01-02")
 
-        self.assertEqual(len(first["cex_markets"]), 2)
-        self.assertEqual(len(second["cex_markets"]), 3)
+        self.assertEqual(len(first["cex_markets"]), 9)
+        self.assertEqual(len(second["cex_markets"]), 10)
 
     def test_large_json_payload_uses_gzip_when_supported(self):
         payload = {"rows": ["repeated-market-fact"] * 500}
@@ -5560,8 +5801,8 @@ assert.equal(
             with self.subTest(source=source["name"]):
                 self.assertNotIn("modified_at", source)
                 self.assertEqual(source["ingested_at"], imported_at)
-        self.assertEqual(payload["metadata"]["token_count"], 1)
-        self.assertEqual(len(payload["cex_markets"]), 2)
+        self.assertEqual(payload["metadata"]["token_count"], 8)
+        self.assertEqual(len(payload["cex_markets"]), 9)
         self.assertEqual(len(payload["dex_pools"]), 1)
         self.assertAlmostEqual(payload["tokens"][0]["price_spread"], 105 / 102 - 1)
         self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)

@@ -197,6 +197,14 @@ a fallback for `TOKEN/USDT`. Fact values are normalized separately to USD:
 USDT uses the documented 1:1 proxy, and a cataloged KRW observation uses the
 retained daily USDT/KRW conversion without changing its market identity.
 
+A configured Crypto.com identity with a validated official absence review but
+no historical source row remains catalog-visible through a lifecycle-only
+read-time projection. The projection stores no database or CSV row, contributes
+no aggregate or ranking value, and publishes no candle, price, volume, depth,
+execution result, or delisting date. Historical observation count is zero;
+current facts remain null and non-retryable. Upbit identities are outside this
+projection.
+
 The sole historical exception is an operator-controlled migration for rows
 known to have been created by the retired Upbit KRW fallback or the old
 Coinbase/Kraken quote-label bug. The two corrections have separate declared

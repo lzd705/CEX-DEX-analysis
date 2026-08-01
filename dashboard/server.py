@@ -1200,6 +1200,32 @@ def current_cex_facts_withheld(market: dict[str, Any]) -> bool:
     )
 
 
+def _lifecycle_only_cex_market(
+    market_id: str,
+    review: dict[str, Any],
+) -> dict[str, Any]:
+    token = review.get("token_symbol")
+    exchange = review.get("exchange")
+    instrument = review.get("instrument")
+    if not all(
+        isinstance(value, str) and value == value.strip() and bool(value)
+        for value in (token, exchange, instrument)
+    ):
+        raise ValueError("CEX lifecycle review identity is incomplete")
+    expected_market_id = cex_market_id(exchange, instrument)
+    if exchange != "crypto_com" or expected_market_id != market_id:
+        raise ValueError("CEX lifecycle review identity does not match the market")
+    return {
+        "token_symbol": token,
+        "market": "cex",
+        "venue": exchange,
+        "instrument": instrument,
+        "observation_count": 0,
+        "observation_days": 0,
+        "price_points": [],
+    }
+
+
 def overlay_cex_instrument_lifecycle(
     payload: dict[str, Any],
     reviews: dict[str, dict[str, Any]] | None = None,
@@ -1308,6 +1334,17 @@ def overlay_cex_instrument_lifecycle(
     stale_evidence_count = (
         0 if root_evidence_is_fresh else configured_market_count
     )
+    existing_market_ids = {
+        cex_market_id(market.get("venue"), market.get("instrument"))
+        for market in result["cex_markets"]
+    }
+    for market_id in sorted(reviews):
+        if market_id in existing_market_ids:
+            continue
+        result["cex_markets"].append(
+            _lifecycle_only_cex_market(market_id, reviews[market_id])
+        )
+        existing_market_ids.add(market_id)
     for market in result["cex_markets"]:
         market_id = cex_market_id(market.get("venue"), market.get("instrument"))
         review = reviews.get(market_id)
@@ -1428,6 +1465,13 @@ def overlay_cex_instrument_lifecycle(
         market["depth_quote_conversion_method"] = None
 
     metadata = result["metadata"]
+    if "token_count" in metadata:
+        metadata["token_count"] = len(
+            {
+                market["token_symbol"]
+                for market in result["cex_markets"] + result["dex_pools"]
+            }
+        )
     metadata["cex_instrument_lifecycle"] = {
         "schema": "cex_instrument_lifecycle/v1",
         "reviewed_market_count": configured_market_count,
@@ -4597,6 +4641,8 @@ def _quality_flags_for_fact(
         codes = {"tiny_pool"}
     elif fact == "depth":
         codes = {
+            "inactive_cex_instrument",
+            "stale_cex_lifecycle_evidence",
             "depth_unavailable",
             "depth_unsupported",
             "unsupported_depth",
