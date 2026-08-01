@@ -2518,6 +2518,20 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertNotIn("price_points", compact["primary_cex"])
         self.assertNotIn("price_points", compact["primary_dex"])
         for primary in (compact["primary_cex"], compact["primary_dex"]):
+            for catalog_only_field in (
+                "observation_count",
+                "quality_flag_details",
+                "current_listing_status",
+                "current_listing_reason_code",
+                "current_listing_checked_at",
+            ):
+                self.assertNotIn(catalog_only_field, primary)
+            self.assertNotIn(
+                "requested_window_days",
+                primary,
+            )
+        self.assertNotIn("tvl_usd", compact["primary_cex"])
+        for primary in (compact["primary_cex"], compact["primary_dex"]):
             self.assertIn("refresh_market_id", primary)
             self.assertIsInstance(primary["depth_retryable"], bool)
             for fact_name in ("tvl", "depth"):
@@ -2534,14 +2548,18 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "first_observed_date",
                 "latest_observed_date",
                 "coverage_ratio",
-                "total_depth_10bps_usd",
-                "total_depth_25bps_usd",
-                "total_depth_50bps_usd",
-                "total_depth_100bps_usd",
                 "depth_status",
                 "quality_flags",
             ):
                 self.assertIn(field, primary)
+            for field in (
+                "total_depth_10bps_usd",
+                "total_depth_25bps_usd",
+                "total_depth_50bps_usd",
+                "total_depth_100bps_usd",
+            ):
+                if field in primary:
+                    self.assertIsNotNone(primary[field])
 
     def test_screener_quality_counts_match_screening_projection_for_every_token(self):
         with patch.dict(server.os.environ, self.environment, clear=True):

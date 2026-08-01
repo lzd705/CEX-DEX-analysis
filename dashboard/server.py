@@ -2788,7 +2788,6 @@ SCREENER_MARKET_FIELDS = (
     "first_observed_date",
     "latest_observed_date",
     "observation_days",
-    "observation_count",
     "coverage_ratio",
     "total_depth_10bps_usd",
     "total_depth_25bps_usd",
@@ -2801,10 +2800,21 @@ SCREENER_MARKET_FIELDS = (
     "tvl_observed_at",
     "quality_status",
     "quality_flags",
-    "quality_flag_details",
-    "current_listing_status",
-    "current_listing_reason_code",
-    "current_listing_checked_at",
+)
+
+SCREENER_REQUIRED_MARKET_FIELDS = frozenset(
+    {
+        "token_symbol",
+        "venue",
+        "market_type",
+        "refresh_market_id",
+        "tvl_status",
+        "tvl_na_reason",
+        "tvl_retryable",
+        "depth_status",
+        "depth_na_reason",
+        "depth_retryable",
+    }
 )
 
 WINDOW_MARKET_FIELDS = (
@@ -2892,7 +2902,11 @@ def _compact_screener_market(
     compact["tvl_na_reason"] = tvl_fact.get("reason_code")
     compact["depth_retryable"] = depth_fact["retryable"]
     compact["depth_na_reason"] = depth_fact.get("reason_code")
-    return compact
+    return {
+        field: value
+        for field, value in compact.items()
+        if value is not None or field in SCREENER_REQUIRED_MARKET_FIELDS
+    }
 
 
 def _public_data_generation(
