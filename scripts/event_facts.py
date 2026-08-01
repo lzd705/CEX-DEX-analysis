@@ -27,7 +27,7 @@ import shutil
 import sqlite3
 import tempfile
 from collections import Counter, defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -278,6 +278,42 @@ def effective_date_bounds(value: str, precision: str) -> tuple[str, str]:
     parsed = datetime.fromisoformat(value[:-1] + "+00:00")
     observed_date = parsed.date().isoformat()
     return observed_date, observed_date
+
+
+def effective_datetime_interval(
+    value: str,
+    precision: str,
+) -> tuple[datetime, datetime | None, str]:
+    """Return the exact instant or UTC calendar interval for one Event Fact.
+
+    Minute/second precision is an exact instant and therefore has no invented
+    interval end. Day/month precision uses its complete UTC calendar interval
+    with an exclusive end. The stored Event Fact remains unchanged.
+    """
+    normalized_value, normalized_precision = normalize_precise_time(
+        value,
+        precision,
+        field="effective_at",
+        required=True,
+    )
+    if normalized_precision in {"second", "minute"}:
+        exact_text = (
+            normalized_value
+            if normalized_precision == "second"
+            else normalized_value[:-1] + ":00Z"
+        )
+        exact = datetime.fromisoformat(exact_text[:-1] + "+00:00")
+        return exact, None, "exact_instant"
+    start_date, end_date = effective_date_bounds(
+        normalized_value,
+        normalized_precision,
+    )
+    start = datetime.fromisoformat(start_date + "T00:00:00+00:00")
+    end_exclusive = (
+        datetime.fromisoformat(end_date + "T00:00:00+00:00")
+        + timedelta(days=1)
+    )
+    return start, end_exclusive, "effective_date_interval"
 
 
 def _validate_https_url(value: Any, *, field: str) -> str:

@@ -172,6 +172,7 @@ from scripts.timestamp_contract import (
     validate_observation_bounds,
 )
 from dashboard.event_facts import (
+    EVENT_CLOCK_STATES,
     EventBundleError,
     LIFECYCLES,
     build_event_payload,
@@ -381,7 +382,7 @@ PUBLIC_API_QUERY_FIELDS = {
         "start",
         "end",
     ),
-    "events": ("token", "start", "end", "lifecycle"),
+    "events": ("token", "start", "end", "lifecycle", "clock_state"),
 }
 
 
@@ -6089,6 +6090,8 @@ def build_event_facts(
     start: str | None = None,
     end: str | None = None,
     lifecycle: str | None = None,
+    clock_state: str | None = None,
+    clock_as_of: datetime | None = None,
 ) -> dict[str, Any]:
     """Return a validated Event bundle projection or explicit unavailability."""
 
@@ -6110,6 +6113,8 @@ def build_event_facts(
             start=start,
             end=end,
             lifecycle=lifecycle,
+            clock_state=clock_state,
+            clock_as_of=clock_as_of,
         )
         payload["availability"] = {
             "status": "unavailable",
@@ -6129,6 +6134,8 @@ def build_event_facts(
             start=start,
             end=end,
             lifecycle=lifecycle,
+            clock_state=clock_state,
+            clock_as_of=clock_as_of,
         )
         payload["availability"] = {
             "status": "unavailable",
@@ -6144,6 +6151,8 @@ def build_event_facts(
         start=start,
         end=end,
         lifecycle=lifecycle,
+        clock_state=clock_state,
+        clock_as_of=clock_as_of,
     )
     payload["availability"] = {"status": "available", "reason": None}
     return payload
@@ -6191,6 +6200,11 @@ def api_source_signature() -> SourceSignature:
 def api_freshness_bucket() -> int:
     """Refresh wall-clock freshness while retaining short-lived response reuse."""
     return int(time.time() // API_FRESHNESS_CACHE_SECONDS)
+
+
+def event_response_clock() -> datetime:
+    """Own one exact UTC clock for each uncached Event API response."""
+    return datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _public_payload_projection(value: Any) -> Any:
@@ -6290,6 +6304,12 @@ def _validate_public_api_client_query(
             raise PublicClientRequestError(
                 "lifecycle must be one of " + ", ".join(sorted(LIFECYCLES))
             )
+        clock_state = (query.get("clock_state") or "").strip().lower()
+        if clock_state and clock_state not in EVENT_CLOCK_STATES:
+            raise PublicClientRequestError(
+                "clock_state must be one of "
+                + ", ".join(sorted(EVENT_CLOCK_STATES))
+            )
 
 
 def _build_public_api_payload(
@@ -6350,6 +6370,8 @@ def _build_public_api_payload(
             start=query.get("start"),
             end=query.get("end"),
             lifecycle=query.get("lifecycle"),
+            clock_state=query.get("clock_state"),
+            clock_as_of=event_response_clock(),
         )
     else:
         raise ValueError(f"Unknown public API route: {route}")
@@ -6478,7 +6500,19 @@ def build_public_api_response(
                     freshness_bucket,
                 )
                 try:
-                    if accepts_gzip:
+                    if route == "events":
+                        payload = _build_public_api_payload(
+                            route,
+                            query_items,
+                            source_signature=source_signature,
+                        )
+                        if api_source_signature() != source_signature:
+                            raise SourceGenerationChanged
+                        response = encode_json_payload(
+                            payload,
+                            "gzip" if accepts_gzip else "",
+                        )
+                    elif accepts_gzip:
                         response = _build_public_api_response_cached(
                             route,
                             query_items,
@@ -6520,7 +6554,7 @@ def public_api_query_items(
         value = query[name][0]
         if route in {"catalog", "events"} and name == "token":
             value = value.strip().upper()
-        elif route == "events" and name == "lifecycle":
+        elif route == "events" and name in {"lifecycle", "clock_state"}:
             value = value.strip().lower()
         elif route == "events":
             value = value.strip()

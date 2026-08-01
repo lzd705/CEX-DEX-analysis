@@ -38,6 +38,7 @@ try:
         DEFAULT_ROUTE_CORE_ROOT,
         load_latest_route_cohort,
     )
+    from scripts.event_facts import effective_datetime_interval
     from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from cex_instrument_lifecycle import configured_market_ids_sha256
@@ -48,6 +49,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
         canonical_quality_fact_rule,
     )
     from route_publication import DEFAULT_ROUTE_CORE_ROOT, load_latest_route_cohort
+    from event_facts import effective_datetime_interval
     from static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
 
 
@@ -186,6 +188,8 @@ EVENT_LIFECYCLES = frozenset(
 EVENT_EVIDENCE_STATUSES = frozenset(
     {"primary_confirmed", "cross_checked", "onchain_observed"}
 )
+EVENT_CLOCK_STATES = frozenset({"past", "future", "current_window"})
+UTC_SECOND_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 EXPECTED_SUMMARY_VERSION = 3
 EXPECTED_QUALITY_CONTRACT_VERSION = 4
 SCREENING_QUALITY_STATUSES = frozenset({"ok", "info", "warning", "critical"})
@@ -2781,6 +2785,7 @@ def validate_events(
     start: str | None = None,
     end: str | None = None,
     lifecycle: str | None = None,
+    clock_state: str | None = None,
     require_events: bool = True,
 ) -> list[dict[str, Any]]:
     availability = payload.get("availability") or {}
@@ -2789,7 +2794,7 @@ def validate_events(
         "Event Fact publication is unavailable",
     )
     require(availability.get("reason") is None, "Available Event feed has a reason")
-    require(payload.get("schema") == "event_facts_api/v1", "Wrong Event API schema")
+    require(payload.get("schema") == "event_facts_api/v2", "Wrong Event API schema")
     require(payload.get("fact_schema") == "event_facts/v1", "Wrong Event fact schema")
     boundary = payload.get("fact_boundary")
     require(
@@ -2810,6 +2815,13 @@ def validate_events(
         and payload["built_at_utc"],
         "Event build timestamp is missing",
     )
+    clock_as_of_utc = payload.get("clock_as_of_utc")
+    require(
+        isinstance(clock_as_of_utc, str)
+        and UTC_SECOND_RE.fullmatch(clock_as_of_utc) is not None,
+        "Event clock_as_of_utc is invalid",
+    )
+    clock_as_of = datetime.fromisoformat(clock_as_of_utc[:-1] + "+00:00")
 
     query = payload.get("query") or {}
     require(query.get("token") == token, "Event token scope was not honored")
@@ -2818,6 +2830,10 @@ def validate_events(
     require(
         query.get("lifecycle") == lifecycle,
         "Event lifecycle scope was not honored",
+    )
+    require(
+        query.get("clock_state") == clock_state,
+        "Event clock-state scope was not honored",
     )
     coverage = payload.get("coverage") or {}
     configured_token_count = coverage.get("configured_token_count")
@@ -2883,6 +2899,21 @@ def validate_events(
             and sum(counts.values()) == len(events),
             f"{counts_field} does not match returned Event rows",
         )
+    clock_counts = payload.get("clock_state_counts")
+    require(
+        isinstance(clock_counts, dict)
+        and all(
+            key in EVENT_CLOCK_STATES
+            and isinstance(value, int)
+            and value > 0
+            for key, value in clock_counts.items()
+        ),
+        "clock_state_counts is invalid",
+    )
+    require(
+        sum(clock_counts.values()) == len(events),
+        "clock_state_counts does not match returned Event rows",
+    )
     if require_events:
         require(bool(events), "Event response has no verified records")
 
@@ -2930,12 +2961,63 @@ def validate_events(
                 event["lifecycle"] == lifecycle,
                 "Event leaked another lifecycle",
             )
+        timing = event.get("time") or {}
+        clock = event.get("clock") or {}
+        current_clock_state = clock.get("state")
+        require(
+            current_clock_state in EVENT_CLOCK_STATES,
+            "Event clock state is invalid",
+        )
+        if clock_state is not None:
+            require(
+                current_clock_state == clock_state,
+                "Event leaked another clock state",
+            )
+        require(
+            clock.get("as_of_utc") == clock_as_of_utc,
+            "Event clock does not use the shared response clock",
+        )
+        try:
+            start_at, end_exclusive, expected_basis = (
+                effective_datetime_interval(
+                    str(timing.get("effective_at") or ""),
+                    str(timing.get("effective_at_precision") or ""),
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise ReleaseCheckError(
+                "Event effective time cannot support its clock projection"
+            ) from error
+        if expected_basis == "exact_instant":
+            expected_clock_state = (
+                "future"
+                if clock_as_of < start_at
+                else "past"
+                if clock_as_of > start_at
+                else "current_window"
+            )
+        else:
+            require(
+                end_exclusive is not None,
+                "Event effective interval has no exclusive end",
+            )
+            expected_clock_state = (
+                "future"
+                if clock_as_of < start_at
+                else "past"
+                if clock_as_of >= end_exclusive
+                else "current_window"
+            )
+        require(
+            current_clock_state == expected_clock_state
+            and clock.get("basis") == expected_basis,
+            "Event clock projection disagrees with effective time",
+        )
         require(
             event.get("evidence_status") in EVENT_EVIDENCE_STATUSES,
             "Event evidence status is invalid",
         )
 
-        timing = event.get("time") or {}
         effective_start = timing.get("effective_date_start")
         effective_end = timing.get("effective_date_end")
         require(
@@ -3000,6 +3082,9 @@ def validate_events(
             sorted(Counter(event["evidence_status"] for event in events).items())
         ),
     }
+    expected_counts["clock_state_counts"] = dict(
+        sorted(Counter(event["clock"]["state"] for event in events).items())
+    )
     for counts_field, expected in expected_counts.items():
         require(
             payload.get(counts_field) == expected,
@@ -3292,12 +3377,14 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
     event_start = seed_event["time"]["effective_date_start"]
     event_end = seed_event["time"]["effective_date_end"]
     event_lifecycle = seed_event["lifecycle"]
+    event_clock_state = seed_event["clock"]["state"]
     scoped_events_path = "/api/markets/events?" + urlencode(
         {
             "token": event_token,
             "start": event_start,
             "end": event_end,
             "lifecycle": event_lifecycle,
+            "clock_state": event_clock_state,
         }
     )
     scoped_events, scoped_events_metrics = fetch_json(
@@ -3312,6 +3399,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         start=event_start,
         end=event_end,
         lifecycle=event_lifecycle,
+        clock_state=event_clock_state,
     )
 
     token_summary = token_catalog.get("token_summary") or {}

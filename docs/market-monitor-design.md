@@ -28,8 +28,9 @@ collection cadence.
   Spread, and Volume line charts plus the raw table.
 - `Liquidity & Execution` compares the latest 10/25/50/100 bps depth and
   fixed-notional quoted-cost scenarios with source-state timestamps.
-- `Events` lists the latest verified revision of matching Event Facts,
-  lifecycle, timing precision, size/market identity, evidence, and source.
+- `Events` lists the latest verified revision of matching Event Facts, with
+  independent `Past / Future / Current` clock filters and evidence-lifecycle
+  filters. Clock state never upgrades a scheduled event to occurred.
 - `Data Quality` explains coverage, freshness, missing/unsupported facts,
   warnings, recovery eligibility, and lineage for the current Token and A/B
   pair. Capability limits and observed market conditions are kept separate
@@ -68,6 +69,13 @@ interval when a published Event Fact overlaps the chart window. The overlay
 answers only “when did this source-backed event take effect?” It does not
 answer “what did the event cause?” and does not calculate pre/post return,
 abnormal return, volume impact, sentiment, or importance.
+
+Event time and evidence lifecycle are deliberately separate. `Past`, `Future`,
+and `Current` describe the published effective-time interval relative to the
+API response clock. `Scheduled`, `Occurred`, `Postponed`, `Cancelled`, and
+`Superseded` describe what the evidence supports. A past scheduled event is
+therefore shown as “effective time passed; occurrence unconfirmed,” not as an
+occurred event.
 
 Event Facts are curated from official sources and published as append-only
 revisions. The repository contains 44 latest facts with at least one verified

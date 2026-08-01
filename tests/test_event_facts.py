@@ -2,12 +2,15 @@ import csv
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from dashboard.event_facts import (
+    EVENT_API_SCHEMA,
     EventBundleError,
     build_event_payload,
+    event_clock_projection,
     load_latest_event_rows,
     resolve_event_bundle,
 )
@@ -19,6 +22,7 @@ from scripts.event_facts import (
     EventFactValidationError,
     build_event_bundle,
     effective_date_bounds,
+    effective_datetime_interval,
     latest_event_rows,
     load_allowed_cex_market_ids,
     load_allowed_tokens,
@@ -332,6 +336,182 @@ class EventFactsTest(unittest.TestCase):
             payload["events"][0]["time"]["effective_date_start"],
             "2026-02-01",
         )
+
+    def test_event_clock_state_preserves_precision_and_lifecycle(self):
+        second = self.candidate()
+        second.update(
+            {
+                "event_id": "arb-second-event",
+                "effective_at": "2026-08-15T12:00:00Z",
+                "effective_at_precision": "second",
+            }
+        )
+        day = self.candidate()
+        day.update(
+            {
+                "event_id": "arb-day-event",
+                "effective_at": "2026-08-16",
+                "effective_at_precision": "day",
+            }
+        )
+        month = self.candidate()
+        month.update(
+            {
+                "event_id": "arb-month-event",
+                "effective_at": "2026-09",
+                "effective_at_precision": "month",
+            }
+        )
+        normalized = self.normalize([second, day, month])
+
+        payload = build_event_payload(
+            normalized,
+            manifest={"bundle_id": "abc", "built_at_utc": self.checked_at},
+            clock_as_of=datetime(2026, 8, 16, 12, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(EVENT_API_SCHEMA, "event_facts_api/v2")
+        self.assertEqual(payload["clock_as_of_utc"], "2026-08-16T12:00:00Z")
+        self.assertEqual(
+            payload["clock_state_counts"],
+            {"current_window": 1, "future": 1, "past": 1},
+        )
+        by_id = {event["event_id"]: event for event in payload["events"]}
+        self.assertEqual(by_id["arb-second-event"]["clock"]["state"], "past")
+        self.assertEqual(
+            by_id["arb-second-event"]["clock"]["as_of_utc"],
+            payload["clock_as_of_utc"],
+        )
+        self.assertEqual(
+            by_id["arb-second-event"]["clock"]["basis"],
+            "exact_instant",
+        )
+        self.assertEqual(
+            by_id["arb-day-event"]["clock"]["state"],
+            "current_window",
+        )
+        self.assertEqual(
+            by_id["arb-day-event"]["clock"]["basis"],
+            "effective_date_interval",
+        )
+        self.assertEqual(by_id["arb-month-event"]["clock"]["state"], "future")
+        self.assertEqual(by_id["arb-second-event"]["lifecycle"], "scheduled")
+        self.assertEqual(by_id["arb-second-event"]["lifecycle"], "scheduled")
+
+    def test_event_clock_filter_is_independent_of_evidence_lifecycle(self):
+        past = self.candidate()
+        past.update(
+            {
+                "event_id": "arb-past-scheduled",
+                "effective_at": "2026-08-01",
+                "effective_at_precision": "day",
+            }
+        )
+        future = self.candidate()
+        future.update(
+            {
+                "event_id": "arb-future-scheduled",
+                "effective_at": "2026-09-01",
+                "effective_at_precision": "day",
+            }
+        )
+        payload = build_event_payload(
+            self.normalize([past, future]),
+            manifest={"bundle_id": "abc", "built_at_utc": self.checked_at},
+            lifecycle="scheduled",
+            clock_state="future",
+            clock_as_of=datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(payload["query"]["lifecycle"], "scheduled")
+        self.assertEqual(payload["query"]["clock_state"], "future")
+        self.assertEqual(payload["event_count"], 1)
+        self.assertEqual(payload["events"][0]["event_id"], "arb-future-scheduled")
+        self.assertEqual(payload["events"][0]["clock"]["state"], "future")
+        self.assertEqual(payload["clock_state_counts"], {"future": 1})
+
+        with self.assertRaisesRegex(ValueError, "clock_state must be one of"):
+            build_event_payload(
+                [],
+                manifest={"bundle_id": "abc"},
+                clock_state="predicted",
+                clock_as_of=datetime(2026, 8, 15, tzinfo=timezone.utc),
+            )
+
+    def test_clock_projection_respects_exact_and_calendar_intervals(self):
+        as_of = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+        self.assertEqual(
+            event_clock_projection(
+                "2026-08-01T12:01Z",
+                "minute",
+                as_of,
+            ),
+            {
+                "state": "future",
+                "as_of_utc": "2026-08-01T12:00:00Z",
+                "basis": "exact_instant",
+            },
+        )
+        self.assertEqual(
+            event_clock_projection("2026-08-01", "day", as_of)["state"],
+            "current_window",
+        )
+        self.assertEqual(
+            event_clock_projection("2026-07", "month", as_of)["state"],
+            "past",
+        )
+        exact_event = "2026-08-01T12:00:30Z"
+        self.assertEqual(
+            event_clock_projection(
+                exact_event,
+                "second",
+                datetime(2026, 8, 1, 12, 0, 29, tzinfo=timezone.utc),
+            )["state"],
+            "future",
+        )
+        self.assertEqual(
+            event_clock_projection(
+                exact_event,
+                "second",
+                datetime(2026, 8, 1, 12, 0, 31, tzinfo=timezone.utc),
+            )["state"],
+            "past",
+        )
+        start, end, basis = effective_datetime_interval(
+            "2024-02",
+            "month",
+        )
+        self.assertEqual(start.isoformat(), "2024-02-01T00:00:00+00:00")
+        self.assertEqual(end.isoformat(), "2024-03-01T00:00:00+00:00")
+        self.assertEqual(basis, "effective_date_interval")
+
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            event_clock_projection(
+                "2026-08-01",
+                "day",
+                datetime(2026, 8, 1, 12),
+            )
+
+    def test_clock_filter_empty_intersection_has_empty_counts(self):
+        row = self.candidate()
+        row.update(
+            {
+                "lifecycle": "occurred",
+                "effective_at": "2026-08-01",
+                "effective_at_precision": "day",
+                "recorded_at_utc": "2026-08-02T00:00:00Z",
+            }
+        )
+        payload = build_event_payload(
+            self.normalize([row]),
+            manifest={"bundle_id": "abc", "built_at_utc": self.checked_at},
+            lifecycle="occurred",
+            clock_state="future",
+            clock_as_of=datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+        self.assertEqual(payload["event_count"], 0)
+        self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["clock_state_counts"], {})
 
     def test_bundle_checksum_fails_closed_after_tampering(self):
         input_path = self.root / "event_facts.csv"

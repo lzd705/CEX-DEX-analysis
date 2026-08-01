@@ -217,12 +217,26 @@ base-10 strings. Blank input becomes JSON `null`; it never becomes zero.
    inventory with the current Screener catalog and requests every Token scope;
    any uncovered or empty Token blocks release.
 
-The helper returns `event_facts_api/v1`, lifecycle and evidence status,
+The helper returns `event_facts_api/v2`, lifecycle and evidence status,
 source/revision lineage, explicit date bounds, exact null-preserving size
 values, and configured/covered/uncovered Token inventory. The dashboard
 exposes this through
-`GET /api/markets/events?token=&start=&end=&lifecycle=` and the Token workspace
-Events page, whose summary displays the release coverage ratio. Compare may
+`GET /api/markets/events?token=&start=&end=&lifecycle=&clock_state=` and the
+Token workspace Events page, whose summary displays the release coverage
+ratio. `clock_state` is independently filterable as `past`, `future`, or
+`current_window`; it never changes the source-backed lifecycle. The response
+publishes `clock_as_of_utc`, the same per-row `as_of_utc`, a calculation
+`basis`, and clock-state counts for the returned rows.
+When `clock_state` is filtered, the counts describe only the returned rows;
+an available empty intersection therefore has `event_count=0`, an empty
+`events` array, and empty counts.
+Minute and second precision use the exact published instant. Day and month
+precision use the complete UTC calendar interval, so the API does not invent
+a midnight event time. A scheduled event whose effective interval has passed
+remains scheduled and carries the explicit notice
+human-readable “Effective time passed; occurrence unconfirmed” disclosure.
+Event responses bypass the ordinary minute-level serialized-response cache,
+so an exact event cannot remain Future after its published instant. Compare may
 overlay matching event dates as temporal context only. Event bundle files
 participate in the server source signature so a validated pointer change
 invalidates the cached generation; an unavailable Event publication remains

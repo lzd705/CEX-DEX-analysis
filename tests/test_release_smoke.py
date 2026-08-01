@@ -1131,6 +1131,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "effective_date_end": "2026-01-10",
             },
             "lifecycle": "occurred",
+            "clock": {"state": "past"},
         }
         all_events = {
             "coverage": {
@@ -3539,6 +3540,11 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "event_subtype": "scheduled_release",
             "event_name": "Scheduled STRK unlock",
             "lifecycle": "scheduled",
+            "clock": {
+                "state": "past",
+                "as_of_utc": "2026-08-16T12:00:00Z",
+                "basis": "effective_date_interval",
+            },
             "evidence_status": "primary_confirmed",
             "time": {
                 "effective_at": "2026-08-15",
@@ -3575,7 +3581,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "notes": None,
         }
         return {
-            "schema": "event_facts_api/v1",
+            "schema": "event_facts_api/v2",
             "fact_schema": "event_facts/v1",
             "fact_boundary": (
                 "Source-backed event facts only. No return, market-impact, "
@@ -3583,6 +3589,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             ),
             "bundle_id": "a" * 24,
             "built_at_utc": "2026-07-29T08:30:00Z",
+            "clock_as_of_utc": "2026-08-16T12:00:00Z",
             "availability": {"status": "available", "reason": None},
             "coverage": {
                 "configured_token_count": 1,
@@ -3596,11 +3603,13 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "start": "2026-08-15",
                 "end": "2026-08-15",
                 "lifecycle": "scheduled",
+                "clock_state": None,
             },
             "event_count": 1,
             "event_type_counts": {"unlock": 1},
             "lifecycle_counts": {"scheduled": 1},
             "evidence_status_counts": {"primary_confirmed": 1},
+            "clock_state_counts": {"past": 1},
             "events": [event],
         }
 
@@ -3614,6 +3623,18 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             lifecycle="scheduled",
         )
         self.assertEqual(events[0]["event_id"], "strk-unlock-2026-08-15")
+
+        filtered = self.event_payload()
+        filtered["query"]["clock_state"] = "past"
+        events = validate_events(
+            filtered,
+            token="STRK",
+            start="2026-08-15",
+            end="2026-08-15",
+            lifecycle="scheduled",
+            clock_state="past",
+        )
+        self.assertEqual(events[0]["clock"]["state"], "past")
 
         unavailable = {
             **payload,
@@ -3668,6 +3689,45 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         ):
             validate_events(
                 wrong_coverage,
+                token="STRK",
+                start="2026-08-15",
+                end="2026-08-15",
+                lifecycle="scheduled",
+            )
+
+        invalid_clock = self.event_payload()
+        invalid_clock["events"][0]["clock"]["state"] = "predicted"
+        with self.assertRaisesRegex(ReleaseCheckError, "clock state is invalid"):
+            validate_events(
+                invalid_clock,
+                token="STRK",
+                start="2026-08-15",
+                end="2026-08-15",
+                lifecycle="scheduled",
+            )
+
+        wrong_clock = self.event_payload()
+        wrong_clock["events"][0]["clock"] = {
+            "state": "current_window",
+            "as_of_utc": wrong_clock["clock_as_of_utc"],
+            "basis": "effective_date_interval",
+        }
+        with self.assertRaisesRegex(ReleaseCheckError, "clock projection"):
+            validate_events(
+                wrong_clock,
+                token="STRK",
+                start="2026-08-15",
+                end="2026-08-15",
+                lifecycle="scheduled",
+            )
+
+        wrong_shared_clock = self.event_payload()
+        wrong_shared_clock["events"][0]["clock"]["as_of_utc"] = (
+            "2026-08-16T11:59:59Z"
+        )
+        with self.assertRaisesRegex(ReleaseCheckError, "shared response clock"):
+            validate_events(
+                wrong_shared_clock,
                 token="STRK",
                 start="2026-08-15",
                 end="2026-08-15",

@@ -13,7 +13,7 @@ import re
 import sqlite3
 import sys
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -28,12 +28,15 @@ from scripts.event_facts import (  # noqa: E402
     EVENT_POINTER_SCHEMA,
     LIFECYCLES,
     effective_date_bounds,
+    effective_datetime_interval,
     sha256_file,
 )
 
 
-EVENT_API_SCHEMA = "event_facts_api/v1"
+EVENT_API_SCHEMA = "event_facts_api/v2"
+EVENT_CLOCK_STATES = frozenset({"past", "future", "current_window"})
 _BUNDLE_ID_RE = re.compile(r"^[0-9a-f]{24}$")
+_UTC_SECOND_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 class EventBundleError(ValueError):
@@ -232,6 +235,63 @@ def public_event_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _clock_as_of(value: datetime | str | None) -> tuple[str, datetime]:
+    if value is None:
+        current = datetime.now(timezone.utc).replace(microsecond=0)
+        return current.isoformat().replace("+00:00", "Z"), current
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("clock_as_of must be timezone-aware")
+        current = value.astimezone(timezone.utc).replace(microsecond=0)
+        return current.isoformat().replace("+00:00", "Z"), current
+    if not isinstance(value, str) or not _UTC_SECOND_RE.fullmatch(value):
+        raise ValueError(
+            "clock_as_of must be timezone-aware or exact UTC text like "
+            "2026-08-15T12:00:00Z"
+        )
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise ValueError("clock_as_of is not a valid timestamp") from error
+    return value, parsed
+
+
+def event_clock_projection(
+    effective_at: str,
+    precision: str,
+    as_of: datetime,
+) -> dict[str, str]:
+    """Derive clock state without changing the evidence lifecycle."""
+    canonical_clock, clock = _clock_as_of(as_of)
+    start, end_exclusive, basis = effective_datetime_interval(
+        effective_at,
+        precision,
+    )
+    if basis == "exact_instant":
+        state = (
+            "future"
+            if clock < start
+            else "past"
+            if clock > start
+            else "current_window"
+        )
+    else:
+        if end_exclusive is None:  # pragma: no cover - helper contract
+            raise ValueError("effective date interval has no exclusive end")
+        state = (
+            "future"
+            if clock < start
+            else "past"
+            if clock >= end_exclusive
+            else "current_window"
+        )
+    return {
+        "state": state,
+        "as_of_utc": canonical_clock,
+        "basis": basis,
+    }
+
+
 def build_event_payload(
     rows: Iterable[Mapping[str, Any]],
     *,
@@ -240,6 +300,8 @@ def build_event_payload(
     start: str | None = None,
     end: str | None = None,
     lifecycle: str | None = None,
+    clock_state: str | None = None,
+    clock_as_of: datetime | str | None = None,
 ) -> dict[str, Any]:
     """Filter latest facts by overlapping effective-date interval."""
 
@@ -254,8 +316,18 @@ def build_event_payload(
         raise ValueError(
             "lifecycle must be one of " + ", ".join(sorted(LIFECYCLES))
         )
+    normalized_clock_state = clock_state.strip().lower() if clock_state else None
+    if (
+        normalized_clock_state
+        and normalized_clock_state not in EVENT_CLOCK_STATES
+    ):
+        raise ValueError(
+            "clock_state must be one of "
+            + ", ".join(sorted(EVENT_CLOCK_STATES))
+        )
+    canonical_clock, clock = _clock_as_of(clock_as_of)
 
-    events = []
+    clocked_events = []
     for raw_row in source_rows:
         if normalized_token and raw_row.get("token_symbol") != normalized_token:
             continue
@@ -269,7 +341,25 @@ def build_event_payload(
             continue
         if end_date and event_start > end_date:
             continue
-        events.append(public_event_row(raw_row))
+        event = public_event_row(raw_row)
+        event["clock"] = event_clock_projection(
+            str(raw_row["effective_at"]),
+            str(raw_row["effective_at_precision"]),
+            clock,
+        )
+        clocked_events.append(event)
+
+    events = [
+        event
+        for event in clocked_events
+        if (
+            normalized_clock_state is None
+            or event["clock"]["state"] == normalized_clock_state
+        )
+    ]
+    clock_state_counts = dict(
+        sorted(Counter(event["clock"]["state"] for event in events).items())
+    )
 
     events.sort(
         key=lambda event: (
@@ -293,6 +383,7 @@ def build_event_payload(
         ),
         "bundle_id": manifest.get("bundle_id"),
         "built_at_utc": manifest.get("built_at_utc"),
+        "clock_as_of_utc": canonical_clock,
         "coverage": {
             "configured_token_count": manifest.get("configured_token_count"),
             "covered_token_count": len(covered_tokens),
@@ -309,6 +400,7 @@ def build_event_payload(
             "start": start_date,
             "end": end_date,
             "lifecycle": normalized_lifecycle,
+            "clock_state": normalized_clock_state,
         },
         "event_count": len(events),
         "event_type_counts": dict(
@@ -317,6 +409,7 @@ def build_event_payload(
         "lifecycle_counts": dict(
             sorted(Counter(event["lifecycle"] for event in events).items())
         ),
+        "clock_state_counts": clock_state_counts,
         "evidence_status_counts": dict(
             sorted(
                 Counter(event["evidence_status"] for event in events).items()

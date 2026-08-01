@@ -729,13 +729,27 @@
                 </details>
               </div>
             </div>
-            <div class="segmented-control events-lifecycle-control" role="group" aria-label="Event lifecycle filter">
-              <button type="button" data-event-lifecycle="all" class="active" aria-pressed="true">All</button>
-              <button type="button" data-event-lifecycle="occurred" aria-pressed="false">Occurred</button>
-              <button type="button" data-event-lifecycle="scheduled" aria-pressed="false">Scheduled</button>
-              <button type="button" data-event-lifecycle="postponed" aria-pressed="false">Postponed</button>
-              <button type="button" data-event-lifecycle="cancelled" aria-pressed="false">Cancelled</button>
-              <button type="button" data-event-lifecycle="superseded" aria-pressed="false">Superseded</button>
+            <div class="events-filter-stack" aria-label="Event timeline filters">
+              <div class="events-filter-row">
+                <span>Time</span>
+                <div class="segmented-control events-clock-control" role="group" aria-label="Event time filter">
+                  <button type="button" data-event-clock-state="all" class="active" aria-pressed="true">All</button>
+                  <button type="button" data-event-clock-state="future" aria-pressed="false">Future</button>
+                  <button type="button" data-event-clock-state="current_window" aria-pressed="false">Current</button>
+                  <button type="button" data-event-clock-state="past" aria-pressed="false">Past</button>
+                </div>
+              </div>
+              <div class="events-filter-row">
+                <span>Evidence status</span>
+                <div class="segmented-control events-lifecycle-control" role="group" aria-label="Event lifecycle filter">
+                  <button type="button" data-event-lifecycle="all" class="active" aria-pressed="true">All</button>
+                  <button type="button" data-event-lifecycle="occurred" aria-pressed="false">Occurred</button>
+                  <button type="button" data-event-lifecycle="scheduled" aria-pressed="false">Scheduled</button>
+                  <button type="button" data-event-lifecycle="postponed" aria-pressed="false">Postponed</button>
+                  <button type="button" data-event-lifecycle="cancelled" aria-pressed="false">Cancelled</button>
+                  <button type="button" data-event-lifecycle="superseded" aria-pressed="false">Superseded</button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -776,13 +790,14 @@
                   <th scope="col">Type</th>
                   <th scope="col">Event Fact</th>
                   <th scope="col">Lifecycle</th>
+                  <th scope="col">Time state</th>
                   <th scope="col">Size / Market</th>
                   <th scope="col">Evidence</th>
                   <th scope="col">Source &amp; Revision</th>
                 </tr>
               </thead>
               <tbody id="events-body">
-                <tr><td colspan="7" class="missing">Loading verified Event Facts</td></tr>
+                <tr><td colspan="8" class="missing">Loading verified Event Facts</td></tr>
               </tbody>
             </table>
           </div>

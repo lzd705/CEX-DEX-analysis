@@ -37,6 +37,9 @@ class EventFrontendTest(unittest.TestCase):
         self.assertIn('id="events-body"', index)
         self.assertIn('data-event-lifecycle="occurred"', index)
         self.assertIn('data-event-lifecycle="scheduled"', index)
+        self.assertIn('data-event-clock-state="future"', index)
+        self.assertIn('data-event-clock-state="past"', index)
+        self.assertIn('data-event-clock-state="current_window"', index)
         self.assertIn("does not estimate return", index)
         self.assertIn("or causality", index)
         self.assertIn("This is not proof that no event exists", app)
@@ -86,7 +89,7 @@ class EventFrontendTest(unittest.TestCase):
 const navigation = require({json.dumps(str(NAVIGATION_PATH))});
 const parsed = navigation.parseRoute(
   "/tokens/STRK/events",
-  "?lifecycle=scheduled&marketA=cex%3Aokx%3ASTRK%2FUSDT"
+  "?lifecycle=scheduled&clock_state=future&marketA=cex%3Aokx%3ASTRK%2FUSDT"
 );
 const built = navigation.buildWorkspacePath("STRK", "events", parsed.state);
 console.log(JSON.stringify({{ parsed, built }}));
@@ -102,7 +105,9 @@ console.log(JSON.stringify({{ parsed, built }}));
 
         self.assertEqual(result["parsed"]["page"], "events")
         self.assertEqual(result["parsed"]["state"]["lifecycle"], "scheduled")
+        self.assertEqual(result["parsed"]["state"]["clockState"], "future")
         self.assertIn("lifecycle=scheduled", result["built"])
+        self.assertIn("clock_state=future", result["built"])
         self.assertIn("marketA=", result["built"])
 
     def test_renderer_distinguishes_available_empty_and_unpublished(self):
@@ -128,7 +133,8 @@ const available = {
   bundle_id: "abc123",
   query: { token: "STRK", lifecycle: null },
   event_count: 1,
-  lifecycle_counts: { occurred: 1 },
+  lifecycle_counts: { scheduled: 1 },
+  clock_state_counts: { past: 1 },
   coverage: {
     configured_token_count: 30,
     covered_token_count: 30,
@@ -141,7 +147,12 @@ const available = {
     event_type: "unlock",
     event_subtype: "scheduled_release",
     event_name: "<verified unlock>",
-    lifecycle: "occurred",
+    lifecycle: "scheduled",
+    clock: {
+      state: "past",
+      as_of_utc: "2026-08-01T00:00:00Z",
+      basis: "effective_date_interval",
+    },
     evidence_status: "primary_confirmed",
     notes: null,
     time: {
@@ -200,6 +211,11 @@ console.log(JSON.stringify({ availableState, emptyState, unavailableState }));
         self.assertIn("&lt;verified unlock&gt;", result["availableState"]["html"])
         self.assertNotIn("<verified unlock>", result["availableState"]["html"])
         self.assertIn("docs.example.test", result["availableState"]["html"])
+        self.assertIn("Past", result["availableState"]["html"])
+        self.assertIn(
+            "Effective time passed; occurrence unconfirmed",
+            result["availableState"]["html"],
+        )
         self.assertIn("latest verified Event Facts", result["availableState"]["status"])
         self.assertIn("not proof", result["emptyState"]["html"])
         self.assertIn("absence is not inferred", result["emptyState"]["status"])
@@ -208,6 +224,116 @@ console.log(JSON.stringify({ availableState, emptyState, unavailableState }));
         self.assertIn("No publication", result["unavailableState"]["countHtml"])
         self.assertIn("different from a verified zero-event", result["unavailableState"]["html"])
         self.assertEqual(result["unavailableState"]["status"], "No publication")
+
+    def test_event_request_sends_and_validates_independent_clock_filter(self):
+        result = run_app_javascript(
+            r"""
+(async () => {
+  const urls = [];
+  let responseClock = "future";
+  global.fetch = async (url) => {
+    urls.push(url);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          schema: "event_facts_api/v2",
+          clock_as_of_utc: "2026-08-01T00:00:00Z",
+          query: {
+            token: "STRK",
+            lifecycle: "scheduled",
+            clock_state: responseClock,
+          },
+          events: [],
+        };
+      },
+    };
+  };
+  const accepted = await fetchEventFacts({
+    token: "STRK",
+    lifecycle: "scheduled",
+    clockState: "future",
+  });
+  responseClock = "past";
+  let mismatch = "";
+  try {
+    await fetchEventFacts({
+      token: "STRK",
+      lifecycle: "scheduled",
+      clockState: "future",
+    });
+  } catch (error) {
+    mismatch = error.message;
+  }
+  console.log(JSON.stringify({
+    urls,
+    acceptedClock: accepted.query.clock_state,
+    mismatch,
+  }));
+})();
+"""
+        )
+
+        self.assertEqual(result["acceptedClock"], "future")
+        self.assertIn("lifecycle=scheduled", result["urls"][0])
+        self.assertIn("clock_state=future", result["urls"][0])
+        self.assertIn("clock scope", result["mismatch"])
+
+    def test_event_request_rejects_missing_scope_and_cross_scope_rows(self):
+        result = run_app_javascript(
+            r"""
+(async () => {
+  const cases = [
+    {
+      schema: "event_facts_api/v2",
+      clock_as_of_utc: "2026-08-01T00:00:00Z",
+      query: { lifecycle: "scheduled", clock_state: "future" },
+      events: [],
+    },
+    {
+      schema: "event_facts_api/v2",
+      clock_as_of_utc: "2026-08-01T00:00:00Z",
+      query: {
+        token: "STRK",
+        lifecycle: "scheduled",
+        clock_state: "future",
+      },
+      events: [{
+        token_symbol: "AAVE",
+        lifecycle: "occurred",
+        clock: {
+          state: "past",
+          as_of_utc: "2026-08-01T00:00:00Z",
+        },
+      }],
+    },
+  ];
+  const errors = [];
+  for (const payload of cases) {
+    global.fetch = async () => ({
+      ok: true,
+      status: 200,
+      async json() { return payload; },
+    });
+    try {
+      await fetchEventFacts({
+        token: "STRK",
+        lifecycle: "scheduled",
+        clockState: "future",
+      });
+      errors.push("accepted");
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+  console.log(JSON.stringify({ errors }));
+})();
+"""
+        )
+
+        self.assertIn("Token-scope", result["errors"][0])
+        self.assertIn("row scope", result["errors"][1])
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ const app = {
   liquidityScale: "log",
   comparisonMetric: "price",
   eventLifecycle: "all",
+  eventClockState: "all",
   liquidityEffectiveScale: null,
   liquidityEffectiveScaleLabel: "",
   executionDirection: "buy_token",
@@ -432,6 +433,7 @@ function currentWorkspaceRouteState(
     if (app.qualityOrigin) state.origin = app.qualityOrigin;
   } else if (page === "events") {
     state.lifecycle = app.eventLifecycle;
+    state.clockState = app.eventClockState;
   }
   return state;
 }
@@ -590,6 +592,7 @@ function syncSegmentedControls() {
     ["[data-liquidity-scale]", "liquidityScale"],
     ["[data-comparison-metric]", "comparisonMetric"],
     ["[data-event-lifecycle]", "eventLifecycle"],
+    ["[data-event-clock-state]", "eventClockState"],
     ["[data-execution-direction]", "executionDirection"],
     ["[data-quality-scope]", "qualityScope"],
   ];
@@ -602,6 +605,7 @@ function syncSegmentedControls() {
           "liquidityScale",
           "comparisonMetric",
           "eventLifecycle",
+          "eventClockState",
           "executionDirection",
           "qualityScope",
         ]
@@ -984,6 +988,7 @@ function applyWorkspaceRoute(route) {
     syncSegmentedControls();
   } else if (route.page === "events") {
     app.eventLifecycle = route.state?.lifecycle || "all";
+    app.eventClockState = route.state?.clockState || "all";
     syncSegmentedControls();
   }
   setActiveAppView("workspace");
@@ -1057,7 +1062,7 @@ function setWorkspaceCatalogLoading(
     `<tr><td colspan="6" class="missing">Loading ${escapeHtml(token)} quality facts…</td></tr>`
   );
   byId("events-body").innerHTML = (
-    `<tr><td colspan="7" class="missing">Loading ${escapeHtml(token)} verified Event Facts…</td></tr>`
+    `<tr><td colspan="8" class="missing">Loading ${escapeHtml(token)} verified Event Facts…</td></tr>`
   );
   ["events-count", "events-occurred", "events-scheduled", "events-source-count"]
     .forEach((id) => {
@@ -1138,7 +1143,7 @@ function setWorkspaceDataUnavailable(token, message) {
     `<tr><td colspan="6" class="missing">No ${escapeHtml(exactToken)} quality facts are available.</td></tr>`
   );
   byId("events-body").innerHTML = (
-    `<tr><td colspan="7" class="missing">No ${escapeHtml(exactToken)} Event Fact dataset is available.</td></tr>`
+    `<tr><td colspan="8" class="missing">No ${escapeHtml(exactToken)} Event Fact dataset is available.</td></tr>`
   );
   ["events-count", "events-occurred", "events-scheduled", "events-source-count"]
     .forEach((id) => {
@@ -3566,6 +3571,22 @@ function eventEffectiveTime(event) {
   return `${value} (${time.effective_at_precision || "unknown"} precision)`;
 }
 
+function eventClockLabel(event) {
+  const state = event?.clock?.state;
+  if (state === "current_window") return "Current";
+  return eventLabel(state || "unavailable");
+}
+
+function eventClockNotice(event) {
+  if (event?.clock?.state === "past" && event?.lifecycle === "scheduled") {
+    return "Effective time passed; occurrence unconfirmed";
+  }
+  if (event?.clock?.basis === "effective_date_interval") {
+    return "Clock state uses the full published precision interval.";
+  }
+  return "Clock state uses the exact published instant.";
+}
+
 function eventSizeOrMarket(event) {
   const pieces = [];
   const size = event?.size || {};
@@ -3653,7 +3674,7 @@ function renderEventFacts(payload) {
 
   if (availability !== "available") {
     byId("events-body").innerHTML = (
-      '<tr><td colspan="7" class="missing">'
+      '<tr><td colspan="8" class="missing">'
       + "The Event Fact dataset is unavailable. This is different from a verified zero-event result."
       + "</td></tr>"
     );
@@ -3688,6 +3709,10 @@ function renderEventFacts(payload) {
             <span class="metric-note">${escapeHtml(event.notes || "No additional source-backed note.")}</span>
           </td>
           <td data-label="Lifecycle"><span class="event-state" data-state="${escapeHtml(event.lifecycle || "unavailable")}">${escapeHtml(eventLabel(event.lifecycle))}</span></td>
+          <td data-label="Time state">
+            <span class="event-clock-state" data-state="${escapeHtml(event.clock?.state || "unavailable")}">${escapeHtml(eventClockLabel(event))}</span>
+            <span class="metric-note">${escapeHtml(eventClockNotice(event))}</span>
+          </td>
           <td data-label="Size / Market">${escapeHtml(eventSizeOrMarket(event))}</td>
           <td data-label="Evidence">${escapeHtml(eventLabel(event.evidence_status))}
             <span class="metric-note">${escapeHtml(eventLabel(source.kind))} · checked ${escapeHtml(source.checked_at_utc || "time unavailable")}</span>
@@ -3697,16 +3722,17 @@ function renderEventFacts(payload) {
           </td>
         </tr>`;
       }).join("")
-    : `<tr><td colspan="7" class="missing">No verified Event Facts for ${escapeHtml(
+    : `<tr><td colspan="8" class="missing">No verified Event Facts for ${escapeHtml(
         payload?.query?.token || selectedWorkspaceToken() || "this Token",
       )} match this release and filter. This is not proof that no event exists.</td></tr>`;
 
   const lifecycle = payload?.query?.lifecycle || "all lifecycles";
+  const clockState = payload?.query?.clock_state || "all times";
   showStatus(
     byId("events-status"),
     events.length
-      ? `${payload.query?.token || "Token"} · ${events.length} latest verified Event Facts · ${eventLabel(lifecycle)} · bundle ${payload.bundle_id || "unavailable"}.`
-      : `No verified Event Facts match ${payload.query?.token || "this Token"} and ${eventLabel(lifecycle)} in this release; absence is not inferred.`,
+      ? `${payload.query?.token || "Token"} · ${events.length} latest verified Event Facts · ${eventLabel(clockState)} · ${eventLabel(lifecycle)} · bundle ${payload.bundle_id || "unavailable"}.`
+      : `No verified Event Facts match ${payload.query?.token || "this Token"}, ${eventLabel(clockState)}, and ${eventLabel(lifecycle)} in this release; absence is not inferred.`,
     events.length ? "success" : "warning",
   );
   hideError(byId("events-error"));
@@ -3718,22 +3744,50 @@ async function fetchEventFacts({
   start = "",
   end = "",
   lifecycle = "",
+  clockState = "",
   signal,
 }) {
   const query = new URLSearchParams({ token });
   if (start) query.set("start", start);
   if (end) query.set("end", end);
   if (lifecycle && lifecycle !== "all") query.set("lifecycle", lifecycle);
+  if (clockState && clockState !== "all") query.set("clock_state", clockState);
   const response = await fetch(`/api/markets/events?${query.toString()}`, { signal });
   const payload = await responseJson(response);
   if (!response.ok) {
     throw new Error(payload.error || "Event Facts failed to load.");
   }
+  if (payload?.schema !== "event_facts_api/v2") {
+    throw new Error("The Event Fact response has an unsupported schema.");
+  }
   if (
-    payload?.query?.token
-    && String(payload.query.token).toUpperCase() !== String(token).toUpperCase()
+    !payload?.query
+    || String(payload.query.token || "").toUpperCase()
+      !== String(token).toUpperCase()
   ) {
     throw new Error("The Event Fact response failed its Token-scope contract.");
+  }
+  const expectedLifecycle = lifecycle && lifecycle !== "all" ? lifecycle : null;
+  const expectedClock = clockState && clockState !== "all" ? clockState : null;
+  if ((payload?.query?.lifecycle || null) !== expectedLifecycle) {
+    throw new Error("The Event Fact response failed its lifecycle scope contract.");
+  }
+  if ((payload?.query?.clock_state || null) !== expectedClock) {
+    throw new Error("The Event Fact response failed its clock scope contract.");
+  }
+  const events = Array.isArray(payload?.events) ? payload.events : null;
+  if (!events || typeof payload?.clock_as_of_utc !== "string") {
+    throw new Error("The Event Fact response failed its row scope contract.");
+  }
+  const rowScopeMismatch = events.some((event) => (
+    String(event?.token_symbol || "").toUpperCase()
+      !== String(token).toUpperCase()
+    || (expectedLifecycle && event?.lifecycle !== expectedLifecycle)
+    || (expectedClock && event?.clock?.state !== expectedClock)
+    || event?.clock?.as_of_utc !== payload.clock_as_of_utc
+  ));
+  if (rowScopeMismatch) {
+    throw new Error("The Event Fact response failed its row scope contract.");
   }
   return payload;
 }
@@ -3753,6 +3807,7 @@ async function loadEvents() {
     const payload = await fetchEventFacts({
       token,
       lifecycle: app.eventLifecycle,
+      clockState: app.eventClockState,
       signal: controller.signal,
     });
     if (requestId !== app.eventRequestId) return false;
@@ -3762,7 +3817,7 @@ async function loadEvents() {
     if (error.name === "AbortError" || requestId !== app.eventRequestId) return false;
     app.eventFacts = null;
     byId("events-body").innerHTML = (
-      '<tr><td colspan="7" class="missing">Verified Event Facts could not be loaded. No zero-event claim is made.</td></tr>'
+      '<tr><td colspan="8" class="missing">Verified Event Facts could not be loaded. No zero-event claim is made.</td></tr>'
     );
     [
       ["events-count", "verified event count"],
@@ -6472,6 +6527,14 @@ function bindEvents() {
   document.querySelectorAll("[data-event-lifecycle]").forEach((button) => {
     button.addEventListener("click", () => {
       app.eventLifecycle = button.dataset.eventLifecycle || "all";
+      syncSegmentedControls();
+      replaceCurrentRoute();
+      loadEvents();
+    });
+  });
+  document.querySelectorAll("[data-event-clock-state]").forEach((button) => {
+    button.addEventListener("click", () => {
+      app.eventClockState = button.dataset.eventClockState || "all";
       syncSegmentedControls();
       replaceCurrentRoute();
       loadEvents();

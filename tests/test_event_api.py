@@ -2,6 +2,7 @@ import csv
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -111,7 +112,7 @@ class EventApiIntegrationTest(unittest.TestCase):
                 lifecycle="SCHEDULED",
             )
 
-        self.assertEqual(payload["schema"], "event_facts_api/v1")
+        self.assertEqual(payload["schema"], "event_facts_api/v2")
         self.assertEqual(
             payload["availability"],
             {"status": "available", "reason": None},
@@ -123,7 +124,22 @@ class EventApiIntegrationTest(unittest.TestCase):
                 "start": "2026-08-15",
                 "end": "2026-08-15",
                 "lifecycle": "scheduled",
+                "clock_state": None,
             },
+        )
+        self.assertRegex(
+            payload["clock_as_of_utc"],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+        )
+        self.assertIn(event_clock := payload["events"][0]["clock"]["state"], {
+            "past", "future", "current_window",
+        })
+        self.assertEqual(payload["clock_state_counts"][event_clock], 1)
+        self.assertTrue(
+            all(
+                event["clock"]["as_of_utc"] == payload["clock_as_of_utc"]
+                for event in payload["events"]
+            )
         )
         self.assertEqual(payload["event_count"], 1)
         self.assertEqual(payload["coverage"]["configured_token_count"], 30)
@@ -186,6 +202,55 @@ class EventApiIntegrationTest(unittest.TestCase):
                     start="2026-08-16",
                     end="2026-08-15",
                 )
+            with self.assertRaisesRegex(ValueError, "clock_state must be one of"):
+                server.build_event_facts(clock_state="predicted")
+
+    def test_event_response_bypasses_minute_cache_for_exact_transitions(self):
+        clocks = [
+            datetime(2026, 8, 15, 12, 0, 29, tzinfo=timezone.utc),
+            datetime(2026, 8, 15, 12, 0, 31, tzinfo=timezone.utc),
+        ]
+        payloads = []
+
+        def fake_payload(route, query_items, source_signature=None):
+            self.assertEqual(route, "events")
+            current = server.event_response_clock()
+            payloads.append(current)
+            return {
+                "clock_as_of_utc": current.isoformat(timespec="seconds").replace(
+                    "+00:00",
+                    "Z",
+                )
+            }
+
+        signature = (("events", 1),)
+        with patch.object(
+            server,
+            "event_response_clock",
+            side_effect=clocks,
+        ), patch.object(
+            server,
+            "_build_public_api_payload",
+            side_effect=fake_payload,
+        ), patch.object(
+            server,
+            "api_source_signature",
+            return_value=signature,
+        ):
+            first, first_compressed = server.build_public_api_response(
+                "events",
+                (),
+                True,
+            )
+            second, second_compressed = server.build_public_api_response(
+                "events",
+                (),
+                True,
+            )
+
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(first_compressed, second_compressed)
+        self.assertNotEqual(first, second)
 
     def test_event_files_participate_in_source_generation(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
@@ -205,6 +270,7 @@ class EventApiIntegrationTest(unittest.TestCase):
                 "start": [" 2026-08-15 "],
                 "end": ["2026-08-15"],
                 "lifecycle": [" SCHEDULED "],
+                "clock_state": [" FUTURE "],
                 "ignored": ["does-not-enter-cache-key"],
             },
         )
@@ -215,6 +281,7 @@ class EventApiIntegrationTest(unittest.TestCase):
                 ("start", "2026-08-15"),
                 ("end", "2026-08-15"),
                 ("lifecycle", "scheduled"),
+                ("clock_state", "future"),
             ),
         )
 
@@ -256,14 +323,21 @@ class EventApiIntegrationTest(unittest.TestCase):
         self.assertTrue(server.is_spa_shell_path("/tokens/STRK/events"))
         self.assertFalse(server.is_spa_shell_path("/tokens/STRK/event-study"))
         handler = object.__new__(server.MarketMonitorHandler)
-        handler.path = "/api/markets/events?token=strk&lifecycle=scheduled"
+        handler.path = (
+            "/api/markets/events?token=strk&lifecycle=scheduled"
+            "&clock_state=future"
+        )
         handler.send_public_api = MagicMock()
 
         handler.do_GET()
 
         handler.send_public_api.assert_called_once_with(
             "events",
-            {"token": ["strk"], "lifecycle": ["scheduled"]},
+            {
+                "token": ["strk"],
+                "lifecycle": ["scheduled"],
+                "clock_state": ["future"],
+            },
         )
 
 

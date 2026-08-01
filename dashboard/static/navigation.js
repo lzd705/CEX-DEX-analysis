@@ -85,6 +85,12 @@
     "cancelled",
     "superseded",
   ]);
+  const EVENT_CLOCK_STATES = new Set([
+    "all",
+    "future",
+    "current_window",
+    "past",
+  ]);
   const PAIR_MODES = new Set(["manual"]);
   const EXECUTION_NOTIONALS = new Set([1000, 5000, 10000, 50000, 100000]);
   const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -222,12 +228,20 @@
       if (origin !== null && QUALITY_ORIGINS.has(origin)) state.origin = origin;
     } else if (page === "events") {
       const lifecycle = firstParam(params, ["lifecycle"]);
+      const clockState = firstParam(params, ["clock_state"]);
       if (
         lifecycle !== null
         && EVENT_LIFECYCLES.has(lifecycle)
         && lifecycle !== "all"
       ) {
         state.lifecycle = lifecycle;
+      }
+      if (
+        clockState !== null
+        && EVENT_CLOCK_STATES.has(clockState)
+        && clockState !== "all"
+      ) {
+        state.clockState = clockState;
       }
     }
     return state;
@@ -325,6 +339,14 @@
     } else if (page === "events") {
       if (state.lifecycle !== "all") {
         setEnum(params, "lifecycle", state.lifecycle, EVENT_LIFECYCLES);
+      }
+      if (state.clockState !== "all") {
+        setEnum(
+          params,
+          "clock_state",
+          state.clockState,
+          EVENT_CLOCK_STATES,
+        );
       }
     }
 

@@ -74,6 +74,8 @@ const shared = {
   view: "directional",
   scale: "log",
   scope: "selected",
+  lifecycle: "scheduled",
+  clockState: "future",
 };
 const result = {};
 for (const page of navigation.WORKSPACE_PAGES) {
@@ -111,6 +113,17 @@ console.log(JSON.stringify(result));
         self.assertEqual(
             set(result["quality"]["state"]),
             {"marketA", "marketB", "start", "end", "scope"},
+        )
+        self.assertEqual(
+            set(result["events"]["state"]),
+            {
+                "marketA",
+                "marketB",
+                "start",
+                "end",
+                "lifecycle",
+                "clockState",
+            },
         )
 
     def test_screener_quality_alert_link_preserves_exact_severity(self):
