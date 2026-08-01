@@ -193,6 +193,19 @@ RPC_ENV_KEYS = {
     chain: f"DEX_DEPTH_RPC_{chain.upper()}"
     for chain in DEFAULT_RPC_URLS
 }
+_PUBLIC_RPC_HOSTS = frozenset(
+    {
+        "ethereum-rpc.publicnode.com",
+        "arb1.arbitrum.io",
+        "mainnet.optimism.io",
+        "base-rpc.publicnode.com",
+        "bsc-dataseed.bnbchain.org",
+        "mainnet.era.zksync.io",
+        # Deterministic non-routable fixtures used by the data-contract tests.
+        "example.test",
+        "rpc.example.test",
+    }
+)
 
 V2_FEE_BPS = {
     "uniswap_v2": Decimal("30"),
@@ -339,11 +352,171 @@ def address_from_token_id(value: str) -> str:
 
 
 def sanitize_endpoint(url: str) -> str:
-    parsed = urllib.parse.urlsplit(url)
-    host = parsed.hostname or ""
-    port = f":{parsed.port}" if parsed.port else ""
-    path = parsed.path or ""
-    return urllib.parse.urlunsplit((parsed.scheme, host + port, path, "", ""))
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower()
+        port_number = parsed.port
+    except (TypeError, ValueError):
+        return "rpc-endpoint:redacted"
+    if scheme not in {"http", "https"} or not host:
+        return "rpc-endpoint:redacted"
+    port = ":{}".format(port_number) if port_number is not None else ""
+    canonical_endpoint = "{}://{}{}".format(scheme, host, port)
+    if host in _PUBLIC_RPC_HOSTS:
+        return canonical_endpoint
+    digest = hashlib.sha256(canonical_endpoint.encode("utf-8")).hexdigest()
+    return "rpc-endpoint-sha256:{}".format(digest)
+
+
+def is_canonical_rpc_quantity(value: Any) -> bool:
+    if not isinstance(value, str) or not value.startswith("0x"):
+        return False
+    digits = value[2:]
+    if not digits or any(character not in "0123456789abcdef" for character in digits):
+        return False
+    return digits == "0" or digits[0] != "0"
+
+
+def canonical_rpc_quantity(value: Any, method: str) -> str:
+    if not is_canonical_rpc_quantity(value):
+        raise RpcError(f"{method} returned a noncanonical RPC quantity")
+    return value
+
+
+def expected_rpc_id(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    request_id = payload.get("id")
+    return request_id if type(request_id) is int else None
+
+
+def redacted_rpc_record_request(payload: Any) -> Any:
+    """Remove concrete calls and simulation senders from persisted RPC logs."""
+    if not isinstance(payload, dict) or payload.get("method") != "eth_estimateGas":
+        return payload
+    request_id = expected_rpc_id(payload)
+    params = payload.get("params")
+    if not isinstance(params, list) or len(params) != 2:
+        return {
+            "jsonrpc": payload.get("jsonrpc"),
+            "id": request_id,
+            "method": "eth_estimateGas",
+            "params": "redacted_invalid_request",
+        }
+    call = params[0]
+    if isinstance(call, dict):
+        try:
+            encoded = json.dumps(
+                call,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            call_hash = "invalid_call"
+        else:
+            call_hash = hashlib.sha256(encoded).hexdigest()
+    else:
+        call_hash = "invalid_call"
+    block_tag = params[1]
+    if not (
+        isinstance(block_tag, str)
+        and block_tag.startswith("0x")
+        and len(block_tag) > 2
+        and all(character in "0123456789abcdef" for character in block_tag[2:])
+    ):
+        block_tag = "invalid_block"
+    return {
+        "jsonrpc": payload.get("jsonrpc"),
+        "id": request_id,
+        "method": "eth_estimateGas",
+        "params": [
+            {"tx_call_sha256": call_hash},
+            block_tag,
+        ],
+    }
+
+
+def redacted_rpc_record_response(payload: Any, response: Any) -> Any:
+    if isinstance(payload, list):
+        if not isinstance(response, list):
+            return {"status": "invalid_batch_response"}
+        by_id = {
+            item.get("id"): item
+            for item in response
+            if isinstance(item, dict) and type(item.get("id")) is int
+        }
+        return [
+            redacted_rpc_record_response(
+                request,
+                by_id.get(expected_rpc_id(request)),
+            )
+            for request in payload
+        ]
+    if not isinstance(payload, dict):
+        return {"status": "invalid_request_envelope"}
+    request_id = expected_rpc_id(payload)
+    method = payload.get("method")
+    safe = {"jsonrpc": "2.0", "id": request_id}
+    if not isinstance(response, dict):
+        return {**safe, "status": "invalid_response"}
+    if (
+        response.get("jsonrpc") != "2.0"
+        or type(response.get("id")) is not int
+        or response.get("id") != request_id
+    ):
+        return {**safe, "status": "invalid_response_envelope"}
+    if "error" in response:
+        error = response.get("error")
+        error_code = error.get("code") if isinstance(error, dict) else None
+        if type(error_code) is not int:
+            error_code = None
+        return {
+            **safe,
+            "error_code": error_code,
+            "status": "rpc_method_failed",
+        }
+    if "result" not in response:
+        return {**safe, "status": "missing_result"}
+    result = response.get("result")
+    if method == "eth_getBlockByNumber":
+        if not isinstance(result, dict):
+            return {**safe, "status": "invalid_block_result"}
+        number = result.get("number")
+        block_hash = result.get("hash")
+        timestamp = result.get("timestamp")
+        if not is_canonical_rpc_quantity(number):
+            return {**safe, "status": "invalid_block_result"}
+        if not (
+            isinstance(block_hash, str)
+            and block_hash.startswith("0x")
+            and len(block_hash) == 66
+            and all(
+                character in "0123456789abcdef"
+                for character in block_hash[2:]
+            )
+        ):
+            block_hash = None
+        if timestamp is not None and not is_canonical_rpc_quantity(timestamp):
+            timestamp = None
+        return {
+            **safe,
+            "result": {
+                "number": number,
+                "hash": block_hash,
+                "timestamp": timestamp,
+            },
+        }
+    if method in ("eth_chainId", "eth_blockNumber", "eth_estimateGas"):
+        if not is_canonical_rpc_quantity(result):
+            return {**safe, "status": "invalid_quantity_result"}
+        return {**safe, "result": result}
+    if isinstance(result, str) and result.startswith("0x") and all(
+        character in "0123456789abcdef" for character in result[2:]
+    ):
+        return {**safe, "result": result}
+    return {**safe, "status": "result_redacted"}
 
 
 def rpc_url_for_chain(chain: str) -> str | None:
@@ -555,8 +728,8 @@ class RpcClient:
             )
         self.records.append(
             {
-                "request": payload,
-                "response": response,
+                "request": redacted_rpc_record_request(payload),
+                "response": redacted_rpc_record_response(payload, response),
                 "response_sha256": hashlib.sha256(raw).hexdigest(),
             }
         )
@@ -574,20 +747,62 @@ class RpcClient:
         response = self._send(payload)
         if not isinstance(response, dict):
             raise RpcError(f"{method} returned a non-object response")
-        if response.get("error"):
-            raise RpcError(f"{method}: {response['error']}")
+        if response.get("jsonrpc") != "2.0":
+            raise RpcError(f"{method} returned an invalid JSON-RPC version")
+        if type(response.get("id")) is not int or response.get("id") != request_id:
+            raise RpcError(f"{method} returned a mismatched JSON-RPC id")
+        if "error" in response:
+            error = response.get("error")
+            error_code = error.get("code") if isinstance(error, dict) else None
+            suffix = (
+                f" code={error_code}"
+                if type(error_code) is int
+                else ""
+            )
+            raise RpcError(f"{method} failed{suffix}")
         if "result" not in response:
             raise RpcError(f"{method} returned no result")
         return response["result"]
 
     def block_number(self) -> int:
-        return int(self.method("eth_blockNumber", []), 16)
+        result = self.method("eth_blockNumber", [])
+        return int(canonical_rpc_quantity(result, "eth_blockNumber"), 16)
+
+    def chain_id(self) -> str:
+        result = self.method("eth_chainId", [])
+        return canonical_rpc_quantity(result, "eth_chainId")
 
     def block(self, block_tag: str) -> dict[str, Any]:
         result = self.method("eth_getBlockByNumber", [block_tag, False])
         if not isinstance(result, dict):
             raise RpcError("eth_getBlockByNumber returned no block")
+        canonical_rpc_quantity(
+            result.get("number"),
+            "eth_getBlockByNumber.number",
+        )
         return result
+
+    def fee_history(
+        self,
+        block_count: str,
+        newest_block: str,
+        reward_percentiles: list[int],
+    ) -> dict[str, Any]:
+        canonical_rpc_quantity(block_count, "eth_feeHistory.block_count")
+        canonical_rpc_quantity(newest_block, "eth_feeHistory.newest_block")
+        if reward_percentiles != [50]:
+            raise RpcError("eth_feeHistory reward percentiles are unsupported")
+        result = self.method(
+            "eth_feeHistory",
+            [block_count, newest_block, reward_percentiles],
+        )
+        if not isinstance(result, dict):
+            raise RpcError("eth_feeHistory returned a non-object result")
+        return result
+
+    def estimate_gas(self, tx_call: dict[str, str], block_tag: str) -> str:
+        result = self.method("eth_estimateGas", [tx_call, block_tag])
+        return canonical_rpc_quantity(result, "eth_estimateGas")
 
     def eth_calls(self, to: str, data_values: list[str], block_tag: str) -> list[str]:
         requests = []
@@ -651,8 +866,27 @@ class _DeadlineBoundRpcClient:
     def block_number(self) -> int:
         return self._call(self._client.block_number)
 
+    def chain_id(self) -> str:
+        return self._call(self._client.chain_id)
+
     def block(self, block_tag: str) -> dict[str, Any]:
         return self._call(self._client.block, block_tag)
+
+    def fee_history(
+        self,
+        block_count: str,
+        newest_block: str,
+        reward_percentiles: list[int],
+    ) -> dict[str, Any]:
+        return self._call(
+            self._client.fee_history,
+            block_count,
+            newest_block,
+            reward_percentiles,
+        )
+
+    def estimate_gas(self, tx_call: dict[str, str], block_tag: str) -> str:
+        return self._call(self._client.estimate_gas, tx_call, block_tag)
 
     def eth_calls(self, to: str, data_values: list[str], block_tag: str) -> list[str]:
         return self._call(self._client.eth_calls, to, data_values, block_tag)

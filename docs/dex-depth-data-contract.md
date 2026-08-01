@@ -25,6 +25,9 @@ The collector requests one block number per chain. Every pool-state `eth_call`
 on that chain uses that exact block tag. The row stores the block number, RPC
 endpoint without credentials/query parameters, observation time, raw transcript
 hash, protocol model, token addresses/decimals, fee, and source token prices.
+The endpoint field is either an allowlisted public scheme/host/optional-port
+label or an opaque SHA-256 endpoint label; credentials, paths, queries, and
+unapproved hostnames are never published.
 
 This prevents different calls for one snapshot from silently mixing states from
 different blocks.
@@ -237,6 +240,128 @@ Base explicitly labels `mainnet.base.org` rate-limited and unsuitable for
 production, so the default uses PublicNode while retaining an environment
 override:
 [Base connection documentation](https://docs.base.org/base-chain/quickstart/connecting-to-base).
+
+## Separate route-cost evidence
+
+Depth and fixed-notional pool execution remain pool-state facts and continue to
+exclude non-pool route costs. `scripts/dex_route_costs.py` provides a separate
+route-cost integrity gate for a later synchronized opportunity pipeline; it
+does not add costs to the existing depth or execution CSVs by inference.
+
+### Current trust boundary: integrity is not authentication
+
+Frozen dataclasses, exact field checks, and canonical SHA-256 records can show
+that one in-process value was not silently changed after construction. They do
+not prove who supplied the value or whether it came from a chain, a cohort
+bundle, an adapter execution, or a relay. Every evidence builder currently
+exposed by `scripts/dex_route_costs.py` is caller-buildable. Those types are
+therefore integrity records, not authenticated evidence, and they cannot create
+a strict route-cost fact.
+
+The current gas path still validates and redacts one concrete fixed-block RPC
+calculation. Its integrity checks include:
+
+- a canonical Market ID shaped as
+  `dex:<chain>:<dex>:<pool-address>:<UPPERCASE-TOKEN>`, where `pool-address`
+  is a 20-byte EVM address encoded as `0x` followed by exactly 40 lowercase
+  hexadecimal digits;
+- the registered chain, adapter, and router identity;
+- exact `from`, `to`, calldata, and value committed by canonical JSON SHA-256;
+  SwapRouter02 `exactInputSingle` decoding checks Token addresses, fee,
+  recipient, direction, target raw quantity, block tag, and context fields;
+- controlled opaque-sender and allowance policy identifiers;
+- a fixed block number, hash, timestamp, and canonical `baseFeePerGas`;
+- an `eth_feeHistory` request for exactly one block and the 50th-percentile
+  reward. The response has an exact shape and canonical hexadecimal values.
+  Its first base fee must exactly equal the fixed block's `baseFeePerGas`; a
+  mismatch is `failed` before `eth_estimateGas`. The calculation derives
+  `max_fee_per_gas_wei = 2 * next_base_fee + median_priority_fee`;
+- a typed native/USD integrity record whose fields, time window, and record
+  hash match the requested context.
+
+The collector verifies `eth_chainId`, resolves the block, validates the block
+base fee against `eth_feeHistory`, validates the native/USD integrity record,
+and only then calls `eth_estimateGas`. The arithmetic remains exact:
+
+```text
+gas_units * max_fee_per_gas_wei / 10^18 * native_token_usd
+```
+
+However, the call-to-Market association, pool metadata, requested notional, and
+native/USD value still originate in public builders. A caller can re-sign the
+same call under a fake pool, a USD 1 or USD 1 billion notional, or a USD 1
+native-Token price. Consequently a successful current calculation is
+`value_status=assumed`, `strict_eligible=false`; invalid or incomplete inputs
+remain terminal with null amount/rate. It is never `quoted` or strict.
+
+The current registry contains only Ethereum Uniswap V3 using adapter
+`uniswap_v3_router/v1` and SwapRouter02 target
+`0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45`. The transaction `to` address
+must equal that registered target. A different chain, DEX name, adapter ID,
+router target, noncanonical Market ID, or unregistered combination is
+unavailable. Registry membership limits behavior; it does not authenticate
+pool facts.
+
+Every JSON-RPC response used by this evidence gate, including
+`eth_feeHistory`, must contain
+`jsonrpc: "2.0"` and an integer response ID exactly equal to the integer request
+ID (booleans are not integers for this contract). Chain ID, block number, and
+gas estimate, block timestamp, fee-history base fees, and reward must be
+canonical Ethereum quantities: a lowercase `0x` string,
+`0x0` for zero, otherwise no leading zero and only lowercase hexadecimal
+digits. Native JSON integers, decimal text, uppercase digits, and nonminimal
+forms such as `0x01` are rejected and revalidated before entering calculation
+lineage.
+
+The output is a redacted gas envelope containing a canonical `cost_component`
+plus chain, block, call hash, policy, gas-unit, fee-cap, price, adapter, and
+integrity-hash fields. Missing or inconsistent inputs and RPC failure produce
+terminal components with null amount/rate; they never become zero. Persisted
+`eth_estimateGas`
+RPC records replace the call with its SHA-256, redact error text, and reduce the
+published endpoint to scheme, host, and optional port only for exact
+allowlisted public hosts. Any other syntactically valid host becomes
+`rpc-endpoint-sha256:<digest>`; malformed endpoints become the fixed
+`rpc-endpoint:redacted` label. Thus a wallet, API key, credential-bearing
+hostname, RPC credential, calldata, or private path cannot escape through
+lineage. A
+stored response ID comes from the already-validated request ID, never from an
+untrusted response. Error records contain only a fixed status and, when the
+provider supplied a safe integer code, that code; nested provider messages and
+data are neither returned nor persisted.
+
+Caller-buildable `router_or_integrator_fee` and `token_transfer_tax` numeric
+records are likewise only `assumed` and non-strict, even when every context and
+hash field matches. A caller declaration of `not_applicable` is `unavailable`,
+because absence requires authenticated adapter behavior, not a signed absence
+claim. Replayed, stale, malformed, or unknown records remain terminal.
+
+`mev_buffer` is scenario-only. Every positive public scenario, including one
+accompanied by a caller-buildable `max_loss_bps`, route/adapter/submission/policy
+record, is `assumed`. It cannot become `bounded_estimate`. The code intentionally
+has no public override that can impersonate future verified relay evidence.
+Missing or zero scenarios remain unavailable as applicable. Funding rates
+remain outside this contract.
+
+### Dependencies before any future strict upgrade
+
+No current public type satisfies the authentication boundary. Strict or bounded
+statuses must remain closed until all relevant upstream integrations exist:
+
+1. Task 5's typed `QuantityQuote`, binding direction, requested notional, target
+   quantity, calldata amounts, and quote lineage as one verified object;
+2. fixed-block `PoolState` read through a verified factory/pool relationship,
+   binding the actual pool address, Token contracts, fee, and block;
+3. an actual synchronized cohort-bundle reader that verifies the immutable
+   bundle and record membership instead of accepting caller-supplied hashes;
+4. a controlled adapter execution result using observed balance deltas or a
+   protocol-specific deterministic rule for router fees and transfer taxes;
+5. authenticated relay/provider policy evidence for route-specific maximum
+   loss, submission mode, policy identity, and validity.
+
+Only connector-owned private verification paths may eventually elevate those
+facts. Adding another frozen class, public builder, hash, or boolean override is
+not sufficient.
 
 ## Non-claims
 
