@@ -235,6 +235,98 @@ catalog identities or historical facts. CEX fee collection is attached to the
 synchronized route/opportunity pipeline, not to the existing daily OHLCV or
 hourly depth publication cycle.
 
+## Private route-inventory evidence and route-mode gate
+
+Strict route capacity may consume the private CSV named by
+`MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE`. Keep the variable blank when no
+current inventory evidence is installed. Its value must be an absolute file
+path outside the repository and web root. Production installs use a regular
+non-symlink file owned by the service user with mode `0600` and exactly these
+columns:
+
+```text
+profile_id,market_id,asset,available_quantity,observed_at,valid_until,
+source_record_sha256
+```
+
+The loader walks from `/` to the file with a separate directory descriptor for
+every path component. Every parent and the final file are opened relative to
+the pinned parent with `O_NOFOLLOW`; a second root-to-leaf walk must reproduce
+the same directory and file identities before parsing starts. It also rejects
+any component resolving to the repository or public web root, and rejects a
+multi-link file so an external hard link cannot bypass that boundary. The
+final single-link file is revalidated as owner-only and parsed from the same
+descriptor. A parent symlink or replacement, file swap, unknown column,
+duplicate market/asset key, mixed or non-opaque profile ID, malformed source
+hash, future observation, or expired/reversed validity window fails closed.
+Market IDs use the canonical
+`cex:<venue>:<BASE>/<QUOTE>` or `dex:<chain>:<dex>:<pool>:<TOKEN>` identity;
+assets are canonical uppercase identifiers and quantities are exact,
+non-negative Decimal strings rather than floats.
+
+The private balances and per-record source hashes never enter public output or
+logs. Public lineage contains only `INVENTORY_EVIDENCE_VERSION=1`, the opaque
+inventory profile hash, the effective observation/expiry window, and an exact
+request binding covering route ID, both Market IDs, buy quote asset/quantity,
+sell Token asset/quantity, and target asset/quantity. The classifier receives
+the independently constructed current request and verifies every field and
+its canonical request hash; evidence from another route or quantity cannot be
+replayed. Only after both balances pass does it expose the exact Token quantity
+proved for that request. Local paths, account or wallet identifiers,
+credentials, and raw rows are not projected. Missing, stale, wrong-asset, or
+malformed evidence is
+`inventory_unavailable`; an exact balance below either requirement is
+`inventory_insufficient`. Both outcomes have null strict capacity.
+
+Route-mode evidence uses two hashes with deliberately different claims.
+`source_record_sha256` identifies the upstream raw record and is lineage only.
+`evidence_binding_sha256` is recomputed over every field in the closed,
+normalized evidence record except the binding field itself, including the
+upstream source hash. It detects a field change paired with reuse of an old
+binding; it is an integrity checksum, not authentication and not proof that a
+caller is authoritative. Atomic and transfer expected requests independently
+carry the source-record hash and evidence-binding hash they received from the
+owning upstream collector. The gate requires exact equality as well as a fresh
+full-record recomputation.
+
+For `prepositioned_inventory`, the buy market must have at least the exact
+quote-asset debit and the sell market must have at least the exact net Token
+quantity. A DEX buy leg has no quote asset encoded in its Market ID, so it is
+unavailable unless Task 5 supplies authoritative typed `MarketRules` and
+`QuantityQuote` objects and their independently verified immutable hashes.
+The reserved DEX quote projection binds Market, base/quote assets, exact debit
+and target quantities, both upstream hashes, time window, and raw-source hash
+with `evidence_binding_sha256`. A valid self-computed mapping checksum alone is
+still `dex_buy_authoritative_upstream_unavailable`; malformed or unbound input
+is `dex_buy_quantity_quote_unavailable`. Until the Task 5 types and source
+verification are connected, every DEX buy remains fail-closed. Inventory only
+limits the requested route capacity: it never upgrades depth, invents a fill,
+or creates a price fact.
+
+Independent DEX leg quotes cannot prove `atomic_onchain`. The composed-call
+evidence must exactly match the classifier's expected route ID, buy/sell
+Markets, cohort-state ID, target asset/quantity, composed-call hash, and route
+outcome hash. Its full-record binding also covers evidence type/status,
+observation/expiry, and `source_record_sha256`; the independently constructed
+expected request supplies the exact expected source and binding hashes. A
+`same_cohort_state=true` field supplied by the evidence is not trusted and is
+not part of the accepted schema. Missing, stale, checksum-reused, or mismatched
+evidence leaves the component `research_estimate` with
+`atomic_route_simulation_unavailable`.
+
+A `rebalance_required` route also remains estimate-only unless both its
+inventory and transfer evidence are complete and current. Transfer evidence
+must bind the route, asset, exact requested quantity, source/destination
+Markets, source/destination state IDs, exact independently expected capacity,
+source-record hash, observation/expiry, and a capacity quantity at least as
+large as the request. Its independently expected full-record binding is
+recomputed before use. The route-mode gate reports only component eligibility:
+`mode_evidence_eligible` when this mode's evidence passes, otherwise
+`research_estimate`. It never emits the final opportunity classification
+`executable_candidate`; only the downstream full opportunity evaluator may do
+that after validating every other component and positive net edge. This layer
+does not add Funding Rate support or change Upbit data or identities.
+
 ## Lock and manifest
 
 Every profile acquires `data/local/collection/collection.lock`. A second run
