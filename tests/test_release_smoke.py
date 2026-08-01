@@ -1,14 +1,19 @@
 import argparse
 import copy
+import tempfile
 import inspect
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import patch
 
+from dashboard import server
 from scripts.check_dashboard_release import (
     DAILY_FACT_EVIDENCE_FIELDS,
     ReleaseCheckError,
     ResponseMetrics,
+    STATIC_ASSET_FILENAMES,
+    fetch_static_asset_bundle,
     release_check,
     validate_comparison,
     validate_events,
@@ -20,9 +25,71 @@ from scripts.check_dashboard_release import (
     validate_token_catalog,
 )
 from scripts.cex_instrument_lifecycle import configured_market_ids_sha256
+from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_SOURCES
 
 
 class DashboardReleaseSmokeTest(unittest.TestCase):
+    def test_public_asset_check_excludes_protected_admin_bundle(self):
+        self.assertIn("actions.css", STATIC_ASSET_FILENAMES)
+        self.assertIn("actions.js", STATIC_ASSET_FILENAMES)
+        self.assertNotIn("admin.css", STATIC_ASSET_FILENAMES)
+        self.assertNotIn("admin.js", STATIC_ASSET_FILENAMES)
+
+    def test_checker_fetches_exact_public_bundle_and_reproduces_server_hash(self):
+        class AssetResponse:
+            status = 200
+            headers = {}
+
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit=None):
+                return self.body
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            static_root = Path(directory_name)
+            source_by_name = dict(PUBLIC_STATIC_ASSET_SOURCES)
+            body_by_name = {}
+            for served_name, source_path in PUBLIC_STATIC_ASSET_SOURCES:
+                source = static_root / source_path
+                source.parent.mkdir(parents=True, exist_ok=True)
+                body = f"asset:{served_name}".encode("utf-8")
+                source.write_bytes(body)
+                body_by_name[served_name] = body
+
+            requested = []
+
+            def fake_urlopen(request, timeout):
+                self.assertEqual(timeout, 1.0)
+                served_name = request.full_url.split(
+                    "https://dashboard.test/", 1
+                )[1].split("?", 1)[0]
+                requested.append(served_name)
+                self.assertIn(served_name, source_by_name)
+                return AssetResponse(body_by_name[served_name])
+
+            with patch.object(server, "STATIC_ROOT", static_root):
+                expected_sha = server._compute_static_asset_sha()
+            with patch(
+                "scripts.check_dashboard_release.urlopen",
+                side_effect=fake_urlopen,
+            ):
+                actual_sha, metrics = fetch_static_asset_bundle(
+                    "https://dashboard.test",
+                    "a" * 12 + "-" + "b" * 12,
+                    timeout=1.0,
+                )
+
+        self.assertEqual(actual_sha, expected_sha)
+        self.assertEqual(requested, list(STATIC_ASSET_FILENAMES))
+        self.assertEqual(len(metrics), len(STATIC_ASSET_FILENAMES))
+
     def freshness(self):
         checked_at = "2026-02-01T01:00:00+00:00"
         return {

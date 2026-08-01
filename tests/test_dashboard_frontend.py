@@ -1,14 +1,18 @@
 import json
+import re
 import shutil
 import subprocess
 import unittest
 from pathlib import Path
+
+from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = PROJECT_ROOT / "dashboard" / "static" / "app.js"
 INDEX_PATH = PROJECT_ROOT / "dashboard" / "static" / "index.html"
 STYLES_PATH = PROJECT_ROOT / "dashboard" / "static" / "styles.css"
+ACTIONS_PATH = PROJECT_ROOT / "dashboard" / "static" / "actions.html"
 
 
 def run_app_javascript(source: str, prelude: str = ""):
@@ -30,6 +34,21 @@ def run_app_javascript(source: str, prelude: str = ""):
 
 
 class DashboardFrontendContractTest(unittest.TestCase):
+    def test_public_pages_and_asset_manifest_have_the_same_versioned_bundle(self):
+        asset_pattern = re.compile(
+            r'(?:href|src)="/([^"?]+)\?v=__ASSET_VERSION__"'
+        )
+        referenced_assets = set()
+        for path in (INDEX_PATH, ACTIONS_PATH):
+            referenced_assets.update(
+                asset_pattern.findall(path.read_text(encoding="utf-8"))
+            )
+
+        self.assertEqual(
+            referenced_assets,
+            set(PUBLIC_STATIC_ASSET_FILENAMES),
+        )
+
     def test_unsubmitted_custom_window_never_leaks_to_applied_consumers(self):
         result = run_app_javascript(
             """

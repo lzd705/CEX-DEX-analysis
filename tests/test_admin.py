@@ -277,10 +277,18 @@ class AdminServiceTest(unittest.TestCase):
             handler.admin_session_token = Mock(return_value=None)
 
             with patch.object(server, "ADMIN_SERVICE", disabled):
-                handler.path = "/admin.html"
-                handler.do_GET()
-                handler.send_error.assert_called_once_with(server.HTTPStatus.NOT_FOUND)
-                handler.send_error.reset_mock()
+                for path in (
+                    "/admin.html",
+                    "/admin.css?v=release-fingerprint",
+                    "/admin.js?v=release-fingerprint",
+                ):
+                    with self.subTest(path=path):
+                        handler.path = path
+                        handler.do_GET()
+                        handler.send_error.assert_called_once_with(
+                            server.HTTPStatus.NOT_FOUND
+                        )
+                        handler.send_error.reset_mock()
 
                 handler.path = "/api/admin/session"
                 handler.do_GET()

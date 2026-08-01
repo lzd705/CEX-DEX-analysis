@@ -4702,7 +4702,14 @@ class MarketMonitorServerTest(unittest.TestCase):
             static_root = Path(directory_name)
             vendor_root = static_root / "vendor"
             vendor_root.mkdir()
-            (static_root / "app.js").write_text("app", encoding="utf-8")
+            for filename in (
+                "actions.css",
+                "actions.js",
+                "app.js",
+                "navigation.js",
+                "styles.css",
+            ):
+                (static_root / filename).write_text(filename, encoding="utf-8")
             lucide_path = vendor_root / "lucide.min.js"
             lucide_path.write_text("vendor-one", encoding="utf-8")
             with patch.object(server, "STATIC_ROOT", static_root):
@@ -4711,6 +4718,38 @@ class MarketMonitorServerTest(unittest.TestCase):
                 second = server._compute_static_asset_sha()
 
         self.assertNotEqual(first, second)
+
+    def test_static_asset_sha_tracks_public_bundle_not_protected_admin_assets(self):
+        with tempfile.TemporaryDirectory() as directory_name:
+            static_root = Path(directory_name)
+            vendor_root = static_root / "vendor"
+            vendor_root.mkdir()
+            for filename in (
+                "actions.css",
+                "actions.js",
+                "admin.css",
+                "admin.js",
+                "app.js",
+                "navigation.js",
+                "styles.css",
+            ):
+                (static_root / filename).write_text(filename, encoding="utf-8")
+            (vendor_root / "lucide.min.js").write_text(
+                "vendor", encoding="utf-8"
+            )
+            with patch.object(server, "STATIC_ROOT", static_root):
+                baseline = server._compute_static_asset_sha()
+                (static_root / "admin.css").write_text(
+                    "protected-admin-change", encoding="utf-8"
+                )
+                after_admin_change = server._compute_static_asset_sha()
+                (static_root / "actions.css").write_text(
+                    "public-actions-change", encoding="utf-8"
+                )
+                after_public_change = server._compute_static_asset_sha()
+
+        self.assertEqual(after_admin_change, baseline)
+        self.assertNotEqual(after_public_change, baseline)
 
     def test_release_evidence_is_frozen_for_the_process_lifetime(self):
         initial_application = server.application_release_sha()

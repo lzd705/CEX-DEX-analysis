@@ -32,6 +32,7 @@ try:
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
     )
+    from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from cex_instrument_lifecycle import configured_market_ids_sha256
     from token_registry import canonical_cex_market_ids, cex_market_ids_sha256
@@ -40,6 +41,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
     )
+    from static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
 
 
 @dataclass(frozen=True)
@@ -55,16 +57,7 @@ class ReleaseCheckError(RuntimeError):
     """One release contract or request failed."""
 
 
-STATIC_ASSET_FILENAMES = (
-    "actions.css",
-    "actions.js",
-    "admin.css",
-    "admin.js",
-    "app.js",
-    "navigation.js",
-    "styles.css",
-    "vendor/lucide.js",
-)
+STATIC_ASSET_FILENAMES = PUBLIC_STATIC_ASSET_FILENAMES
 MAX_STATIC_ASSET_BYTES = 4 * 1024 * 1024
 
 

@@ -62,6 +62,7 @@ try:
         quality_outcome_rule,
         sanitize_public_source_endpoint,
     )
+    from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_SOURCES
     from dashboard.public_actions import (
         PUBLIC_ACTION_PATHS,
         PUBLIC_ADD_TOKEN_ACTOR,
@@ -113,6 +114,7 @@ except ModuleNotFoundError:
         quality_outcome_rule,
         sanitize_public_source_endpoint,
     )
+    from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_SOURCES
     from public_actions import (  # type: ignore[no-redef]
         PUBLIC_ACTION_PATHS,
         PUBLIC_ADD_TOKEN_ACTOR,
@@ -283,25 +285,11 @@ def _read_application_release_sha() -> str:
 
 
 def _compute_static_asset_sha() -> str:
-    """Fingerprint every CSS/JavaScript byte served by the dashboard."""
+    """Fingerprint the complete asset bundle reachable by a public client."""
 
     digest = hashlib.sha256()
-    asset_paths = sorted(
-        (
-            path
-            for path in STATIC_ROOT.iterdir()
-            if path.is_file() and path.suffix in {".css", ".js"}
-        ),
-        key=lambda path: path.name,
-    )
-    served_assets = [
-        (path.name, path)
-        for path in asset_paths
-    ]
-    served_assets.append(
-        ("vendor/lucide.js", STATIC_ROOT / "vendor" / "lucide.min.js")
-    )
-    for served_name, path in sorted(served_assets):
+    for served_name, source_path in PUBLIC_STATIC_ASSET_SOURCES:
+        path = STATIC_ROOT / source_path
         digest.update(served_name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())

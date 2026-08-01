@@ -1,7 +1,7 @@
 # Administrator Operations
 
 The administrator surface is absent by default. With `ADMIN_ENABLED` unset or
-false, `/admin.html`, `/admin.js`, and every `/api/admin/*` route return 404.
+false, `/admin.html`, `/admin.css`, `/admin.js`, and every `/api/admin/*` route return 404.
 Supplying a username or password hash alone does not expose the routes.
 
 ## Local setup
