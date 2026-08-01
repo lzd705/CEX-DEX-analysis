@@ -159,6 +159,82 @@ status, and revision lineage. It does not calculate event returns, impact, or
 causality. Source-check freshness is a human review property, not an hourly
 market-data SLA.
 
+## CEX taker-fee evidence and the secret boundary
+
+CEX account fees are route-cost inputs, not anonymous market facts. The fee
+collector accepts only an already configured read-only client wrapper exposing
+`fetch_authenticated_fee(venue=..., instrument=...)`. API keys, secrets,
+passphrases, authorization headers, account IDs, and raw authenticated payloads
+must remain inside that wrapper. The normalized output retains only the exact
+market side, fee rate, fee asset, calculation basis, observation/expiry times,
+an opaque 64-hex profile ID, and a SHA-256 of the whitelisted fee evidence.
+Collector failures use bounded reason codes; exception text, client objects,
+credentials, and local paths are not logged.
+
+The request identity is canonical and indivisible:
+`cex:<venue>:<BASE>/<QUOTE>`, `venue`, and `instrument=<BASE>/<QUOTE>` must
+agree before any client call. The adapter alone maps that pair to the venue's
+native spelling. The received fee asset is derived as BASE for a buy and QUOTE
+for a sell; callers cannot substitute another Token. Binance BNB is the sole
+exception, and only an authenticated response that names BNB plus an explicit
+funded-account assertion can prove that branch. Strict evidence is owned by the
+requested snapshot only while `observed_at <= now < valid_until`.
+
+The authenticated response shapes were checked on 2026-08-02 against the
+official interfaces:
+
+- Binance Spot `GET /api/v3/account/commission` and its
+  [commission calculation FAQ](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/commission_faq.md).
+  The normalizer adds taker plus buyer/seller rates for standard, special, and
+  tax commission. A Binance discount is applied only when both official flags
+  are true, the response names BNB, and the caller explicitly proves BNB is
+  funded; otherwise the state is rejected instead of guessed.
+- Bybit V5 [`GET /v5/account/fee-rate`](https://bybit-exchange.github.io/docs/v5/account/fee-rate).
+  The result category must be exactly lowercase `spot`; the bound spot
+  instrument and response timestamp are mandatory.
+- OKX V5 [`GET /api/v5/account/trade-fee`](https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-fee-rates).
+  OKX encodes a commission as a negative rate, so the normalized non-negative
+  cost is its exact magnitude. A positive taker rebate is rejected because the
+  current cost-component contract cannot represent a negative cost.
+
+For another spot venue, an operator may install a generic CSV with exactly:
+
+```text
+profile_id,venue,instrument,side,taker_fee_bps,fee_asset,basis,
+observed_at,valid_until,source_record_sha256
+```
+
+The file named by `MARKET_CEX_PRIVATE_FEE_PROFILE` must be a regular non-symlink
+file owned by the service user with mode `0600`. `profile_id` is an opaque
+lowercase SHA-256 identifier, never a username or account number. `instrument`
+uses canonical `BASE/QUOTE`, `fee_asset` must equal the received asset, and the
+only accepted `basis` code is `authenticated_taker_fee`; output expands that
+code through a fixed template rather than copying operator text. The loader
+opens with `O_NOFOLLOW`, validates owner, mode, device, and inode with `fstat`,
+then reads from that same descriptor. Duplicate profile/venue/instrument/side
+keys, file swaps, future observations, expired records, non-exact numbers, and
+unknown columns fail closed. A missing exact record is `unavailable`; it is
+never zero and never silently replaced by a default rate.
+
+The tracked `config/cex_public_fee_schedules.csv` is a separate, explicitly
+opt-in research source. Every row has an HTTPS source, check time, expiry, and
+minimum/maximum taker-fee bounds. Collection projects only the conservative
+upper bound and labels it `bounded_estimate`; the full interval remains in the
+basis, and `strict_eligible` is always false. Rows accept only the controlled
+`official_spot_taker_fee_range` basis code and the literal
+`fee_asset=received_asset`; source URLs must use HTTPS without credentials,
+query strings, or fragments. The tracked file is intentionally header-only:
+no venue currently has a generic public row whose account, region, pair, fee
+Token, and special/tax conditions form an honest current bound. Therefore an
+opted-in lookup against the tracked file returns explicit `unavailable`, with
+no fabricated timestamp or rate. An operator may add a reviewed, expiring row
+only when all of those conditions are actually bounded.
+
+Funding rates are out of scope, and this fee layer does not change Upbit
+catalog identities or historical facts. CEX fee collection is attached to the
+synchronized route/opportunity pipeline, not to the existing daily OHLCV or
+hourly depth publication cycle.
+
 ## Lock and manifest
 
 Every profile acquires `data/local/collection/collection.lock`. A second run
@@ -652,7 +728,9 @@ retention requirement before applying or enabling
   requests a non-empty scoped Event response for every covered Token.
   An unavailable Event bundle is not reported as a verified zero-event result.
 
-Funding rates, numeric account-specific CEX fees, gas, DEX V3 fixed-notional
-execution, and event-study outputs remain unsupported. Collection operations
-must not manufacture them from spot prices, depth, TVL, pool swap fees, or Event
-Facts.
+Funding rates, gas, DEX V3 fixed-notional execution, and event-study outputs
+remain unsupported. Existing depth execution rows also continue to exclude
+account-specific CEX fees; only the synchronized route pipeline may add one
+when it has current authenticated or validated-private evidence. Collection
+operations must not manufacture any of these values from spot prices, depth,
+TVL, pool swap fees, public fee defaults, or Event Facts.
