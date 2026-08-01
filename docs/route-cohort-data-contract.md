@@ -110,6 +110,27 @@ The Task 4 command reads `<data-dir>/route_universe.json` and accepts
 calls, creates no raw artifacts, and publishes nothing. `--publish` fails
 explicitly until Task 5 owns immutable bundle publication.
 
+Live CLI collection resolves every selected canonical CEX ID against the
+authoritative CEX catalog and every selected canonical DEX ID against the TVL
+pool inventory. It never reconstructs a symbol, exchange, or pool from a
+display label. A missing or duplicate resolved identity fails closed. The CEX
+and DEX adapters invoke the Task 3 one-leg primitives using only their declared
+arguments; the DEX adapter receives the common fixed block number and block
+timestamp, never a target-time pseudo-argument.
+
+The returned `route_cohort_collection/v1` declares a deterministic
+`route_cohort_id`, canonical `target_observed_at`,
+`collection_started_at`, `collection_deadline_at`, `skew_sla_seconds = "60"`,
+`route_age_sla_seconds = "120"`, candidate generation, selected-window/notional
+lineage, normalized legs, and route timing rows. A fixed DEX observation must
+echo its resolved block number and timestamp; a mismatch becomes the retained
+terminal reason `fixed_block_lineage_mismatch`. Leg projections exclude raw
+paths, exception traces, and credential-like fields before the future bundle
+boundary; endpoints retain only scheme, host, and path. The cohort ID and
+fingerprint hash all of those declared logical fields, including the canonical
+collection timestamps and SLA/selection lineage, so a later bundle can detect
+metadata conflicts without consulting mutable sources.
+
 ## Exact timestamp arithmetic
 
 `scripts.timestamp_contract.exact_rfc3339_epoch_seconds(value)` accepts a
