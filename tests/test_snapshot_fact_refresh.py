@@ -687,6 +687,28 @@ class SnapshotFactReaderTest(unittest.TestCase):
         self.assertEqual(result.reason_code, "observed")
         self.assertTrue(result.publication_generation)
 
+    def test_reads_legacy_coinbase_nanosecond_timestamp(self):
+        result = self.read(
+            "cex_depth_latest.csv",
+            {
+                "token_symbol": "AAVE",
+                "market_id": "cex:coinbase:AAVE/USDT",
+                "fact_type": "depth",
+            },
+            [
+                cex_row(
+                    exchange="coinbase",
+                    source_instrument="AAVE-USDT",
+                    observed_at="2026-07-31T23:05:47.660676312Z",
+                )
+            ],
+        )
+
+        self.assertEqual(
+            result.observed_at,
+            "2026-07-31T23:05:47.660676+00:00",
+        )
+
     def test_rejects_blank_negative_nan_and_infinite_measured_values(self):
         for value in ("", "-1", "NaN", "inf", "-Infinity"):
             with self.subTest(value=value):

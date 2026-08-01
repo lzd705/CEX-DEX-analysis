@@ -147,6 +147,7 @@ from scripts.execution_cost import (
     usd_price_timing,
     validate_execution_snapshot,
 )
+from scripts.timestamp_contract import parse_rfc3339_utc
 from dashboard.event_facts import (
     EventBundleError,
     LIFECYCLES,
@@ -783,12 +784,10 @@ def _inventory_observed_at_bounds(
         if not value:
             continue
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
+            parsed = parse_rfc3339_utc(value)
+        except (OverflowError, ValueError):
             continue
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            continue
-        observed.append(parsed.astimezone(timezone.utc))
+        observed.append(parsed)
     if not observed:
         return None, None
     return min(observed).isoformat(), max(observed).isoformat()
@@ -812,10 +811,7 @@ def _parse_cohort_timestamp(
             f"{label} must be a timezone-aware ISO timestamp"
         )
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise ValueError("timestamp is not timezone-aware")
-        return parsed.astimezone(timezone.utc)
+        return parse_rfc3339_utc(value)
     except (OverflowError, ValueError) as error:
         raise DepthExecutionCohortError(
             f"{label} must be a timezone-aware ISO timestamp"
@@ -826,7 +822,7 @@ def _cohort_observed_at_bounds(
     rows: Iterable[dict[str, Any]],
     field: str = "observed_at",
 ) -> tuple[str | None, str | None]:
-    """Return UTC bounds after validating required and present timestamps."""
+    """Canonicalize valid row timestamps and return their exact UTC bounds."""
     observed = []
     for index, row in enumerate(rows):
         value = row.get(field)
@@ -841,6 +837,7 @@ def _cohort_observed_at_bounds(
             empty_is_missing=True,
         )
         if parsed is not None:
+            row[field] = parsed.isoformat()
             observed.append(parsed)
     if not observed:
         return None, None

@@ -94,6 +94,15 @@ Execution is refreshed only as the atomically derived companion of a supported
 depth refresh; a missing execution inventory row never exposes a dead-end
 execution-only action.
 
+Source timestamps use a strict timezone-aware ISO/RFC 3339 boundary. CEX
+sources may provide more than six fractional-second digits; collectors and
+readers normalize these values to canonical UTC microsecond precision by
+truncating, never rounding, the sub-microsecond remainder. The original source
+precision remains auditable in the retained raw response and its hash. A
+missing source timestamp may use the recorded response time, but a nonempty
+malformed source timestamp is published as an explicit `parse` failure rather
+than silently receiving a substitute observation time.
+
 Data Quality contract v4 deliberately carries two same-publication views. The
 selected-window `quality_status` / `quality_flags` explain the current research
 window; `screening_quality_status` / `screening_quality_flags` preserve the

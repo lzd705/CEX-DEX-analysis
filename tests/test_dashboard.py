@@ -661,6 +661,54 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn("observation_span_seconds", snapshot)
         self.assertEqual(snapshot["observation_span_seconds"], 0)
 
+    def test_cex_nanosecond_source_timestamps_are_canonicalized_on_load(self):
+        source_time = "2026-07-31T23:05:47.660676312Z"
+        canonical_time = "2026-07-31T23:05:47.660676+00:00"
+        self.write_cex_depth_cohort(
+            [
+                {
+                    "exchange": "coinbase",
+                    "source_instrument": "BTC-USDT",
+                    "observed_at": source_time,
+                }
+            ]
+        )
+        depth_snapshot = server._load_cex_depth_snapshot_cached(
+            str(self.depth_path),
+            server.data_signature([self.depth_path]),
+        )
+        self.assertEqual(depth_snapshot["observed_at"], canonical_time)
+        self.assertEqual(
+            next(iter(depth_snapshot["rows"].values()))["observed_at"],
+            canonical_time,
+        )
+
+        rows = self.execution_rows(
+            "cex:coinbase:BTC/USDT",
+            "cex",
+            state_observed_at=source_time,
+            exchange="coinbase",
+            source_instrument="BTC-USDT",
+        )
+        for row in rows:
+            row["observed_at"] = source_time
+        write_csv(
+            self.cex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            rows,
+        )
+        execution_snapshot = server.load_execution_cost_snapshot(
+            self.cex_execution_path
+        )
+        self.assertEqual(execution_snapshot["observed_at"], canonical_time)
+        self.assertTrue(
+            all(
+                row["observed_at"] == canonical_time
+                and row["state_observed_at"] == canonical_time
+                for row in execution_snapshot["rows"]
+            )
+        )
+
     def test_depth_execution_cohort_mismatch_is_http_503_for_public_fact_routes(self):
         error_type = getattr(server, "DepthExecutionCohortError", None)
         self.assertIsNotNone(

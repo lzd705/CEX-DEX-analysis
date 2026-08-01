@@ -34,6 +34,7 @@ from scripts.fetch_cex_depth import (
     publish_full_publication_bundle,
     publish_snapshot,
     source_request,
+    timestamp_text,
     upbit_book,
     validate_snapshot,
 )
@@ -86,6 +87,16 @@ def write_snapshot_rows(path, rows):
 
 
 class FetchCexDepthTest(unittest.TestCase):
+    def test_coinbase_nanosecond_timestamp_is_canonicalized(self):
+        self.assertEqual(
+            timestamp_text("2026-07-31T23:05:47.660676312Z"),
+            "2026-07-31T23:05:47.660676+00:00",
+        )
+
+    def test_invalid_nonempty_source_timestamp_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "source timestamp"):
+            timestamp_text("not-a-timestamp")
+
     def test_filtered_collection_cannot_replace_published_inventory(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             ensure_full_publish_scope(True, {"UNI"}, set())
@@ -1183,6 +1194,62 @@ class FetchCexDepthTest(unittest.TestCase):
         self.assertEqual(
             {row["status_reason"] for row in failed_execution},
             {"source_no_two_sided_book"},
+        )
+
+    def test_invalid_source_timestamp_is_published_as_parse_failure(self):
+        invalid_response = json.dumps(
+            {
+                "bids": [["99", "2"]],
+                "asks": [["101", "3"]],
+                "sequence": 123,
+                "time": "not-a-timestamp",
+            }
+        ).encode()
+        valid_response = json.dumps(
+            {
+                "bids": [["99", "2"]],
+                "asks": [["101", "3"]],
+                "lastUpdateId": 123,
+            }
+        ).encode()
+
+        def fake_request(url):
+            raw = invalid_response if "coinbase.com" in url else valid_response
+            return json.loads(raw), raw
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            _, depth_rows, execution_rows = collect_depth_with_execution(
+                [
+                    market(),
+                    market(
+                        token="AAVE",
+                        exchange="coinbase",
+                        symbol="AAVE/USD",
+                    ),
+                ],
+                raw_root=Path(directory_name),
+                request=fake_request,
+                sleep_seconds=0,
+            )
+
+        failed_depth = next(
+            row for row in depth_rows if row["exchange"] == "coinbase"
+        )
+        self.assertEqual(failed_depth["status"], "failed")
+        self.assertEqual(failed_depth["reason_code"], "parse")
+        failed_execution = [
+            row
+            for row in execution_rows
+            if row["market_id"] == "cex:coinbase:AAVE/USD"
+        ]
+        self.assertEqual(len(failed_execution), 10)
+        self.assertEqual(
+            {row["status"] for row in failed_execution},
+            {"failed"},
+        )
+        self.assertEqual(
+            {row["status_reason"] for row in failed_execution},
+            {"parse"},
         )
 
     def test_depth_failure_reasons_separate_source_state_from_transport(self):

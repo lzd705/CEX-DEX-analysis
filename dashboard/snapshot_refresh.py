@@ -10,7 +10,6 @@ import math
 import os
 import stat
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -22,6 +21,7 @@ from scripts.quality_outcomes import (
     quality_outcome_resolution_state,
     quality_outcome_rule,
 )
+from scripts.timestamp_contract import canonical_rfc3339_utc
 
 
 MAX_PUBLICATION_BYTES = 8 * 1024 * 1024
@@ -139,12 +139,9 @@ def _address(value: Any) -> str:
 def _timestamp(value: Any) -> str:
     text = _text(value, MAX_SNAPSHOT_ID_LENGTH)
     try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError as error:
+        return canonical_rfc3339_utc(text)
+    except (OverflowError, ValueError) as error:
         raise ValueError("snapshot timestamp is invalid") from error
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("snapshot timestamp must include a timezone")
-    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _finite_nonnegative(value: Any) -> float:

@@ -77,6 +77,7 @@ try:
         normalize_cex_source_outcome,
         quality_outcome_resolution_state,
     )
+    from scripts.timestamp_contract import canonical_rfc3339_utc
 except ModuleNotFoundError:
     from atomic_publication import atomic_replace_bundle, csv_payload
     from bounded_snapshot_merge import (
@@ -117,6 +118,7 @@ except ModuleNotFoundError:
         normalize_cex_source_outcome,
         quality_outcome_resolution_state,
     )
+    from timestamp_contract import canonical_rfc3339_utc
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -294,6 +296,8 @@ def depth_failure_reason_code(error: BaseException) -> str:
         return "source_no_two_sided_book"
     if "crossed or locked" in message or "invalid numeric order-book" in message:
         return "source_invalid_order_book"
+    if "source timestamp" in message:
+        return "parse"
     if "returned no order book" in message:
         return "source_no_order_book"
     if "unsupported exchange" in message or "unsupported source" in message:
@@ -331,17 +335,14 @@ def timestamp_text(value: Any) -> str:
         numeric = float(text)
     except ValueError:
         try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            return text
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc).isoformat()
+            return canonical_rfc3339_utc(text)
+        except (OverflowError, ValueError) as error:
+            raise ValueError("Invalid source timestamp") from error
     seconds = numeric / 1000 if numeric > 10_000_000_000 else numeric
     try:
         return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
-    except (OverflowError, OSError, ValueError):
-        return text
+    except (OverflowError, OSError, ValueError) as error:
+        raise ValueError("Invalid source timestamp") from error
 
 
 def load_markets_from_database(database_path: Path) -> list[dict[str, str]]:
