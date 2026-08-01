@@ -209,6 +209,39 @@ class FakeV3Rpc(FakeV2Rpc):
         raise AssertionError((to, data_values))
 
 
+class FixedBlockV2Rpc(FakeV2Rpc):
+    instances = []
+
+    def __init__(self, chain, url):
+        super().__init__(chain, url)
+        self.next_rpc_id = 1
+        self.rpc_ids = []
+        type(self).instances.append(self)
+
+    def block_number(self):
+        raise AssertionError("a supplied fixed block must not query the head")
+
+    def block(self, block_tag):
+        self.rpc_ids.append(self.next_rpc_id)
+        self.next_rpc_id += 1
+        self.records.append(
+            {
+                "request": {
+                    "id": self.rpc_ids[-1],
+                    "method": "eth_getBlockByNumber",
+                    "block": block_tag,
+                },
+                "response": {"number": block_tag, "timestamp": "0x65920080"},
+            }
+        )
+        return {"number": block_tag, "timestamp": "0x65920080"}
+
+    def eth_calls(self, to, data_values, block_tag):
+        self.rpc_ids.append(self.next_rpc_id)
+        self.next_rpc_id += 1
+        return super().eth_calls(to, data_values, block_tag)
+
+
 class DexDepthMathTest(unittest.TestCase):
     def test_filtered_collection_cannot_replace_published_inventory(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
@@ -1665,6 +1698,84 @@ class DexDepthCollectionTest(unittest.TestCase):
         self.assertFalse(
             (self.root / "processed" / EXECUTION_CURRENT_FILENAME).exists()
         )
+
+    def test_one_pool_primitive_matches_full_collector_rows_and_transcript_hash(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        timestamp = "2026-08-01T12:00:00+00:00"
+        with patch(
+            "scripts.fetch_dex_depth.utc_now_text",
+            return_value=timestamp,
+        ):
+            snapshot_id, full_depth, full_execution = (
+                collect_dex_depth_with_execution(
+                    [self.pool],
+                    raw_root=self.root / "full",
+                    sleep_seconds=0,
+                    rpc_factory=FakeV2Rpc,
+                )
+            )
+            one_depth, one_execution = collect_dex_pool_observation(
+                self.pool,
+                snapshot_id=snapshot_id,
+                raw_path=self.root / "one.json",
+                rpc_factory=FakeV2Rpc,
+            )
+
+        full_raw = (
+            self.root
+            / "full"
+            / snapshot_id
+            / "001-eth-AAVE-uniswap_v2.json"
+        ).read_bytes()
+        one_raw = (self.root / "one.json").read_bytes()
+        self.assertEqual(one_depth, full_depth[0])
+        self.assertEqual(one_execution, full_execution)
+        self.assertEqual(len(one_execution), 10)
+        self.assertEqual(one_raw, full_raw)
+        self.assertEqual(
+            one_depth["raw_response_sha256"],
+            full_depth[0]["raw_response_sha256"],
+        )
+
+    def test_one_pool_fixed_block_and_client_transcript_are_isolated(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        FixedBlockV2Rpc.instances = []
+        rows = []
+        for index in range(2):
+            row, execution_rows = collect_dex_pool_observation(
+                self.pool,
+                snapshot_id="route-cohort-1",
+                raw_path=self.root / f"isolated-{index}.json",
+                rpc_factory=FixedBlockV2Rpc,
+                fixed_block_number=456,
+            )
+            rows.append(row)
+            self.assertEqual(len(execution_rows), 10)
+
+        self.assertEqual([row["block_number"] for row in rows], ["456", "456"])
+        self.assertEqual(len(FixedBlockV2Rpc.instances), 2)
+        first, second = FixedBlockV2Rpc.instances
+        self.assertIsNot(first.records, second.records)
+        self.assertEqual(first.rpc_ids[0], 1)
+        self.assertEqual(second.rpc_ids[0], 1)
+        for client in (first, second):
+            block_requests = [
+                record["request"]["block"]
+                for record in client.records
+                if isinstance(record["request"], dict)
+                and record["request"].get("method") == "eth_getBlockByNumber"
+            ]
+            state_block_tags = [
+                record["request"]["block"]
+                for record in client.records
+                if isinstance(record["request"], dict)
+                and "to" in record["request"]
+            ]
+            self.assertEqual(block_requests, ["0x1c8"])
+            self.assertTrue(state_block_tags)
+            self.assertEqual(set(state_block_tags), {"0x1c8"})
 
 
 if __name__ == "__main__":

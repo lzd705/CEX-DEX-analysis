@@ -1823,6 +1823,56 @@ class FetchCexDepthTest(unittest.TestCase):
 
         self.assertFalse(current_exists)
 
+    def test_one_market_primitive_matches_full_collector_rows_and_raw_hash(self):
+        from scripts.fetch_cex_depth import collect_cex_market_observation
+
+        response = json.dumps(
+            {
+                "bids": [["99.99", "2"], ["98.9", "5"]],
+                "asks": [["100.01", "3"], ["101.1", "7"]],
+                "lastUpdateId": 123,
+            }
+        ).encode("utf-8")
+
+        def fake_request(_url):
+            return json.loads(response), response
+
+        timestamp = "2026-08-01T12:00:00+00:00"
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            with patch(
+                "scripts.fetch_cex_depth.utc_now_text",
+                return_value=timestamp,
+            ):
+                snapshot_id, full_depth, full_execution = (
+                    collect_depth_with_execution(
+                        [market()],
+                        raw_root=root / "full",
+                        request=fake_request,
+                        sleep_seconds=0,
+                    )
+                )
+                one_depth, one_execution = collect_cex_market_observation(
+                    market(),
+                    snapshot_id=snapshot_id,
+                    raw_path=root / "one.json",
+                    request=fake_request,
+                )
+
+            full_raw = (
+                root / "full" / snapshot_id / "001-binance-UNI.json"
+            ).read_bytes()
+            one_raw = (root / "one.json").read_bytes()
+
+        self.assertEqual(one_depth, full_depth[0])
+        self.assertEqual(one_execution, full_execution)
+        self.assertEqual(len(one_execution), 10)
+        self.assertEqual(one_raw, full_raw)
+        self.assertEqual(
+            one_depth["raw_response_sha256"],
+            hashlib.sha256(response).hexdigest(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

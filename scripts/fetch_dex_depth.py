@@ -47,6 +47,7 @@ except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
 try:
+    from scripts.collection_deadline import CollectionDeadline
     from scripts.atomic_publication import atomic_replace_bundle, csv_payload
     from scripts.bounded_snapshot_merge import (
         merge_exact_market_snapshot,
@@ -76,6 +77,7 @@ try:
     )
     from scripts.timestamp_contract import validate_observation_bounds
 except ModuleNotFoundError:
+    from collection_deadline import CollectionDeadline
     from atomic_publication import atomic_replace_bundle, csv_payload
     from bounded_snapshot_merge import (
         merge_exact_market_snapshot,
@@ -448,7 +450,16 @@ def require_usable_pool_usd_price(
     return timing
 
 
-def http_json_rpc(url: str, payload: Any) -> tuple[Any, bytes]:
+def http_json_rpc(
+    url: str,
+    payload: Any,
+    *,
+    deadline: CollectionDeadline | None = None,
+    timeout_seconds: float = 30,
+    max_retries: int = MAX_RETRIES,
+) -> tuple[Any, bytes]:
+    if max_retries < 1:
+        raise ValueError("max_retries must be at least 1")
     encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -460,25 +471,38 @@ def http_json_rpc(url: str, payload: Any) -> tuple[Any, bytes]:
         },
         method="POST",
     )
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
+            timeout = (
+                deadline.request_timeout(timeout_seconds)
+                if deadline is not None
+                else timeout_seconds
+            )
             with urllib.request.urlopen(
                 request,
-                timeout=30,
+                timeout=timeout,
                 context=TLS_CONTEXT,
             ) as response:
                 raw = response.read()
                 return json.loads(raw.decode("utf-8")), raw
         except urllib.error.HTTPError as error:
             retryable = error.code == 429 or 500 <= error.code < 600
-            if not retryable or attempt + 1 >= MAX_RETRIES:
+            if not retryable or attempt + 1 >= max_retries:
                 raise
             retry_after = float(error.headers.get("Retry-After") or 0)
-            time.sleep(max(retry_after, 2 ** attempt))
+            delay = max(retry_after, 2 ** attempt)
+            if deadline is not None:
+                deadline.sleep_before_retry(delay)
+            else:
+                time.sleep(delay)
         except urllib.error.URLError:
-            if attempt + 1 >= MAX_RETRIES:
+            if attempt + 1 >= max_retries:
                 raise
-            time.sleep(max(1.0, 2 ** attempt))
+            delay = max(1.0, 2 ** attempt)
+            if deadline is not None:
+                deadline.sleep_before_retry(delay)
+            else:
+                time.sleep(delay)
     raise RpcError(f"JSON-RPC request failed after retries: {sanitize_endpoint(url)}")
 
 
@@ -489,16 +513,35 @@ class RpcClient:
         url: str,
         *,
         request: Callable[[str, Any], tuple[Any, bytes]] = http_json_rpc,
+        deadline: CollectionDeadline | None = None,
+        timeout_seconds: float = 30,
+        max_retries: int = MAX_RETRIES,
     ) -> None:
         self.chain = chain
         self.url = url
         self.endpoint = sanitize_endpoint(url)
         self.request = request
+        self.deadline = deadline
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
         self.records: list[dict[str, Any]] = []
         self._next_id = 1
 
     def _send(self, payload: Any) -> Any:
-        response, raw = self.request(self.url, payload)
+        if (
+            self.deadline is None
+            and self.timeout_seconds == 30
+            and self.max_retries == MAX_RETRIES
+        ):
+            response, raw = self.request(self.url, payload)
+        else:
+            response, raw = self.request(
+                self.url,
+                payload,
+                deadline=self.deadline,
+                timeout_seconds=self.timeout_seconds,
+                max_retries=self.max_retries,
+            )
         self.records.append(
             {
                 "request": payload,
@@ -1740,6 +1783,166 @@ def raw_transcript_bytes(
     ).encode("utf-8")
 
 
+def collect_dex_pool_observation(
+    pool: dict[str, str],
+    *,
+    snapshot_id: str,
+    raw_path: Path,
+    rpc_factory: Callable[[str, str], RpcClient] = RpcClient,
+    client: RpcClient | None = None,
+    fixed_block_number: int | None = None,
+    fixed_block_timestamp: str = "",
+    deadline: CollectionDeadline | None = None,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Collect one DEX pool with isolated client state unless one is supplied."""
+    request_started_at = utc_now_text()
+    protocol, unsupported_reason = protocol_model(
+        pool["dex"],
+        pool["chain"],
+        pool["pool_address"],
+    )
+    if protocol == "unsupported":
+        response_received_at = utc_now_text()
+        return unsupported_row(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            reason=unsupported_reason,
+        ), terminal_execution_rows(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            protocol="unsupported",
+            status="unsupported",
+            status_reason="unsupported_protocol_or_chain",
+            error=unsupported_reason,
+        )
+
+    chain = pool["chain"].lower()
+    rpc_url = rpc_url_for_chain(chain)
+    if not rpc_url:
+        response_received_at = utc_now_text()
+        reason = f"missing_rpc_endpoint:{chain}"
+        return unsupported_row(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            reason=reason,
+        ), terminal_execution_rows(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            protocol="unsupported",
+            status="unsupported",
+            status_reason="unsupported_protocol_or_chain",
+            error=reason,
+        )
+
+    if client is None:
+        if deadline is None:
+            client = rpc_factory(chain, rpc_url)
+        else:
+            client = rpc_factory(chain, rpc_url, deadline=deadline)
+    record_start = len(client.records)
+    block_number = fixed_block_number
+    block_timestamp = fixed_block_timestamp
+    try:
+        if block_number is None:
+            block_number = client.block_number()
+        if not block_timestamp:
+            block = client.block(hex(block_number))
+            returned_number = block.get("number")
+            if returned_number is not None:
+                normalized_number = (
+                    int(returned_number, 16)
+                    if isinstance(returned_number, str)
+                    else int(returned_number)
+                )
+                if normalized_number != block_number:
+                    raise ValueError("fixed block response number does not match")
+            block_timestamp = block_timestamp_text(block)
+        row, pool_execution_rows = observed_pool_row(
+            pool,
+            snapshot_id=snapshot_id,
+            block_number=block_number,
+            block_timestamp=block_timestamp,
+            client=client,
+            request_started_at=request_started_at,
+            raw_response_sha256="",
+            protocol=protocol,
+        )
+        transcript = raw_transcript_bytes(
+            pool=pool,
+            block_number=block_number,
+            endpoint=client.endpoint,
+            records=client.records[record_start:],
+        )
+        raw_path.write_bytes(transcript)
+        raw_hash = hashlib.sha256(transcript).hexdigest()
+        row["raw_response_sha256"] = raw_hash
+        for execution_row in pool_execution_rows:
+            execution_row["raw_response_sha256"] = raw_hash
+    except Exception as error:
+        transcript = raw_transcript_bytes(
+            pool=pool,
+            block_number=block_number,
+            endpoint=client.endpoint,
+            records=client.records[record_start:],
+            error=error,
+        )
+        raw_path.write_bytes(transcript)
+        raw_hash = hashlib.sha256(transcript).hexdigest()
+        response_received_at = utc_now_text()
+        row = base_row(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+        )
+        price_timing = pool_usd_price_timing(pool, block_timestamp)
+        row.update(
+            {
+                "protocol_model": protocol,
+                "block_number": str(block_number) if block_number is not None else "",
+                "block_timestamp": block_timestamp,
+                "usd_price_skew_seconds": (
+                    str(price_timing["skew_seconds"])
+                    if price_timing["skew_seconds"] is not None
+                    else ""
+                ),
+                "usd_price_freshness_status": price_timing["status"],
+                "source_endpoint": client.endpoint,
+                "raw_response_sha256": raw_hash,
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+            }
+        )
+        status_reason = (
+            "usd_price_conversion_stale_or_unavailable"
+            if str(error).startswith("usd_price_conversion_unavailable:")
+            else "pool_state_collection_failed"
+        )
+        pool_execution_rows = terminal_execution_rows(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            protocol=protocol,
+            status="failed",
+            status_reason=status_reason,
+            error=f"{type(error).__name__}: {error}",
+            block_number=block_number,
+            block_timestamp=block_timestamp,
+            source_endpoint=client.endpoint,
+            raw_response_sha256=raw_hash,
+        )
+    return row, pool_execution_rows
+
+
 def collect_dex_depth_with_execution(
     pools: list[dict[str, str]],
     *,
@@ -1764,168 +1967,48 @@ def collect_dex_depth_with_execution(
     execution_rows: list[dict[str, str]] = []
 
     for index, pool in enumerate(pools, start=1):
-        request_started_at = utc_now_text()
         protocol, unsupported_reason = protocol_model(
             pool["dex"],
             pool["chain"],
             pool["pool_address"],
         )
-        if protocol == "unsupported":
-            response_received_at = utc_now_text()
-            row = unsupported_row(
-                pool,
-                snapshot_id=snapshot_id,
-                request_started_at=request_started_at,
-                response_received_at=response_received_at,
-                reason=unsupported_reason,
-            )
-            rows.append(row)
-            execution_rows.extend(
-                terminal_execution_rows(
-                    pool,
-                    snapshot_id=snapshot_id,
-                    request_started_at=request_started_at,
-                    response_received_at=response_received_at,
-                    protocol="unsupported",
-                    status="unsupported",
-                    status_reason="unsupported_protocol_or_chain",
-                    error=unsupported_reason,
-                )
-            )
-            print(
-                f"[{index}/{len(pools)}] {pool['token_symbol']} "
-                f"{pool['chain']} {pool['dex']}: unsupported",
-                flush=True,
-            )
-            continue
-
         chain = pool["chain"].lower()
         rpc_url = rpc_url_for_chain(chain)
-        if not rpc_url:
-            response_received_at = utc_now_text()
-            reason = f"missing_rpc_endpoint:{chain}"
-            row = unsupported_row(
-                pool,
-                snapshot_id=snapshot_id,
-                request_started_at=request_started_at,
-                response_received_at=response_received_at,
-                reason=reason,
-            )
-            rows.append(row)
-            execution_rows.extend(
-                terminal_execution_rows(
-                    pool,
-                    snapshot_id=snapshot_id,
-                    request_started_at=request_started_at,
-                    response_received_at=response_received_at,
-                    protocol="unsupported",
-                    status="unsupported",
-                    status_reason="unsupported_protocol_or_chain",
-                    error=reason,
-                )
-            )
-            continue
-        client = clients.setdefault(chain, rpc_factory(chain, rpc_url))
-        record_start = len(client.records)
-        block_number = blocks.get(chain)
-        block_timestamp = block_timestamps.get(chain, "")
         raw_path = (
             snapshot_raw_dir
             / f"{index:03d}-{chain}-{pool['token_symbol']}-{pool['dex']}.json"
         )
-        try:
-            if block_number is None:
-                block_number = client.block_number()
-                block = client.block(hex(block_number))
-                returned_number = block.get("number")
-                if returned_number is not None:
-                    normalized_number = (
-                        int(returned_number, 16)
-                        if isinstance(returned_number, str)
-                        else int(returned_number)
-                    )
-                    if normalized_number != block_number:
-                        raise ValueError("fixed block response number does not match")
-                block_timestamp = block_timestamp_text(block)
-                blocks[chain] = block_number
-                block_timestamps[chain] = block_timestamp
-            row, pool_execution_rows = observed_pool_row(
+        if protocol == "unsupported" or not rpc_url:
+            row, pool_execution_rows = collect_dex_pool_observation(
                 pool,
                 snapshot_id=snapshot_id,
-                block_number=block_number,
-                block_timestamp=block_timestamp,
-                client=client,
-                request_started_at=request_started_at,
-                raw_response_sha256="",
-                protocol=protocol,
+                raw_path=raw_path,
+                rpc_factory=rpc_factory,
             )
-            transcript = raw_transcript_bytes(
-                pool=pool,
-                block_number=block_number,
-                endpoint=client.endpoint,
-                records=client.records[record_start:],
-            )
-            raw_path.write_bytes(transcript)
-            raw_hash = hashlib.sha256(transcript).hexdigest()
-            row["raw_response_sha256"] = raw_hash
-            for execution_row in pool_execution_rows:
-                execution_row["raw_response_sha256"] = raw_hash
-        except Exception as error:
-            transcript = raw_transcript_bytes(
-                pool=pool,
-                block_number=block_number,
-                endpoint=client.endpoint,
-                records=client.records[record_start:],
-                error=error,
-            )
-            raw_path.write_bytes(transcript)
-            raw_hash = hashlib.sha256(transcript).hexdigest()
-            response_received_at = utc_now_text()
-            row = base_row(
-                pool,
-                snapshot_id=snapshot_id,
-                request_started_at=request_started_at,
-                response_received_at=response_received_at,
-            )
-            price_timing = pool_usd_price_timing(pool, block_timestamp)
-            row.update(
-                {
-                    "protocol_model": protocol,
-                    "block_number": (
-                        str(block_number) if block_number is not None else ""
-                    ),
-                    "block_timestamp": block_timestamp,
-                    "usd_price_skew_seconds": (
-                        str(price_timing["skew_seconds"])
-                        if price_timing["skew_seconds"] is not None
-                        else ""
-                    ),
-                    "usd_price_freshness_status": price_timing["status"],
-                    "source_endpoint": client.endpoint,
-                    "raw_response_sha256": raw_hash,
-                    "status": "failed",
-                    "error": f"{type(error).__name__}: {error}",
-                }
-            )
-            status_reason = (
-                "usd_price_conversion_stale_or_unavailable"
-                if str(error).startswith("usd_price_conversion_unavailable:")
-                else "pool_state_collection_failed"
-            )
-            pool_execution_rows = terminal_execution_rows(
-                pool,
-                snapshot_id=snapshot_id,
-                request_started_at=request_started_at,
-                response_received_at=response_received_at,
-                protocol=protocol,
-                status="failed",
-                status_reason=status_reason,
-                error=f"{type(error).__name__}: {error}",
-                block_number=block_number,
-                block_timestamp=block_timestamp,
-                source_endpoint=client.endpoint,
-                raw_response_sha256=raw_hash,
-            )
+            rows.append(row)
+            execution_rows.extend(pool_execution_rows)
+            if protocol == "unsupported":
+                print(
+                    f"[{index}/{len(pools)}] {pool['token_symbol']} "
+                    f"{pool['chain']} {pool['dex']}: unsupported",
+                    flush=True,
+                )
+            continue
+        client = clients.setdefault(chain, rpc_factory(chain, rpc_url))
+        block_number = blocks.get(chain)
+        block_timestamp = block_timestamps.get(chain, "")
+        row, pool_execution_rows = collect_dex_pool_observation(
+            pool,
+            snapshot_id=snapshot_id,
+            raw_path=raw_path,
+            rpc_factory=rpc_factory,
+            client=client,
+            fixed_block_number=block_number,
+            fixed_block_timestamp=block_timestamp,
+        )
+        if row["block_number"] and row["block_timestamp"]:
+            blocks[chain] = int(row["block_number"])
+            block_timestamps[chain] = row["block_timestamp"]
         rows.append(row)
         execution_rows.extend(pool_execution_rows)
         print(

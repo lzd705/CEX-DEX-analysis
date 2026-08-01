@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
 try:
+    from scripts.collection_deadline import CollectionDeadline
     from scripts.atomic_publication import atomic_replace_bundle, csv_payload
     from scripts.bounded_snapshot_merge import (
         merge_exact_market_snapshot,
@@ -83,6 +84,7 @@ try:
         validate_observation_bounds,
     )
 except ModuleNotFoundError:
+    from collection_deadline import CollectionDeadline
     from atomic_publication import atomic_replace_bundle, csv_payload
     from bounded_snapshot_merge import (
         merge_exact_market_snapshot,
@@ -437,7 +439,15 @@ def query_url(base: str, params: dict[str, Any]) -> str:
     return f"{base}?{urllib.parse.urlencode(params)}"
 
 
-def request_json(url: str) -> tuple[Any, bytes]:
+def request_json(
+    url: str,
+    *,
+    deadline: CollectionDeadline | None = None,
+    timeout_seconds: float = 30,
+    max_retries: int = MAX_RETRIES,
+) -> tuple[Any, bytes]:
+    if max_retries < 1:
+        raise ValueError("max_retries must be at least 1")
     request = urllib.request.Request(
         url,
         headers={
@@ -445,21 +455,38 @@ def request_json(url: str) -> tuple[Any, bytes]:
             "User-Agent": "CEX-DEX-Market-Monitor/1.0",
         },
     )
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
-            with urllib.request.urlopen(request, timeout=30, context=TLS_CONTEXT) as response:
+            timeout = (
+                deadline.request_timeout(timeout_seconds)
+                if deadline is not None
+                else timeout_seconds
+            )
+            with urllib.request.urlopen(
+                request,
+                timeout=timeout,
+                context=TLS_CONTEXT,
+            ) as response:
                 raw = response.read()
                 return json.loads(raw.decode("utf-8")), raw
         except urllib.error.HTTPError as error:
             retryable = error.code == 429 or 500 <= error.code < 600
-            if not retryable or attempt + 1 >= MAX_RETRIES:
+            if not retryable or attempt + 1 >= max_retries:
                 raise
             retry_after = error.headers.get("Retry-After")
-            time.sleep(max(2.0, float(retry_after or 0), 2 ** attempt))
+            delay = max(2.0, float(retry_after or 0), 2 ** attempt)
+            if deadline is not None:
+                deadline.sleep_before_retry(delay)
+            else:
+                time.sleep(delay)
         except urllib.error.URLError:
-            if attempt + 1 >= MAX_RETRIES:
+            if attempt + 1 >= max_retries:
                 raise
-            time.sleep(max(2.0, 2 ** attempt))
+            delay = max(2.0, 2 ** attempt)
+            if deadline is not None:
+                deadline.sleep_before_retry(delay)
+            else:
+                time.sleep(delay)
     raise RuntimeError(f"Failed after retries: {url}")
 
 
@@ -1222,6 +1249,127 @@ def safe_component(value: str) -> str:
     return "".join(character if character.isalnum() else "-" for character in value).strip("-")
 
 
+def collect_cex_market_observation(
+    market: dict[str, str],
+    *,
+    snapshot_id: str,
+    raw_path: Path,
+    request: Callable[[str], tuple[Any, bytes]] = request_json,
+    deadline: CollectionDeadline | None = None,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Collect one CEX market without owning orchestration or publication."""
+    request_started_at = utc_now_text()
+    effective_request = request
+    if deadline is not None:
+        effective_request = lambda url: request(url, deadline=deadline)
+    try:
+        book = fetch_source_book(
+            market["exchange"],
+            market["cex_symbol"],
+            request=effective_request,
+        )
+        response_received_at = utc_now_text()
+        raw_path.write_bytes(book["raw"])
+        if book.get("quote_conversion_raw"):
+            raw_path.with_name(raw_path.stem + "-quote-conversion.json").write_bytes(
+                book["quote_conversion_raw"]
+            )
+        row = observed_row(
+            market,
+            book,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+        )
+        try:
+            market_execution_rows = execution_rows_for_book(
+                market,
+                book,
+                snapshot_id=snapshot_id,
+                request_started_at=request_started_at,
+                response_received_at=response_received_at,
+            )
+        except Exception as execution_error:
+            market_execution_rows = failed_execution_rows(
+                market,
+                snapshot_id=snapshot_id,
+                request_started_at=request_started_at,
+                response_received_at=response_received_at,
+                error=execution_error,
+                source_endpoint=book["source_endpoint"],
+                source_instrument=book["source_instrument"],
+                source_quote_asset=book["source_quote_asset"],
+                source_sequence=book.get("source_sequence", ""),
+                raw_response_sha256=hashlib.sha256(book["raw"]).hexdigest(),
+                status_reason="execution_calculation_failed",
+            )
+    except Exception as error:
+        response_received_at = utc_now_text()
+        reason_code = depth_failure_reason_code(error)
+        source_endpoint = ""
+        source_instrument = ""
+        source_quote_asset = ""
+        source_raw = b""
+        if isinstance(error, SourceBookError):
+            source_endpoint = error.endpoint
+            source_instrument = error.source_instrument
+            source_quote_asset = error.source_quote_asset
+            source_raw = error.raw
+        elif market["exchange"] != "upbit":
+            try:
+                (
+                    source_endpoint,
+                    source_instrument,
+                    source_quote_asset,
+                    _full_book,
+                ) = source_request(market["exchange"], market["cex_symbol"])
+            except ValueError:
+                pass
+        if source_raw:
+            raw_path.write_bytes(source_raw)
+            raw_response_sha256 = hashlib.sha256(source_raw).hexdigest()
+        else:
+            error_payload = json.dumps(
+                {
+                    "market": market,
+                    "source_endpoint": source_endpoint,
+                    "request_started_at": request_started_at,
+                    "response_received_at": response_received_at,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            raw_path.write_bytes(error_payload)
+            raw_response_sha256 = ""
+        row = failure_row(
+            market,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            error=error,
+            source_endpoint=source_endpoint,
+            source_instrument=source_instrument,
+            source_quote_asset=source_quote_asset,
+            raw_response_sha256=raw_response_sha256,
+            reason_code=reason_code,
+        )
+        market_execution_rows = failed_execution_rows(
+            market,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            error=error,
+            source_endpoint=source_endpoint,
+            source_instrument=source_instrument,
+            source_quote_asset=source_quote_asset,
+            raw_response_sha256=raw_response_sha256,
+            status_reason=reason_code,
+        )
+    return row, market_execution_rows
+
+
 def collect_depth_with_execution(
     markets: list[dict[str, str]],
     *,
@@ -1237,116 +1385,16 @@ def collect_depth_with_execution(
     execution_rows: list[dict[str, str]] = []
 
     for index, market in enumerate(markets, start=1):
-        request_started_at = utc_now_text()
         raw_path = snapshot_raw_dir / (
             f"{index:03d}-{safe_component(market['exchange'])}-"
             f"{safe_component(market['token_symbol'])}.json"
         )
-        try:
-            book = fetch_source_book(
-                market["exchange"],
-                market["cex_symbol"],
-                request=request,
-            )
-            response_received_at = utc_now_text()
-            raw_path.write_bytes(book["raw"])
-            if book.get("quote_conversion_raw"):
-                raw_path.with_name(raw_path.stem + "-quote-conversion.json").write_bytes(
-                    book["quote_conversion_raw"]
-                )
-            row = observed_row(
-                market,
-                book,
-                snapshot_id=snapshot_id,
-                request_started_at=request_started_at,
-                response_received_at=response_received_at,
-            )
-            try:
-                market_execution_rows = execution_rows_for_book(
-                    market,
-                    book,
-                    snapshot_id=snapshot_id,
-                    request_started_at=request_started_at,
-                    response_received_at=response_received_at,
-                )
-            except Exception as execution_error:
-                market_execution_rows = failed_execution_rows(
-                    market,
-                    snapshot_id=snapshot_id,
-                    request_started_at=request_started_at,
-                    response_received_at=response_received_at,
-                    error=execution_error,
-                    source_endpoint=book["source_endpoint"],
-                    source_instrument=book["source_instrument"],
-                    source_quote_asset=book["source_quote_asset"],
-                    source_sequence=book.get("source_sequence", ""),
-                    raw_response_sha256=hashlib.sha256(book["raw"]).hexdigest(),
-                    status_reason="execution_calculation_failed",
-                )
-        except Exception as error:
-            response_received_at = utc_now_text()
-            reason_code = depth_failure_reason_code(error)
-            source_endpoint = ""
-            source_instrument = ""
-            source_quote_asset = ""
-            source_raw = b""
-            if isinstance(error, SourceBookError):
-                source_endpoint = error.endpoint
-                source_instrument = error.source_instrument
-                source_quote_asset = error.source_quote_asset
-                source_raw = error.raw
-            elif market["exchange"] != "upbit":
-                try:
-                    (
-                        source_endpoint,
-                        source_instrument,
-                        source_quote_asset,
-                        _full_book,
-                    ) = source_request(market["exchange"], market["cex_symbol"])
-                except ValueError:
-                    pass
-            if source_raw:
-                raw_path.write_bytes(source_raw)
-                raw_response_sha256 = hashlib.sha256(source_raw).hexdigest()
-            else:
-                error_payload = json.dumps(
-                    {
-                        "market": market,
-                        "source_endpoint": source_endpoint,
-                        "request_started_at": request_started_at,
-                        "response_received_at": response_received_at,
-                        "error_type": type(error).__name__,
-                        "error": str(error),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ).encode("utf-8")
-                raw_path.write_bytes(error_payload)
-                raw_response_sha256 = ""
-            row = failure_row(
-                market,
-                snapshot_id=snapshot_id,
-                request_started_at=request_started_at,
-                response_received_at=response_received_at,
-                error=error,
-                source_endpoint=source_endpoint,
-                source_instrument=source_instrument,
-                source_quote_asset=source_quote_asset,
-                raw_response_sha256=raw_response_sha256,
-                reason_code=reason_code,
-            )
-            market_execution_rows = failed_execution_rows(
-                market,
-                snapshot_id=snapshot_id,
-                request_started_at=request_started_at,
-                response_received_at=response_received_at,
-                error=error,
-                source_endpoint=source_endpoint,
-                source_instrument=source_instrument,
-                source_quote_asset=source_quote_asset,
-                raw_response_sha256=raw_response_sha256,
-                status_reason=reason_code,
-            )
+        row, market_execution_rows = collect_cex_market_observation(
+            market,
+            snapshot_id=snapshot_id,
+            raw_path=raw_path,
+            request=request,
+        )
         rows.append(row)
         execution_rows.extend(market_execution_rows)
         print(
