@@ -283,6 +283,10 @@ class RouteCohortIdentityTests(unittest.TestCase):
             ValueError, "route candidate legs must be directional"
         ):
             classify_route_timing(route, buy_leg, sell_leg)
+        with self.assertRaisesRegex(
+            ValueError, "route candidate legs must be directional"
+        ):
+            validate_route_cohort_rows([route], [buy_leg, sell_leg])
 
 
 if __name__ == "__main__":
