@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -82,8 +83,18 @@ try:
         normalize_cex_source_outcome,
         quality_outcome_resolution_state,
     )
+    from scripts.route_quantity import (
+        CommonTarget,
+        FeeSemantics,
+        MarketRules,
+        QuantityQuote,
+        fee_semantics_record_binding_sha256,
+        market_rules_record_binding_sha256,
+        quote_cex_book_quantity,
+    )
     from scripts.timestamp_contract import (
         canonical_rfc3339_utc,
+        exact_rfc3339_epoch_seconds,
         validate_observation_bounds,
     )
 except ModuleNotFoundError:
@@ -128,8 +139,18 @@ except ModuleNotFoundError:
         normalize_cex_source_outcome,
         quality_outcome_resolution_state,
     )
+    from route_quantity import (  # type: ignore
+        CommonTarget,
+        FeeSemantics,
+        MarketRules,
+        QuantityQuote,
+        fee_semantics_record_binding_sha256,
+        market_rules_record_binding_sha256,
+        quote_cex_book_quantity,
+    )
     from timestamp_contract import (
         canonical_rfc3339_utc,
+        exact_rfc3339_epoch_seconds,
         validate_observation_bounds,
     )
 
@@ -982,6 +1003,324 @@ def cex_market_id(market: dict[str, str]) -> str:
     return (
         f"cex:{market['exchange'].lower()}:"
         f"{market['cex_symbol'].upper()}"
+    )
+
+
+def _canonical_quantity_level(value: Any, field: str) -> str:
+    if not isinstance(value, Decimal):
+        raise ValueError(f"{field} must be an exact normalized Decimal")
+    number = finite_decimal(value, positive=True)
+    text = format(number, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+@dataclass(frozen=True)
+class _CexQuantityBookSnapshot:
+    market_id: str
+    exchange: str
+    cex_symbol: str
+    bids: tuple[tuple[Decimal, Decimal], ...]
+    asks: tuple[tuple[Decimal, Decimal], ...]
+    raw: bytes
+    source_instrument: str
+    source_quote_asset: str
+    source_sequence: str
+    source_observed_at: str
+    source_endpoint: str
+    full_book_reported: bool
+
+
+def _expected_cex_source_identity(
+    exchange: str,
+    cex_symbol: str,
+) -> tuple[str, str]:
+    quote_asset = cex_symbol.split("/", 1)[1].upper()
+    makers = {
+        "binance": make_binance_symbol,
+        "okx": make_okx_inst_id,
+        "bybit": make_bybit_symbol,
+        "kucoin": make_kucoin_symbol,
+        "gate": make_gate_currency_pair,
+        "bitget": make_bitget_symbol,
+        "mexc": make_mexc_symbol,
+        "htx": make_htx_symbol,
+        "coinbase": make_coinbase_product_id,
+        "kraken": make_kraken_pair,
+        "crypto_com": make_crypto_com_instrument,
+    }
+    if exchange == "upbit":
+        candidates = make_upbit_market_candidates(cex_symbol)
+        if len(candidates) != 1:
+            raise ValueError("Upbit source_instrument mapping is ambiguous")
+        instrument = candidates[0]
+        return instrument, instrument.split("-", 1)[0].upper()
+    maker = makers.get(exchange)
+    if maker is None:
+        raise ValueError("unsupported CEX source instrument adapter")
+    instrument = maker(cex_symbol)
+    if exchange in {"coinbase", "kraken"}:
+        quote_asset = "USD"
+    return instrument, quote_asset
+
+
+def _freeze_quantity_levels(
+    levels: Any,
+    side: str,
+) -> tuple[tuple[Decimal, Decimal], ...]:
+    if not isinstance(levels, (tuple, list)) or not levels:
+        raise ValueError(f"normalized CEX {side} are required")
+    frozen = []
+    for index, level in enumerate(tuple(levels)):
+        if not isinstance(level, (tuple, list)) or len(level) != 2:
+            raise ValueError(f"normalized CEX {side} level is invalid")
+        price, quantity = level
+        _canonical_quantity_level(price, f"{side}[{index}].price")
+        _canonical_quantity_level(quantity, f"{side}[{index}].quantity")
+        frozen.append((price, quantity))
+    return tuple(frozen)
+
+
+def _freeze_cex_quantity_book(
+    market: dict[str, str],
+    book: dict[str, Any],
+    market_rules: MarketRules,
+) -> _CexQuantityBookSnapshot:
+    exchange_value = market.get("exchange")
+    symbol_value = market.get("cex_symbol")
+    if not isinstance(exchange_value, str) or not isinstance(symbol_value, str):
+        raise ValueError("CEX collector Market identity is incomplete")
+    exchange = exchange_value.lower()
+    cex_symbol = symbol_value.upper()
+    market_id = "cex:{}:{}".format(exchange, cex_symbol)
+    if market_rules.market_id != market_id:
+        raise ValueError("Market ID does not match the CEX collector market")
+    expected_instrument, expected_quote = _expected_cex_source_identity(
+        exchange,
+        cex_symbol,
+    )
+    raw = book.get("raw")
+    frozen_bids = _freeze_quantity_levels(book.get("bids"), "bids")
+    frozen_asks = _freeze_quantity_levels(book.get("asks"), "asks")
+    source_instrument = book.get("source_instrument")
+    source_quote_asset = book.get("source_quote_asset")
+    source_sequence = book.get("source_sequence", "")
+    source_observed_at = book.get("source_observed_at", "")
+    source_endpoint = book.get("source_endpoint", "")
+    full_book_reported = book.get("full_book_reported", False)
+    if type(raw) is not bytes or not raw:
+        raise ValueError("exact raw response bytes are required")
+    if source_instrument != expected_instrument:
+        raise ValueError(
+            "source_instrument does not match the exact venue adapter"
+        )
+    if (
+        source_quote_asset != expected_quote
+        or source_quote_asset != market_rules.quote_asset
+    ):
+        raise ValueError(
+            "source_quote_asset does not match Market and venue adapter"
+        )
+    if not isinstance(source_sequence, str):
+        raise ValueError("source_sequence must be text")
+    if not isinstance(source_observed_at, str):
+        raise ValueError("source_observed_at must be text")
+    if not isinstance(source_endpoint, str):
+        raise ValueError("source_endpoint must be text")
+    if type(full_book_reported) is not bool:
+        raise ValueError("full_book_reported must be boolean")
+    return _CexQuantityBookSnapshot(
+        market_id=market_id,
+        exchange=exchange,
+        cex_symbol=cex_symbol,
+        bids=frozen_bids,
+        asks=frozen_asks,
+        raw=raw,
+        source_instrument=source_instrument,
+        source_quote_asset=source_quote_asset,
+        source_sequence=source_sequence,
+        source_observed_at=source_observed_at,
+        source_endpoint=source_endpoint,
+        full_book_reported=full_book_reported,
+    )
+
+
+def _quantity_levels_binding_sha256(
+    snapshot: _CexQuantityBookSnapshot,
+) -> str:
+    canonical_sides: dict[str, list[list[str]]] = {}
+    for side in ("bids", "asks"):
+        levels = getattr(snapshot, side)
+        canonical_levels = []
+        for index, level in enumerate(levels):
+            canonical_levels.append(
+                [
+                    _canonical_quantity_level(
+                        level[0],
+                        f"{side}[{index}].price",
+                    ),
+                    _canonical_quantity_level(
+                        level[1],
+                        f"{side}[{index}].quantity",
+                    ),
+                ]
+            )
+        canonical_sides[side] = canonical_levels
+    encoded = json.dumps(
+        canonical_sides,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_exact_epoch_text(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _cex_quantity_state_id_from_snapshot(
+    snapshot: _CexQuantityBookSnapshot,
+    *,
+    snapshot_id: str,
+    observed_at: str,
+    cohort_now: str,
+    market_rules: MarketRules,
+    fee_semantics: FeeSemantics,
+) -> str:
+    if (
+        not isinstance(snapshot_id, str)
+        or not snapshot_id
+        or snapshot_id != snapshot_id.strip()
+    ):
+        raise ValueError("snapshot_id must be canonical text")
+    try:
+        exact_observed_at = exact_rfc3339_epoch_seconds(observed_at)
+        exact_cohort_now = exact_rfc3339_epoch_seconds(cohort_now)
+    except (OverflowError, ValueError) as error:
+        raise ValueError(
+            "observed_at and cohort_now must be RFC 3339 text"
+        ) from error
+    current_rules_binding = market_rules_record_binding_sha256(market_rules)
+    if market_rules.record_binding_sha256 != current_rules_binding:
+        raise ValueError("MarketRules full-record binding mismatch")
+    current_fee_binding = fee_semantics_record_binding_sha256(fee_semantics)
+    if fee_semantics.record_binding_sha256 != current_fee_binding:
+        raise ValueError("FeeSemantics full-record binding mismatch")
+    levels_binding = _quantity_levels_binding_sha256(snapshot)
+    payload = {
+        "contract": "cex_quantity_state/v1",
+        "market_id": snapshot.market_id,
+        "snapshot_id": snapshot_id,
+        "observed_at_epoch_seconds": _canonical_exact_epoch_text(
+            exact_observed_at
+        ),
+        "cohort_now_epoch_seconds": _canonical_exact_epoch_text(
+            exact_cohort_now
+        ),
+        "source_instrument": snapshot.source_instrument,
+        "source_sequence": snapshot.source_sequence,
+        "source_observed_at": snapshot.source_observed_at,
+        "source_endpoint": snapshot.source_endpoint,
+        "source_quote_asset": snapshot.source_quote_asset,
+        "full_book_reported": snapshot.full_book_reported,
+        "raw_response_sha256": hashlib.sha256(snapshot.raw).hexdigest(),
+        "levels_binding_sha256": levels_binding,
+        "market_rules_binding_sha256": current_rules_binding,
+        "fee_binding_sha256": current_fee_binding,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return "cex-quantity:" + hashlib.sha256(encoded).hexdigest()
+
+
+def cex_quantity_state_id(
+    market: dict[str, str],
+    book: dict[str, Any],
+    *,
+    snapshot_id: str,
+    observed_at: str,
+    cohort_now: str,
+    market_rules: MarketRules,
+    fee_semantics: FeeSemantics,
+) -> str:
+    """Bind exact book, Market, snapshot, rules, and fees for calculation.
+
+    This is an integrity checksum, not authentication. Public callers can
+    construct their own records, so matching this ID alone never upgrades a
+    quantity calculation to strict route evidence.
+    """
+    frozen = _freeze_cex_quantity_book(market, book, market_rules)
+    return _cex_quantity_state_id_from_snapshot(
+        frozen,
+        snapshot_id=snapshot_id,
+        observed_at=observed_at,
+        cohort_now=cohort_now,
+        market_rules=market_rules,
+        fee_semantics=fee_semantics,
+    )
+
+
+def route_quantity_quote_for_book(
+    market: dict[str, str],
+    book: dict[str, Any],
+    *,
+    direction: str,
+    target_token_quantity: CommonTarget,
+    market_rules: MarketRules,
+    fee_semantics: FeeSemantics,
+    snapshot_id: str,
+    observed_at: str,
+    cohort_now: str,
+    expected_state_id: str,
+) -> QuantityQuote:
+    """Bind a calculation quote to one immutable raw CEX book snapshot.
+
+    The fixed-notional v1 publication path intentionally does not call this
+    adapter. Route evaluation opts in with independently sourced market rules
+    and fee semantics, while the adapter selects the original bid/ask levels
+    and derives its immutable state identity from the exact raw response.
+    """
+    frozen = _freeze_cex_quantity_book(market, book, market_rules)
+    calculated_state_id = _cex_quantity_state_id_from_snapshot(
+        frozen,
+        snapshot_id=snapshot_id,
+        observed_at=observed_at,
+        cohort_now=cohort_now,
+        market_rules=market_rules,
+        fee_semantics=fee_semantics,
+    )
+    if expected_state_id != calculated_state_id:
+        raise ValueError("CEX quantity state binding does not match")
+    if direction == "buy":
+        levels = frozen.asks
+    elif direction == "sell":
+        levels = frozen.bids
+    else:
+        raise ValueError("direction must be buy or sell")
+    levels_binding = _quantity_levels_binding_sha256(frozen)
+    return quote_cex_book_quantity(
+        levels,
+        target_token_quantity,
+        market_rules,
+        fee_semantics,
+        direction=direction,
+        source_quote_asset=frozen.source_quote_asset,
+        full_book_reported=frozen.full_book_reported,
+        state_id=calculated_state_id,
+        snapshot_id=snapshot_id,
+        state_observed_at=observed_at,
+        cohort_now=cohort_now,
+        raw_response_sha256=hashlib.sha256(frozen.raw).hexdigest(),
+        levels_binding_sha256=levels_binding,
     )
 
 
