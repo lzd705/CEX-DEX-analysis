@@ -2899,6 +2899,44 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(lifecycle["response_sha256"], "9" * 64)
         self.assertEqual(lifecycle["stale_evidence_market_count"], 0)
 
+    def test_lifecycle_withheld_fact_flags_are_identical_across_fact_families(self):
+        for listing_status, expected_code in (
+            ("absent_from_official_current_catalog", "inactive_cex_instrument"),
+            ("official_catalog_evidence_stale", "stale_cex_lifecycle_evidence"),
+        ):
+            with self.subTest(listing_status=listing_status):
+                market = {
+                    "market_id": "cex:crypto_com:GMX/USDT",
+                    "market_type": "cex",
+                    "current_listing_status": listing_status,
+                    "current_listing_checked_at": "2026-08-01T00:00:00+00:00",
+                    "current_listing_source": (
+                        "https://api.crypto.com/exchange/v1/public/get-instruments"
+                    ),
+                    "current_listing_response_sha256": "9" * 64,
+                }
+
+                daily = server._daily_quality_fact(
+                    market,
+                    {"window_start": "2026-07-01", "window_end": "2026-07-30"},
+                )
+                execution = server._execution_quality_fact(
+                    market,
+                    {"snapshot": {}, "error_code": None},
+                )
+                daily_flag = next(
+                    flag
+                    for flag in daily["quality_flags"]
+                    if flag["code"] == expected_code
+                )
+                execution_flag = next(
+                    flag
+                    for flag in execution["quality_flags"]
+                    if flag["code"] == expected_code
+                )
+
+                self.assertEqual(daily_flag, execution_flag)
+
     def test_configured_upbit_identity_metadata_is_hash_bound_and_propagates_to_catalog(self):
         attach = getattr(
             server,

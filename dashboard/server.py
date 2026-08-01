@@ -4634,6 +4634,11 @@ def _daily_quality_fact(
             market.get("current_listing_status")
             == "official_catalog_evidence_stale"
         )
+        lifecycle_flag_code = (
+            "stale_cex_lifecycle_evidence"
+            if stale
+            else "inactive_cex_instrument"
+        )
         reason_code = (
             "official_catalog_evidence_stale"
             if stale
@@ -4673,21 +4678,12 @@ def _daily_quality_fact(
             "coverage_ratio": None,
             "quality_flags": [
                 {
-                    "code": (
-                        "stale_cex_lifecycle_evidence"
-                        if stale
-                        else "inactive_cex_instrument"
-                    ),
+                    "code": lifecycle_flag_code,
                     "severity": "critical",
                     "category": "data_health",
-                    "message": (
-                        "Current facts are withheld because the official "
-                        "instrument-catalog evidence is older than 36 hours."
-                        if stale
-                        else "Current daily facts are withheld because the "
-                        "instrument is absent from the official current "
-                        "exchange catalog."
-                    ),
+                    "message": SCREENING_QUALITY_FLAG_MESSAGES[
+                        lifecycle_flag_code
+                    ],
                     "observed_value": market.get(
                         "current_listing_checked_at"
                     ),
@@ -5108,6 +5104,11 @@ def _execution_quality_fact(
             market.get("current_listing_status")
             == "official_catalog_evidence_stale"
         )
+        lifecycle_flag_code = (
+            "stale_cex_lifecycle_evidence"
+            if stale
+            else "inactive_cex_instrument"
+        )
         status = "needs_review" if stale else "source_no_observation"
         reason_code = (
             "official_catalog_evidence_stale"
@@ -5133,21 +5134,12 @@ def _execution_quality_fact(
             "temporal_alignment": None,
             "quality_flags": [
                 {
-                    "code": (
-                        "stale_cex_lifecycle_evidence"
-                        if stale
-                        else "inactive_cex_instrument"
-                    ),
+                    "code": lifecycle_flag_code,
                     "severity": "critical",
                     "category": "data_health",
-                    "message": (
-                        "Execution facts remain withheld because the official "
-                        "instrument-catalog evidence is stale."
-                        if stale
-                        else "Execution facts are withheld because the "
-                        "instrument is absent from the official current "
-                        "exchange catalog."
-                    ),
+                    "message": SCREENING_QUALITY_FLAG_MESSAGES[
+                        lifecycle_flag_code
+                    ],
                     "observed_value": market.get(
                         "current_listing_checked_at"
                     ),
