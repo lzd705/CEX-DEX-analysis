@@ -198,15 +198,30 @@ USDT uses the documented 1:1 proxy, and a cataloged KRW observation uses the
 retained daily USDT/KRW conversion without changing its market identity.
 
 The sole historical exception is an operator-controlled migration for rows
-known to have been created by the retired Upbit KRW fallback. It requires
-`--cex-only --append`, an explicit Token set, an exchange set containing
-`upbit`, an inclusive window of at most 180 days, and
-`--remove-legacy-upbit-krw-fallback`. A legacy KRW row is replaced only when
-the candidate contains the configured exact USDT market on that same UTC date.
-The migration preflight applies the same market-date preservation rule to the
-Coinbase/Kraken USD correction. A `no_data` or `not_listed` attempt by itself
-never authorizes deletion of an existing historical observation. Technical
-failures retain the previous rows; the switch is off by default.
+known to have been created by the retired Upbit KRW fallback or the old
+Coinbase/Kraken quote-label bug. The two corrections have separate declared
+scopes. A Coinbase/Kraken run requires an explicit Token set and
+`--exchanges coinbase,kraken`; it does not use the Upbit removal switch and its
+preflight requires the complete Upbit row multiset to remain unchanged. An
+Upbit cleanup is a separate operation that requires `--exchanges upbit` and
+the explicit `--remove-legacy-upbit-krw-fallback` switch. The runner divides
+the inclusive date range into windows of at most 180 days and accepts only
+conclusive full-window attempts.
+
+Genuine exact-identity baseline rows must survive on the same UTC date.
+Positively classified alias rows are not transmuted into another quote market:
+the full original rows are moved out of served facts into a hash-bound,
+atomically published quarantine. The audit separates dates with a same-date
+exact observation from alias-only dates, which remain missing rather than
+being forward-filled. Partial or technical outcomes retain the previous
+published snapshot and block migration; every migration is a dry-run unless
+the operator supplies `--apply`.
+
+The quarantine latest file is accompanied by an immutable content-addressed
+archive for every migration, so later scopes do not erase earlier retired-row
+evidence. Its baseline hash binds to the authoritative SQLite export used to
+seed the migration. The runner also requires normalized row equality between
+that export and the published CEX CSV before any source request is made.
 
 DEX price and volume facts come from GeckoTerminal API v2 daily pool OHLCV with
 `currency=usd` and the configured target Token side.

@@ -6,11 +6,13 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import shutil
 import uuid
+from collections import Counter
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
 if __package__:
     from .fact_quality import build_report, build_retry_windows
@@ -24,6 +26,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_DATA_DIR = PROJECT_ROOT / "data/local"
 QUALITY_DIRECTORY = "quality"
 DAILY_QUALITY_FILENAME = "daily-latest.json"
+EXACT_IDENTITY_QUARANTINE_FILENAME = "cex-exact-identity-quarantine.json"
+EXACT_IDENTITY_QUARANTINE_SCHEMA = "cex_exact_identity_quarantine/v1"
+EXACT_IDENTITY_QUARANTINE_ARCHIVE_PREFIX = (
+    "cex-exact-identity-quarantine-"
+)
 REJECTED_QUALITY_DIRECTORY = "rejected"
 REJECTED_QUALITY_FILENAME = "report.json"
 REJECTED_LATEST_FILENAME = "latest.json"
@@ -37,6 +44,15 @@ ATTEMPT_FILES = {
     "cex": "cex_daily_collection_attempts.json",
     "dex": "dex_daily_collection_attempts.json",
 }
+QUARANTINE_DISPOSITIONS = {
+    "same_date_exact_present",
+    "alias_only_no_exact_observation",
+}
+EXACT_IDENTITY_QUARANTINE_EXCHANGES = (
+    "upbit",
+    "coinbase",
+    "kraken",
+)
 
 
 def validate_csv(path: Path, required_columns: Set[str]) -> int:
@@ -73,6 +89,218 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def exact_identity_quarantine_rows_sha256(
+    rows: Sequence[Mapping[str, Any]],
+) -> str:
+    encoded = json.dumps(
+        rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_exact_identity_quarantine(
+    path: Path,
+    *,
+    candidate_cex_path: Path,
+) -> Dict[str, Any]:
+    """Validate the durable audit for rows retired by exact-ID migration."""
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected_fields = {
+        "schema",
+        "status",
+        "reason_code",
+        "created_at_utc",
+        "scope",
+        "baseline_cex_sha256",
+        "candidate_cex_sha256",
+        "configured_market_set_sha256",
+        "alias_row_count",
+        "same_date_exact_present_count",
+        "alias_only_quarantined_count",
+        "token_counts",
+        "exchange_counts",
+        "rows_sha256",
+        "rows",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise ValueError("exact-identity quarantine fields are invalid")
+    if payload.get("schema") != EXACT_IDENTITY_QUARANTINE_SCHEMA:
+        raise ValueError("exact-identity quarantine schema is unsupported")
+    if payload.get("status") != "retired_aliases_quarantined":
+        raise ValueError("exact-identity quarantine status is invalid")
+    if payload.get("reason_code") != "retired_cex_quote_identity_alias":
+        raise ValueError("exact-identity quarantine reason is invalid")
+    for field in (
+        "baseline_cex_sha256",
+        "candidate_cex_sha256",
+        "configured_market_set_sha256",
+        "rows_sha256",
+    ):
+        value = payload.get(field)
+        if not isinstance(value, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", value
+        ):
+            raise ValueError("exact-identity quarantine hash is invalid")
+    if payload["candidate_cex_sha256"] != _sha256_file(candidate_cex_path):
+        raise ValueError("exact-identity quarantine candidate hash does not match")
+    created_text = payload.get("created_at_utc")
+    if not isinstance(created_text, str) or not created_text:
+        raise ValueError("exact-identity quarantine timestamp is missing")
+    parsed_created = datetime.fromisoformat(
+        created_text[:-1] + "+00:00"
+        if created_text.endswith("Z")
+        else created_text
+    )
+    if parsed_created.tzinfo is None or parsed_created.utcoffset() is None:
+        raise ValueError("exact-identity quarantine timestamp is not aware")
+
+    scope = payload.get("scope")
+    if not isinstance(scope, dict) or set(scope) != {
+        "start_date",
+        "end_date",
+        "tokens",
+        "exchanges",
+        "remove_legacy_upbit_krw_fallback",
+    }:
+        raise ValueError("exact-identity quarantine scope is invalid")
+    start_text = scope.get("start_date")
+    end_text = scope.get("end_date")
+    if not isinstance(start_text, str) or not isinstance(end_text, str):
+        raise ValueError("exact-identity quarantine date scope is invalid")
+    start_day = date.fromisoformat(start_text)
+    end_day = date.fromisoformat(end_text)
+    if (
+        start_text != start_day.isoformat()
+        or end_text != end_day.isoformat()
+        or end_day < start_day
+    ):
+        raise ValueError("exact-identity quarantine date scope is invalid")
+    tokens = scope.get("tokens")
+    exchanges = scope.get("exchanges")
+    remove_upbit_alias = scope.get(
+        "remove_legacy_upbit_krw_fallback"
+    )
+    if (
+        not isinstance(tokens, list)
+        or not tokens
+        or any(
+            not isinstance(token, str) or token != token.strip().upper()
+            for token in tokens
+        )
+        or len(tokens) != len(set(tokens))
+        or not isinstance(exchanges, list)
+        or not exchanges
+        or any(
+            not isinstance(exchange, str)
+            or exchange not in EXACT_IDENTITY_QUARANTINE_EXCHANGES
+            for exchange in exchanges
+        )
+        or exchanges != [
+            exchange
+            for exchange in EXACT_IDENTITY_QUARANTINE_EXCHANGES
+            if exchange in exchanges
+        ]
+        or len(exchanges) != len(set(exchanges))
+        or type(remove_upbit_alias) is not bool
+        or (remove_upbit_alias and "upbit" not in exchanges)
+    ):
+        raise ValueError("exact-identity quarantine market scope is invalid")
+
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("exact-identity quarantine rows are missing")
+    if payload.get(
+        "rows_sha256"
+    ) != exact_identity_quarantine_rows_sha256(rows):
+        raise ValueError("exact-identity quarantine row hash does not match")
+    if payload.get("alias_row_count") != len(rows):
+        raise ValueError("exact-identity quarantine row count does not match")
+    candidate_exact_dates = set()
+    with candidate_cex_path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            candidate_exact_dates.add(
+                (
+                    str(row.get("date") or ""),
+                    str(row.get("token_symbol") or "").strip().upper(),
+                    str(row.get("exchange") or "").strip().lower(),
+                    str(row.get("cex_symbol") or "").strip().upper(),
+                )
+            )
+    natural_keys = set()
+    disposition_counts = Counter()
+    token_counts = Counter()
+    exchange_counts = Counter()
+    for item in rows:
+        if not isinstance(item, dict) or set(item) != {
+            "disposition",
+            "expected_instrument",
+            "row",
+        }:
+            raise ValueError(
+                "exact-identity quarantine row envelope is invalid"
+            )
+        disposition = item.get("disposition")
+        if disposition not in QUARANTINE_DISPOSITIONS:
+            raise ValueError(
+                "exact-identity quarantine disposition is invalid"
+            )
+        row = item.get("row")
+        if not isinstance(row, dict) or set(row) != set(CEX_COLUMNS):
+            raise ValueError("exact-identity quarantine CEX row is invalid")
+        day_text = row.get("date")
+        token = str(row.get("token_symbol") or "").strip().upper()
+        exchange = str(row.get("exchange") or "").strip().lower()
+        instrument = str(row.get("cex_symbol") or "").strip().upper()
+        expected_instrument = item.get("expected_instrument")
+        valid_identity = (
+            exchange == "upbit"
+            and exchange in exchanges
+            and remove_upbit_alias
+            and instrument == "{}/KRW".format(token)
+            and expected_instrument == "{}/USDT".format(token)
+        ) or (
+            exchange in {"coinbase", "kraken"}
+            and exchange in exchanges
+            and instrument == "{}/USDT".format(token)
+            and expected_instrument == "{}/USD".format(token)
+        )
+        if (
+            not isinstance(day_text, str)
+            or not start_text <= day_text <= end_text
+            or token not in tokens
+            or not valid_identity
+        ):
+            raise ValueError("exact-identity quarantine alias identity is invalid")
+        natural_key = (day_text, token, exchange, instrument)
+        if natural_key in natural_keys:
+            raise ValueError("exact-identity quarantine contains duplicate rows")
+        natural_keys.add(natural_key)
+        exact_key = (day_text, token, exchange, expected_instrument)
+        exact_exists = exact_key in candidate_exact_dates
+        if exact_exists != (disposition == "same_date_exact_present"):
+            raise ValueError(
+                "exact-identity quarantine disposition is inconsistent"
+            )
+        disposition_counts[disposition] += 1
+        token_counts[token] += 1
+        exchange_counts[exchange] += 1
+    if payload.get("same_date_exact_present_count") != disposition_counts[
+        "same_date_exact_present"
+    ] or payload.get("alias_only_quarantined_count") != disposition_counts[
+        "alias_only_no_exact_observation"
+    ]:
+        raise ValueError("exact-identity quarantine disposition counts do not match")
+    if payload.get("token_counts") != dict(sorted(token_counts.items())):
+        raise ValueError("exact-identity quarantine Token counts do not match")
+    if payload.get("exchange_counts") != dict(sorted(exchange_counts.items())):
+        raise ValueError("exact-identity quarantine exchange counts do not match")
+    return payload
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -277,6 +505,19 @@ def import_snapshot(
                 staged_attempts[market_type] = staged
             else:
                 staged_attempts[market_type] = None
+        source_quarantine = (
+            source_dir
+            / QUALITY_DIRECTORY
+            / EXACT_IDENTITY_QUARANTINE_FILENAME
+        )
+        quarantine_payload = None
+        if source_quarantine.exists():
+            quarantine_payload = validate_exact_identity_quarantine(
+                source_quarantine,
+                candidate_cex_path=(
+                    staging_dir / "cex_exchange_volume_daily.csv"
+                ),
+            )
 
         quality_report = build_report(
             staging_dir / "cex_exchange_volume_daily.csv",
@@ -313,6 +554,24 @@ def import_snapshot(
         staged_quality_dir.mkdir()
         staged_quality_report = staged_quality_dir / DAILY_QUALITY_FILENAME
         _write_json(staged_quality_report, quality_report)
+        staged_quarantine = None
+        staged_quarantine_archive = None
+        if quarantine_payload is not None:
+            staged_quarantine = (
+                staged_quality_dir
+                / EXACT_IDENTITY_QUARANTINE_FILENAME
+            )
+            _write_json(staged_quarantine, quarantine_payload)
+            staged_quarantine_archive = staged_quality_dir / (
+                "{}{}.json".format(
+                    EXACT_IDENTITY_QUARANTINE_ARCHIVE_PREFIX,
+                    _sha256_file(staged_quarantine),
+                )
+            )
+            shutil.copyfile(
+                staged_quarantine,
+                staged_quarantine_archive,
+            )
 
         target_quality_dir = target_dir / QUALITY_DIRECTORY
         target_quality_dir.mkdir(parents=True, exist_ok=True)
@@ -326,6 +585,21 @@ def import_snapshot(
                 target_quality_dir / DAILY_QUALITY_FILENAME,
             )
         )
+        if staged_quarantine is not None:
+            supporting_publications.append(
+                (
+                    staged_quarantine_archive,
+                    target_quality_dir
+                    / staged_quarantine_archive.name,
+                )
+            )
+            supporting_publications.append(
+                (
+                    staged_quarantine,
+                    target_quality_dir
+                    / EXACT_IDENTITY_QUARANTINE_FILENAME,
+                )
+            )
         rollback_dir = staging_dir / ".rollback"
         rollback_dir.mkdir()
         rollback_entries = []

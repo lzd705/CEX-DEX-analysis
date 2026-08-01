@@ -1,3 +1,4 @@
+import copy
 import csv
 import hashlib
 import json
@@ -11,12 +12,16 @@ from unittest.mock import patch
 
 from scripts.import_local_snapshot import (
     DAILY_QUALITY_FILENAME,
+    EXACT_IDENTITY_QUARANTINE_FILENAME,
+    EXACT_IDENTITY_QUARANTINE_SCHEMA,
     FILES,
     QUALITY_DIRECTORY,
     REJECTED_LATEST_FILENAME,
     REJECTED_QUALITY_DIRECTORY,
     REJECTED_QUALITY_FILENAME,
+    exact_identity_quarantine_rows_sha256,
     import_snapshot,
+    validate_exact_identity_quarantine,
 )
 from scripts.market_database import CEX_COLUMNS, DATABASE_FILENAME, DEX_COLUMNS
 
@@ -154,6 +159,202 @@ def read_rejected_report(target):
 
 
 class ImportLocalSnapshotTest(unittest.TestCase):
+    def test_exact_identity_quarantine_is_validated_and_published_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            target = root / "target"
+            source.mkdir()
+            target.mkdir()
+            exact_row = cex_row(
+                "2026-01-01",
+                exchange="coinbase",
+                cex_symbol="AAVE/USD",
+            )
+            write_snapshot(
+                source,
+                cex_rows=[exact_row],
+                dex_rows=[dex_row("2026-01-01")],
+            )
+            retired_row = cex_row(
+                "2026-01-01",
+                exchange="coinbase",
+                cex_symbol="AAVE/USDT",
+            )
+            quarantine_rows = [{
+                "disposition": "same_date_exact_present",
+                "expected_instrument": "AAVE/USD",
+                "row": retired_row,
+            }]
+            payload = {
+                "schema": EXACT_IDENTITY_QUARANTINE_SCHEMA,
+                "status": "retired_aliases_quarantined",
+                "reason_code": "retired_cex_quote_identity_alias",
+                "created_at_utc": "2026-01-02T00:00:00+00:00",
+                "scope": {
+                    "start_date": "2026-01-01",
+                    "end_date": "2026-01-01",
+                    "tokens": ["AAVE"],
+                    "exchanges": ["coinbase"],
+                    "remove_legacy_upbit_krw_fallback": False,
+                },
+                "baseline_cex_sha256": "a" * 64,
+                "candidate_cex_sha256": hashlib.sha256(
+                    (source / "cex_exchange_volume_daily.csv").read_bytes()
+                ).hexdigest(),
+                "configured_market_set_sha256": "b" * 64,
+                "alias_row_count": 1,
+                "same_date_exact_present_count": 1,
+                "alias_only_quarantined_count": 0,
+                "token_counts": {"AAVE": 1},
+                "exchange_counts": {"coinbase": 1},
+                "rows_sha256": exact_identity_quarantine_rows_sha256(
+                    quarantine_rows
+                ),
+                "rows": quarantine_rows,
+            }
+            source_quality = source / QUALITY_DIRECTORY
+            source_quality.mkdir()
+            (source_quality / EXACT_IDENTITY_QUARANTINE_FILENAME).write_text(
+                json.dumps(payload) + "\n",
+                encoding="utf-8",
+            )
+
+            import_snapshot(
+                source,
+                target_dir=target,
+                quality_today=date(2026, 1, 2),
+            )
+
+            published = json.loads(
+                (
+                    target
+                    / QUALITY_DIRECTORY
+                    / EXACT_IDENTITY_QUARANTINE_FILENAME
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(published, payload)
+
+            invalid = copy.deepcopy(payload)
+            invalid["scope"]["exchanges"] = ["upbit"]
+            invalid["scope"]["remove_legacy_upbit_krw_fallback"] = False
+            invalid["same_date_exact_present_count"] = 0
+            invalid["alias_only_quarantined_count"] = 1
+            invalid["exchange_counts"] = {"upbit": 1}
+            invalid["rows"][0]["disposition"] = (
+                "alias_only_no_exact_observation"
+            )
+            invalid["rows"][0]["expected_instrument"] = "AAVE/USDT"
+            invalid["rows"][0]["row"]["exchange"] = "upbit"
+            invalid["rows"][0]["row"]["cex_symbol"] = "AAVE/KRW"
+            invalid["rows_sha256"] = exact_identity_quarantine_rows_sha256(
+                invalid["rows"]
+            )
+            quarantine_path = (
+                source_quality / EXACT_IDENTITY_QUARANTINE_FILENAME
+            )
+            quarantine_path.write_text(
+                json.dumps(invalid) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "quarantine alias identity is invalid",
+            ):
+                validate_exact_identity_quarantine(
+                    quarantine_path,
+                    candidate_cex_path=(
+                        source / "cex_exchange_volume_daily.csv"
+                    ),
+                )
+
+            second_source = root / "second-source"
+            second_source.mkdir()
+            second_exact_row = cex_row(
+                "2026-01-01",
+                exchange="upbit",
+                cex_symbol="AAVE/USDT",
+            )
+            write_snapshot(
+                second_source,
+                cex_rows=[second_exact_row],
+                dex_rows=[dex_row("2026-01-01")],
+            )
+            second_retired_row = cex_row(
+                "2026-01-01",
+                exchange="upbit",
+                cex_symbol="AAVE/KRW",
+            )
+            second_rows = [{
+                "disposition": "same_date_exact_present",
+                "expected_instrument": "AAVE/USDT",
+                "row": second_retired_row,
+            }]
+            second_payload = copy.deepcopy(payload)
+            second_payload.update(
+                {
+                    "scope": {
+                        "start_date": "2026-01-01",
+                        "end_date": "2026-01-01",
+                        "tokens": ["AAVE"],
+                        "exchanges": ["upbit"],
+                        "remove_legacy_upbit_krw_fallback": True,
+                    },
+                    "baseline_cex_sha256": "c" * 64,
+                    "candidate_cex_sha256": hashlib.sha256(
+                        (
+                            second_source
+                            / "cex_exchange_volume_daily.csv"
+                        ).read_bytes()
+                    ).hexdigest(),
+                    "configured_market_set_sha256": "d" * 64,
+                    "token_counts": {"AAVE": 1},
+                    "exchange_counts": {"upbit": 1},
+                    "rows_sha256": exact_identity_quarantine_rows_sha256(
+                        second_rows
+                    ),
+                    "rows": second_rows,
+                }
+            )
+            second_quality = second_source / QUALITY_DIRECTORY
+            second_quality.mkdir()
+            (
+                second_quality / EXACT_IDENTITY_QUARANTINE_FILENAME
+            ).write_text(
+                json.dumps(second_payload) + "\n",
+                encoding="utf-8",
+            )
+
+            import_snapshot(
+                second_source,
+                target_dir=target,
+                quality_today=date(2026, 1, 2),
+            )
+
+            latest = json.loads(
+                (
+                    target
+                    / QUALITY_DIRECTORY
+                    / EXACT_IDENTITY_QUARANTINE_FILENAME
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(latest, second_payload)
+            archived = sorted(
+                (target / QUALITY_DIRECTORY).glob(
+                    "cex-exact-identity-quarantine-*.json"
+                )
+            )
+            self.assertEqual(len(archived), 2)
+            self.assertEqual(
+                {
+                    json.loads(path.read_text(encoding="utf-8"))[
+                        "rows_sha256"
+                    ]
+                    for path in archived
+                },
+                {payload["rows_sha256"], second_payload["rows_sha256"]},
+            )
+
     def test_lineage_matched_attempt_is_embedded_and_explains_retry(self):
         with tempfile.TemporaryDirectory() as source_name, tempfile.TemporaryDirectory() as target_name:
             source = Path(source_name)

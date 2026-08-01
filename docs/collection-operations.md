@@ -183,47 +183,98 @@ refresh.
 
 ## Exact historical-gap backfill
 
-### One-time Upbit fallback identity migration
+### One-time exact CEX identity migrations
 
 The retired Upbit adapter could collect `TOKEN/KRW` even though the configured
 market was `TOKEN/USDT`. Older Coinbase and Kraken adapters could also label
-their actual USD products as `TOKEN/USDT`. Remove or replace those known rows
-only through the dedicated migration runner; do not filter the published CSV
-or SQLite database manually. The runner splits a longer interval into adjacent
-windows of at most 180 inclusive days, uses one private staging snapshot, and
-publishes at most once after every window passes:
+their actual USD products as `TOKEN/USDT`. These are two independent migration
+scopes. Do not combine them implicitly, and do not filter the published CSV or
+SQLite database manually.
+
+For the Coinbase/Kraken correction, always name both the Token set and the two
+selected exchanges. Do not pass the Upbit removal switch. Start with one Token
+in a validating dry-run:
 
 ```bash
 python3 scripts/migrate_cex_exact_identities.py \
   --start YYYY-MM-DD --end YYYY-MM-DD \
-  --remove-legacy-upbit-krw-fallback \
+  --tokens 1INCH \
+  --exchanges coinbase,kraken \
   --data-dir /absolute/published/data \
-  --staging-dir /absolute/new/dry-run-staging
+  --staging-dir /absolute/new/coinbase-kraken-smoke-dry-run
 ```
 
 The default is a validating dry-run and the staging directory must not already
-exist. After reviewing its JSON report, rerun with a different new staging
-directory and explicit `--apply`:
+exist. After the one-Token smoke passes, run the complete declared Token set in
+a different new staging directory, still without `--apply`:
 
 ```bash
 python3 scripts/migrate_cex_exact_identities.py \
   --start YYYY-MM-DD --end YYYY-MM-DD \
-  --remove-legacy-upbit-krw-fallback \
+  --tokens TOKEN1,TOKEN2 \
+  --exchanges coinbase,kraken \
   --data-dir /absolute/published/data \
-  --staging-dir /absolute/new/apply-staging \
+  --staging-dir /absolute/new/coinbase-kraken-full-dry-run
+```
+
+Publication is permitted only when both `exchanges` fields equal
+`["coinbase", "kraken"]`, `preflight.upbit_rows_unchanged` is true, the scoped
+legacy residue is zero, every retired row is present in the hash-bound
+quarantine, all existing exact `/USD` market-dates survive, and non-target CEX
+facts plus the complete DEX bytes remain unchanged. Then rerun the identical
+Token, exchange, and date scope with another new staging directory and explicit
+`--apply`:
+
+```bash
+python3 scripts/migrate_cex_exact_identities.py \
+  --start YYYY-MM-DD --end YYYY-MM-DD \
+  --tokens TOKEN1,TOKEN2 \
+  --exchanges coinbase,kraken \
+  --data-dir /absolute/published/data \
+  --staging-dir /absolute/new/coinbase-kraken-apply \
   --apply
 ```
+
+The Coinbase/Kraken run treats every Upbit row as immutable. Its preflight
+compares the complete Upbit row multiset before and after staging and rejects
+publication if a single Upbit fact changes.
+
+The older Upbit KRW fallback is a separate, explicitly authorized operation.
+Only that operation selects exactly `--exchanges upbit` and supplies
+`--remove-legacy-upbit-krw-fallback`; neither option is implied by a
+Coinbase/Kraken run.
+
+The runner splits a longer interval into adjacent windows of at most 180
+inclusive days, uses one private staging snapshot, and publishes at most once
+after every window passes.
 
 The runner holds `collection/collection.lock` from before seeding until after
 the sole import. An already-held lock exits nonzero before staging, collection,
 or import. The Upbit flag is deliberately opt-in and fail-closed. Every
-baseline target market-date must survive as the configured exact identity on
-the same UTC date; this applies to both Upbit KRW→USDT cleanup and
-Coinbase/Kraken USDT→USD correction. `no_data` or `not_listed` is not deletion
-evidence for a previously published observation. Network, rate-limit, parse,
-validation, unavailable-range, or market-date preservation failures block the
-complete migration and preserve the published snapshot. A legitimately
-configured KRW market remains untouched during normal collection.
+baseline row already carrying the configured exact identity must survive on
+the same UTC date. Rows positively classified as retired Upbit KRW fallback or
+Coinbase/Kraken USDT mislabels are never relabeled into another market. They
+leave served facts only inside the declared migration scope and only after the
+complete original rows, baseline/candidate hashes, disposition counts, and a
+row-set hash are written to the atomically published exact-identity quarantine.
+Each publication also writes an immutable content-addressed quarantine archive;
+the fixed filename is only the latest pointer, so a later independent migration
+cannot overwrite the earlier reversible evidence. The baseline hash is taken
+from the authoritative SQLite export, and the runner fails before collection
+unless that export and the published CEX CSV contain the same normalized rows.
+An alias-only date therefore becomes an explained missing exact fact; it does
+not become a synthetic candle. Network, rate-limit, parse, validation,
+unavailable-range, exact market-date preservation, or quarantine failures
+block the complete migration and preserve the published snapshot. A
+legitimately configured KRW market remains untouched during normal collection.
+
+Every source response is first clipped to the requested inclusive UTC window.
+An exact-identity migration requires a conclusive full-window outcome;
+`partial`, network, rate-limit, parse, validation, or unavailable-range status
+fails closed before publication. The migration also fails if any genuine exact
+baseline market-date is lost, if any retired quote-label residue remains, or
+if the quarantine does not account for every removed alias row. No outcome
+authorizes forward filling or synthetic exact facts.
 
 Use the internal exact-window runner for historical gaps. It does not accept an
 operator-supplied Token or date, and it does not call the `daily` collection

@@ -27,13 +27,20 @@ boundary.
    the exact configured instrument. Coinbase and Kraken rows use `/USD` because
    those adapters call USD products. Within a conclusive recollection window,
    known legacy Coinbase/Kraken rows that were incorrectly labeled `/USDT` are
-   replaced by same-date exact `/USD` rows; this is a bounded correction of
-   corrupted identity metadata, not quote-asset aliasing. Historical Upbit `/KRW` rows
-   produced by the retired fallback path are removed only with the explicit
-   `--remove-legacy-upbit-krw-fallback` migration switch, inside a declared
-   window, and only when the candidate contains the same-date exact `/USDT`
-   observation. `no_data` or `not_listed` alone never authorizes deletion of a
-   published historical row. The default collector continues to preserve a
+   retired through a migration explicitly scoped to those two exchanges,
+   without treating USD and USDT as interchangeable. During that run every
+   Upbit row is immutable and the preflight verifies the complete Upbit row
+   multiset. Historical Upbit `/KRW` rows produced by the retired fallback path
+   are a separate migration and leave served facts only through the explicit
+   Upbit switch and declared Upbit-only scope. Removed rows are never rewritten
+   as another market: complete original rows and their dispositions are
+   retained in an atomically published quarantine bound to baseline,
+   candidate, and row-set SHA-256 values. Genuine exact baseline dates remain
+   mandatory, while an alias-only date becomes missing rather than synthetic.
+   Every quarantine is also retained under an immutable content-addressed
+   filename. The baseline hash is computed from the authoritative SQLite export
+   after normalized equality with the public CSV is proven. Partial collection
+   evidence blocks publication. The default collector continues to preserve a
    legitimately configured `/KRW` market.
 4. Screener/catalog quality and selected-window quality remain separate facts.
    Both disclose their evaluation windows, observed values, and thresholds.
@@ -47,9 +54,9 @@ boundary.
 
 ## Safety boundary
 
-Valid historical observations and raw source evidence are retained. A
-conclusive bounded recollection may replace normalized rows whose market
-identity was demonstrably mislabeled; it does not rewrite an actual USD, USDT,
-or KRW market into another quote asset. Quarantine is reversible and source-
-backed. Missing facts stay null and do not become zero. No public retry control
-is shown for an official-current-catalog absence.
+Valid exact historical observations and raw source evidence are retained. A
+conclusive bounded recollection may retire rows whose market identity was
+demonstrably mislabeled; it does not rewrite an actual USD, USDT, or KRW market
+into another quote asset. The complete retired rows remain reversible in the
+hash-bound quarantine. Missing facts stay null and do not become zero. No
+public retry control is shown for an official-current-catalog absence.
