@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
 
@@ -12,6 +13,37 @@ RFC3339_TIMESTAMP = re.compile(
     r"(?:\.(?P<fraction>\d+))?"
     r"(?P<offset>Z|[+-]\d{2}:\d{2})"
 )
+
+
+def exact_rfc3339_epoch_seconds(value: str) -> Decimal:
+    """Return an RFC 3339 UTC timestamp as Decimal epoch seconds."""
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be RFC 3339 text")
+    matched = RFC3339_TIMESTAMP.fullmatch(value)
+    if matched is None:
+        raise ValueError("timestamp must be RFC 3339 with a timezone")
+    offset = (
+        "+00:00" if matched.group("offset") == "Z" else matched.group("offset")
+    )
+    try:
+        parsed = datetime.fromisoformat(matched.group("prefix") + offset)
+        parsed = parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as error:
+        raise ValueError("timestamp must represent a valid RFC 3339 instant") from error
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = parsed - epoch
+    whole_seconds = delta.days * 86_400 + delta.seconds
+    fraction = matched.group("fraction") or ""
+    if fraction:
+        return Decimal(whole_seconds) + Decimal("0." + fraction)
+    return Decimal(whole_seconds)
+
+
+def exact_timestamp_skew_seconds(left: str, right: str) -> Decimal:
+    """Return the exact absolute RFC 3339 timestamp skew in seconds."""
+    return abs(
+        exact_rfc3339_epoch_seconds(left) - exact_rfc3339_epoch_seconds(right)
+    )
 
 
 def parse_rfc3339_utc(value: str) -> datetime:
