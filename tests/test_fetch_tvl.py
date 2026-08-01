@@ -219,6 +219,47 @@ class FetchTvlTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "coverage"):
             validate_snapshot([pool(), pool(token="AAVE", address="0xaave")], observed)
 
+    def test_validate_snapshot_rejects_missing_or_noncanonical_observation_time(self):
+        observed = rows_from_payload(
+            [pool()],
+            {"data": [source_item()]},
+            snapshot_id="snapshot-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="abc123",
+        )
+        for invalid_time in (
+            "",
+            "2026-07-27T00:00:01",
+            "2026-07-27T08:00:01+08:00",
+            "not-a-time",
+        ):
+            with self.subTest(observed_at=invalid_time):
+                malformed = [{**observed[0], "observed_at": invalid_time}]
+                with self.assertRaisesRegex(ValueError, "observed_at"):
+                    validate_snapshot([pool()], malformed)
+
+    def test_validate_snapshot_binds_tvl_value_to_observation_status(self):
+        observed = rows_from_payload(
+            [pool()],
+            {"data": [source_item()]},
+            snapshot_id="snapshot-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="abc123",
+        )
+        with self.assertRaisesRegex(ValueError, "observed TVL"):
+            validate_snapshot([pool()], [{**observed[0], "tvl_usd": ""}])
+        with self.assertRaisesRegex(ValueError, "non-observed TVL"):
+            validate_snapshot(
+                [pool()],
+                [{**observed[0], "status": "missing", "tvl_usd": "123"}],
+                allow_no_observed=True,
+            )
+        validate_snapshot([pool()], [{**observed[0], "tvl_usd": "0"}])
+
     def test_exact_candidate_accepts_only_terminal_missing_or_not_found(self):
         terminal = rows_from_payload(
             [pool(address="0xMissing")],

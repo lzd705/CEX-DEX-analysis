@@ -11,7 +11,9 @@ an on-chain contract address.  New records default to
 
 from __future__ import annotations
 
+import csv
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -40,6 +42,14 @@ SUPPORTED_CHAINS = tuple(sorted(CHAIN_ADDRESS_KIND))
 TOKEN_STATUSES = {"pending", "active", "failed", "needs_review"}
 CEX_MAPPING_STATUSES = {"requires_manual_review", "approved", "not_listed"}
 TOKEN_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
+CEX_SYMBOL_PATTERN = re.compile(
+    r"^[A-Z0-9._-]{1,32}/[A-Z0-9._-]{1,32}$"
+)
+CEX_EXCHANGE_PATTERN = re.compile(r"^[a-z0-9_]{2,32}$")
+CEX_MARKET_ID_PATTERN = re.compile(
+    r"^cex:([a-z0-9_]{2,32}):"
+    r"([A-Z0-9._-]{1,32})/([A-Z0-9._-]{1,32})$"
+)
 EVM_ADDRESS_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
 STARKNET_ADDRESS_PATTERN = re.compile(r"^0x[0-9a-fA-F]{1,64}$")
 SOLANA_ADDRESS_PATTERN = re.compile(
@@ -174,6 +184,115 @@ def empty_registry() -> Dict[str, Any]:
     return {"schema_version": REGISTRY_SCHEMA_VERSION, "tokens": {}}
 
 
+def canonical_cex_market_ids(
+    market_ids: Iterable[str],
+    *,
+    exchange: Optional[str] = None,
+) -> tuple[str, ...]:
+    """Return one bounded, exact, sorted CEX market-ID inventory."""
+    if isinstance(market_ids, (str, bytes)):
+        raise ValueError("CEX market IDs must be an inventory")
+    expected_exchange = None
+    if exchange is not None:
+        expected_exchange = str(exchange or "").strip().lower()
+        if CEX_EXCHANGE_PATTERN.fullmatch(expected_exchange) is None:
+            raise ValueError("CEX exchange identity is invalid")
+    values = list(market_ids)
+    if not values or len(values) > 10_000:
+        raise ValueError("CEX market ID inventory is invalid")
+    canonical = []
+    for market_id in values:
+        if not isinstance(market_id, str) or market_id != market_id.strip():
+            raise ValueError("CEX market ID is invalid")
+        match = CEX_MARKET_ID_PATTERN.fullmatch(market_id)
+        if match is None or (
+            expected_exchange is not None
+            and match.group(1) != expected_exchange
+        ):
+            raise ValueError("CEX market ID is invalid")
+        canonical.append(market_id)
+    if len(canonical) != len(set(canonical)):
+        raise ValueError("CEX market IDs must be unique")
+    return tuple(sorted(canonical))
+
+
+def cex_market_ids_sha256(
+    market_ids: Iterable[str],
+    *,
+    exchange: Optional[str] = None,
+) -> str:
+    """Hash one canonical exact CEX market-ID inventory."""
+    canonical = canonical_cex_market_ids(
+        market_ids,
+        exchange=exchange,
+    )
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def configured_cex_market_ids(
+    tokens_csv: Path,
+    runtime_registry: Path,
+    *,
+    exchange: str,
+) -> tuple[str, ...]:
+    """Merge static and active approved runtime markets for one CEX."""
+    normalized_exchange = str(exchange or "").strip().lower()
+    if CEX_EXCHANGE_PATTERN.fullmatch(normalized_exchange) is None:
+        raise ValueError("CEX exchange identity is invalid")
+
+    by_token: Dict[str, str] = {}
+
+    def add(token_symbol: Any, cex_symbol: Any) -> None:
+        token = normalize_token_symbol(token_symbol)
+        instrument = str(cex_symbol or "").strip().upper()
+        if (
+            CEX_SYMBOL_PATTERN.fullmatch(instrument) is None
+            or instrument.split("/", 1)[0] != token
+        ):
+            raise TokenRegistryError(
+                "invalid_registry_record",
+                "Configured CEX instrument must match the Token symbol",
+            )
+        market_id = "cex:{}:{}".format(normalized_exchange, instrument)
+        existing = by_token.get(token)
+        if existing is not None and existing != market_id:
+            raise TokenRegistryError(
+                "cex_mapping_conflict",
+                "Static and runtime CEX mappings conflict for one Token",
+                {"token_symbol": token, "exchange": normalized_exchange},
+            )
+        by_token[token] = market_id
+
+    with Path(tokens_csv).open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if not {"token_symbol", "cex_symbol"}.issubset(
+            set(reader.fieldnames or [])
+        ):
+            raise ValueError("Static Token catalog is missing CEX identity fields")
+        for row in reader:
+            add(row.get("token_symbol"), row.get("cex_symbol"))
+
+    registry = TokenRegistry(Path(runtime_registry))
+    for record in registry.list_records(statuses={"active"}):
+        mapping = record.get("cex_mapping") or {}
+        if (
+            mapping.get("status") != "approved"
+            or normalized_exchange not in mapping.get("exchanges", [])
+        ):
+            continue
+        add(record.get("token_symbol"), mapping.get("cex_symbol"))
+
+    return canonical_cex_market_ids(
+        by_token.values(),
+        exchange=normalized_exchange,
+    )
+
+
 def _normalize_optional_text(
     value: Any,
     *,
@@ -193,7 +312,11 @@ def _normalize_optional_text(
     return text
 
 
-def _normalize_cex_mapping(value: Any) -> Dict[str, Any]:
+def _normalize_cex_mapping(
+    value: Any,
+    *,
+    token_symbol: str,
+) -> Dict[str, Any]:
     if value is None:
         return {
             "status": "requires_manual_review",
@@ -217,6 +340,18 @@ def _normalize_cex_mapping(value: Any) -> Dict[str, Any]:
         field="cex_mapping.cex_symbol",
         maximum_length=64,
     )
+    if cex_symbol is not None:
+        canonical_symbol = cex_symbol.upper()
+        if (
+            not isinstance(value.get("cex_symbol"), str)
+            or value.get("cex_symbol") != cex_symbol
+            or CEX_SYMBOL_PATTERN.fullmatch(canonical_symbol) is None
+        ):
+            raise TokenRegistryError(
+                "invalid_registry_record",
+                "CEX mapping symbol must be one canonical BASE/QUOTE pair",
+            )
+        cex_symbol = canonical_symbol
     exchanges_value = value.get("exchanges", [])
     if not isinstance(exchanges_value, list):
         raise TokenRegistryError(
@@ -242,6 +377,19 @@ def _normalize_cex_mapping(value: Any) -> Dict[str, Any]:
         raise TokenRegistryError(
             "invalid_registry_record",
             "Approved CEX mapping requires a symbol and at least one exchange",
+        )
+    if (
+        status == "approved"
+        and cex_symbol is not None
+        and cex_symbol.split("/", 1)[0] != token_symbol
+    ):
+        raise TokenRegistryError(
+            "invalid_registry_record",
+            "Approved CEX mapping base asset must match the Token symbol",
+            {
+                "token_symbol": token_symbol,
+                "cex_symbol": cex_symbol,
+            },
         )
     return {
         "status": status,
@@ -333,7 +481,10 @@ def normalize_token_record(record: Mapping[str, Any]) -> Dict[str, Any]:
             maximum_length=240,
         ),
         "status": status,
-        "cex_mapping": _normalize_cex_mapping(record.get("cex_mapping")),
+        "cex_mapping": _normalize_cex_mapping(
+            record.get("cex_mapping"),
+            token_symbol=symbol,
+        ),
         "created_at": created_at,
         "created_by": created_by,
         "activated_at": _normalize_optional_text(

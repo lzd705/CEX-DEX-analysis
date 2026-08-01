@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import unittest
 import urllib.error
 import urllib.parse
@@ -42,6 +44,7 @@ from scripts.fetch_cex import build_coverage_rows
 from scripts.fetch_cex import select_stable_exchanges
 from scripts.fetch_cex import write_exchange_rows
 from scripts.fetch_cex import merge_exchange_rows
+from scripts.fetch_cex import merge_conclusive_attempt_windows
 from scripts.fetch_cex import build_rows
 from scripts.fetch_cex import cex_attempt_record
 from scripts.fetch_cex import classify_attempt_error
@@ -49,6 +52,28 @@ from scripts.fetch_cex import write_attempt_ledger
 
 
 class FetchCexTests(unittest.TestCase):
+    def test_fetch_cex_standalone_cli_help_loads_local_dependencies(self):
+        result = subprocess.run(
+            [sys.executable, str(Path(fetch_cex.__file__).resolve()), "--help"],
+            cwd=Path(fetch_cex.__file__).resolve().parents[1],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout.lower())
+
+    def test_upbit_candidate_is_the_exact_configured_quote_market(self):
+        self.assertEqual(
+            make_upbit_market_candidates("AAVE/USDT"),
+            ["USDT-AAVE"],
+        )
+        self.assertEqual(
+            make_upbit_market_candidates("AAVE/KRW"),
+            ["KRW-AAVE"],
+        )
+
     def test_thirty_day_old_single_day_binance_request_returns_target_row(self):
         target_date = (
             datetime.now(timezone.utc).date() - timedelta(days=30)
@@ -100,6 +125,46 @@ class FetchCexTests(unittest.TestCase):
             [str(target_ms + 86_400_000 - 1)],
         )
         self.assertEqual(rows[0]["date"], target_date)
+
+    def test_coinbase_rows_keep_the_exact_usd_source_identity(self):
+        candle = [1704067200, 7.00, 7.50, 7.10, 7.30, 1000.0]
+        with patch.object(
+            fetch_cex,
+            "fetch_coinbase_candles",
+            return_value=[candle],
+        ) as source:
+            rows = fetch_cex.fetch_exchange_rows(
+                "UNI",
+                "UNI/USDT",
+                "coinbase",
+                "2024-01-01",
+                "2024-01-01",
+            )
+
+        source.assert_called_once_with(
+            "UNI-USD", fetch_cex.LIMIT_DAYS, "2024-01-01", "2024-01-01"
+        )
+        self.assertEqual(rows[0]["cex_symbol"], "UNI/USD")
+
+    def test_kraken_rows_keep_the_exact_usd_source_identity(self):
+        kline = [1704067200, "7.10", "7.50", "7.00", "7.30", "7.25", "1000", 123]
+        with patch.object(
+            fetch_cex,
+            "fetch_kraken_klines",
+            return_value=[kline],
+        ) as source:
+            rows = fetch_cex.fetch_exchange_rows(
+                "UNI",
+                "UNI/USDT",
+                "kraken",
+                "2024-01-01",
+                "2024-01-01",
+            )
+
+        source.assert_called_once_with(
+            "UNIUSD", fetch_cex.LIMIT_DAYS, "2024-01-01", "2024-01-01"
+        )
+        self.assertEqual(rows[0]["cex_symbol"], "UNI/USD")
 
     def test_recent_binance_request_keeps_recent_endpoint_shape(self):
         response = MagicMock()
@@ -344,6 +409,37 @@ class FetchCexTests(unittest.TestCase):
         self.assertEqual(attempts[0]["reason_code"], "source_unavailable")
         self.assertEqual(attempts[0]["http_status"], 503)
 
+    def test_build_rows_records_coinbase_attempt_under_exact_usd_identity(self):
+        attempts = []
+        row = {
+            "date": "2026-07-28",
+            "token_symbol": "UNI",
+            "exchange": "coinbase",
+            "cex_symbol": "UNI/USD",
+            "open": 1,
+            "high": 1,
+            "low": 1,
+            "close": 1,
+            "base_volume": 1,
+            "quote_volume_usd": 1,
+            "source_instrument": "UNI/USD",
+        }
+        with patch(
+            "scripts.fetch_cex.fetch_exchange_rows",
+            return_value=[row],
+        ), patch.object(fetch_cex.time, "sleep"):
+            rows = build_rows(
+                [{"token_symbol": "UNI", "cex_symbol": "UNI/USDT"}],
+                ["coinbase"],
+                attempt_records=attempts,
+                start_date="2026-07-28",
+                end_date="2026-07-28",
+            )
+
+        self.assertEqual(rows, [row])
+        self.assertEqual(attempts[0]["instrument"], "UNI/USD")
+        self.assertEqual(attempts[0]["source_instrument"], "UNI/USD")
+
     def test_source_range_attempt_is_unsupported_not_network_failed(self):
         attempt = cex_attempt_record(
             "UNI",
@@ -515,7 +611,7 @@ class FetchCexTests(unittest.TestCase):
     def test_exchange_writer_strips_only_transient_source_instrument(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "rows.csv"
-            row = {"date": "2026-07-28", "token_symbol": "AAVE", "exchange": "upbit", "cex_symbol": "AAVE/USDT", "open": 1, "high": 1, "low": 1, "close": 1, "base_volume": 1, "quote_volume_usd": 1, "source_instrument": "AAVE/KRW"}
+            row = {"date": "2026-07-28", "token_symbol": "AAVE", "exchange": "upbit", "cex_symbol": "AAVE/USDT", "open": 1, "high": 1, "low": 1, "close": 1, "base_volume": 1, "quote_volume_usd": 1, "source_instrument": "AAVE/USDT"}
             write_exchange_rows([row], path)
             self.assertNotIn("source_instrument", path.read_text(encoding="utf-8"))
             with self.assertRaises(ValueError):
@@ -526,24 +622,27 @@ class FetchCexTests(unittest.TestCase):
             fetch_cex.main(exchanges=["binance"], output_dir=Path(directory))
         writer.assert_not_called()
 
-    def test_upbit_fallback_keeps_the_configured_canonical_symbol_and_alias_lineage(self):
+    def test_upbit_uses_only_the_exact_configured_venue_instrument(self):
         candle = {
-            "market": "KRW-AAVE",
+            "market": "USDT-AAVE",
             "candle_date_time_utc": "2026-07-28T00:00:00",
-            "opening_price": 100000,
-            "high_price": 110000,
-            "low_price": 90000,
-            "trade_price": 105000,
+            "opening_price": 100,
+            "high_price": 110,
+            "low_price": 90,
+            "trade_price": 105,
             "candle_acc_trade_volume": 10,
-            "candle_acc_trade_price": 1050000,
+            "candle_acc_trade_price": 1050,
         }
-        reference = dict(candle, market="KRW-USDT", trade_price=1000)
-        with patch("scripts.fetch_cex.fetch_upbit_candles", side_effect=[[candle], [reference]]):
+        with patch(
+            "scripts.fetch_cex.fetch_upbit_candles",
+            return_value=[candle],
+        ) as fetcher:
             rows = fetch_cex.build_upbit_rows("AAVE", "AAVE/USDT", 1)
         attempt = cex_attempt_record(
             "AAVE", "upbit", "AAVE/USDT", rows=rows, start_date="2026-07-28", end_date="2026-07-28"
         )
 
+        fetcher.assert_called_once_with("USDT-AAVE", 1, end_date=None)
         self.assertEqual(rows[0]["cex_symbol"], "AAVE/USDT")
         self.assertEqual(
             {key: rows[0][key] for key in ("open", "high", "low", "close", "quote_volume_usd")},
@@ -551,13 +650,13 @@ class FetchCexTests(unittest.TestCase):
         )
         self.assertEqual(
             {key: attempt[key] for key in ("instrument", "source_instrument", "source_instrument_alias_validated")},
-            {"instrument": "AAVE/USDT", "source_instrument": "AAVE/KRW", "source_instrument_alias_validated": True},
+            {"instrument": "AAVE/USDT", "source_instrument": "AAVE/USDT", "source_instrument_alias_validated": False},
         )
 
     def test_upbit_empty_candidates_publish_terminal_no_candles_with_lineage(self):
         with patch(
             "scripts.fetch_cex.fetch_upbit_candles",
-            side_effect=[[], []],
+            return_value=[],
         ):
             try:
                 rows = fetch_cex.build_upbit_rows(
@@ -578,15 +677,6 @@ class FetchCexTests(unittest.TestCase):
         self.assertEqual(
             getattr(rows, "candidate_outcomes", None),
             [
-                {
-                    "market": "KRW-AAVE",
-                    "source_instrument": "AAVE/KRW",
-                    "stage": "candles",
-                    "status": "no_data",
-                    "reason_code": "no_candles",
-                    "http_status": None,
-                    "observation_count": 0,
-                },
                 {
                     "market": "USDT-AAVE",
                     "source_instrument": "AAVE/USDT",
@@ -628,7 +718,7 @@ class FetchCexTests(unittest.TestCase):
             },
         )
 
-    def test_upbit_technical_candidate_error_is_not_erased_by_empty_fallback(self):
+    def test_upbit_exact_instrument_transport_error_is_not_reclassified(self):
         source_error = urllib.error.HTTPError(
             "https://source.example/candles",
             503,
@@ -638,7 +728,7 @@ class FetchCexTests(unittest.TestCase):
         )
         with patch(
             "scripts.fetch_cex.fetch_upbit_candles",
-            side_effect=[source_error, []],
+            side_effect=source_error,
         ):
             with self.assertRaises(RuntimeError) as context:
                 fetch_cex.build_upbit_rows("AAVE", "AAVE/USDT", 1)
@@ -647,21 +737,12 @@ class FetchCexTests(unittest.TestCase):
             getattr(context.exception, "candidate_outcomes", None),
             [
                 {
-                    "market": "KRW-AAVE",
-                    "source_instrument": "AAVE/KRW",
+                    "market": "USDT-AAVE",
+                    "source_instrument": "AAVE/USDT",
                     "stage": "candles",
                     "status": "failed",
                     "reason_code": "source_unavailable",
                     "http_status": 503,
-                    "observation_count": 0,
-                },
-                {
-                    "market": "USDT-AAVE",
-                    "source_instrument": "AAVE/USDT",
-                    "stage": "candles",
-                    "status": "no_data",
-                    "reason_code": "no_candles",
-                    "http_status": None,
                     "observation_count": 0,
                 },
             ],
@@ -671,68 +752,36 @@ class FetchCexTests(unittest.TestCase):
             "source_unavailable",
         )
 
-    def test_upbit_reference_quote_failure_is_not_reclassified_as_absence(self):
+    def test_explicit_upbit_krw_instrument_keeps_krw_identity_and_fx_lineage(self):
         candle = {
             "market": "KRW-AAVE",
             "candle_date_time_utc": "2026-07-28T00:00:00",
-            "opening_price": 100000,
-            "high_price": 110000,
-            "low_price": 90000,
-            "trade_price": 105000,
+            "opening_price": 1000,
+            "high_price": 1100,
+            "low_price": 900,
+            "trade_price": 1050,
             "candle_acc_trade_volume": 10,
-            "candle_acc_trade_price": 1050000,
-        }
-        reference_error = urllib.error.HTTPError(
-            "https://source.example/reference",
-            503,
-            "Unavailable",
-            None,
-            None,
-        )
-        with patch(
-            "scripts.fetch_cex.fetch_upbit_candles",
-            side_effect=[[candle], reference_error, []],
-        ):
-            with self.assertRaises(RuntimeError) as context:
-                fetch_cex.build_upbit_rows("AAVE", "AAVE/USDT", 1)
-
-        self.assertEqual(
-            getattr(context.exception, "candidate_outcomes", None),
-            [
-                {
-                    "market": "KRW-AAVE",
-                    "source_instrument": "AAVE/KRW",
-                    "stage": "quote_conversion",
-                    "status": "failed",
-                    "reason_code": "source_unavailable",
-                    "http_status": 503,
-                    "observation_count": 1,
-                },
-                {
-                    "market": "USDT-AAVE",
-                    "source_instrument": "AAVE/USDT",
-                    "stage": "candles",
-                    "status": "no_data",
-                    "reason_code": "no_candles",
-                    "http_status": None,
-                    "observation_count": 0,
-                },
-            ],
-        )
-        self.assertEqual(
-            classify_attempt_error(context.exception)["reason_code"],
-            "source_unavailable",
-        )
-
-    def test_upbit_canonicalization_preserves_ldo_usdt_review_identity(self):
-        candle = {
-            "market": "KRW-LDO", "candle_date_time_utc": "2026-07-28T00:00:00",
-            "opening_price": 1000, "high_price": 1100, "low_price": 900,
-            "trade_price": 1050, "candle_acc_trade_volume": 10,
             "candle_acc_trade_price": 10500,
         }
         reference = dict(candle, market="KRW-USDT", trade_price=1000)
-        with patch("scripts.fetch_cex.fetch_upbit_candles", side_effect=[[candle], [reference]]):
+        with patch(
+            "scripts.fetch_cex.fetch_upbit_candles",
+            side_effect=[[candle], [reference]],
+        ):
+            rows = fetch_cex.build_upbit_rows("AAVE", "AAVE/KRW", 1)
+
+        self.assertEqual(rows[0]["cex_symbol"], "AAVE/KRW")
+        self.assertEqual(rows[0]["source_instrument"], "AAVE/KRW")
+        self.assertEqual(rows[0]["close"], 1.05)
+
+    def test_upbit_canonicalization_preserves_ldo_usdt_review_identity(self):
+        candle = {
+            "market": "USDT-LDO", "candle_date_time_utc": "2026-07-28T00:00:00",
+            "opening_price": 1, "high_price": 1.1, "low_price": 0.9,
+            "trade_price": 1.05, "candle_acc_trade_volume": 10,
+            "candle_acc_trade_price": 10.5,
+        }
+        with patch("scripts.fetch_cex.fetch_upbit_candles", return_value=[candle]):
             rows = fetch_cex.build_upbit_rows("LDO", "LDO/USDT", 1)
         self.assertEqual(rows[0]["cex_symbol"], "LDO/USDT")
 
@@ -756,6 +805,316 @@ class FetchCexTests(unittest.TestCase):
         self.assertEqual(by_key[("UNI", "2026-01-01")]["close"], 1.5)
         self.assertEqual(by_key[("UNI", "2026-01-02")]["close"], 1.6)
         self.assertEqual(by_key[("AAVE", "2026-01-01")]["close"], 2.0)
+
+    def test_upbit_merge_preserves_distinct_venue_instruments(self):
+        existing = [
+            {
+                "date": "2026-07-01",
+                "token_symbol": "MORPHO",
+                "exchange": "upbit",
+                "cex_symbol": "MORPHO/KRW",
+                "close": 1.0,
+            },
+            {
+                "date": "2026-07-02",
+                "token_symbol": "MORPHO",
+                "exchange": "upbit",
+                "cex_symbol": "MORPHO/KRW",
+                "close": 2.0,
+            },
+        ]
+        canonical = [
+            {
+                "date": "2026-07-02",
+                "token_symbol": "MORPHO",
+                "exchange": "upbit",
+                "cex_symbol": "MORPHO/USDT",
+                "source_instrument": "MORPHO/USDT",
+                "close": 2.5,
+            },
+        ]
+
+        result = merge_exchange_rows(existing, canonical)
+
+        self.assertEqual(
+            {(row["cex_symbol"], row["date"]) for row in result},
+            {
+                ("MORPHO/KRW", "2026-07-01"),
+                ("MORPHO/KRW", "2026-07-02"),
+                ("MORPHO/USDT", "2026-07-02"),
+            },
+        )
+        latest = next(
+            row for row in result
+            if row["date"] == "2026-07-02"
+            and row["cex_symbol"] == "MORPHO/USDT"
+        )
+        self.assertEqual(latest["close"], 2.5)
+
+    def test_partial_refresh_replaces_only_observed_dates_and_preserves_other_baseline_dates(self):
+        existing = [
+            {
+                "date": day,
+                "token_symbol": "MORPHO",
+                "exchange": "upbit",
+                "cex_symbol": symbol,
+                "close": value,
+            }
+            for symbol, day, value in (
+                ("MORPHO/KRW", "2026-07-01", 1.0),
+                ("MORPHO/KRW", "2026-07-02", 2.0),
+                ("MORPHO/USDT", "2026-07-01", 1.1),
+                ("MORPHO/USDT", "2026-07-02", 2.1),
+            )
+        ]
+        new_rows = [{
+            "date": "2026-07-02",
+            "token_symbol": "MORPHO",
+            "exchange": "upbit",
+            "cex_symbol": "MORPHO/USDT",
+            "close": 2.5,
+        }]
+        attempt = {
+            "token_symbol": "MORPHO",
+            "exchange": "upbit",
+            "instrument": "MORPHO/USDT",
+            "requested_start_date": "2026-07-01",
+            "requested_end_date": "2026-07-02",
+            "observed_dates": ["2026-07-02"],
+            "status": "partial",
+            "reason_code": "no_candles",
+        }
+
+        result = merge_conclusive_attempt_windows(
+            existing,
+            new_rows,
+            [attempt],
+        )
+
+        self.assertEqual(
+            {(row["cex_symbol"], row["date"]) for row in result},
+            {
+                ("MORPHO/KRW", "2026-07-01"),
+                ("MORPHO/KRW", "2026-07-02"),
+                ("MORPHO/USDT", "2026-07-01"),
+                ("MORPHO/USDT", "2026-07-02"),
+            },
+        )
+
+    def test_opt_in_upbit_partial_migration_removes_legacy_krw_only_on_observed_dates(self):
+        existing = [
+            {
+                "date": day,
+                "token_symbol": token,
+                "exchange": exchange,
+                "cex_symbol": symbol,
+                "close": value,
+            }
+            for token, exchange, symbol, day, value in (
+                ("MORPHO", "upbit", "MORPHO/KRW", "2026-06-30", 0.5),
+                ("MORPHO", "upbit", "MORPHO/KRW", "2026-07-01", 1.0),
+                ("MORPHO", "upbit", "MORPHO/KRW", "2026-07-02", 2.0),
+                ("MORPHO", "upbit", "MORPHO/USDT", "2026-07-01", 1.1),
+                ("MORPHO", "upbit", "MORPHO/USDT", "2026-07-02", 2.1),
+                ("AAVE", "upbit", "AAVE/KRW", "2026-07-01", 3.0),
+                ("MORPHO", "binance", "MORPHO/KRW", "2026-07-01", 4.0),
+            )
+        ]
+        new_rows = [{
+            "date": "2026-07-02",
+            "token_symbol": "MORPHO",
+            "exchange": "upbit",
+            "cex_symbol": "MORPHO/USDT",
+            "close": 2.5,
+        }]
+        attempt = {
+            "token_symbol": "MORPHO",
+            "exchange": "upbit",
+            "instrument": "MORPHO/USDT",
+            "requested_start_date": "2026-07-01",
+            "requested_end_date": "2026-07-02",
+            "observed_dates": ["2026-07-02"],
+            "status": "partial",
+            "reason_code": "no_candles",
+        }
+
+        result = merge_conclusive_attempt_windows(
+            existing,
+            new_rows,
+            [attempt],
+            remove_legacy_upbit_krw_fallback=True,
+        )
+
+        self.assertEqual(
+            {
+                (row["token_symbol"], row["exchange"], row["cex_symbol"], row["date"])
+                for row in result
+            },
+            {
+                ("MORPHO", "upbit", "MORPHO/KRW", "2026-06-30"),
+                ("MORPHO", "upbit", "MORPHO/KRW", "2026-07-01"),
+                ("MORPHO", "upbit", "MORPHO/USDT", "2026-07-01"),
+                ("MORPHO", "upbit", "MORPHO/USDT", "2026-07-02"),
+                ("AAVE", "upbit", "AAVE/KRW", "2026-07-01"),
+                ("MORPHO", "binance", "MORPHO/KRW", "2026-07-01"),
+            },
+        )
+
+    def test_opt_in_upbit_migration_retains_legacy_krw_after_technical_failure(self):
+        existing = [{
+            "date": "2026-07-01",
+            "token_symbol": "MORPHO",
+            "exchange": "upbit",
+            "cex_symbol": "MORPHO/KRW",
+            "close": 1.0,
+        }]
+        attempt = {
+            "token_symbol": "MORPHO",
+            "exchange": "upbit",
+            "instrument": "MORPHO/USDT",
+            "requested_start_date": "2026-07-01",
+            "requested_end_date": "2026-07-02",
+            "status": "failed",
+            "reason_code": "network",
+        }
+
+        result = merge_conclusive_attempt_windows(
+            existing,
+            [],
+            [attempt],
+            remove_legacy_upbit_krw_fallback=True,
+        )
+
+        self.assertEqual(result, existing)
+
+    def test_partial_coinbase_usd_refresh_removes_legacy_label_only_on_observed_dates(self):
+        existing = [
+            {
+                "date": day,
+                "token_symbol": "UNI",
+                "exchange": exchange,
+                "cex_symbol": symbol,
+                "close": value,
+            }
+            for exchange, symbol, day, value in (
+                ("coinbase", "UNI/USDT", "2026-07-01", 1.0),
+                ("coinbase", "UNI/USDT", "2026-07-02", 2.0),
+                ("coinbase", "UNI/USDT", "2026-06-30", 0.5),
+                ("binance", "UNI/USDT", "2026-07-01", 1.1),
+            )
+        ]
+        new_rows = [{
+            "date": "2026-07-02",
+            "token_symbol": "UNI",
+            "exchange": "coinbase",
+            "cex_symbol": "UNI/USD",
+            "close": 2.5,
+        }]
+        attempt = {
+            "token_symbol": "UNI",
+            "exchange": "coinbase",
+            "instrument": "UNI/USD",
+            "requested_start_date": "2026-07-01",
+            "requested_end_date": "2026-07-02",
+            "observed_dates": ["2026-07-02"],
+            "status": "partial",
+            "reason_code": "no_candles",
+        }
+
+        result = merge_conclusive_attempt_windows(existing, new_rows, [attempt])
+
+        self.assertEqual(
+            {
+                (row["exchange"], row["cex_symbol"], row["date"])
+                for row in result
+            },
+            {
+                ("coinbase", "UNI/USDT", "2026-06-30"),
+                ("coinbase", "UNI/USDT", "2026-07-01"),
+                ("coinbase", "UNI/USD", "2026-07-02"),
+                ("binance", "UNI/USDT", "2026-07-01"),
+            },
+        )
+
+    def test_crypto_com_inventory_is_checked_once_before_candles(self):
+        tokens = [
+            {"token_symbol": "GMX", "cex_symbol": "GMX/USDT"},
+            {"token_symbol": "UNI", "cex_symbol": "UNI/USDT"},
+        ]
+        candle = {
+            "t": 1_788_134_400_000,
+            "o": "7",
+            "h": "8",
+            "l": "6",
+            "c": "7.5",
+            "v": "10",
+        }
+        attempts = []
+        with patch.object(
+            fetch_cex,
+            "fetch_crypto_com_instruments",
+            return_value={"UNI_USDT"},
+        ) as inventory, patch.object(
+            fetch_cex,
+            "fetch_crypto_com_candles",
+            return_value=[candle],
+        ) as candles, patch.object(fetch_cex.time, "sleep"):
+            rows = build_rows(
+                tokens,
+                exchanges=["crypto_com"],
+                attempt_records=attempts,
+            )
+
+        inventory.assert_called_once_with()
+        candles.assert_called_once()
+        self.assertEqual([row["token_symbol"] for row in rows], ["UNI"])
+        by_token = {attempt["token_symbol"]: attempt for attempt in attempts}
+        self.assertEqual(by_token["GMX"]["reason_code"], "not_listed")
+        self.assertEqual(by_token["GMX"]["status"], "failed")
+        self.assertEqual(by_token["UNI"]["status"], "succeeded")
+
+    def test_crypto_com_daily_preflight_uses_exact_official_spot_schema(self):
+        payload = {
+            "code": 0,
+            "result": {
+                "data": [
+                    {
+                        "symbol": "AAVE_USDT",
+                        "inst_type": "CCY_PAIR",
+                        "display_name": "AAVE/USDT",
+                        "base_ccy": "AAVE",
+                        "quote_ccy": "USDT",
+                        "tradable": True,
+                    }
+                ]
+            },
+        }
+        with patch.object(fetch_cex, "request_json", return_value=payload):
+            instruments = fetch_cex.fetch_crypto_com_instruments()
+
+        self.assertEqual(instruments, {"AAVE_USDT"})
+
+    def test_crypto_com_inventory_failure_never_falls_through_to_candles(self):
+        tokens = [{"token_symbol": "GMX", "cex_symbol": "GMX/USDT"}]
+        attempts = []
+        with patch.object(
+            fetch_cex,
+            "fetch_crypto_com_instruments",
+            side_effect=urllib.error.URLError("offline"),
+        ), patch.object(
+            fetch_cex,
+            "fetch_crypto_com_candles",
+        ) as candles, patch.object(fetch_cex.time, "sleep"):
+            rows = build_rows(
+                tokens,
+                exchanges=["crypto_com"],
+                attempt_records=attempts,
+            )
+
+        candles.assert_not_called()
+        self.assertEqual(rows, [])
+        self.assertEqual(attempts[0]["reason_code"], "network")
+        self.assertEqual(attempts[0]["status"], "failed")
 
     def test_default_minimum_exchange_count_is_three(self):
         self.assertEqual(MIN_EXCHANGE_COUNT, 3)
@@ -791,9 +1150,9 @@ class FetchCexTests(unittest.TestCase):
         result = make_crypto_com_instrument("UNI/USDT")
         self.assertEqual(result, "UNI_USDT")
 
-    def test_make_upbit_market_candidates_prefers_krw(self):
+    def test_make_upbit_market_candidates_uses_exact_configured_quote(self):
         result = make_upbit_market_candidates("UNI/USDT")
-        self.assertEqual(result, ["KRW-UNI", "USDT-UNI"])
+        self.assertEqual(result, ["USDT-UNI"])
 
     def test_convert_binance_kline_uses_quote_volume(self):
         kline = [
@@ -966,10 +1325,11 @@ class FetchCexTests(unittest.TestCase):
             1000.0,
         ]
 
-        result = convert_coinbase_candle(candle, "UNI", "UNI/USDT")
+        result = convert_coinbase_candle(candle, "UNI", "UNI/USD")
 
         self.assertEqual(result["date"], "2024-01-01")
         self.assertEqual(result["exchange"], "coinbase")
+        self.assertEqual(result["cex_symbol"], "UNI/USD")
         self.assertEqual(result["base_volume"], 1000.0)
         self.assertEqual(result["quote_volume_usd"], 7300.0)
 
@@ -985,10 +1345,11 @@ class FetchCexTests(unittest.TestCase):
             123,
         ]
 
-        result = convert_kraken_kline(kline, "UNI", "UNI/USDT")
+        result = convert_kraken_kline(kline, "UNI", "UNI/USD")
 
         self.assertEqual(result["date"], "2024-01-01")
         self.assertEqual(result["exchange"], "kraken")
+        self.assertEqual(result["cex_symbol"], "UNI/USD")
         self.assertEqual(result["base_volume"], 1000.0)
         self.assertEqual(result["quote_volume_usd"], 7300.0)
 

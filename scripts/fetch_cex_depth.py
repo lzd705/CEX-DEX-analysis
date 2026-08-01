@@ -45,6 +45,7 @@ try:
         validate_exact_publication_scope,
     )
     from scripts.fetch_cex import (
+        canonical_collected_instrument,
         make_binance_symbol,
         make_bitget_symbol,
         make_bybit_symbol,
@@ -77,7 +78,10 @@ try:
         normalize_cex_source_outcome,
         quality_outcome_resolution_state,
     )
-    from scripts.timestamp_contract import canonical_rfc3339_utc
+    from scripts.timestamp_contract import (
+        canonical_rfc3339_utc,
+        validate_observation_bounds,
+    )
 except ModuleNotFoundError:
     from atomic_publication import atomic_replace_bundle, csv_payload
     from bounded_snapshot_merge import (
@@ -86,6 +90,7 @@ except ModuleNotFoundError:
         validate_exact_publication_scope,
     )
     from fetch_cex import (
+        canonical_collected_instrument,
         make_binance_symbol,
         make_bitget_symbol,
         make_bybit_symbol,
@@ -118,7 +123,10 @@ except ModuleNotFoundError:
         normalize_cex_source_outcome,
         quality_outcome_resolution_state,
     )
-    from timestamp_contract import canonical_rfc3339_utc
+    from timestamp_contract import (
+        canonical_rfc3339_utc,
+        validate_observation_bounds,
+    )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -407,6 +415,21 @@ def load_cataloged_markets(
         )
     if not rows:
         raise ValueError("Published CEX market inventory contains no markets")
+    for row in rows:
+        published_instrument = str(row.get("cex_symbol") or "").strip().upper()
+        exact_instrument = canonical_collected_instrument(
+            str(row.get("exchange") or ""),
+            published_instrument,
+        )
+        if published_instrument != exact_instrument:
+            raise ValueError(
+                "Published CEX catalog does not preserve the exact source "
+                "instrument identity for {}: expected {}, found {}".format(
+                    row.get("exchange"),
+                    exact_instrument,
+                    published_instrument,
+                )
+            )
     return rows
 
 
@@ -1409,6 +1432,7 @@ def validate_snapshot(
         raise ValueError("CEX depth snapshot contains duplicate market rows")
     if expected != actual:
         raise ValueError("CEX depth snapshot coverage does not match the published inventory")
+    validate_observation_bounds(rows)
     if any(row["status"] not in {"observed", "partial", "failed"} for row in rows):
         raise ValueError("CEX depth snapshot contains an invalid status")
     if any(row.get("reason_code") not in CEX_DEPTH_REASON_CODES for row in rows):

@@ -17,7 +17,7 @@ from scripts.quality_outcomes import (
 )
 
 
-CATALOG_VERSION = 2
+CATALOG_VERSION = 3
 DAILY_GRAIN = "1 day, UTC"
 PRICE_QUOTE_ASSET = "USD"
 MISSING_VALUE_RULE = (
@@ -37,6 +37,8 @@ MARKET_QUALITY_THRESHOLDS = {
     "minimum_primary_coverage_ratio": 0.80,
 }
 QUALITY_FLAG_CATEGORIES = {
+    "inactive_cex_instrument": "data_health",
+    "stale_cex_lifecycle_evidence": "data_health",
     "depth_unsupported": "capability",
     "depth_partial": "measurement_limit",
     "depth_failed": "data_health",
@@ -47,6 +49,12 @@ QUALITY_FLAG_CATEGORIES = {
     "wide_quoted_spread": "market_condition",
     "low_daily_coverage": "data_health",
 }
+CEX_CURRENT_FACT_WITHHELD_STATUSES = frozenset(
+    {
+        "absent_from_official_current_catalog",
+        "official_catalog_evidence_stale",
+    }
+)
 PRIMARY_SELECTION_WEIGHTS = {
     "window_volume_share": 40.0,
     "coverage_ratio": 25.0,
@@ -252,6 +260,42 @@ def market_quality_assessment(row: dict[str, Any]) -> dict[str, Any]:
     """Return machine-readable and human-auditable market quality flags."""
     flags: list[dict[str, Any]] = []
     market_type = row.get("market") or row.get("market_type")
+    if (
+        market_type == "cex"
+        and row.get("current_listing_status")
+        == "absent_from_official_current_catalog"
+    ):
+        flags.append(
+            _quality_flag(
+                "inactive_cex_instrument",
+                "critical",
+                (
+                    "This instrument was absent from the official current "
+                    "exchange catalog at the recorded check. Historical rows "
+                    "are withheld from current facts; no delisting date is inferred."
+                ),
+                observed_value=row.get("current_listing_checked_at"),
+                threshold="present_in_official_current_catalog",
+            )
+        )
+    elif (
+        market_type == "cex"
+        and row.get("current_listing_status")
+        == "official_catalog_evidence_stale"
+    ):
+        flags.append(
+            _quality_flag(
+                "stale_cex_lifecycle_evidence",
+                "critical",
+                (
+                    "Current facts remain withheld because the last official "
+                    "instrument-catalog check is older than the freshness "
+                    "contract. The listing state is unknown until rechecked."
+                ),
+                observed_value=row.get("current_listing_checked_at"),
+                threshold="official_catalog_check_within_36_hours",
+            )
+        )
     depth_status = row.get(
         "depth_status" if market_type == "cex" else "dex_depth_status",
         row.get("depth_status"),
@@ -501,10 +545,19 @@ def select_primary_market(
     rows: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Choose one primary market with an auditable, deterministic score."""
+    catalog_candidate_count = len(rows)
+    rows = [
+        row
+        for row in rows
+        if row.get("current_listing_status")
+        not in CEX_CURRENT_FACT_WITHHELD_STATUSES
+    ]
     if not rows:
         return None, {
             "method": PRIMARY_SELECTION_METHOD,
             "candidate_count": 0,
+            "catalog_candidate_count": catalog_candidate_count,
+            "excluded_current_instrument_count": catalog_candidate_count,
             "selected_market_id": None,
             "score": None,
             "components": None,
@@ -572,6 +625,8 @@ def select_primary_market(
     reason = {
         "method": PRIMARY_SELECTION_METHOD,
         "candidate_count": len(rows),
+        "catalog_candidate_count": catalog_candidate_count,
+        "excluded_current_instrument_count": catalog_candidate_count - len(rows),
         "selected_market_id": market_identity(selected),
         "score": score,
         "components": components,
@@ -592,10 +647,12 @@ def _common_price_comparison(
         return {
             "date": None,
             "latest": None,
+            "latest_absolute_midpoint": None,
             "maximum_absolute": None,
             "mean_absolute": None,
             "median_absolute": None,
             "comparable_days": 0,
+            "absolute_method": "symmetric_midpoint_relative_gap",
         }
     cex_prices = {
         point["date"]: finite_number(point.get("price_usd"))
@@ -611,20 +668,25 @@ def _common_price_comparison(
         if cex_prices[day] is not None
         and dex_prices[day] is not None
         and cex_prices[day] > 0
+        and dex_prices[day] > 0
     )
     if not common_dates:
         return {
             "date": None,
             "latest": None,
+            "latest_absolute_midpoint": None,
             "maximum_absolute": None,
             "mean_absolute": None,
             "median_absolute": None,
             "comparable_days": 0,
+            "absolute_method": "symmetric_midpoint_relative_gap",
         }
-    absolute_spreads = sorted(
-        abs(dex_prices[day] / cex_prices[day] - 1)
+    absolute_by_date = {
+        day: abs(dex_prices[day] - cex_prices[day])
+        / ((dex_prices[day] + cex_prices[day]) / 2)
         for day in common_dates
-    )
+    }
+    absolute_spreads = sorted(absolute_by_date.values())
     comparison_date = common_dates[-1]
     spread = dex_prices[comparison_date] / cex_prices[comparison_date] - 1
     middle = len(absolute_spreads) // 2
@@ -636,10 +698,12 @@ def _common_price_comparison(
     return {
         "date": comparison_date,
         "latest": spread,
+        "latest_absolute_midpoint": absolute_by_date[comparison_date],
         "maximum_absolute": max(absolute_spreads),
         "mean_absolute": sum(absolute_spreads) / len(absolute_spreads),
         "median_absolute": median,
         "comparable_days": len(absolute_spreads),
+        "absolute_method": "symmetric_midpoint_relative_gap",
     }
 
 
@@ -719,6 +783,11 @@ def build_token_summaries(
                 else None
             ),
             "price_spread": spread_summary["latest"],
+            "absolute_price_gap": spread_summary[
+                "latest_absolute_midpoint"
+            ],
+            "price_spread_method": "directional_dex_over_cex_minus_one",
+            "absolute_price_gap_method": spread_summary["absolute_method"],
             "spread_date": spread_summary["date"],
             "maximum_absolute_price_spread": spread_summary[
                 "maximum_absolute"
@@ -965,6 +1034,22 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "depth_25bps_complete": row.get("depth_25bps_complete", False),
                 "depth_50bps_complete": row.get("depth_50bps_complete", False),
                 "depth_100bps_complete": row.get("depth_100bps_complete", False),
+                "current_listing_status": row.get("current_listing_status"),
+                "current_listing_reason_code": row.get(
+                    "current_listing_reason_code"
+                ),
+                "current_listing_checked_at": row.get(
+                    "current_listing_checked_at"
+                ),
+                "current_listing_source": sanitize_public_source_endpoint(
+                    row.get("current_listing_source")
+                ),
+                "current_listing_response_sha256": row.get(
+                    "current_listing_response_sha256"
+                ),
+                "historical_observation_count": row.get(
+                    "historical_observation_count"
+                ),
                 "observed_start": row.get(
                     "first_observed_date",
                     row["price_points"][0]["date"] if row["price_points"] else None,
@@ -1167,10 +1252,17 @@ def catalog_from_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "tvl_snapshot": payload["metadata"].get("tvl_snapshot"),
         "cex_depth_snapshot": payload["metadata"].get("cex_depth_snapshot"),
         "dex_depth_snapshot": payload["metadata"].get("dex_depth_snapshot"),
+        "configured_cex_market_identities": payload["metadata"].get(
+            "configured_cex_market_identities"
+        ),
         "cex_normalization_note": (
-            "The displayed instrument is the configured canonical pair label. "
-            "Adapters normalize source prices and volume to USD; USDT pairs use a "
-            "1 USDT = 1 USD proxy, and venue-native raw pair labels may differ."
+            "The displayed instrument is the exact venue market identity. "
+            "Endpoint syntax may encode separators or asset order differently, "
+            "but base and quote assets are never relabeled: USD, USDT, and KRW "
+            "remain distinct. Coinbase and Kraken USD products display /USD, "
+            "and an Upbit /KRW market cannot stand in for /USDT. Fact values "
+            "are normalized separately to USD; USDT pairs use the documented "
+            "1 USDT = 1 USD proxy."
         ),
         "cex_depth_note": payload["metadata"].get("cex_depth_note"),
         "dex_depth_note": payload["metadata"].get("dex_depth_note"),

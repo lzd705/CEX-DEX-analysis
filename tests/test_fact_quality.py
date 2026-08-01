@@ -358,32 +358,27 @@ class FactQualityTest(unittest.TestCase):
 
         self.assertEqual(selected["attempt_id"], "later")
 
-    def test_upbit_source_alias_accepts_only_the_explicit_usdt_to_krw_fallback(self):
+    def test_cex_attempt_evidence_requires_the_exact_source_instrument(self):
         valid = cex_attempt(
             "2026-07-19",
             exchange="upbit",
             instrument="AAVE/USDT",
-            source_instrument="AAVE/KRW",
-            source_instrument_alias_validated=True,
-        )
-        normalized = normalize_collection_attempts([valid], market_type="cex")
-        self.assertEqual(normalized[0]["source_instrument"], "AAVE/KRW")
-        self.assertTrue(normalized[0]["source_instrument_alias_validated"])
-
-        direct = dict(
-            valid,
             source_instrument="AAVE/USDT",
             source_instrument_alias_validated=False,
         )
-        direct_normalized = normalize_collection_attempts([direct], market_type="cex")
-        self.assertFalse(direct_normalized[0]["source_instrument_alias_validated"])
+        normalized = normalize_collection_attempts([valid], market_type="cex")
+        self.assertEqual(normalized[0]["source_instrument"], "AAVE/USDT")
+        self.assertFalse(normalized[0]["source_instrument_alias_validated"])
 
         invalid = (
-            {"exchange": "binance"},
+            {"source_instrument": "AAVE/KRW"},
+            {
+                "source_instrument": "AAVE/KRW",
+                "source_instrument_alias_validated": True,
+            },
             {"source_instrument": "UNI/KRW"},
-            {"instrument": "AAVE/KRW", "source_instrument": "AAVE/USDT"},
-            {"source_instrument_alias_validated": False},
             {"source_instrument": "AAVE/USDT", "source_instrument_alias_validated": True},
+            {"source_instrument": None, "source_instrument_alias_validated": True},
         )
         for mutation in invalid:
             with self.subTest(mutation=mutation):
@@ -526,7 +521,7 @@ class FactQualityTest(unittest.TestCase):
         self.assertEqual(report["attempt_sources"][0]["status"], "ignored_invalid")
         self.assertEqual(issue["reason_code"], "missing_unexplained")
 
-    def test_upbit_review_hints_match_fact_market_and_collector_fallbacks(self):
+    def test_upbit_review_hints_match_only_the_exact_fact_market(self):
         hints = source_url_hints(
             {
                 "market_type": "cex",
@@ -535,11 +530,10 @@ class FactQualityTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(len(hints), 3)
+        self.assertEqual(len(hints), 2)
         self.assertIn("market=USDT-LDO", hints[0])
-        self.assertIn("market=KRW-LDO", hints[1])
         self.assertEqual(
-            hints[2],
+            hints[1],
             "https://api.upbit.com/v1/market/all?is_details=true",
         )
 
@@ -963,6 +957,109 @@ class FactQualityTest(unittest.TestCase):
                 for item in report["manual_review_queue"]
             )
         )
+
+    def test_cex_token_must_match_the_exact_instrument_base_asset(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [cex_row("2026-07-19", token_symbol="AAVE", cex_symbol="BTC/USDT")],
+        )
+
+        report = self.report()
+        mismatch = [
+            issue for issue in report["issues"]
+            if issue["reason_code"] == "cex_token_instrument_mismatch"
+        ]
+
+        self.assertEqual(len(mismatch), 1)
+        self.assertEqual(mismatch[0]["category"], "hard_invalid")
+        self.assertFalse(mismatch[0]["retryable"])
+        self.assertEqual(report["markets"], [])
+
+    def test_coinbase_and_kraken_rows_must_preserve_the_actual_usd_quote(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row(
+                    "2026-07-18",
+                    token_symbol="AAVE",
+                    exchange="coinbase",
+                    cex_symbol="AAVE/USDT",
+                ),
+                cex_row(
+                    "2026-07-19",
+                    token_symbol="AAVE",
+                    exchange="kraken",
+                    cex_symbol="AAVE/USDT",
+                ),
+            ],
+        )
+
+        report = self.report()
+        mismatches = [
+            issue for issue in report["issues"]
+            if issue["reason_code"] == "cex_source_instrument_mismatch"
+        ]
+
+        self.assertEqual(len(mismatches), 2)
+        self.assertTrue(all(item["category"] == "hard_invalid" for item in mismatches))
+        self.assertEqual(report["markets"], [])
+
+    def test_one_physical_dex_pool_cannot_drift_between_dex_labels(self):
+        write_csv(
+            self.dex_path,
+            DEX_COLUMNS,
+            [
+                dex_row("2026-07-18", dex="uniswap_v3"),
+                dex_row("2026-07-19", dex="uniswap-v3-ethereum"),
+            ],
+        )
+
+        report = self.report()
+        drift = [
+            issue for issue in report["issues"]
+            if issue["reason_code"] == "dex_pool_label_drift"
+        ]
+
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(drift[0]["category"], "hard_invalid")
+        self.assertFalse(drift[0]["retryable"])
+        self.assertEqual(report["markets"], [])
+
+    def test_dex_pool_label_drift_quarantines_every_token_perspective(self):
+        write_csv(
+            self.dex_path,
+            DEX_COLUMNS,
+            [
+                dex_row(
+                    "2026-07-18",
+                    token_symbol="AAVE",
+                    dex="uniswap_v3",
+                ),
+                dex_row(
+                    "2026-07-19",
+                    token_symbol="CRV",
+                    dex="uniswap-v3-ethereum",
+                ),
+            ],
+        )
+
+        report = self.report()
+        drift = [
+            issue for issue in report["issues"]
+            if issue["reason_code"] == "dex_pool_label_drift"
+        ]
+
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(
+            drift[0]["details"]["market_ids"],
+            [
+                "dex:eth:uniswap-v3-ethereum:0xaavepool:CRV",
+                "dex:eth:uniswap_v3:0xaavepool:AAVE",
+            ],
+        )
+        self.assertEqual(report["markets"], [])
 
     def test_inconsistent_high_low_is_a_separate_hard_error(self):
         write_csv(

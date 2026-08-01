@@ -5,6 +5,11 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+try:
+    from scripts.timestamp_contract import parse_rfc3339_utc
+except ModuleNotFoundError:  # pragma: no cover - direct package execution
+    from timestamp_contract import parse_rfc3339_utc
+
 
 DAILY_MAX_LAG_DAYS = 1
 TVL_MAX_AGE_HOURS = 26.0
@@ -12,6 +17,7 @@ CEX_DEPTH_MAX_AGE_HOURS = 2.0
 DEX_DEPTH_MAX_AGE_HOURS = 2.0
 CEX_EXECUTION_MAX_AGE_HOURS = 2.0
 DEX_EXECUTION_MAX_AGE_HOURS = 2.0
+MAX_FUTURE_CLOCK_SKEW_MINUTES = 5
 
 
 def utc_now() -> datetime:
@@ -21,13 +27,7 @@ def utc_now() -> datetime:
 def parse_utc_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
-    normalized = value.strip()
-    if normalized.endswith("Z"):
-        normalized = normalized[:-1] + "+00:00"
-    parsed = datetime.fromisoformat(normalized)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return parse_rfc3339_utc(value.strip())
 
 
 def daily_freshness(
@@ -81,6 +81,14 @@ def snapshot_freshness(
             "age_hours": None,
             "max_age_hours": max_age_hours,
         }
+    if observed > checked_at + timedelta(
+        minutes=MAX_FUTURE_CLOCK_SKEW_MINUTES
+    ):
+        raise ValueError(
+            "{} observed_at exceeds the allowed future clock skew".format(
+                source
+            )
+        )
     age_hours = max(0.0, (checked_at - observed).total_seconds() / 3600)
     return {
         "source": source,

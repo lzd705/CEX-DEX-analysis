@@ -187,11 +187,26 @@ semantics, fee scope, formulas, and publication gates are defined in
 `docs/execution-cost-data-contract.md`. Its requested notionals are JSON
 numbers; measured Decimal facts remain exact base-10 strings or `null`.
 
-CEX configured pair labels normally use USDT. The current adapter contract uses
-USDT as a 1:1 USD proxy; Upbit KRW observations are converted through the
-daily USDT/KRW rate. Some adapters fetch a venue-native USD pair even when the
-stored configured label is `TOKEN/USDT`, so the catalog describes that label
-as canonical rather than claiming it is the raw venue instrument.
+CEX catalog instruments identify the exact venue base and quote assets.
+Endpoint encodings may change separators or asset order, but they cannot relabel
+the market: `TOKEN/USD`, `TOKEN/USDT`, and `TOKEN/KRW` are distinct identities.
+Coinbase and Kraken observations are therefore stored as `TOKEN/USD` when the
+adapters call their USD products, never as `TOKEN/USDT`. Upbit collects only the
+exact configured instrument; an explicitly cataloged `TOKEN/KRW` market is not
+a fallback for `TOKEN/USDT`. Fact values are normalized separately to USD:
+USDT uses the documented 1:1 proxy, and a cataloged KRW observation uses the
+retained daily USDT/KRW conversion without changing its market identity.
+
+The sole historical exception is an operator-controlled migration for rows
+known to have been created by the retired Upbit KRW fallback. It requires
+`--cex-only --append`, an explicit Token set, an exchange set containing
+`upbit`, an inclusive window of at most 180 days, and
+`--remove-legacy-upbit-krw-fallback`. A legacy KRW row is replaced only when
+the candidate contains the configured exact USDT market on that same UTC date.
+The migration preflight applies the same market-date preservation rule to the
+Coinbase/Kraken USD correction. A `no_data` or `not_listed` attempt by itself
+never authorizes deletion of an existing historical observation. Technical
+failures retain the previous rows; the switch is off by default.
 
 DEX price and volume facts come from GeckoTerminal API v2 daily pool OHLCV with
 `currency=usd` and the configured target Token side.
@@ -230,9 +245,10 @@ measurements, observed market conditions, and data-health failures are not
 collapsed into one warning state.
 
 Daily attempt evidence is exact-market evidence. CEX matching requires
-`token_symbol × exchange × canonical instrument`; a validated source alias is
-additional lineage and never replaces the canonical instrument. DEX matching
-requires Token, chain, DEX adapter, and pool. Attempt IDs and UTC-aware
+`token_symbol × exchange × canonical instrument`; a validated source syntax
+alias may document punctuation or venue ordering, but never a different base or
+quote asset, and never replaces the canonical instrument. DEX matching requires
+Token, chain, DEX adapter, and pool. Attempt IDs and UTC-aware
 completion times must be valid and unique, request windows bounded and exact,
 observed dates inside the window, and status/reason/outcome/count invariants
 consistent. The entire malformed ledger is ignored fail-closed, leaving the

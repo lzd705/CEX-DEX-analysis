@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>CEX / DEX Market Monitor</title>
-    <link rel="stylesheet" href="/styles.css?v=20260731-spread-quality-v1">
+    <link rel="stylesheet" href="/styles.css?v=__ASSET_VERSION__">
   </head>
   <body>
     <header class="app-header">
@@ -117,6 +117,14 @@
 
       <div id="market-loading" class="status-banner" role="status" aria-live="polite" hidden></div>
       <div id="global-error" class="error-banner global-error" role="alert" aria-live="assertive" hidden></div>
+      <div
+        id="action-status"
+        class="status-banner global-action-status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        hidden
+      ></div>
 
       <section
         id="facts-workbench"
@@ -132,8 +140,8 @@
               <i data-lucide="arrow-left"></i>
               Back to Screener
             </a>
-            <span class="eyebrow">Single Token research workspace</span>
-            <h2 id="facts-title">Token Research</h2>
+            <span id="workspace-eyebrow" class="eyebrow">Single Token market workspace</span>
+            <h2 id="facts-title">Markets</h2>
             <p id="workspace-description">Select one Token, then move through its markets, daily comparison, liquidity, verified events, and data quality without losing the selected pair.</p>
           </div>
           <div class="workspace-heading-meta">
@@ -702,7 +710,7 @@
         >
           <div class="page-heading events-heading">
             <div>
-              <span class="eyebrow">Source-backed event timeline</span>
+              <span class="eyebrow">Release-wide source-backed event timeline</span>
               <h3>Verified Event Facts</h3>
               <div class="module-context" aria-label="Verified Event Fact scope">
                 <span class="module-chip">Official sources</span>
@@ -891,10 +899,10 @@
           <span>Rank by</span>
           <select id="sort-field">
             <option value="volume">USD Volume</option>
-            <option value="spread">Latest Absolute Price Gap</option>
-            <option value="spread_max">Maximum Absolute Price Gap</option>
-            <option value="spread_mean">Average Absolute Price Gap</option>
-            <option value="spread_median">Median Absolute Price Gap</option>
+            <option value="spread">Latest Symmetric Price Gap</option>
+            <option value="spread_max">Maximum Symmetric Price Gap</option>
+            <option value="spread_mean">Average Symmetric Price Gap</option>
+            <option value="spread_median">Median Symmetric Price Gap</option>
             <option value="return">Window Return</option>
             <option value="volatility">Daily Volatility</option>
             <option value="depth_100bps">Primary ±100 bps Depth</option>
@@ -949,12 +957,12 @@
                 </th>
                 <th scope="col">DEX Share</th>
                 <th scope="col">
-                  Primary Price Gap
+                  Primary DEX/CEX Basis
                   <span
                     class="column-info"
                     tabindex="0"
-                    aria-label="Primary price gap equals primary DEX price divided by primary CEX price, minus one."
-                    data-tooltip="Primary DEX / CEX − 1."
+                    aria-label="Primary directional basis equals primary DEX price divided by primary CEX price, minus one. Screener gap ranking uses a separate symmetric midpoint-relative formula consistent with Compare."
+                    data-tooltip="Directional basis: DEX / CEX − 1. Gap ranks: symmetric midpoint-relative."
                   ><i data-lucide="info"></i></span>
                 </th>
                 <th scope="col">
@@ -979,8 +987,8 @@
 
     </main>
 
-    <script src="/vendor/lucide.js"></script>
-    <script src="/navigation.js?v=20260731-spread-quality-v1"></script>
-    <script src="/app.js?v=20260731-spread-quality-v1"></script>
+    <script src="/vendor/lucide.js?v=__ASSET_VERSION__"></script>
+    <script src="/navigation.js?v=__ASSET_VERSION__"></script>
+    <script src="/app.js?v=__ASSET_VERSION__"></script>
   </body>
 </html>

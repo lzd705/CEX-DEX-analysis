@@ -269,6 +269,7 @@ class RunFactPipelineTest(unittest.TestCase):
                 end_date="2026-07-28",
                 limit_days=4,
                 output_dir=processed_dir.resolve(),
+                remove_legacy_upbit_krw_fallback=False,
             )
             fetch_dex.assert_called_once_with(
                 token_symbols=["XYZ"],
@@ -283,6 +284,77 @@ class RunFactPipelineTest(unittest.TestCase):
                 processed_dir.resolve(),
                 target_dir=data_dir.resolve(),
             )
+
+    def test_pipeline_forwards_explicit_bounded_upbit_legacy_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "runtime"
+            processed_dir = root / "staging"
+            arguments = SimpleNamespace(
+                cex_only=True,
+                dex_only=False,
+                tokens="morpho",
+                exchanges="upbit",
+                append=True,
+                start="2026-07-01",
+                end="2026-07-02",
+                publish_local=False,
+                data_dir=data_dir,
+                processed_dir=processed_dir,
+                remove_legacy_upbit_krw_fallback=True,
+            )
+            with patch.object(
+                run_fact_pipeline,
+                "parse_args",
+                return_value=arguments,
+            ), patch.object(
+                run_fact_pipeline,
+                "load_append_attempt_evidence",
+                return_value={"cex": [], "dex": []},
+            ), patch.object(
+                run_fact_pipeline,
+                "seed_processed_from_local",
+            ), patch.object(
+                run_fact_pipeline,
+                "merge_append_attempt_evidence",
+            ), patch.object(
+                run_fact_pipeline.fetch_cex,
+                "main",
+            ) as fetch_cex:
+                run_fact_pipeline.main()
+
+            fetch_cex.assert_called_once_with(
+                token_symbols=["MORPHO"],
+                exchanges=["upbit"],
+                append=True,
+                start_date="2026-07-01",
+                end_date="2026-07-02",
+                limit_days=5,
+                output_dir=processed_dir.resolve(),
+                remove_legacy_upbit_krw_fallback=True,
+            )
+
+    def test_pipeline_rejects_unbounded_upbit_legacy_cleanup(self):
+        arguments = SimpleNamespace(
+            cex_only=True,
+            dex_only=False,
+            tokens="morpho",
+            exchanges="upbit",
+            append=True,
+            start=None,
+            end=None,
+            publish_local=False,
+            data_dir=Path("runtime"),
+            processed_dir=Path("staging"),
+            remove_legacy_upbit_krw_fallback=True,
+        )
+        with patch.object(
+            run_fact_pipeline,
+            "parse_args",
+            return_value=arguments,
+        ):
+            with self.assertRaisesRegex(ValueError, "bounded Upbit"):
+                run_fact_pipeline.main()
 
     def test_append_seed_uses_the_selected_runtime_directory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -505,8 +577,8 @@ class RunFactPipelineTest(unittest.TestCase):
     def test_sliced_attempt_ids_keep_the_original_attempt_identity(self):
         first = cex_attempt("UNI", "2026-07-01", "2026-07-03", reason="no_candles")
         first.update(
-            exchange="upbit", instrument="UNI/USDT", source_instrument="UNI/KRW",
-            source_instrument_alias_validated=True,
+            exchange="upbit", instrument="UNI/USDT", source_instrument="UNI/USDT",
+            source_instrument_alias_validated=False,
         )
         second = dict(first, attempt_id="a-different-source-attempt")
 
@@ -514,8 +586,8 @@ class RunFactPipelineTest(unittest.TestCase):
         second_slice = run_fact_pipeline._attempt_with_window(second, date(2026, 7, 2), date(2026, 7, 2))
 
         self.assertNotEqual(first_slice["attempt_id"], second_slice["attempt_id"])
-        self.assertEqual(first_slice["source_instrument"], "UNI/KRW")
-        self.assertTrue(first_slice["source_instrument_alias_validated"])
+        self.assertEqual(first_slice["source_instrument"], "UNI/USDT")
+        self.assertFalse(first_slice["source_instrument_alias_validated"])
 
     def test_partial_carry_omits_zero_observation_slice_and_keeps_measured_slice(self):
         prior = cex_attempt("UNI", "2026-07-01", "2026-07-05", reason="no_candles")

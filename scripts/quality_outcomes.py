@@ -34,6 +34,10 @@ _RULES = {
     ("source_no_observation", "no_candles"): _rule(
         False, True, "confirmed_absence"
     ),
+    (
+        "source_no_observation",
+        "instrument_absent_from_current_catalog",
+    ): _rule(False, True, "confirmed_current_catalog_absence"),
     ("source_no_observation", "source_no_two_sided_book"): _rule(
         False, True, "confirmed_absence"
     ),
@@ -42,6 +46,9 @@ _RULES = {
     ),
     ("source_no_observation", "source_no_tvl_observation"): _rule(
         False, True, "confirmed_absence"
+    ),
+    ("needs_review", "official_catalog_evidence_stale"): _rule(
+        False, False, "manual_review"
     ),
     ("source_no_observation", "source_pool_not_found"): _rule(
         False, True, "confirmed_absence"
@@ -239,6 +246,8 @@ _CEX_REASON_CODES = {
     "not_listed",
     "source_rejected_request",
     "unsupported_source",
+    "instrument_absent_from_current_catalog",
+    "official_catalog_evidence_stale",
 }
 _DEX_UNSUPPORTED_PREFIXES = {
     "source_range_unavailable",
@@ -303,6 +312,7 @@ def normalize_cex_source_outcome(status, reason_code, error):
     if raw_status == "source_no_observation" and reason in {
         "source_no_two_sided_book",
         "source_no_order_book",
+        "instrument_absent_from_current_catalog",
     }:
         return (raw_status, reason)
     if raw_status == "unsupported" and reason == "unsupported_source":
@@ -310,6 +320,7 @@ def normalize_cex_source_outcome(status, reason_code, error):
     if raw_status == "needs_review" and reason in {
         "not_listed",
         "source_rejected_request",
+        "official_catalog_evidence_stale",
     }:
         return (raw_status, reason)
     if raw_status == "invalid" and reason == "source_invalid_order_book":
@@ -491,9 +502,14 @@ _DAILY_QUALITY_FACT_OUTCOMES = frozenset(
         ("source_no_observation", "multiple_daily_quality_reasons"),
         ("unsupported", "multiple_daily_quality_reasons"),
         ("source_no_observation", "no_candles"),
+        (
+            "source_no_observation",
+            "instrument_absent_from_current_catalog",
+        ),
         ("unsupported", "source_range_unavailable"),
         ("needs_review", "not_listed"),
         ("needs_review", "stale_market_lifecycle_unknown"),
+        ("needs_review", "official_catalog_evidence_stale"),
         ("needs_review", "source_rejected_request"),
         ("needs_review", "daily_quality_outcome_invalid"),
         ("needs_review", "daily_audit_no_matching_issue"),
@@ -551,6 +567,11 @@ _CEX_DEPTH_FACT_OUTCOMES = frozenset(
         ("collection_failed", "validation"),
         ("source_no_observation", "source_no_two_sided_book"),
         ("source_no_observation", "source_no_order_book"),
+        (
+            "source_no_observation",
+            "instrument_absent_from_current_catalog",
+        ),
+        ("needs_review", "official_catalog_evidence_stale"),
         ("unsupported", "unsupported_source"),
         ("needs_review", "not_listed"),
         ("needs_review", "source_rejected_request"),
@@ -610,6 +631,11 @@ _CEX_EXECUTION_FACT_OUTCOMES = frozenset(
         ("collection_failed", "multiple_daily_quality_reasons"),
         ("source_no_observation", "source_no_two_sided_book"),
         ("source_no_observation", "source_no_order_book"),
+        (
+            "source_no_observation",
+            "instrument_absent_from_current_catalog",
+        ),
+        ("needs_review", "official_catalog_evidence_stale"),
         ("unsupported", "unsupported_source"),
         ("needs_review", "not_listed"),
         ("needs_review", "source_rejected_request"),

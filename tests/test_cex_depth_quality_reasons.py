@@ -2,6 +2,7 @@ import csv
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +25,28 @@ def write_csv(path, fieldnames, rows):
         writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_empty_lifecycle_manifest(directory):
+    path = Path(directory) / "cex_instrument_lifecycle.json"
+    checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    path.write_text(
+        json.dumps({
+            "schema": "cex_instrument_lifecycle/v1",
+            "generated_at_utc": checked_at,
+            "checked_at_utc": checked_at,
+            "response_sha256": "a" * 64,
+            "inventory_count": 1,
+            "configured_market_count": 30,
+            "configured_market_ids_sha256": (
+                "ffb0c254ace2ee7b6bf3d40cecd21730d6def0dcce710c7a21e3eed37209957d"
+            ),
+            "review_count": 0,
+            "reviews": [],
+        }),
+        encoding="utf-8",
+    )
+    return path
 
 
 def public_empty_book_execution_fact():
@@ -93,6 +116,9 @@ def public_empty_book_execution_fact():
             "MARKET_DEX_DATA": str(dex_path),
             "MARKET_CEX_DEPTH_DATA": str(depth_path),
             "MARKET_CEX_EXECUTION_COST_DATA": str(execution_path),
+            "MARKET_CEX_INSTRUMENT_LIFECYCLE": str(
+                write_empty_lifecycle_manifest(data_dir)
+            ),
         }
         server.clear_runtime_caches()
         try:
@@ -174,6 +200,9 @@ class CexDepthQualityReasonTest(unittest.TestCase):
                 "MARKET_CEX_DATA": str(cex_path),
                 "MARKET_DEX_DATA": str(dex_path),
                 "MARKET_CEX_DEPTH_DATA": str(depth_path),
+                "MARKET_CEX_INSTRUMENT_LIFECYCLE": str(
+                    write_empty_lifecycle_manifest(data_dir)
+                ),
             }
             server.clear_runtime_caches()
             try:

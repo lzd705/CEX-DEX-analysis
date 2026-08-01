@@ -74,6 +74,7 @@ try:
         normalize_dex_depth_source_outcome,
         quality_outcome_resolution_state,
     )
+    from scripts.timestamp_contract import validate_observation_bounds
 except ModuleNotFoundError:
     from atomic_publication import atomic_replace_bundle, csv_payload
     from bounded_snapshot_merge import (
@@ -102,6 +103,7 @@ except ModuleNotFoundError:
         normalize_dex_depth_source_outcome,
         quality_outcome_resolution_state,
     )
+    from timestamp_contract import validate_observation_bounds
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -2005,6 +2007,7 @@ def validate_snapshot(
         raise ValueError("DEX depth snapshot contains duplicate Token/pool rows")
     if expected != actual:
         raise ValueError("DEX depth snapshot coverage does not match the TVL inventory")
+    validate_observation_bounds(rows)
     accepted = {"observed", "partial", "unsupported", "failed"}
     if any(row["status"] not in accepted for row in rows):
         raise ValueError("DEX depth snapshot contains an invalid status")

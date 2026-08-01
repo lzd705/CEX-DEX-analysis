@@ -306,6 +306,22 @@ class ExecutionCostContractTest(unittest.TestCase):
         ):
             validate_execution_snapshot(["cex:test:UNI/USDT"], rows)
 
+    def test_snapshot_validation_requires_canonical_utc_observed_at(self):
+        for observed_at in (
+            "",
+            "2026-07-28T00:00:00",
+            "2026-07-28T00:00:00Z",
+            "2026-07-28T08:00:00+08:00",
+            " 2026-07-28T00:00:00+00:00",
+        ):
+            with self.subTest(observed_at=observed_at):
+                rows = [
+                    {**row, "observed_at": observed_at}
+                    for row in complete_rows()
+                ]
+                with self.assertRaisesRegex(ValueError, "observed_at"):
+                    validate_execution_snapshot(["cex:test:UNI/USDT"], rows)
+
     def test_measured_rows_require_raw_source_provenance(self):
         for field, value in (
             ("raw_response_sha256", ""),

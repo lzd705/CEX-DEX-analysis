@@ -309,23 +309,10 @@ def normalize_collection_attempts(
                 )
             if not isinstance(source_alias_validated, bool):
                 raise ValueError("source alias validation flag is invalid")
-            if source_instrument is None:
-                if source_alias_validated:
-                    raise ValueError("source alias cannot be validated without a source instrument")
-            elif source_instrument == instrument:
-                if source_alias_validated:
-                    raise ValueError("direct source instrument cannot claim alias validation")
-            else:
-                canonical_base, canonical_quote = instrument.split("/", 1)
-                source_base, source_quote = source_instrument.split("/", 1)
-                if not (
-                    source_alias_validated is True
-                    and exchange == "upbit"
-                    and canonical_quote == "USDT"
-                    and source_quote == "KRW"
-                    and canonical_base == source_base
-                ):
-                    raise ValueError("source instrument alias is not an approved Upbit fallback")
+            if source_alias_validated:
+                raise ValueError("cross-instrument source aliases are not supported")
+            if source_instrument is not None and source_instrument != instrument:
+                raise ValueError("source instrument must match the exact market identity")
         finished_text = raw.get("finished_at_utc")
         if not isinstance(finished_text, str) or not finished_text or len(finished_text) > 64:
             raise ValueError("finished_at_utc is missing or outside the supported range")
@@ -508,27 +495,18 @@ def source_url_hints(market: Mapping[str, Any]) -> List[str]:
     dashed = "{}-{}".format(base, quote_asset)
     underscored = "{}_{}".format(base, quote_asset)
     if exchange == "upbit":
-        # Upbit uses QUOTE-BASE identifiers and the collector can fall back
-        # between KRW and USDT. A hint hard-coded to KRW can therefore point
-        # at the wrong lifecycle (for example, LDO/USDT while KRW-LDO is not
-        # listed). Put the market represented by the fact first, retain the
-        # collector fallback, and expose the official market inventory.
-        quote_candidates = []
-        if quote_asset in {"KRW", "USDT"}:
-            quote_candidates.append(quote_asset)
-        for candidate in ("KRW", "USDT"):
-            if candidate not in quote_candidates:
-                quote_candidates.append(candidate)
+        # Upbit uses QUOTE-BASE identifiers.  Only the exact venue instrument
+        # represented by this Market ID is a valid evidence link; KRW and USDT
+        # markets are never interchangeable facts.
         return [
             "https://api.upbit.com/v1/candles/days?{}".format(
                 urlencode(
                     {
-                        "market": "{}-{}".format(candidate, base),
+                        "market": "{}-{}".format(quote_asset, base),
                         "count": "30",
                     }
                 )
             )
-            for candidate in quote_candidates
         ] + [
             "https://api.upbit.com/v1/market/all?{}".format(
                 urlencode({"is_details": "true"})
@@ -811,6 +789,14 @@ def read_daily_source(
     series: Dict[str, Dict[str, Any]] = {}
     issues: List[Dict[str, Any]] = []
     primary_key_rows: Dict[Tuple[str, ...], List[int]] = defaultdict(list)
+    dex_pool_identities: Dict[Tuple[str, str], Dict[str, Any]] = defaultdict(
+        lambda: {
+            "dex_labels": set(),
+            "market_ids": set(),
+            "token_symbols": set(),
+            "row_numbers": [],
+        }
+    )
     row_count = 0
 
     with path.open("r", newline="", encoding="utf-8") as handle:
@@ -829,6 +815,7 @@ def read_daily_source(
             missing_identity = [
                 field for field in identity_fields if not (row.get(field) or "").strip()
             ]
+            identity_valid = not missing_identity
             if missing_identity:
                 issues.append(
                     make_issue(
@@ -845,6 +832,90 @@ def read_daily_source(
                         },
                     )
                 )
+            if market_type == "cex" and not missing_identity:
+                try:
+                    canonical_instrument = normalize_cex_instrument(
+                        row.get("cex_symbol"),
+                        field_name="daily CEX instrument",
+                    )
+                except ValueError:
+                    identity_valid = False
+                    issues.append(
+                        make_issue(
+                            category="hard_invalid",
+                            status="invalid",
+                            reason_code="invalid_cex_instrument",
+                            retryable=False,
+                            market=market,
+                            day_text=raw_day or None,
+                            message=(
+                                "The CEX instrument is not a canonical exact "
+                                "BASE/QUOTE venue identity."
+                            ),
+                            details={"row_number": row_number},
+                        )
+                    )
+                else:
+                    base_asset, quote_asset = canonical_instrument.split("/", 1)
+                    if base_asset != market.get("token_symbol"):
+                        identity_valid = False
+                        issues.append(
+                            make_issue(
+                                category="hard_invalid",
+                                status="invalid",
+                                reason_code="cex_token_instrument_mismatch",
+                                retryable=False,
+                                market=market,
+                                day_text=raw_day or None,
+                                message=(
+                                    "The CEX instrument base asset does not "
+                                    "match the row Token identity."
+                                ),
+                                details={
+                                    "row_number": row_number,
+                                    "token_symbol": market.get("token_symbol"),
+                                    "instrument": canonical_instrument,
+                                },
+                            )
+                        )
+                    expected_quote = {
+                        "coinbase": "USD",
+                        "kraken": "USD",
+                    }.get(str(market.get("exchange") or ""))
+                    if expected_quote and quote_asset != expected_quote:
+                        identity_valid = False
+                        issues.append(
+                            make_issue(
+                                category="hard_invalid",
+                                status="invalid",
+                                reason_code="cex_source_instrument_mismatch",
+                                retryable=False,
+                                market=market,
+                                day_text=raw_day or None,
+                                message=(
+                                    "The CEX market label does not preserve "
+                                    "the quote asset requested from this venue."
+                                ),
+                                details={
+                                    "row_number": row_number,
+                                    "instrument": canonical_instrument,
+                                    "expected_quote_asset": expected_quote,
+                                    "observed_quote_asset": quote_asset,
+                                },
+                            )
+                        )
+            elif market_type == "dex" and not missing_identity:
+                physical_key = (
+                    str(market.get("chain")),
+                    str(market.get("pool_address")),
+                )
+                identity_state = dex_pool_identities[physical_key]
+                identity_state["dex_labels"].add(str(market.get("dex")))
+                identity_state["market_ids"].add(str(market.get("market_id")))
+                identity_state["token_symbols"].add(
+                    str(market.get("token_symbol"))
+                )
+                identity_state["row_numbers"].append(row_number)
             if parsed_day is None:
                 issues.append(
                     make_issue(
@@ -892,7 +963,7 @@ def read_daily_source(
                     or parsed_day <= latest_completed_day
                 )
             )
-            if market_id and date_is_publishable:
+            if market_id and date_is_publishable and identity_valid:
                 assert parsed_day is not None
                 normalized_day = parsed_day.isoformat()
                 if market_type == "cex":
@@ -931,10 +1002,59 @@ def read_daily_source(
                 market_id
                 and date_is_publishable
                 and values_valid
-                and not missing_identity
+                and identity_valid
             ):
                 assert parsed_day is not None
                 series[str(market_id)]["valid_dates"].add(parsed_day)
+
+    if market_type == "dex":
+        for physical_key, identity_state in sorted(dex_pool_identities.items()):
+            dex_labels = sorted(identity_state["dex_labels"])
+            if len(dex_labels) < 2:
+                continue
+            market_ids = sorted(identity_state["market_ids"])
+            representative = (
+                series.get(market_ids[0], {}).get("market")
+                if market_ids
+                else None
+            ) or {
+                "market_id": None,
+                "market_type": "dex",
+                "token_symbol": (
+                    sorted(identity_state["token_symbols"])[0]
+                    if len(identity_state["token_symbols"]) == 1
+                    else None
+                ),
+                "exchange": None,
+                "instrument": None,
+                "chain": physical_key[0],
+                "dex": None,
+                "pool_address": physical_key[1],
+            }
+            issues.append(
+                make_issue(
+                    category="hard_invalid",
+                    status="invalid",
+                    reason_code="dex_pool_label_drift",
+                    retryable=False,
+                    market=representative,
+                    day_text=None,
+                    message=(
+                        "One physical chain/pool identity is assigned to "
+                        "multiple DEX adapter labels."
+                    ),
+                    details={
+                        "dex_labels": dex_labels,
+                        "market_ids": market_ids,
+                        "token_symbols": sorted(
+                            identity_state["token_symbols"]
+                        ),
+                        "row_numbers": identity_state["row_numbers"],
+                    },
+                )
+            )
+            for market_id in market_ids:
+                series.pop(market_id, None)
 
     for key, row_numbers in sorted(primary_key_rows.items()):
         if len(row_numbers) < 2:
@@ -959,7 +1079,11 @@ def read_daily_source(
                 market_id = candidate_id
                 market = candidate
                 break
-        assert market_id is not None and market is not None
+        # A physical DEX pool with conflicting adapter labels is quarantined
+        # above as one identity-level hard error; do not emit derivative
+        # duplicate-key issues for series that were removed from publication.
+        if market_id is None or market is None:
+            continue
         issues.append(
             make_issue(
                 category="hard_invalid",

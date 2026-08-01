@@ -26,6 +26,10 @@ OUTPUTS = {
         "cex-dex-dashboard.service",
         0o644,
     ),
+    SYSTEMD_ROOT / "cex-dex-dashboard-user.service.in": (
+        "cex-dex-dashboard-user.service",
+        0o644,
+    ),
     SYSTEMD_ROOT / "cex-dex-cex-depth-retention.service.in": (
         "cex-dex-cex-depth-retention.service",
         0o644,
@@ -96,6 +100,7 @@ def render_templates(
         "MARKET_DATA_DIR": str(market_data_dir),
         "MARKET_WORK_DIR": str(market_work_dir),
         "ADMIN_JOB_DIR": str(admin_job_dir),
+        "BIND_HOST": "127.0.0.1",
     }
     written = []
     for source, (filename, mode) in OUTPUTS.items():

@@ -47,6 +47,7 @@ try:
         normalize_tvl_source_outcome,
         quality_outcome_resolution_state,
     )
+    from scripts.timestamp_contract import validate_observation_bounds
 except ModuleNotFoundError:
     from atomic_publication import atomic_replace_bundle, csv_payload
     from bounded_snapshot_merge import merge_exact_market_snapshot
@@ -59,6 +60,7 @@ except ModuleNotFoundError:
         normalize_tvl_source_outcome,
         quality_outcome_resolution_state,
     )
+    from timestamp_contract import validate_observation_bounds
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -498,6 +500,8 @@ def validate_snapshot(
     allow_terminal_only: bool = False,
     allow_no_observed: bool = False,
 ) -> None:
+    validate_observation_bounds(rows)
+    validate_tvl_fact_rows(rows)
     expected = {
         (row["token_symbol"].upper(), *pool_key(row["chain"], row["pool_address"]))
         for row in inventory
@@ -531,9 +535,29 @@ def validate_snapshot(
             raise ValueError(
                 "TVL exact candidate is not a terminal non-retryable outcome"
             )
+
+
+def validate_tvl_fact_rows(rows: Iterable[dict[str, str]]) -> None:
+    """Bind every TVL value to an explicit source-observation status."""
     for row in rows:
-        if row["tvl_usd"] and float(row["tvl_usd"]) < 0:
-            raise ValueError("TVL snapshot contains a negative TVL")
+        status = str(row.get("status") or "").strip().lower()
+        raw_value = row.get("tvl_usd")
+        has_value = raw_value not in (None, "")
+        if status == "observed":
+            if not has_value:
+                raise ValueError("TVL snapshot observed TVL must have a value")
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "TVL snapshot observed TVL must be finite and non-negative"
+                ) from error
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    "TVL snapshot observed TVL must be finite and non-negative"
+                )
+        elif has_value:
+            raise ValueError("TVL snapshot non-observed TVL must be null")
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:

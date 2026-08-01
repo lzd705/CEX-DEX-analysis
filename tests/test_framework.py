@@ -162,6 +162,9 @@ class FrameworkStructureTest(unittest.TestCase):
             runbook,
         )
         self.assertIn("Keep the old process running during this preflight", runbook)
+        self.assertEqual(runbook.count("--expected-application-sha"), 2)
+        self.assertEqual(runbook.count("--expected-asset-sha"), 2)
+        self.assertIn("from dashboard.server import static_asset_sha", runbook)
 
     def test_market_monitor_has_no_factor_or_admin_surface(self):
         html = (PROJECT_ROOT / "dashboard/static/index.html").read_text(encoding="utf-8")

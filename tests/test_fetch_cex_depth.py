@@ -23,6 +23,7 @@ from scripts.fetch_cex_depth import (
     execution_rows_for_book,
     failed_execution_rows,
     failure_row,
+    load_cataloged_markets,
     load_markets_from_csv,
     load_markets_from_database,
     merge_exact_publication_bundle,
@@ -1041,6 +1042,30 @@ class FetchCexDepthTest(unittest.TestCase):
             "UNI/USDT",
         )
 
+    def test_catalog_loader_rejects_coinbase_rows_mislabeled_as_usdt(self):
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            csv_path = directory / "cex.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["token_symbol", "exchange", "cex_symbol"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    market(
+                        token="AAVE",
+                        exchange="coinbase",
+                        symbol="AAVE/USDT",
+                    )
+                )
+
+            with self.assertRaisesRegex(ValueError, "source instrument identity"):
+                load_cataloged_markets(
+                    database_path=directory / "missing.sqlite3",
+                    csv_path=csv_path,
+                )
+
     def test_collect_writes_raw_manifest_and_complete_inventory(self):
         response = json.dumps(
             {
@@ -1302,10 +1327,10 @@ class FetchCexDepthTest(unittest.TestCase):
             "network",
         )
 
-    def test_upbit_fx_failure_dominates_later_not_listed_fallback(self):
-        krw_book = [
+    def test_upbit_depth_uses_only_the_exact_configured_instrument(self):
+        usdt_book = [
             {
-                "market": "KRW-TEST",
+                "market": "USDT-TEST",
                 "timestamp": 1785373200000,
                 "orderbook_units": [
                     {
@@ -1318,22 +1343,22 @@ class FetchCexDepthTest(unittest.TestCase):
             }
         ]
 
-        def mixed_request(url):
-            if "markets=KRW-TEST" in url:
-                raw = json.dumps(krw_book).encode()
-                return krw_book, raw
-            if "markets=KRW-USDT" in url:
-                raise urllib.error.URLError("temporary FX DNS failure")
-            raise urllib.error.HTTPError(url, 404, "Not found", {}, None)
+        requested = []
 
-        with self.assertRaises(Exception) as context:
-            upbit_book("TEST/USDT", mixed_request)
+        def exact_request(url):
+            requested.append(url)
+            if "markets=USDT-TEST" in url:
+                raw = json.dumps(usdt_book).encode()
+                return usdt_book, raw
+            raise AssertionError("Unexpected Upbit fallback request: {}".format(url))
 
-        error = context.exception
-        self.assertEqual(depth_failure_reason_code(error), "network")
-        self.assertIn("markets=KRW-USDT", error.endpoint)
-        self.assertEqual(error.source_instrument, "KRW-USDT")
-        self.assertEqual(error.raw, b"")
+        book = upbit_book("TEST/USDT", exact_request)
+
+        self.assertEqual(len(requested), 1)
+        self.assertIn("markets=USDT-TEST", requested[0])
+        self.assertEqual(book["source_instrument"], "USDT-TEST")
+        self.assertEqual(book["source_quote_asset"], "USDT")
+        self.assertEqual(book["quote_to_usd"], Decimal(1))
 
     def test_upbit_fx_parse_failure_hashes_the_fx_response(self):
         krw_book = [
@@ -1361,7 +1386,7 @@ class FetchCexDepthTest(unittest.TestCase):
             raise urllib.error.HTTPError(url, 404, "Not found", {}, None)
 
         with self.assertRaises(Exception) as context:
-            upbit_book("TEST/USDT", invalid_fx_request)
+            upbit_book("TEST/KRW", invalid_fx_request)
 
         error = context.exception
         self.assertIn("markets=KRW-USDT", error.endpoint)
@@ -1379,6 +1404,28 @@ class FetchCexDepthTest(unittest.TestCase):
         validate_snapshot([market()], [row])
         with self.assertRaisesRegex(ValueError, "coverage"):
             validate_snapshot([market(), market(token="AAVE", symbol="AAVE/USDT")], [row])
+
+    def test_validate_requires_canonical_utc_observed_at_for_every_market(self):
+        row = observed_row(
+            market(),
+            complete_book(),
+            snapshot_id="depth-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+        for observed_at in (
+            "",
+            "2026-07-27T00:00:01",
+            "2026-07-27T00:00:01Z",
+            "2026-07-27T08:00:01+08:00",
+            " 2026-07-27T00:00:01+00:00",
+        ):
+            with self.subTest(observed_at=observed_at):
+                with self.assertRaisesRegex(ValueError, "observed_at"):
+                    validate_snapshot(
+                        [market()],
+                        [{**row, "observed_at": observed_at}],
+                    )
 
     def test_exact_candidate_accepts_only_terminal_nonretryable_no_book(self):
         terminal = failure_row(

@@ -75,8 +75,8 @@ class EventFrontendTest(unittest.TestCase):
         self.assertIn("overflow: visible", freshness_rule.group(1))
         self.assertIn("white-space: normal", freshness_rule.group(1))
         self.assertIn("#freshness { min-width: 0; overflow-wrap: anywhere; }", mobile)
-        self.assertIn("/styles.css?v=20260731-spread-quality-v1", index)
-        self.assertIn("/app.js?v=20260731-spread-quality-v1", index)
+        self.assertIn("/styles.css?v=__ASSET_VERSION__", index)
+        self.assertIn("/app.js?v=__ASSET_VERSION__", index)
 
     def test_event_route_round_trips_lifecycle_filter(self):
         node = shutil.which("node")
@@ -187,6 +187,7 @@ renderEventFacts({
 });
 const unavailableState = {
   count: elements["events-count"].textContent,
+  countHtml: elements["events-count"].innerHTML,
   html: elements["events-body"].innerHTML,
   status: elements["events-status"].textContent,
 };
@@ -202,7 +203,9 @@ console.log(JSON.stringify({ availableState, emptyState, unavailableState }));
         self.assertIn("latest verified Event Facts", result["availableState"]["status"])
         self.assertIn("not proof", result["emptyState"]["html"])
         self.assertIn("absence is not inferred", result["emptyState"]["status"])
-        self.assertEqual(result["unavailableState"]["count"], "N/A")
+        self.assertEqual(result["unavailableState"]["count"], "")
+        self.assertIn('class="na-disclosure"', result["unavailableState"]["countHtml"])
+        self.assertIn("No publication", result["unavailableState"]["countHtml"])
         self.assertIn("different from a verified zero-event", result["unavailableState"]["html"])
         self.assertEqual(result["unavailableState"]["status"], "No publication")
 

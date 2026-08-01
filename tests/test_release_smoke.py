@@ -13,34 +13,126 @@ from scripts.check_dashboard_release import (
     validate_comparison,
     validate_events,
     validate_execution,
+    validate_exact_cex_market_identity,
     validate_quality,
     validate_screening_quality_parity,
     validate_summary,
     validate_token_catalog,
 )
+from scripts.cex_instrument_lifecycle import configured_market_ids_sha256
 
 
 class DashboardReleaseSmokeTest(unittest.TestCase):
+    def freshness(self):
+        checked_at = "2026-02-01T01:00:00+00:00"
+        return {
+            "checked_at": checked_at,
+            "overall_status": "current",
+            "common_comparable_end": "2026-01-31",
+            "cex_daily": {
+                "source": "cex_daily",
+                "status": "current",
+                "available_start": "2026-01-01",
+                "available_end": "2026-01-31",
+                "latest_completed_utc_day": "2026-01-31",
+                "lag_days": 0,
+                "max_lag_days": 1,
+            },
+            "dex_daily": {
+                "source": "dex_daily",
+                "status": "current",
+                "available_start": "2026-01-01",
+                "available_end": "2026-01-31",
+                "latest_completed_utc_day": "2026-01-31",
+                "lag_days": 0,
+                "max_lag_days": 1,
+            },
+            **{
+                source: {
+                    "source": source,
+                    "status": "current",
+                    "observed_at": "2026-02-01T00:00:00+00:00",
+                    "age_hours": 1.0,
+                    "max_age_hours": maximum,
+                }
+                for source, maximum in (
+                    ("dex_tvl", 26.0),
+                    ("cex_depth", 2.0),
+                    ("dex_depth", 2.0),
+                    ("cex_execution", 2.0),
+                    ("dex_execution", 2.0),
+                )
+            },
+        }
+
     def summary(self):
         return {
             "metadata": {
                 "response_scope": "screener_summary",
-                "summary_version": 2,
+                "summary_version": 3,
                 "data_generation": "generation-1",
                 "start_date": "2026-01-01",
                 "end_date": "2026-01-31",
                 "default_workspace_token": "AAVE",
                 "token_count": 1,
                 "catalog_market_count": 2,
+                "freshness": self.freshness(),
+                "cex_instrument_lifecycle": {
+                    "schema": "cex_instrument_lifecycle/v1",
+                    "reviewed_market_count": 2,
+                    "absence_market_count": 0,
+                    "applied_market_count": 0,
+                    "withheld_payload_market_count": 0,
+                    "stale_evidence_market_count": 0,
+                    "official_inventory_count": 1_000,
+                    "response_sha256": "9" * 64,
+                    "configured_market_ids_sha256": (
+                        configured_market_ids_sha256(
+                            {
+                                "cex:crypto_com:AAVE/USDT",
+                                "cex:crypto_com:UNI/USDT",
+                            }
+                        )
+                    ),
+                    "freshness_max_age_seconds": 129600,
+                    "checked_at_min": "2026-02-01T00:30:00+00:00",
+                    "checked_at_max": "2026-02-01T00:30:00+00:00",
+                },
+                "configured_cex_market_identities": {
+                    "schema": "configured_cex_market_identities/v1",
+                    "upbit": {
+                        "market_count": 2,
+                        "market_ids": [
+                            "cex:upbit:AAVE/USDT",
+                            "cex:upbit:UNI/USDT",
+                        ],
+                        "market_ids_sha256": (
+                            "556bd70f57ba9cac453a87e26c2e5a1b"
+                            "7098133cdfc1956cfad0e20dda693635"
+                        ),
+                    },
+                },
             },
             "tokens": [{
                 "token_symbol": "AAVE",
                 "market_count": 2,
                 "quality_status_counts": {"ok": 2},
                 "quality_alert_counts": {"info": 1},
+                "price_spread": 0.01,
+                "price_spread_method": "directional_dex_over_cex_minus_one",
+                "absolute_price_gap": 2 / 202,
+                "absolute_price_gap_method": (
+                    "symmetric_midpoint_relative_gap"
+                ),
+                "maximum_absolute_price_spread": 0.03,
+                "mean_absolute_price_spread": 0.02,
+                "median_absolute_price_spread": 0.015,
                 "spread_comparable_days": 20,
                 "primary_cex": {
-                    "refresh_market_id": "cex:binance:AAVE/USDT",
+                    "refresh_market_id": "cex:crypto_com:AAVE/USDT",
+                    "token_symbol": "AAVE",
+                    "venue": "crypto_com",
+                    "instrument": "AAVE/USDT",
                     "depth_status": "observed",
                     "depth_na_reason": "observed",
                     "depth_retryable": False,
@@ -50,6 +142,9 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 },
                 "primary_dex": {
                     "refresh_market_id": "dex:eth:uniswap_v3:pool:AAVE",
+                    "token_symbol": "AAVE",
+                    "venue": "eth / uniswap_v3",
+                    "pool_address": "pool",
                     "depth_status": "collection_failed",
                     "depth_na_reason": "source_unavailable",
                     "depth_retryable": True,
@@ -64,18 +159,93 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         return ResponseMetrics(path, 1.0, wire, raw, True)
 
     def screening_quality(self, token="AAVE"):
+        def fact(status, reason_code, retryable=False, action=None):
+            return {
+                "status": status,
+                "reason_code": reason_code,
+                "retryable": retryable,
+                "action": action,
+                "quality_flags": [],
+            }
+
+        def daily_fact():
+            return {
+                **fact("observed", "observed"),
+                "daily_evidence_mode": "published_daily_audit",
+                "reason_code_counts": {},
+                "issue_status_counts": {},
+                "issue_outcome_counts": [],
+                "affected_dates": [],
+                "affected_date_count": 0,
+            }
+
+        market_ids = [
+            f"cex:crypto_com:{token}/USDT",
+            f"dex:eth:uniswap_v3:pool:{token}",
+        ]
+        zero_rollups = [
+            {
+                "market_id": market_id,
+                "issue_count": 0,
+                "reason_code_counts": {},
+                "status_counts": {},
+                "issue_outcome_counts": [],
+                "affected_dates": [],
+                "affected_date_count": 0,
+                "evidence_mode": "published_daily_audit",
+                "fact_outcome": {
+                    "status": "observed",
+                    "reason_code": "observed",
+                    "retryable": False,
+                    "action": None,
+                },
+            }
+            for market_id in market_ids
+        ]
+
         return {
             "metadata": {
                 "contract_version": 4,
                 "data_generation": "generation-1",
                 "scope": "all",
+                "daily_quality_report": {
+                    "status": "matched",
+                    "evidence_mode": "published_daily_audit",
+                    "identity_status": "matched_current_import",
+                    "schema": "fact_quality_report/v1",
+                    "selected_window_issue_count": 0,
+                    "reason_code_counts": {},
+                    "status_counts": {},
+                    "issue_outcome_counts": [],
+                    "affected_dates": [],
+                    "affected_date_count": 0,
+                    "market_issue_rollups": zero_rollups,
+                },
             },
             "token_symbol": token,
             "markets": [
                 {
-                    "market_id": f"cex:binance:{token}/USDT",
+                    "market_id": f"cex:crypto_com:{token}/USDT",
+                    "market_type": "cex",
                     "token_symbol": token,
+                    "quality_status": "ok",
+                    "quality_flags": [],
+                    "facts": {
+                        "daily": daily_fact(),
+                        "tvl": fact(
+                            "not_applicable",
+                            "cex_markets_do_not_have_pool_tvl",
+                        ),
+                        "depth": fact("observed", "observed"),
+                        "execution": fact("observed", "observed"),
+                    },
                     "screening_quality_status": "ok",
+                    "screening_quality_scope": "catalog",
+                    "screening_quality_window": {
+                        "start": "2026-01-01",
+                        "end": "2026-01-31",
+                        "method": "max_query_source_market_observed_start",
+                    },
                     "screening_quality_flags": [
                         {
                             "code": "depth_unavailable",
@@ -84,17 +254,121 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                             "message": (
                                 "No executable-depth observation is available."
                             ),
+                            "observed_value": None,
+                            "threshold": None,
                         }
                     ],
                 },
                 {
                     "market_id": f"dex:eth:uniswap_v3:pool:{token}",
+                    "market_type": "dex",
                     "token_symbol": token,
+                    "quality_status": "ok",
+                    "quality_flags": [],
+                    "facts": {
+                        "daily": daily_fact(),
+                        "tvl": fact("observed", "observed"),
+                        "depth": fact(
+                            "collection_failed",
+                            "source_unavailable",
+                            True,
+                            "retry_depth_collection",
+                        ),
+                        "execution": fact(
+                            "unsupported",
+                            "unsupported_protocol_or_chain",
+                        ),
+                    },
                     "screening_quality_status": "ok",
+                    "screening_quality_scope": "catalog",
+                    "screening_quality_window": {
+                        "start": "2026-01-01",
+                        "end": "2026-01-31",
+                        "method": "max_query_source_market_observed_start",
+                    },
                     "screening_quality_flags": [],
                 },
             ],
         }
+
+    def test_release_exact_cex_identity_rejects_legacy_quote_aliases(self):
+        def validate(market_id, token, configured_upbit_market_ids):
+            try:
+                return validate_exact_cex_market_identity(
+                    market_id,
+                    token,
+                    configured_upbit_market_ids=(
+                        configured_upbit_market_ids
+                    ),
+                )
+            except TypeError as error:
+                self.fail(
+                    "Exact identity validation must accept authoritative "
+                    "Upbit configuration: {}".format(error)
+                )
+
+        valid = (
+            ("cex:coinbase:AAVE/USD", "AAVE"),
+            ("cex:kraken:AAVE/USD", "AAVE"),
+            ("cex:binance:AAVE/USDT", "AAVE"),
+        )
+        for market_id, token in valid:
+            with self.subTest(valid=market_id):
+                validate(
+                    market_id,
+                    token,
+                    {
+                        "cex:upbit:AAVE/USDT",
+                    },
+                )
+
+        for configured_market_id in (
+            "cex:upbit:AAVE/USDT",
+            "cex:upbit:AAVE/KRW",
+        ):
+            with self.subTest(configured_upbit=configured_market_id):
+                try:
+                    validate(
+                        configured_market_id,
+                        "AAVE",
+                        {configured_market_id},
+                    )
+                except ReleaseCheckError as error:
+                    self.fail(
+                        "An explicitly configured Upbit quote is an exact "
+                        "market identity: {}".format(error)
+                    )
+
+        invalid = (
+            "cex:coinbase:AAVE/USDT",
+            "cex:kraken:AAVE/USDT",
+            "cex:coinbase:UNI/USD",
+        )
+        for market_id in invalid:
+            with self.subTest(invalid=market_id), self.assertRaisesRegex(
+                ReleaseCheckError,
+                "exact CEX identity",
+            ):
+                validate(
+                    market_id,
+                    "AAVE",
+                    {
+                        "cex:upbit:AAVE/USDT",
+                    },
+                )
+
+        try:
+            validate(
+                "cex:upbit:AAVE/KRW",
+                "AAVE",
+                {"cex:upbit:AAVE/USDT"},
+            )
+        except ReleaseCheckError:
+            pass
+        else:
+            self.fail(
+                "Upbit KRW must be rejected when the authoritative market is USDT"
+            )
 
     def test_screening_quality_must_match_summary_counts(self):
         summary_row = self.summary()["tokens"][0]
@@ -108,7 +382,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         self.assertEqual(
             parity["market_ids"],
             [
-                "cex:binance:AAVE/USDT",
+                "cex:crypto_com:AAVE/USDT",
                 "dex:eth:uniswap_v3:pool:AAVE",
             ],
         )
@@ -132,11 +406,31 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "severity": "critical",
             "category": "data_health",
             "message": "The latest depth collection failed.",
+            "observed_value": "collection_failed",
+            "threshold": None,
         }]
         with self.assertRaisesRegex(ReleaseCheckError, "screening quality"):
             validate_screening_quality_parity(
                 summary_row,
                 status_mismatch,
+                expected_generation="generation-1",
+            )
+
+        severity_status_drift = copy.deepcopy(quality)
+        severity_status_drift["markets"][0]["screening_quality_status"] = "warning"
+        severity_status_drift["markets"][0]["screening_quality_flags"][0][
+            "severity"
+        ] = "critical"
+        severity_status_drift["markets"][0]["screening_quality_flags"][0][
+            "category"
+        ] = "data_health"
+        drift_summary = copy.deepcopy(summary_row)
+        drift_summary["quality_status_counts"] = {"ok": 1, "warning": 1}
+        drift_summary["quality_alert_counts"] = {"critical": 1}
+        with self.assertRaisesRegex(ReleaseCheckError, "status differs from its flags"):
+            validate_screening_quality_parity(
+                drift_summary,
+                severity_status_drift,
                 expected_generation="generation-1",
             )
 
@@ -157,6 +451,61 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             validate_screening_quality_parity(
                 self.summary()["tokens"][0],
                 quality,
+                expected_generation="generation-1",
+            )
+
+    def test_screening_quality_validates_every_market_fact_family(self):
+        quality = self.screening_quality()
+        quality["markets"][1]["facts"]["tvl"].update(
+            {
+                "status": "failed",
+                "reason_code": "execution_calculation_failed",
+                "retryable": True,
+                "action": "retry_tvl_collection",
+            }
+        )
+
+        with self.assertRaisesRegex(ReleaseCheckError, "canonical fact"):
+            validate_screening_quality_parity(
+                self.summary()["tokens"][0],
+                quality,
+                expected_generation="generation-1",
+            )
+
+        selected_status_drift = self.screening_quality()
+        selected_status_drift["markets"][1]["quality_status"] = "warning"
+        with self.assertRaisesRegex(ReleaseCheckError, "selected quality"):
+            validate_screening_quality_parity(
+                self.summary()["tokens"][0],
+                selected_status_drift,
+                expected_generation="generation-1",
+            )
+
+        daily_count_drift = self.screening_quality()
+        daily_count_drift["markets"][1]["facts"]["daily"][
+            "affected_date_count"
+        ] = 1
+        with self.assertRaisesRegex(ReleaseCheckError, "daily fact"):
+            validate_screening_quality_parity(
+                self.summary()["tokens"][0],
+                daily_count_drift,
+                expected_generation="generation-1",
+            )
+
+        fallback_audit = self.screening_quality()
+        fallback_audit["metadata"]["daily_quality_report"].update(
+            {
+                "status": "unavailable",
+                "evidence_mode": "catalog_window_inference",
+                "identity_status": "unavailable",
+            }
+        )
+        for field in ("schema", "market_issue_rollups", "issue_outcome_counts"):
+            fallback_audit["metadata"]["daily_quality_report"].pop(field, None)
+        with self.assertRaisesRegex(ReleaseCheckError, "matched"):
+            validate_screening_quality_parity(
+                self.summary()["tokens"][0],
+                fallback_audit,
                 expected_generation="generation-1",
             )
 
@@ -303,7 +652,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         duplicate_ids["markets"][1]["market_id"] = duplicate_ids["markets"][0][
             "market_id"
         ]
-        mutations.append(("unique", duplicate_ids))
+        mutations.append(("duplicated|unique", duplicate_ids))
 
         empty_id = self.screening_quality()
         empty_id["markets"][0]["market_id"] = ""
@@ -445,6 +794,8 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "severity": "warning",
                 "category": "market_condition",
                 "message": "Quoted CEX spread exceeds the quality threshold.",
+                "observed_value": 125.0,
+                "threshold": 100.0,
             },
         ]
         summary_row = copy.deepcopy(self.summary()["tokens"][0])
@@ -460,6 +811,19 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         summary = self.summary()
         second_row = copy.deepcopy(summary["tokens"][0])
         second_row["token_symbol"] = "UNI"
+        second_row["primary_cex"].update(
+            {
+                "token_symbol": "UNI",
+                "instrument": "UNI/USDT",
+                "refresh_market_id": "cex:crypto_com:UNI/USDT",
+            }
+        )
+        second_row["primary_dex"].update(
+            {
+                "token_symbol": "UNI",
+                "refresh_market_id": "dex:eth:uniswap_v3:pool:UNI",
+            }
+        )
         summary["tokens"].append(second_row)
         summary["metadata"]["token_count"] = 2
         summary["metadata"]["catalog_market_count"] = 4
@@ -467,12 +831,25 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             token: self.screening_quality(token)
             for token in ("AAVE", "UNI")
         }
+        def rename_quality_market(payload, index, new_market_id):
+            old_market_id = payload["markets"][index]["market_id"]
+            payload["markets"][index]["market_id"] = new_market_id
+            for rollup in payload["metadata"]["daily_quality_report"][
+                "market_issue_rollups"
+            ]:
+                if rollup["market_id"] == old_market_id:
+                    rollup["market_id"] = new_market_id
         valid_quality_by_token = copy.deepcopy(quality_by_token)
         full_catalog = {
-            "metadata": {"data_generation": "generation-1"},
+            "metadata": {
+                "data_generation": "generation-1",
+                "configured_cex_market_identities": copy.deepcopy(
+                    summary["metadata"]["configured_cex_market_identities"]
+                ),
+            },
             "markets": [
                 {
-                    "market_id": "cex:binance:AAVE/USDT",
+                    "market_id": "cex:crypto_com:AAVE/USDT",
                     "token_symbol": "AAVE",
                 },
                 {
@@ -480,7 +857,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     "token_symbol": "AAVE",
                 },
                 {
-                    "market_id": "cex:binance:UNI/USDT",
+                    "market_id": "cex:crypto_com:UNI/USDT",
                     "token_symbol": "UNI",
                 },
                 {
@@ -506,13 +883,30 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             },
             "bundle_id": "a" * 24,
         }
+        health_payload = {
+            "status": "ok",
+            "data_ready": True,
+            "data_status": "current",
+            "freshness": self.freshness(),
+            "cex_instrument_lifecycle": copy.deepcopy(
+                summary["metadata"]["cex_instrument_lifecycle"]
+            ),
+            "application_sha": "a" * 40,
+            "asset_sha": "b" * 64,
+            "asset_version": f"{'a' * 12}-{'b' * 12}",
+        }
         fetched_paths = []
-        summary_state = {"count": 0, "tail_generation": None}
+        served_asset_state = {"sha": "b" * 64}
+        summary_state = {
+            "count": 0,
+            "tail_generation": None,
+            "tail_freshness_stale": False,
+        }
 
         def fake_fetch(_base_url, path, *, timeout):
             fetched_paths.append(path)
             if path == "/health":
-                payload = {"status": "ok", "data_ready": True}
+                payload = copy.deepcopy(health_payload)
             elif path == "/api/markets/summary":
                 summary_state["count"] += 1
                 payload = copy.deepcopy(summary)
@@ -523,10 +917,26 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     payload["metadata"]["data_generation"] = summary_state[
                         "tail_generation"
                     ]
+                if (
+                    summary_state["count"] > 1
+                    and summary_state["tail_freshness_stale"]
+                ):
+                    payload["metadata"]["freshness"]["overall_status"] = "stale"
+                    payload["metadata"]["freshness"]["cex_depth"]["status"] = "stale"
+                    payload["metadata"]["freshness"]["cex_depth"]["age_hours"] = 3.0
             elif path == "/api/markets/catalog":
                 payload = full_catalog
             elif path.startswith("/api/markets/catalog?"):
-                payload = {"token_summary": {}}
+                payload = {
+                    "metadata": {
+                        "configured_cex_market_identities": copy.deepcopy(
+                            summary["metadata"][
+                                "configured_cex_market_identities"
+                            ]
+                        ),
+                    },
+                    "token_summary": {},
+                }
             elif path == "/api/markets/events":
                 payload = all_events
             elif "scope=all" in path and path.startswith("/api/markets/quality?"):
@@ -543,14 +953,17 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             summary_gzip_max=1_000,
             token_raw_max=2_000,
             token_gzip_max=1_000,
+            expected_application_sha="a" * 40,
+            expected_asset_sha="b" * 64,
         )
         markets = [
-            {"market_id": "cex:binance:AAVE/USDT", "market_type": "cex"},
+            {"market_id": "cex:crypto_com:AAVE/USDT", "market_type": "cex"},
             {
                 "market_id": "dex:eth:uniswap_v3:pool:AAVE",
                 "market_type": "dex",
             },
         ]
+        validator_calls = {}
         def run_release(*, bypass_summary_validation=False):
             summary_state["count"] = 0
             with ExitStack() as stack:
@@ -573,21 +986,178 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     return_value=markets,
                 ))
                 stack.enter_context(patch(
+                    "scripts.check_dashboard_release.fetch_static_asset_bundle",
+                    side_effect=lambda *_args, **_kwargs: (
+                        served_asset_state["sha"],
+                        [],
+                    ),
+                ))
+                stack.enter_context(patch(
                     "scripts.check_dashboard_release.validate_events",
                     return_value=[event],
                 ))
-                stack.enter_context(patch(
+                comparison_validator = stack.enter_context(patch(
                     "scripts.check_dashboard_release.validate_comparison"
                 ))
                 stack.enter_context(patch(
                     "scripts.check_dashboard_release.validate_quality"
                 ))
-                stack.enter_context(patch(
+                execution_validator = stack.enter_context(patch(
                     "scripts.check_dashboard_release.validate_execution"
                 ))
-                return release_check(args)
+                result = release_check(args)
+                validator_calls["comparison"] = comparison_validator.call_args
+                validator_calls["execution"] = execution_validator.call_args
+                return result
 
         result = run_release()
+
+        self.assertEqual(result["application_sha"], "a" * 40)
+        self.assertEqual(result["asset_sha"], "b" * 64)
+        self.assertEqual(
+            validator_calls["comparison"].kwargs[
+                "expected_comparison_generation"
+            ],
+            "generation-1",
+        )
+        self.assertEqual(
+            validator_calls["execution"].kwargs[
+                "expected_execution_generation"
+            ],
+            "generation-1",
+        )
+
+        baseline_summary = copy.deepcopy(summary)
+        baseline_quality_by_token = copy.deepcopy(quality_by_token)
+        baseline_full_catalog = copy.deepcopy(full_catalog)
+        baseline_token_markets = copy.deepcopy(markets)
+        baseline_fetched_paths = list(fetched_paths)
+        try:
+            configured_krw = {
+                "schema": "configured_cex_market_identities/v1",
+                "upbit": {
+                    "market_count": 2,
+                    "market_ids": [
+                        "cex:upbit:AAVE/KRW",
+                        "cex:upbit:UNI/USDT",
+                    ],
+                    "market_ids_sha256": (
+                        "440b52cffc9da70c7adaf402da4131c48"
+                        "1e4356cb85ef9994da59d0a2f1f9154"
+                    ),
+                },
+            }
+            summary["metadata"]["configured_cex_market_identities"] = (
+                copy.deepcopy(configured_krw)
+            )
+            summary["metadata"]["catalog_market_count"] = 5
+            summary["tokens"][0]["market_count"] = 3
+            summary["tokens"][0]["quality_status_counts"] = {"ok": 3}
+            summary["tokens"][0]["quality_alert_counts"] = {"info": 2}
+
+            upbit_quality = copy.deepcopy(
+                quality_by_token["AAVE"]["markets"][0]
+            )
+            upbit_quality["market_id"] = "cex:upbit:AAVE/KRW"
+            quality_by_token["AAVE"]["markets"].append(upbit_quality)
+            upbit_rollup = copy.deepcopy(
+                quality_by_token["AAVE"]["metadata"][
+                    "daily_quality_report"
+                ]["market_issue_rollups"][0]
+            )
+            upbit_rollup["market_id"] = "cex:upbit:AAVE/KRW"
+            quality_by_token["AAVE"]["metadata"][
+                "daily_quality_report"
+            ]["market_issue_rollups"].append(upbit_rollup)
+
+            full_catalog["metadata"][
+                "configured_cex_market_identities"
+            ] = copy.deepcopy(configured_krw)
+            full_catalog["markets"].append({
+                "market_id": "cex:upbit:AAVE/KRW",
+                "token_symbol": "AAVE",
+            })
+            markets.append({
+                "market_id": "cex:upbit:AAVE/KRW",
+                "market_type": "cex",
+            })
+
+            try:
+                run_release()
+            except ReleaseCheckError as error:
+                self.fail(
+                    "Full release rejected configured Upbit KRW: {}".format(
+                        error
+                    )
+                )
+
+            configured_usdt = {
+                "schema": "configured_cex_market_identities/v1",
+                "upbit": {
+                    "market_count": 2,
+                    "market_ids": [
+                        "cex:upbit:AAVE/USDT",
+                        "cex:upbit:UNI/USDT",
+                    ],
+                    "market_ids_sha256": (
+                        "556bd70f57ba9cac453a87e26c2e5a1b"
+                        "7098133cdfc1956cfad0e20dda693635"
+                    ),
+                },
+            }
+            summary["metadata"]["configured_cex_market_identities"] = (
+                copy.deepcopy(configured_usdt)
+            )
+            full_catalog["metadata"][
+                "configured_cex_market_identities"
+            ] = copy.deepcopy(configured_usdt)
+            with self.assertRaisesRegex(
+                ReleaseCheckError,
+                "configured Upbit",
+            ):
+                run_release()
+        finally:
+            summary = baseline_summary
+            quality_by_token = baseline_quality_by_token
+            full_catalog = baseline_full_catalog
+            markets = baseline_token_markets
+            fetched_paths[:] = baseline_fetched_paths
+
+        health_payload["data_status"] = "stale"
+        health_payload["freshness"]["overall_status"] = "stale"
+        health_payload["freshness"]["cex_depth"]["status"] = "stale"
+        health_payload["freshness"]["cex_depth"]["age_hours"] = 3.0
+        with self.assertRaisesRegex(ReleaseCheckError, "freshness"):
+            run_release()
+        health_payload["data_status"] = "current"
+        health_payload["freshness"] = self.freshness()
+
+        stale_lifecycle = copy.deepcopy(summary)
+        stale_lifecycle["metadata"]["cex_instrument_lifecycle"][
+            "stale_evidence_market_count"
+        ] = 1
+        original_summary = summary
+        summary = stale_lifecycle
+        try:
+            with self.assertRaisesRegex(ReleaseCheckError, "lifecycle"):
+                run_release()
+        finally:
+            summary = original_summary
+
+        health_payload["application_sha"] = "c" * 40
+        with self.assertRaisesRegex(ReleaseCheckError, "application SHA"):
+            run_release()
+        health_payload["application_sha"] = "a" * 40
+
+        health_payload["asset_version"] = f"{'a' * 12}-{'c' * 12}"
+        with self.assertRaisesRegex(ReleaseCheckError, "asset version"):
+            run_release()
+        health_payload["asset_version"] = f"{'a' * 12}-{'b' * 12}"
+
+        served_asset_state["sha"] = "c" * 64
+        with self.assertRaisesRegex(ReleaseCheckError, "served assets"):
+            run_release()
+        served_asset_state["sha"] = "b" * 64
 
         all_quality_paths = [
             path
@@ -608,10 +1178,27 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             2,
         )
 
+        lifecycle = summary["metadata"]["cex_instrument_lifecycle"]
+        valid_lifecycle_hash = lifecycle["configured_market_ids_sha256"]
+        lifecycle["configured_market_ids_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ReleaseCheckError, "lifecycle catalog"):
+            run_release()
+        lifecycle["configured_market_ids_sha256"] = valid_lifecycle_hash
+
+        lifecycle["reviewed_market_count"] = 1
+        with self.assertRaisesRegex(ReleaseCheckError, "lifecycle catalog"):
+            run_release()
+        lifecycle["reviewed_market_count"] = 2
+
         summary_state["tail_generation"] = "generation-2"
         with self.assertRaisesRegex(ReleaseCheckError, "generation changed"):
             run_release()
         summary_state["tail_generation"] = None
+
+        summary_state["tail_freshness_stale"] = True
+        with self.assertRaisesRegex(ReleaseCheckError, "freshness"):
+            run_release()
+        summary_state["tail_freshness_stale"] = False
 
         quality_by_token["UNI"]["metadata"]["data_generation"] = "generation-2"
         with self.assertRaisesRegex(ReleaseCheckError, "generation"):
@@ -628,15 +1215,19 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             run_release()
         full_catalog["metadata"] = missing_catalog_generation
 
-        quality_by_token["UNI"]["markets"][0]["market_id"] = (
-            quality_by_token["AAVE"]["markets"][0]["market_id"]
+        rename_quality_market(
+            quality_by_token["UNI"],
+            0,
+            quality_by_token["AAVE"]["markets"][0]["market_id"],
         )
         with self.assertRaisesRegex(ReleaseCheckError, "reused across Tokens"):
             run_release()
         quality_by_token = copy.deepcopy(valid_quality_by_token)
 
-        quality_by_token["AAVE"]["markets"][0]["market_id"] = (
-            "cex:bogus:AAVE/USDT"
+        rename_quality_market(
+            quality_by_token["AAVE"],
+            0,
+            "cex:bogus:AAVE/USDT",
         )
         with self.assertRaisesRegex(ReleaseCheckError, "exact market inventory"):
             run_release()
@@ -644,8 +1235,8 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
 
         aave_market_id = quality_by_token["AAVE"]["markets"][0]["market_id"]
         uni_market_id = quality_by_token["UNI"]["markets"][0]["market_id"]
-        quality_by_token["AAVE"]["markets"][0]["market_id"] = uni_market_id
-        quality_by_token["UNI"]["markets"][0]["market_id"] = aave_market_id
+        rename_quality_market(quality_by_token["AAVE"], 0, uni_market_id)
+        rename_quality_market(quality_by_token["UNI"], 0, aave_market_id)
         with self.assertRaisesRegex(ReleaseCheckError, "exact market inventory"):
             run_release()
         quality_by_token = copy.deepcopy(valid_quality_by_token)
@@ -657,6 +1248,24 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             run_release()
         full_catalog["markets"] = copy.deepcopy(valid_full_markets)
 
+        summary["tokens"][0]["primary_cex"].update(
+            {
+                "venue": "bogus",
+                "refresh_market_id": "cex:bogus:AAVE/USDT",
+            }
+        )
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "Summary primary market.*full catalog",
+        ):
+            run_release()
+        summary["tokens"][0]["primary_cex"].update(
+            {
+                "venue": "crypto_com",
+                "refresh_market_id": "cex:crypto_com:AAVE/USDT",
+            }
+        )
+
         missing_market_token = copy.deepcopy(valid_full_markets)
         missing_market_token[0].pop("token_symbol")
         full_catalog["markets"] = missing_market_token
@@ -666,6 +1275,8 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         missing_token_catalog = copy.deepcopy(valid_full_markets)
         for market in missing_token_catalog:
             market["token_symbol"] = "AAVE"
+            if market["market_id"] == "cex:crypto_com:UNI/USDT":
+                market["market_id"] = "dex:eth:replacement:pool:AAVE"
         full_catalog["markets"] = missing_token_catalog
         with self.assertRaisesRegex(ReleaseCheckError, "Token inventory"):
             run_release()
@@ -718,7 +1329,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 raw_max=2000,
                 gzip_max=1000,
             )
-        with self.assertRaisesRegex(ReleaseCheckError, "version is not 2"):
+        with self.assertRaisesRegex(ReleaseCheckError, "version is not 3"):
             validate_summary(
                 {
                     **summary,
@@ -733,6 +1344,17 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             broken["tokens"][0]["primary_cex"].pop("depth_retryable")
             validate_summary(
                 broken,
+                self.metrics(),
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "refresh identity"):
+            wrong_refresh = self.summary()
+            wrong_refresh["tokens"][0]["primary_cex"][
+                "refresh_market_id"
+            ] = "cex:bogus:AAVE/USDT"
+            validate_summary(
+                wrong_refresh,
                 self.metrics(),
                 raw_max=2000,
                 gzip_max=1000,
@@ -774,6 +1396,41 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 raw_max=2000,
                 gzip_max=1000,
             )
+        with self.assertRaisesRegex(ReleaseCheckError, "N/A outcome"):
+            fail_closed_cex_tvl = self.summary()
+            fail_closed_cex_tvl["tokens"][0]["primary_cex"].update(
+                {
+                    "tvl_status": "needs_review",
+                    "tvl_na_reason": "daily_quality_outcome_invalid",
+                    "tvl_retryable": False,
+                }
+            )
+            validate_summary(
+                fail_closed_cex_tvl,
+                self.metrics(),
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "spread contract"):
+            directional_only = self.summary()
+            directional_only["tokens"][0].pop("absolute_price_gap")
+            validate_summary(
+                directional_only,
+                self.metrics(),
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "spread contract"):
+            wrong_method = self.summary()
+            wrong_method["tokens"][0]["absolute_price_gap_method"] = (
+                "absolute_directional_gap"
+            )
+            validate_summary(
+                wrong_method,
+                self.metrics(),
+                raw_max=2000,
+                gzip_max=1000,
+            )
         with self.assertRaisesRegex(ReleaseCheckError, "not unique"):
             duplicated = self.summary()
             duplicated["tokens"].append(copy.deepcopy(duplicated["tokens"][0]))
@@ -809,6 +1466,24 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                         gzip_max=1000,
                     )
 
+        for field in (
+            "absence_market_count",
+            "withheld_payload_market_count",
+            "official_inventory_count",
+            "response_sha256",
+            "configured_market_ids_sha256",
+        ):
+            with self.subTest(lifecycle_root_field=field):
+                invalid = self.summary()
+                invalid["metadata"]["cex_instrument_lifecycle"].pop(field)
+                with self.assertRaisesRegex(ReleaseCheckError, "lifecycle"):
+                    validate_summary(
+                        invalid,
+                        self.metrics(),
+                        raw_max=2000,
+                        gzip_max=1000,
+                    )
+
     def test_token_catalog_rejects_cross_token_or_generation_mismatch(self):
         catalog = {
             "token_symbol": "AAVE",
@@ -816,6 +1491,17 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "window_start": "2026-01-01",
                 "window_end": "2026-01-31",
                 "data_generation": "generation-1",
+                "configured_cex_market_identities": {
+                    "schema": "configured_cex_market_identities/v1",
+                    "upbit": {
+                        "market_count": 1,
+                        "market_ids": ["cex:upbit:AAVE/KRW"],
+                        "market_ids_sha256": (
+                            "f6a0641ba18fc9fe86dc38d1535009418"
+                            "92ab681d9b78ce29cdf9cb1b316a8e5"
+                        ),
+                    },
+                },
             },
             "markets": [{"token_symbol": "AAVE", "market_id": "a"}],
         }
@@ -830,6 +1516,74 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             gzip_max=1000,
         )
         self.assertEqual(len(markets), 1)
+
+        configured_krw = copy.deepcopy(catalog)
+        configured_krw["markets"] = [{
+            "token_symbol": "AAVE",
+            "market_id": "cex:upbit:AAVE/KRW",
+        }]
+        try:
+            validate_token_catalog(
+                configured_krw,
+                self.metrics("/api/markets/catalog"),
+                token="AAVE",
+                start="2026-01-01",
+                end="2026-01-31",
+                generation="generation-1",
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        except ReleaseCheckError as error:
+            self.fail(
+                "Token catalog rejected configured Upbit KRW: {}".format(
+                    error
+                )
+            )
+
+        mismatched_upbit = copy.deepcopy(configured_krw)
+        mismatched_upbit["metadata"]["configured_cex_market_identities"][
+            "upbit"
+        ] = {
+            "market_count": 1,
+            "market_ids": ["cex:upbit:AAVE/USDT"],
+            "market_ids_sha256": (
+                "4a493498d2a13699db76b760609e91071"
+                "5cd3df58dc1ad988984f0e3b61a9960"
+            ),
+        }
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "configured Upbit",
+        ):
+            validate_token_catalog(
+                mismatched_upbit,
+                self.metrics("/api/markets/catalog"),
+                token="AAVE",
+                start="2026-01-01",
+                end="2026-01-31",
+                generation="generation-1",
+                raw_max=2000,
+                gzip_max=1000,
+            )
+
+        tampered_authority = copy.deepcopy(configured_krw)
+        tampered_authority["metadata"][
+            "configured_cex_market_identities"
+        ]["upbit"]["market_ids_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "count or hash",
+        ):
+            validate_token_catalog(
+                tampered_authority,
+                self.metrics("/api/markets/catalog"),
+                token="AAVE",
+                start="2026-01-01",
+                end="2026-01-31",
+                generation="generation-1",
+                raw_max=2000,
+                gzip_max=1000,
+            )
 
         with self.assertRaisesRegex(ReleaseCheckError, "leaked another Token"):
             validate_token_catalog(
@@ -850,6 +1604,23 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 start="2026-01-01",
                 end="2026-01-31",
                 generation="generation-2",
+                raw_max=2000,
+                gzip_max=1000,
+            )
+        with self.assertRaisesRegex(ReleaseCheckError, "exact CEX identity"):
+            validate_token_catalog(
+                {
+                    **catalog,
+                    "markets": [{
+                        "token_symbol": "AAVE",
+                        "market_id": "cex:coinbase:AAVE/USDT",
+                    }],
+                },
+                self.metrics("/api/markets/catalog"),
+                token="AAVE",
+                start="2026-01-01",
+                end="2026-01-31",
+                generation="generation-1",
                 raw_max=2000,
                 gzip_max=1000,
             )
@@ -879,6 +1650,45 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             end="2026-01-31",
             expected_generation="generation-1",
         )
+        comparison_with_generation = copy.deepcopy(comparison)
+        comparison_with_generation["metadata"]["comparison_generation"] = (
+            "comparison-generation-1"
+        )
+        validate_comparison(
+            comparison_with_generation,
+            token="AAVE",
+            market_a=market_a,
+            market_b=market_b,
+            start="2026-01-01",
+            end="2026-01-31",
+            expected_generation="generation-1",
+            expected_comparison_generation="comparison-generation-1",
+        )
+        for comparison_generation in (None, "comparison-generation-2"):
+            with self.subTest(
+                comparison_generation=comparison_generation,
+            ):
+                invalid = copy.deepcopy(comparison)
+                if comparison_generation is not None:
+                    invalid["metadata"]["comparison_generation"] = (
+                        comparison_generation
+                    )
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "Comparison generation",
+                ):
+                    validate_comparison(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        start="2026-01-01",
+                        end="2026-01-31",
+                        expected_generation="generation-1",
+                        expected_comparison_generation=(
+                            "comparison-generation-1"
+                        ),
+                    )
         stale_comparison = copy.deepcopy(comparison)
         stale_comparison["metadata"]["data_generation"] = "generation-2"
         with self.assertRaisesRegex(ReleaseCheckError, "generations differ"):
@@ -913,6 +1723,12 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "quality_flags": [],
                 "screening_quality_status": "ok",
                 "screening_quality_flags": [],
+                "screening_quality_scope": "catalog",
+                "screening_quality_window": {
+                    "start": "2026-01-01",
+                    "end": "2026-01-31",
+                    "method": "max_query_source_market_observed_start",
+                },
                 "facts": {
                     fact_name: {
                         "status": (
@@ -1142,6 +1958,138 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 expected_generation="generation-1",
             )
 
+        instrument_absent = copy.deepcopy(quality)
+        instrument_absent["metadata"]["daily_quality_report"].update(
+            {
+                "selected_window_issue_count": 1,
+                "issue_outcome_counts": [
+                    {
+                        "status": "source_no_observation",
+                        "reason_code": (
+                            "instrument_absent_from_current_catalog"
+                        ),
+                        "count": 1,
+                    }
+                ],
+                "reason_code_counts": {
+                    "instrument_absent_from_current_catalog": 1,
+                },
+                "status_counts": {"source_no_observation": 1},
+                "affected_date_count": 1,
+                "affected_dates": ["2026-01-15"],
+            }
+        )
+        instrument_absent["metadata"]["daily_quality_report"][
+            "market_issue_rollups"
+        ][0].update(
+            {
+                "issue_count": 1,
+                "issue_outcome_counts": [
+                    {
+                        "status": "source_no_observation",
+                        "reason_code": (
+                            "instrument_absent_from_current_catalog"
+                        ),
+                        "count": 1,
+                    }
+                ],
+                "reason_code_counts": {
+                    "instrument_absent_from_current_catalog": 1,
+                },
+                "status_counts": {"source_no_observation": 1},
+                "affected_date_count": 1,
+                "affected_dates": ["2026-01-15"],
+                "evidence_mode": "published_daily_audit",
+                "fact_outcome": {
+                    "status": "source_no_observation",
+                    "reason_code": (
+                        "instrument_absent_from_current_catalog"
+                    ),
+                    "retryable": False,
+                    "action": "operator_review_source_outcome",
+                },
+            }
+        )
+        instrument_absent["markets"][0]["facts"]["daily"].update(
+            {
+                "status": "source_no_observation",
+                "reason_code": "instrument_absent_from_current_catalog",
+                "retryable": False,
+                "action": "operator_review_source_outcome",
+                "daily_evidence_mode": "published_daily_audit",
+                "issue_status_counts": {"source_no_observation": 1},
+                "issue_outcome_counts": [
+                    {
+                        "status": "source_no_observation",
+                        "reason_code": (
+                            "instrument_absent_from_current_catalog"
+                        ),
+                        "count": 1,
+                    }
+                ],
+                "reason_code_counts": {
+                    "instrument_absent_from_current_catalog": 1,
+                },
+                "affected_date_count": 1,
+                "affected_dates": ["2026-01-15"],
+            }
+        )
+        validate_quality(
+            instrument_absent,
+            token="AAVE",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation="generation-1",
+        )
+        for lifecycle_fact_name in ("depth", "execution"):
+            with self.subTest(cex_lifecycle_fact=lifecycle_fact_name):
+                cex_lifecycle_absence = copy.deepcopy(quality)
+                cex_lifecycle_absence["markets"][0]["facts"][
+                    lifecycle_fact_name
+                ].update(
+                    {
+                        "status": "source_no_observation",
+                        "reason_code": (
+                            "instrument_absent_from_current_catalog"
+                        ),
+                        "retryable": False,
+                        "action": None,
+                    }
+                )
+                validate_quality(
+                    cex_lifecycle_absence,
+                    token="AAVE",
+                    market_a=market_a,
+                    market_b=market_b,
+                    expected_generation="generation-1",
+                )
+
+            with self.subTest(dex_lifecycle_fact=lifecycle_fact_name):
+                dex_lifecycle_absence = copy.deepcopy(quality)
+                dex_lifecycle_absence["markets"][1]["facts"][
+                    lifecycle_fact_name
+                ].update(
+                    {
+                        "status": "source_no_observation",
+                        "reason_code": (
+                            "instrument_absent_from_current_catalog"
+                        ),
+                        "retryable": False,
+                        "action": None,
+                    }
+                )
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "canonical outcome",
+                ):
+                    validate_quality(
+                        dex_lifecycle_absence,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                    )
+
         mixed_report = copy.deepcopy(quality)
         mixed_report["metadata"]["daily_quality_report"].update(
             {
@@ -1368,6 +2316,24 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 expected_generation="generation-1",
             )
 
+        fail_closed_cex_tvl = copy.deepcopy(quality)
+        fail_closed_cex_tvl["markets"][0]["facts"]["tvl"].update(
+            {
+                "status": "needs_review",
+                "reason_code": "daily_quality_outcome_invalid",
+                "retryable": False,
+                "action": "operator_manual_review",
+            }
+        )
+        with self.assertRaisesRegex(ReleaseCheckError, "canonical outcome"):
+            validate_quality(
+                fail_closed_cex_tvl,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
         needs_review = copy.deepcopy(quality)
         needs_review["markets"][0]["facts"]["depth"].update(
             {
@@ -1396,6 +2362,69 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             expected_generation="generation-1",
         )
 
+        producer_retry_actions = (
+            (
+                0,
+                "depth",
+                "collection_failed",
+                "network",
+                "retry_depth_collection",
+            ),
+            (
+                0,
+                "execution",
+                "failed",
+                "execution_snapshot_invalid",
+                "retry_execution_collection",
+            ),
+            (
+                1,
+                "tvl",
+                "collection_failed",
+                "source_unavailable",
+                "retry_tvl_collection",
+            ),
+        )
+        for (
+            market_index,
+            fact_name,
+            status,
+            reason_code,
+            action,
+        ) in producer_retry_actions:
+            with self.subTest(producer_retry_action=action):
+                retryable_fact = copy.deepcopy(quality)
+                retryable_fact["markets"][market_index]["facts"][
+                    fact_name
+                ].update(
+                    {
+                        "status": status,
+                        "reason_code": reason_code,
+                        "retryable": True,
+                        "action": action,
+                    }
+                )
+                validate_quality(
+                    retryable_fact,
+                    token="AAVE",
+                    market_a=market_a,
+                    market_b=market_b,
+                    expected_generation="generation-1",
+                )
+        missing_action = copy.deepcopy(quality)
+        missing_action["markets"][0]["facts"]["depth"].pop("action")
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "selected quality contract",
+        ):
+            validate_quality(
+                missing_action,
+                token="AAVE",
+                market_a=market_a,
+                market_b=market_b,
+                expected_generation="generation-1",
+            )
+
         invalid_tuple = copy.deepcopy(quality)
         invalid_tuple["markets"][0]["facts"]["depth"].update(
             {
@@ -1422,6 +2451,45 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "observed_value": None,
             "threshold": None,
         }
+        explicit_null_measurements = copy.deepcopy(quality)
+        explicit_null_measurements["markets"][0]["quality_status"] = (
+            "critical"
+        )
+        explicit_null_measurements["markets"][0]["quality_flags"] = [
+            copy.deepcopy(critical_flag)
+        ]
+        explicit_null_measurements["markets"][0]["facts"]["depth"][
+            "quality_flags"
+        ] = [copy.deepcopy(critical_flag)]
+        validate_quality(
+            explicit_null_measurements,
+            token="AAVE",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation="generation-1",
+        )
+        for measurement_field in ("observed_value", "threshold"):
+            with self.subTest(missing_measurement_field=measurement_field):
+                missing_measurement = copy.deepcopy(
+                    explicit_null_measurements
+                )
+                missing_measurement["markets"][0]["quality_flags"][0].pop(
+                    measurement_field
+                )
+                missing_measurement["markets"][0]["facts"]["depth"][
+                    "quality_flags"
+                ][0].pop(measurement_field)
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "missing or unknown fields",
+                ):
+                    validate_quality(
+                        missing_measurement,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                    )
         status_drift = copy.deepcopy(quality)
         status_drift["markets"][0]["quality_flags"] = [critical_flag]
         status_drift["markets"][0]["facts"]["depth"][
@@ -1670,6 +2738,41 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             expected_generation="generation-1",
             catalog_metadata=catalog_metadata,
         )
+        execution_with_generation = copy.deepcopy(execution)
+        execution_with_generation["metadata"]["execution_generation"] = (
+            "execution-generation-1"
+        )
+        validate_execution(
+            execution_with_generation,
+            token="AAVE",
+            market_a=market_a,
+            market_b=market_b,
+            expected_generation="generation-1",
+            expected_execution_generation="execution-generation-1",
+            catalog_metadata=catalog_metadata,
+        )
+        for execution_generation in (None, "execution-generation-2"):
+            with self.subTest(execution_generation=execution_generation):
+                invalid = copy.deepcopy(execution)
+                if execution_generation is not None:
+                    invalid["metadata"]["execution_generation"] = (
+                        execution_generation
+                    )
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "Execution generation",
+                ):
+                    validate_execution(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=market_b,
+                        expected_generation="generation-1",
+                        expected_execution_generation=(
+                            "execution-generation-1"
+                        ),
+                        catalog_metadata=catalog_metadata,
+                    )
         stale_execution = copy.deepcopy(execution)
         stale_execution["metadata"]["data_generation"] = "generation-2"
         with self.assertRaisesRegex(ReleaseCheckError, "generations differ"):

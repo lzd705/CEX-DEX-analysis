@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import math
 import re
@@ -12,18 +13,27 @@ import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 try:
+    from scripts.cex_instrument_lifecycle import (
+        configured_market_ids_sha256,
+    )
+    from scripts.token_registry import (
+        canonical_cex_market_ids,
+        cex_market_ids_sha256,
+    )
     from scripts.quality_outcomes import (
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from cex_instrument_lifecycle import configured_market_ids_sha256
+    from token_registry import canonical_cex_market_ids, cex_market_ids_sha256
     from quality_outcomes import (
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
@@ -43,9 +53,81 @@ class ReleaseCheckError(RuntimeError):
     """One release contract or request failed."""
 
 
+STATIC_ASSET_FILENAMES = (
+    "actions.css",
+    "actions.js",
+    "admin.css",
+    "admin.js",
+    "app.js",
+    "navigation.js",
+    "styles.css",
+    "vendor/lucide.js",
+)
+MAX_STATIC_ASSET_BYTES = 4 * 1024 * 1024
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ReleaseCheckError(message)
+
+
+def validate_release_health(
+    health: dict[str, Any],
+    *,
+    expected_application_sha: str | None = None,
+    expected_asset_sha: str | None = None,
+) -> tuple[str, str, str]:
+    application_sha = health.get("application_sha")
+    asset_sha = health.get("asset_sha")
+    asset_version = health.get("asset_version")
+    require(
+        isinstance(application_sha, str)
+        and re.fullmatch(r"[0-9a-f]{40,64}", application_sha) is not None,
+        "Health application SHA is missing or invalid",
+    )
+    require(
+        isinstance(asset_sha, str)
+        and re.fullmatch(r"[0-9a-f]{64}", asset_sha) is not None,
+        "Health asset SHA is missing or invalid",
+    )
+    if expected_application_sha is not None:
+        expected = str(expected_application_sha).strip().lower()
+        require(
+            re.fullmatch(r"[0-9a-f]{40,64}", expected) is not None,
+            "Expected application SHA is invalid",
+        )
+        require(
+            application_sha == expected,
+            "Deployed application SHA does not match the expected application SHA",
+        )
+    if expected_asset_sha is not None:
+        expected_asset = str(expected_asset_sha).strip().lower()
+        require(
+            re.fullmatch(r"[0-9a-f]{64}", expected_asset) is not None,
+            "Expected asset SHA is invalid",
+        )
+        require(
+            asset_sha == expected_asset,
+            "Deployed asset SHA does not match the expected asset SHA",
+        )
+    expected_version = f"{application_sha[:12]}-{asset_sha[:12]}"
+    require(
+        asset_version == expected_version,
+        "Health asset version does not match application and asset SHA evidence",
+    )
+    require(
+        health.get("data_status") == "current",
+        "Health freshness status is not current",
+    )
+    freshness_checked_at = validate_source_freshness(
+        health.get("freshness"),
+        label="Health",
+    )
+    validate_lifecycle_freshness(
+        health.get("cex_instrument_lifecycle"),
+        freshness_checked_at=freshness_checked_at,
+    )
+    return application_sha, asset_sha, asset_version
 
 
 COLLECTED_NOTIONALS = frozenset({1_000, 5_000, 10_000, 50_000, 100_000})
@@ -57,7 +139,7 @@ EVENT_LIFECYCLES = frozenset(
 EVENT_EVIDENCE_STATUSES = frozenset(
     {"primary_confirmed", "cross_checked", "onchain_observed"}
 )
-EXPECTED_SUMMARY_VERSION = 2
+EXPECTED_SUMMARY_VERSION = 3
 EXPECTED_QUALITY_CONTRACT_VERSION = 4
 SCREENING_QUALITY_STATUSES = frozenset({"ok", "info", "warning", "critical"})
 SCREENING_QUALITY_SEVERITIES = frozenset({"info", "warning", "critical"})
@@ -71,10 +153,22 @@ SCREENING_QUALITY_CATEGORIES = frozenset(
     }
 )
 SCREENING_QUALITY_FLAG_FIELDS = frozenset(
-    {"code", "severity", "category", "message"}
+    {
+        "code",
+        "severity",
+        "category",
+        "message",
+        "observed_value",
+        "threshold",
+    }
 )
 SCREENING_QUALITY_MARKET_FIELDS = frozenset(
-    {"screening_quality_status", "screening_quality_flags"}
+    {
+        "screening_quality_status",
+        "screening_quality_flags",
+        "screening_quality_scope",
+        "screening_quality_window",
+    }
 )
 SELECTED_QUALITY_MARKET_FIELDS = frozenset(
     {
@@ -82,6 +176,8 @@ SELECTED_QUALITY_MARKET_FIELDS = frozenset(
         "quality_flags",
         "screening_quality_status",
         "screening_quality_flags",
+        "screening_quality_scope",
+        "screening_quality_window",
     }
 )
 QUALITY_FACT_NAMES = frozenset({"daily", "tvl", "depth", "execution"})
@@ -166,6 +262,190 @@ FORBIDDEN_EVENT_RESULT_FIELDS = frozenset(
         "causal_result",
     }
 )
+CANONICAL_CEX_TVL_OUTCOME = (
+    "not_applicable",
+    "cex_markets_do_not_have_pool_tvl",
+)
+EXACT_CEX_QUOTE_ASSETS = {
+    "coinbase": "USD",
+    "kraken": "USD",
+}
+
+
+def validate_configured_cex_identity_metadata(
+    metadata: Any,
+) -> frozenset[str]:
+    """Validate the server-published authority for exact Upbit identities."""
+    root = (
+        metadata.get("configured_cex_market_identities")
+        if isinstance(metadata, dict)
+        else None
+    )
+    require(
+        isinstance(root, dict)
+        and root.get("schema") == "configured_cex_market_identities/v1"
+        and set(root) == {"schema", "upbit"},
+        "Configured Upbit market identity metadata is missing or invalid",
+    )
+    upbit = root.get("upbit")
+    require(
+        isinstance(upbit, dict)
+        and set(upbit)
+        == {"market_count", "market_ids", "market_ids_sha256"},
+        "Configured Upbit market identity metadata is missing or invalid",
+    )
+    market_ids = upbit.get("market_ids")
+    require(
+        isinstance(market_ids, list),
+        "Configured Upbit market identity inventory is invalid",
+    )
+    try:
+        canonical = canonical_cex_market_ids(
+            market_ids,
+            exchange="upbit",
+        )
+        expected_hash = cex_market_ids_sha256(
+            canonical,
+            exchange="upbit",
+        )
+    except (TypeError, ValueError) as error:
+        raise ReleaseCheckError(
+            "Configured Upbit market identity inventory is invalid"
+        ) from error
+    require(
+        list(canonical) == market_ids
+        and type(upbit.get("market_count")) is int
+        and upbit["market_count"] == len(canonical)
+        and upbit.get("market_ids_sha256") == expected_hash,
+        "Configured Upbit market identity count or hash is invalid",
+    )
+    return frozenset(canonical)
+
+
+def validate_exact_cex_market_identity(
+    market_id: Any,
+    token_symbol: Any,
+    *,
+    configured_upbit_market_ids: Any,
+) -> None:
+    """Reject known legacy quote aliases at the public release boundary."""
+    if not isinstance(market_id, str) or not market_id.startswith("cex:"):
+        return
+    match = re.fullmatch(
+        r"cex:([a-z0-9_]{2,32}):([A-Z0-9._-]{1,32})/"
+        r"([A-Z0-9._-]{1,32})",
+        market_id,
+        flags=re.ASCII,
+    )
+    require(
+        match is not None
+        and isinstance(token_symbol, str)
+        and match.group(2) == token_symbol,
+        "Full catalog exact CEX identity is invalid",
+    )
+    exchange = match.group(1)
+    if exchange == "upbit":
+        try:
+            configured_upbit = frozenset(
+                canonical_cex_market_ids(
+                    configured_upbit_market_ids,
+                    exchange="upbit",
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise ReleaseCheckError(
+                "Configured Upbit market identity inventory is invalid"
+            ) from error
+        require(
+            market_id in configured_upbit,
+            "Full catalog market is not a configured Upbit exact identity",
+        )
+        return
+    expected_quote = EXACT_CEX_QUOTE_ASSETS.get(exchange)
+    require(
+        expected_quote is None or match.group(3) == expected_quote,
+        "Full catalog exact CEX identity uses a legacy quote alias",
+    )
+
+
+def _release_quality_fact_rule(
+    market_type: Any,
+    fact_name: Any,
+    status: Any,
+    reason_code: Any,
+) -> Any:
+    """Apply release-only family constraints on top of producer rules."""
+    family = str(market_type or "").strip().lower()
+    fact = str(fact_name or "").strip().lower()
+    pair = (
+        str(status or "").strip().lower(),
+        str(reason_code or "").strip().lower(),
+    )
+    if (
+        family == "cex"
+        and fact == "tvl"
+        and pair != CANONICAL_CEX_TVL_OUTCOME
+    ):
+        return None
+    return canonical_quality_fact_rule(
+        family,
+        fact,
+        pair[0],
+        pair[1],
+    )
+
+
+def _release_quality_fact_action(
+    market_type: Any,
+    fact_name: Any,
+    status: Any,
+    reason_code: Any,
+    retryable: Any,
+    **kwargs: Any,
+) -> str | None:
+    """Derive one action without broadening an outcome to another fact."""
+    rule = _release_quality_fact_rule(
+        market_type,
+        fact_name,
+        status,
+        reason_code,
+    )
+    if (
+        rule is None
+        or type(retryable) is not bool
+        or retryable is not rule.retryable
+    ):
+        raise ValueError("quality fact outcome is not canonical")
+    return canonical_quality_fact_action(
+        market_type,
+        fact_name,
+        status,
+        reason_code,
+        retryable,
+        **kwargs,
+    )
+
+
+def _validate_endpoint_generation(
+    metadata: dict[str, Any],
+    *,
+    field: str,
+    expected: str | None,
+    label: str,
+) -> None:
+    """Enable endpoint-specific generation checks when producers publish one."""
+    if expected is None:
+        return
+    require(
+        isinstance(expected, str)
+        and bool(expected)
+        and expected == expected.strip(),
+        f"Expected {label} generation is invalid",
+    )
+    require(
+        metadata.get(field) == expected,
+        f"{label} generation differs from the expected generation",
+    )
 
 
 def fetch_json(
@@ -212,6 +492,72 @@ def fetch_json(
     )
 
 
+def fetch_static_asset_bundle(
+    base_url: str,
+    asset_version: str,
+    *,
+    timeout: float,
+) -> tuple[str, list[ResponseMetrics]]:
+    """Fetch the versioned first-party assets and recompute their exact hash."""
+    require(
+        isinstance(asset_version, str)
+        and re.fullmatch(r"[0-9a-f]{12}-[0-9a-f]{12}", asset_version)
+        is not None,
+        "Static asset version is invalid",
+    )
+    digest = hashlib.sha256()
+    metrics = []
+    for filename in STATIC_ASSET_FILENAMES:
+        path = "/{}?v={}".format(filename, asset_version)
+        request = Request(
+            "{}{}".format(base_url.rstrip("/"), path),
+            headers={"Accept-Encoding": "gzip"},
+        )
+        started = time.perf_counter()
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                body = response.read(MAX_STATIC_ASSET_BYTES + 1)
+                encoding = response.headers.get(
+                    "Content-Encoding", ""
+                ).lower()
+                status = response.status
+        except HTTPError as error:
+            raise ReleaseCheckError(
+                "{} returned HTTP {}".format(path, error.code)
+            ) from error
+        except URLError as error:
+            raise ReleaseCheckError(
+                "{} request failed: {}".format(path, error.reason)
+            ) from error
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        require(status == 200, "{} returned HTTP {}".format(path, status))
+        compressed = encoding == "gzip"
+        try:
+            raw = gzip.decompress(body) if compressed else body
+        except gzip.BadGzipFile as error:
+            raise ReleaseCheckError(
+                "{} declared invalid gzip".format(path)
+            ) from error
+        require(
+            len(raw) <= MAX_STATIC_ASSET_BYTES,
+            "{} exceeds the static asset size limit".format(path),
+        )
+        digest.update(filename.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(raw)
+        digest.update(b"\0")
+        metrics.append(
+            ResponseMetrics(
+                path=path,
+                elapsed_ms=elapsed_ms,
+                wire_bytes=len(body),
+                raw_bytes=len(raw),
+                compressed=compressed,
+            )
+        )
+    return digest.hexdigest(), metrics
+
+
 def validate_summary(
     payload: dict[str, Any],
     metrics: ResponseMetrics,
@@ -220,6 +566,15 @@ def validate_summary(
     gzip_max: int,
 ) -> tuple[str, str, str, str]:
     metadata = payload.get("metadata") or {}
+    validate_configured_cex_identity_metadata(metadata)
+    freshness_checked_at = validate_source_freshness(
+        metadata.get("freshness"),
+        label="Summary",
+    )
+    validate_lifecycle_freshness(
+        metadata.get("cex_instrument_lifecycle"),
+        freshness_checked_at=freshness_checked_at,
+    )
     tokens = payload.get("tokens")
     require(
         metadata.get("response_scope") == "screener_summary",
@@ -270,11 +625,53 @@ def validate_summary(
             ),
             "Summary quality alert counts are invalid",
         )
+        comparable_days = row.get("spread_comparable_days")
+        spread_values = {
+            field: row.get(field)
+            for field in (
+                "absolute_price_gap",
+                "maximum_absolute_price_spread",
+                "mean_absolute_price_spread",
+                "median_absolute_price_spread",
+            )
+        }
         require(
-            type(row.get("spread_comparable_days")) is int
-            and row["spread_comparable_days"] >= 0,
-            "Summary spread comparable-day count is invalid",
+            type(comparable_days) is int
+            and comparable_days >= 0
+            and row.get("price_spread_method")
+            == "directional_dex_over_cex_minus_one"
+            and row.get("absolute_price_gap_method")
+            == "symmetric_midpoint_relative_gap"
+            and all(
+                value is None
+                or (
+                    type(value) in {int, float}
+                    and math.isfinite(value)
+                    and value >= 0
+                )
+                for value in spread_values.values()
+            )
+            and (
+                all(value is None for value in spread_values.values())
+                if comparable_days == 0
+                else all(value is not None for value in spread_values.values())
+            )
+            and (
+                row.get("price_spread") is None
+                if comparable_days == 0
+                else type(row.get("price_spread")) in {int, float}
+                and math.isfinite(row["price_spread"])
+            ),
+            "Summary spread contract is invalid",
         )
+        if comparable_days:
+            maximum_gap = spread_values["maximum_absolute_price_spread"]
+            require(
+                maximum_gap >= spread_values["absolute_price_gap"]
+                and maximum_gap >= spread_values["mean_absolute_price_spread"]
+                and maximum_gap >= spread_values["median_absolute_price_spread"],
+                "Summary spread contract is internally inconsistent",
+            )
         for market_type in ("cex", "dex"):
             market = row.get(f"primary_{market_type}")
             if market is None:
@@ -284,9 +681,41 @@ def validate_summary(
                 "Summary primary market is not an object",
             )
             refresh_id = market.get("refresh_market_id")
+            market_token = market.get("token_symbol")
+            venue = market.get("venue")
+            instrument = market.get("instrument")
+            pool_address = market.get("pool_address")
+            expected_refresh_id = None
+            if market_type == "cex" and (
+                isinstance(venue, str)
+                and venue
+                and isinstance(instrument, str)
+                and "/" in instrument
+                and instrument.split("/", 1)[0] == token_symbol
+                and market_token == token_symbol
+            ):
+                expected_refresh_id = "cex:{}:{}".format(
+                    venue,
+                    instrument,
+                )
+            elif market_type == "dex" and (
+                isinstance(venue, str)
+                and venue.count(" / ") == 1
+                and isinstance(pool_address, str)
+                and bool(pool_address)
+                and market_token == token_symbol
+            ):
+                chain, dex = venue.split(" / ", 1)
+                if chain and dex:
+                    expected_refresh_id = "dex:{}:{}:{}:{}".format(
+                        chain,
+                        dex,
+                        pool_address,
+                        token_symbol,
+                    )
             require(
                 isinstance(refresh_id, str)
-                and refresh_id.startswith(f"{market_type}:"),
+                and refresh_id == expected_refresh_id,
                 "Summary primary market refresh identity is invalid",
             )
             require(
@@ -299,7 +728,7 @@ def validate_summary(
                 reason_field = f"{fact_name}_na_reason"
                 reason = market.get(reason_field)
                 retryable = market.get(f"{fact_name}_retryable")
-                rule = canonical_quality_fact_rule(
+                rule = _release_quality_fact_rule(
                     market_type,
                     fact_name,
                     status,
@@ -361,6 +790,9 @@ def validate_token_catalog(
     gzip_max: int,
 ) -> list[dict[str, Any]]:
     metadata = payload.get("metadata") or {}
+    configured_upbit_market_ids = (
+        validate_configured_cex_identity_metadata(metadata)
+    )
     markets = payload.get("markets")
     require(payload.get("token_symbol") == token, "Token catalog returned wrong Token")
     require(isinstance(markets, list) and markets, "Token catalog has no markets")
@@ -382,6 +814,12 @@ def validate_token_catalog(
         and len(set(market_ids)) == len(market_ids),
         "Token catalog market IDs are invalid or duplicated",
     )
+    for row, market_id in zip(markets, market_ids):
+        validate_exact_cex_market_identity(
+            market_id,
+            row.get("token_symbol") if isinstance(row, dict) else None,
+            configured_upbit_market_ids=configured_upbit_market_ids,
+        )
     require(metadata.get("window_start") == start, "Token catalog start window differs")
     require(metadata.get("window_end") == end, "Token catalog end window differs")
     require(
@@ -409,6 +847,7 @@ def validate_comparison(
     start: str,
     end: str,
     expected_generation: str,
+    expected_comparison_generation: str | None = None,
 ) -> None:
     metadata = payload.get("metadata") or {}
     observations = payload.get("observations")
@@ -426,6 +865,12 @@ def validate_comparison(
     require(
         metadata.get("data_generation") == expected_generation,
         "Summary and Compare generations differ",
+    )
+    _validate_endpoint_generation(
+        metadata,
+        field="comparison_generation",
+        expected=expected_comparison_generation,
+        label="Comparison",
     )
     require(
         isinstance(observations, list) and observations,
@@ -504,7 +949,7 @@ def _normalized_daily_outcome_counts(
         families = (market_type,) if market_type else ("cex", "dex")
         require(
             any(
-                canonical_quality_fact_rule(
+                _release_quality_fact_rule(
                     family,
                     "daily",
                     pair[0],
@@ -821,7 +1266,7 @@ def _validate_daily_fact_evidence(
                 "Quality daily fact zero evidence/action is invalid",
             )
             try:
-                expected_action = canonical_quality_fact_action(
+                expected_action = _release_quality_fact_action(
                     market_type,
                     "daily",
                     status,
@@ -866,7 +1311,7 @@ def _validate_daily_fact_evidence(
         )
         manual_review_present = bool(status_counts.get("needs_review"))
         try:
-            expected_action = canonical_quality_fact_action(
+            expected_action = _release_quality_fact_action(
                 market_type,
                 "daily",
                 expected_status,
@@ -943,7 +1388,7 @@ def _validate_daily_fact_evidence(
         "Quality daily fact lacks required published evidence/action",
     )
     try:
-        expected_action = canonical_quality_fact_action(
+        expected_action = _release_quality_fact_action(
             market_type,
             "daily",
             status,
@@ -1033,6 +1478,7 @@ def validate_quality(
             quality_fields == SELECTED_QUALITY_MARKET_FIELDS,
             "Quality selected quality contract has missing projection fields",
         )
+        _validate_screening_context(row)
         selected_status = row["quality_status"]
         selected_flags = row["quality_flags"]
         screening_status = row["screening_quality_status"]
@@ -1118,7 +1564,7 @@ def validate_quality(
                     "Quality facts contain conflicting flag projections",
                 )
                 fact_flags_by_code[normalized_flag["code"]] = normalized_flag
-            rule = canonical_quality_fact_rule(
+            rule = _release_quality_fact_rule(
                 market_type,
                 fact_name,
                 status,
@@ -1155,7 +1601,7 @@ def validate_quality(
                 daily_evidence_rows.append(daily_evidence)
                 expected_action = fact.get("action")
             else:
-                expected_action = canonical_quality_fact_action(
+                expected_action = _release_quality_fact_action(
                     market_type,
                     fact_name,
                     status,
@@ -1299,12 +1745,54 @@ def _validate_screening_flag(flag: Any) -> dict[str, str]:
         and "\\" not in message,
         "Quality screening flag message contains a protected path",
     )
-    return {
-        "code": code,
-        "severity": severity,
-        "category": category,
-        "message": message,
-    }
+    for field in ("observed_value", "threshold"):
+        try:
+            encoded = json.dumps(
+                flag[field],
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as error:
+            raise ReleaseCheckError(
+                "Quality screening measurement is not bounded JSON"
+            ) from error
+        require(
+            len(encoded) <= 1024
+            and RAW_URL_PATTERN.search(encoded) is None
+            and ABSOLUTE_POSIX_PATH_PATTERN.search(encoded) is None
+            and "\\" not in encoded,
+            "Quality screening measurement exposes unbounded or protected data",
+        )
+    return dict(flag)
+
+
+def _validate_screening_context(market: dict[str, Any]) -> None:
+    require(
+        market.get("screening_quality_scope") == "catalog",
+        "Quality screening scope is invalid",
+    )
+    window = market.get("screening_quality_window")
+    require(
+        isinstance(window, dict)
+        and set(window) == {"start", "end", "method"},
+        "Quality screening evaluation window is invalid",
+    )
+    start = window["start"]
+    end = window["end"]
+    method = window["method"]
+    require(
+        (start is None or _is_canonical_date(start))
+        and (end is None or _is_canonical_date(end))
+        and isinstance(method, (str, type(None)))
+        and (method is None or (method == method.strip() and len(method) <= 96)),
+        "Quality screening evaluation window is not bounded",
+    )
+    require(
+        start is None or end is None or start <= end,
+        "Quality screening evaluation window is reversed",
+    )
 
 
 def _validate_selected_quality_flag(flag: Any) -> dict[str, Any]:
@@ -1314,6 +1802,8 @@ def _validate_selected_quality_flag(flag: Any) -> dict[str, Any]:
         set(flag) == SELECTED_QUALITY_FLAG_FIELDS,
         "Quality selected quality contract flag has missing or unknown fields",
     )
+    # The producer always emits both measurement keys. An explicit JSON null
+    # is canonical when a flag does not have a numeric measurement.
     code = flag["code"]
     severity = flag["severity"]
     category = flag["category"]
@@ -1340,6 +1830,130 @@ def _validate_selected_quality_flag(flag: Any) -> dict[str, Any]:
         "Quality selected quality contract flag exposes protected text",
     )
     return flag
+
+
+def _validate_all_scope_market_fact_contract(
+    market: dict[str, Any],
+    *,
+    token: str,
+    daily_report: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate every fact family for one scope=all Quality market.
+
+    Screening parity covers the complete catalog, so it must not validate only
+    the screening badges while leaving non-primary market facts unchecked.
+    """
+    market_type = market.get("market_type")
+    market_id = market.get("market_id")
+    require(
+        market_type in {"cex", "dex"}
+        and isinstance(market_id, str)
+        and market_id.startswith("{}:".format(market_type))
+        and market.get("token_symbol") == token,
+        "Quality all-scope market identity/type is inconsistent",
+    )
+    facts = market.get("facts")
+    require(
+        isinstance(facts, dict) and set(facts) == QUALITY_FACT_NAMES,
+        "Quality all-scope market has missing or unknown fact families",
+    )
+    selected_status = market.get("quality_status")
+    selected_flags = market.get("quality_flags")
+    require(
+        selected_status in SCREENING_QUALITY_STATUSES
+        and isinstance(selected_flags, list)
+        and (selected_status == "ok" or bool(selected_flags)),
+        "Quality all-scope selected quality projection is invalid",
+    )
+    selected_flags_by_code: dict[str, dict[str, Any]] = {}
+    for raw_flag in selected_flags:
+        flag = _validate_selected_quality_flag(raw_flag)
+        require(
+            flag["code"] not in selected_flags_by_code,
+            "Quality all-scope selected quality flags are duplicated",
+        )
+        selected_flags_by_code[flag["code"]] = flag
+    require(
+        selected_status == _quality_status_from_flags(
+            list(selected_flags_by_code.values())
+        ),
+        "Quality all-scope selected quality status differs from its flags",
+    )
+    fact_flags_by_code: dict[str, dict[str, Any]] = {}
+    daily_evidence: dict[str, Any] | None = None
+    for fact_name in QUALITY_FACT_NAMES:
+        fact = facts[fact_name]
+        status = fact.get("status") if isinstance(fact, dict) else None
+        reason_code = fact.get("reason_code") if isinstance(fact, dict) else None
+        retryable = fact.get("retryable") if isinstance(fact, dict) else None
+        action = fact.get("action") if isinstance(fact, dict) else None
+        flags = fact.get("quality_flags") if isinstance(fact, dict) else None
+        require(
+            isinstance(fact, dict)
+            and isinstance(status, str)
+            and 0 < len(status) <= 64
+            and SCREENING_QUALITY_CODE_PATTERN.fullmatch(status) is not None
+            and isinstance(reason_code, str)
+            and 0 < len(reason_code) <= 64
+            and SCREENING_QUALITY_CODE_PATTERN.fullmatch(reason_code) is not None
+            and type(retryable) is bool
+            and "action" in fact
+            and (action is None or isinstance(action, str))
+            and isinstance(flags, list),
+            "Quality all-scope market has an invalid fact projection",
+        )
+        for raw_flag in flags:
+            flag = _validate_selected_quality_flag(raw_flag)
+            prior = fact_flags_by_code.get(flag["code"])
+            require(
+                prior is None or prior == flag,
+                "Quality all-scope facts contain conflicting flag projections",
+            )
+            fact_flags_by_code[flag["code"]] = flag
+        rule = _release_quality_fact_rule(
+            market_type,
+            fact_name,
+            status,
+            reason_code,
+        )
+        require(
+            rule is not None and retryable is rule.retryable,
+            "Quality all-scope market does not use a canonical fact outcome",
+        )
+        if fact_name == "daily":
+            daily_evidence = _validate_daily_fact_evidence(
+                fact,
+                market_type=market_type,
+                report_status=daily_report["status"],
+            )
+            require(
+                daily_evidence
+                == daily_report["market_rollups"].get(market_id),
+                "Quality all-scope daily fact does not match its report rollup",
+            )
+            continue
+        try:
+            expected_action = _release_quality_fact_action(
+                market_type,
+                fact_name,
+                status,
+                reason_code,
+                retryable,
+            )
+        except ValueError as error:
+            raise ReleaseCheckError(
+                "Quality all-scope market does not use a canonical fact action"
+            ) from error
+        require(
+            action == expected_action,
+            "Quality all-scope market does not use a canonical fact action",
+        )
+    require(
+        selected_flags_by_code == fact_flags_by_code,
+        "Quality all-scope selected quality flags differ from fact flags",
+    )
+    assert daily_evidence is not None
+    return daily_evidence
 
 
 def validate_screening_quality_parity(
@@ -1390,9 +2004,36 @@ def validate_screening_quality_parity(
         "Quality market count does not match Summary",
     )
 
+    declared_market_ids = {
+        market.get("market_id")
+        for market in markets
+        if isinstance(market, dict)
+        and isinstance(market.get("market_id"), str)
+    }
+    require(
+        all(
+            isinstance(market, dict)
+            and isinstance(market.get("market_id"), str)
+            and bool(market["market_id"])
+            and market["market_id"] == market["market_id"].strip()
+            for market in markets
+        )
+        and len(declared_market_ids) == len(markets),
+        "Quality market IDs are invalid or duplicated",
+    )
+    daily_report = _validate_daily_quality_report(
+        metadata.get("daily_quality_report"),
+        expected_market_ids=declared_market_ids,
+    )
+    require(
+        daily_report["status"] == "matched",
+        "Screening Quality daily audit is not matched to the current import",
+    )
+
     market_ids: set[str] = set()
     status_counts: Counter[str] = Counter()
     alert_counts: Counter[str] = Counter()
+    daily_evidence_rows: list[dict[str, Any]] = []
     for market in markets:
         require(isinstance(market, dict), "Quality market is not an object")
         market_id = market.get("market_id")
@@ -1408,6 +2049,13 @@ def validate_screening_quality_parity(
             market.get("token_symbol") == token,
             "Quality market Token does not match Summary",
         )
+        daily_evidence_rows.append(
+            _validate_all_scope_market_fact_contract(
+                market,
+                token=token,
+                daily_report=daily_report,
+            )
+        )
         screening_fields = {
             key
             for key in market
@@ -1417,6 +2065,7 @@ def validate_screening_quality_parity(
             screening_fields == SCREENING_QUALITY_MARKET_FIELDS,
             "Quality market has missing or unknown screening quality fields",
         )
+        _validate_screening_context(market)
         status = market["screening_quality_status"]
         require(
             isinstance(status, str)
@@ -1429,10 +2078,16 @@ def validate_screening_quality_parity(
             status == "ok" or bool(flags),
             "Quality non-OK status has no fallback alert",
         )
-        status_counts[status] += 1
+        normalized_screening_flags = []
         for raw_flag in flags:
             flag = _validate_screening_flag(raw_flag)
+            normalized_screening_flags.append(flag)
             alert_counts[flag["severity"]] += 1
+        require(
+            status == _quality_status_from_flags(normalized_screening_flags),
+            "Quality screening status differs from its flags",
+        )
+        status_counts[status] += 1
 
     expected_status_counts = _normalized_summary_counts(
         summary_row.get("quality_status_counts"),
@@ -1453,6 +2108,33 @@ def validate_screening_quality_parity(
     require(
         actual_alert_counts == expected_alert_counts,
         "Summary screening quality alert counts do not match Quality",
+    )
+    published_issue_count = sum(
+        evidence["issue_count"]
+        for evidence in daily_evidence_rows
+        if evidence["mode"] == "published_daily_audit"
+    )
+    published_status_counts: Counter[str] = Counter()
+    published_reason_counts: Counter[str] = Counter()
+    published_outcome_counts: Counter[tuple[str, str]] = Counter()
+    published_dates: set[str] = set()
+    for evidence in daily_evidence_rows:
+        if evidence["mode"] != "published_daily_audit":
+            continue
+        published_status_counts.update(evidence["status_counts"])
+        published_reason_counts.update(evidence["reason_counts"])
+        published_outcome_counts.update(evidence["outcome_counts"])
+        published_dates.update(evidence["affected_dates"])
+    require(
+        published_issue_count == daily_report["issue_count"]
+        and dict(sorted(published_status_counts.items()))
+        == daily_report["status_counts"]
+        and dict(sorted(published_reason_counts.items()))
+        == daily_report["reason_counts"]
+        and dict(sorted(published_outcome_counts.items()))
+        == daily_report["outcome_counts"]
+        and sorted(published_dates) == daily_report["affected_dates"],
+        "Screening Quality daily facts do not reconcile to the report",
     )
     return {
         "token_symbol": token,
@@ -1507,6 +2189,193 @@ def _canonical_cohort_timestamp(
         f"{label} {field} is not canonical UTC",
     )
     return normalized
+
+
+def validate_source_freshness(
+    freshness: Any,
+    *,
+    label: str,
+) -> datetime:
+    """Require every release-critical source to be current and self-consistent."""
+    require(isinstance(freshness, dict), f"{label} freshness is missing")
+    required = {
+        "checked_at",
+        "overall_status",
+        "common_comparable_end",
+        "cex_daily",
+        "dex_daily",
+        "dex_tvl",
+        "cex_depth",
+        "dex_depth",
+        "cex_execution",
+        "dex_execution",
+    }
+    require(
+        required.issubset(freshness),
+        f"{label} freshness is incomplete",
+    )
+    checked_at = _canonical_cohort_timestamp(
+        freshness.get("checked_at"),
+        label,
+        "freshness.checked_at",
+    )
+    require(
+        freshness.get("overall_status") == "current",
+        f"{label} freshness overall status is not current",
+    )
+
+    daily_ends: list[str] = []
+    latest_completed = (checked_at.date() - timedelta(days=1)).isoformat()
+    for source_name in ("cex_daily", "dex_daily"):
+        item = freshness.get(source_name)
+        require(
+            isinstance(item, dict)
+            and item.get("source") == source_name
+            and item.get("status") == "current",
+            f"{label} freshness {source_name} is not current",
+        )
+        available_start = item.get("available_start")
+        available_end = item.get("available_end")
+        completed = item.get("latest_completed_utc_day")
+        require(
+            _is_canonical_date(available_start)
+            and _is_canonical_date(available_end)
+            and available_start <= available_end
+            and completed == latest_completed,
+            f"{label} freshness {source_name} date bounds are invalid",
+        )
+        lag_days = item.get("lag_days")
+        max_lag_days = item.get("max_lag_days")
+        expected_lag = max(
+            0,
+            (
+                datetime.strptime(latest_completed, "%Y-%m-%d").date()
+                - datetime.strptime(available_end, "%Y-%m-%d").date()
+            ).days,
+        )
+        require(
+            type(lag_days) is int
+            and type(max_lag_days) is int
+            and max_lag_days >= 0
+            and lag_days == expected_lag
+            and lag_days <= max_lag_days,
+            f"{label} freshness {source_name} lag is stale or inconsistent",
+        )
+        daily_ends.append(available_end)
+
+    require(
+        freshness.get("common_comparable_end") == min(daily_ends),
+        f"{label} freshness common comparable end is inconsistent",
+    )
+    for source_name in (
+        "dex_tvl",
+        "cex_depth",
+        "dex_depth",
+        "cex_execution",
+        "dex_execution",
+    ):
+        item = freshness.get(source_name)
+        require(
+            isinstance(item, dict)
+            and item.get("source") == source_name
+            and item.get("status") == "current",
+            f"{label} freshness {source_name} is not current",
+        )
+        observed_at = _canonical_cohort_timestamp(
+            item.get("observed_at"),
+            label,
+            "freshness.{}.observed_at".format(source_name),
+        )
+        age_hours = item.get("age_hours")
+        max_age_hours = item.get("max_age_hours")
+        expected_age = round(
+            max(0.0, (checked_at - observed_at).total_seconds() / 3600),
+            3,
+        )
+        require(
+            type(age_hours) in {int, float}
+            and not isinstance(age_hours, bool)
+            and math.isfinite(age_hours)
+            and type(max_age_hours) in {int, float}
+            and not isinstance(max_age_hours, bool)
+            and math.isfinite(max_age_hours)
+            and max_age_hours > 0
+            and abs(float(age_hours) - expected_age) <= 0.001
+            and 0 <= float(age_hours) <= float(max_age_hours)
+            and observed_at <= checked_at + timedelta(minutes=5),
+            f"{label} freshness {source_name} age is stale or inconsistent",
+        )
+    return checked_at
+
+
+def validate_lifecycle_freshness(
+    lifecycle: Any,
+    *,
+    freshness_checked_at: datetime,
+) -> None:
+    """Reject releases backed by expired CEX catalog-membership evidence."""
+    require(
+        isinstance(lifecycle, dict)
+        and lifecycle.get("schema") == "cex_instrument_lifecycle/v1",
+        "Summary CEX lifecycle freshness is missing",
+    )
+    for field in (
+        "reviewed_market_count",
+        "absence_market_count",
+        "applied_market_count",
+        "withheld_payload_market_count",
+        "stale_evidence_market_count",
+    ):
+        require(
+            type(lifecycle.get(field)) is int and lifecycle[field] >= 0,
+            "Summary CEX lifecycle counts are invalid",
+        )
+    require(
+        lifecycle["absence_market_count"]
+        <= lifecycle["reviewed_market_count"]
+        and lifecycle["applied_market_count"]
+        == lifecycle["absence_market_count"]
+        and lifecycle["withheld_payload_market_count"]
+        <= lifecycle["applied_market_count"]
+        and lifecycle["stale_evidence_market_count"] == 0,
+        "Summary CEX lifecycle evidence is stale",
+    )
+    official_inventory_count = lifecycle.get("official_inventory_count")
+    response_sha256 = lifecycle.get("response_sha256")
+    configured_market_hash = lifecycle.get("configured_market_ids_sha256")
+    require(
+        type(official_inventory_count) is int
+        and official_inventory_count > 0
+        and isinstance(response_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", response_sha256) is not None,
+        "Summary CEX lifecycle root evidence is invalid",
+    )
+    require(
+        isinstance(configured_market_hash, str)
+        and re.fullmatch(r"[0-9a-f]{64}", configured_market_hash) is not None,
+        "Summary CEX lifecycle configured-market evidence is invalid",
+    )
+    max_age = lifecycle.get("freshness_max_age_seconds")
+    require(
+        type(max_age) is int and max_age > 0,
+        "Summary CEX lifecycle freshness threshold is invalid",
+    )
+    checked_min = _canonical_cohort_timestamp(
+        lifecycle.get("checked_at_min"),
+        "Summary CEX lifecycle",
+        "checked_at_min",
+    )
+    checked_max = _canonical_cohort_timestamp(
+        lifecycle.get("checked_at_max"),
+        "Summary CEX lifecycle",
+        "checked_at_max",
+    )
+    oldest_age = (freshness_checked_at - checked_min).total_seconds()
+    require(
+        checked_min <= checked_max
+        and -300 <= oldest_age <= max_age,
+        "Summary CEX lifecycle evidence exceeds its freshness threshold",
+    )
 
 
 def _validate_cohort_observation_metadata(
@@ -1570,11 +2439,18 @@ def validate_execution(
     market_b: str,
     expected_generation: str,
     catalog_metadata: dict[str, Any],
+    expected_execution_generation: str | None = None,
 ) -> None:
     metadata = payload.get("metadata") or {}
     require(
         metadata.get("data_generation") == expected_generation,
         "Summary and Execution generations differ",
+    )
+    _validate_endpoint_generation(
+        metadata,
+        field="execution_generation",
+        expected=expected_execution_generation,
+        label="Execution",
     )
     require(
         metadata.get("cohort_observation_model")
@@ -2066,6 +2942,21 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
     metrics.append(health_metrics)
     require(health.get("status") == "ok", "Health status is not ok")
     require(health.get("data_ready") is True, "Health reports data_ready=false")
+    application_sha, asset_sha, asset_version = validate_release_health(
+        health,
+        expected_application_sha=getattr(args, "expected_application_sha", None),
+        expected_asset_sha=getattr(args, "expected_asset_sha", None),
+    )
+    served_asset_sha, asset_metrics = fetch_static_asset_bundle(
+        args.base_url,
+        asset_version,
+        timeout=args.timeout,
+    )
+    metrics.extend(asset_metrics)
+    require(
+        served_asset_sha == asset_sha,
+        "Versioned served assets do not match the deployed asset SHA",
+    )
 
     summary, summary_metrics = fetch_json(
         args.base_url,
@@ -2138,6 +3029,14 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         for row in summary["tokens"]
         if isinstance(row, dict) and isinstance(row.get("token_symbol"), str)
     }
+    summary_primary_market_pairs = {
+        (row["token_symbol"], primary["refresh_market_id"])
+        for row in summary["tokens"]
+        if isinstance(row, dict) and isinstance(row.get("token_symbol"), str)
+        for primary in (row.get("primary_cex"), row.get("primary_dex"))
+        if isinstance(primary, dict)
+        and isinstance(primary.get("refresh_market_id"), str)
+    }
 
     catalog_path = "/api/markets/catalog?" + urlencode(
         {"token": token, "start": start, "end": end}
@@ -2158,6 +3057,13 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         raw_max=args.token_raw_max,
         gzip_max=args.token_gzip_max,
     )
+    require(
+        token_catalog.get("metadata", {}).get(
+            "configured_cex_market_identities"
+        )
+        == summary_metadata.get("configured_cex_market_identities"),
+        "Summary and Token catalog configured Upbit identities differ",
+    )
     token_catalog_market_ids = {
         str(market["market_id"])
         for market in markets
@@ -2175,6 +3081,14 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         isinstance(full_catalog_metadata, dict)
         and full_catalog_metadata.get("data_generation") == generation,
         "Summary and full catalog generation differ",
+    )
+    configured_upbit_market_ids = (
+        validate_configured_cex_identity_metadata(full_catalog_metadata)
+    )
+    require(
+        full_catalog_metadata.get("configured_cex_market_identities")
+        == summary_metadata.get("configured_cex_market_identities"),
+        "Summary and full catalog configured Upbit identities differ",
     )
     full_markets = full_catalog.get("markets")
     require(isinstance(full_markets, list), "Full audit catalog has no markets array")
@@ -2205,6 +3119,11 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         full_market_ids.add(market_id)
         full_market_pairs.add((market_token, market_id))
         full_catalog_tokens.add(market_token)
+        validate_exact_cex_market_identity(
+            market_id,
+            market_token,
+            configured_upbit_market_ids=configured_upbit_market_ids,
+        )
     require(
         full_catalog_tokens == summary_token_set,
         "Full audit catalog Token inventory differs from Summary",
@@ -2220,6 +3139,31 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
     require(
         audited_market_pairs == full_market_pairs,
         "Screening Quality exact market inventory differs from the full catalog",
+    )
+    lifecycle = summary_metadata.get("cex_instrument_lifecycle")
+    require(isinstance(lifecycle, dict), "Summary lifecycle catalog is missing")
+    crypto_com_market_ids = {
+        market_id
+        for market_id in full_market_ids
+        if market_id.startswith("cex:crypto_com:")
+    }
+    try:
+        crypto_com_market_hash = configured_market_ids_sha256(
+            crypto_com_market_ids
+        )
+    except (TypeError, ValueError) as error:
+        raise ReleaseCheckError(
+            "Full lifecycle catalog identity inventory is invalid"
+        ) from error
+    require(
+        len(crypto_com_market_ids) == lifecycle["reviewed_market_count"]
+        and crypto_com_market_hash
+        == lifecycle["configured_market_ids_sha256"],
+        "Summary lifecycle catalog does not match the full catalog",
+    )
+    require(
+        summary_primary_market_pairs <= full_market_pairs,
+        "Summary primary market refresh identity is absent from the full catalog",
     )
     require(
         token_catalog_market_ids
@@ -2360,6 +3304,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         start=start,
         end=end,
         expected_generation=generation,
+        expected_comparison_generation=generation,
     )
 
     quality, quality_metrics = fetch_json(
@@ -2388,7 +3333,42 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         market_a=market_a,
         market_b=market_b,
         expected_generation=generation,
+        expected_execution_generation=generation,
         catalog_metadata=full_catalog.get("metadata") or {},
+    )
+
+    final_health, final_health_metrics = fetch_json(
+        args.base_url,
+        "/health",
+        timeout=args.timeout,
+    )
+    metrics.append(final_health_metrics)
+    require(final_health.get("status") == "ok", "Final Health status is not ok")
+    require(
+        final_health.get("data_ready") is True,
+        "Final Health reports data_ready=false",
+    )
+    final_application_sha, final_asset_sha, final_asset_version = (
+        validate_release_health(
+            final_health,
+            expected_application_sha=application_sha,
+            expected_asset_sha=asset_sha,
+        )
+    )
+    require(
+        (final_application_sha, final_asset_sha, final_asset_version)
+        == (application_sha, asset_sha, asset_version),
+        "Application or frontend assets changed during release validation",
+    )
+    final_served_asset_sha, final_asset_metrics = fetch_static_asset_bundle(
+        args.base_url,
+        final_asset_version,
+        timeout=args.timeout,
+    )
+    metrics.extend(final_asset_metrics)
+    require(
+        final_served_asset_sha == final_asset_sha,
+        "Final versioned served assets do not match the deployed asset SHA",
     )
 
     final_summary, final_summary_metrics = fetch_json(
@@ -2402,6 +3382,14 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         final_summary_metadata.get("data_generation") == generation,
         "Published data generation changed during release validation",
     )
+    final_freshness_checked_at = validate_source_freshness(
+        final_summary_metadata.get("freshness"),
+        label="Final Summary",
+    )
+    validate_lifecycle_freshness(
+        final_summary_metadata.get("cex_instrument_lifecycle"),
+        freshness_checked_at=final_freshness_checked_at,
+    )
 
     return {
         "status": "ok",
@@ -2409,6 +3397,9 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "token": token,
         "window": {"start": start, "end": end},
         "data_generation": generation,
+        "application_sha": application_sha,
+        "asset_sha": asset_sha,
+        "asset_version": asset_version,
         "token_count": len(summary["tokens"]),
         "screening_quality_parity_count": screening_quality_parity_count,
         "screening_quality_market_count": screening_quality_market_count,
@@ -2437,6 +3428,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-gzip-max", type=int, default=25_000)
     parser.add_argument("--token-raw-max", type=int, default=250_000)
     parser.add_argument("--token-gzip-max", type=int, default=50_000)
+    parser.add_argument(
+        "--expected-application-sha",
+        help="Require /health to report this exact deployed Git SHA",
+    )
+    parser.add_argument(
+        "--expected-asset-sha",
+        help="Require /health to report this exact deployed frontend asset SHA",
+    )
     return parser.parse_args()
 
 

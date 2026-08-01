@@ -35,6 +35,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dashboard.freshness import build_source_freshness
 from scripts.publication_gate import COVERAGE_GATE_LOG_MARKER
+from scripts.cex_instrument_lifecycle import (
+    load_cex_instrument_lifecycle_manifest,
+)
+from scripts.timestamp_contract import (
+    parse_rfc3339_utc,
+    validate_observation_bounds,
+)
 from scripts.token_registry import TokenRegistry
 
 
@@ -42,13 +49,16 @@ DEFAULT_DATA_DIR = PROJECT_ROOT / "data/local"
 TOKEN_CONFIG = PROJECT_ROOT / "config/tokens.csv"
 DEX_PRICE_INPUT = PROJECT_ROOT / "data/processed/dex_pool_tvl_snapshot.csv"
 PROFILE_STEPS = {
-    "full": ("daily", "depth", "tvl", "dex_depth"),
-    "daily": ("daily", "tvl"),
+    "full": ("lifecycle", "daily", "depth", "tvl", "dex_depth"),
+    "daily": ("lifecycle", "daily", "tvl"),
     "tvl": ("tvl",),
     "depth": ("depth", "dex_price", "dex_depth"),
     "cex_depth": ("depth",),
     "dex_depth": ("dex_price", "dex_depth"),
 }
+LIFECYCLE_FILENAME = "cex_instrument_lifecycle.json"
+LIFECYCLE_FRESHNESS_SECONDS = 36 * 60 * 60
+LIFECYCLE_FUTURE_TOLERANCE_SECONDS = 5 * 60
 DAILY_FILENAMES = {
     "cex_daily": "cex_exchange_volume_daily.csv",
     "dex_daily": "dex_pool_volume_daily.csv",
@@ -104,16 +114,29 @@ def csv_date_bounds(path: Path) -> dict[str, str] | None:
     }
 
 
-def snapshot_summary(path: Path) -> dict[str, Any] | None:
+def snapshot_summary(
+    path: Path,
+    *,
+    require_complete_observations: bool = False,
+) -> dict[str, Any] | None:
     if not path.exists():
         return None
     with path.open("r", newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     if not rows:
         return None
-    observed_at_values = sorted(
-        row["observed_at"] for row in rows if row.get("observed_at")
-    )
+    if require_complete_observations:
+        observed_at_min, observed_at_max = validate_observation_bounds(rows)
+    else:
+        observed_at_values = sorted(
+            row["observed_at"] for row in rows if row.get("observed_at")
+        )
+        observed_at_min = (
+            observed_at_values[0] if observed_at_values else None
+        )
+        observed_at_max = (
+            observed_at_values[-1] if observed_at_values else None
+        )
     return {
         "snapshot_ids": sorted(
             {row["snapshot_id"] for row in rows if row.get("snapshot_id")}
@@ -128,13 +151,13 @@ def snapshot_summary(path: Path) -> dict[str, Any] | None:
         # Full-inventory freshness is conservative. A bounded one-market
         # refresh must not make every retained non-target row look current.
         "observed_at": (
-            observed_at_values[0] if observed_at_values else None
+            observed_at_min
         ),
         "observed_at_min": (
-            observed_at_values[0] if observed_at_values else None
+            observed_at_min
         ),
         "observed_at_max": (
-            observed_at_values[-1] if observed_at_values else None
+            observed_at_max
         ),
         "row_count": len(rows),
         "status_counts": dict(Counter(row.get("status") or "missing_status" for row in rows)),
@@ -152,6 +175,59 @@ def file_record(path: Path) -> dict[str, Any]:
     }
 
 
+def lifecycle_summary(
+    path: Path,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    record = file_record(path)
+    if not record["exists"]:
+        return {
+            "status": "unavailable",
+            "threshold_seconds": LIFECYCLE_FRESHNESS_SECONDS,
+            "file": record,
+        }
+    try:
+        payload = load_cex_instrument_lifecycle_manifest(path)
+        checked_at_text = payload["checked_at_utc"]
+        checked_at = parse_rfc3339_utc(checked_at_text)
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return {
+            "status": "invalid",
+            "reason": "manifest_validation_failed",
+            "threshold_seconds": LIFECYCLE_FRESHNESS_SECONDS,
+            "file": record,
+        }
+    age_seconds = (now - checked_at).total_seconds()
+    if age_seconds < -LIFECYCLE_FUTURE_TOLERANCE_SECONDS:
+        status = "invalid"
+        reason = "generated_at_in_future"
+    elif age_seconds > LIFECYCLE_FRESHNESS_SECONDS:
+        status = "stale"
+        reason = "freshness_threshold_exceeded"
+    else:
+        status = "current"
+        reason = None
+    summary = {
+        "status": status,
+        "generated_at_utc": payload["generated_at_utc"],
+        "checked_at_utc": checked_at_text,
+        "response_sha256": payload["response_sha256"],
+        "inventory_count": payload["inventory_count"],
+        "configured_market_count": payload["configured_market_count"],
+        "configured_market_ids_sha256": payload[
+            "configured_market_ids_sha256"
+        ],
+        "age_seconds": round(age_seconds, 3),
+        "threshold_seconds": LIFECYCLE_FRESHNESS_SECONDS,
+        "review_count": payload["review_count"],
+        "file": record,
+    }
+    if reason is not None:
+        summary["reason"] = reason
+    return summary
+
+
 def build_collection_status(
     data_dir: Path = DEFAULT_DATA_DIR,
     *,
@@ -165,15 +241,31 @@ def build_collection_status(
     dex_depth_path = data_dir / SNAPSHOT_FILENAMES["dex_depth"]
     cex_execution_path = data_dir / SNAPSHOT_FILENAMES["cex_execution_cost"]
     dex_execution_path = data_dir / SNAPSHOT_FILENAMES["dex_execution_cost"]
+    lifecycle_path = data_dir / LIFECYCLE_FILENAME
     source_date_ranges = {
         "cex_daily": csv_date_bounds(cex_path),
         "dex_daily": csv_date_bounds(dex_path),
     }
-    tvl = snapshot_summary(tvl_path)
-    depth = snapshot_summary(depth_path)
-    dex_depth = snapshot_summary(dex_depth_path)
-    cex_execution = snapshot_summary(cex_execution_path)
-    dex_execution = snapshot_summary(dex_execution_path)
+    tvl = snapshot_summary(
+        tvl_path,
+        require_complete_observations=True,
+    )
+    depth = snapshot_summary(
+        depth_path,
+        require_complete_observations=True,
+    )
+    dex_depth = snapshot_summary(
+        dex_depth_path,
+        require_complete_observations=True,
+    )
+    cex_execution = snapshot_summary(
+        cex_execution_path,
+        require_complete_observations=True,
+    )
+    dex_execution = snapshot_summary(
+        dex_execution_path,
+        require_complete_observations=True,
+    )
     return {
         "checked_at": utc_text(checked_at),
         "source_date_ranges": source_date_ranges,
@@ -182,6 +274,10 @@ def build_collection_status(
         "dex_depth_snapshot": dex_depth,
         "cex_execution_cost_snapshot": cex_execution,
         "dex_execution_cost_snapshot": dex_execution,
+        "cex_instrument_lifecycle": lifecycle_summary(
+            lifecycle_path,
+            now=checked_at,
+        ),
         "freshness": build_source_freshness(
             source_date_ranges,
             tvl_observed_at=tvl.get("observed_at") if tvl else None,
@@ -203,7 +299,11 @@ def build_collection_status(
         ),
         "files": {
             name: file_record(data_dir / filename)
-            for name, filename in {**DAILY_FILENAMES, **SNAPSHOT_FILENAMES}.items()
+            for name, filename in {
+                **DAILY_FILENAMES,
+                **SNAPSHOT_FILENAMES,
+                "cex_instrument_lifecycle": LIFECYCLE_FILENAME,
+            }.items()
         },
     }
 
@@ -328,7 +428,25 @@ def build_step_commands(
     raw_root = data_dir / "raw"
     commands: list[tuple[str, list[str]]] = []
     for step in PROFILE_STEPS[profile]:
-        if step == "daily":
+        if step == "lifecycle":
+            manifest_path = (
+                data_dir / LIFECYCLE_FILENAME
+                if publish_local
+                else processed_dir / LIFECYCLE_FILENAME
+            )
+            command = [
+                python_executable,
+                str(PROJECT_ROOT / "scripts/collect_cex_instrument_lifecycle.py"),
+                "--tokens-csv",
+                str(TOKEN_CONFIG),
+                "--runtime-registry",
+                str(runtime_registry_path(data_dir)),
+                "--manifest",
+                str(manifest_path),
+                "--raw-root",
+                str(raw_root / "cex-instrument-lifecycle"),
+            ]
+        elif step == "daily":
             command = [
                 python_executable,
                 str(PROJECT_ROOT / "scripts/run_fact_pipeline.py"),
@@ -438,6 +556,13 @@ def default_step_runner(command: list[str], log_path: Path) -> int:
 
 def validate_step_freshness(name: str, status: dict[str, Any]) -> list[str]:
     """Return stale, unavailable, or wholly unusable scheduled outputs."""
+    if name == "lifecycle":
+        return (
+            []
+            if status.get("cex_instrument_lifecycle", {}).get("status")
+            == "current"
+            else ["cex_instrument_lifecycle"]
+        )
     expected_sources = {
         "daily": ("cex_daily", "dex_daily"),
         "tvl": ("dex_tvl",),
@@ -703,38 +828,70 @@ def run_collection_cycle(
                 )
             )
             if exit_code == 0 and should_validate:
-                post_step_status = build_collection_status(data_dir, now=started)
-                invalid_sources = validate_step_freshness(name, post_step_status)
-                validation_sources = {
-                    source: post_step_status["freshness"][source]
-                    for source in {
-                        "daily": ("cex_daily", "dex_daily"),
-                        "tvl": ("dex_tvl",),
-                        "depth": ("cex_depth",),
-                        "dex_depth": ("dex_depth",),
-                    }[name]
-                }
-                if name == "depth":
-                    validation_sources["cex_execution_cost"] = (
-                        post_step_status["cex_execution_cost_snapshot"]
+                try:
+                    post_step_status = build_collection_status(
+                        data_dir,
+                        now=(utc_now() if now is None else started),
                     )
-                elif name == "dex_depth":
-                    validation_sources["dex_execution_cost"] = (
-                        post_step_status["dex_execution_cost_snapshot"]
+                    invalid_sources = validate_step_freshness(
+                        name,
+                        post_step_status,
                     )
-                validation = {
-                    "checked": True,
-                    "sources": validation_sources,
-                    "status": "passed" if not invalid_sources else "failed",
-                }
-                if invalid_sources:
+                    if name == "lifecycle":
+                        validation_sources = {
+                            "cex_instrument_lifecycle": post_step_status[
+                                "cex_instrument_lifecycle"
+                            ]
+                        }
+                    else:
+                        validation_sources = {
+                            source: post_step_status["freshness"][source]
+                            for source in {
+                                "daily": ("cex_daily", "dex_daily"),
+                                "tvl": ("dex_tvl",),
+                                "depth": ("cex_depth",),
+                                "dex_depth": ("dex_depth",),
+                            }[name]
+                        }
+                    if name == "depth":
+                        validation_sources["cex_execution_cost"] = (
+                            post_step_status["cex_execution_cost_snapshot"]
+                        )
+                    elif name == "dex_depth":
+                        validation_sources["dex_execution_cost"] = (
+                            post_step_status["dex_execution_cost_snapshot"]
+                        )
+                    validation = {
+                        "checked": True,
+                        "sources": validation_sources,
+                        "status": (
+                            "passed" if not invalid_sources else "failed"
+                        ),
+                    }
+                except (FileNotFoundError, ValueError) as error:
                     exit_code = 3
                     step_error = (
-                        "Freshness validation failed for: "
-                        + ", ".join(invalid_sources)
+                        "Post-publication validation failed: {}: {}".format(
+                            type(error).__name__,
+                            error,
+                        )
                     )
+                    validation = {
+                        "checked": True,
+                        "status": "failed",
+                        "error": step_error,
+                    }
                     with log_path.open("a", encoding="utf-8") as log:
                         log.write(step_error + "\n")
+                else:
+                    if invalid_sources:
+                        exit_code = 3
+                        step_error = (
+                            "Freshness validation failed for: "
+                            + ", ".join(invalid_sources)
+                        )
+                        with log_path.open("a", encoding="utf-8") as log:
+                            log.write(step_error + "\n")
             elif exit_code == 0:
                 validation = {
                     "checked": False,
@@ -780,6 +937,17 @@ def run_collection_cycle(
             and all(item["exit_code"] == 0 for item in step_results)
             else "failed"
         )
+        try:
+            final_facts = build_collection_status(data_dir)
+        except (FileNotFoundError, ValueError) as error:
+            status = "failed"
+            final_facts = {
+                "status": "invalid",
+                "error": "Post-collection fact status failed: {}: {}".format(
+                    type(error).__name__,
+                    error,
+                ),
+            }
         manifest = {
             "schema_version": 1,
             "run_id": run_id,
@@ -796,7 +964,7 @@ def run_collection_cycle(
                 "claim cross-source atomicity."
             ),
             "steps": step_results,
-            "facts": build_collection_status(data_dir),
+            "facts": final_facts,
             "dependency_files": (
                 {"dex_price_input": file_record(dex_price_input)}
                 if any(

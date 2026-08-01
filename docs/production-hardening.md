@@ -15,6 +15,9 @@ Before deployment, choose:
   `/srv/cex-dex/app/current`;
 - `MARKET_DATA_DIR`: an absolute directory containing the published SQLite,
   CSV, quality, registry, collection-lock, and raw-response files;
+- `MARKET_CEX_INSTRUMENT_LIFECYCLE`: exactly
+  `MARKET_DATA_DIR/cex_instrument_lifecycle.json`, so the dashboard reads the
+  atomically refreshed daily manifest rather than the tracked seed file;
 - `ADMIN_JOB_DIR`: an absolute directory for administrator job records. It may
   live under `MARKET_DATA_DIR`, but it does not have to;
 - TLS certificates for `@DOMAIN@`, normally issued and renewed by Certbot or the
@@ -87,6 +90,9 @@ Verify the rendered contract before starting the service:
 ```bash
 grep -F "MARKET_DATA_DIR=/data/market/published" \
   /etc/cex-dex/dashboard.env
+grep -F \
+  "MARKET_CEX_INSTRUMENT_LIFECYCLE=/data/market/published/cex_instrument_lifecycle.json" \
+  /etc/cex-dex/dashboard.env
 grep -F "ReadWritePaths=/data/market/published" \
   /etc/systemd/system/cex-dex-dashboard.service
 systemd-analyze verify /etc/systemd/system/cex-dex-dashboard.service
@@ -98,6 +104,16 @@ systemctl list-timers cex-dex-daily.timer cex-dex-depth.timer
 journalctl -u cex-dex-dashboard.service --since today
 ```
 
+Before calling a release current, confirm that the daily lifecycle step wrote
+fresh root evidence at the exact path read by the dashboard:
+
+```bash
+python3 scripts/run_collection_cycle.py --profile daily --publish-local \
+  --data-dir /data/market/published
+jq '{checked_at_utc,response_sha256,inventory_count,configured_market_count,review_count}' \
+  /data/market/published/cex_instrument_lifecycle.json
+```
+
 Use `journalctl --vacuum-time=30d` for an immediate cleanup. The optional
 `deploy/systemd/journald-cex-dex.conf.example` documents a compressed 30-day,
 1 GiB host-wide policy; it affects every journald service and therefore needs a
@@ -105,9 +121,12 @@ host-level review.
 
 ### Unprivileged supervisor fallback
 
-If the operator cannot install a system service yet, render
-`deploy/systemd/cex-dex-dashboard-user.service.in` with the absolute project
-root and reviewed bind address. Install it as
+If the operator cannot install a system service yet, use
+`deploy/render_runtime_templates.py` with the same absolute project root and
+`MARKET_DATA_DIR` used by the user collection timers. The renderer pins the
+dashboard to loopback and embeds both the runtime data directory and exact CEX
+lifecycle manifest path. Install the rendered
+`cex-dex-dashboard-user.service` as
 `~/.config/systemd/user/cex-dex-dashboard.service`, then run:
 
 ```bash
@@ -118,10 +137,9 @@ systemctl --user is-active cex-dex-dashboard.service
 ```
 
 This fallback explicitly keeps `ADMIN_ENABLED=false`, restarts the process
-after failure, and survives logout only when linger is enabled. Prefer
-`@BIND_HOST@=127.0.0.1` with the HTTPS proxy below. A non-loopback bind is a
-temporary compatibility choice, not a substitute for TLS, rate limiting, or
-closing port 8765.
+after failure, and survives logout only when linger is enabled. Use the HTTPS
+or connection-capped loopback proxy below for public access rather than
+changing the rendered bind address.
 
 ### Connection-capped demo proxy
 
@@ -201,6 +219,9 @@ python3 --version
 python3 -m py_compile dashboard/server.py dashboard/market_facts.py \
   scripts/check_dashboard_release.py
 python3 -c "import dashboard.server; import dashboard.market_facts"
+export CEX_DEX_EXPECTED_APPLICATION_SHA="$(git rev-parse HEAD)"
+export CEX_DEX_EXPECTED_ASSET_SHA="$(python3 -c \
+  'from dashboard.server import static_asset_sha; print(static_asset_sha())')"
 ```
 
 The supported production baseline is Python 3.8.10. The import check is
@@ -215,7 +236,10 @@ After switching either symlink:
 ```bash
 sudo systemctl restart cex-dex-dashboard.service
 python3 scripts/check_dashboard_health.py
-python3 scripts/check_dashboard_release.py --base-url http://127.0.0.1:8765
+python3 scripts/check_dashboard_release.py \
+  --base-url http://127.0.0.1:8765 \
+  --expected-application-sha "$CEX_DEX_EXPECTED_APPLICATION_SHA" \
+  --expected-asset-sha "$CEX_DEX_EXPECTED_ASSET_SHA"
 ```
 
 For an unprivileged user service, use the same checks but restart with:
@@ -224,8 +248,17 @@ For an unprivileged user service, use the same checks but restart with:
 systemctl --user restart cex-dex-dashboard.service
 systemctl --user is-active cex-dex-dashboard.service
 python3 scripts/check_dashboard_health.py
-python3 scripts/check_dashboard_release.py --base-url http://127.0.0.1:8765
+python3 scripts/check_dashboard_release.py \
+  --base-url http://127.0.0.1:8765 \
+  --expected-application-sha "$CEX_DEX_EXPECTED_APPLICATION_SHA" \
+  --expected-asset-sha "$CEX_DEX_EXPECTED_ASSET_SHA"
 ```
+
+Both expected values must be computed from the immutable prospective release
+before the restart. Do not copy either value from the post-restart `/health`
+response: that would only compare the process with its own claim. The release
+checker independently hashes the versioned CSS/JavaScript responses and rejects
+an application SHA, asset SHA, or served-byte mismatch.
 
 If `/health`, the executable release smoke, or browser smoke fails, atomically
 switch the relevant symlink back to the previous known-good release or data

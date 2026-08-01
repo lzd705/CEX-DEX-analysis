@@ -409,7 +409,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.cohort_validator()(metadata, snapshot, "dex")
 
-    def test_depth_execution_cohort_span_uses_canonical_bounds_and_preserves_null(self):
+    def test_observation_span_helper_preserves_missing_bound_for_noncohort_callers(self):
         span = getattr(server, "observation_span_seconds", None)
         self.assertIsNotNone(
             span,
@@ -1246,7 +1246,7 @@ class MarketMonitorServerTest(unittest.TestCase):
 
     def test_public_api_projection_recursively_removes_private_collector_evidence(self):
         malicious_catalog = {
-            "metadata": {"catalog_version": 2, "data_generation": "generation"},
+            "metadata": {"catalog_version": 3, "data_generation": "generation"},
             "markets": [{
                 "market_id": "cex:test:BTC/USDT",
                 "depth_error": "PermissionError: /srv/private/depth.csv",
@@ -1381,6 +1381,7 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "instrument": "AAVE/USDT",
                 "depth_status": "collection_failed",
                 "depth_reason_code": "network",
+                "depth_observed_at": "2026-08-01T01:02:03+00:00",
             },
             "cex",
         )
@@ -1390,8 +1391,10 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "venue": "eth / uniswap_v3",
                 "pool_address": "0xAbC",
                 "tvl_status": "not_cataloged_in_snapshot",
+                "tvl_observed_at": "2026-08-01T01:03:04+00:00",
                 "dex_depth_status": "unsupported",
                 "depth_error": "unsupported_protocol",
+                "depth_observed_at": "2026-08-01T01:04:05+00:00",
             },
             "dex",
         )
@@ -1421,6 +1424,10 @@ class MarketMonitorServerTest(unittest.TestCase):
             ),
             ("collection_failed", "network", True),
         )
+        self.assertEqual(
+            cex["depth_observed_at"],
+            "2026-08-01T01:02:03+00:00",
+        )
         self.assertEqual(dex["market_id"], "0xAbC")
         self.assertEqual(
             dex["refresh_market_id"],
@@ -1436,6 +1443,13 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "not_cataloged_in_snapshot",
                 "tvl_market_not_cataloged_in_snapshot",
                 True,
+            ),
+        )
+        self.assertEqual(
+            (dex["tvl_observed_at"], dex["depth_observed_at"]),
+            (
+                "2026-08-01T01:03:04+00:00",
+                "2026-08-01T01:04:05+00:00",
             ),
         )
         self.assertEqual(
@@ -1467,9 +1481,21 @@ class MarketMonitorServerTest(unittest.TestCase):
 
         self.assertEqual(summary["date"], "2026-07-03")
         self.assertAlmostEqual(summary["latest"], 0.04)
-        self.assertAlmostEqual(summary["maximum_absolute"], 0.04)
-        self.assertAlmostEqual(summary["mean_absolute"], (0.01 + 0.02 + 0.04) / 3)
-        self.assertAlmostEqual(summary["median_absolute"], 0.02)
+        midpoint_gaps = [1 / 99.5, 2 / 101, 4 / 102]
+        self.assertAlmostEqual(
+            summary["latest_absolute_midpoint"],
+            midpoint_gaps[-1],
+        )
+        self.assertAlmostEqual(summary["maximum_absolute"], max(midpoint_gaps))
+        self.assertAlmostEqual(
+            summary["mean_absolute"],
+            sum(midpoint_gaps) / 3,
+        )
+        self.assertAlmostEqual(summary["median_absolute"], sorted(midpoint_gaps)[1])
+        self.assertEqual(
+            summary["absolute_method"],
+            "symmetric_midpoint_relative_gap",
+        )
         self.assertEqual(summary["comparable_days"], 3)
 
     def test_overlay_copy_shares_only_read_only_daily_series(self):
@@ -1907,6 +1933,93 @@ class MarketMonitorServerTest(unittest.TestCase):
             "abc123",
         )
 
+    def test_tvl_loader_rejects_missing_or_noncanonical_observation_time(self):
+        fieldnames = [
+            "snapshot_id",
+            "observed_at",
+            "token_symbol",
+            "chain",
+            "pool_address",
+            "tvl_usd",
+            "tvl_method",
+            "source",
+            "source_endpoint",
+            "raw_response_sha256",
+            "status",
+        ]
+        base_row = {
+            "snapshot_id": "tvl-snapshot-1",
+            "observed_at": "2026-07-27T01:02:03+00:00",
+            "token_symbol": "BTC",
+            "chain": "eth",
+            "pool_address": "0xpool",
+            "tvl_usd": "7654.32",
+            "tvl_method": "geckoterminal_reserve_in_usd",
+            "source": "GeckoTerminal API v2",
+            "source_endpoint": "https://example.test/pool",
+            "raw_response_sha256": "abc123",
+            "status": "observed",
+        }
+        for invalid_time in (
+            "",
+            "2026-07-27T01:02:03",
+            "2026-07-27T09:02:03+08:00",
+            "not-a-time",
+        ):
+            with self.subTest(observed_at=invalid_time):
+                write_csv(
+                    self.tvl_path,
+                    fieldnames,
+                    [{**base_row, "observed_at": invalid_time}],
+                )
+                server._load_tvl_snapshot_cached.cache_clear()
+                with self.assertRaises(ValueError):
+                    server._load_tvl_snapshot_cached(
+                        str(self.tvl_path),
+                        server.data_signature([self.tvl_path]),
+                    )
+
+    def test_tvl_loader_rejects_status_value_contradictions_and_keeps_zero(self):
+        fieldnames = [
+            "snapshot_id", "observed_at", "token_symbol", "chain",
+            "pool_address", "tvl_usd", "tvl_method", "source",
+            "source_endpoint", "raw_response_sha256", "status",
+        ]
+        base_row = {
+            "snapshot_id": "tvl-snapshot-1",
+            "observed_at": "2026-07-27T01:02:03+00:00",
+            "token_symbol": "BTC",
+            "chain": "eth",
+            "pool_address": "0xpool",
+            "tvl_usd": "1",
+            "tvl_method": "geckoterminal_reserve_in_usd",
+            "source": "GeckoTerminal API v2",
+            "source_endpoint": "https://example.test/pool",
+            "raw_response_sha256": "abc123",
+            "status": "observed",
+        }
+        invalid_rows = (
+            {**base_row, "tvl_usd": ""},
+            {**base_row, "status": "missing", "tvl_usd": "123"},
+        )
+        for row in invalid_rows:
+            with self.subTest(status=row["status"], tvl_usd=row["tvl_usd"]):
+                write_csv(self.tvl_path, fieldnames, [row])
+                server._load_tvl_snapshot_cached.cache_clear()
+                with self.assertRaisesRegex(ValueError, "TVL"):
+                    server._load_tvl_snapshot_cached(
+                        str(self.tvl_path),
+                        server.data_signature([self.tvl_path]),
+                    )
+
+        write_csv(self.tvl_path, fieldnames, [{**base_row, "tvl_usd": "0"}])
+        server._load_tvl_snapshot_cached.cache_clear()
+        snapshot = server._load_tvl_snapshot_cached(
+            str(self.tvl_path),
+            server.data_signature([self.tvl_path]),
+        )
+        self.assertEqual(snapshot["rows"][("BTC", "eth", "0xpool")]["tvl_usd"], "0")
+
     def test_point_in_time_cex_depth_overlays_cataloged_market(self):
         depth_row = {field: "" for field in DEPTH_COLUMNS_ALL}
         depth_row.update(
@@ -2096,10 +2209,14 @@ class MarketMonitorServerTest(unittest.TestCase):
         with patch.dict(server.os.environ, self.environment, clear=True):
             catalog = server.build_market_catalog()
 
-        self.assertEqual(catalog["metadata"]["catalog_version"], 2)
+        self.assertEqual(catalog["metadata"]["catalog_version"], 3)
         self.assertEqual(catalog["metadata"]["time_grain"], "1 day, UTC")
         self.assertEqual(catalog["metadata"]["price_quote_asset"], "USD")
         self.assertIn("not order-book depth", catalog["metadata"]["semantic_boundary"])
+        normalization_note = catalog["metadata"]["cex_normalization_note"]
+        self.assertIn("exact venue market identity", normalization_note)
+        self.assertIn("USD, USDT, and KRW", normalization_note)
+        self.assertIn("never relabeled", normalization_note)
         self.assertEqual(catalog["tokens"], ["BTC"])
         market_ids = {market["market_id"] for market in catalog["markets"]}
         self.assertEqual(
@@ -2259,7 +2376,47 @@ class MarketMonitorServerTest(unittest.TestCase):
         )
 
     def test_summary_producer_satisfies_structured_na_release_contract(self):
-        with patch.dict(server.os.environ, self.environment, clear=True):
+        checked_at = "2026-08-01T06:00:00+00:00"
+        daily = {
+            "status": "current",
+            "available_start": "2026-07-01",
+            "available_end": "2026-07-31",
+            "latest_completed_utc_day": "2026-07-31",
+            "lag_days": 0,
+            "max_lag_days": 1,
+        }
+        current_freshness = {
+            "checked_at": checked_at,
+            "overall_status": "current",
+            "common_comparable_end": "2026-07-31",
+            "cex_daily": {"source": "cex_daily", **daily},
+            "dex_daily": {"source": "dex_daily", **daily},
+            **{
+                source: {
+                    "source": source,
+                    "status": "current",
+                    "observed_at": "2026-08-01T05:00:00+00:00",
+                    "age_hours": 1.0,
+                    "max_age_hours": maximum,
+                }
+                for source, maximum in (
+                    ("dex_tvl", 26.0),
+                    ("cex_depth", 2.0),
+                    ("dex_depth", 2.0),
+                    ("cex_execution", 2.0),
+                    ("dex_execution", 2.0),
+                )
+            },
+        }
+        with patch.dict(
+            server.os.environ,
+            self.environment,
+            clear=True,
+        ), patch.object(
+            server,
+            "build_source_freshness",
+            return_value=current_freshness,
+        ):
             summary = server.build_market_summary()
 
         validate_summary(
@@ -2287,7 +2444,7 @@ class MarketMonitorServerTest(unittest.TestCase):
 
         self.assertEqual(set(summary), {"metadata", "tokens"})
         self.assertEqual(summary["metadata"]["response_scope"], "screener_summary")
-        self.assertEqual(summary["metadata"]["summary_version"], 2)
+        self.assertEqual(summary["metadata"]["summary_version"], 3)
         self.assertTrue(summary["metadata"]["data_generation"])
         self.assertNotIn("markets", summary)
         self.assertNotIn("cex_markets", summary)
@@ -2296,6 +2453,18 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(
             summary["metadata"]["data_generation"],
             token_catalog["metadata"]["data_generation"],
+        )
+        self.assertIn(
+            "configured_cex_market_identities",
+            summary["metadata"],
+        )
+        self.assertIn(
+            "configured_cex_market_identities",
+            token_catalog["metadata"],
+        )
+        self.assertEqual(
+            summary["metadata"]["configured_cex_market_identities"],
+            token_catalog["metadata"]["configured_cex_market_identities"],
         )
 
         compact = summary["tokens"][0]
@@ -2306,9 +2475,24 @@ class MarketMonitorServerTest(unittest.TestCase):
             "aggregate_volume_usd",
             "aggregate_dex_volume_share",
             "price_spread",
+            "price_spread_method",
+            "absolute_price_gap",
+            "absolute_price_gap_method",
             "spread_date",
+            "maximum_absolute_price_spread",
+            "mean_absolute_price_spread",
+            "median_absolute_price_spread",
+            "spread_comparable_days",
         ):
             self.assertEqual(compact[field], original[field], field)
+        self.assertNotAlmostEqual(
+            compact["absolute_price_gap"],
+            abs(compact["price_spread"]),
+        )
+        self.assertEqual(
+            compact["absolute_price_gap_method"],
+            "symmetric_midpoint_relative_gap",
+        )
         self.assertEqual(compact["market_count"], 3)
         self.assertEqual(compact["cex_market_count"], 2)
         self.assertEqual(compact["dex_market_count"], 1)
@@ -2489,6 +2673,534 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertNotIn("screening_quality_source", serialized)
         self.assertNotIn(str(self.temporary_directory.name), serialized)
 
+    def test_screening_projection_preserves_measurement_and_evaluation_window(self):
+        projection = server.screening_quality_projection(
+            {
+                "quality_status": "warning",
+                "coverage_expected_start": "2026-01-16",
+                "coverage_expected_end": "2026-07-30",
+                "coverage_start_method": "max_query_source_market_observed_start",
+                "quality_flag_details": [
+                    {
+                        "code": "low_daily_coverage",
+                        "severity": "warning",
+                        "category": "data_health",
+                        "message": "Internal message must not leak.",
+                        "observed_value": 0.750958,
+                        "threshold": 0.8,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(projection["scope"], "catalog")
+        self.assertEqual(
+            projection["evaluation_window"],
+            {
+                "start": "2026-01-16",
+                "end": "2026-07-30",
+                "method": "max_query_source_market_observed_start",
+            },
+        )
+        self.assertEqual(projection["flags"][0]["observed_value"], 0.750958)
+        self.assertEqual(projection["flags"][0]["threshold"], 0.8)
+
+    def test_inactive_current_cex_instrument_withholds_stale_facts_and_ranking(self):
+        market = {
+            "token_symbol": "GMX",
+            "market": "cex",
+            "venue": "crypto_com",
+            "instrument": "GMX/USDT",
+            "price_usd": 10.0,
+            "volume_usd": 0.0,
+            "window_return": 0.0,
+            "daily_volatility": 0.0,
+            "coverage_ratio": 1.0,
+            "observation_count": 30,
+            "observation_days": 30,
+            "price_points": [{"date": "2026-07-30", "price_usd": 10.0}],
+            "depth_status": "observed",
+            "depth_observed_at": "2026-07-31T23:59:00+00:00",
+            "best_bid": 9.9,
+            "best_ask": 10.1,
+            "spread_bps": 200.0,
+            "bid_depth_10bps_usd": 100.0,
+            "ask_depth_10bps_usd": 120.0,
+            "total_depth_10bps_usd": 220.0,
+            "bid_depth_100bps_usd": 1000.0,
+            "ask_depth_100bps_usd": 1200.0,
+            "total_depth_100bps_usd": 2200.0,
+            "depth_10bps_complete": True,
+            "depth_100bps_complete": True,
+            "depth_snapshot_id": "old-depth",
+        }
+        payload = {
+            "metadata": {},
+            "cex_markets": [market],
+            "dex_pools": [],
+        }
+        review = {
+            "market_id": "cex:crypto_com:GMX/USDT",
+            "token_symbol": "GMX",
+            "exchange": "crypto_com",
+            "instrument": "GMX/USDT",
+            "current_listing_status": "absent_from_official_current_catalog",
+            "reason_code": "instrument_absent_from_current_catalog",
+            "checked_at_utc": "2026-08-01T03:10:02+00:00",
+            "source_url": "https://api.crypto.com/exchange/v1/public/get-instruments",
+            "response_sha256": "9" * 64,
+        }
+
+        result = server.overlay_cex_instrument_lifecycle(
+            payload,
+            {review["market_id"]: review},
+            now=datetime(2026, 8, 1, 4, 0, tzinfo=timezone.utc),
+        )
+        quarantined = result["cex_markets"][0]
+
+        for field in (
+            "price_usd",
+            "volume_usd",
+            "window_return",
+            "daily_volatility",
+            "coverage_ratio",
+        ):
+            self.assertIsNone(quarantined[field])
+        self.assertEqual(quarantined["price_points"], [])
+        for field in (
+            "best_bid", "best_ask", "spread_bps",
+            "bid_depth_10bps_usd", "ask_depth_10bps_usd",
+            "total_depth_10bps_usd", "bid_depth_100bps_usd",
+            "ask_depth_100bps_usd", "total_depth_100bps_usd",
+        ):
+            self.assertIsNone(quarantined[field], field)
+        self.assertFalse(quarantined["depth_10bps_complete"])
+        self.assertFalse(quarantined["depth_100bps_complete"])
+        self.assertEqual(quarantined["depth_status"], "source_no_observation")
+        self.assertEqual(
+            quarantined["depth_reason_code"],
+            "instrument_absent_from_current_catalog",
+        )
+        self.assertIsNone(quarantined["depth_snapshot_id"])
+        self.assertEqual(quarantined["historical_observation_count"], 30)
+        self.assertEqual(
+            quarantined["current_listing_status"],
+            "absent_from_official_current_catalog",
+        )
+        finalized = server.finalize_fact_contract(result)
+        self.assertIsNone(finalized["tokens"][0]["aggregate_cex_volume_usd"])
+        self.assertIsNone(finalized["tokens"][0]["primary_cex_id"])
+        self.assertEqual(finalized["cex_markets"][0]["quality_status"], "critical")
+        self.assertIn(
+            "inactive_cex_instrument",
+            finalized["cex_markets"][0]["quality_flags"],
+        )
+        depth_fact = server._depth_quality_fact({
+            **finalized["cex_markets"][0],
+            "market_type": "cex",
+        })
+        self.assertEqual(depth_fact["status"], "source_no_observation")
+        self.assertFalse(depth_fact["retryable"])
+        self.assertIsNone(depth_fact["bands_bps"]["10"]["total_usd"])
+
+    def test_stale_lifecycle_evidence_stays_withheld_but_no_longer_claims_current_absence(self):
+        payload = {
+            "metadata": {},
+            "cex_markets": [{
+                "token_symbol": "GMX",
+                "market": "cex",
+                "venue": "crypto_com",
+                "instrument": "GMX/USDT",
+                "price_usd": 10.0,
+                "volume_usd": 100.0,
+                "price_points": [{"date": "2026-07-30", "price_usd": 10.0}],
+            }],
+            "dex_pools": [],
+        }
+        review = {
+            "market_id": "cex:crypto_com:GMX/USDT",
+            "token_symbol": "GMX",
+            "exchange": "crypto_com",
+            "instrument": "GMX/USDT",
+            "current_listing_status": "absent_from_official_current_catalog",
+            "reason_code": "instrument_absent_from_current_catalog",
+            "checked_at_utc": "2026-07-29T00:00:00+00:00",
+            "source_url": "https://api.crypto.com/exchange/v1/public/get-instruments",
+            "response_sha256": "9" * 64,
+        }
+
+        result = server.overlay_cex_instrument_lifecycle(
+            payload,
+            {review["market_id"]: review},
+            now=datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc),
+        )
+        market = result["cex_markets"][0]
+        self.assertIsNone(market["price_usd"])
+        self.assertEqual(
+            market["current_listing_status"],
+            "official_catalog_evidence_stale",
+        )
+        self.assertEqual(
+            market["current_listing_reason_code"],
+            "official_catalog_evidence_stale",
+        )
+        fact = server._daily_quality_fact(
+            {**market, "market_id": review["market_id"], "market_type": "cex"},
+            {"window_start": "2026-07-01", "window_end": "2026-07-30"},
+        )
+        self.assertEqual(fact["status"], "needs_review")
+        self.assertEqual(fact["reason_code"], "official_catalog_evidence_stale")
+        self.assertTrue(any(
+            flag["code"] == "stale_cex_lifecycle_evidence"
+            and flag["severity"] == "critical"
+            for flag in fact["quality_flags"]
+        ))
+
+    def test_zero_absence_lifecycle_still_projects_catalog_wide_root_evidence(self):
+        payload = {"metadata": {}, "cex_markets": [], "dex_pools": []}
+        evidence = {
+            "checked_at_utc": "2026-08-01T03:10:02+00:00",
+            "response_sha256": "9" * 64,
+            "inventory_count": 1_000,
+            "configured_market_count": 30,
+        }
+
+        result = server.overlay_cex_instrument_lifecycle(
+            payload,
+            {},
+            lifecycle_evidence=evidence,
+            now=datetime(2026, 8, 1, 4, 0, tzinfo=timezone.utc),
+        )
+
+        lifecycle = result["metadata"]["cex_instrument_lifecycle"]
+        self.assertEqual(lifecycle["reviewed_market_count"], 30)
+        self.assertEqual(lifecycle["absence_market_count"], 0)
+        self.assertEqual(lifecycle["checked_at_min"], evidence["checked_at_utc"])
+        self.assertEqual(lifecycle["checked_at_max"], evidence["checked_at_utc"])
+        self.assertEqual(lifecycle["official_inventory_count"], 1_000)
+        self.assertEqual(lifecycle["response_sha256"], "9" * 64)
+        self.assertEqual(lifecycle["stale_evidence_market_count"], 0)
+
+    def test_configured_upbit_identity_metadata_is_hash_bound_and_propagates_to_catalog(self):
+        attach = getattr(
+            server,
+            "attach_configured_cex_identity_metadata",
+            None,
+        )
+        self.assertIsNotNone(
+            attach,
+            "configured CEX identity metadata attachment is missing",
+        )
+        payload = {
+            "metadata": {
+                "available_start": "2026-01-01",
+                "available_end": "2026-01-02",
+                "sources": [],
+                "storage": {"engine": "test"},
+            },
+            "cex_markets": [],
+            "dex_pools": [],
+        }
+        with patch.object(
+            server,
+            "current_configured_upbit_market_ids",
+            return_value=(
+                "cex:upbit:AAVE/KRW",
+                "cex:upbit:UNI/USDT",
+            ),
+        ):
+            attached = attach(payload)
+
+        expected = {
+            "schema": "configured_cex_market_identities/v1",
+            "upbit": {
+                "market_count": 2,
+                "market_ids": [
+                    "cex:upbit:AAVE/KRW",
+                    "cex:upbit:UNI/USDT",
+                ],
+                "market_ids_sha256": (
+                    "440b52cffc9da70c7adaf402da4131c48"
+                    "1e4356cb85ef9994da59d0a2f1f9154"
+                ),
+            },
+        }
+        self.assertEqual(
+            attached["metadata"]["configured_cex_market_identities"],
+            expected,
+        )
+        self.assertNotIn(
+            "configured_cex_market_identities",
+            payload["metadata"],
+        )
+        catalog = market_facts.catalog_from_market_payload(attached)
+        self.assertEqual(
+            catalog["metadata"]["configured_cex_market_identities"],
+            expected,
+        )
+
+    def test_stale_root_lifecycle_withholds_present_crypto_com_market(self):
+        payload = {
+            "metadata": {},
+            "cex_markets": [{
+                "token_symbol": "AAVE",
+                "venue": "crypto_com",
+                "instrument": "AAVE/USDT",
+                "price_usd": 123.0,
+                "volume_usd": 456.0,
+                "coverage_ratio": 1.0,
+                "price_points": [
+                    {"date": "2026-07-30", "price_usd": 123.0}
+                ],
+                "best_bid": 122.0,
+                "best_ask": 124.0,
+                "depth_status": "observed",
+            }],
+            "dex_pools": [],
+        }
+        evidence = {
+            "checked_at_utc": "2026-07-29T00:00:00+00:00",
+            "response_sha256": "9" * 64,
+            "inventory_count": 1_000,
+            "configured_market_count": 1,
+            "configured_market_ids_sha256": server.configured_market_ids_sha256(
+                ["cex:crypto_com:AAVE/USDT"]
+            ),
+        }
+
+        result = server.overlay_cex_instrument_lifecycle(
+            payload,
+            {},
+            lifecycle_evidence=evidence,
+            now=datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc),
+        )
+
+        market = result["cex_markets"][0]
+        self.assertIsNone(market["price_usd"])
+        self.assertIsNone(market["volume_usd"])
+        self.assertEqual(market["price_points"], [])
+        self.assertIsNone(market["best_bid"])
+        self.assertIsNone(market["best_ask"])
+        self.assertEqual(
+            market["current_listing_status"],
+            "official_catalog_evidence_stale",
+        )
+        self.assertEqual(
+            market["current_listing_reason_code"],
+            "official_catalog_evidence_stale",
+        )
+        self.assertEqual(market["depth_status"], "needs_review")
+        self.assertEqual(
+            result["metadata"]["cex_instrument_lifecycle"][
+                "withheld_payload_market_count"
+            ],
+            1,
+        )
+
+    def test_lifecycle_manifest_is_rejected_after_same_size_catalog_identity_change(self):
+        root = Path(self.temporary_directory.name) / "lifecycle-binding"
+        root.mkdir()
+        tokens_path = root / "tokens.csv"
+        registry_path = root / "token_registry.json"
+        manifest_path = root / "cex_instrument_lifecycle.json"
+
+        def write_tokens(first_symbol):
+            write_csv(
+                tokens_path,
+                ["token_symbol", "cex_symbol"],
+                [
+                    {
+                        "token_symbol": first_symbol,
+                        "cex_symbol": first_symbol + "/USDT",
+                    },
+                    {"token_symbol": "GMX", "cex_symbol": "GMX/USDT"},
+                ],
+            )
+
+        write_tokens("AAVE")
+        review = {
+            "market_id": "cex:crypto_com:GMX/USDT",
+            "market_type": "cex",
+            "token_symbol": "GMX",
+            "exchange": "crypto_com",
+            "instrument": "GMX/USDT",
+            "current_listing_status": "absent_from_official_current_catalog",
+            "reason_code": "instrument_absent_from_current_catalog",
+            "checked_at_utc": "2026-08-01T03:10:02+00:00",
+            "source_url": "https://api.crypto.com/exchange/v1/public/get-instruments",
+            "http_status": 200,
+            "response_sha256": "9" * 64,
+            "inventory_count": 1_000,
+            "instrument_present": False,
+        }
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "cex_instrument_lifecycle/v1",
+                    "generated_at_utc": review["checked_at_utc"],
+                    "checked_at_utc": review["checked_at_utc"],
+                    "response_sha256": review["response_sha256"],
+                    "inventory_count": review["inventory_count"],
+                    "configured_market_count": 2,
+                    "configured_market_ids_sha256": (
+                        "2ac2c0098299d53cc739440dae18d8a422e26054c429ed506ea4fa954c8695a9"
+                    ),
+                    "review_count": 1,
+                    "reviews": [review],
+                }
+            ),
+            encoding="utf-8",
+        )
+        payload = {
+            "metadata": {},
+            "cex_markets": [
+                {
+                    "token_symbol": "GMX",
+                    "market": "cex",
+                    "venue": "crypto_com",
+                    "instrument": "GMX/USDT",
+                }
+            ],
+            "dex_pools": [],
+        }
+
+        server._load_cex_instrument_lifecycle_cached.cache_clear()
+        with patch.object(
+            server,
+            "CEX_LIFECYCLE_TOKEN_CONFIG_PATH",
+            tokens_path,
+            create=True,
+        ), patch.dict(
+            "os.environ",
+            {"TOKEN_REGISTRY_PATH": str(registry_path)},
+            clear=False,
+        ), patch.object(
+            server,
+            "resolve_cex_instrument_lifecycle_path",
+            return_value=manifest_path,
+        ):
+            server.overlay_cex_instrument_lifecycle(
+                payload,
+                now=datetime(2026, 8, 1, 4, 0, tzinfo=timezone.utc),
+            )
+            write_tokens("RAY")
+            with self.assertRaisesRegex(ValueError, "configured market.*hash"):
+                server.overlay_cex_instrument_lifecycle(
+                    payload,
+                    now=datetime(2026, 8, 1, 4, 0, tzinfo=timezone.utc),
+                )
+
+    def test_lifecycle_manifest_applies_catalog_policy_when_window_has_no_row(self):
+        review = {
+            "market_id": "cex:crypto_com:GMX/USDT",
+            "token_symbol": "GMX",
+            "exchange": "crypto_com",
+            "instrument": "GMX/USDT",
+            "current_listing_status": "absent_from_official_current_catalog",
+            "reason_code": "instrument_absent_from_current_catalog",
+            "checked_at_utc": "2026-08-01T03:10:02+00:00",
+            "source_url": "https://api.crypto.com/exchange/v1/public/get-instruments",
+            "response_sha256": "9" * 64,
+        }
+        evidence = {
+            "checked_at_utc": review["checked_at_utc"],
+            "response_sha256": review["response_sha256"],
+            "inventory_count": 1_000,
+            "configured_market_count": 1,
+        }
+
+        result = server.overlay_cex_instrument_lifecycle(
+            {"metadata": {}, "cex_markets": [], "dex_pools": []},
+            {review["market_id"]: review},
+            lifecycle_evidence=evidence,
+            now=datetime(2026, 8, 1, 4, 0, tzinfo=timezone.utc),
+        )
+
+        lifecycle = result["metadata"]["cex_instrument_lifecycle"]
+        self.assertEqual(lifecycle["absence_market_count"], 1)
+        self.assertEqual(lifecycle["applied_market_count"], 1)
+        self.assertEqual(lifecycle["withheld_payload_market_count"], 0)
+
+    def test_lifecycle_projection_cache_reclassifies_unchanged_evidence_after_ttl(self):
+        payload = {"metadata": {}, "cex_markets": [], "dex_pools": []}
+        calls = []
+
+        def project(source_payload, *, now=None):
+            calls.append(now)
+            return {
+                **source_payload,
+                "lifecycle_projection": (
+                    "fresh" if now.timestamp() < 10_000 else "stale"
+                ),
+            }
+
+        server._build_lifecycle_payload_cached.cache_clear()
+        with patch.object(
+            server,
+            "_build_enriched_payload_cached",
+            return_value=payload,
+        ), patch.object(
+            server,
+            "overlay_cex_instrument_lifecycle",
+            side_effect=project,
+        ), patch.object(
+            server,
+            "finalize_fact_contract",
+            side_effect=lambda value: value,
+        ):
+            fresh = server._build_lifecycle_payload_cached(("same",), 100)
+            stale = server._build_lifecycle_payload_cached(("same",), 200)
+
+        self.assertEqual(fresh["lifecycle_projection"], "fresh")
+        self.assertEqual(stale["lifecycle_projection"], "stale")
+        self.assertEqual(
+            [int(value.timestamp()) for value in calls],
+            [6_000, 12_000],
+        )
+
+    def test_inactive_current_cex_instrument_has_terminal_daily_na_and_no_rows(self):
+        market = {
+            "market_id": "cex:crypto_com:GMX/USDT",
+            "market_type": "cex",
+            "token_symbol": "GMX",
+            "venue": "crypto_com",
+            "instrument": "GMX/USDT",
+            "current_listing_status": "absent_from_official_current_catalog",
+            "current_listing_reason_code": "instrument_absent_from_current_catalog",
+            "current_listing_checked_at": "2026-08-01T03:10:02+00:00",
+            "window_metrics": {
+                "observation_count": 30,
+                "requested_window_days": 30,
+                "coverage_ratio": 1.0,
+            },
+        }
+        metadata = {
+            "window_start": "2026-07-01",
+            "window_end": "2026-07-30",
+        }
+
+        fact = server._daily_quality_fact(market, metadata)
+        with patch.object(server, "database_market_rows") as database_rows, patch.object(
+            server,
+            "resolve_database_path",
+            return_value=Path("facts.sqlite3"),
+        ):
+            rows = server.selected_market_rows(
+                market,
+                "2026-07-01",
+                "2026-07-30",
+            )
+
+        database_rows.assert_not_called()
+        self.assertEqual(rows, [])
+        self.assertEqual(fact["status"], "source_no_observation")
+        self.assertEqual(
+            fact["reason_code"],
+            "instrument_absent_from_current_catalog",
+        )
+        self.assertFalse(fact["retryable"])
+        self.assertIsNone(fact["action"])
+
     def test_screener_default_token_always_exists_in_selected_window(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
             payload = server.build_market_payload()
@@ -2522,7 +3234,7 @@ class MarketMonitorServerTest(unittest.TestCase):
     def test_public_generation_covers_sources_and_contract_but_not_query_window(self):
         metadata = {
             "available_end": "2026-01-02",
-            "catalog_version": 2,
+            "catalog_version": 3,
             "start_date": "2026-01-01",
             "end_date": "2026-01-02",
             "sources": [],
@@ -2545,7 +3257,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             {**metadata, "start_date": "2025-12-01"},
             first_signature,
         )
-        with patch.object(server, "CATALOG_SUMMARY_VERSION", 3):
+        with patch.object(server, "CATALOG_SUMMARY_VERSION", 4):
             changed_contract = server._public_data_generation(
                 metadata,
                 first_signature,
@@ -3965,6 +4677,139 @@ class MarketMonitorServerTest(unittest.TestCase):
             lucide_path.read_text(encoding="utf-8")[:200],
         )
 
+    def test_static_html_uses_runtime_release_and_content_fingerprint(self):
+        asset_sha = server.static_asset_sha()
+        release_sha = server.application_release_sha()
+        version = server.static_asset_version()
+        html = server.render_versioned_html(server.STATIC_ROOT / "index.html")
+
+        self.assertRegex(asset_sha, r"^[0-9a-f]{64}$")
+        self.assertRegex(release_sha, r"^(?:[0-9a-f]{40,64}|unavailable)$")
+        self.assertIn(asset_sha[:12], version)
+        if release_sha != "unavailable":
+            self.assertIn(release_sha[:12], version)
+        self.assertNotIn("__ASSET_VERSION__", html)
+        for asset in (
+            "styles.css",
+            "navigation.js",
+            "app.js",
+            "vendor/lucide.js",
+        ):
+            self.assertIn(f"/{asset}?v={version}", html)
+
+    def test_static_asset_sha_includes_the_served_vendor_bundle(self):
+        with tempfile.TemporaryDirectory() as directory_name:
+            static_root = Path(directory_name)
+            vendor_root = static_root / "vendor"
+            vendor_root.mkdir()
+            (static_root / "app.js").write_text("app", encoding="utf-8")
+            lucide_path = vendor_root / "lucide.min.js"
+            lucide_path.write_text("vendor-one", encoding="utf-8")
+            with patch.object(server, "STATIC_ROOT", static_root):
+                first = server._compute_static_asset_sha()
+                lucide_path.write_text("vendor-two", encoding="utf-8")
+                second = server._compute_static_asset_sha()
+
+        self.assertNotEqual(first, second)
+
+    def test_release_evidence_is_frozen_for_the_process_lifetime(self):
+        initial_application = server.application_release_sha()
+        initial_asset = server.static_asset_sha()
+        application_clear = getattr(server.application_release_sha, "cache_clear", None)
+        asset_clear = getattr(server.static_asset_sha, "cache_clear", None)
+        if application_clear:
+            application_clear()
+        if asset_clear:
+            asset_clear()
+        try:
+            with tempfile.TemporaryDirectory() as directory_name:
+                root = Path(directory_name)
+                git_dir = root / ".git"
+                static_dir = root / "static"
+                git_dir.mkdir()
+                static_dir.mkdir()
+                (git_dir / "HEAD").write_text("b" * 40 + "\n", encoding="utf-8")
+                (static_dir / "app.js").write_text("changed", encoding="utf-8")
+                with patch.object(server, "PROJECT_ROOT", root), patch.object(
+                    server,
+                    "STATIC_ROOT",
+                    static_dir,
+                ), patch.dict(server.os.environ, {}, clear=True):
+                    self.assertEqual(
+                        server.application_release_sha(),
+                        initial_application,
+                    )
+                    self.assertEqual(server.static_asset_sha(), initial_asset)
+        finally:
+            if application_clear:
+                application_clear()
+            if asset_clear:
+                asset_clear()
+
+    def test_health_exposes_application_and_asset_release_evidence(self):
+        handler = object.__new__(server.MarketMonitorHandler)
+        handler.path = "/health"
+        payload = {
+            "metadata": {
+                "storage": {"engine": "sqlite"},
+                "freshness": {"overall_status": "current"},
+                "cex_instrument_lifecycle": {
+                    "absence_market_count": 1,
+                    "applied_market_count": 1,
+                    "stale_evidence_market_count": 0,
+                },
+            }
+        }
+        with patch.object(
+            server,
+            "build_market_payload",
+            return_value=payload,
+        ), patch.object(
+            server.MarketMonitorHandler,
+            "send_json",
+        ) as send_json:
+            handler.do_GET()
+
+        health = send_json.call_args.args[0]
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["application_sha"], server.application_release_sha())
+        self.assertEqual(health["asset_sha"], server.static_asset_sha())
+        self.assertEqual(health["asset_version"], server.static_asset_version())
+        self.assertEqual(health["data_status"], "current")
+        self.assertEqual(
+            health["cex_instrument_lifecycle"],
+            payload["metadata"]["cex_instrument_lifecycle"],
+        )
+
+    def test_health_data_status_is_stale_when_lifecycle_evidence_is_stale(self):
+        handler = object.__new__(server.MarketMonitorHandler)
+        handler.path = "/health"
+        payload = {
+            "metadata": {
+                "storage": {"engine": "sqlite"},
+                "freshness": {"overall_status": "current"},
+                "cex_instrument_lifecycle": {
+                    "absence_market_count": 1,
+                    "applied_market_count": 1,
+                    "stale_evidence_market_count": 1,
+                },
+            }
+        }
+        with patch.object(
+            server,
+            "build_market_payload",
+            return_value=payload,
+        ), patch.object(
+            server.MarketMonitorHandler,
+            "send_json",
+        ) as send_json:
+            handler.do_GET()
+
+        health = send_json.call_args.args[0]
+        self.assertEqual(health["status"], "ok")
+        self.assertTrue(health["data_ready"])
+        self.assertEqual(health["data_status"], "stale")
+
     def test_only_declared_spa_routes_serve_the_application_shell(self):
         handler = object.__new__(server.MarketMonitorHandler)
         handler.directory = str(server.STATIC_ROOT)
@@ -4001,7 +4846,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn('role="alert"', index)
         self.assertIn('aria-busy="true"', index)
         self.assertIn("Midpoint-relative Spread (bps)", index)
-        self.assertIn("Primary Price Gap", index)
+        self.assertIn("Primary DEX/CEX Basis", index)
         self.assertIn('class="column-info"', index)
         self.assertIn(
             "Hover, focus, or tap a value for its CEX / DEX split.",
@@ -4579,7 +5424,12 @@ assert.equal(
     def test_sqlite_runtime_matches_csv_facts(self):
         data_dir = self.cex_path.parent
         database_path = data_dir / server.DATABASE_FILENAME
-        build_database(data_dir, database_path)
+        imported_at = "2026-08-01T02:03:04+00:00"
+        with patch(
+            "scripts.market_database.utc_now_text",
+            return_value=imported_at,
+        ):
+            build_database(data_dir, database_path)
 
         with patch.dict(
             server.os.environ,
@@ -4589,6 +5439,24 @@ assert.equal(
             payload = server.build_market_payload("2026-01-01", "2026-01-02")
 
         self.assertEqual(payload["metadata"]["storage"]["engine"], "sqlite")
+        self.assertEqual(
+            payload["metadata"]["storage"]["imported_at"],
+            imported_at,
+        )
+        daily_source_names = {server.CEX_FILENAME, server.DEX_FILENAME}
+        daily_sources = [
+            source
+            for source in payload["metadata"]["sources"]
+            if source["name"] in daily_source_names
+        ]
+        self.assertEqual(
+            {source["name"] for source in daily_sources},
+            daily_source_names,
+        )
+        for source in daily_sources:
+            with self.subTest(source=source["name"]):
+                self.assertNotIn("modified_at", source)
+                self.assertEqual(source["ingested_at"], imported_at)
         self.assertEqual(payload["metadata"]["token_count"], 1)
         self.assertEqual(len(payload["cex_markets"]), 2)
         self.assertEqual(len(payload["dex_pools"]), 1)
@@ -4596,6 +5464,44 @@ assert.equal(
         self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)
 
 class DashboardApiTest(unittest.TestCase):
+    def test_public_api_metadata_exposes_fail_closed_fact_refresh_capability(self):
+        source_payload = {
+            "metadata": {"response_scope": "screener_summary"},
+            "tokens": [],
+        }
+
+        with patch.object(
+            server,
+            "build_market_summary",
+            return_value=source_payload,
+        ), patch.object(
+            server,
+            "PUBLIC_ACTION_POLICY",
+            server.PublicActionPolicy(fact_refresh_enabled=False),
+        ):
+            disabled = server._build_public_api_payload("summary", ())
+
+        with patch.object(
+            server,
+            "build_market_summary",
+            return_value=source_payload,
+        ), patch.object(
+            server,
+            "PUBLIC_ACTION_POLICY",
+            server.PublicActionPolicy(fact_refresh_enabled=True),
+        ):
+            enabled = server._build_public_api_payload("summary", ())
+
+        self.assertEqual(
+            disabled["metadata"]["public_actions"],
+            {"fact_refresh_enabled": False},
+        )
+        self.assertEqual(
+            enabled["metadata"]["public_actions"],
+            {"fact_refresh_enabled": True},
+        )
+        self.assertNotIn("public_actions", source_payload["metadata"])
+
     def test_dex_depth_quality_rejects_stale_usd_alignment(self):
         base_market = {
             "market_type": "dex",

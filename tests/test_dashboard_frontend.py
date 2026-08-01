@@ -16,13 +16,16 @@ def run_app_javascript(source: str, prelude: str = ""):
     if node is None:
         raise unittest.SkipTest("Node.js is not installed in this runtime")
     script = prelude + "\n" + APP_PATH.read_text(encoding="utf-8") + "\n" + source
-    completed = subprocess.run(
-        [node, "-e", script],
-        cwd=PROJECT_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise AssertionError(error.stderr or error.stdout) from error
     return json.loads(completed.stdout)
 
 
@@ -249,9 +252,15 @@ globalThis.MarketMonitorNavigation = {
         self.assertIn("start=2026-07-01", result["comparisonUrl"])
         self.assertIn("end=2026-07-29", result["comparisonUrl"])
         self.assertEqual(len(result["eventUrls"]), 2)
-        for event_url in result["eventUrls"]:
-            self.assertIn("start=2026-07-01", event_url)
-            self.assertIn("end=2026-07-29", event_url)
+        dated_event_urls = [
+            url for url in result["eventUrls"] if "start=2026-07-01" in url
+        ]
+        release_wide_event_urls = [
+            url for url in result["eventUrls"] if "start=" not in url and "end=" not in url
+        ]
+        self.assertEqual(len(dated_event_urls), 1)
+        self.assertIn("end=2026-07-29", dated_event_urls[0])
+        self.assertEqual(len(release_wide_event_urls), 1)
         self.assertEqual(
             result["exportName"],
             "cex-dex-market-facts-2026-07-01-2026-07-29.csv",
@@ -426,6 +435,117 @@ globalThis.MarketMonitorNavigation = {
             },
         })
 
+    def test_same_catalog_route_change_invalidates_every_page_request_owner(self):
+        result = run_app_javascript(
+            """
+const aborted = [];
+function controller(name) {
+  return { abort() { aborted.push(name); } };
+}
+app.catalog = { metadata: {} };
+app.activeCatalogKey = "BTC|2026-07-01|2026-07-30|g1";
+app.comparisonRequestId = 4;
+app.executionRequestId = 5;
+app.qualityRequestId = 6;
+app.eventRequestId = 7;
+app.comparisonController = controller("comparison");
+app.executionController = controller("execution");
+app.qualityController = controller("quality");
+app.eventController = controller("events");
+setWorkspaceCatalogLoading(
+  "BTC",
+  "liquidity",
+  "BTC|2026-07-01|2026-07-30|g1",
+  { preserveGlobalError: true },
+);
+console.log(JSON.stringify({
+  aborted,
+  requestIds: {
+    comparison: app.comparisonRequestId,
+    execution: app.executionRequestId,
+    quality: app.qualityRequestId,
+    events: app.eventRequestId,
+  },
+  catalogRetained: Boolean(app.catalog),
+}));
+"""
+        )
+        self.assertEqual(
+            result["aborted"],
+            ["comparison", "execution", "quality", "events"],
+        )
+        self.assertEqual(result["requestIds"], {
+            "comparison": 5,
+            "execution": 6,
+            "quality": 7,
+            "events": 8,
+        })
+        self.assertTrue(result["catalogRetained"])
+
+    def test_informational_quality_reasons_keep_distinct_visual_severity(self):
+        result = run_app_javascript(
+            """
+const qualityBody = { innerHTML: "" };
+const filterSummary = { hidden: true, textContent: "", dataset: {} };
+global.document = {
+  getElementById(id) {
+    return id === "quality-body" ? qualityBody
+      : id === "quality-filter-summary" ? filterSummary : null;
+  },
+};
+const flag = {
+  code: "depth_unsupported",
+  severity: "info",
+  category: "capability",
+  explanation: "Depth is unsupported by this adapter.",
+  observedValue: null,
+  threshold: null,
+};
+const badges = renderQualityBadges([flag]);
+app.qualityOrigin = "screener";
+app.qualitySeverity = "info";
+renderQualityPayload({
+  markets: [{
+    market_id: "dex:eth:uniswap_v4:pool:AAVE",
+    market_type: "dex",
+    token_symbol: "AAVE",
+    venue: "uniswap_v4",
+    instrument: "AAVE/USDC",
+    screening_quality_status: "ok",
+    screening_quality_scope: "catalog",
+    screening_quality_window: {
+      start: "2026-01-01", end: "2026-07-30", method: "catalog",
+    },
+    screening_quality_flags: [{
+      code: flag.code,
+      severity: flag.severity,
+      category: flag.category,
+      message: flag.explanation,
+      observed_value: null,
+      threshold: null,
+    }],
+    facts: {},
+  }],
+});
+console.log(JSON.stringify({
+  badges,
+  html: qualityBody.innerHTML,
+  summaryState: filterSummary.dataset.state,
+  summary: filterSummary.textContent,
+}));
+"""
+        )
+        self.assertIn('class="quality-flag info"', result["badges"])
+        self.assertNotIn('class="quality-flag warn"', result["badges"])
+        self.assertIn('data-severity="info"', result["html"])
+        self.assertEqual(result["summaryState"], "info")
+        self.assertIn("1 info reason", result["summary"])
+        styles = (PROJECT_ROOT / "dashboard" / "static" / "styles.css").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('.quality-reasons li[data-severity="info"]', styles)
+        self.assertIn('.quality-linked-row[data-highlight-severity="info"]', styles)
+
     def test_catalog_window_boundary_keeps_committed_state_and_guards_generation_refresh(self):
         self.maxDiff = None
         result = run_app_javascript(
@@ -472,14 +592,20 @@ const END = "2026-07-29";
 function payload(start, generation) {
   return {
     metadata: {
-      response_scope: "screener_summary", summary_version: 2,
+      response_scope: "screener_summary", summary_version: 3,
       data_generation: generation, start_date: start, end_date: END,
       available_start: "2026-05-01", available_end: END,
       sources: [], tvl_note: "TVL unavailable",
       cex_depth_note: "CEX depth unavailable",
       dex_depth_note: "DEX depth unavailable",
     },
-    tokens: [{ token_symbol: "BTC", primary_cex: null, primary_dex: null }],
+    tokens: [{
+      token_symbol: "BTC",
+      absolute_price_gap: null,
+      absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+      primary_cex: null,
+      primary_dex: null,
+    }],
   };
 }
 function writeApplied(start, generation, visible, catalog = null) {
@@ -988,7 +1114,7 @@ function summaryPayload(start, end, generation = "generation-a") {
   return {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 2,
+      summary_version: 3,
       data_generation: generation,
       start_date: start,
       end_date: end,
@@ -1002,6 +1128,8 @@ function summaryPayload(start, end, generation = "generation-a") {
     },
     tokens: [{
       token_symbol: "BTC",
+      absolute_price_gap: null,
+      absolute_price_gap_method: "symmetric_midpoint_relative_gap",
       primary_cex: null,
       primary_dex: null,
     }],
@@ -1598,7 +1726,7 @@ function summaryPayload() {
   return {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 2,
+      summary_version: 3,
       data_generation: "generation-b",
       start_date: "2026-07-23",
       end_date: "2026-07-29",
@@ -1607,7 +1735,13 @@ function summaryPayload() {
       default_workspace_token: "ETH",
       sources: [],
     },
-    tokens: [{ token_symbol: "ETH", primary_cex: null, primary_dex: null }],
+    tokens: [{
+      token_symbol: "ETH",
+      absolute_price_gap: null,
+      absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+      primary_cex: null,
+      primary_dex: null,
+    }],
   };
 }
 global.fetch = async (url) => {
@@ -1649,7 +1783,7 @@ applyWorkspaceRoute = (route) => { workspaceApplications += 1; app.route = route
 app.payload = {
   metadata: {
     response_scope: "screener_summary",
-    summary_version: 2,
+    summary_version: 3,
     data_generation: "generation-a",
     start_date: "2026-06-30",
     end_date: "2026-07-29",
@@ -1657,7 +1791,13 @@ app.payload = {
     available_end: "2026-07-29",
     default_workspace_token: "BTC",
   },
-  tokens: [{ token_symbol: "BTC", primary_cex: null, primary_dex: null }],
+  tokens: [{
+    token_symbol: "BTC",
+    absolute_price_gap: null,
+    absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+    primary_cex: null,
+    primary_dex: null,
+  }],
 };
 app.route = navigation.parseRoute(window.location.pathname, window.location.search);
 app.routeReady = true;
@@ -2213,11 +2353,13 @@ if (typeof openCustomWindowEditor !== "function") {
 const summary = {
   metadata: {
     response_scope: "screener_summary",
-    summary_version: 2,
+    summary_version: 3,
     data_generation: "g1",
   },
   tokens: [{
     token_symbol: "AAVE",
+    absolute_price_gap: null,
+    absolute_price_gap_method: "symmetric_midpoint_relative_gap",
     primary_cex: null,
     primary_dex: null,
   }],
@@ -2232,10 +2374,16 @@ const legacy = {
   cex_markets: [],
   dex_pools: [],
 };
+const missingSymmetricGap = JSON.parse(JSON.stringify(summary));
+delete missingSymmetricGap.tokens[0].absolute_price_gap;
+const wrongGapMethod = JSON.parse(JSON.stringify(summary));
+wrongGapMethod.tokens[0].absolute_price_gap_method = "directional_dex_over_cex_minus_one";
 console.log(JSON.stringify({
   summary: isMarketPayload(summary),
   staleSummary: isMarketPayload(staleSummary),
   legacy: isMarketPayload(legacy),
+  missingSymmetricGap: isMarketPayload(missingSymmetricGap),
+  wrongGapMethod: isMarketPayload(wrongGapMethod),
   missingAggregates: aggregateFacts({}, [], []),
 }));
 """
@@ -2243,6 +2391,8 @@ console.log(JSON.stringify({
         self.assertTrue(result["summary"])
         self.assertFalse(result["staleSummary"])
         self.assertFalse(result["legacy"])
+        self.assertFalse(result["missingSymmetricGap"])
+        self.assertFalse(result["wrongGapMethod"])
         self.assertEqual(
             result["missingAggregates"],
             {
@@ -2250,6 +2400,50 @@ console.log(JSON.stringify({
                 "aggregateDex": None,
                 "aggregateTotal": None,
                 "aggregateDexShare": None,
+            },
+        )
+
+    def test_default_summary_cache_uses_gap_contract_versioned_key(self):
+        result = run_app_javascript(
+            """
+const summary = {
+  metadata: {
+    response_scope: "screener_summary",
+    summary_version: 3,
+    data_generation: "g1",
+  },
+  tokens: [{
+    token_symbol: "AAVE",
+    absolute_price_gap: null,
+    absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+    primary_cex: null,
+    primary_dex: null,
+  }],
+};
+let readKey = "";
+let writeKey = "";
+global.window = {
+  localStorage: {
+    getItem(key) { readKey = key; return JSON.stringify(summary); },
+    setItem(key) { writeKey = key; },
+  },
+};
+const restored = readDefaultMarketCache();
+writeDefaultMarketCache(summary);
+console.log(JSON.stringify({
+  readKey,
+  writeKey,
+  restoredToken: restored?.tokens?.[0]?.token_symbol || null,
+}));
+"""
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "readKey": "market-monitor:screener-summary:v3",
+                "writeKey": "market-monitor:screener-summary:v3",
+                "restoredToken": "AAVE",
             },
         )
 
@@ -2303,6 +2497,36 @@ console.log(JSON.stringify({
         self.assertIn("clearDefaultMarketCache();", display)
         self.assertIn("defaultGeneration === currentGeneration", synchronizer)
 
+    def test_cached_summary_never_replays_a_stale_public_action_capability(self):
+        result = run_app_javascript(
+            """
+const cached = {
+  metadata: {
+    response_scope: "screener_summary",
+    summary_version: 3,
+    data_generation: "g1",
+    public_actions: { fact_refresh_enabled: true },
+  },
+  tokens: [],
+};
+global.window = {
+  localStorage: {
+    getItem() { return JSON.stringify(cached); },
+  },
+};
+const restored = readDefaultMarketCache();
+console.log(JSON.stringify({
+  capability: restored?.metadata?.public_actions || null,
+  sourceCapability: cached.metadata.public_actions,
+}));
+"""
+        )
+        self.assertIsNone(result["capability"])
+        self.assertEqual(
+            result["sourceCapability"],
+            {"fact_refresh_enabled": True},
+        )
+
     def test_token_catalog_loader_is_window_scoped_without_writing_route_cache(self):
         result = run_app_javascript(
             """
@@ -2329,7 +2553,7 @@ console.log(JSON.stringify({
   app.payload = {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 2,
+      summary_version: 3,
       data_generation: "g1",
     },
     tokens: [],
@@ -2382,7 +2606,7 @@ console.log(JSON.stringify({
   app.payload = {
     metadata: {
       response_scope: "screener_summary",
-      summary_version: 2,
+      summary_version: 3,
       data_generation: "g1",
     },
     tokens: [],
@@ -2441,7 +2665,7 @@ console.log(JSON.stringify({ html }));
 """
         )
         self.assertIn("Catalog quality counts are incomplete", result["html"])
-        self.assertIn('aria-label="N/A reason"', result["html"])
+        self.assertIn('aria-label="N/A reason', result["html"])
         self.assertNotIn("Healthy", result["html"])
 
     def test_compact_primary_markets_keep_cex_and_dex_selection_metrics(self):
@@ -2572,6 +2796,129 @@ console.log(JSON.stringify({
         self.assertEqual(result["zeroValue"], 0)
         self.assertEqual(result["missingValue"], None)
 
+    def test_latest_gap_sort_uses_only_symmetric_midpoint_summary_fact(self):
+        result = run_app_javascript(
+            """
+const sortField = { value: "spread" };
+global.document = {
+  getElementById(id) {
+    return id === "sort-field" ? sortField : null;
+  },
+};
+const withExactFact = {
+  token_symbol: "AAVE",
+  absolute_price_gap: 2 / 202,
+  absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+  price_spread: 0.25,
+};
+const missingExactFact = {
+  token_symbol: "UNI",
+  price_spread: 0.25,
+};
+app.payload = {
+  metadata: { response_scope: "screener_summary" },
+  tokens: [withExactFact, missingExactFact],
+};
+console.log(JSON.stringify({
+  exact: sortValue(withExactFact),
+  missing: sortValue(missingExactFact),
+}));
+"""
+        )
+        self.assertAlmostEqual(result["exact"], 2 / 202)
+        self.assertIsNone(result["missing"])
+
+    def test_all_symmetric_gap_rank_metrics_use_exact_compact_facts(self):
+        result = run_app_javascript(
+            """
+const sortField = { value: "spread" };
+global.document = {
+  getElementById(id) {
+    return id === "sort-field" ? sortField : null;
+  },
+};
+const tokenSummary = {
+  token_symbol: "AAVE",
+  absolute_price_gap: 0.0012,
+  maximum_absolute_price_spread: 0.004,
+  mean_absolute_price_spread: 0.0025,
+  median_absolute_price_spread: 0.003,
+};
+const missing = { token_symbol: "MISSING" };
+const fields = ["spread", "spread_max", "spread_mean", "spread_median"];
+const observed = {};
+const unavailable = {};
+fields.forEach((field) => {
+  sortField.value = field;
+  observed[field] = {
+    value: sortValue(tokenSummary),
+    label: formatRankValue(tokenSummary),
+  };
+  unavailable[field] = {
+    value: sortValue(missing),
+    label: formatRankValue(missing),
+  };
+});
+console.log(JSON.stringify({ observed, unavailable }));
+"""
+        )
+
+        self.assertEqual(
+            result["observed"],
+            {
+                "spread": {"value": 0.0012, "label": "12 bps"},
+                "spread_max": {"value": 0.004, "label": "40 bps"},
+                "spread_mean": {"value": 0.0025, "label": "25 bps"},
+                "spread_median": {"value": 0.003, "label": "30 bps"},
+            },
+        )
+        self.assertEqual(
+            result["unavailable"],
+            {
+                field: {"value": None, "label": None}
+                for field in ("spread", "spread_max", "spread_mean", "spread_median")
+            },
+        )
+
+    def test_workspace_heading_distinguishes_markets_from_token_research(self):
+        result = run_app_javascript(
+            """
+const elements = {
+  "workspace-eyebrow": { textContent: "" },
+  "facts-title": { textContent: "" },
+};
+global.document = {
+  getElementById(id) {
+    return elements[id] || null;
+  },
+};
+setWorkspacePageIdentity("AAVE", "markets");
+const markets = {
+  eyebrow: elements["workspace-eyebrow"].textContent,
+  title: elements["facts-title"].textContent,
+};
+setWorkspacePageIdentity("AAVE", "compare");
+const research = {
+  eyebrow: elements["workspace-eyebrow"].textContent,
+  title: elements["facts-title"].textContent,
+};
+console.log(JSON.stringify({ markets, research }));
+"""
+        )
+        self.assertEqual(result["markets"]["title"], "AAVE Markets")
+        self.assertEqual(
+            result["markets"]["eyebrow"],
+            "Single Token market catalog",
+        )
+        self.assertEqual(
+            result["research"]["title"],
+            "AAVE Token Research",
+        )
+        self.assertEqual(
+            result["research"]["eyebrow"],
+            "Single Token research workspace",
+        )
+
     def test_sort_registry_forces_cross_spread_and_forbids_combined_returns(self):
         result = run_app_javascript(
             """
@@ -2607,6 +2954,570 @@ console.log(JSON.stringify({
         self.assertIn('fetch("/api/actions/facts/refresh"', app_js)
         self.assertIn('market?.[`${fact}_retryable`] === true', app_js)
         self.assertIn(".na-disclosure-panel", styles)
+
+    def test_na_refresh_requires_public_capability_and_names_exact_fact_context(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        styles = STYLES_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="action-status"', index)
+        self.assertIn('class="status-banner global-action-status"', index)
+        self.assertLess(
+            index.index('id="action-status"'),
+            index.index('id="facts-workbench"'),
+        )
+        disclosure_rule = styles[
+            styles.index(".na-disclosure > summary {"):
+            styles.index(".na-disclosure > summary::-webkit-details-marker")
+        ]
+        self.assertIn("min-height: 44px", disclosure_rule)
+        result = run_app_javascript(
+            """
+const options = {
+  retryable: true,
+  token: "AAVE",
+  marketId: "cex:binance:AAVE/USDT",
+  marketLabel: "Binance AAVE/USDT",
+  fact: "depth",
+  factLabel: "executable depth",
+  bandBps: 100,
+  notionalUsd: 10000,
+};
+app.catalog = null;
+app.payload = {
+  metadata: { public_actions: { fact_refresh_enabled: false } },
+};
+const disabled = naFactMarkup("The source request failed.", options);
+app.payload = {
+  metadata: { public_actions: { fact_refresh_enabled: true } },
+};
+const enabled = naFactMarkup("The source request failed.", options);
+console.log(JSON.stringify({ disabled, enabled }));
+"""
+        )
+        self.assertNotIn("na-refresh-action", result["disabled"])
+        self.assertIn("na-refresh-action", result["enabled"])
+        self.assertIn("data-refresh-status", result["enabled"])
+        self.assertIn("Token AAVE", result["enabled"])
+        self.assertIn("Binance AAVE/USDT", result["enabled"])
+        self.assertIn("executable depth", result["enabled"])
+        self.assertIn("±100 bps", result["enabled"])
+        self.assertIn("$10,000", result["enabled"])
+
+    def test_snapshot_na_reason_reports_last_collection_attempt_time(self):
+        result = run_app_javascript(
+            """
+console.log(JSON.stringify({
+  known: snapshotMissingReason({
+    depth_status: "collection_failed",
+    depth_na_reason: "source_unavailable",
+    depth_observed_at: "2026-07-31T12:34:56Z",
+  }, "depth", "Depth unavailable."),
+  unknown: snapshotMissingReason({
+    tvl_status: "unavailable",
+  }, "tvl", "TVL unavailable."),
+}));
+"""
+        )
+        self.assertIn("2026-07-31 12:34:56 UTC", result["known"])
+        self.assertIn("Last collection attempt", result["known"])
+        self.assertIn("Last collection attempt time is not published", result["unknown"])
+
+    def test_snapshot_refresh_polls_public_job_and_reloads_current_fact_view(self):
+        result = run_app_javascript(
+            """
+function control() {
+  return { hidden: true, textContent: "", dataset: {} };
+}
+const actionStatus = control();
+const actionMessages = [];
+Object.defineProperty(actionStatus, "textContent", {
+  get() { return this._text || ""; },
+  set(value) { this._text = String(value); actionMessages.push(this._text); },
+});
+const marketStatus = control();
+const globalError = control();
+const inlineStatus = control();
+const panel = {
+  querySelector(selector) {
+    return selector === "[data-refresh-status]" ? inlineStatus : null;
+  },
+};
+const button = {
+  disabled: false,
+  textContent: "Refresh this fact",
+  dataset: {
+    refreshToken: "AAVE",
+    refreshMarketId: "cex:binance:AAVE/USDT",
+    refreshFact: "depth",
+  },
+  closest(selector) { return selector === ".na-disclosure-panel" ? panel : null; },
+};
+const nodes = {
+  "action-status": actionStatus,
+  "market-status": marketStatus,
+  "global-error": globalError,
+};
+global.document = { getElementById(id) { return nodes[id] || null; } };
+const jobId = "0123456789abcdef0123456789abcdef";
+const requests = [];
+let statusRead = 0;
+global.fetch = async (url, options = {}) => {
+  requests.push({ url, method: options.method || "GET" });
+  if (url === "/api/actions/facts/refresh") {
+    return { ok: true, status: 202, json: async () => ({
+      job_id: jobId, status: "queued", stage: "queued",
+    }) };
+  }
+  statusRead += 1;
+  const statuses = [
+    { job_id: jobId, status: "queued", stage: "queued" },
+    { job_id: jobId, status: "running", stage: "refresh_cex_depth" },
+    { job_id: jobId, status: "succeeded", stage: "complete", publication_committed: true },
+  ];
+  return { ok: true, status: 200, json: async () => statuses[statusRead - 1] };
+};
+waitForSnapshotRefreshPoll = async () => {};
+let reloads = 0;
+reloadFactsAfterSnapshotRefresh = async () => { reloads += 1; return true; };
+(async () => {
+  const completed = await requestSnapshotFactRefresh(button);
+  console.log(JSON.stringify({
+    completed,
+    reloads,
+    requests,
+    actionMessages,
+    actionHidden: actionStatus.hidden,
+    inlineText: inlineStatus.textContent,
+    inlineHidden: inlineStatus.hidden,
+    marketStatusText: marketStatus.textContent,
+  }));
+})();
+"""
+        )
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["reloads"], 1)
+        self.assertEqual(result["requests"][0]["method"], "POST")
+        self.assertEqual(
+            [item["method"] for item in result["requests"][1:]],
+            ["GET", "GET", "GET"],
+        )
+        self.assertTrue(any(
+            "0123456789abcdef0123456789abcdef" in message and "queued" in message.lower()
+            for message in result["actionMessages"]
+        ))
+        self.assertTrue(any(
+            "running" in message.lower() for message in result["actionMessages"]
+        ))
+        self.assertIn("reloaded", result["actionMessages"][-1].lower())
+        self.assertFalse(result["actionHidden"])
+        self.assertFalse(result["inlineHidden"])
+        self.assertEqual(result["marketStatusText"], "")
+
+    def test_snapshot_refresh_terminal_result_cannot_reload_after_route_pair_changes(self):
+        result = run_app_javascript(
+            """
+function control(value = "") {
+  return { hidden: true, textContent: "", value, dataset: {} };
+}
+const actionStatus = control();
+const inlineStatus = control();
+const marketA = control("cex:binance:AAVE/USDT");
+const marketB = control("dex:ethereum:uniswap:AAVE/USDC");
+const button = {
+  disabled: false,
+  textContent: "Refresh this fact",
+  dataset: {
+    refreshToken: "AAVE",
+    refreshMarketId: "cex:binance:AAVE/USDT",
+    refreshFact: "depth",
+  },
+  closest() {
+    return { querySelector() { return inlineStatus; } };
+  },
+};
+const nodes = {
+  "action-status": actionStatus,
+  "facts-market-a": marketA,
+  "facts-market-b": marketB,
+};
+global.document = {
+  getElementById(id) { return nodes[id] || control(); },
+};
+global.window = {
+  location: {
+    pathname: "/tokens/AAVE/liquidity",
+    search: "?market_a=cex%3Abinance%3AAAVE%2FUSDT&market_b=dex%3Aethereum%3Auniswap%3AAAVE%2FUSDC",
+  },
+  history: {
+    pushState(_state, _title, path) {
+      const [pathname, search = ""] = path.split("?");
+      window.location.pathname = pathname;
+      window.location.search = search ? `?${search}` : "";
+    },
+  },
+  scrollTo() {},
+};
+app.route = {
+  kind: "workspace",
+  token: "AAVE",
+  page: "liquidity",
+  state: {
+    marketA: "cex:binance:AAVE/USDT",
+    marketB: "dex:ethereum:uniswap:AAVE/USDC",
+  },
+};
+const jobId = "0123456789abcdef0123456789abcdef";
+let releaseTerminal;
+const terminalReady = new Promise((resolve) => { releaseTerminal = resolve; });
+let markPollStarted;
+const pollStarted = new Promise((resolve) => { markPollStarted = resolve; });
+global.fetch = async (url) => {
+  if (url === "/api/actions/facts/refresh") {
+    return {
+      ok: true,
+      status: 202,
+      json: async () => ({ job_id: jobId, status: "queued" }),
+    };
+  }
+  markPollStarted();
+  await terminalReady;
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      job_id: jobId,
+      status: "succeeded",
+      stage: "complete",
+      publication_committed: true,
+    }),
+  };
+};
+let reloads = 0;
+reloadFactsAfterSnapshotRefresh = async () => { reloads += 1; return true; };
+applyRouteFromLocation = async () => {
+  app.route = {
+    kind: "workspace",
+    token: "BTC",
+    page: "compare",
+    state: {
+      marketA: "cex:coinbase:BTC/USD",
+      marketB: "dex:ethereum:uniswap:BTC/USDC",
+    },
+  };
+  marketA.value = "cex:coinbase:BTC/USD";
+  marketB.value = "dex:ethereum:uniswap:BTC/USDC";
+  return true;
+};
+(async () => {
+  const pending = requestSnapshotFactRefresh(button);
+  await pollStarted;
+  navigateTo("/tokens/BTC/compare?market_a=cex%3Acoinbase%3ABTC%2FUSD");
+  releaseTerminal();
+  const completed = await pending;
+  console.log(JSON.stringify({
+    completed,
+    reloads,
+    globalText: actionStatus.textContent,
+    globalState: actionStatus.dataset.state || "",
+    buttonText: button.textContent,
+  }));
+})();
+"""
+        )
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["reloads"], 0)
+        self.assertEqual(result["globalText"], "")
+        self.assertEqual(result["globalState"], "")
+        self.assertNotEqual(result["buttonText"], "Refresh complete")
+
+    def test_new_snapshot_refresh_sequence_suppresses_old_job_completion(self):
+        result = run_app_javascript(
+            """
+function control() {
+  return { hidden: true, textContent: "", dataset: {} };
+}
+const actionStatus = control();
+const firstInline = control();
+const secondInline = control();
+function refreshButton(marketId, fact, inline) {
+  return {
+    disabled: false,
+    textContent: "Refresh this fact",
+    dataset: {
+      refreshToken: "AAVE",
+      refreshMarketId: marketId,
+      refreshFact: fact,
+    },
+    closest() { return { querySelector() { return inline; } }; },
+  };
+}
+const firstButton = refreshButton("cex:binance:AAVE/USDT", "depth", firstInline);
+const secondButton = refreshButton(
+  "dex:ethereum:uniswap:AAVE/USDC",
+  "tvl",
+  secondInline,
+);
+global.document = {
+  getElementById(id) { return id === "action-status" ? actionStatus : null; },
+};
+global.window = {
+  location: { pathname: "/screener", search: "" },
+};
+app.route = { kind: "screener", filters: {} };
+const firstJob = "11111111111111111111111111111111";
+const secondJob = "22222222222222222222222222222222";
+let releaseFirst;
+const firstTerminalReady = new Promise((resolve) => { releaseFirst = resolve; });
+let markFirstPollStarted;
+const firstPollStarted = new Promise((resolve) => { markFirstPollStarted = resolve; });
+global.fetch = async (url, options = {}) => {
+  if (url === "/api/actions/facts/refresh") {
+    const body = JSON.parse(options.body);
+    const jobId = body.fact_type === "depth" ? firstJob : secondJob;
+    return {
+      ok: true,
+      status: 202,
+      json: async () => ({ job_id: jobId, status: "queued" }),
+    };
+  }
+  if (url.endsWith(firstJob)) {
+    markFirstPollStarted();
+    await firstTerminalReady;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        job_id: firstJob,
+        status: "succeeded",
+        publication_committed: true,
+      }),
+    };
+  }
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      job_id: secondJob,
+      status: "succeeded",
+      publication_committed: true,
+    }),
+  };
+};
+let reloads = 0;
+reloadFactsAfterSnapshotRefresh = async () => { reloads += 1; return true; };
+(async () => {
+  const firstPending = requestSnapshotFactRefresh(firstButton);
+  await firstPollStarted;
+  const secondCompleted = await requestSnapshotFactRefresh(secondButton);
+  const statusAfterSecond = actionStatus.textContent;
+  releaseFirst();
+  const firstCompleted = await firstPending;
+  console.log(JSON.stringify({
+    firstCompleted,
+    secondCompleted,
+    reloads,
+    statusAfterSecond,
+    finalStatus: actionStatus.textContent,
+    firstButtonDisabled: firstButton.disabled,
+    firstButtonText: firstButton.textContent,
+    secondButtonText: secondButton.textContent,
+  }));
+})();
+"""
+        )
+        self.assertFalse(result["firstCompleted"])
+        self.assertTrue(result["secondCompleted"])
+        self.assertEqual(result["reloads"], 1)
+        self.assertIn("22222222222222222222222222222222", result["statusAfterSecond"])
+        self.assertEqual(result["finalStatus"], result["statusAfterSecond"])
+        self.assertFalse(result["firstButtonDisabled"])
+        self.assertEqual(result["firstButtonText"], "Refresh this fact")
+        self.assertEqual(result["secondButtonText"], "Refresh complete")
+
+    def test_snapshot_refresh_reload_owner_gate_rejects_a_stale_summary_response(self):
+        result = run_app_javascript(
+            """
+function control() {
+  return {
+    value: "", hidden: false, disabled: false, textContent: "", innerHTML: "",
+    dataset: {}, attributes: {}, style: {},
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const controls = new Map();
+global.document = {
+  getElementById(id) {
+    if (!controls.has(id)) controls.set(id, control());
+    return controls.get(id);
+  },
+  querySelectorAll() { return []; },
+};
+global.window = { location: { pathname: "/screener", search: "" } };
+const current = {
+  metadata: {
+    response_scope: "screener_summary",
+    summary_version: 3,
+    data_generation: "g1",
+    start_date: "2026-07-01",
+    end_date: "2026-07-29",
+    available_start: "2026-05-01",
+    available_end: "2026-07-29",
+    sources: [],
+    tvl_note: "",
+    cex_depth_note: "",
+    dex_depth_note: "",
+  },
+  tokens: [{
+    token_symbol: "AAVE", marker: "CURRENT",
+    absolute_price_gap: null,
+    absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+    primary_cex: null, primary_dex: null,
+  }],
+};
+const stale = {
+  ...current,
+  metadata: { ...current.metadata, data_generation: "g2" },
+  tokens: [{
+    token_symbol: "AAVE", marker: "STALE_REFRESH",
+    absolute_price_gap: null,
+    absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+    primary_cex: null, primary_dex: null,
+  }],
+};
+app.payload = current;
+app.visibleTokens = [...current.tokens];
+let resolveSummary;
+global.fetch = () => new Promise((resolve) => { resolveSummary = resolve; });
+let displayedMarker = null;
+displayMarket = (payload) => {
+  displayedMarker = payload.tokens[0].marker;
+  app.payload = payload;
+};
+let owned = true;
+(async () => {
+  const pending = loadMarket("2026-07-01", "2026-07-29", {
+    preserve: true,
+    responseIsOwned: () => owned,
+  });
+  await Promise.resolve();
+  owned = false;
+  resolveSummary({ ok: true, status: 200, json: async () => stale });
+  const loaded = await pending;
+  console.log(JSON.stringify({
+    loaded,
+    displayedMarker,
+    retainedMarker: app.payload.tokens[0].marker,
+  }));
+})();
+"""
+        )
+        self.assertFalse(result["loaded"])
+        self.assertIsNone(result["displayedMarker"])
+        self.assertEqual(result["retainedMarker"], "CURRENT")
+
+    def test_snapshot_refresh_failure_is_visible_actionable_and_retryable(self):
+        result = run_app_javascript(
+            """
+function control() {
+  return { hidden: true, textContent: "", dataset: {} };
+}
+const actionStatus = control();
+const inlineStatus = control();
+const button = {
+  disabled: false,
+  textContent: "Refresh this fact",
+  dataset: {
+    refreshToken: "AAVE",
+    refreshMarketId: "cex:binance:AAVE/USDT",
+    refreshFact: "depth",
+  },
+  closest() {
+    return { querySelector() { return inlineStatus; } };
+  },
+};
+global.document = {
+  getElementById(id) {
+    if (id === "action-status") return actionStatus;
+    if (id === "global-error" || id === "market-status") return control();
+    return null;
+  },
+};
+const jobId = "fedcba9876543210fedcba9876543210";
+let requests = 0;
+global.fetch = async (url) => {
+  requests += 1;
+  if (url === "/api/actions/facts/refresh") {
+    return { ok: true, status: 202, json: async () => ({ job_id: jobId, status: "queued" }) };
+  }
+  return { ok: true, status: 200, json: async () => ({
+    job_id: jobId,
+    status: "partial",
+    stage: "verify_snapshot_after",
+    error_code: "snapshot_target_unresolved",
+    retryable: true,
+    publication_committed: false,
+  }) };
+};
+waitForSnapshotRefreshPoll = async () => {};
+let reloads = 0;
+reloadFactsAfterSnapshotRefresh = async () => { reloads += 1; return true; };
+(async () => {
+  const completed = await requestSnapshotFactRefresh(button);
+  console.log(JSON.stringify({
+    completed,
+    requests,
+    reloads,
+    buttonDisabled: button.disabled,
+    buttonText: button.textContent,
+    actionHidden: actionStatus.hidden,
+    actionState: actionStatus.dataset.state,
+    actionText: actionStatus.textContent,
+    inlineHidden: inlineStatus.hidden,
+    inlineText: inlineStatus.textContent,
+  }));
+})();
+"""
+        )
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["requests"], 2)
+        self.assertEqual(result["reloads"], 0)
+        self.assertFalse(result["buttonDisabled"])
+        self.assertEqual(result["buttonText"], "Refresh this fact")
+        self.assertFalse(result["actionHidden"])
+        self.assertEqual(result["actionState"], "critical")
+        self.assertIn("still unavailable", result["actionText"].lower())
+        self.assertIn("retry", result["actionText"].lower())
+        self.assertFalse(result["inlineHidden"])
+        self.assertEqual(result["inlineText"], result["actionText"])
+
+    def test_snapshot_refresh_treats_worker_interruption_as_terminal_failure(self):
+        result = run_app_javascript(
+            """
+const jobId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+global.fetch = async () => ({
+  ok: true,
+  status: 200,
+  json: async () => ({
+    job_id: jobId,
+    status: "interrupted",
+    stage: "interrupted",
+    error_code: "process_interrupted",
+    retryable: true,
+  }),
+});
+(async () => {
+  try {
+    const job = await pollSnapshotFactRefresh(null, jobId);
+    console.log(JSON.stringify({ status: job.status, error: null }));
+  } catch (error) {
+    console.log(JSON.stringify({ status: null, error: error.message }));
+  }
+})();
+"""
+        )
+        self.assertEqual(result["status"], "interrupted")
+        self.assertIsNone(result["error"])
 
     def test_market_pair_controls_share_one_aligned_grid_without_warning_column(self):
         styles = STYLES_PATH.read_text(encoding="utf-8")
@@ -3244,6 +4155,140 @@ console.log(JSON.stringify({
         self.assertNotIn('byId("date-start").value =', loader)
         self.assertIn("syncClosedDraftToApplied();", app_js)
 
+    def test_pending_summary_cannot_overwrite_a_new_page_or_token_route(self):
+        result = run_app_javascript(
+            """
+function control() {
+  return {
+    value: "", hidden: false, disabled: false, textContent: "", innerHTML: "",
+    dataset: {}, attributes: {}, style: {},
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+    addEventListener() {}, contains() { return false; },
+  };
+}
+const controls = new Map();
+global.document = {
+  getElementById(id) {
+    if (!controls.has(id)) controls.set(id, control());
+    return controls.get(id);
+  },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+global.window = {
+  location: { pathname: "/tokens/BTC/markets", search: "" },
+  history: { replaceState() {} },
+  lucide: null,
+};
+
+function summary(start, marker) {
+  return {
+    metadata: {
+      response_scope: "screener_summary", summary_version: 3,
+      data_generation: "g1", start_date: start, end_date: "2026-07-29",
+      available_start: "2026-05-01", available_end: "2026-07-29",
+      sources: [], tvl_note: "", cex_depth_note: "", dex_depth_note: "",
+    },
+    tokens: [
+      {
+        token_symbol: "BTC", marker,
+        absolute_price_gap: null,
+        absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+        primary_cex: null, primary_dex: null,
+      },
+      {
+        token_symbol: "ETH", marker,
+        absolute_price_gap: null,
+        absolute_price_gap_method: "symmetric_midpoint_relative_gap",
+        primary_cex: null, primary_dex: null,
+      },
+    ],
+  };
+}
+
+setActiveAppView = () => {};
+setActiveWorkspacePage = () => {};
+setWorkspaceCatalogLoading = () => {};
+setWorkspaceDataUnavailable = () => {};
+applyWorkspaceRoute = (route) => { app.route = route; };
+finalizeRoutePresentation = () => { app.routeReady = true; };
+cachedTokenCatalog = (_key) => ({ metadata: {}, markets: [] });
+cacheTokenCatalog = () => {};
+
+async function scenario(token, page) {
+  app.payload = summary("2026-06-30", "CURRENT");
+  app.visibleTokens = [...app.payload.tokens];
+  app.route = {
+    kind: "workspace", token: "BTC", page: "markets",
+    state: { start: "2026-06-30", end: "2026-07-29" },
+  };
+  app.routeReady = true;
+  app.routeRequestId = 0;
+  app.marketRequestId = 0;
+  app.marketController = null;
+  app.catalogController = null;
+  app.catalogsByToken.clear();
+
+  let request;
+  global.fetch = (url, options = {}) => new Promise((resolve) => {
+    request = { url, signal: options.signal, resolve };
+  });
+  const pending = loadMarket("2026-07-23", "2026-07-29", { preserve: true });
+  await Promise.resolve();
+
+  globalThis.__pendingSummaryRoute = {
+    kind: "workspace", token, page,
+    state: { start: "2026-06-30", end: "2026-07-29" },
+  };
+  window.location.pathname = `/tokens/${token}/${page}`;
+  const routeApplied = await applyRouteFromLocation();
+  request.resolve({
+    ok: true, status: 200,
+    json: async () => summary("2026-07-23", "STALE"),
+  });
+  const staleApplied = await pending;
+  return {
+    routeApplied,
+    staleApplied,
+    aborted: request.signal.aborted,
+    token: app.route.token,
+    page: app.route.page,
+    start: app.payload.metadata.start_date,
+    markers: app.payload.tokens.map((row) => row.marker),
+  };
+}
+
+console.log(JSON.stringify({
+  pageSwitch: await scenario("BTC", "compare"),
+  tokenSwitch: await scenario("ETH", "markets"),
+}));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  parseRoute() { return globalThis.__pendingSummaryRoute; },
+};
+""",
+        )
+        expected_common = {
+            "routeApplied": True,
+            "staleApplied": False,
+            "aborted": True,
+            "start": "2026-06-30",
+            "markers": ["CURRENT", "CURRENT"],
+        }
+        self.assertEqual(result["pageSwitch"], {
+            **expected_common,
+            "token": "BTC",
+            "page": "compare",
+        })
+        self.assertEqual(result["tokenSwitch"], {
+            **expected_common,
+            "token": "ETH",
+            "page": "markets",
+        })
+
     def test_screener_drill_down_preserves_the_rendered_summary_window(self):
         app_js = APP_PATH.read_text(encoding="utf-8")
         summary_state = app_js[
@@ -3416,6 +4461,350 @@ console.log(JSON.stringify({ screener, selected: qualityBody.innerHTML }));
         self.assertIn("Screener-only warning reason.", result["screener"]["html"])
         self.assertIn("1 warning reason", result["screener"]["summary"])
         self.assertNotIn("Screener-only warning reason.", result["selected"])
+
+    def test_screener_critical_chip_drills_into_exact_critical_projection(self):
+        result = run_app_javascript(
+            """
+const qualityBody = { innerHTML: "" };
+const filterSummary = { hidden: true, textContent: "", dataset: {} };
+global.document = {
+  getElementById(id) {
+    if (id === "quality-body") return qualityBody;
+    if (id === "quality-filter-summary") return filterSummary;
+    return null;
+  },
+};
+app.payload = {
+  metadata: { start_date: "2026-07-01", end_date: "2026-07-30" },
+  tokens: [],
+};
+const chips = screenerQualityMarkup(
+  "AAVE",
+  { critical: 1, warning: 1, info: 0 },
+  true,
+);
+const criticalHref = chips.match(
+  /data-severity="critical" href="([^"]+)"/,
+)?.[1] || "";
+app.qualityOrigin = "screener";
+app.qualitySeverity = "critical";
+renderQualityPayload({
+  markets: [
+    {
+      market_id: "cex:binance:AAVE/USDT",
+      market_type: "cex",
+      token_symbol: "AAVE",
+      venue: "binance",
+      instrument: "AAVE/USDT",
+      screening_quality_status: "critical",
+      screening_quality_flags: [{
+        code: "critical_fixture",
+        severity: "critical",
+        category: "data_integrity",
+        message: "Exact critical reason from the Screener.",
+      }],
+      facts: {},
+    },
+    {
+      market_id: "cex:coinbase:AAVE/USD",
+      market_type: "cex",
+      token_symbol: "AAVE",
+      venue: "coinbase",
+      instrument: "AAVE/USD",
+      screening_quality_status: "warning",
+      screening_quality_flags: [{
+        code: "warning_fixture",
+        severity: "warning",
+        category: "data_health",
+        message: "A warning that must not appear in the Critical drilldown.",
+      }],
+      facts: {},
+    },
+  ],
+});
+console.log(JSON.stringify({
+  chips,
+  criticalHref,
+  html: qualityBody.innerHTML,
+  summary: filterSummary.textContent,
+}));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  buildWorkspacePath(token, page, state = {}) {
+    const query = new URLSearchParams();
+    Object.entries(state).forEach(([key, value]) => {
+      if (value !== "" && value !== null && value !== undefined) {
+        query.set(key, String(value));
+      }
+    });
+    return `/tokens/${token}/${page}?${query.toString()}`;
+  },
+};
+""",
+        )
+
+        self.assertIn('data-severity="critical"', result["chips"])
+        self.assertIn("/tokens/AAVE/quality?", result["criticalHref"])
+        self.assertIn("start=2026-07-01", result["criticalHref"])
+        self.assertIn("end=2026-07-30", result["criticalHref"])
+        self.assertIn("scope=all", result["criticalHref"])
+        self.assertIn("severity=critical", result["criticalHref"])
+        self.assertIn("origin=screener", result["criticalHref"])
+        self.assertIn("cex:binance:AAVE/USDT", result["html"])
+        self.assertIn("Exact critical reason from the Screener.", result["html"])
+        self.assertNotIn("cex:coinbase:AAVE/USD", result["html"])
+        self.assertNotIn("A warning that must not appear", result["html"])
+        self.assertIn("1 critical reason linked from the Screener", result["summary"])
+
+    def test_screener_quality_explains_catalog_window_and_threshold(self):
+        result = run_app_javascript(
+            """
+const qualityBody = { innerHTML: "" };
+const filterSummary = { hidden: true, textContent: "", dataset: {} };
+global.document = {
+  getElementById(id) {
+    return id === "quality-body" ? qualityBody
+      : id === "quality-filter-summary" ? filterSummary : null;
+  },
+};
+app.qualityOrigin = "screener";
+app.qualitySeverity = "warning";
+renderQualityPayload({
+  metadata: {
+    screening_evaluation_scope: "catalog",
+    screening_evaluation_window: {
+      start: "2026-01-16",
+      end: "2026-07-30",
+      method: "max_query_source_market_observed_start",
+    },
+    window_start: "2026-07-01",
+    window_end: "2026-07-30",
+  },
+  markets: [{
+    market_id: "cex:crypto_com:WLD/USDT",
+    market_type: "cex",
+    token_symbol: "WLD",
+    venue: "crypto_com",
+    instrument: "WLD/USDT",
+    screening_quality_status: "warning",
+    screening_quality_scope: "catalog",
+    screening_quality_window: {
+      start: "2026-01-16",
+      end: "2026-07-30",
+      method: "max_query_source_market_observed_start",
+    },
+    screening_quality_flags: [{
+      code: "low_daily_coverage",
+      severity: "warning",
+      category: "data_health",
+      message: "Daily close coverage is below the threshold.",
+      observed_value: 0.750958,
+      threshold: 0.8,
+    }],
+    facts: {
+      daily: { status: "observed", observed_value: 1.0 },
+    },
+  }],
+});
+console.log(JSON.stringify({ html: qualityBody.innerHTML, summary: filterSummary.textContent }));
+"""
+        )
+
+        self.assertIn("Screener catalog window", result["html"])
+        self.assertIn("2026-01-16", result["html"])
+        self.assertIn("2026-07-30", result["html"])
+        self.assertIn("Observed 75.0958%", result["html"])
+        self.assertIn("minimum 80%", result["html"])
+
+    def test_execution_na_disclosure_uses_canonical_scenario_reason(self):
+        result = run_app_javascript(
+            """
+const unsupported = {
+  status: "unsupported",
+  status_reason: "unsupported_protocol_or_chain",
+};
+const sourceEmpty = {
+  status: "source_no_observation",
+  status_reason: "source_no_order_book",
+};
+const absentResult = {
+  status: "not_cataloged_in_snapshot",
+  rows: [],
+};
+const marketResult = {
+  status: "available",
+  market: {
+    token_symbol: "AAVE",
+    market_id: "cex:binance:AAVE/USDT",
+    market_type: "cex",
+    venue: "binance",
+    instrument: "AAVE/USDT",
+  },
+};
+console.log(JSON.stringify({
+  unsupportedCost: executionCostMarkup(unsupported, marketResult, 10000),
+  unsupportedFill: executionFillMarkup(unsupported, marketResult, 10000),
+  sourceEmpty: executionCostMarkup(sourceEmpty, { status: "available" }),
+  notCataloged: executionFillMarkup(null, absentResult),
+}));
+"""
+        )
+
+        for markup in result.values():
+            self.assertIn('class="na-disclosure"', markup)
+            self.assertIn('aria-label="N/A reason', markup)
+        self.assertIn("not supported for this protocol or chain", result["unsupportedCost"])
+        self.assertIn("not supported for this protocol or chain", result["unsupportedFill"])
+        self.assertIn("AAVE/USDT", result["unsupportedCost"])
+        self.assertIn("$10,000", result["unsupportedCost"])
+        self.assertIn("no order book", result["sourceEmpty"])
+        self.assertIn("not included in the published execution snapshot", result["notCataloged"])
+
+    def test_comparison_and_liquidity_summary_na_values_disclose_exact_reason(self):
+        result = run_app_javascript(
+            """
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map();
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control(id === "facts-token" ? "AAVE" : ""));
+    return nodes.get(id);
+  },
+};
+global.window = { lucide: null };
+renderComparisonChart = () => {};
+
+renderComparison({
+  token_symbol: "AAVE",
+  market_a: { venue: "binance" },
+  market_b: { venue: "uniswap" },
+  market_a_statistics: { window_return: null, daily_volatility: null },
+  market_b_statistics: { window_return: null, daily_volatility: null },
+  latest_comparable_observation: null,
+  observations: [],
+  metadata: { comparison_days: 0, union_observation_days: 0 },
+});
+const comparisonMarkup = [
+  "compare-date", "compare-absolute", "compare-bps",
+  "compare-a-return", "compare-b-return",
+  "compare-a-volatility", "compare-b-volatility",
+].map((id) => nodes.get(id).innerHTML);
+
+const marketA = {
+  market_id: "cex:binance:AAVE/USDT", market_type: "cex",
+  venue: "binance", depth_status: "source_no_observation",
+  depth_na_reason: "source_no_order_book", depth_retryable: false,
+};
+const marketB = {
+  market_id: "dex:eth:uniswap:pool:AAVE", market_type: "dex",
+  venue: "uniswap", depth_status: "collection_failed",
+  depth_na_reason: "source_unavailable", depth_retryable: true,
+};
+renderLiquiditySummary(marketA, marketB, null, null);
+const liquidity = ["liquidity-a-100", "liquidity-b-100", "liquidity-skew"]
+  .map((id) => nodes.get(id).innerHTML);
+console.log(JSON.stringify({ comparison: comparisonMarkup, liquidity }));
+""",
+        )
+        for markup in result["comparison"] + result["liquidity"]:
+            self.assertIn('class="na-disclosure"', markup)
+            self.assertIn('aria-label="N/A reason', markup)
+        self.assertIn("both selected markets", result["comparison"][0])
+        self.assertIn("no order book", result["liquidity"][0])
+        self.assertIn("source unavailable", result["liquidity"][1].lower())
+        self.assertIn("both selected markets", result["liquidity"][2])
+
+    def test_pair_identity_change_clears_screener_drilldown(self):
+        result = run_app_javascript(
+            """
+function control(value = "") {
+  return { value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    setAttribute() {}, removeAttribute() {} };
+}
+const nodes = {
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control("dex:eth:uniswap:pool:AAVE"),
+  "workspace-context-notice": control(),
+};
+global.document = { getElementById(id) { return nodes[id] || control(); } };
+global.window = {
+  location: { pathname: "/tokens/AAVE/quality", search: "?scope=all&severity=warning&origin=screener" },
+  history: { replaceState(_a, _b, path) { this.path = path; } },
+  localStorage: { setItem() {}, removeItem() {} },
+};
+app.route = { kind: "workspace", token: "AAVE", page: "quality", state: {} };
+app.routeReady = true;
+app.qualityScope = "all";
+app.qualityOrigin = "screener";
+app.qualitySeverity = "warning";
+app.pairSelections = {};
+renderFactsMarketWarnings = () => {};
+renderWorkspaceContext = () => {};
+renderWorkspaceMarkets = () => {};
+renderQualityFromCatalog = () => {};
+renderLiquidityCurve = () => {};
+loadQuality = () => {};
+updateRouteLinks = () => {};
+selectWorkspaceMarket("a", "cex:coinbase:AAVE/USD");
+const pairPath = window.history.path;
+app.qualityOrigin = "screener";
+app.qualitySeverity = "critical";
+app.qualityScope = "selected";
+let tokenPath = "";
+navigateTo = (path) => { tokenPath = path; };
+selectWorkspaceToken("RAY");
+console.log(JSON.stringify({
+  origin: app.qualityOrigin,
+  severity: app.qualitySeverity,
+  scope: app.qualityScope,
+  pairPath,
+  tokenPath,
+}));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  buildWorkspacePath(token, page, state = {}) {
+    const query = new URLSearchParams();
+    Object.entries(state).forEach(([key, value]) => {
+      if (value !== "" && value !== null && value !== undefined) {
+        query.set(key, String(value));
+      }
+    });
+    const suffix = query.toString();
+    return `/tokens/${token}/${page}${suffix ? `?${suffix}` : ""}`;
+  },
+  parseRoute(pathname, search) {
+    const parts = pathname.split("/").filter(Boolean);
+    return {
+      kind: "workspace",
+      token: parts[1],
+      page: parts[2],
+      state: Object.fromEntries(new URLSearchParams(search)),
+    };
+  },
+};
+""",
+        )
+
+        self.assertEqual(result["origin"], "")
+        self.assertEqual(result["severity"], "")
+        self.assertEqual(result["scope"], "all")
+        for path in (result["pairPath"], result["tokenPath"]):
+            self.assertNotIn("origin=", path)
+            self.assertNotIn("severity=", path)
+        self.assertNotIn("marketA=", result["tokenPath"])
+        self.assertNotIn("marketB=", result["tokenPath"])
+        self.assertIn("/tokens/RAY/quality", result["tokenPath"])
 
     def test_catalog_fallback_keeps_screener_projection_after_quality_request_failure(self):
         result = run_app_javascript(

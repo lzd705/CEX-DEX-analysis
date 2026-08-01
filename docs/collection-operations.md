@@ -10,8 +10,8 @@ python3 scripts/run_collection_cycle.py --profile PROFILE --publish-local
 
 | Profile | Ordered steps | Intended cadence |
 | --- | --- | --- |
-| `full` | incremental daily OHLCV, CEX depth/cost, published TVL, then DEX depth/cost | manual catch-up and release validation |
-| `daily` | incremental daily OHLCV, TVL | daily at 00:30 UTC |
+| `full` | official CEX lifecycle inventory, incremental daily OHLCV, CEX depth/cost, published TVL, then DEX depth/cost | manual catch-up and release validation |
+| `daily` | official CEX lifecycle inventory, incremental daily OHLCV, TVL | daily at 00:30 UTC |
 | `tvl` | TVL only | manual retry/recovery |
 | `depth` | CEX depth/cost, temporary DEX USD-price refresh, then DEX depth/cost | hourly at minute 05 UTC |
 | `cex_depth` | CEX depth and fixed-notional cost from one book snapshot | manual retry/recovery |
@@ -22,6 +22,45 @@ source with a three-day overlap, and ends at the latest completed UTC day. It
 passes every configured Token to `run_fact_pipeline.py --append`, so the upsert
 preserves older history. `--full-rebuild` is an explicit exception and must not
 be used by timers.
+
+### Daily CEX current-instrument lifecycle evidence
+
+The `full` and `daily` profiles first call the official Crypto.com
+`public/get-instruments` endpoint. The shared parser accepts an instrument as a
+current canonical spot identity only when `inst_type` is `CCY_PAIR`, `symbol`
+is `BASE_QUOTE`, `display_name` is `BASE/QUOTE`, `base_ccy` and `quote_ccy`
+match, and `tradable` is the JSON boolean `true`.
+
+Perpetuals, futures, non-tradable rows, and namespaced venue variants do not
+establish presence for a canonical spot market. A catalog containing no exact
+tradable spot rows is rejected. The collector compares that inventory with all
+static Token pairs plus active runtime Token mappings explicitly approved for
+`crypto_com`. It publishes reviews only for exact configured markets missing
+from the current inventory. A market that reappears is removed from the next
+manifest; no delisting or relisting date is invented.
+
+The exact HTTP response is retained before parsing at:
+
+```text
+MARKET_DATA_DIR/raw/cex-instrument-lifecycle/<response_sha256>.json
+```
+
+The validated runtime manifest is atomically replaced at:
+
+```text
+MARKET_DATA_DIR/cex_instrument_lifecycle.json
+```
+
+Its root always records `checked_at_utc`, `response_sha256`,
+`inventory_count`, and `configured_market_count`, even when `review_count` is
+zero. The runner accepts the lifecycle step only while that root check is no
+more than 36 hours old and no more than five minutes in the future.
+
+A network error produces no new raw file. An HTTP or parse/contract error may
+retain the received raw response for diagnosis, but none of those failures can
+replace the previous manifest. Without `--fail-fast`, independent daily/TVL
+work may continue; the final cycle still fails and the dashboard continues to
+expose the prior manifest with its real age.
 
 Each daily collector also writes one run-scoped attempt ledger beside its
 staging CSV:
@@ -135,7 +174,7 @@ data/local/collection/latest.json
 
 The manifest records exact argument arrays, timestamps, duration, exit status,
 full-log SHA-256, a bounded log tail, current file SHA-256 values, coverage,
-source-specific date ranges, and freshness.
+source-specific date ranges, lifecycle root evidence, and freshness.
 
 Scheduled publishing also applies a post-step freshness gate. A collector that
 exits zero while its expected source remains stale is recorded as failed. A
@@ -143,6 +182,48 @@ rate-limited or empty response therefore cannot masquerade as a successful
 refresh.
 
 ## Exact historical-gap backfill
+
+### One-time Upbit fallback identity migration
+
+The retired Upbit adapter could collect `TOKEN/KRW` even though the configured
+market was `TOKEN/USDT`. Older Coinbase and Kraken adapters could also label
+their actual USD products as `TOKEN/USDT`. Remove or replace those known rows
+only through the dedicated migration runner; do not filter the published CSV
+or SQLite database manually. The runner splits a longer interval into adjacent
+windows of at most 180 inclusive days, uses one private staging snapshot, and
+publishes at most once after every window passes:
+
+```bash
+python3 scripts/migrate_cex_exact_identities.py \
+  --start YYYY-MM-DD --end YYYY-MM-DD \
+  --remove-legacy-upbit-krw-fallback \
+  --data-dir /absolute/published/data \
+  --staging-dir /absolute/new/dry-run-staging
+```
+
+The default is a validating dry-run and the staging directory must not already
+exist. After reviewing its JSON report, rerun with a different new staging
+directory and explicit `--apply`:
+
+```bash
+python3 scripts/migrate_cex_exact_identities.py \
+  --start YYYY-MM-DD --end YYYY-MM-DD \
+  --remove-legacy-upbit-krw-fallback \
+  --data-dir /absolute/published/data \
+  --staging-dir /absolute/new/apply-staging \
+  --apply
+```
+
+The runner holds `collection/collection.lock` from before seeding until after
+the sole import. An already-held lock exits nonzero before staging, collection,
+or import. The Upbit flag is deliberately opt-in and fail-closed. Every
+baseline target market-date must survive as the configured exact identity on
+the same UTC date; this applies to both Upbit KRW→USDT cleanup and
+Coinbase/Kraken USDT→USD correction. `no_data` or `not_listed` is not deletion
+evidence for a previously published observation. Network, rate-limit, parse,
+validation, unavailable-range, or market-date preservation failures block the
+complete migration and preserve the published snapshot. A legitimately
+configured KRW market remains untouched during normal collection.
 
 Use the internal exact-window runner for historical gaps. It does not accept an
 operator-supplied Token or date, and it does not call the `daily` collection
@@ -441,7 +522,8 @@ systemctl --user list-timers cex-dex-daily.timer cex-dex-depth.timer
 The installer validates the absolute paths and renders dedicated user-service
 units. Each unit embeds `MARKET_DATA_DIR`; it does not depend on the root-only
 `/etc/cex-dex/dashboard.env`. Raw evidence is written below that same runtime
-root at `raw/tvl`, `raw/cex-depth`, and `raw/dex-depth`. Collector staging is
+root at `raw/tvl`, `raw/cex-depth`, `raw/dex-depth`, and the content-addressed
+`raw/cex-instrument-lifecycle` inventory evidence. Collector staging is
 the reviewed sibling `.<data-directory-name>-processed`, except that the
 checkout default `data/local` uses `data/processed`.
 
@@ -457,9 +539,10 @@ facts in place and records a failed run manifest. Diagnose the retained step
 log, fix the source/configuration issue, then rerun the relevant profile.
 A lock-contention skip does not create an empty run directory or overwrite the
 latest completed run manifest.
-The daily service is intentionally not fail-fast: TVL is still attempted when
-the independent daily OHLCV step fails, while the final service status remains
-failed and auditable.
+The daily service is intentionally not fail-fast: OHLCV and TVL are still
+attempted when the independent lifecycle inventory or daily OHLCV step fails,
+while the final service status remains failed and auditable. A failed lifecycle
+check never replaces its prior runtime manifest.
 The hourly depth service is also not fail-fast across independent CEX and DEX
 sources: the DEX price refresh is still attempted when a CEX venue fails.
 Within the DEX chain, however, the price refresh is a hard dependency. DEX

@@ -575,7 +575,7 @@ main { min-width: 0; padding: 14px 18px 30px; }
 .fixed-scope-chip[hidden] { display: none; }
 .na-disclosure { display: inline-block; position: relative; }
 .na-disclosure > summary {
-  min-height: 32px;
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -603,7 +603,16 @@ main { min-width: 0; padding: 14px 18px 30px; }
   white-space: normal;
 }
 .na-disclosure-panel p { margin: 0; }
-.na-refresh-action { margin-top: 8px; min-height: 36px; }
+.na-refresh-action { margin-top: 8px; min-height: 44px; }
+.na-refresh-status {
+  display: block;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  color: #b8e9ec;
+}
+.na-refresh-status[data-state="success"] { color: #9ce3bd; }
+.na-refresh-status[data-state="critical"] { color: #ffb4bf; }
 .market-warning-trigger {
   width: 44px;
   height: 44px;
@@ -894,10 +903,21 @@ main { min-width: 0; padding: 14px 18px 30px; }
   background: #312616;
   color: #f2cf91;
 }
+.status-banner[data-state="info"] {
+  border-color: #376d72;
+  background: #123237;
+  color: #b8e9ec;
+}
 .status-banner[data-state="critical"] {
   border-color: #713944;
   background: #371c23;
   color: #ffb4bf;
+}
+.global-action-status {
+  position: sticky;
+  top: 8px;
+  z-index: 120;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, .35);
 }
 .contract-badge[data-state="warning"] {
   border-color: #7b5b2f;
@@ -1732,6 +1752,7 @@ main { min-width: 0; padding: 14px 18px 30px; }
   font-size: 11px;
 }
 .quality-reasons li[data-severity="critical"] { border-color: var(--negative); }
+.quality-reasons li[data-severity="info"] { border-color: var(--accent); }
 .quality-reasons strong { display: block; color: var(--text); }
 .quality-filter-summary { margin-bottom: 10px; }
 .quality-linked-row { background: rgba(126, 190, 195, .045); }
@@ -1740,6 +1761,9 @@ main { min-width: 0; padding: 14px 18px 30px; }
 }
 .quality-linked-row[data-highlight-severity="warning"] {
   box-shadow: inset 3px 0 0 var(--amber);
+}
+.quality-linked-row[data-highlight-severity="info"] {
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 .facts-contract {
   margin-top: 12px;
@@ -1979,6 +2003,11 @@ th.sticky-token { z-index: 12; background: #1c2027; }
   background: #362a17;
   color: #f0cc87;
 }
+.quality-flag.info {
+  border-color: #376d72;
+  background: #123237;
+  color: #b8e9ec;
+}
 .quality-flag.danger {
   border-color: #82424d;
   background: #3b1e25;
@@ -2120,6 +2149,7 @@ footer {
     width: min(100%, 320px);
     margin-top: 4px;
   }
+  .na-disclosure > summary { min-height: 44px; }
   .market-warning-tooltip {
     width: min(380px, calc(100vw - 32px));
     max-height: 55vh;

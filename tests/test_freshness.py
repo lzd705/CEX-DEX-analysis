@@ -48,6 +48,47 @@ class FreshnessTest(unittest.TestCase):
         self.assertEqual(stale["status"], "stale")
         self.assertEqual(stale["age_hours"], 3)
 
+    def test_snapshot_freshness_accepts_python38_incompatible_nanoseconds(self):
+        current = snapshot_freshness(
+            "cex_depth",
+            "2026-07-27T11:00:00.019274961Z",
+            now=NOW,
+            max_age_hours=2,
+        )
+
+        self.assertEqual(current["status"], "current")
+        self.assertEqual(
+            current["observed_at"],
+            "2026-07-27T11:00:00.019274+00:00",
+        )
+
+    def test_snapshot_freshness_rejects_timezone_normalization_overflow(self):
+        with self.assertRaises(ValueError):
+            snapshot_freshness(
+                "cex_depth",
+                "0001-01-01T00:00:00+23:59",
+                now=NOW,
+                max_age_hours=2,
+            )
+
+    def test_snapshot_freshness_rejects_future_clock_skew_beyond_tolerance(self):
+        tolerated = snapshot_freshness(
+            "cex_depth",
+            "2026-07-27T12:05:00+00:00",
+            now=NOW,
+            max_age_hours=2,
+        )
+        self.assertEqual(tolerated["status"], "current")
+        self.assertEqual(tolerated["age_hours"], 0.0)
+
+        with self.assertRaises(ValueError):
+            snapshot_freshness(
+                "cex_depth",
+                "2026-07-27T12:05:01+00:00",
+                now=NOW,
+                max_age_hours=2,
+            )
+
     def test_source_summary_reports_common_end_and_overall_status(self):
         result = build_source_freshness(
             {

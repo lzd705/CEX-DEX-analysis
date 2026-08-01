@@ -3,7 +3,7 @@ import fcntl
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,8 +15,10 @@ from scripts.run_collection_cycle import (
     publication_gates_from_log,
     resolve_incremental_window,
     run_collection_cycle,
+    snapshot_summary,
     validate_step_freshness,
 )
+from scripts.timestamp_contract import validate_observation_bounds
 
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
@@ -102,6 +104,22 @@ class CollectionCycleTest(unittest.TestCase):
                 }
             ],
         )
+        (self.data_dir / "cex_instrument_lifecycle.json").write_text(
+            json.dumps(
+                {
+                    "schema": "cex_instrument_lifecycle/v1",
+                    "generated_at_utc": NOW.isoformat(),
+                    "checked_at_utc": NOW.isoformat(),
+                    "response_sha256": "a" * 64,
+                    "inventory_count": 1,
+                    "configured_market_count": 1,
+                    "configured_market_ids_sha256": "a" * 64,
+                    "review_count": 0,
+                    "reviews": [],
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -155,9 +173,22 @@ class CollectionCycleTest(unittest.TestCase):
 
         self.assertEqual(
             [name for name, _ in commands],
-            ["daily", "depth", "tvl", "dex_depth"],
+            ["lifecycle", "daily", "depth", "tvl", "dex_depth"],
         )
-        daily = commands[0][1]
+        lifecycle = commands[0][1]
+        self.assertIn("scripts/collect_cex_instrument_lifecycle.py", lifecycle[1])
+        self.assertEqual(
+            lifecycle[lifecycle.index("--manifest") + 1],
+            str(self.data_dir.resolve() / "cex_instrument_lifecycle.json"),
+        )
+        self.assertEqual(
+            lifecycle[lifecycle.index("--raw-root") + 1],
+            str(
+                self.data_dir.resolve()
+                / "raw/cex-instrument-lifecycle"
+            ),
+        )
+        daily = commands[1][1]
         self.assertIn("--append", daily)
         self.assertEqual(daily[daily.index("--tokens") + 1], "UNI,AAVE")
         self.assertEqual(daily[daily.index("--start") + 1], "2026-07-20")
@@ -167,7 +198,7 @@ class CollectionCycleTest(unittest.TestCase):
             str(self.data_dir.resolve()),
         )
         self.assertIn("--publish-local", daily)
-        for _name, command in commands[1:]:
+        for _name, command in commands[2:]:
             self.assertEqual(
                 command[command.index("--publish-dir") + 1],
                 str(self.data_dir.resolve()),
@@ -177,7 +208,7 @@ class CollectionCycleTest(unittest.TestCase):
             "tvl": "tvl",
             "dex_depth": "dex-depth",
         }
-        for name, command in commands[1:]:
+        for name, command in commands[2:]:
             self.assertEqual(
                 command[command.index("--raw-root") + 1],
                 str(self.data_dir.resolve() / "raw" / expected_raw_roots[name]),
@@ -209,8 +240,12 @@ class CollectionCycleTest(unittest.TestCase):
             )
 
         list_records.assert_called_once_with(statuses={"active"})
+        self.assertEqual(
+            [name for name, _command in commands],
+            ["lifecycle", "daily", "tvl"],
+        )
         daily_tokens = set(
-            commands[0][1][commands[0][1].index("--tokens") + 1].split(",")
+            commands[1][1][commands[1][1].index("--tokens") + 1].split(",")
         )
         self.assertIn("ACTIVE_RUNTIME", daily_tokens)
         self.assertNotIn("PENDING_RUNTIME", daily_tokens)
@@ -376,11 +411,72 @@ class CollectionCycleTest(unittest.TestCase):
             "2026-07-22",
         )
         self.assertEqual(status["freshness"]["common_comparable_end"], "2026-07-22")
+        self.assertEqual(
+            status["cex_instrument_lifecycle"]["status"],
+            "current",
+        )
+        self.assertEqual(
+            status["cex_instrument_lifecycle"]["checked_at_utc"],
+            NOW.isoformat(),
+        )
+        self.assertEqual(
+            status["cex_instrument_lifecycle"]["response_sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(
+            status["cex_instrument_lifecycle"]["inventory_count"],
+            1,
+        )
+        self.assertEqual(
+            status["cex_instrument_lifecycle"]["configured_market_count"],
+            1,
+        )
+        self.assertEqual(
+            status["cex_instrument_lifecycle"][
+                "configured_market_ids_sha256"
+            ],
+            "a" * 64,
+        )
         self.assertEqual(status["tvl_snapshot"]["status_counts"], {"observed": 1})
         self.assertEqual(
             status["cex_execution_cost_snapshot"]["source_snapshot_ids"],
             ["depth-1"],
         )
+
+    def test_lifecycle_freshness_rejects_stale_or_future_manifest(self):
+        manifest_path = self.data_dir / "cex_instrument_lifecycle.json"
+        for generated_at, expected_status in (
+            ("2026-07-25T00:00:00+00:00", "stale"),
+            ("2026-07-27T12:10:00+00:00", "invalid"),
+        ):
+            with self.subTest(generated_at=generated_at):
+                manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": "cex_instrument_lifecycle/v1",
+                            "generated_at_utc": generated_at,
+                            "checked_at_utc": generated_at,
+                            "response_sha256": "a" * 64,
+                            "inventory_count": 1,
+                            "configured_market_count": 1,
+                            "configured_market_ids_sha256": "a" * 64,
+                            "review_count": 0,
+                            "reviews": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                status = build_collection_status(self.data_dir, now=NOW)
+
+                self.assertEqual(
+                    status["cex_instrument_lifecycle"]["status"],
+                    expected_status,
+                )
+                self.assertEqual(
+                    validate_step_freshness("lifecycle", status),
+                    ["cex_instrument_lifecycle"],
+                )
 
     def test_snapshot_freshness_uses_oldest_inventory_observation(self):
         write_csv(
@@ -415,6 +511,160 @@ class CollectionCycleTest(unittest.TestCase):
             "2026-07-27T11:59:00+00:00",
         )
         self.assertEqual(status["freshness"]["dex_tvl"]["status"], "stale")
+
+    def test_snapshot_summary_rejects_any_missing_inventory_observation(self):
+        path = self.data_dir / "cex_depth_latest.csv"
+        write_csv(
+            path,
+            ["snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "depth-2",
+                    "observed_at": "2026-07-27T10:30:00+00:00",
+                    "status": "observed",
+                },
+                {
+                    "snapshot_id": "depth-2",
+                    "observed_at": "",
+                    "status": "failed",
+                },
+            ],
+        )
+
+        with self.assertRaisesRegex(ValueError, "observed_at"):
+            snapshot_summary(path, require_complete_observations=True)
+
+    def test_collection_status_rejects_missing_tvl_inventory_observation(self):
+        path = self.data_dir / "dex_pool_tvl_latest.csv"
+        write_csv(
+            path,
+            ["snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "tvl-2",
+                    "observed_at": "2026-07-27T10:30:00+00:00",
+                    "status": "observed",
+                },
+                {
+                    "snapshot_id": "tvl-2",
+                    "observed_at": "",
+                    "status": "failed",
+                },
+            ],
+        )
+
+        with self.assertRaisesRegex(ValueError, "observed_at"):
+            build_collection_status(self.data_dir, now=NOW)
+
+    def test_snapshot_summary_rejects_noncanonical_or_naive_observations(self):
+        path = self.data_dir / "cex_depth_latest.csv"
+        for observed_at in (
+            "2026-07-27T10:30:00",
+            "2026-07-27T10:30:00Z",
+            "2026-07-27T18:30:00+08:00",
+            " 2026-07-27T10:30:00+00:00",
+        ):
+            with self.subTest(observed_at=observed_at):
+                write_csv(
+                    path,
+                    ["snapshot_id", "observed_at", "status"],
+                    [
+                        {
+                            "snapshot_id": "depth-2",
+                            "observed_at": observed_at,
+                            "status": "observed",
+                        }
+                    ],
+                )
+
+                with self.assertRaisesRegex(ValueError, "observed_at"):
+                    snapshot_summary(
+                        path,
+                        require_complete_observations=True,
+                    )
+
+    def test_snapshot_summary_bounds_exactly_span_every_inventory_member(self):
+        path = self.data_dir / "cex_depth_latest.csv"
+        write_csv(
+            path,
+            ["snapshot_id", "observed_at", "status"],
+            [
+                {
+                    "snapshot_id": "depth-2",
+                    "observed_at": "2026-07-27T10:30:05+00:00",
+                    "status": "observed",
+                },
+                {
+                    "snapshot_id": "depth-2",
+                    "observed_at": "2026-07-27T10:29:59+00:00",
+                    "status": "partial",
+                },
+                {
+                    "snapshot_id": "depth-2",
+                    "observed_at": "2026-07-27T10:30:02+00:00",
+                    "status": "failed",
+                },
+            ],
+        )
+
+        summary = snapshot_summary(
+            path,
+            require_complete_observations=True,
+        )
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(
+            summary["observed_at"],
+            "2026-07-27T10:29:59+00:00",
+        )
+        self.assertEqual(
+            summary["observed_at_min"],
+            "2026-07-27T10:29:59+00:00",
+        )
+        self.assertEqual(
+            summary["observed_at_max"],
+            "2026-07-27T10:30:05+00:00",
+        )
+
+    def test_declared_observation_bounds_must_equal_validated_inventory(self):
+        rows = [
+            {"observed_at": "2026-07-27T10:30:00+00:00"},
+            {"observed_at": "2026-07-27T10:30:05+00:00"},
+        ]
+        self.assertEqual(
+            validate_observation_bounds(
+                rows,
+                declared_min="2026-07-27T10:30:00+00:00",
+                declared_max="2026-07-27T10:30:05+00:00",
+            ),
+            (
+                "2026-07-27T10:30:00+00:00",
+                "2026-07-27T10:30:05+00:00",
+            ),
+        )
+        for declared_min, declared_max in (
+            (
+                "2026-07-27T10:29:59+00:00",
+                "2026-07-27T10:30:05+00:00",
+            ),
+            (
+                "2026-07-27T10:30:00+00:00",
+                "2026-07-27T10:30:04+00:00",
+            ),
+        ):
+            with self.subTest(
+                declared_min=declared_min,
+                declared_max=declared_max,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "validated inventory|outside declared bounds",
+                ):
+                    validate_observation_bounds(
+                        rows,
+                        declared_min=declared_min,
+                        declared_max=declared_max,
+                    )
 
     def test_successful_cycle_writes_per_step_logs_and_latest_manifest(self):
         def runner(command, log_path):
@@ -645,6 +895,90 @@ class CollectionCycleTest(unittest.TestCase):
         self.assertEqual(len(result["steps"]), 1)
         self.assertEqual(result["steps"][0]["exit_code"], 2)
 
+    def test_long_step_validates_snapshot_against_completion_clock(self):
+        finished = NOW + timedelta(minutes=10)
+        clock_calls = 0
+
+        def advancing_clock():
+            nonlocal clock_calls
+            clock_calls += 1
+            return NOW if clock_calls <= 2 else finished
+
+        def runner(_command, log_path):
+            write_csv(
+                self.data_dir / "dex_pool_tvl_latest.csv",
+                ["snapshot_id", "observed_at", "status"],
+                [{
+                    "snapshot_id": "tvl-after-long-step",
+                    "observed_at": finished.isoformat(),
+                    "status": "observed",
+                }],
+            )
+            log_path.write_text("published\n", encoding="utf-8")
+            return 0
+
+        with patch(
+            "scripts.run_collection_cycle.utc_now",
+            side_effect=advancing_clock,
+        ):
+            result = run_collection_cycle(
+                "tvl",
+                publish_local=True,
+                data_dir=self.data_dir,
+                run_root=self.root / "long-runs",
+                latest_status_path=self.root / "long-latest.json",
+                lock_path=self.root / "long.lock",
+                step_runner=runner,
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["steps"][0]["exit_code"], 0)
+        self.assertEqual(
+            result["steps"][0]["validation"]["status"],
+            "passed",
+        )
+
+    def test_post_publication_validation_error_is_recorded_in_manifest(self):
+        def runner(_command, log_path):
+            write_csv(
+                self.data_dir / "dex_pool_tvl_latest.csv",
+                ["snapshot_id", "observed_at", "status"],
+                [{
+                    "snapshot_id": "tvl-invalid-future",
+                    "observed_at": "2099-01-01T00:00:00+00:00",
+                    "status": "observed",
+                }],
+            )
+            log_path.write_text("published\n", encoding="utf-8")
+            return 0
+
+        with patch(
+            "scripts.run_collection_cycle.utc_now",
+            return_value=NOW,
+        ):
+            result = run_collection_cycle(
+                "tvl",
+                publish_local=True,
+                data_dir=self.data_dir,
+                run_root=self.root / "invalid-runs",
+                latest_status_path=self.root / "invalid-latest.json",
+                lock_path=self.root / "invalid.lock",
+                now=NOW,
+                step_runner=runner,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["steps"][0]["exit_code"], 3)
+        self.assertEqual(
+            result["steps"][0]["validation"]["status"],
+            "failed",
+        )
+        self.assertIn(
+            "Post-publication validation failed",
+            result["steps"][0]["error"],
+        )
+        self.assertTrue((self.root / "invalid-latest.json").is_file())
+
     def test_failed_price_refresh_skips_dependent_dex_collection(self):
         calls = []
 
@@ -693,9 +1027,12 @@ class CollectionCycleTest(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["steps"][0]["exit_code"], 3)
-        self.assertEqual(result["steps"][0]["validation"]["status"], "failed")
-        self.assertIn("dex_daily", result["steps"][0]["error"])
+        self.assertEqual(result["steps"][0]["name"], "lifecycle")
+        self.assertEqual(result["steps"][0]["exit_code"], 0)
+        self.assertEqual(result["steps"][1]["name"], "daily")
+        self.assertEqual(result["steps"][1]["exit_code"], 3)
+        self.assertEqual(result["steps"][1]["validation"]["status"], "failed")
+        self.assertIn("dex_daily", result["steps"][1]["error"])
 
     def test_depth_step_fails_when_matching_execution_snapshot_is_missing(self):
         (self.data_dir / "cex_execution_cost_latest.csv").unlink()

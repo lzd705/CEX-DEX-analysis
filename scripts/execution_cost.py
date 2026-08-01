@@ -26,11 +26,13 @@ try:
         normalize_execution_source_outcome,
         sanitize_public_source_endpoint,
     )
+    from scripts.timestamp_contract import validate_observation_bounds
 except ModuleNotFoundError:
     from quality_outcomes import (  # type: ignore[no-redef]
         normalize_execution_source_outcome,
         sanitize_public_source_endpoint,
     )
+    from timestamp_contract import validate_observation_bounds
 
 
 EXECUTION_COST_CONTRACT_VERSION = "1"
@@ -593,6 +595,7 @@ def _validate_execution_snapshot(
     expected = set(expected_market_ids)
     if not expected:
         raise ValueError("Execution inventory is empty")
+    validate_observation_bounds(rows)
     keys = [
         (
             row.get("snapshot_id"),

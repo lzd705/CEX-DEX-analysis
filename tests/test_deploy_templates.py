@@ -31,11 +31,14 @@ class DeployTemplateTests(unittest.TestCase):
                 admin_job_dir=admin_job_dir,
             )
 
-            self.assertEqual(len(written), 7)
+            self.assertEqual(len(written), 8)
             environment = (output_dir / "dashboard.env").read_text(encoding="utf-8")
             service = (output_dir / "cex-dex-dashboard.service").read_text(
                 encoding="utf-8"
             )
+            user_service = (
+                output_dir / "cex-dex-dashboard-user.service"
+            ).read_text(encoding="utf-8")
             daily = (output_dir / "cex-dex-daily.service").read_text(
                 encoding="utf-8"
             )
@@ -50,11 +53,28 @@ class DeployTemplateTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
             work_dir = market_data_dir.parent / ".published-processed"
             self.assertIn(f"MARKET_DATA_DIR={market_data_dir}", environment)
+            self.assertIn(
+                "MARKET_CEX_INSTRUMENT_LIFECYCLE={}".format(
+                    market_data_dir / "cex_instrument_lifecycle.json"
+                ),
+                environment,
+            )
             self.assertIn(f"ADMIN_JOB_DIR={admin_job_dir}", environment)
             self.assertIn(f"ReadWritePaths={market_data_dir}", service)
             self.assertIn(f"ReadWritePaths={work_dir}", service)
             self.assertIn(f"ReadWritePaths={admin_job_dir}", service)
             self.assertIn(f"ReadOnlyPaths={project_root}", service)
+            self.assertIn(
+                f"Environment=MARKET_DATA_DIR={market_data_dir}",
+                user_service,
+            )
+            self.assertIn(
+                "Environment=MARKET_CEX_INSTRUMENT_LIFECYCLE={}".format(
+                    market_data_dir / "cex_instrument_lifecycle.json"
+                ),
+                user_service,
+            )
+            self.assertIn("--host 127.0.0.1", user_service)
             for collection in (daily, depth):
                 self.assertIn("User=market-monitor", collection)
                 self.assertIn("Group=market-monitor", collection)
@@ -74,6 +94,7 @@ class DeployTemplateTests(unittest.TestCase):
                 self.assertNotIn("User=", collection)
                 self.assertNotRegex(collection, renderer.PLACEHOLDER)
             self.assertNotRegex(service, renderer.PLACEHOLDER)
+            self.assertNotRegex(user_service, renderer.PLACEHOLDER)
             self.assertNotRegex(environment, renderer.PLACEHOLDER)
             self.assertEqual(
                 stat.S_IMODE((output_dir / "dashboard.env").stat().st_mode),

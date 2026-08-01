@@ -9,6 +9,8 @@ WorkingDirectory=@PROJECT_ROOT@
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=ADMIN_ENABLED=false
+Environment=MARKET_DATA_DIR=@MARKET_DATA_DIR@
+Environment=MARKET_CEX_INSTRUMENT_LIFECYCLE=@MARKET_DATA_DIR@/cex_instrument_lifecycle.json
 EnvironmentFile=-%h/.config/cex-dex/dashboard.env
 ExecStart=/usr/bin/python3 dashboard/server.py --host @BIND_HOST@ --port 8765
 Restart=on-failure

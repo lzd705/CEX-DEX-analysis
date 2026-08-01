@@ -38,6 +38,7 @@ const app = {
   executionRequestId: 0,
   qualityRequestId: 0,
   eventRequestId: 0,
+  snapshotRefreshRequestId: 0,
   marketController: null,
   catalogController: null,
   marketRequestWindowKey: "",
@@ -45,6 +46,7 @@ const app = {
   executionController: null,
   qualityController: null,
   eventController: null,
+  snapshotRefreshController: null,
   liquidityLayoutMode: null,
   liquidityResizeScheduled: false,
   liquidityResizeObserver: null,
@@ -54,7 +56,7 @@ const app = {
   comparisonChartResizeObserver: null,
 };
 
-const DEFAULT_MARKET_CACHE_KEY = "market-monitor:screener-summary:v1";
+const DEFAULT_MARKET_CACHE_KEY = "market-monitor:screener-summary:v3";
 const TOKEN_PAIR_CACHE_KEY = "market-monitor:token-pairs:v1";
 const navigation = globalThis.MarketMonitorNavigation;
 const DEPTH_BANDS = [10, 25, 50, 100];
@@ -144,6 +146,12 @@ const DAILY_QUALITY_REASON_LABELS = {
   full_book_insufficient_liquidity: "Full book cannot fill the requested size",
   execution_snapshot_unavailable: "Execution snapshot unavailable",
   execution_snapshot_invalid: "Execution snapshot invalid",
+  execution_market_not_cataloged_in_snapshot: "Market not included in the published execution snapshot",
+  instrument_absent_from_current_catalog: "Instrument absent from the official current exchange catalog",
+  unsupported_protocol_or_chain: "Execution not supported for this protocol or chain",
+  unsupported_protocol: "Execution not supported for this protocol",
+  unsupported_chain: "Execution not supported for this chain",
+  unsupported_method: "Execution method is unsupported",
 };
 const QUALITY_SEVERITY_RANK = { info: 1, warning: 2, critical: 3 };
 const SCREENER_SORT_DEFINITIONS = Object.freeze({
@@ -154,25 +162,25 @@ const SCREENER_SORT_DEFINITIONS = Object.freeze({
     snapshot: false,
   }),
   spread: Object.freeze({
-    label: "Latest Absolute Price Gap",
+    label: "Latest Symmetric Price Gap",
     allowedScopes: Object.freeze(["cross"]),
     defaultScope: "cross",
     snapshot: false,
   }),
   spread_max: Object.freeze({
-    label: "Maximum Absolute Price Gap",
+    label: "Maximum Symmetric Price Gap",
     allowedScopes: Object.freeze(["cross"]),
     defaultScope: "cross",
     snapshot: false,
   }),
   spread_mean: Object.freeze({
-    label: "Average Absolute Price Gap",
+    label: "Average Symmetric Price Gap",
     allowedScopes: Object.freeze(["cross"]),
     defaultScope: "cross",
     snapshot: false,
   }),
   spread_median: Object.freeze({
-    label: "Median Absolute Price Gap",
+    label: "Median Symmetric Price Gap",
     allowedScopes: Object.freeze(["cross"]),
     defaultScope: "cross",
     snapshot: false,
@@ -521,6 +529,8 @@ function replaceCurrentRoute({
   } else {
     path = navigation.buildScreenerPath(currentScreenerFilters({ window }));
   }
+  const current = `${globalThis.window.location.pathname}${globalThis.window.location.search}`;
+  if (path !== current) invalidateSnapshotRefreshRequest({ clearFeedback: true });
   globalThis.window.history.replaceState({}, "", path);
   app.route = navigation.parseRoute(
     globalThis.window.location.pathname,
@@ -530,6 +540,7 @@ function replaceCurrentRoute({
 }
 
 function navigateTo(path, { replace = false } = {}) {
+  invalidateSnapshotRefreshRequest({ clearFeedback: true });
   if (replace) window.history.replaceState({}, "", path);
   else window.history.pushState({}, "", path);
   applyRouteFromLocation();
@@ -997,6 +1008,16 @@ function invalidateRouteRequest() {
   return app.routeRequestId;
 }
 
+function setWorkspacePageIdentity(token, page = app.route?.page) {
+  const marketsPage = page === "markets";
+  byId("workspace-eyebrow").textContent = marketsPage
+    ? "Single Token market catalog"
+    : "Single Token research workspace";
+  byId("facts-title").textContent = marketsPage
+    ? `${token} Markets`
+    : `${token} Token Research`;
+}
+
 function setWorkspaceCatalogLoading(
   token,
   page,
@@ -1004,14 +1025,15 @@ function setWorkspaceCatalogLoading(
   { preserveGlobalError = false } = {},
 ) {
   if (!preserveGlobalError) hideError(byId("global-error"));
-  if (app.activeCatalogKey === catalogKey && app.catalog) return;
-  app.catalog = null;
-  app.activeCatalogToken = "";
-  app.activeCatalogKey = "";
+  const retainCatalog = app.activeCatalogKey === catalogKey && app.catalog;
   invalidateComparisonRequest();
   invalidateExecutionRequest();
   invalidateQualityRequest();
   invalidateEventRequest();
+  if (retainCatalog) return;
+  app.catalog = null;
+  app.activeCatalogToken = "";
+  app.activeCatalogKey = "";
   app.comparison = null;
   app.execution = null;
   app.eventFacts = null;
@@ -1020,7 +1042,7 @@ function setWorkspaceCatalogLoading(
   closeFactsMarketWarnings();
   renderFactsMarketWarning("a", null);
   renderFactsMarketWarning("b", null);
-  byId("facts-title").textContent = `${token} Token Research`;
+  setWorkspacePageIdentity(token, page);
   byId("workspace-description").textContent = (
     `Loading ${token} market identities, liquidity, and quality facts.`
   );
@@ -1094,7 +1116,7 @@ function setWorkspaceDataUnavailable(token, message) {
   closeFactsMarketWarnings();
   renderFactsMarketWarning("a", null);
   renderFactsMarketWarning("b", null);
-  byId("facts-title").textContent = `${exactToken} Token Research`;
+  setWorkspacePageIdentity(exactToken, app.route?.page);
   byId("workspace-description").textContent = (
     "Source-backed Token facts are unavailable. No previous Token catalog is retained on screen."
   );
@@ -1409,7 +1431,7 @@ function finalizeRoutePresentation() {
   announceRoute(app.route);
   updateRouteLinks();
   canonicalizeCurrentRoute();
-  if (window.lucide) window.lucide.createIcons();
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
 
 function validateDateRange(start = "", end = "", { required = false } = {}) {
@@ -1609,9 +1631,11 @@ function syncScreenerSortControls() {
 
 function sortValue(tokenSummary) {
   const aggregates = aggregateFacts(tokenSummary, [], []);
-  const { cex, dex, spread } = comparison(tokenSummary);
   const field = byId("sort-field").value;
-  if (field === "spread") return finite(spread) ? Math.abs(spread) : -Infinity;
+  if (field === "spread") {
+    const value = tokenSummary.absolute_price_gap;
+    return finite(value) ? value : -Infinity;
+  }
   if (field === "spread_max") {
     const value = tokenSummary.maximum_absolute_price_spread;
     return finite(value) ? value : -Infinity;
@@ -1624,6 +1648,7 @@ function sortValue(tokenSummary) {
     const value = tokenSummary.median_absolute_price_spread;
     return finite(value) ? value : -Infinity;
   }
+  const { cex, dex } = comparison(tokenSummary);
   if (field === "return") {
     const value = app.scope === "dex" ? dex?.window_return : cex?.window_return;
     return finite(value) ? value : -Infinity;
@@ -1926,7 +1951,11 @@ function qualityFlagMeasurement(flag) {
 function renderQualityBadges(flags) {
   if (!flags.length) return '<span class="quality-flag good">No quality flags</span>';
   return flags.map((flag) => {
-    const severityClass = flag.severity === "critical" ? "danger" : "warn";
+    const severityClass = flag.severity === "critical"
+      ? "danger"
+      : flag.severity === "warning"
+        ? "warn"
+        : "info";
     const label = qualityFlagLabel(flag);
     return `<span class="quality-flag ${severityClass}" title="${escapeHtml(flag.explanation)}">`
       + `${escapeHtml(label)}</span>`;
@@ -1940,22 +1969,85 @@ function screenerMetricTooltip(value, tooltip) {
     + `${escapeHtml(value)}</span>`;
 }
 
+function publicFactRefreshEnabled() {
+  const metadata = app.route?.kind === "workspace"
+    ? app.catalog?.metadata
+    : app.payload?.metadata;
+  return metadata?.public_actions?.fact_refresh_enabled === true;
+}
+
+function naFactAriaLabel({
+  token = "",
+  marketId = "",
+  marketLabel = "",
+  fact = "",
+  factLabel = "",
+  bandBps = null,
+  notionalUsd = null,
+} = {}) {
+  const hasBand = bandBps !== null && bandBps !== "" && finite(Number(bandBps));
+  const hasNotional = notionalUsd !== null
+    && notionalUsd !== ""
+    && finite(Number(notionalUsd));
+  const context = [
+    token ? `Token ${token}` : "",
+    marketLabel ? `market ${marketLabel}` : marketId ? `market ${marketId}` : "",
+    factLabel ? `fact ${factLabel}` : fact ? `fact ${fact}` : "",
+    hasBand ? `band ±${Number(bandBps)} bps` : "",
+    hasNotional ? `notional ${formatRawUsd(Number(notionalUsd))}` : "",
+  ].filter(Boolean);
+  return context.length ? `N/A reason: ${context.join(" · ")}` : "N/A reason";
+}
+
 function naFactMarkup(reason, {
   retryable = false,
   token = "",
   marketId = "",
+  marketLabel = "",
   fact = "",
+  factLabel = "",
+  bandBps = null,
+  notionalUsd = null,
 } = {}) {
-  const action = retryable && token && marketId && fact
+  const context = {
+    token,
+    marketId,
+    marketLabel,
+    fact,
+    factLabel,
+    bandBps,
+    notionalUsd,
+  };
+  const action = retryable && publicFactRefreshEnabled() && token && marketId && fact
     ? `<button type="button" class="na-refresh-action secondary-command" `
       + `data-refresh-fact="${escapeHtml(fact)}" `
       + `data-refresh-token="${escapeHtml(token)}" `
       + `data-refresh-market-id="${escapeHtml(marketId)}">Refresh this fact</button>`
+      + `<span class="na-refresh-status" data-refresh-status role="status" `
+      + `aria-live="polite" aria-atomic="true" hidden></span>`
     : "";
   return `<details class="na-disclosure">
-    <summary aria-label="N/A reason"><span>N/A</span><i data-lucide="info"></i></summary>
+    <summary aria-label="${escapeHtml(naFactAriaLabel(context))}"><span>N/A</span><i data-lucide="info"></i></summary>
     <div class="na-disclosure-panel"><p>${escapeHtml(reason)}</p>${action}</div>
   </details>`;
+}
+
+function setFactValue(
+  id,
+  available,
+  displayValue,
+  reason,
+  disclosureOptions = {},
+) {
+  const element = byId(id);
+  if (!element) return;
+  if (available) {
+    element.innerHTML = "";
+    element.textContent = String(displayValue);
+    return;
+  }
+  element.textContent = "";
+  element.innerHTML = naFactMarkup(reason, disclosureOptions);
 }
 
 function snapshotRetryable(market, fact) {
@@ -1965,11 +2057,24 @@ function snapshotRetryable(market, fact) {
 function snapshotMissingReason(market, fact, fallback) {
   const status = market?.[`${fact}_status`] || "unavailable";
   const reasonCode = market?.[`${fact}_na_reason`];
+  const observedAt = market?.[`${fact}_observed_at`];
   const reason = reasonCode
     ? DAILY_QUALITY_REASON_LABELS[reasonCode]
       || reasonCode.replaceAll("_", " ")
     : fallback;
-  return `${reason} Status: ${status}.`;
+  const lastAttempt = observedAt
+    ? `Last collection attempt: ${formatUtcTimestamp(observedAt)}.`
+    : "Last collection attempt time is not published.";
+  return `${reason} Status: ${status}. ${lastAttempt}`;
+}
+
+function snapshotMarketContextLabel(market) {
+  if (!market) return "";
+  return [
+    market.market_type?.toUpperCase(),
+    market.venue,
+    market.instrument || market.pool_address,
+  ].filter(Boolean).join(" · ");
 }
 
 function screenerDepthMarkup(market, token) {
@@ -1984,18 +2089,24 @@ function screenerDepthMarkup(market, token) {
     retryable: snapshotRetryable(market, "depth"),
     token,
     marketId: market?.refresh_market_id,
+    marketLabel: snapshotMarketContextLabel(market),
     fact: "depth",
+    factLabel: "executable depth",
+    bandBps: 100,
   });
 }
 
 function screenerQualityMarkup(token, statusCounts, countsComplete) {
   if (!countsComplete) {
-    return naFactMarkup("Catalog quality counts are incomplete for this Token.");
+    return naFactMarkup(
+      "Catalog quality counts are incomplete for this Token.",
+      { token, factLabel: "catalog quality counts" },
+    );
   }
   const chips = [
-    ["critical", "Critical reasons"],
-    ["warning", "Warning reasons"],
-    ["info", "Info reasons"],
+    ["critical", "Critical"],
+    ["warning", "Warning"],
+    ["info", "Info"],
   ].filter(([severity]) => finite(statusCounts?.[severity]) && statusCounts[severity] > 0)
     .map(([severity, label]) => {
       const path = navigation
@@ -2007,7 +2118,8 @@ function screenerQualityMarkup(token, statusCounts, countsComplete) {
         })
         : "#";
       return `<a class="quality-count-chip" data-severity="${severity}" `
-        + `href="${escapeHtml(path)}">${statusCounts[severity]} ${label}</a>`;
+        + `href="${escapeHtml(path)}">${statusCounts[severity]} ${label} `
+        + `reason${statusCounts[severity] === 1 ? "" : "s"}</a>`;
     });
   return chips.length
     ? `<span class="quality-count-chips">${chips.join("")}</span>`
@@ -2045,7 +2157,10 @@ function screenerTokenRow(tokenSummary) {
     <td data-label="Token" class="sticky-token token-name">${escapeHtml(token)}</td>
     <td data-label="Rank value" class="rank-value">
       ${rankValue === null
-        ? naFactMarkup("The selected ranking metric has no valid source observation for this Token and window.")
+        ? naFactMarkup(
+          "The selected ranking metric has no valid source observation for this Token and window.",
+          { token, factLabel: "selected ranking metric" },
+        )
         : escapeHtml(rankValue)}
     </td>
     <td data-label="Covered markets">
@@ -2055,17 +2170,27 @@ function screenerTokenRow(tokenSummary) {
       ${finite(aggregates.aggregateTotal)
         ? screenerMetricTooltip(
           aggregateValue,
-          `CEX ${formatCurrency(aggregates.aggregateCex)} · DEX ${formatCurrency(aggregates.aggregateDex)}`,
+          `CEX ${finite(aggregates.aggregateCex) ? formatCurrency(aggregates.aggregateCex) : "unavailable"} · `
+            + `DEX ${finite(aggregates.aggregateDex) ? formatCurrency(aggregates.aggregateDex) : "unavailable"}`,
         )
-        : naFactMarkup("No finite daily volume is available in the selected window.")}
+        : naFactMarkup(
+          "No finite daily volume is available in the selected window.",
+          { token, factLabel: "aggregate daily USD volume" },
+        )}
     </td>
     <td data-label="DEX share">${finite(aggregates.aggregateDexShare)
       ? formatShare(aggregates.aggregateDexShare)
-      : naFactMarkup("DEX volume share cannot be calculated because aggregate CEX/DEX volume is unavailable or zero.")}</td>
-    <td data-label="Primary price gap" class="${metricClass(spread)}">
+      : naFactMarkup(
+        "DEX volume share cannot be calculated because aggregate CEX/DEX volume is unavailable or zero.",
+        { token, factLabel: "DEX volume share" },
+      )}</td>
+    <td data-label="Primary DEX/CEX basis" class="${metricClass(spread)}">
       ${finite(spread)
         ? screenerMetricTooltip(priceGapValue, "Primary DEX / CEX − 1.")
-        : naFactMarkup("Primary CEX and DEX prices are not comparable on a common observed date.")}
+        : naFactMarkup(
+          "Primary CEX and DEX prices are not comparable on a common observed date.",
+          { token, factLabel: "primary cross-venue price gap" },
+        )}
     </td>
     <td data-label="Primary ±100 bps depth">
       <span class="depth-pair-values">${screenerDepthMarkup(cex, token)} / ${screenerDepthMarkup(dex, token)}</span>
@@ -2080,7 +2205,9 @@ function screenerTokenRow(tokenSummary) {
         retryable: snapshotRetryable(dex, "tvl"),
         token,
         marketId: dex?.refresh_market_id,
+        marketLabel: snapshotMarketContextLabel(dex),
         fact: "tvl",
+        factLabel: "pool TVL",
       })}</td>
     <td data-label="Quality">
       ${screenerQualityMarkup(token, alertCounts, qualityCountsComplete)}
@@ -2104,41 +2231,276 @@ function renderTable() {
     ? tokens.map((token) => screenerTokenRow(token)).join("")
     : `<tr><td data-label="Result" colspan="10" class="missing">No Token matches this search.</td></tr>`;
   byId("row-count").textContent = `${tokens.length} Tokens · one row per Token`;
-  if (window.lucide) window.lucide.createIcons();
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
+}
+
+const SNAPSHOT_REFRESH_JOB_ID = /^[0-9a-f]{32}$/;
+const SNAPSHOT_REFRESH_TERMINAL_STATUSES = new Set([
+  "succeeded",
+  "partial",
+  "failed",
+  "interrupted",
+]);
+const SNAPSHOT_REFRESH_POLL_INTERVAL_MS = 2000;
+const SNAPSHOT_REFRESH_MAX_POLLS = 300;
+
+function snapshotRefreshInlineStatus(button) {
+  return button?.closest?.(".na-disclosure-panel")
+    ?.querySelector?.("[data-refresh-status]") || null;
+}
+
+function snapshotRefreshRouteContext() {
+  const route = app.route || { kind: "unknown" };
+  const routeState = route.kind === "workspace" ? route.state || {} : route.filters || {};
+  const selectedPair = route.kind === "workspace" ? selectedPairState() : {};
+  const location = globalThis.window?.location;
+  return JSON.stringify({
+    kind: route.kind || "unknown",
+    page: route.kind === "workspace" ? route.page || "" : "",
+    token: route.kind === "workspace" ? String(route.token || "").toUpperCase() : "",
+    marketA: selectedPair.marketA || routeState.marketA || "",
+    marketB: selectedPair.marketB || routeState.marketB || "",
+    start: routeState.start || "",
+    end: routeState.end || "",
+    location: location ? `${location.pathname || ""}${location.search || ""}` : "",
+  });
+}
+
+function invalidateSnapshotRefreshRequest({ clearFeedback = false } = {}) {
+  if (app.snapshotRefreshController) app.snapshotRefreshController.abort();
+  app.snapshotRefreshController = null;
+  app.snapshotRefreshRequestId += 1;
+  if (clearFeedback) {
+    const globalStatus = byId("action-status");
+    if (globalStatus) hideStatus(globalStatus);
+  }
+  return app.snapshotRefreshRequestId;
+}
+
+function beginSnapshotRefreshRequest(payload) {
+  const requestId = invalidateSnapshotRefreshRequest();
+  const controller = new AbortController();
+  app.snapshotRefreshController = controller;
+  return {
+    requestId,
+    controller,
+    routeContext: snapshotRefreshRouteContext(),
+    tokenSymbol: payload.token_symbol,
+    marketId: payload.market_id,
+    factType: payload.fact_type,
+  };
+}
+
+function snapshotRefreshOwnerIsCurrent(owner) {
+  if (!owner) return true;
+  if (
+    owner.requestId !== app.snapshotRefreshRequestId
+    || owner.controller !== app.snapshotRefreshController
+    || owner.controller.signal.aborted
+    || owner.routeContext !== snapshotRefreshRouteContext()
+  ) {
+    return false;
+  }
+  if (app.route?.kind === "workspace") {
+    return String(app.route.token || "").toUpperCase() === owner.tokenSymbol;
+  }
+  return true;
+}
+
+function showSnapshotRefreshFeedback(button, message, state = "info", owner = null) {
+  if (!snapshotRefreshOwnerIsCurrent(owner)) return false;
+  const inline = snapshotRefreshInlineStatus(button);
+  if (inline) showStatus(inline, message, state);
+  const globalStatus = byId("action-status");
+  if (globalStatus) showStatus(globalStatus, message, state);
+  return true;
+}
+
+function waitForSnapshotRefreshPoll() {
+  return new Promise((resolve) => {
+    globalThis.setTimeout(resolve, SNAPSHOT_REFRESH_POLL_INTERVAL_MS);
+  });
+}
+
+function snapshotRefreshFailureMessage(job, { reloaded = false } = {}) {
+  const reasons = {
+    snapshot_target_unresolved: (
+      "The source completed, but the requested fact is still unavailable."
+    ),
+    snapshot_refresh_failed: "The collector could not complete the refresh.",
+    snapshot_refresh_failed_after_publication: (
+      "A new publication was written, but the collector did not finish cleanly."
+    ),
+    snapshot_publication_unreadable: (
+      "The server could not verify the published snapshot."
+    ),
+    snapshot_refresh_no_longer_retryable: (
+      "The fact is no longer eligible for an automatic refresh."
+    ),
+    process_interrupted: "The refresh worker was interrupted.",
+  };
+  const reason = reasons[job?.error_code]
+    || "The refresh did not produce a verified observed fact.";
+  const nextStep = job?.retryable
+    ? "Retry this fact after the source recovers, or inspect Data Quality for the current reason."
+    : "Inspect Data Quality for the current reason before taking further action.";
+  const publication = reloaded
+    ? " The latest validated publication was reloaded for the current page."
+    : "";
+  return `Job ${job?.job_id || "unavailable"} · ${job?.status || "failed"}. `
+    + `${reason}${publication} The value remains N/A, not zero. ${nextStep}`;
+}
+
+async function pollSnapshotFactRefresh(button, jobId, owner = null) {
+  for (let attempt = 0; attempt < SNAPSHOT_REFRESH_MAX_POLLS; attempt += 1) {
+    if (!snapshotRefreshOwnerIsCurrent(owner)) return null;
+    const response = await fetch(
+      `/api/actions/jobs/${jobId}`,
+      owner ? { signal: owner.controller.signal } : undefined,
+    );
+    const job = await responseJson(response);
+    if (!snapshotRefreshOwnerIsCurrent(owner)) return null;
+    if (!response.ok) {
+      throw new Error(job.error || "Refresh job status is unavailable.");
+    }
+    if (job?.job_id !== jobId) {
+      throw new Error("Refresh job status did not match the accepted job.");
+    }
+    const status = String(job.status || "").toLowerCase();
+    if (status === "queued" || status === "running") {
+      showSnapshotRefreshFeedback(
+        button,
+        `Job ${jobId} · ${status}${job.stage ? ` · ${job.stage}` : ""}. `
+          + "The existing N/A remains visible until a validated snapshot is published.",
+        "info",
+        owner,
+      );
+      await waitForSnapshotRefreshPoll();
+      if (!snapshotRefreshOwnerIsCurrent(owner)) return null;
+      continue;
+    }
+    if (!SNAPSHOT_REFRESH_TERMINAL_STATUSES.has(status)) {
+      throw new Error("Refresh job returned an invalid status.");
+    }
+    return { ...job, status };
+  }
+  throw new Error(
+    "Refresh job is still running. Check Data Actions or retry status later; the current N/A was preserved.",
+  );
+}
+
+async function reloadFactsAfterSnapshotRefresh(owner = null) {
+  if (!snapshotRefreshOwnerIsCurrent(owner)) return false;
+  const window = appliedTimeWindow();
+  const loaded = await loadMarket(window.start, window.end, {
+    preserve: Boolean(app.payload),
+    refreshWorkspaceOnGenerationChange: false,
+    responseIsOwned: () => snapshotRefreshOwnerIsCurrent(owner),
+  });
+  if (!loaded || !snapshotRefreshOwnerIsCurrent(owner)) return false;
+  if (app.route?.kind !== "workspace") return true;
+  app.catalogsByToken.clear();
+  app.catalog = null;
+  app.activeCatalogToken = "";
+  app.activeCatalogKey = "";
+  const applied = await applyRouteFromLocation({ preserveWorkspaceError: true });
+  return snapshotRefreshOwnerIsCurrent(owner) && applied;
 }
 
 async function requestSnapshotFactRefresh(button) {
-  if (!button || button.disabled) return;
+  if (!button || button.disabled) return false;
   const payload = {
     token_symbol: button.dataset.refreshToken || "",
     market_id: button.dataset.refreshMarketId || "",
     fact_type: button.dataset.refreshFact || "",
   };
+  const owner = beginSnapshotRefreshRequest(payload);
   const originalText = button.textContent;
   button.disabled = true;
   button.textContent = "Queuing refresh…";
+  showSnapshotRefreshFeedback(
+    button,
+    `${payload.token_symbol} ${payload.fact_type.toUpperCase()} refresh is being submitted. `
+      + "The current N/A is preserved.",
+    "info",
+    owner,
+  );
   try {
     const response = await fetch("/api/actions/facts/refresh", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: owner.controller.signal,
     });
     const result = await responseJson(response);
+    if (!snapshotRefreshOwnerIsCurrent(owner)) return false;
     if (!response.ok) throw new Error(result.error || "Fact refresh was rejected.");
-    button.textContent = "Refresh queued";
-    showStatus(
-      byId("market-status"),
-      `${payload.token_symbol} ${payload.fact_type.toUpperCase()} refresh queued. `
+    const jobId = String(result.job_id || "").toLowerCase();
+    if (!SNAPSHOT_REFRESH_JOB_ID.test(jobId)) {
+      throw new Error("Fact refresh returned an invalid public job ID.");
+    }
+    button.textContent = "Refresh in progress…";
+    showSnapshotRefreshFeedback(
+      button,
+      `Job ${jobId} · ${result.status || "queued"}. `
         + "The N/A remains until a validated snapshot is published.",
-      "success",
+      "info",
+      owner,
     );
-  } catch (error) {
+    const job = await pollSnapshotFactRefresh(button, jobId, owner);
+    if (!job || !snapshotRefreshOwnerIsCurrent(owner)) return false;
+    if (job.status === "succeeded") {
+      const reloaded = await reloadFactsAfterSnapshotRefresh(owner);
+      if (!snapshotRefreshOwnerIsCurrent(owner)) return false;
+      if (!reloaded) {
+        throw new Error(
+          "The refresh succeeded, but the current page could not reload the validated facts. Reload the page to view the new publication.",
+        );
+      }
+      button.textContent = "Refresh complete";
+      showSnapshotRefreshFeedback(
+        button,
+        `Job ${jobId} · succeeded. The latest validated facts were reloaded for the current page.`,
+        "success",
+        owner,
+      );
+      return true;
+    }
+    let reloaded = false;
+    if (job.publication_committed === true) {
+      reloaded = await reloadFactsAfterSnapshotRefresh(owner);
+    }
+    if (!snapshotRefreshOwnerIsCurrent(owner)) return false;
     button.disabled = false;
     button.textContent = originalText;
-    showError(
-      byId("global-error"),
-      publicErrorMessage(error, "Fact refresh is unavailable."),
+    showSnapshotRefreshFeedback(
+      button,
+      snapshotRefreshFailureMessage(job, { reloaded }),
+      "critical",
+      owner,
     );
+    return false;
+  } catch (error) {
+    if (error.name === "AbortError" || !snapshotRefreshOwnerIsCurrent(owner)) return false;
+    button.disabled = false;
+    button.textContent = originalText;
+    const message = publicErrorMessage(error, "Fact refresh is unavailable.");
+    showSnapshotRefreshFeedback(
+      button,
+      `${message} The value remains N/A, not zero. Retry later or inspect Data Quality for the current reason.`,
+      "critical",
+      owner,
+    );
+    return false;
+  } finally {
+    const sequenceStillCurrent = owner.requestId === app.snapshotRefreshRequestId;
+    if (!sequenceStillCurrent && owner.routeContext === snapshotRefreshRouteContext()) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+    if (sequenceStillCurrent) {
+      app.snapshotRefreshController = null;
+    }
   }
 }
 
@@ -2176,9 +2538,9 @@ function renderWorkspaceContext() {
   const qualityText = counts.critical
     ? `${counts.critical} critical · ${counts.warning || 0} warning`
     : counts.warning
-      ? `${counts.warning} warnings`
-      : "No catalog warnings";
-  byId("facts-title").textContent = `${token} Token Research`;
+      ? `${counts.warning} warning${counts.warning === 1 ? "" : "s"}`
+      : "No active alerts";
+  setWorkspacePageIdentity(token, app.route?.page);
   byId("workspace-market-count").textContent = `${cexCount} CEX · ${dexCount} DEX`;
   const snapshotTimes = markets.flatMap((market) => [
     market.depth_observed_at,
@@ -2191,11 +2553,14 @@ function renderWorkspaceContext() {
   byId("workspace-quality-status").dataset.state = qualityState;
   if (tokenSummary) {
     const aggregates = aggregateFacts(tokenSummary, [], []);
-    byId("workspace-description").textContent = (
-      `${formatCurrency(aggregates.aggregateTotal)} aggregate window volume · `
-      + `${formatShare(aggregates.aggregateDexShare)} DEX share. `
-      + "Market A/B stay shared across the four research pages."
-    );
+    const aggregateText = finite(aggregates.aggregateTotal)
+      ? `${formatCurrency(aggregates.aggregateTotal)} aggregate window volume`
+      : "Aggregate window volume unavailable";
+    const shareText = finite(aggregates.aggregateDexShare)
+      ? `${formatShare(aggregates.aggregateDexShare)} DEX share`
+      : "DEX share unavailable";
+    byId("workspace-description").textContent = `${aggregateText} · ${shareText}. `
+      + "Market A/B stay shared across the four research pages.";
   }
   const pair = selectedPairState();
   const byMarketId = new Map(markets.map((market) => [market.market_id, market]));
@@ -2240,12 +2605,22 @@ function renderWorkspaceMarkets() {
               retryable: snapshotRetryable(market, "depth"),
               token,
               marketId: market.market_id,
+              marketLabel: factsMarketLabel(market),
               fact: "depth",
+              factLabel: "executable depth",
+              bandBps: 100,
             },
           );
         const tvlValue = firstFinite(row?.tvl_usd, market.tvl_usd);
         const tvl = market.market_type === "cex"
-          ? naFactMarkup("TVL is not applicable to a centralized order book.")
+          ? naFactMarkup(
+            "TVL is not applicable to a centralized order book.",
+            {
+              token,
+              marketLabel: factsMarketLabel(market),
+              factLabel: "pool TVL",
+            },
+          )
           : finite(tvlValue)
             ? formatCurrency(tvlValue)
             : naFactMarkup(
@@ -2258,7 +2633,9 @@ function renderWorkspaceMarkets() {
                 retryable: snapshotRetryable(market, "tvl"),
                 token,
                 marketId: market.market_id,
+                marketLabel: factsMarketLabel(market),
                 fact: "tvl",
+                factLabel: "pool TVL",
               },
             );
         const identityMeta = [
@@ -2277,15 +2654,24 @@ function renderWorkspaceMarkets() {
           <td data-label="Type">${qualityStateMarkup(market.market_type, market.market_type.toUpperCase())}</td>
           <td data-label="Window price">${finite(row?.price_usd)
             ? formatPrice(row.price_usd)
-            : naFactMarkup("No finite daily close is available for this market in the selected window.")}</td>
+            : naFactMarkup(
+              "No finite daily close is available for this market in the selected window.",
+              { token, marketLabel: factsMarketLabel(market), factLabel: "daily close" },
+            )}</td>
           <td data-label="Window volume">${finite(row?.volume_usd)
             ? formatCurrency(row.volume_usd)
-            : naFactMarkup("No finite daily USD volume is available for this market in the selected window.")}</td>
+            : naFactMarkup(
+              "No finite daily USD volume is available for this market in the selected window.",
+              { token, marketLabel: factsMarketLabel(market), factLabel: "daily USD volume" },
+            )}</td>
           <td data-label="TVL">${tvl}</td>
           <td data-label="±100 bps depth">${depth}<span class="metric-note">${escapeHtml(market.depth_status || "unavailable")}</span></td>
           <td data-label="Coverage">${finite(row?.coverage_ratio)
             ? formatRatio(row?.coverage_ratio)
-            : naFactMarkup("Coverage is unavailable because no valid daily observation count was published.")}</td>
+            : naFactMarkup(
+              "Coverage is unavailable because no valid daily observation count was published.",
+              { token, marketLabel: factsMarketLabel(market), factLabel: "daily coverage" },
+            )}</td>
           <td data-label="Quality">
             ${qualityStateMarkup(rowQualityStatus, rowQualityLabel)}
             <span class="metric-note">${flags.length} reason${flags.length === 1 ? "" : "s"}</span>
@@ -2469,11 +2855,11 @@ function qualityFactMarkup(name, fact) {
     details.push(
       `State time: ${formatUtcTimestamp(temporal.state_observed_at)}`,
       temporal.status === "not_applicable"
-        ? "USD price time: N/A — USD/USDT identity or proxy"
+        ? "USD price time: not applicable — USD/USDT identity or proxy"
         : `USD price time: ${formatUtcTimestamp(temporal.usd_price_observed_at)}`,
       temporal.usd_price_state_skew_seconds === null
         || temporal.usd_price_state_skew_seconds === undefined
-        ? `Price/state skew: N/A · ${temporal.status || "unavailable"}`
+        ? `Price/state skew: not applicable · ${temporal.status || "unavailable"}`
         : `Price/state skew: ${formatDurationSeconds(
           temporal.usd_price_state_skew_seconds,
         )} · maximum ${formatDurationSeconds(
@@ -2486,7 +2872,7 @@ function qualityFactMarkup(name, fact) {
       `USD price time: ${formatUtcTimestamp(temporal.usd_price_observed_at)}`,
       temporal.usd_price_state_skew_seconds === null
         || temporal.usd_price_state_skew_seconds === undefined
-        ? `Price/state skew: N/A · ${temporal.status || "unavailable"}`
+        ? `Price/state skew: unavailable · ${temporal.status || "unavailable"}`
         : `Price/state skew: ${formatDurationSeconds(
           temporal.usd_price_state_skew_seconds,
         )} · maximum ${formatDurationSeconds(
@@ -2545,6 +2931,8 @@ function qualityProjection(item) {
       flags: Array.isArray(source.screening_quality_flags)
         ? source.screening_quality_flags
         : [],
+      scope: source.screening_quality_scope || "catalog",
+      evaluationWindow: source.screening_quality_window || null,
     };
   }
   return {
@@ -2554,6 +2942,8 @@ function qualityProjection(item) {
       : Array.isArray(market.quality_flags)
         ? market.quality_flags
         : [],
+    scope: "selected",
+    evaluationWindow: null,
   };
 }
 
@@ -2582,7 +2972,7 @@ function renderQualityPayload(payload) {
     filterSummary.textContent = severity
       ? `Showing ${rows.length} market${rows.length === 1 ? "" : "s"} with ${matchingReasonCount} ${severity} reason${matchingReasonCount === 1 ? "" : "s"} linked from the Screener.`
       : "";
-    filterSummary.dataset.state = severity === "critical" ? "critical" : "warning";
+    filterSummary.dataset.state = severity || "info";
   }
   byId("quality-body").innerHTML = rows.length
     ? rows.map((item) => {
@@ -2605,9 +2995,14 @@ function renderQualityPayload(payload) {
           groups[category].push(flag);
           return groups;
         }, {});
+        const screeningWindow = projection.evaluationWindow;
+        const screeningScope = app.qualityOrigin === "screener"
+          ? `<p class="quality-evaluation-scope"><strong>Screener catalog window</strong> ${escapeHtml(screeningWindow?.start || "unavailable")} → ${escapeHtml(screeningWindow?.end || "unavailable")}. The Daily Facts column remains the selected date window; this Screener reason uses the catalog evaluation window.</p>`
+          : "";
         const reasons = flags.length
           ? `<details class="quality-reasons" ${severity ? "open" : ""}>
               <summary>${flags.length} current reason${flags.length === 1 ? "" : "s"}</summary>
+              ${screeningScope}
               ${Object.entries(reasonGroups).map(([category, categoryFlags]) => `
                 <strong class="quality-reason-category">${escapeHtml(category.replaceAll("_", " "))}</strong>
                 <ul>${categoryFlags.map((flag) => `<li data-severity="${escapeHtml(flag.severity)}">
@@ -2658,17 +3053,64 @@ function formatExecutionFill(row) {
   return fill === null ? "N/A" : formatShare(fill);
 }
 
-function executionCostMarkup(row) {
+function executionScenarioNaReason(row, result, factLabel) {
+  const status = row?.status || result?.status || "unavailable";
+  const reasonCode = row?.status_reason || result?.reason_code || ({
+    not_cataloged_in_snapshot: "execution_market_not_cataloged_in_snapshot",
+    unavailable: "execution_snapshot_unavailable",
+  }[status] || "");
+  const exactReasons = {
+    unsupported_protocol_or_chain: "Execution is not supported for this protocol or chain.",
+    unsupported_protocol: "Execution is not supported for this protocol.",
+    unsupported_chain: "Execution is not supported for this chain.",
+    unsupported_method: "The requested execution method is unsupported.",
+    unsupported_source: "Execution is not supported by this source adapter.",
+    source_no_order_book: "The source returned no order book for this market.",
+    source_no_two_sided_book: "The source did not publish a two-sided order book.",
+    full_book_insufficient_liquidity: "The full published order book cannot fill this requested size.",
+    execution_market_not_cataloged_in_snapshot: "This market was not included in the published execution snapshot.",
+    execution_snapshot_unavailable: "The execution snapshot is unavailable.",
+    execution_snapshot_invalid: "The execution snapshot failed validation.",
+    instrument_absent_from_current_catalog: "The instrument is absent from the official current exchange catalog.",
+  };
+  const reason = exactReasons[reasonCode]
+    || DAILY_QUALITY_REASON_LABELS[reasonCode]
+    || (reasonCode ? reasonCode.replaceAll("_", " ") : "No canonical execution reason was published.");
+  return `${reason} ${factLabel} remains N/A, not zero. Status: ${status}.`;
+}
+
+function executionDisclosureContext(row, result, factLabel, notionalUsd = null) {
+  const market = result?.market;
+  return {
+    token: market?.token_symbol || "",
+    marketId: market?.market_id || "",
+    marketLabel: market
+      ? [market.market_type?.toUpperCase(), market.venue, market.instrument]
+        .filter(Boolean).join(" · ")
+      : "",
+    fact: "execution",
+    factLabel,
+    notionalUsd: row?.requested_notional_usd ?? notionalUsd,
+  };
+}
+
+function executionCostMarkup(row, result = null, notionalUsd = null) {
   const value = formatExecutionCost(row);
   return value === "N/A"
-    ? naFactMarkup("No collected execution-cost scenario exists for this market, side, and notional.")
+    ? naFactMarkup(
+      executionScenarioNaReason(row, result, "Execution cost"),
+      executionDisclosureContext(row, result, "execution cost", notionalUsd),
+    )
     : escapeHtml(value);
 }
 
-function executionFillMarkup(row) {
+function executionFillMarkup(row, result = null, notionalUsd = null) {
   const value = formatExecutionFill(row);
   return value === "N/A"
-    ? naFactMarkup("Fill ratio is unavailable because no matching execution scenario was published.")
+    ? naFactMarkup(
+      executionScenarioNaReason(row, result, "Fill ratio"),
+      executionDisclosureContext(row, result, "fill ratio", notionalUsd),
+    )
     : escapeHtml(value);
 }
 
@@ -2697,7 +3139,7 @@ function executionMarketName(result, slot) {
 }
 
 function formatDurationSeconds(value) {
-  if (!finite(value)) return "N/A";
+  if (!finite(value)) return "unavailable";
   const seconds = Math.round(value);
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
@@ -2707,7 +3149,7 @@ function formatDurationSeconds(value) {
 
 function executionFeeScope(rows) {
   const statuses = [...new Set(rows.map((row) => row?.fee_status).filter(Boolean))];
-  if (!statuses.length) return "N/A";
+  if (!statuses.length) return null;
   const labels = {
     excluded_unknown_account_tier: "CEX account fee excluded",
     included_protocol_fee: "DEX pool swap fee included",
@@ -2726,7 +3168,7 @@ function renderExecutionTiming(slot, result) {
     warning: "Usable · timing warning",
     stale: "Withheld · stale",
     unavailable: "Withheld · unavailable",
-    not_applicable: "N/A · identity/proxy",
+    not_applicable: "Not applicable · identity/proxy",
     not_evaluated: "Not evaluated",
   };
   card.dataset.state = status;
@@ -2740,7 +3182,7 @@ function renderExecutionTiming(slot, result) {
   );
   byId(`execution-${normalized}-price-time`).textContent = (
     status === "not_applicable"
-      ? "USD price time N/A — USD/USDT identity or proxy"
+      ? "USD price time not applicable — USD/USDT identity or proxy"
       : `USD price time ${formatUtcTimestamp(timing?.usd_price_observed_at)}`
   );
   const skew = formatDurationSeconds(timing?.usd_price_state_skew_seconds);
@@ -2749,7 +3191,7 @@ function renderExecutionTiming(slot, result) {
   );
   byId(`execution-${normalized}-price-skew`).textContent = (
     status === "not_applicable" || status === "not_evaluated"
-      ? `Price/state skew N/A${timing?.reason ? ` · ${timing.reason}` : ""}`
+      ? `Price/state skew not applicable${timing?.reason ? ` · ${timing.reason}` : ""}`
       : `Price/state skew ${skew} · max ${maximum}${
         result?.publication_status === "withheld"
           ? " · costs withheld; N/A is not zero"
@@ -2833,11 +3275,11 @@ function renderExecution(payload) {
     const rowB = rowsB[index];
     return `<tr>
       <th scope="row" data-label="Requested Notional">${formatCurrency(Number(notional))}</th>
-      <td data-label="A Cost">${executionCostMarkup(rowA)}</td>
-      <td data-label="A Fill">${executionFillMarkup(rowA)}</td>
+      <td data-label="A Cost">${executionCostMarkup(rowA, resultA, notional)}</td>
+      <td data-label="A Fill">${executionFillMarkup(rowA, resultA, notional)}</td>
       <td data-label="A Status">${executionStatusMarkup(rowA, resultA)}</td>
-      <td data-label="B Cost">${executionCostMarkup(rowB)}</td>
-      <td data-label="B Fill">${executionFillMarkup(rowB)}</td>
+      <td data-label="B Cost">${executionCostMarkup(rowB, resultB, notional)}</td>
+      <td data-label="B Fill">${executionFillMarkup(rowB, resultB, notional)}</td>
       <td data-label="B Status">${executionStatusMarkup(rowB, resultB)}</td>
     </tr>`;
   }).join("");
@@ -2854,18 +3296,46 @@ function renderExecution(payload) {
   );
   byId("execution-a-label").textContent = `${executionMarketName(resultA, "A")} cost`;
   byId("execution-b-label").textContent = `${executionMarketName(resultB, "B")} cost`;
-  byId("execution-a-cost").textContent = formatExecutionCost(selectedA);
-  byId("execution-b-cost").textContent = formatExecutionCost(selectedB);
-  byId("execution-a-fill").textContent = (
-    `${formatExecutionFill(selectedA)} fill · ${selectedA?.status_reason || selectedA?.status || resultA?.status || "unavailable"}`
+  byId("execution-a-cost").innerHTML = executionCostMarkup(
+    selectedA,
+    resultA,
+    app.executionNotionalUsd,
   );
-  byId("execution-b-fill").textContent = (
-    `${formatExecutionFill(selectedB)} fill · ${selectedB?.status_reason || selectedB?.status || resultB?.status || "unavailable"}`
+  byId("execution-b-cost").innerHTML = executionCostMarkup(
+    selectedB,
+    resultB,
+    app.executionNotionalUsd,
   );
-  byId("execution-skew").textContent = formatDurationSeconds(
-    payload.metadata?.snapshot_skew_seconds,
+  byId("execution-a-fill").innerHTML = executionFillMarkup(
+    selectedA,
+    resultA,
+    app.executionNotionalUsd,
   );
-  byId("execution-fee-scope").textContent = executionFeeScope([selectedA, selectedB]);
+  byId("execution-b-fill").innerHTML = executionFillMarkup(
+    selectedB,
+    resultB,
+    app.executionNotionalUsd,
+  );
+  const snapshotSkew = payload.metadata?.snapshot_skew_seconds;
+  setFactValue(
+    "execution-skew",
+    finite(snapshotSkew),
+    formatDurationSeconds(snapshotSkew),
+    "Snapshot skew requires valid state timestamps for both selected execution markets.",
+    { token: payload.token_symbol, factLabel: "execution snapshot skew" },
+  );
+  const feeScope = executionFeeScope([selectedA, selectedB]);
+  setFactValue(
+    "execution-fee-scope",
+    Boolean(feeScope),
+    feeScope || "",
+    "Fee scope is unavailable because neither selected scenario published a fee-status field.",
+    {
+      token: payload.token_symbol,
+      factLabel: "execution fee scope",
+      notionalUsd: app.executionNotionalUsd,
+    },
+  );
 
   const scenarioRows = [...rowsA, ...rowsB].filter(Boolean);
   const statuses = scenarioRows.map((row) => row.status);
@@ -2899,6 +3369,7 @@ function renderExecution(payload) {
     withheldResults.length ? "critical" : state,
   );
   hideError(byId("execution-error"));
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
 
 async function loadExecutionCost() {
@@ -3029,6 +3500,7 @@ async function loadQuality() {
         + `${dailyAuditText}.`,
       state,
     );
+    if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
     hideError(byId("quality-error"));
     return true;
   } catch (error) {
@@ -3093,7 +3565,7 @@ function eventSizeOrMarket(event) {
   else if (market.venue || market.market_symbol) {
     pieces.push([market.venue, market.market_symbol].filter(Boolean).join(" · "));
   }
-  return pieces.length ? pieces.join(" · ") : "N/A · not reported or not applicable";
+  return pieces.length ? pieces.join(" · ") : "Not reported or not applicable";
 }
 
 function eventSourceHostname(url) {
@@ -3106,31 +3578,57 @@ function eventSourceHostname(url) {
 
 function renderEventFacts(payload) {
   app.eventFacts = payload;
+  const eventToken = payload?.query?.token || selectedWorkspaceToken();
   const availability = eventAvailabilityStatus(payload);
   const events = Array.isArray(payload?.events) ? payload.events : [];
   const lifecycleCounts = payload?.lifecycle_counts || {};
   const sources = new Set(events.map((event) => event?.source?.url).filter(Boolean));
-  byId("events-count").textContent = availability === "available"
-    ? String(payload?.event_count ?? events.length)
-    : "N/A";
-  byId("events-occurred").textContent = availability === "available"
-    ? String(lifecycleCounts.occurred || 0)
-    : "N/A";
-  byId("events-scheduled").textContent = availability === "available"
-    ? String(lifecycleCounts.scheduled || 0)
-    : "N/A";
-  byId("events-source-count").textContent = availability === "available"
-    ? String(sources.size)
-    : "N/A";
+  const unavailableReason = payload?.availability?.reason
+    || "The Event Fact dataset is not published.";
+  setFactValue(
+    "events-count",
+    availability === "available",
+    String(payload?.event_count ?? events.length),
+    unavailableReason,
+    { token: eventToken, factLabel: "verified event count" },
+  );
+  setFactValue(
+    "events-occurred",
+    availability === "available",
+    String(lifecycleCounts.occurred || 0),
+    unavailableReason,
+    { token: eventToken, factLabel: "occurred event count" },
+  );
+  setFactValue(
+    "events-scheduled",
+    availability === "available",
+    String(lifecycleCounts.scheduled || 0),
+    unavailableReason,
+    { token: eventToken, factLabel: "scheduled event count" },
+  );
+  setFactValue(
+    "events-source-count",
+    availability === "available",
+    String(sources.size),
+    unavailableReason,
+    { token: eventToken, factLabel: "official event source count" },
+  );
   const configuredTokenCount = Number(payload?.coverage?.configured_token_count);
   const coveredTokenCount = Number(payload?.coverage?.covered_token_count);
-  byId("events-token-coverage").textContent = (
+  const tokenCoverageAvailable = (
     availability === "available"
     && Number.isFinite(configuredTokenCount)
     && Number.isFinite(coveredTokenCount)
-  )
-    ? `${coveredTokenCount} / ${configuredTokenCount}`
-    : "N/A";
+  );
+  setFactValue(
+    "events-token-coverage",
+    tokenCoverageAvailable,
+    `${coveredTokenCount} / ${configuredTokenCount}`,
+    tokenCoverageAvailable
+      ? ""
+      : `${unavailableReason} Token coverage therefore cannot be calculated.`,
+    { token: eventToken, factLabel: "event Token coverage" },
+  );
 
   if (availability !== "available") {
     byId("events-body").innerHTML = (
@@ -3145,6 +3643,7 @@ function renderEventFacts(payload) {
       "warning",
     );
     hideError(byId("events-error"));
+    if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
     return;
   }
 
@@ -3158,7 +3657,7 @@ function renderEventFacts(payload) {
         return `<tr>
           <td data-label="Effective time">
             <strong>${escapeHtml(eventEffectiveTime(event))}</strong>
-            <span class="metric-note">Announced ${escapeHtml(event.time?.announced_at || "N/A")}</span>
+            <span class="metric-note">Announced ${escapeHtml(event.time?.announced_at || "not reported")}</span>
           </td>
           <td data-label="Type">${escapeHtml(eventLabel(event.event_type))}
             <span class="metric-note">${escapeHtml(eventLabel(event.event_subtype))}</span>
@@ -3170,7 +3669,7 @@ function renderEventFacts(payload) {
           <td data-label="Lifecycle"><span class="event-state" data-state="${escapeHtml(event.lifecycle || "unavailable")}">${escapeHtml(eventLabel(event.lifecycle))}</span></td>
           <td data-label="Size / Market">${escapeHtml(eventSizeOrMarket(event))}</td>
           <td data-label="Evidence">${escapeHtml(eventLabel(event.evidence_status))}
-            <span class="metric-note">${escapeHtml(eventLabel(source.kind))} · checked ${escapeHtml(source.checked_at_utc || "N/A")}</span>
+            <span class="metric-note">${escapeHtml(eventLabel(source.kind))} · checked ${escapeHtml(source.checked_at_utc || "time unavailable")}</span>
           </td>
           <td data-label="Source & Revision">${sourceLink}
             <span class="metric-note">Revision ${escapeHtml(event.revision)} · ${escapeHtml(revision.reason || "reason unavailable")}</span>
@@ -3190,6 +3689,7 @@ function renderEventFacts(payload) {
     events.length ? "success" : "warning",
   );
   hideError(byId("events-error"));
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
 
 async function fetchEventFacts({
@@ -3218,7 +3718,6 @@ async function fetchEventFacts({
 }
 
 async function loadEvents() {
-  const window = appliedTimeWindow();
   const requestId = invalidateEventRequest();
   const token = selectedWorkspaceToken();
   if (!app.catalog || !token) {
@@ -3232,8 +3731,6 @@ async function loadEvents() {
   try {
     const payload = await fetchEventFacts({
       token,
-      start: window.start,
-      end: window.end,
       lifecycle: app.eventLifecycle,
       signal: controller.signal,
     });
@@ -3247,15 +3744,19 @@ async function loadEvents() {
       '<tr><td colspan="7" class="missing">Verified Event Facts could not be loaded. No zero-event claim is made.</td></tr>'
     );
     [
-      "events-count",
-      "events-occurred",
-      "events-scheduled",
-      "events-source-count",
-      "events-token-coverage",
+      ["events-count", "verified event count"],
+      ["events-occurred", "occurred event count"],
+      ["events-scheduled", "scheduled event count"],
+      ["events-source-count", "official event source count"],
+      ["events-token-coverage", "event Token coverage"],
     ]
-      .forEach((id) => {
-        byId(id).textContent = "N/A";
-      });
+      .forEach(([id, factLabel]) => setFactValue(
+        id,
+        false,
+        "",
+        "Verified Event Facts could not be loaded from the published bundle.",
+        { token, factLabel },
+      ));
     showStatus(
       byId("events-status"),
       "Event Fact publication is unavailable; market facts remain usable.",
@@ -3265,6 +3766,7 @@ async function loadEvents() {
       byId("events-error"),
       publicErrorMessage(error, "Event Facts failed to load."),
     );
+    if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
     return false;
   } finally {
     if (requestId === app.eventRequestId) app.eventController = null;
@@ -4015,7 +4517,10 @@ function liquidityDepthMarkup(value, complete, market, band, component) {
     retryable: snapshotRetryable(market, "depth"),
     token: selectedWorkspaceToken(),
     marketId: market?.market_id,
+    marketLabel: snapshotMarketContextLabel(market),
     fact: "depth",
+    factLabel: `${component} executable depth`,
+    bandBps: band,
   });
 }
 
@@ -4096,7 +4601,7 @@ function renderLiquidityMarketMeta(slot, market, issues) {
        ))} · ${escapeHtml(
          market.depth_usd_price_freshness_status || "unavailable",
        )}</span>`
-    : '<span>USD conversion uses the order-book quote basis; independent price time may be N/A.</span>';
+    : '<span>USD conversion uses the order-book quote basis; an independent price time is not applicable.</span>';
   element.dataset.state = issues.length || status === "failed" || hasCriticalFlag
     ? "critical"
     : status === "observed" || status === "complete"
@@ -4144,15 +4649,54 @@ function renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB) {
   byId("liquidity-b-label").textContent = marketB
     ? `B · ${marketB.venue} total at ±100 bps`
     : "Market B at ±100 bps";
-  byId("liquidity-a-100").textContent = formatSummaryDepth(
-    liquidityDepthValue(dataMarketA, 100),
-    completeA,
+  const depthA = liquidityDepthValue(dataMarketA, 100);
+  const depthB = liquidityDepthValue(dataMarketB, 100);
+  setFactValue(
+    "liquidity-a-100",
+    validDepth(depthA),
+    formatSummaryDepth(depthA, completeA),
+    snapshotMissingReason(
+      marketA,
+      "depth",
+      "Market A has no measured total depth inside ±100 bps.",
+    ),
+    {
+      retryable: snapshotRetryable(marketA, "depth"),
+      token: selectedWorkspaceToken(),
+      marketId: marketA?.market_id,
+      marketLabel: snapshotMarketContextLabel(marketA),
+      fact: "depth",
+      factLabel: "total executable depth",
+      bandBps: 100,
+    },
   );
-  byId("liquidity-b-100").textContent = formatSummaryDepth(
-    liquidityDepthValue(dataMarketB, 100),
-    completeB,
+  setFactValue(
+    "liquidity-b-100",
+    validDepth(depthB),
+    formatSummaryDepth(depthB, completeB),
+    snapshotMissingReason(
+      marketB,
+      "depth",
+      "Market B has no measured total depth inside ±100 bps.",
+    ),
+    {
+      retryable: snapshotRetryable(marketB, "depth"),
+      token: selectedWorkspaceToken(),
+      marketId: marketB?.market_id,
+      marketLabel: snapshotMarketContextLabel(marketB),
+      fact: "depth",
+      factLabel: "total executable depth",
+      bandBps: 100,
+    },
   );
-  byId("liquidity-skew").textContent = liquiditySnapshotSkew(marketA, marketB) || "N/A";
+  const skew = liquiditySnapshotSkew(marketA, marketB);
+  setFactValue(
+    "liquidity-skew",
+    Boolean(skew),
+    skew || "",
+    "Snapshot skew requires valid measured-depth timestamps for both selected markets.",
+    { token: selectedWorkspaceToken(), factLabel: "depth snapshot skew" },
+  );
   const pairedBands = DEPTH_BANDS.filter((band) => (
     liquidityDepthValue(dataMarketA, band) !== null
     && liquidityDepthValue(dataMarketB, band) !== null
@@ -4261,6 +4805,7 @@ function renderLiquidityCurve() {
     "Only the four labeled thresholds are measured; missing markets are not replaced with zero or TVL.",
   ].join(" ");
   hideLiquidityTooltip();
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
 
 function showLiquidityTooltip(point) {
@@ -4600,7 +5145,7 @@ function comparisonTickRows(rows, maximumTicks) {
 }
 
 function formatComparisonChartValue(metric, value) {
-  if (!finite(value)) return "N/A · no fill";
+  if (!finite(value)) return "Unavailable · no fill";
   if (metric === "spread") return `${bpsFormat.format(value)} bps`;
   if (metric === "volume") return formatCurrency(value);
   return formatPrice(value);
@@ -4623,7 +5168,7 @@ function comparisonChartTooltipText(model, point) {
         eventLabel(event.lifecycle),
         `${event.time?.effective_at || point.date} (${event.time?.effective_at_precision || "unknown"} precision)`,
         eventSourceHostname(event.source?.url),
-        `revision ${event.revision || "N/A"}`,
+        `revision ${event.revision || "unavailable"}`,
       ].join(" · ")).join("; ")} · temporal overlay only, not causality`
     : "no verified event marker on this date in the current release";
   if (metric === "spread") {
@@ -5045,31 +5590,55 @@ function clearComparisonResult(message = "") {
   byId("compare-markets").disabled = false;
 }
 
-function comparisonValueMarkup(value, formatter, reason) {
-  return finite(value) ? escapeHtml(formatter(value)) : naFactMarkup(reason);
+function comparisonValueMarkup(value, formatter, reason, context = {}) {
+  return finite(value)
+    ? escapeHtml(formatter(value))
+    : naFactMarkup(reason, context);
 }
 
 function renderComparison(payload) {
   app.comparison = payload;
   const latest = payload.latest_comparable_observation;
-  byId("compare-date").textContent = latest?.date || "N/A";
-  byId("compare-absolute").textContent = formatRawUsd(latest?.absolute_spread_usd);
-  byId("compare-bps").textContent = finite(latest?.spread_bps)
-    ? `${bpsFormat.format(latest.spread_bps)} bps`
-    : "N/A";
+  setFactValue(
+    "compare-date",
+    Boolean(latest?.date),
+    latest?.date || "",
+    "No UTC date in this window has valid prices for both selected markets.",
+    { token: payload.token_symbol, factLabel: "latest comparable UTC date" },
+  );
+  setFactValue(
+    "compare-absolute",
+    finite(latest?.absolute_spread_usd),
+    formatRawUsd(latest?.absolute_spread_usd),
+    "Absolute price difference requires valid Market A and B prices on the same UTC date.",
+    { token: payload.token_symbol, factLabel: "absolute price difference" },
+  );
+  setFactValue(
+    "compare-bps",
+    finite(latest?.spread_bps),
+    finite(latest?.spread_bps) ? `${bpsFormat.format(latest.spread_bps)} bps` : "",
+    "Midpoint-relative spread requires valid Market A and B prices on the same UTC date.",
+    { token: payload.token_symbol, factLabel: "midpoint-relative spread" },
+  );
   byId("compare-days").textContent = `${payload.metadata.comparison_days} / ${payload.metadata.union_observation_days}`;
-  byId("compare-a-return").textContent = formatPercent(
-    payload.market_a_statistics?.window_return,
-  );
-  byId("compare-b-return").textContent = formatPercent(
-    payload.market_b_statistics?.window_return,
-  );
-  byId("compare-a-volatility").textContent = formatPercent(
-    payload.market_a_statistics?.daily_volatility,
-  );
-  byId("compare-b-volatility").textContent = formatPercent(
-    payload.market_b_statistics?.daily_volatility,
-  );
+  [
+    ["compare-a-return", payload.market_a_statistics?.window_return, "Market A window return requires at least two valid daily closes."],
+    ["compare-b-return", payload.market_b_statistics?.window_return, "Market B window return requires at least two valid daily closes."],
+    ["compare-a-volatility", payload.market_a_statistics?.daily_volatility, "Market A daily volatility requires sufficient valid return observations."],
+    ["compare-b-volatility", payload.market_b_statistics?.daily_volatility, "Market B daily volatility requires sufficient valid return observations."],
+  ].forEach(([id, value, reason]) => setFactValue(
+    id,
+    finite(value),
+    formatPercent(value),
+    reason,
+    {
+      token: payload.token_symbol,
+      marketLabel: id.includes("-a-")
+        ? snapshotMarketContextLabel(payload.market_a)
+        : snapshotMarketContextLabel(payload.market_b),
+      factLabel: id.includes("return") ? "window return" : "daily volatility",
+    },
+  ));
   byId("market-a-price-heading").textContent = `${payload.market_a.venue} Price (USD)`;
   byId("market-a-volume-heading").textContent = `${payload.market_a.venue} Volume (USD)`;
   byId("market-b-price-heading").textContent = `${payload.market_b.venue} Price (USD)`;
@@ -5084,12 +5653,12 @@ function renderComparison(payload) {
   byId("comparison-body").innerHTML = rows.length
     ? rows.map((row) => `<tr>
         <td>${escapeHtml(row.date)}</td>
-        <td>${comparisonValueMarkup(row.market_a.price_usd, formatRawUsd, "Market A has no valid daily USD price on this UTC date.")}</td>
-        <td>${comparisonValueMarkup(row.market_a.volume_usd, formatRawVolume, "Market A has no valid daily USD volume on this UTC date.")}</td>
-        <td>${comparisonValueMarkup(row.market_b.price_usd, formatRawUsd, "Market B has no valid daily USD price on this UTC date.")}</td>
-        <td>${comparisonValueMarkup(row.market_b.volume_usd, formatRawVolume, "Market B has no valid daily USD volume on this UTC date.")}</td>
-        <td>${comparisonValueMarkup(row.absolute_spread_usd, formatRawUsd, "Absolute spread requires valid Market A and B prices on the same UTC date.")}</td>
-        <td>${comparisonValueMarkup(row.spread_bps, (value) => bpsFormat.format(value), "Spread bps requires valid Market A and B prices on the same UTC date.")}</td>
+        <td>${comparisonValueMarkup(row.market_a.price_usd, formatRawUsd, "Market A has no valid daily USD price on this UTC date.", { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_a), factLabel: `daily USD price on ${row.date}` })}</td>
+        <td>${comparisonValueMarkup(row.market_a.volume_usd, formatRawVolume, "Market A has no valid daily USD volume on this UTC date.", { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_a), factLabel: `daily USD volume on ${row.date}` })}</td>
+        <td>${comparisonValueMarkup(row.market_b.price_usd, formatRawUsd, "Market B has no valid daily USD price on this UTC date.", { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_b), factLabel: `daily USD price on ${row.date}` })}</td>
+        <td>${comparisonValueMarkup(row.market_b.volume_usd, formatRawVolume, "Market B has no valid daily USD volume on this UTC date.", { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_b), factLabel: `daily USD volume on ${row.date}` })}</td>
+        <td>${comparisonValueMarkup(row.absolute_spread_usd, formatRawUsd, "Absolute spread requires valid Market A and B prices on the same UTC date.", { token: payload.token_symbol, factLabel: `absolute price difference on ${row.date}` })}</td>
+        <td>${comparisonValueMarkup(row.spread_bps, (value) => bpsFormat.format(value), "Spread bps requires valid Market A and B prices on the same UTC date.", { token: payload.token_symbol, factLabel: `midpoint-relative spread on ${row.date}` })}</td>
         <td class="${row.missing_reason ? "missing" : ""}">${escapeHtml(missingLabels[row.missing_reason] || "Comparable")}</td>
       </tr>`).join("")
     : '<tr><td colspan="8" class="missing">No observations in this window.</td></tr>';
@@ -5100,6 +5669,7 @@ function renderComparison(payload) {
     "success",
   );
   byId("facts-workbench").setAttribute("aria-busy", "false");
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
 
 async function responseJson(response) {
@@ -5223,23 +5793,35 @@ function isMarketPayload(payload) {
     payload
     && payload.metadata
     && payload.metadata.response_scope === "screener_summary"
-    && payload.metadata.summary_version === 2
+    && payload.metadata.summary_version === 3
     && typeof payload.metadata.data_generation === "string"
     && payload.metadata.data_generation.length > 0
     && Array.isArray(payload.tokens)
     && payload.tokens.every((token) => (
       token
       && typeof token.token_symbol === "string"
+      && Object.hasOwn(token, "absolute_price_gap")
+      && (
+        token.absolute_price_gap === null
+        || (finite(token.absolute_price_gap) && token.absolute_price_gap >= 0)
+      )
+      && token.absolute_price_gap_method === "symmetric_midpoint_relative_gap"
       && Object.hasOwn(token, "primary_cex")
       && Object.hasOwn(token, "primary_dex")
     ))
   );
 }
 
+function cacheSafeMarketPayload(payload) {
+  const metadata = { ...(payload?.metadata || {}) };
+  delete metadata.public_actions;
+  return { ...payload, metadata };
+}
+
 function readDefaultMarketCache() {
   try {
     const payload = JSON.parse(window.localStorage.getItem(DEFAULT_MARKET_CACHE_KEY));
-    return isMarketPayload(payload) ? payload : null;
+    return isMarketPayload(payload) ? cacheSafeMarketPayload(payload) : null;
   } catch {
     return null;
   }
@@ -5247,7 +5829,10 @@ function readDefaultMarketCache() {
 
 function writeDefaultMarketCache(payload) {
   try {
-    window.localStorage.setItem(DEFAULT_MARKET_CACHE_KEY, JSON.stringify(payload));
+    window.localStorage.setItem(
+      DEFAULT_MARKET_CACHE_KEY,
+      JSON.stringify(cacheSafeMarketPayload(payload)),
+    );
   } catch {
     // A fresh network response still renders when browser storage is unavailable.
   }
@@ -5383,6 +5968,7 @@ async function loadMarket(
     preserve = false,
     refreshWorkspaceOnGenerationChange = true,
     onRequestStart = null,
+    responseIsOwned = null,
   } = {},
 ) {
   const requestId = invalidateMarketRequest();
@@ -5415,6 +6001,7 @@ async function loadMarket(
       throw new Error("Screener summary failed its compact response contract.");
     }
     if (requestId !== app.marketRequestId) return false;
+    if (responseIsOwned && !responseIsOwned()) return false;
     displayMarket(payload, { refreshWorkspaceOnGenerationChange });
     if (!start && !end) writeDefaultMarketCache(payload);
     hideStatus(byId("market-loading"));
@@ -5480,6 +6067,7 @@ async function applyWindow(candidate = draftTimeWindow()) {
     return false;
   }
   showDateWindowError("");
+  invalidateSnapshotRefreshRequest({ clearFeedback: true });
   const routeAtApply = app.route.kind === "workspace"
     ? { ...app.route, state: { ...(app.route.state || {}) } }
     : app.route;
@@ -5553,6 +6141,14 @@ function persistSelectedPair() {
   return false;
 }
 
+function clearScreenerQualityDrilldown({ pairComplete = false } = {}) {
+  app.qualityOrigin = "";
+  app.qualitySeverity = "";
+  if (app.route?.kind === "workspace" && app.route.page === "quality") {
+    app.qualityScope = pairComplete ? "selected" : "all";
+  }
+}
+
 function applySelectedPair() {
   if (!persistSelectedPair()) {
     replaceCurrentRoute();
@@ -5591,9 +6187,37 @@ function selectWorkspaceMarket(slot, marketIdValue) {
   } else if (persistSelectedPair()) {
     hideStatus(byId("workspace-context-notice"));
   }
+  const pair = selectedPairState();
+  clearScreenerQualityDrilldown({
+    pairComplete: Boolean(
+      pair.marketA && pair.marketB && pair.marketA !== pair.marketB
+    ),
+  });
   persistSelectedPair();
   replaceCurrentRoute();
   refreshWorkspacePageData();
+}
+
+function selectWorkspaceToken(newToken) {
+  const previousToken = app.route?.kind === "workspace" ? app.route.token : "";
+  if (!newToken || !navigation) return false;
+  clearScreenerQualityDrilldown({ pairComplete: false });
+  delete app.pairSelections[newToken];
+  writePairSelections();
+  const page = app.route?.kind === "workspace" ? app.route.page : "markets";
+  navigateTo(navigation.buildWorkspacePath(
+    newToken,
+    page,
+    workspaceStateWithoutMarkets(page),
+  ));
+  showStatus(
+    byId("workspace-context-notice"),
+    previousToken
+      ? `Token changed from ${previousToken} to ${newToken}. The previous markets were cleared.`
+      : `Choose two ${newToken} markets.`,
+    "stale",
+  );
+  return true;
 }
 
 function workspaceStateWithoutMarkets(page) {
@@ -5777,24 +6401,7 @@ function bindEvents() {
   });
   byId("token-search").addEventListener("search", applyTokenSearch);
   byId("facts-token").addEventListener("change", () => {
-    const newToken = byId("facts-token").value;
-    const previousToken = app.route?.kind === "workspace" ? app.route.token : "";
-    if (!newToken || !navigation) return;
-    delete app.pairSelections[newToken];
-    writePairSelections();
-    const page = app.route?.kind === "workspace" ? app.route.page : "markets";
-    navigateTo(navigation.buildWorkspacePath(
-      newToken,
-      page,
-      workspaceStateWithoutMarkets(page),
-    ));
-    showStatus(
-      byId("workspace-context-notice"),
-      previousToken
-        ? `Token changed from ${previousToken} to ${newToken}. The previous markets were cleared.`
-        : `Choose two ${newToken} markets.`,
-      "stale",
-    );
+    selectWorkspaceToken(byId("facts-token").value);
   });
   byId("facts-market-a").addEventListener("change", () => {
     selectWorkspaceMarket("a", byId("facts-market-a").value);
@@ -5952,7 +6559,10 @@ function bindEvents() {
     event.preventDefault();
     navigateTo(`${url.pathname}${url.search}${url.hash}`);
   });
-  window.addEventListener("popstate", applyRouteFromLocation);
+  window.addEventListener("popstate", () => {
+    invalidateSnapshotRefreshRequest({ clearFeedback: true });
+    void applyRouteFromLocation();
+  });
 }
 
 function primeInitialRouteView(route) {
@@ -6001,7 +6611,7 @@ async function initialize() {
       await applyRouteFromLocation();
     }
   }
-  if (window.lucide) window.lucide.createIcons();
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
 
 if (typeof document !== "undefined") initialize();

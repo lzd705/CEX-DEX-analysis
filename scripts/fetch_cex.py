@@ -29,11 +29,13 @@ except ImportError:  # pragma: no cover - system trust remains the safe fallback
     certifi = None
 
 try:
+    from scripts.cex_instrument_lifecycle import parse_crypto_com_inventory
     from scripts.fact_quality import (
         normalize_cex_instrument,
         normalize_collection_attempts,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from cex_instrument_lifecycle import parse_crypto_com_inventory
     from fact_quality import normalize_cex_instrument, normalize_collection_attempts
 
 
@@ -362,16 +364,7 @@ def cex_attempt_record(
     source_instrument = next(iter(source_instruments), None)
     source_alias_validated = False
     if source_instrument and source_instrument != canonical_instrument:
-        canonical_base, _, canonical_quote = canonical_instrument.partition("/")
-        source_base, _, source_quote = source_instrument.partition("/")
-        if not (
-            str(exchange).strip().lower() == "upbit"
-            and canonical_quote == "USDT"
-            and source_quote == "KRW"
-            and canonical_base == source_base
-        ):
-            raise ValueError("CEX source instrument is not an approved alias")
-        source_alias_validated = True
+        raise ValueError("CEX source instrument must match the exact market identity")
     identity = {
         "market_type": "cex",
         "token_symbol": str(token_symbol).strip().upper(),
@@ -531,15 +524,43 @@ def make_kraken_pair(cex_symbol: str) -> str:
     return base_asset + "USD"
 
 
+def canonical_collected_instrument(exchange: str, cex_symbol: str) -> str:
+    """Return the exact venue instrument represented by collected rows.
+
+    The token registry supplies a broad spot preference (normally USDT), but
+    the Coinbase and Kraken adapters intentionally call their USD products.
+    USD and USDT are distinct venue instruments, so the public market identity
+    must preserve the actual source quote instead of relabeling it as USDT.
+    """
+    instrument = normalize_cex_instrument(
+        cex_symbol,
+        field_name="configured CEX instrument",
+    )
+    base_asset, _quote_asset = instrument.split("/", 1)
+    if str(exchange).strip().lower() in {"coinbase", "kraken"}:
+        return base_asset + "/USD"
+    return instrument
+
+
 def make_crypto_com_instrument(cex_symbol: str) -> str:
     """Convert UNI/USDT to UNI_USDT for Crypto.com."""
     return cex_symbol.replace("/", "_").upper()
 
 
 def make_upbit_market_candidates(cex_symbol: str):
-    """Return Upbit markets in preferred quote-currency order."""
-    base_asset = cex_symbol.split("/")[0].upper()
-    return ["KRW-" + base_asset, "USDT-" + base_asset]
+    """Return only the exact configured Upbit venue instrument.
+
+    A KRW order book is a different market from a USDT order book.  It must
+    never be used as a data fallback for a ``TOKEN/USDT`` catalog identity.
+    KRW collection remains supported when ``TOKEN/KRW`` is configured
+    explicitly.
+    """
+    instrument = normalize_cex_instrument(
+        cex_symbol,
+        field_name="Upbit configured instrument",
+    )
+    base_asset, quote_asset = instrument.split("/", 1)
+    return [quote_asset + "-" + base_asset]
 
 
 def convert_binance_kline(kline, token_symbol: str, cex_symbol: str, exchange: str):
@@ -845,6 +866,115 @@ def merge_exchange_rows(existing_rows, new_rows):
     for row in new_rows:
         merged[(row["token_symbol"], row["exchange"], row["cex_symbol"], row["date"])] = row
     return list(merged.values())
+
+
+def merge_conclusive_attempt_windows(
+    existing_rows,
+    new_rows,
+    attempts,
+    *,
+    remove_legacy_upbit_krw_fallback=False,
+):
+    """Replace exact venue-instrument windows with conclusive outcomes.
+
+    Successful, empty, and explicit not-listed outcomes are conclusive for the
+    requested exact-instrument window. A partial outcome replaces only the
+    dates it actually observed; it cannot erase other published dates in the
+    requested window. Technical failures and unsupported historical ranges
+    retain the last known facts. The only cross-label deletions are bounded
+    legacy migrations. Coinbase/Kraken rows mislabeled as USDT while calling
+    USD products are corrected only on conclusively covered dates. Upbit KRW
+    fallback rows are removed only under an explicit operator migration switch
+    and only on dates covered by the exact TOKEN/USDT attempt. The default
+    preserves distinct KRW markets.
+    """
+    replacement_windows = []
+    for attempt in attempts or []:
+        status = str(attempt.get("status") or "")
+        reason_code = str(attempt.get("reason_code") or "")
+        is_conclusive = status in {"succeeded", "partial", "no_data"} or (
+            status == "failed" and reason_code == "not_listed"
+        )
+        if not is_conclusive:
+            continue
+        start_date = str(attempt.get("requested_start_date") or "")
+        end_date = str(attempt.get("requested_end_date") or "")
+        if not start_date or not end_date:
+            continue
+        # Parse once so malformed producer state cannot silently delete rows.
+        requested_dates = _window_dates(start_date, end_date)
+        replacement_dates = None
+        if status == "partial":
+            raw_observed_dates = attempt.get("observed_dates")
+            if not isinstance(raw_observed_dates, (list, tuple, set)):
+                raise ValueError(
+                    "Partial CEX attempt must declare observed_dates"
+                )
+            replacement_dates = {
+                str(day_text) for day_text in raw_observed_dates
+            }
+            if (
+                not replacement_dates
+                or len(replacement_dates) != len(raw_observed_dates)
+                or not replacement_dates.issubset(requested_dates)
+            ):
+                raise ValueError(
+                    "Partial CEX attempt observed_dates are invalid"
+                )
+        exchange = str(attempt.get("exchange") or "").strip().lower()
+        instrument = normalize_cex_instrument(
+            attempt.get("instrument"),
+            field_name="CEX attempted instrument",
+        )
+        replacement_instruments = {instrument}
+        if exchange in {"coinbase", "kraken"} and instrument.endswith("/USD"):
+            base_asset = instrument.split("/", 1)[0]
+            replacement_instruments.add(base_asset + "/USDT")
+        if (
+            remove_legacy_upbit_krw_fallback
+            and exchange == "upbit"
+            and instrument.endswith("/USDT")
+        ):
+            base_asset = instrument.split("/", 1)[0]
+            replacement_instruments.add(base_asset + "/KRW")
+        replacement_windows.append(
+            (
+                str(attempt.get("token_symbol") or "").strip().upper(),
+                exchange,
+                frozenset(replacement_instruments),
+                start_date,
+                end_date,
+                replacement_dates,
+            )
+        )
+
+    retained_rows = []
+    for row in existing_rows:
+        token = str(row.get("token_symbol") or "").strip().upper()
+        exchange = str(row.get("exchange") or "").strip().lower()
+        instrument = normalize_cex_instrument(
+            row.get("cex_symbol"),
+            field_name="existing CEX instrument",
+        )
+        day = str(row.get("date") or "")
+        replaced = any(
+            token == target_token
+            and exchange == target_exchange
+            and instrument in target_instruments
+            and start_date <= day <= end_date
+            and (target_dates is None or day in target_dates)
+            for (
+                target_token,
+                target_exchange,
+                target_instruments,
+                start_date,
+                end_date,
+                target_dates,
+            ) in replacement_windows
+        )
+        if not replaced:
+            retained_rows.append(row)
+    return merge_exchange_rows(retained_rows, new_rows)
 
 
 def filter_token_rows(rows, token_symbols):
@@ -1171,6 +1301,14 @@ def fetch_crypto_com_candles(
     return result.get("data", [])
 
 
+def fetch_crypto_com_instruments():
+    """Return the exact current Crypto.com spot instrument inventory."""
+    url = "https://api.crypto.com/exchange/v1/public/get-instruments"
+    data = request_json(url)
+    instruments, _inventory_count = parse_crypto_com_inventory(data)
+    return instruments
+
+
 def fetch_upbit_candles(market: str, limit_days: int, end_date=None):
     """Fetch daily candles from Upbit Korea."""
     query = {
@@ -1198,7 +1336,7 @@ def build_upbit_rows(
     start_date=None,
     end_date=None,
 ):
-    """Fetch the preferred available Upbit market and convert volume to USD."""
+    """Fetch the exact configured Upbit market and convert quote volume to USD."""
     candidate_outcomes = []
     candidate_errors = []
 
@@ -1264,7 +1402,6 @@ def build_upbit_rows(
 
                 row = convert_upbit_candle(candle, token_symbol, quote_to_usd)
                 row["source_instrument"] = row["cex_symbol"]
-                row["cex_symbol"] = cex_symbol.upper()
                 rows.append(row)
 
             if not rows:
@@ -1413,25 +1550,27 @@ def fetch_exchange_rows(
         return rows
 
     if exchange == "coinbase":
-        product_id = make_coinbase_product_id(cex_symbol)
+        source_instrument = canonical_collected_instrument(exchange, cex_symbol)
+        product_id = make_coinbase_product_id(source_instrument)
         candles = fetch_coinbase_candles(
             product_id, LIMIT_DAYS, start_date, end_date
         )
         rows = []
 
         for candle in candles:
-            row = convert_coinbase_candle(candle, token_symbol, cex_symbol)
+            row = convert_coinbase_candle(candle, token_symbol, source_instrument)
             rows.append(row)
 
         return rows
 
     if exchange == "kraken":
-        pair = make_kraken_pair(cex_symbol)
+        source_instrument = canonical_collected_instrument(exchange, cex_symbol)
+        pair = make_kraken_pair(source_instrument)
         klines = fetch_kraken_klines(pair, LIMIT_DAYS, start_date, end_date)
         rows = []
 
         for kline in klines:
-            row = convert_kraken_kline(kline, token_symbol, cex_symbol)
+            row = convert_kraken_kline(kline, token_symbol, source_instrument)
             rows.append(row)
 
         return rows
@@ -1472,13 +1611,32 @@ def build_rows(
     """Fetch all CEX rows for configured tokens."""
     all_rows = []
     selected_exchanges = exchanges or EXCHANGES
+    crypto_com_instruments = None
+    crypto_com_inventory_error = None
+    if "crypto_com" in selected_exchanges:
+        try:
+            crypto_com_instruments = fetch_crypto_com_instruments()
+        except Exception as error:
+            crypto_com_inventory_error = error
 
     for token in token_rows:
         token_symbol = token["token_symbol"]
         cex_symbol = token["cex_symbol"]
 
         for exchange in selected_exchanges:
+            collected_instrument = canonical_collected_instrument(
+                exchange,
+                cex_symbol,
+            )
             try:
+                if exchange == "crypto_com":
+                    if crypto_com_inventory_error is not None:
+                        raise crypto_com_inventory_error
+                    instrument_name = make_crypto_com_instrument(cex_symbol)
+                    if instrument_name not in (crypto_com_instruments or set()):
+                        raise RuntimeError(
+                            "instrument not listed in the current Crypto.com catalog"
+                        )
                 rows = fetch_exchange_rows(
                     token_symbol,
                     cex_symbol,
@@ -1493,7 +1651,7 @@ def build_rows(
                         cex_attempt_record(
                             token_symbol,
                             exchange,
-                            cex_symbol,
+                            collected_instrument,
                             error=error,
                             start_date=start_date,
                             end_date=end_date,
@@ -1507,7 +1665,7 @@ def build_rows(
                     cex_attempt_record(
                         token_symbol,
                         exchange,
-                        cex_symbol,
+                        collected_instrument,
                         rows=rows,
                         start_date=start_date,
                         end_date=end_date,
@@ -1762,6 +1920,7 @@ def main(
     end_date=None,
     limit_days=LIMIT_DAYS,
     output_dir=None,
+    remove_legacy_upbit_krw_fallback=False,
 ) -> None:
     """Fetch CEX data into processed CSV files."""
     global LIMIT_DAYS
@@ -1799,7 +1958,18 @@ def main(
     if append:
         if token_symbols is None:
             raise ValueError("--append requires --tokens")
-        rows = merge_exchange_rows(read_exchange_rows(exchange_output_path), rows)
+        existing_rows = read_exchange_rows(exchange_output_path)
+        if publish_attempts:
+            rows = merge_conclusive_attempt_windows(
+                existing_rows,
+                rows,
+                attempt_records,
+                remove_legacy_upbit_krw_fallback=(
+                    remove_legacy_upbit_krw_fallback
+                ),
+            )
+        else:
+            rows = merge_exchange_rows(existing_rows, rows)
     stable_exchanges = select_stable_exchanges(
         rows,
         minimum_exchange_count=min(MIN_EXCHANGE_COUNT, len(selected_exchanges)),
@@ -1853,6 +2023,15 @@ def parse_args():
     parser.add_argument("--end", help="Inclusive UTC date")
     parser.add_argument("--limit-days", type=int, default=LIMIT_DAYS)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--remove-legacy-upbit-krw-fallback",
+        action="store_true",
+        help=(
+            "Delete bounded legacy Upbit TOKEN/KRW fallback rows only after "
+            "a conclusive exact TOKEN/USDT attempt; use only for the audited "
+            "one-time identity migration"
+        ),
+    )
     args = parser.parse_args()
 
     tokens = [item.strip().upper() for item in (args.tokens or "").split(",") if item.strip()] or None
@@ -1865,6 +2044,7 @@ def parse_args():
         args.end,
         args.limit_days,
         args.output_dir,
+        args.remove_legacy_upbit_krw_fallback,
     )
 
 
@@ -1877,6 +2057,7 @@ if __name__ == "__main__":
         end_date,
         limit_days,
         selected_output_dir,
+        remove_legacy_upbit_krw_fallback,
     ) = parse_args()
     main(
         selected_tokens,
@@ -1886,4 +2067,5 @@ if __name__ == "__main__":
         end_date,
         limit_days,
         selected_output_dir,
+        remove_legacy_upbit_krw_fallback,
     )

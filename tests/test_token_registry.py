@@ -15,6 +15,7 @@ from scripts.token_registry import (
     normalize_contract_address,
     token_identity_key,
 )
+from scripts import token_registry as token_registry_module
 
 
 SOLANA_ADDRESS = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
@@ -44,6 +45,85 @@ def token_record(symbol="TEST", address="0x" + "12" * 20, status="pending"):
 
 
 class TokenRegistryTest(unittest.TestCase):
+    def test_configured_cex_market_ids_merge_static_and_active_approved_runtime_scope(self):
+        loader = getattr(
+            token_registry_module,
+            "configured_cex_market_ids",
+            None,
+        )
+        self.assertIsNotNone(
+            loader,
+            "authoritative configured CEX market inventory is missing",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            static_path = root / "tokens.csv"
+            static_path.write_text(
+                "token_symbol,cex_symbol\n"
+                "AAVE,AAVE/USDT\n"
+                "UNI,UNI/KRW\n",
+                encoding="utf-8",
+            )
+            registry_path = root / "token_registry.json"
+
+            active_upbit = token_record(
+                symbol="TEST",
+                address="0x" + "12" * 20,
+                status="active",
+            )
+            active_upbit["cex_mapping"] = {
+                "status": "approved",
+                "cex_symbol": "TEST/KRW",
+                "exchanges": ["upbit"],
+            }
+            failed_upbit = token_record(
+                symbol="DEAD",
+                address="0x" + "34" * 20,
+                status="failed",
+            )
+            failed_upbit["cex_mapping"] = {
+                "status": "approved",
+                "cex_symbol": "DEAD/KRW",
+                "exchanges": ["upbit"],
+            }
+            active_other_exchange = token_record(
+                symbol="OTHER",
+                address="0x" + "56" * 20,
+                status="active",
+            )
+            active_other_exchange["cex_mapping"] = {
+                "status": "approved",
+                "cex_symbol": "OTHER/USDT",
+                "exchanges": ["binance"],
+            }
+            records = (
+                active_upbit,
+                failed_upbit,
+                active_other_exchange,
+            )
+            atomic_write_registry(
+                registry_path,
+                {
+                    "schema_version": REGISTRY_SCHEMA_VERSION,
+                    "tokens": {
+                        token_identity_key(
+                            record["chain"],
+                            record["contract_address"],
+                        ): record
+                        for record in records
+                    },
+                },
+            )
+
+            self.assertEqual(
+                loader(static_path, registry_path, exchange="upbit"),
+                (
+                    "cex:upbit:AAVE/USDT",
+                    "cex:upbit:TEST/KRW",
+                    "cex:upbit:UNI/KRW",
+                ),
+            )
+
     def test_chain_allowlist_and_address_canonicalization(self):
         self.assertEqual(normalize_chain(" ETH "), "eth")
         self.assertEqual(
@@ -151,6 +231,21 @@ class TokenRegistryTest(unittest.TestCase):
             record["cex_mapping"] = {
                 "status": "requires_manual_review",
                 "cex_symbol": "TEST/USDT",
+                "exchanges": ["binance"],
+            }
+
+            with self.assertRaises(TokenRegistryError) as context:
+                registry.upsert(record)
+
+            self.assertEqual(context.exception.code, "invalid_registry_record")
+
+    def test_registry_rejects_approved_cex_instrument_for_another_token(self):
+        with TemporaryDirectory() as directory:
+            registry = TokenRegistry(Path(directory) / "token_registry.json")
+            record = token_record()
+            record["cex_mapping"] = {
+                "status": "approved",
+                "cex_symbol": "BTC/USDT",
                 "exchanges": ["binance"],
             }
 

@@ -50,10 +50,10 @@ or public data-edit controls.
 ## Local workflow
 
 ```bash
-# Run the complete incremental collection cycle and publish every fact family.
+# Run the complete incremental cycle, starting with official CEX lifecycle evidence.
 python3 scripts/run_collection_cycle.py --profile full --publish-local
 
-# Daily schedule profile: incremental CEX/DEX OHLCV plus point-in-time TVL.
+# Daily schedule: official CEX lifecycle, incremental OHLCV, and point-in-time TVL.
 python3 scripts/run_collection_cycle.py --profile daily --publish-local
 
 # Hourly profile: CEX depth/cost, private DEX price refresh, then DEX depth/cost.

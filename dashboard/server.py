@@ -8,6 +8,7 @@ import csv
 import gzip
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import math
@@ -147,7 +148,22 @@ from scripts.execution_cost import (
     usd_price_timing,
     validate_execution_snapshot,
 )
-from scripts.timestamp_contract import parse_rfc3339_utc
+from scripts.cex_instrument_lifecycle import (
+    configured_market_ids_sha256,
+    load_cex_instrument_lifecycle_manifest,
+)
+from scripts.collect_cex_instrument_lifecycle import (
+    load_configured_crypto_com_markets,
+)
+from scripts.fetch_tvl import validate_tvl_fact_rows
+from scripts.token_registry import (
+    cex_market_ids_sha256,
+    configured_cex_market_ids,
+)
+from scripts.timestamp_contract import (
+    parse_rfc3339_utc,
+    validate_observation_bounds,
+)
 from dashboard.event_facts import (
     EventBundleError,
     LIFECYCLES,
@@ -172,8 +188,153 @@ CEX_EXECUTION_COST_FILENAME = "cex_execution_cost_latest.csv"
 DEX_EXECUTION_COST_FILENAME = "dex_execution_cost_latest.csv"
 DAILY_QUALITY_REPORT_RELATIVE_PATH = Path("quality") / "daily-latest.json"
 DAILY_QUALITY_REPORT_SCHEMA = "fact_quality_report/v1"
+CEX_INSTRUMENT_LIFECYCLE_PATH = (
+    PROJECT_ROOT / "data" / "curated" / "cex_instrument_lifecycle.json"
+)
+CEX_LIFECYCLE_TOKEN_CONFIG_PATH = PROJECT_ROOT / "config" / "tokens.csv"
 MAX_DAILY_QUALITY_REPORT_BYTES = 8 * 1024 * 1024
 MAX_DAILY_QUALITY_REPORT_ISSUES = 50_000
+CEX_LIFECYCLE_MAX_AGE_SECONDS = 36 * 60 * 60
+CEX_LIFECYCLE_SOURCE_URL = (
+    "https://api.crypto.com/exchange/v1/public/get-instruments"
+)
+CEX_CURRENT_FACT_WITHHELD_STATUSES = frozenset(
+    {
+        "absent_from_official_current_catalog",
+        "official_catalog_evidence_stale",
+    }
+)
+
+
+def _validated_release_sha(value: str | None) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40,64}", normalized):
+        return normalized
+    return None
+
+
+def _read_application_release_sha() -> str:
+    """Return the deployed application revision without executing Git."""
+
+    configured = _validated_release_sha(os.environ.get("CEX_DEX_RELEASE_SHA"))
+    if configured:
+        return configured
+
+    git_marker = PROJECT_ROOT / ".git"
+    git_directory = git_marker
+    if git_marker.is_file():
+        marker = git_marker.read_text(encoding="utf-8").strip()
+        if marker.startswith("gitdir:"):
+            candidate = Path(marker.split(":", 1)[1].strip())
+            git_directory = (
+                candidate
+                if candidate.is_absolute()
+                else (PROJECT_ROOT / candidate).resolve()
+            )
+    if not git_directory.is_dir():
+        return "unavailable"
+
+    head_path = git_directory / "HEAD"
+    if not head_path.is_file():
+        return "unavailable"
+    head = head_path.read_text(encoding="utf-8").strip()
+    direct = _validated_release_sha(head)
+    if direct:
+        return direct
+    if not head.startswith("ref: "):
+        return "unavailable"
+    reference = head[5:].strip()
+    if not reference or reference.startswith("/") or ".." in Path(reference).parts:
+        return "unavailable"
+    reference_roots = [git_directory]
+    common_marker = git_directory / "commondir"
+    if common_marker.is_file():
+        common_candidate = Path(
+            common_marker.read_text(encoding="utf-8").strip()
+        )
+        common_directory = (
+            common_candidate
+            if common_candidate.is_absolute()
+            else (git_directory / common_candidate).resolve()
+        )
+        if common_directory.is_dir() and common_directory not in reference_roots:
+            reference_roots.append(common_directory)
+    for reference_root in reference_roots:
+        reference_path = reference_root / reference
+        if reference_path.is_file():
+            resolved = _validated_release_sha(
+                reference_path.read_text(encoding="utf-8").strip()
+            )
+            if resolved:
+                return resolved
+        packed_refs = reference_root / "packed-refs"
+        if packed_refs.is_file():
+            for line in packed_refs.read_text(encoding="utf-8").splitlines():
+                if not line or line.startswith(("#", "^")):
+                    continue
+                fields = line.split(" ", 1)
+                if len(fields) == 2 and fields[1] == reference:
+                    resolved = _validated_release_sha(fields[0])
+                    if resolved:
+                        return resolved
+    return "unavailable"
+
+
+def _compute_static_asset_sha() -> str:
+    """Fingerprint every CSS/JavaScript byte served by the dashboard."""
+
+    digest = hashlib.sha256()
+    asset_paths = sorted(
+        (
+            path
+            for path in STATIC_ROOT.iterdir()
+            if path.is_file() and path.suffix in {".css", ".js"}
+        ),
+        key=lambda path: path.name,
+    )
+    served_assets = [
+        (path.name, path)
+        for path in asset_paths
+    ]
+    served_assets.append(
+        ("vendor/lucide.js", STATIC_ROOT / "vendor" / "lucide.min.js")
+    )
+    for served_name, path in sorted(served_assets):
+        digest.update(served_name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+# Freeze release evidence when this Python process imports the application.
+# A later checkout update must not let an old process claim the new revision.
+_PROCESS_APPLICATION_SHA = _read_application_release_sha()
+_PROCESS_STATIC_ASSET_SHA = _compute_static_asset_sha()
+
+
+def application_release_sha() -> str:
+    """Return the immutable application revision loaded by this process."""
+    return _PROCESS_APPLICATION_SHA
+
+
+def static_asset_sha() -> str:
+    """Return the immutable served-asset fingerprint for this process."""
+    return _PROCESS_STATIC_ASSET_SHA
+
+
+def static_asset_version() -> str:
+    release = application_release_sha()
+    asset = static_asset_sha()
+    release_component = release[:12] if release != "unavailable" else "unavailable"
+    return f"{release_component}-{asset[:12]}"
+
+
+def render_versioned_html(path: Path) -> str:
+    return path.read_text(encoding="utf-8").replace(
+        "__ASSET_VERSION__",
+        static_asset_version(),
+    )
 VENDOR_FILES = {
     "/vendor/lucide.js": STATIC_ROOT / "vendor/lucide.min.js",
 }
@@ -205,7 +366,7 @@ CEX_DEPTH_REASON_CODES = NON_RETRYABLE_CEX_DEPTH_REASON_CODES | {
 API_FRESHNESS_CACHE_SECONDS = 60
 LARGE_PAYLOAD_CACHE_SIZE = 8
 SERIALIZED_RESPONSE_CACHE_SIZE = 64
-CATALOG_SUMMARY_VERSION = 2
+CATALOG_SUMMARY_VERSION = 3
 SourceSignature = Tuple[Tuple[Any, ...], ...]
 PUBLIC_API_CACHE_LOCK = threading.RLock()
 SOURCE_CACHE_GENERATION_LOCK = threading.RLock()
@@ -350,6 +511,78 @@ def resolve_database_path() -> Path | None:
         if database_path.exists():
             return database_path
     return None
+
+
+def resolve_cex_instrument_lifecycle_path() -> Path:
+    """Resolve the reviewed current-instrument manifest outside request input."""
+    configured = os.environ.get("MARKET_CEX_INSTRUMENT_LIFECYCLE")
+    path = (
+        Path(configured).expanduser().resolve()
+        if configured
+        else CEX_INSTRUMENT_LIFECYCLE_PATH
+    )
+    if not path.is_file():
+        raise FileNotFoundError("CEX instrument lifecycle manifest is unavailable")
+    return path
+
+
+def resolve_runtime_token_registry_path() -> Path:
+    """Resolve the same runtime Token registry used by Add Token and collection."""
+    configured = os.environ.get("TOKEN_REGISTRY_PATH")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    configured_data_dir = os.environ.get("MARKET_DATA_DIR")
+    if configured_data_dir:
+        data_dir = Path(configured_data_dir).expanduser().resolve()
+    else:
+        configured_database = os.environ.get("MARKET_DATABASE")
+        data_dir = (
+            Path(configured_database).expanduser().resolve().parent
+            if configured_database
+            else PROJECT_ROOT / "data" / "local"
+        )
+    return data_dir / "admin" / "token_registry.json"
+
+
+def current_configured_crypto_com_market_ids() -> tuple[str, ...]:
+    """Rebuild exact Crypto.com identities from the live static/runtime catalog."""
+    markets = load_configured_crypto_com_markets(
+        CEX_LIFECYCLE_TOKEN_CONFIG_PATH,
+        resolve_runtime_token_registry_path(),
+    )
+    return tuple(market["market_id"] for market in markets)
+
+
+def current_configured_upbit_market_ids() -> tuple[str, ...]:
+    """Return exact Upbit identities from static and active runtime config."""
+    return configured_cex_market_ids(
+        CEX_LIFECYCLE_TOKEN_CONFIG_PATH,
+        resolve_runtime_token_registry_path(),
+        exchange="upbit",
+    )
+
+
+def attach_configured_cex_identity_metadata(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish the authority used to distinguish exact Upbit quote markets."""
+    market_ids = current_configured_upbit_market_ids()
+    result = {
+        **payload,
+        "metadata": {**payload["metadata"]},
+    }
+    result["metadata"]["configured_cex_market_identities"] = {
+        "schema": "configured_cex_market_identities/v1",
+        "upbit": {
+            "market_count": len(market_ids),
+            "market_ids": list(market_ids),
+            "market_ids_sha256": cex_market_ids_sha256(
+                market_ids,
+                exchange="upbit",
+            ),
+        },
+    }
+    return result
 
 
 def resolve_daily_quality_report_path() -> Path | None:
@@ -921,6 +1154,9 @@ def _load_tvl_snapshot_cached(
     if not rows:
         raise ValueError(f"{path.name} contains no TVL rows")
 
+    observed_at_min, observed_at_max = validate_observation_bounds(rows)
+    validate_tvl_fact_rows(rows)
+
     latest: dict[tuple[str, str, str], dict[str, str]] = {}
     for row in rows:
         key = (
@@ -933,9 +1169,6 @@ def _load_tvl_snapshot_cached(
         if key not in latest or row["observed_at"] > latest[key]["observed_at"]:
             latest[key] = row
     snapshot_ids = sorted({row["snapshot_id"] for row in rows if row.get("snapshot_id")})
-    observed_at_min, observed_at_max = _inventory_observed_at_bounds(
-        latest.values()
-    )
     return {
         "path": path,
         "rows": latest,
@@ -958,6 +1191,285 @@ def _copy_payload_for_overlay(payload: dict[str, Any]) -> dict[str, Any]:
         "cex_markets": [market.copy() for market in payload["cex_markets"]],
         "dex_pools": [pool.copy() for pool in payload["dex_pools"]],
     }
+
+
+@lru_cache(maxsize=8)
+def _load_cex_instrument_lifecycle_cached(
+    path_text: str,
+    _signature: SourceSignature,
+) -> dict[str, Any]:
+    return load_cex_instrument_lifecycle_manifest(Path(path_text))
+
+
+def current_cex_facts_withheld(market: dict[str, Any]) -> bool:
+    return (
+        str(market.get("current_listing_status") or "").strip().lower()
+        in CEX_CURRENT_FACT_WITHHELD_STATUSES
+    )
+
+
+def overlay_cex_instrument_lifecycle(
+    payload: dict[str, Any],
+    reviews: dict[str, dict[str, Any]] | None = None,
+    *,
+    lifecycle_evidence: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Withhold stale current facts for officially absent CEX instruments.
+
+    Historical source rows remain in the protected dataset. The public current
+    projection preserves only their bounded observation count/date lineage and
+    never infers a delisting date.
+    """
+    result = _copy_payload_for_overlay(payload)
+    lifecycle_path = None
+    if reviews is None:
+        lifecycle_path = resolve_cex_instrument_lifecycle_path()
+        manifest = _load_cex_instrument_lifecycle_cached(
+            str(lifecycle_path),
+            data_signature([lifecycle_path]),
+        )
+        reviews = {
+            review["market_id"]: review
+            for review in manifest["reviews"]
+        }
+        configured_market_ids = current_configured_crypto_com_market_ids()
+        current_configured_count = len(configured_market_ids)
+        current_configured_hash = configured_market_ids_sha256(
+            configured_market_ids
+        )
+        if manifest["configured_market_count"] != current_configured_count:
+            raise ValueError(
+                "CEX lifecycle configured market count does not match current catalog"
+            )
+        if (
+            manifest["configured_market_ids_sha256"]
+            != current_configured_hash
+        ):
+            raise ValueError(
+                "CEX lifecycle configured market set hash does not match current catalog"
+            )
+        unknown_reviews = set(reviews) - set(configured_market_ids)
+        if unknown_reviews:
+            raise ValueError(
+                "CEX lifecycle absence review is outside the current catalog"
+            )
+        lifecycle_evidence = {
+            "checked_at_utc": manifest["checked_at_utc"],
+            "response_sha256": manifest["response_sha256"],
+            "inventory_count": manifest["inventory_count"],
+            "configured_market_count": manifest[
+                "configured_market_count"
+            ],
+            "configured_market_ids_sha256": manifest[
+                "configured_market_ids_sha256"
+            ],
+        }
+    elif lifecycle_evidence is None:
+        checked_times = sorted(
+            {
+                review["checked_at_utc"]
+                for review in reviews.values()
+            }
+        )
+        response_hashes = sorted(
+            {
+                review["response_sha256"]
+                for review in reviews.values()
+            }
+        )
+        if len(checked_times) != 1 or len(response_hashes) != 1:
+            raise ValueError("CEX lifecycle review root evidence is inconsistent")
+        inventory_counts = {
+            review.get("inventory_count")
+            for review in reviews.values()
+            if review.get("inventory_count") is not None
+        }
+        lifecycle_evidence = {
+            "checked_at_utc": checked_times[0],
+            "response_sha256": response_hashes[0],
+            "inventory_count": (
+                next(iter(inventory_counts))
+                if len(inventory_counts) == 1
+                else len(reviews)
+            ),
+            "configured_market_count": len(reviews),
+            "configured_market_ids_sha256": configured_market_ids_sha256(
+                reviews
+            ) if reviews else None,
+        }
+    assert lifecycle_evidence is not None
+    root_checked_at_text = lifecycle_evidence["checked_at_utc"]
+    root_checked_at = parse_rfc3339_utc(root_checked_at_text)
+    configured_market_count = lifecycle_evidence[
+        "configured_market_count"
+    ]
+    official_inventory_count = lifecycle_evidence["inventory_count"]
+    withheld_payload_count = 0
+    reference_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    root_evidence_age_seconds = (
+        reference_time - root_checked_at
+    ).total_seconds()
+    root_evidence_is_fresh = (
+        -300 <= root_evidence_age_seconds <= CEX_LIFECYCLE_MAX_AGE_SECONDS
+    )
+    stale_evidence_count = (
+        0 if root_evidence_is_fresh else configured_market_count
+    )
+    for market in result["cex_markets"]:
+        market_id = cex_market_id(market.get("venue"), market.get("instrument"))
+        review = reviews.get(market_id)
+        catalog_wide_stale = (
+            not root_evidence_is_fresh
+            and market.get("venue") == "crypto_com"
+        )
+        if review is None and not catalog_wide_stale:
+            continue
+        if review is not None:
+            if (
+                market.get("token_symbol") != review.get("token_symbol")
+                or market.get("venue") != review.get("exchange")
+                or market.get("instrument") != review.get("instrument")
+            ):
+                raise ValueError(
+                    "CEX lifecycle review identity does not match the market"
+                )
+            checked_at_text = review["checked_at_utc"]
+            source_url = review["source_url"]
+            response_sha256 = review["response_sha256"]
+        else:
+            checked_at_text = root_checked_at_text
+            source_url = CEX_LIFECYCLE_SOURCE_URL
+            response_sha256 = lifecycle_evidence["response_sha256"]
+        withheld_payload_count += 1
+        checked_at = parse_rfc3339_utc(checked_at_text)
+        evidence_age_seconds = (reference_time - checked_at).total_seconds()
+        evidence_is_fresh = (
+            -300 <= evidence_age_seconds <= CEX_LIFECYCLE_MAX_AGE_SECONDS
+        )
+        if review is not None and evidence_is_fresh and root_evidence_is_fresh:
+            listing_status = review["current_listing_status"]
+            listing_reason = review["reason_code"]
+            depth_status = "source_no_observation"
+        else:
+            listing_status = "official_catalog_evidence_stale"
+            listing_reason = "official_catalog_evidence_stale"
+            depth_status = "needs_review"
+        market["historical_observation_count"] = market.get(
+            "observation_count",
+            market.get("observation_days"),
+        )
+        market["historical_first_observed_date"] = market.get(
+            "first_observed_date"
+        )
+        market["historical_latest_observed_date"] = market.get(
+            "latest_observed_date",
+            market.get("latest_date"),
+        )
+        market["current_listing_status"] = listing_status
+        market["current_listing_reason_code"] = listing_reason
+        market["current_listing_checked_at"] = checked_at_text
+        market["current_listing_evidence_age_seconds"] = evidence_age_seconds
+        market["current_listing_source"] = source_url
+        market["current_listing_response_sha256"] = response_sha256
+        for field in (
+            "price_usd",
+            "volume_usd",
+            "window_return",
+            "daily_volatility",
+            "coverage_ratio",
+            "observation_count",
+            "observation_days",
+            "calendar_span_days",
+            "requested_window_days",
+            "missing_calendar_days",
+            "return_interval_count",
+            "skipped_gap_interval_count",
+            "max_gap_days",
+            "first_observed_date",
+            "latest_observed_date",
+            "latest_date",
+            "coverage_expected_start",
+            "coverage_expected_end",
+        ):
+            market[field] = None
+        market["price_points"] = []
+        for field in (
+            "best_bid",
+            "best_ask",
+            "midpoint",
+            "spread_quote",
+            "spread_bps",
+            "bid_depth_10bps_usd",
+            "ask_depth_10bps_usd",
+            "total_depth_10bps_usd",
+            "bid_depth_25bps_usd",
+            "ask_depth_25bps_usd",
+            "total_depth_25bps_usd",
+            "bid_depth_50bps_usd",
+            "ask_depth_50bps_usd",
+            "total_depth_50bps_usd",
+            "bid_depth_100bps_usd",
+            "ask_depth_100bps_usd",
+            "total_depth_100bps_usd",
+        ):
+            market[field] = None
+        for field in (
+            "depth_10bps_complete",
+            "depth_25bps_complete",
+            "depth_50bps_complete",
+            "depth_100bps_complete",
+        ):
+            market[field] = False
+        market["depth_status"] = depth_status
+        market["depth_source_status"] = None
+        market["depth_reason_code"] = listing_reason
+        market["depth_error"] = None
+        market["depth_observed_at"] = checked_at_text
+        market["depth_method"] = "official_current_instrument_catalog_membership"
+        market["depth_snapshot_id"] = None
+        market["depth_source"] = "Official current exchange instrument catalog"
+        market["depth_source_endpoint"] = source_url
+        market["depth_raw_response_sha256"] = response_sha256
+        market["depth_source_instrument"] = None
+        market["depth_source_quote_asset"] = None
+        market["depth_quote_conversion_method"] = None
+
+    metadata = result["metadata"]
+    metadata["cex_instrument_lifecycle"] = {
+        "schema": "cex_instrument_lifecycle/v1",
+        "reviewed_market_count": configured_market_count,
+        "absence_market_count": len(reviews),
+        # Fresh evidence applies only the exact absence set. Once the shared
+        # root evidence expires, the fail-closed policy applies to the whole
+        # configured Crypto.com catalog until a new official check succeeds.
+        # A selected date window may contain fewer rows, so actual withholding
+        # remains a separate payload count.
+        "applied_market_count": (
+            len(reviews)
+            if root_evidence_is_fresh
+            else configured_market_count
+        ),
+        "withheld_payload_market_count": withheld_payload_count,
+        "stale_evidence_market_count": stale_evidence_count,
+        "official_inventory_count": official_inventory_count,
+        "response_sha256": lifecycle_evidence["response_sha256"],
+        "configured_market_ids_sha256": lifecycle_evidence.get(
+            "configured_market_ids_sha256"
+        ),
+        "freshness_max_age_seconds": CEX_LIFECYCLE_MAX_AGE_SECONDS,
+        "checked_at_min": root_checked_at_text,
+        "checked_at_max": root_checked_at_text,
+        "semantics": (
+            "Current official catalog absence withholds current facts but does "
+            "not establish an exact delisting date."
+        ),
+    }
+    if lifecycle_path is not None:
+        source = file_metadata(lifecycle_path)
+        metadata["cex_instrument_lifecycle"]["source"] = source
+        metadata.setdefault("sources", []).append(source)
+    return result
 
 
 def overlay_tvl_snapshot(payload: dict[str, Any], tvl_path: Path | None) -> dict[str, Any]:
@@ -1778,13 +2290,13 @@ def _build_database_payload_cached(
                 {
                     "name": state["cex_source_name"],
                     "bytes": state["cex_source_bytes"],
-                    "modified_at": state["imported_at"],
+                    "ingested_at": state["imported_at"],
                     "sha256": state["cex_sha256"][:16],
                 },
                 {
                     "name": state["dex_source_name"],
                     "bytes": state["dex_source_bytes"],
-                    "modified_at": state["imported_at"],
+                    "ingested_at": state["imported_at"],
                     "sha256": state["dex_sha256"][:16],
                 },
             ],
@@ -1793,6 +2305,7 @@ def _build_database_payload_cached(
                 "schema_version": 1,
                 "snapshot_id": state["snapshot_id"],
                 "import_run_id": state["run_id"],
+                "imported_at": state["imported_at"],
             },
             "tvl_note": "Pool TVL is a latest-fetch snapshot, not a historical daily series.",
         },
@@ -1925,12 +2438,38 @@ def _build_enriched_payload_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]
         payload,
         Path(dex_depth_path_text) if dex_depth_path_text else None,
     )
+    return payload
+
+
+@lru_cache(maxsize=LARGE_PAYLOAD_CACHE_SIZE)
+def _build_lifecycle_payload_cached(
+    cache_key: tuple[Any, ...],
+    freshness_bucket: int,
+) -> dict[str, Any]:
+    """Project wall-clock lifecycle evidence outside source-only caches.
+
+    Lifecycle status changes when official catalog evidence crosses its TTL,
+    even if no file signature changes.  Binding this projection to the same
+    short freshness bucket used by public responses prevents a long-running
+    process from claiming that stale evidence is still current.
+    """
+    reference_time = datetime.fromtimestamp(
+        freshness_bucket * API_FRESHNESS_CACHE_SECONDS,
+        tz=timezone.utc,
+    )
+    payload = overlay_cex_instrument_lifecycle(
+        _build_enriched_payload_cached(cache_key),
+        now=reference_time,
+    )
+    payload = attach_configured_cex_identity_metadata(payload)
     return finalize_fact_contract(payload)
 
 
 def build_market_payload(
     start: str | None = None,
     end: str | None = None,
+    *,
+    _freshness_bucket: int | None = None,
 ) -> dict[str, Any]:
     # Keep generation validation, assembly, and the lru_cache write-back in one
     # critical section. Otherwise a concurrent cache clear can finish while an
@@ -1938,12 +2477,24 @@ def build_market_payload(
     with SOURCE_CACHE_GENERATION_LOCK:
         ensure_source_cache_generation(api_source_signature())
         cache_key = market_payload_cache_key(start, end)
-        return attach_freshness_metadata(_build_enriched_payload_cached(cache_key))
+        freshness_bucket = (
+            api_freshness_bucket()
+            if _freshness_bucket is None
+            else _freshness_bucket
+        )
+        return attach_freshness_metadata(
+            _build_lifecycle_payload_cached(cache_key, freshness_bucket)
+        )
 
 
 @lru_cache(maxsize=8)
-def _build_market_catalog_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]:
-    return catalog_from_market_payload(_build_enriched_payload_cached(cache_key))
+def _build_market_catalog_cached(
+    cache_key: tuple[Any, ...],
+    freshness_bucket: int,
+) -> dict[str, Any]:
+    return catalog_from_market_payload(
+        _build_lifecycle_payload_cached(cache_key, freshness_bucket)
+    )
 
 
 def build_market_catalog(
@@ -1952,13 +2503,16 @@ def build_market_catalog(
 ) -> dict[str, Any]:
     """Return every observed market plus the versioned fact contract."""
     with SOURCE_CACHE_GENERATION_LOCK:
-        default_payload = build_market_payload()
+        freshness_bucket = api_freshness_bucket()
+        default_payload = build_market_payload(
+            _freshness_bucket=freshness_bucket,
+        )
         metadata = default_payload["metadata"]
         cache_key = market_payload_cache_key(
             metadata["available_start"],
             metadata["available_end"],
         )
-        catalog = _build_market_catalog_cached(cache_key)
+        catalog = _build_market_catalog_cached(cache_key, freshness_bucket)
         generation_signature = (
             source_signature
             if source_signature is not None
@@ -2005,6 +2559,8 @@ def _catalog_default_workspace_token(
 
 SCREENING_QUALITY_FLAG_CODES = frozenset(
     {
+        "inactive_cex_instrument",
+        "stale_cex_lifecycle_evidence",
         "depth_unavailable",
         "depth_unsupported",
         "depth_partial",
@@ -2017,6 +2573,14 @@ SCREENING_QUALITY_FLAG_CODES = frozenset(
     }
 )
 SCREENING_QUALITY_FLAG_MESSAGES = {
+    "inactive_cex_instrument": (
+        "The instrument was absent from the official current exchange catalog; "
+        "historical rows are withheld from current facts."
+    ),
+    "stale_cex_lifecycle_evidence": (
+        "The official instrument-catalog evidence is older than 36 hours; "
+        "current facts remain withheld until the listing state is rechecked."
+    ),
     "depth_unavailable": "No executable-depth observation is available.",
     "depth_unsupported": "Executable depth is unsupported for this market.",
     "depth_partial": (
@@ -2074,6 +2638,8 @@ def screening_quality_projection(market: dict[str, Any]) -> dict[str, Any]:
                     else "data_health"
                 ),
                 "message": SCREENING_QUALITY_FLAG_MESSAGES[code],
+                "observed_value": detail.get("observed_value"),
+                "threshold": detail.get("threshold"),
             }
         )
     if not flags and status in SCREENING_QUALITY_SEVERITIES:
@@ -2086,9 +2652,20 @@ def screening_quality_projection(market: dict[str, Any]) -> dict[str, Any]:
                     "The catalog reports a non-OK quality status without a "
                     "structured reason."
                 ),
+                "observed_value": None,
+                "threshold": None,
             }
         )
-    return {"status": status, "flags": flags}
+    return {
+        "status": status,
+        "flags": flags,
+        "scope": "catalog",
+        "evaluation_window": {
+            "start": market.get("coverage_expected_start"),
+            "end": market.get("coverage_expected_end"),
+            "method": market.get("coverage_start_method"),
+        },
+    }
 
 
 def catalog_summary_from_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
@@ -2188,6 +2765,8 @@ def token_catalog_from_catalog(
                 **market,
                 "screening_quality_status": screening["status"],
                 "screening_quality_flags": screening["flags"],
+                "screening_quality_scope": screening["scope"],
+                "screening_quality_window": screening["evaluation_window"],
             }
         )
     return {
@@ -2226,11 +2805,16 @@ SCREENER_MARKET_FIELDS = (
     "total_depth_50bps_usd",
     "total_depth_100bps_usd",
     "depth_100bps_complete",
+    "depth_observed_at",
     "tvl_usd",
     "tvl_status",
+    "tvl_observed_at",
     "quality_status",
     "quality_flags",
     "quality_flag_details",
+    "current_listing_status",
+    "current_listing_reason_code",
+    "current_listing_checked_at",
 )
 
 WINDOW_MARKET_FIELDS = (
@@ -2446,6 +3030,15 @@ def market_summary_from_payload(
                     "volume_aggregation_method"
                 ),
                 "price_spread": token_summary.get("price_spread"),
+                "price_spread_method": token_summary.get(
+                    "price_spread_method"
+                ),
+                "absolute_price_gap": token_summary.get(
+                    "absolute_price_gap"
+                ),
+                "absolute_price_gap_method": token_summary.get(
+                    "absolute_price_gap_method"
+                ),
                 "spread_date": token_summary.get("spread_date"),
                 "maximum_absolute_price_spread": token_summary.get(
                     "maximum_absolute_price_spread"
@@ -2742,6 +3335,8 @@ def selected_market_rows(
     start: str,
     end: str,
 ) -> list[dict[str, Any]]:
+    if current_cex_facts_withheld(market):
+        return []
     database_path = resolve_database_path()
     if database_path is not None:
         return database_market_rows(database_path, market, start, end)
@@ -2816,6 +3411,7 @@ def build_market_comparison(
             "sources": metadata["sources"],
             "storage": metadata["storage"],
             "data_generation": metadata["data_generation"],
+            "comparison_generation": metadata["data_generation"],
             "comparison_days": len(comparable),
             "union_observation_days": len(observations),
         },
@@ -3248,11 +3844,31 @@ def build_execution_cost_comparison(
     }
 
     def market_result(market: dict[str, Any]) -> dict[str, Any]:
+        if current_cex_facts_withheld(market):
+            stale = (
+                market.get("current_listing_status")
+                == "official_catalog_evidence_stale"
+            )
+            return {
+                "market": market,
+                "status": "needs_review" if stale else "source_no_observation",
+                "reason_code": (
+                    "official_catalog_evidence_stale"
+                    if stale
+                    else "instrument_absent_from_current_catalog"
+                ),
+                "retryable": False,
+                "rows": [],
+                "timing": None,
+                "publication_status": "withheld",
+            }
         snapshot = snapshots.get(market["market_type"])
         if snapshot is None:
             return {
                 "market": market,
                 "status": "unavailable",
+                "reason_code": "execution_snapshot_unavailable",
+                "retryable": False,
                 "rows": [],
                 "timing": None,
                 "publication_status": "unavailable",
@@ -3262,6 +3878,8 @@ def build_execution_cost_comparison(
             return {
                 "market": market,
                 "status": "not_cataloged_in_snapshot",
+                "reason_code": "execution_market_not_cataloged_in_snapshot",
+                "retryable": False,
                 "rows": [],
                 "timing": None,
                 "publication_status": "unavailable",
@@ -3274,6 +3892,8 @@ def build_execution_cost_comparison(
         return {
             "market": market,
             "status": "available",
+            "reason_code": None,
+            "retryable": False,
             "rows": _execution_public_rows(rows, timing),
             "timing": timing,
             "publication_status": (
@@ -3305,6 +3925,7 @@ def build_execution_cost_comparison(
         "metadata": {
             "contract_version": EXECUTION_COST_CONTRACT_VERSION,
             "data_generation": catalog["metadata"]["data_generation"],
+            "execution_generation": catalog["metadata"]["data_generation"],
             "notionals_usd": [int(value) for value in EXECUTION_NOTIONALS_USD],
             "directions": list(EXECUTION_DIRECTIONS),
             "notional_definition": NOTIONAL_DEFINITION,
@@ -4007,6 +4628,76 @@ def _daily_quality_fact(
     market: dict[str, Any],
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
+    if current_cex_facts_withheld(market):
+        stale = (
+            market.get("current_listing_status")
+            == "official_catalog_evidence_stale"
+        )
+        reason_code = (
+            "official_catalog_evidence_stale"
+            if stale
+            else "instrument_absent_from_current_catalog"
+        )
+        return {
+            **_quality_lineage(
+                status="needs_review" if stale else "source_no_observation",
+                observed_at=market.get("current_listing_checked_at"),
+                source="Official current exchange instrument catalog",
+                source_endpoint=market.get("current_listing_source"),
+                method="official_current_instrument_catalog_membership",
+                reason=(
+                    "The last official instrument-catalog evidence is older "
+                    "than the 36-hour freshness contract. Current facts remain "
+                    "withheld until the listing state is rechecked."
+                    if stale
+                    else "The instrument was absent from the official current "
+                    "exchange catalog at the recorded check. Historical "
+                    "candles are withheld from current facts; no exact "
+                    "delisting date is inferred."
+                ),
+                reason_code=reason_code,
+                retryable=False,
+                action=None,
+                raw_response_sha256=market.get(
+                    "current_listing_response_sha256"
+                ),
+            ),
+            "observed_start": None,
+            "observed_end": None,
+            "observation_days": None,
+            "requested_window_days": None,
+            "missing_calendar_days": None,
+            "coverage_expected_start": None,
+            "coverage_expected_end": None,
+            "coverage_ratio": None,
+            "quality_flags": [
+                {
+                    "code": (
+                        "stale_cex_lifecycle_evidence"
+                        if stale
+                        else "inactive_cex_instrument"
+                    ),
+                    "severity": "critical",
+                    "category": "data_health",
+                    "message": (
+                        "Current facts are withheld because the official "
+                        "instrument-catalog evidence is older than 36 hours."
+                        if stale
+                        else "Current daily facts are withheld because the "
+                        "instrument is absent from the official current "
+                        "exchange catalog."
+                    ),
+                    "observed_value": market.get(
+                        "current_listing_checked_at"
+                    ),
+                    "threshold": (
+                        "official_catalog_check_within_36_hours"
+                        if stale
+                        else "present_in_official_current_catalog"
+                    ),
+                }
+            ],
+        }
     window_metrics = market.get("window_metrics")
     metrics = window_metrics if isinstance(window_metrics, dict) else {}
     observation_days = metrics.get(
@@ -4411,6 +5102,68 @@ def _execution_quality_fact(
     market: dict[str, Any],
     source_state: dict[str, Any],
 ) -> dict[str, Any]:
+    if current_cex_facts_withheld(market):
+        stale = (
+            market.get("current_listing_status")
+            == "official_catalog_evidence_stale"
+        )
+        status = "needs_review" if stale else "source_no_observation"
+        reason_code = (
+            "official_catalog_evidence_stale"
+            if stale
+            else "instrument_absent_from_current_catalog"
+        )
+        return {
+            **_quality_lineage(
+                status=status,
+                observed_at=market.get("current_listing_checked_at"),
+                source="Official current exchange instrument catalog",
+                source_endpoint=market.get("current_listing_source"),
+                method="official_current_instrument_catalog_membership",
+                reason=reason_code,
+                reason_code=reason_code,
+                retryable=False,
+                action=None,
+                raw_response_sha256=market.get(
+                    "current_listing_response_sha256"
+                ),
+            ),
+            "source_snapshot_id": None,
+            "temporal_alignment": None,
+            "quality_flags": [
+                {
+                    "code": (
+                        "stale_cex_lifecycle_evidence"
+                        if stale
+                        else "inactive_cex_instrument"
+                    ),
+                    "severity": "critical",
+                    "category": "data_health",
+                    "message": (
+                        "Execution facts remain withheld because the official "
+                        "instrument-catalog evidence is stale."
+                        if stale
+                        else "Execution facts are withheld because the "
+                        "instrument is absent from the official current "
+                        "exchange catalog."
+                    ),
+                    "observed_value": market.get(
+                        "current_listing_checked_at"
+                    ),
+                    "threshold": (
+                        "official_catalog_check_within_36_hours"
+                        if stale
+                        else "present_in_official_current_catalog"
+                    ),
+                }
+            ],
+            "published_at": None,
+            "status_counts": {status: 1},
+            "status_reason_counts": {reason_code: 1},
+            "scenario_count": 0,
+            "directions": [],
+            "notionals_usd": [],
+        }
     snapshot = source_state["snapshot"]
     load_error_code = source_state["error_code"]
     if load_error_code is not None:
@@ -4877,6 +5630,10 @@ def build_market_quality(
                 "quality_flags": quality_flags,
                 "screening_quality_status": screening["status"],
                 "screening_quality_flags": screening["flags"],
+                "screening_quality_scope": screening["scope"],
+                "screening_quality_window": screening[
+                    "evaluation_window"
+                ],
                 "market_conditions": [
                     flag
                     for flag in quality_flags
@@ -5193,9 +5950,18 @@ def api_source_signature() -> SourceSignature:
         if quality_report_path is not None
         else ()
     )
+    lifecycle_signature = _safe_path_signature(
+        resolve_cex_instrument_lifecycle_path()
+    )
+    configured_catalog_signature = (
+        _safe_path_signature(CEX_LIFECYCLE_TOKEN_CONFIG_PATH)
+        + _safe_path_signature(resolve_runtime_token_registry_path())
+    )
     return (
         data_signature(paths)
         + quality_signature
+        + lifecycle_signature
+        + configured_catalog_signature
         + event_source_signature()
     )
 
@@ -5226,6 +5992,32 @@ def _public_payload_projection(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_public_payload_projection(item) for item in value)
     return value
+
+
+def attach_public_action_capabilities(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish only the feature capability needed to render safe actions.
+
+    Fact-level retryability and process-level action availability are separate
+    contracts.  Keeping this projection outside the cached fact builders means
+    the source payload is never mutated and a client cannot infer availability
+    from a retryable quality state alone.
+    """
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return payload
+    return {
+        **payload,
+        "metadata": {
+            **metadata,
+            "public_actions": {
+                "fact_refresh_enabled": bool(
+                    PUBLIC_ACTION_POLICY.fact_refresh_enabled
+                ),
+            },
+        },
+    }
 
 
 def _validate_public_api_client_query(
@@ -5339,7 +6131,9 @@ def _build_public_api_payload(
         )
     else:
         raise ValueError(f"Unknown public API route: {route}")
-    return _public_payload_projection(payload)
+    return _public_payload_projection(
+        attach_public_action_capabilities(payload)
+    )
 
 
 @lru_cache(maxsize=SERIALIZED_RESPONSE_CACHE_SIZE)
@@ -5392,6 +6186,7 @@ def clear_runtime_caches() -> None:
             _build_market_payload_cached,
             _build_database_payload_cached,
             _build_enriched_payload_cached,
+            _build_lifecycle_payload_cached,
             _build_market_catalog_cached,
             _build_public_api_response_cached,
         ):
@@ -5419,6 +6214,7 @@ def ensure_source_cache_generation(
             _build_market_payload_cached,
             _build_database_payload_cached,
             _build_enriched_payload_cached,
+            _build_lifecycle_payload_cached,
             _build_market_catalog_cached,
             _build_public_api_response_cached,
         ):
@@ -6212,6 +7008,35 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             return str(STATIC_ROOT / "index.html")
         return super().translate_path(path)
 
+    def send_head(self):
+        """Render HTML asset fingerprints at request time; stream other files normally."""
+
+        translated = Path(self.translate_path(self.path))
+        try:
+            is_static_html = (
+                translated.suffix == ".html"
+                and translated.resolve().is_relative_to(STATIC_ROOT.resolve())
+            )
+        except AttributeError:  # Python 3.8 compatibility.
+            try:
+                translated.resolve().relative_to(STATIC_ROOT.resolve())
+                is_static_html = translated.suffix == ".html"
+            except ValueError:
+                is_static_html = False
+        if not is_static_html or not translated.is_file():
+            return super().send_head()
+
+        body = render_versioned_html(translated).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header(
+            "Last-Modified",
+            self.date_time_string(translated.stat().st_mtime),
+        )
+        self.end_headers()
+        return io.BytesIO(body)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if is_admin_surface_path(parsed.path) and not self.admin_surface_available():
@@ -6410,13 +7235,27 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             try:
                 payload = build_market_payload()
                 metadata = payload["metadata"]
+                lifecycle = metadata.get("cex_instrument_lifecycle")
+                lifecycle_is_current = (
+                    isinstance(lifecycle, dict)
+                    and lifecycle.get("stale_evidence_market_count") == 0
+                    and lifecycle.get("applied_market_count")
+                    == lifecycle.get("absence_market_count")
+                )
+                data_status = metadata["freshness"]["overall_status"]
+                if not lifecycle_is_current:
+                    data_status = "stale"
                 self.send_json(
                     {
                         "status": "ok",
                         "data_ready": True,
                         "storage": metadata["storage"]["engine"],
-                        "data_status": metadata["freshness"]["overall_status"],
+                        "data_status": data_status,
                         "freshness": metadata["freshness"],
+                        "cex_instrument_lifecycle": lifecycle,
+                        "application_sha": application_release_sha(),
+                        "asset_sha": static_asset_sha(),
+                        "asset_version": static_asset_version(),
                     }
                 )
             except (

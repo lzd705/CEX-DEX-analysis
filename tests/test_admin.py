@@ -1779,7 +1779,7 @@ class AdminServiceTest(unittest.TestCase):
         generation_change_finished = Event()
         payload = {"metadata": {}, "cex_markets": [], "dex_pools": []}
 
-        def slow_build(_cache_key):
+        def slow_build(_cache_key, _freshness_bucket):
             build_started.set()
             if not release_build.wait(timeout=2):
                 raise TimeoutError("test did not release the payload build")
@@ -1800,7 +1800,7 @@ class AdminServiceTest(unittest.TestCase):
             return_value=("first-generation",),
         ), patch.object(
             server,
-            "_build_enriched_payload_cached",
+            "_build_lifecycle_payload_cached",
             side_effect=slow_build,
         ), patch.object(
             server,
@@ -1936,6 +1936,15 @@ class AdminServiceTest(unittest.TestCase):
         self.assertIn("ReadWritePaths=@ADMIN_JOB_DIR@", service)
         self.assertNotIn("ReadWritePaths=-@PROJECT_ROOT@/data/", service)
         self.assertIn("Environment=ADMIN_ENABLED=false", user_service)
+        self.assertIn(
+            "Environment=MARKET_DATA_DIR=@MARKET_DATA_DIR@",
+            user_service,
+        )
+        self.assertIn(
+            "Environment=MARKET_CEX_INSTRUMENT_LIFECYCLE="
+            "@MARKET_DATA_DIR@/cex_instrument_lifecycle.json",
+            user_service,
+        )
         self.assertIn("--host @BIND_HOST@", user_service)
         self.assertIn("Restart=on-failure", user_service)
         self.assertIn("WantedBy=default.target", user_service)

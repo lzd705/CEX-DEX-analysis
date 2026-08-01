@@ -558,6 +558,29 @@ class DexDepthCollectionTest(unittest.TestCase):
                 allow_terminal_only=True,
             )
 
+    def test_validate_requires_canonical_utc_observed_at_for_every_pool(self):
+        terminal = unsupported_row(
+            self.pool,
+            snapshot_id="candidate-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            reason="unsupported_protocol:fixture",
+        )
+        for observed_at in (
+            "",
+            "2026-07-27T00:00:01",
+            "2026-07-27T00:00:01Z",
+            "2026-07-27T08:00:01+08:00",
+            " 2026-07-27T00:00:01+00:00",
+        ):
+            with self.subTest(observed_at=observed_at):
+                with self.assertRaisesRegex(ValueError, "observed_at"):
+                    validate_depth_snapshot(
+                        [self.pool],
+                        [{**terminal, "observed_at": observed_at}],
+                        allow_terminal_only=True,
+                    )
+
     def test_exact_pool_refresh_merges_without_collecting_other_pools(self):
         other_pool = {
             **self.pool,

@@ -589,6 +589,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Collector staging directory (defaults beside --data-dir)",
     )
+    parser.add_argument(
+        "--remove-legacy-upbit-krw-fallback",
+        action="store_true",
+        help=(
+            "One-time bounded migration: after conclusive exact Upbit USDT "
+            "attempts, remove legacy KRW fallback rows in the same windows"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -671,6 +679,22 @@ def main() -> None:
     args = parse_args()
     tokens = parse_list(args.tokens, upper=True)
     exchanges = parse_list(args.exchanges, upper=False)
+    remove_legacy_upbit_krw_fallback = bool(
+        getattr(args, "remove_legacy_upbit_krw_fallback", False)
+    )
+    if remove_legacy_upbit_krw_fallback and not (
+        args.cex_only
+        and args.append
+        and tokens
+        and exchanges
+        and "upbit" in exchanges
+        and args.start
+        and args.end
+    ):
+        raise ValueError(
+            "bounded Upbit legacy cleanup requires --cex-only --append, "
+            "explicit --tokens, --exchanges including upbit, and --start/--end"
+        )
     limit_days = resolve_limit_days(args.start, args.end)
     data_dir = args.data_dir.expanduser().resolve()
     processed_dir = resolve_processed_dir(data_dir, args.processed_dir)
@@ -701,6 +725,9 @@ def main() -> None:
             end_date=args.end,
             limit_days=limit_days,
             output_dir=processed_dir,
+            remove_legacy_upbit_krw_fallback=(
+                remove_legacy_upbit_krw_fallback
+            ),
         )
         collected_market_types.append("cex")
     if not args.cex_only:

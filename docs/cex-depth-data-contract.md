@@ -38,10 +38,14 @@ total depth USD = bid depth USD + ask depth USD
 This is quote notional resting inside a price band. It is not trade volume,
 TVL, active DEX liquidity, guaranteed executable size, or measured slippage.
 
-USDT books use the explicit `1 USDT = 1 USD` proxy. Coinbase and Kraken USD
-books use `1 USD = 1 USD`. When Upbit falls back to a KRW market, the collector
-converts KRW notional using the midpoint of a separately retained
-`KRW-USDT` order-book response.
+Every row retains the exact venue base and quote assets. Endpoint spellings may
+change separators or asset order, but they cannot change market identity:
+`TOKEN/USD`, `TOKEN/USDT`, and `TOKEN/KRW` are distinct books. USDT books use
+the explicit `1 USDT = 1 USD` proxy, while Coinbase and Kraken USD books use
+`1 USD = 1 USD`. An explicitly cataloged Upbit `TOKEN/KRW` book converts KRW
+notional using the midpoint of a separately retained `KRW-USDT` order-book
+response; it remains a `TOKEN/KRW` market and is never a fallback for
+`TOKEN/USDT`.
 
 ## Completeness
 
@@ -66,7 +70,8 @@ Failures remain missing; they are never replaced with zero.
 1. Read distinct Token, exchange, and canonical instrument identities from the
    published SQLite database; fall back to the reviewed detailed CEX CSV only
    when the database is unavailable.
-2. Translate the canonical instrument into the venue's native symbol.
+2. Encode that exact instrument in the venue's native symbol syntax without
+   substituting its base or quote asset.
 3. Request one public spot order-book snapshot per cataloged market.
 4. Save the unmodified successful response, or a structured failure record.
 5. Validate positive price/quantity levels and reject empty, locked, or crossed
