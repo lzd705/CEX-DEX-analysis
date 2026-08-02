@@ -78,6 +78,14 @@ try:
         normalize_dex_depth_source_outcome,
         quality_outcome_resolution_state,
     )
+    from scripts.route_quantity import (
+        CommonTarget,
+        MarketRules,
+        QuantityQuote,
+        V2PoolState,
+        quote_v2_pool_quantity,
+        validate_v2_quantity_quote_against_state,
+    )
     from scripts.timestamp_contract import validate_observation_bounds
 except ModuleNotFoundError:
     from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
@@ -107,6 +115,14 @@ except ModuleNotFoundError:
     from quality_outcomes import (
         normalize_dex_depth_source_outcome,
         quality_outcome_resolution_state,
+    )
+    from route_quantity import (
+        CommonTarget,
+        MarketRules,
+        QuantityQuote,
+        V2PoolState,
+        quote_v2_pool_quantity,
+        validate_v2_quantity_quote_against_state,
     )
     from timestamp_contract import validate_observation_bounds
 
@@ -1024,6 +1040,78 @@ def _v2_fee_numerator(fee_bps: Decimal) -> int:
     if not 0 <= fee_integer < 10_000:
         raise ValueError("V2 fee_bps must be in [0, 10000)")
     return 10_000 - fee_integer
+
+
+_V2_POOL_STATE_FIELDS = (
+    "chain",
+    "chain_id",
+    "dex",
+    "pool_address",
+    "token0_address",
+    "token1_address",
+    "token0_decimals",
+    "token1_decimals",
+    "reserve0_raw",
+    "reserve1_raw",
+    "reserve_timestamp_last_raw",
+    "fee_bps",
+    "fee_numerator",
+    "fee_denominator",
+    "fee_formula",
+    "fee_proof_sha256",
+    "block_number",
+    "block_hash",
+    "block_header_sha256",
+    "observed_at",
+    "raw_response_sha256",
+)
+
+
+def freeze_v2_pool_state(source: Any) -> V2PoolState:
+    """Read every mutable V2 input exactly once into an immutable state."""
+    if isinstance(source, V2PoolState):
+        return source
+    getter = getattr(source, "get", None)
+    if not callable(getter):
+        raise ValueError("V2 pool state source must be a mapping")
+    frozen = {field: getter(field) for field in _V2_POOL_STATE_FIELDS}
+    return V2PoolState(**frozen)
+
+
+def route_quantity_quote_for_v2_pool(
+    source: Any,
+    *,
+    direction: str,
+    target_token_quantity: CommonTarget,
+    market_rules: MarketRules,
+    target_token_address: str,
+    quote_token_address: str,
+    expected_state_id: str,
+    cohort_now: str,
+) -> QuantityQuote:
+    """Freeze once, verify the caller's binding, and quote the same state."""
+    state = freeze_v2_pool_state(source)
+    if state.state_id != expected_state_id:
+        raise ValueError("V2 quantity state binding does not match")
+    quote = quote_v2_pool_quantity(
+        state,
+        target_token_quantity,
+        market_rules,
+        direction=direction,
+        target_token_address=target_token_address,
+        quote_token_address=quote_token_address,
+        cohort_now=cohort_now,
+    )
+    return validate_v2_quantity_quote_against_state(
+        quote,
+        state,
+        target_token_quantity,
+        market_rules,
+        direction=direction,
+        target_token_address=target_token_address,
+        quote_token_address=quote_token_address,
+        cohort_now=cohort_now,
+    )
 
 
 def v2_exact_input_quote(

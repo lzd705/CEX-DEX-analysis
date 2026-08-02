@@ -44,6 +44,8 @@ from scripts.fetch_dex_depth import (
     publish_execution_snapshot,
     publish_full_publication_bundle,
     publish_snapshot,
+    freeze_v2_pool_state,
+    route_quantity_quote_for_v2_pool,
     terminal_execution_rows,
     unsupported_row,
     validate_snapshot as validate_depth_snapshot,
@@ -53,6 +55,7 @@ from scripts.fetch_dex_depth import (
     v2_execution_rows,
     v3_move_to_price,
 )
+from scripts.route_quantity import CommonTarget, MarketRules
 from scripts.publication_gate import CoverageRegressionError
 from scripts.execution_cost import (
     EXECUTION_DIRECTIONS,
@@ -301,6 +304,160 @@ class ActualV2Transport:
 
 
 class DexDepthMathTest(unittest.TestCase):
+    def test_v2_quantity_adapter_freezes_mutable_state_once_for_hash_and_quote(self):
+        pool_address = "0x3333333333333333333333333333333333333333"
+        target_address = "0x1111111111111111111111111111111111111111"
+        quote_address = "0x2222222222222222222222222222222222222222"
+        stable = {
+            "chain": "eth",
+            "chain_id": 1,
+            "dex": "uniswap_v2",
+            "pool_address": pool_address,
+            "token0_address": target_address,
+            "token1_address": quote_address,
+            "token0_decimals": 18,
+            "token1_decimals": 6,
+            "reserve0_raw": 100 * 10**18,
+            "reserve1_raw": 10_000_000_000,
+            "reserve_timestamp_last_raw": 1_704_067_200,
+            "fee_bps": 30,
+            "fee_numerator": 9_970,
+            "fee_denominator": 10_000,
+            "fee_formula": (
+                "amount_in_with_fee=amount_in*fee_numerator;"
+                "denominator=reserve_in*fee_denominator+amount_in_with_fee"
+            ),
+            "fee_proof_sha256": "c" * 64,
+            "block_number": 123,
+            "block_hash": "0x" + "d" * 64,
+            "block_header_sha256": "e" * 64,
+            "observed_at": "2026-08-01T12:00:00.0000005Z",
+            "raw_response_sha256": "f" * 64,
+        }
+        expected_state_id = freeze_v2_pool_state(stable).state_id
+        rules = MarketRules(
+            market_id=f"dex:eth:uniswap_v2:{pool_address}:AAVE",
+            base_asset="AAVE",
+            quote_asset="USDC",
+            base_unit_decimals=18,
+            quote_unit_decimals=6,
+            base_increment=Decimal("0.000000000000000001"),
+            quote_increment=Decimal("0.000001"),
+            min_base_quantity=Decimal("0"),
+            min_quote_notional=Decimal("0"),
+            observed_at="2026-08-01T12:00:00Z",
+            valid_until="2026-08-01T12:05:00Z",
+            source_record_sha256="a" * 64,
+        )
+        target = CommonTarget(
+            asset="AAVE",
+            unit_decimals=18,
+            raw_quantity=10 * 10**18,
+            lattice_raw=1,
+        )
+
+        class MutatingState(dict):
+            def __init__(self, values):
+                super().__init__(values)
+                self.reserve_reads = 0
+
+            def get(self, key, default=None):
+                if key == "reserve0_raw":
+                    self.reserve_reads += 1
+                    if self.reserve_reads > 1:
+                        return 500 * 10**18
+                return super().get(key, default)
+
+        mutable = MutatingState(stable)
+        result = route_quantity_quote_for_v2_pool(
+            mutable,
+            direction="sell",
+            target_token_quantity=target,
+            market_rules=rules,
+            target_token_address=target_address,
+            quote_token_address=quote_address,
+            expected_state_id=expected_state_id,
+            cohort_now="2026-08-01T12:02:00.0000005Z",
+        )
+
+        self.assertEqual(mutable.reserve_reads, 1)
+        self.assertEqual(result.state_id, expected_state_id)
+        self.assertEqual(result.quote_received_quantity, Decimal("906.610893"))
+
+    def test_v2_quantity_adapter_rejects_wrong_pool_block_hash_and_fee_proof_bindings(self):
+        base = {
+            "chain": "eth",
+            "chain_id": 1,
+            "dex": "uniswap_v2",
+            "pool_address": "0x3333333333333333333333333333333333333333",
+            "token0_address": "0x1111111111111111111111111111111111111111",
+            "token1_address": "0x2222222222222222222222222222222222222222",
+            "token0_decimals": 18,
+            "token1_decimals": 6,
+            "reserve0_raw": 100 * 10**18,
+            "reserve1_raw": 10_000_000_000,
+            "reserve_timestamp_last_raw": 1_704_067_200,
+            "fee_bps": 30,
+            "fee_numerator": 9_970,
+            "fee_denominator": 10_000,
+            "fee_formula": (
+                "amount_in_with_fee=amount_in*fee_numerator;"
+                "denominator=reserve_in*fee_denominator+amount_in_with_fee"
+            ),
+            "fee_proof_sha256": "c" * 64,
+            "block_number": 123,
+            "block_hash": "0x" + "d" * 64,
+            "block_header_sha256": "e" * 64,
+            "observed_at": "2026-08-01T12:00:00Z",
+            "raw_response_sha256": "f" * 64,
+        }
+        expected = freeze_v2_pool_state(base).state_id
+        changes = (
+            ("pool_address", "0x4444444444444444444444444444444444444444"),
+            ("block_number", 124),
+            ("block_hash", "0x" + "1" * 64),
+            ("block_header_sha256", "2" * 64),
+            ("fee_proof_sha256", "3" * 64),
+        )
+        for field_name, value in changes:
+            with self.subTest(field_name=field_name):
+                with self.assertRaisesRegex(ValueError, "state binding"):
+                    route_quantity_quote_for_v2_pool(
+                        {**base, field_name: value},
+                        direction="sell",
+                        target_token_quantity=CommonTarget(
+                            asset="AAVE",
+                            unit_decimals=18,
+                            raw_quantity=10 * 10**18,
+                            lattice_raw=1,
+                        ),
+                        market_rules=MarketRules(
+                            market_id=(
+                                "dex:eth:uniswap_v2:"
+                                "0x3333333333333333333333333333333333333333:AAVE"
+                            ),
+                            base_asset="AAVE",
+                            quote_asset="USDC",
+                            base_unit_decimals=18,
+                            quote_unit_decimals=6,
+                            base_increment=Decimal("0.000000000000000001"),
+                            quote_increment=Decimal("0.000001"),
+                            min_base_quantity=Decimal("0"),
+                            min_quote_notional=Decimal("0"),
+                            observed_at="2026-08-01T12:00:00Z",
+                            valid_until="2026-08-01T12:05:00Z",
+                            source_record_sha256="a" * 64,
+                        ),
+                        target_token_address=(
+                            "0x1111111111111111111111111111111111111111"
+                        ),
+                        quote_token_address=(
+                            "0x2222222222222222222222222222222222222222"
+                        ),
+                        expected_state_id=expected,
+                        cohort_now="2026-08-01T12:02:00Z",
+                    )
+
     def test_filtered_collection_cannot_replace_published_inventory(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             ensure_full_publish_scope(True, {"AAVE"}, set())

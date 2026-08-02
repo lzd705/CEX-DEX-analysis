@@ -25,9 +25,25 @@ except ModuleNotFoundError:
 
 ROUTE_QUANTITY_CONTRACT_VERSION = "1"
 MAX_CEX_QUANTITY_STATE_AGE_SECONDS = Decimal("60")
+MAX_DEX_QUANTITY_STATE_AGE_SECONDS = Decimal("120")
+V2_FEE_FORMULA = (
+    "amount_in_with_fee=amount_in*fee_numerator;"
+    "denominator=reserve_in*fee_denominator+amount_in_with_fee"
+)
+EVM_CHAIN_ID_BY_NAME = {
+    "eth": 1,
+    "optimism": 10,
+    "bsc": 56,
+    "zksync": 324,
+    "base": 8453,
+    "arbitrum": 42161,
+}
 
 _ASSET = re.compile(r"[A-Z0-9][A-Z0-9._-]{0,63}\Z", flags=re.ASCII)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z", flags=re.ASCII)
+_EVM_ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z", flags=re.ASCII)
+_EVM_BLOCK_HASH = re.compile(r"0x[0-9a-f]{64}\Z", flags=re.ASCII)
+_DEX_COMPONENT = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z", flags=re.ASCII)
 _CEX_MARKET = re.compile(
     r"cex:([a-z0-9][a-z0-9._-]{0,63}):"
     r"([A-Z0-9][A-Z0-9._-]{0,63})/"
@@ -65,6 +81,13 @@ _UNAVAILABLE_REASONS = frozenset(
         "market_rules_not_current",
         "minimum_base_quantity_not_met",
         "minimum_notional_not_met",
+        "pool_output_below_one_raw",
+        "pool_reserve_insufficient",
+        "pool_state_not_current",
+        "pool_state_binding_mismatch",
+        "pool_state_market_mismatch",
+        "pool_state_token_address_mismatch",
+        "pool_state_token_decimals_mismatch",
         "source_quote_asset_mismatch",
         "target_asset_mismatch",
         "target_base_unit_misaligned",
@@ -72,6 +95,30 @@ _UNAVAILABLE_REASONS = frozenset(
         "third_asset_conversion_unavailable",
     }
 )
+
+
+def _evm_address(value: Any, field: str) -> str:
+    text = _required_text(value, field)
+    if (
+        _EVM_ADDRESS.fullmatch(text) is None
+        or text == "0x" + "0" * 40
+    ):
+        raise ValueError(
+            "{} must be a canonical nonzero EVM address".format(field)
+        )
+    return text
+
+
+def _block_hash(value: Any, field: str) -> str:
+    text = _required_text(value, field)
+    if (
+        _EVM_BLOCK_HASH.fullmatch(text) is None
+        or text == "0x" + "0" * 64
+    ):
+        raise ValueError(
+            "{} must be a canonical nonzero EVM block hash".format(field)
+        )
+    return text
 
 
 def _required_text(value: Any, field: str) -> str:
@@ -358,6 +405,160 @@ class MarketRules:
 
 
 @dataclass(frozen=True)
+class V2PoolState:
+    chain: str
+    chain_id: int
+    dex: str
+    pool_address: str
+    token0_address: str
+    token1_address: str
+    token0_decimals: int
+    token1_decimals: int
+    reserve0_raw: int
+    reserve1_raw: int
+    reserve_timestamp_last_raw: int
+    fee_bps: int
+    fee_numerator: int
+    fee_denominator: int
+    fee_formula: str
+    fee_proof_sha256: str
+    block_number: int
+    block_hash: str
+    block_header_sha256: str
+    observed_at: str
+    raw_response_sha256: str
+    state_id: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        chain = _required_text(self.chain, "chain").lower()
+        dex = _required_text(self.dex, "dex").lower()
+        if (
+            _DEX_COMPONENT.fullmatch(chain) is None
+            or _DEX_COMPONENT.fullmatch(dex) is None
+        ):
+            raise ValueError("chain and dex must be canonical")
+        chain_id = _integer(self.chain_id, "chain_id", minimum=1)
+        expected_chain_id = EVM_CHAIN_ID_BY_NAME.get(chain)
+        if expected_chain_id is None or chain_id != expected_chain_id:
+            raise ValueError("chain_id does not match the supported chain")
+        pool = _evm_address(self.pool_address, "pool_address")
+        token0 = _evm_address(self.token0_address, "token0_address")
+        token1 = _evm_address(self.token1_address, "token1_address")
+        if token0 == token1:
+            raise ValueError("V2 token addresses must differ")
+        decimals0 = _integer(self.token0_decimals, "token0_decimals")
+        decimals1 = _integer(self.token1_decimals, "token1_decimals")
+        if decimals0 > 255 or decimals1 > 255:
+            raise ValueError("V2 token decimals must be within [0, 255]")
+        reserve0 = _integer(self.reserve0_raw, "reserve0_raw", minimum=1)
+        reserve1 = _integer(self.reserve1_raw, "reserve1_raw", minimum=1)
+        if reserve0 >= 1 << 112 or reserve1 >= 1 << 112:
+            raise ValueError("reserve0_raw and reserve1_raw must fit uint112")
+        reserve_timestamp = _integer(
+            self.reserve_timestamp_last_raw,
+            "reserve_timestamp_last_raw",
+        )
+        if reserve_timestamp > (1 << 32) - 1:
+            raise ValueError("reserve_timestamp_last_raw must fit uint32")
+        fee_bps = _integer(self.fee_bps, "fee_bps")
+        if fee_bps >= 10_000:
+            raise ValueError("fee_bps must be below 10000")
+        fee_numerator = _integer(
+            self.fee_numerator,
+            "fee_numerator",
+            minimum=1,
+        )
+        fee_denominator = _integer(
+            self.fee_denominator,
+            "fee_denominator",
+            minimum=1,
+        )
+        if fee_numerator > fee_denominator:
+            raise ValueError("fee numerator must not exceed fee denominator")
+        if (
+            (fee_denominator - fee_numerator) * 10_000
+            != fee_bps * fee_denominator
+        ):
+            raise ValueError("fee fraction does not match fee_bps")
+        fee_formula = _required_text(self.fee_formula, "fee_formula")
+        if fee_formula != V2_FEE_FORMULA:
+            raise ValueError("fee_formula is unsupported")
+        fee_proof = _hash(self.fee_proof_sha256, "fee_proof_sha256")
+        block_number = _integer(self.block_number, "block_number", minimum=1)
+        block_hash = _block_hash(self.block_hash, "block_hash")
+        block_header = _hash(
+            self.block_header_sha256,
+            "block_header_sha256",
+        )
+        observed_at, _observed_epoch = _timestamp(
+            self.observed_at,
+            "observed_at",
+        )
+        raw_hash = _hash(self.raw_response_sha256, "raw_response_sha256")
+        object.__setattr__(self, "chain", chain)
+        object.__setattr__(self, "chain_id", chain_id)
+        object.__setattr__(self, "dex", dex)
+        object.__setattr__(self, "pool_address", pool)
+        object.__setattr__(self, "token0_address", token0)
+        object.__setattr__(self, "token1_address", token1)
+        object.__setattr__(self, "token0_decimals", decimals0)
+        object.__setattr__(self, "token1_decimals", decimals1)
+        object.__setattr__(self, "reserve0_raw", reserve0)
+        object.__setattr__(self, "reserve1_raw", reserve1)
+        object.__setattr__(
+            self,
+            "reserve_timestamp_last_raw",
+            reserve_timestamp,
+        )
+        object.__setattr__(self, "fee_bps", fee_bps)
+        object.__setattr__(self, "fee_numerator", fee_numerator)
+        object.__setattr__(self, "fee_denominator", fee_denominator)
+        object.__setattr__(self, "fee_formula", fee_formula)
+        object.__setattr__(self, "fee_proof_sha256", fee_proof)
+        object.__setattr__(self, "block_number", block_number)
+        object.__setattr__(self, "block_hash", block_hash)
+        object.__setattr__(self, "block_header_sha256", block_header)
+        object.__setattr__(self, "observed_at", observed_at)
+        object.__setattr__(self, "raw_response_sha256", raw_hash)
+        object.__setattr__(self, "state_id", v2_pool_state_id(self))
+
+
+def v2_pool_state_id(state: V2PoolState) -> str:
+    """Bind every frozen V2 state claim under an adapter-specific namespace."""
+    if not isinstance(state, V2PoolState):
+        raise ValueError("state must be V2PoolState")
+    _observed, observed_epoch = _timestamp(state.observed_at, "observed_at")
+    digest = _record_binding(
+        {
+            "contract": "dex_v2_quantity_state/v1",
+            "chain": state.chain,
+            "chain_id": state.chain_id,
+            "dex": state.dex,
+            "pool_address": state.pool_address,
+            "token0_address": state.token0_address,
+            "token1_address": state.token1_address,
+            "token0_decimals": state.token0_decimals,
+            "token1_decimals": state.token1_decimals,
+            "reserve0_raw": state.reserve0_raw,
+            "reserve1_raw": state.reserve1_raw,
+            "reserve_timestamp_last_raw": state.reserve_timestamp_last_raw,
+            "fee_bps": state.fee_bps,
+            "fee_numerator": state.fee_numerator,
+            "fee_denominator": state.fee_denominator,
+            "fee_formula": state.fee_formula,
+            "fee_proof_sha256": state.fee_proof_sha256,
+            "block_number": state.block_number,
+            "block_hash": state.block_hash,
+            "block_header_sha256": state.block_header_sha256,
+            "observed_at_epoch_numerator": observed_epoch.numerator,
+            "observed_at_epoch_denominator": observed_epoch.denominator,
+            "raw_response_sha256": state.raw_response_sha256,
+        }
+    )
+    return "dex-v2-quantity:" + digest
+
+
+@dataclass(frozen=True)
 class FeeSemantics:
     rate_bps: Decimal
     fee_asset: str
@@ -521,6 +722,8 @@ class QuantityQuote:
     calculation_complete: bool
     strict_eligible: bool
     target_base_asset: str
+    target_token_address: Optional[str]
+    quote_token_address: Optional[str]
     target_base_raw: int
     target_base_unit_decimals: int
     target_lattice_raw: int
@@ -544,8 +747,11 @@ class QuantityQuote:
     quote_received_quantity: Optional[Decimal]
     fee_debit_asset: Optional[str]
     fee_debit_quantity: Optional[Decimal]
+    fee_application: Optional[str]
     levels_or_ticks_consumed: int
     ending_price: Optional[Decimal]
+    ending_price_numerator: Optional[int]
+    ending_price_denominator: Optional[int]
     vwap_quote_per_base: Optional[Decimal]
     vwap_quote_numerator: Optional[int]
     vwap_quote_denominator: Optional[int]
@@ -641,6 +847,23 @@ def validate_quantity_quote(quote: QuantityQuote) -> QuantityQuote:
             raise ValueError("QuantityQuote target asset does not match Market")
     if target_asset == market_base and target_mismatch_is_explicit_unavailable:
         raise ValueError("target_asset_mismatch reason does not match target")
+    if (quote.target_token_address is None) != (
+        quote.quote_token_address is None
+    ):
+        raise ValueError("QuantityQuote token addresses must be paired")
+    if quote.target_token_address is not None:
+        target_token_address = _evm_address(
+            quote.target_token_address,
+            "target_token_address",
+        )
+        quote_token_address = _evm_address(
+            quote.quote_token_address,
+            "quote_token_address",
+        )
+        if target_token_address == quote_token_address:
+            raise ValueError("QuantityQuote token addresses must differ")
+    if cex_match is not None and quote.target_token_address is not None:
+        raise ValueError("CEX QuantityQuote cannot carry token addresses")
 
     status = _required_text(quote.status, "status")
     if status not in {"unavailable", "partial", "calculation_complete"}:
@@ -649,7 +872,10 @@ def validate_quantity_quote(quote: QuantityQuote) -> QuantityQuote:
     if status == "calculation_complete":
         if not quote.complete or not quote.calculation_complete:
             raise ValueError("calculation_complete flags are inconsistent")
-        if reason != "authenticated_upstream_unavailable":
+        if reason not in {
+            "authenticated_upstream_unavailable",
+            "fixed_block_fee_proof_not_authenticated",
+        }:
             raise ValueError("calculation_complete reason is inconsistent")
     elif status == "partial":
         if quote.complete or quote.calculation_complete:
@@ -744,11 +970,15 @@ def validate_quantity_quote(quote: QuantityQuote) -> QuantityQuote:
         quote.filled_gross_base_quantity,
         quote.gross_quote_quantity,
         quote.fee_debit_quantity,
-        quote.ending_price,
+        quote.fee_application,
+        quote.ending_price_numerator,
+        quote.ending_price_denominator,
     )
     if status == "unavailable":
         unavailable_calculation_fields = (
             quote.order_base_quantity,
+            quote.target_token_address,
+            quote.quote_token_address,
             quote.order_base_raw,
             quote.filled_gross_base_quantity,
             quote.filled_gross_base_raw,
@@ -766,7 +996,10 @@ def validate_quantity_quote(quote: QuantityQuote) -> QuantityQuote:
             quote.quote_received_quantity,
             quote.fee_debit_asset,
             quote.fee_debit_quantity,
+            quote.fee_application,
             quote.ending_price,
+            quote.ending_price_numerator,
+            quote.ending_price_denominator,
             quote.vwap_quote_per_base,
             quote.vwap_quote_numerator,
             quote.vwap_quote_denominator,
@@ -782,6 +1015,11 @@ def validate_quantity_quote(quote: QuantityQuote) -> QuantityQuote:
             or consumed < 1
         ):
             raise ValueError("calculated quote is missing required values")
+        if quote.state_id.startswith("dex-v2-quantity:") and (
+            quote.target_token_address is None
+            or quote.quote_token_address is None
+        ):
+            raise ValueError("DEX V2 QuantityQuote token addresses are missing")
         order_quantity = _fraction(quote.order_base_quantity)
         filled_quantity = _fraction(quote.filled_gross_base_quantity)
         gross_quote_quantity = _fraction(quote.gross_quote_quantity)
@@ -793,8 +1031,36 @@ def validate_quantity_quote(quote: QuantityQuote) -> QuantityQuote:
         if quote.fee_debit_asset is None:
             raise ValueError("calculated quote fee asset is missing")
         _asset(quote.fee_debit_asset, "fee_debit_asset")
+        fee_application = _required_text(
+            quote.fee_application,
+            "fee_application",
+        )
+        if fee_application not in {"additional_debit", "embedded_in_quote"}:
+            raise ValueError("fee_application is unsupported")
+        if cex_match is not None and fee_application != "additional_debit":
+            raise ValueError("CEX fee_application must be additional_debit")
+        if quote.state_id.startswith("dex-v2-quantity:") and (
+            fee_application != "embedded_in_quote" or fee_quantity != 0
+        ):
+            raise ValueError("DEX V2 fee_application must be embedded_in_quote")
         if quote.vwap_quote_numerator is None or quote.vwap_quote_denominator is None:
             raise ValueError("calculated quote exact VWAP is missing")
+        ending_numerator = _integer(
+            quote.ending_price_numerator,
+            "ending_price_numerator",
+            minimum=1,
+        )
+        ending_denominator = _integer(
+            quote.ending_price_denominator,
+            "ending_price_denominator",
+            minimum=1,
+        )
+        exact_ending_price = Fraction(ending_numerator, ending_denominator)
+        if (
+            quote.ending_price is not None
+            and _fraction(quote.ending_price) != exact_ending_price
+        ):
+            raise ValueError("Decimal ending price does not match exact ending price")
         numerator = _integer(
             quote.vwap_quote_numerator,
             "vwap_quote_numerator",
@@ -957,11 +1223,9 @@ def validate_quantity_quote(quote: QuantityQuote) -> QuantityQuote:
         quote.raw_response_sha256,
         quote.levels_binding_sha256,
     )
-    if any(collector_fields):
+    if cex_match is not None and any(collector_fields):
         if not all(collector_fields):
             raise ValueError("collector bindings must be complete")
-        if cex_match is None:
-            raise ValueError("cex-quantity collector bindings require a CEX Market")
         _required_text(quote.snapshot_id, "snapshot_id")
         _state_text, state_epoch = _timestamp(
             quote.state_observed_at,
@@ -987,6 +1251,47 @@ def validate_quantity_quote(quote: QuantityQuote) -> QuantityQuote:
             raise ValueError("book_state_not_current reason is inconsistent")
         if re.fullmatch(r"cex-quantity:[0-9a-f]{64}", quote.state_id) is None:
             raise ValueError("collector state_id must be a bound SHA-256")
+    elif dex_match is not None and (
+        quote.state_id.startswith("dex-v2-quantity:")
+        or any(collector_fields)
+    ):
+        if quote.snapshot_id:
+            raise ValueError("DEX V2 quantity quote has unexpected CEX bindings")
+        if not all(
+            (
+                quote.state_observed_at,
+                quote.cohort_now,
+                quote.raw_response_sha256,
+                quote.levels_binding_sha256,
+            )
+        ):
+            raise ValueError("DEX V2 state bindings must be complete")
+        _state_text, state_epoch = _timestamp(
+            quote.state_observed_at,
+            "state_observed_at",
+        )
+        _cohort_text, cohort_epoch = _timestamp(
+            quote.cohort_now,
+            "cohort_now",
+        )
+        state_age = cohort_epoch - state_epoch
+        state_is_current = (
+            Fraction(0)
+            <= state_age
+            <= _fraction(MAX_DEX_QUANTITY_STATE_AGE_SECONDS)
+        )
+        if status != "unavailable" and not state_is_current:
+            raise ValueError("calculated DEX V2 state is not current")
+        if (
+            status == "unavailable"
+            and reason == "pool_state_not_current"
+            and state_is_current
+        ):
+            raise ValueError("pool_state_not_current reason is inconsistent")
+        _hash(quote.raw_response_sha256, "raw_response_sha256")
+        _hash(quote.levels_binding_sha256, "levels_binding_sha256")
+        if re.fullmatch(r"dex-v2-quantity:[0-9a-f]{64}", quote.state_id) is None:
+            raise ValueError("DEX V2 state_id must be a bound SHA-256")
     else:
         _required_text(quote.state_id, "state_id")
     return quote
@@ -1072,6 +1377,8 @@ def _unavailable_quote(
         calculation_complete=False,
         strict_eligible=False,
         target_base_asset=target.asset,
+        target_token_address=None,
+        quote_token_address=None,
         target_base_raw=target.raw_quantity,
         target_base_unit_decimals=target.unit_decimals,
         target_lattice_raw=target.lattice_raw,
@@ -1095,8 +1402,11 @@ def _unavailable_quote(
         quote_received_quantity=None,
         fee_debit_asset=None,
         fee_debit_quantity=None,
+        fee_application=None,
         levels_or_ticks_consumed=0,
         ending_price=None,
+        ending_price_numerator=None,
+        ending_price_denominator=None,
         vwap_quote_per_base=None,
         vwap_quote_numerator=None,
         vwap_quote_denominator=None,
@@ -1542,6 +1852,8 @@ def quote_cex_book_quantity(
         calculation_complete=(status == "calculation_complete"),
         strict_eligible=False,
         target_base_asset=target_token_quantity.asset,
+        target_token_address=None,
+        quote_token_address=None,
         target_base_raw=target_token_quantity.raw_quantity,
         target_base_unit_decimals=target_token_quantity.unit_decimals,
         target_lattice_raw=target_token_quantity.lattice_raw,
@@ -1605,8 +1917,15 @@ def quote_cex_book_quantity(
         quote_received_quantity=quote_received_decimal,
         fee_debit_asset=fee_asset,
         fee_debit_quantity=fee_decimal,
+        fee_application="additional_debit",
         levels_or_ticks_consumed=consumed,
         ending_price=ending,
+        ending_price_numerator=(
+            _fraction(ending).numerator if ending is not None else None
+        ),
+        ending_price_denominator=(
+            _fraction(ending).denominator if ending is not None else None
+        ),
         vwap_quote_per_base=vwap,
         vwap_quote_numerator=(
             vwap_fraction.numerator if vwap_fraction is not None else None
@@ -1629,3 +1948,341 @@ def quote_cex_book_quantity(
             fee_semantics
         ),
     )
+
+
+def _v2_fee_binding_sha256(state: V2PoolState) -> str:
+    return _record_binding(
+        {
+            "contract": "dex_v2_pool_fee/v1",
+            "chain": state.chain,
+            "dex": state.dex,
+            "pool_address": state.pool_address,
+            "fee_bps": state.fee_bps,
+            "fee_numerator": state.fee_numerator,
+            "fee_denominator": state.fee_denominator,
+            "fee_formula": state.fee_formula,
+            "fee_proof_sha256": state.fee_proof_sha256,
+            "block_number": state.block_number,
+            "block_hash": state.block_hash,
+        }
+    )
+
+
+def _v2_unavailable_quote(
+    *,
+    state: V2PoolState,
+    target: CommonTarget,
+    rules: MarketRules,
+    direction: str,
+    reason_code: str,
+    cohort_now: str,
+) -> QuantityQuote:
+    state_id = state.state_id
+    binding = state_id.split(":", 1)[1]
+    return QuantityQuote(
+        contract_version=ROUTE_QUANTITY_CONTRACT_VERSION,
+        market_id=rules.market_id,
+        direction=direction,
+        status="unavailable",
+        reason_code=reason_code,
+        complete=False,
+        calculation_complete=False,
+        strict_eligible=False,
+        target_base_asset=target.asset,
+        target_token_address=None,
+        quote_token_address=None,
+        target_base_raw=target.raw_quantity,
+        target_base_unit_decimals=target.unit_decimals,
+        target_lattice_raw=target.lattice_raw,
+        target_base_quantity=target.quantity,
+        market_base_unit_decimals=rules.base_unit_decimals,
+        order_base_quantity=None,
+        order_base_raw=None,
+        filled_gross_base_quantity=None,
+        filled_gross_base_raw=None,
+        gross_base_received_quantity=None,
+        gross_base_received_raw=None,
+        net_base_received_quantity=None,
+        net_base_received_raw=None,
+        base_debit_quantity=None,
+        base_debit_raw=None,
+        gross_quote_quantity=None,
+        net_quote_quantity=None,
+        quote_debit_asset=None,
+        quote_debit_quantity=None,
+        quote_received_asset=None,
+        quote_received_quantity=None,
+        fee_debit_asset=None,
+        fee_debit_quantity=None,
+        fee_application=None,
+        levels_or_ticks_consumed=0,
+        ending_price=None,
+        ending_price_numerator=None,
+        ending_price_denominator=None,
+        vwap_quote_per_base=None,
+        vwap_quote_numerator=None,
+        vwap_quote_denominator=None,
+        state_id=state_id,
+        snapshot_id="",
+        state_observed_at=state.observed_at,
+        cohort_now=cohort_now,
+        raw_response_sha256=state.raw_response_sha256,
+        levels_binding_sha256=binding,
+        market_rules_sha256=rules.source_record_sha256,
+        fee_source_sha256=state.fee_proof_sha256,
+        market_rules_binding_sha256=market_rules_record_binding_sha256(rules),
+        fee_binding_sha256=_v2_fee_binding_sha256(state),
+    )
+
+
+def quote_v2_pool_quantity(
+    pool_state: V2PoolState,
+    target_token_quantity: CommonTarget,
+    market_rules: MarketRules,
+    *,
+    direction: str,
+    target_token_address: str,
+    quote_token_address: str,
+    cohort_now: str,
+) -> QuantityQuote:
+    """Quote one net base target against one immutable V2 pool state."""
+    if not isinstance(pool_state, V2PoolState):
+        raise ValueError("pool_state must be V2PoolState")
+    if not isinstance(target_token_quantity, CommonTarget):
+        raise ValueError("target_token_quantity must be a CommonTarget")
+    if not isinstance(market_rules, MarketRules):
+        raise ValueError("market_rules must be MarketRules")
+    direction_text = _required_text(direction, "direction")
+    if direction_text not in {"buy", "sell"}:
+        raise ValueError("direction must be buy or sell")
+    target_address = _evm_address(
+        target_token_address,
+        "target_token_address",
+    )
+    quote_address = _evm_address(
+        quote_token_address,
+        "quote_token_address",
+    )
+    cohort_text, cohort_epoch = _timestamp(cohort_now, "cohort_now")
+
+    def unavailable(reason_code: str) -> QuantityQuote:
+        return _v2_unavailable_quote(
+            state=pool_state,
+            target=target_token_quantity,
+            rules=market_rules,
+            direction=direction_text,
+            reason_code=reason_code,
+            cohort_now=cohort_text,
+        )
+
+    if pool_state.state_id != v2_pool_state_id(pool_state):
+        return unavailable("pool_state_binding_mismatch")
+    _state_text, state_epoch = _timestamp(
+        pool_state.observed_at,
+        "state_observed_at",
+    )
+    state_age = cohort_epoch - state_epoch
+    if (
+        state_age < 0
+        or state_age > _fraction(MAX_DEX_QUANTITY_STATE_AGE_SECONDS)
+    ):
+        return unavailable("pool_state_not_current")
+    if (
+        market_rules.record_binding_sha256
+        != market_rules_record_binding_sha256(market_rules)
+    ):
+        return unavailable("market_rules_binding_mismatch")
+    if not _record_is_current(
+        observed_at=market_rules.observed_at,
+        valid_until=market_rules.valid_until,
+        cohort_epoch=cohort_epoch,
+    ):
+        return unavailable("market_rules_not_current")
+    market_match = _DEX_MARKET.fullmatch(market_rules.market_id)
+    if market_match is None:
+        raise ValueError("V2 quantity quotes require DEX MarketRules")
+    market_chain, market_dex, market_pool, _market_asset = market_match.groups()
+    if (
+        market_chain != pool_state.chain
+        or market_dex != pool_state.dex
+        or market_pool != pool_state.pool_address
+    ):
+        return unavailable("pool_state_market_mismatch")
+    if target_token_quantity.asset != market_rules.base_asset:
+        return unavailable("target_asset_mismatch")
+    if target_address == quote_address:
+        return unavailable("pool_state_token_address_mismatch")
+    if (target_address, quote_address) == (
+        pool_state.token0_address,
+        pool_state.token1_address,
+    ):
+        target_index = 0
+    elif (target_address, quote_address) == (
+        pool_state.token1_address,
+        pool_state.token0_address,
+    ):
+        target_index = 1
+    else:
+        return unavailable("pool_state_token_address_mismatch")
+
+    target_decimals = (
+        pool_state.token0_decimals
+        if target_index == 0
+        else pool_state.token1_decimals
+    )
+    quote_decimals = (
+        pool_state.token1_decimals
+        if target_index == 0
+        else pool_state.token0_decimals
+    )
+    if (
+        market_rules.base_unit_decimals != target_decimals
+        or market_rules.quote_unit_decimals != quote_decimals
+    ):
+        return unavailable("pool_state_token_decimals_mismatch")
+    target_fraction = _fraction(target_token_quantity.quantity)
+    target_raw_fraction = target_fraction * (10**target_decimals)
+    if target_raw_fraction.denominator != 1:
+        return unavailable("target_base_unit_misaligned")
+    target_raw = target_raw_fraction.numerator
+    if target_raw % market_rules.base_increment_raw:
+        return unavailable("target_lot_misaligned")
+    if target_fraction < _fraction(market_rules.min_base_quantity):
+        return unavailable("minimum_base_quantity_not_met")
+
+    if target_index == 0:
+        reserve_base = pool_state.reserve0_raw
+        reserve_quote = pool_state.reserve1_raw
+    else:
+        reserve_base = pool_state.reserve1_raw
+        reserve_quote = pool_state.reserve0_raw
+    fee_numerator = pool_state.fee_numerator
+    fee_denominator = pool_state.fee_denominator
+    if direction_text == "sell":
+        amount_with_fee = target_raw * fee_numerator
+        quote_raw = (
+            amount_with_fee
+            * reserve_quote
+            // (reserve_base * fee_denominator + amount_with_fee)
+        )
+        if quote_raw <= 0:
+            return unavailable("pool_output_below_one_raw")
+        new_base = reserve_base + target_raw
+        new_quote = reserve_quote - quote_raw
+    else:
+        if target_raw >= reserve_base:
+            return unavailable("pool_reserve_insufficient")
+        quote_raw = (
+            reserve_quote * target_raw * fee_denominator
+            // ((reserve_base - target_raw) * fee_numerator)
+            + 1
+        )
+        new_base = reserve_base - target_raw
+        new_quote = reserve_quote + quote_raw
+
+    quote_fraction = Fraction(quote_raw, 10**quote_decimals)
+    if quote_fraction < _fraction(market_rules.min_quote_notional):
+        return unavailable("minimum_notional_not_met")
+    ending_fraction = Fraction(
+        new_quote * (10**target_decimals),
+        new_base * (10**quote_decimals),
+    )
+    vwap_fraction = quote_fraction / target_fraction
+    target_decimal = _fraction_decimal(target_fraction, "target base quantity")
+    quote_decimal = _fraction_decimal(quote_fraction, "gross quote quantity")
+    ending_decimal = _optional_finite_ratio(ending_fraction, Fraction(1))
+    vwap_decimal = _optional_finite_ratio(quote_fraction, target_fraction)
+    state_binding = pool_state.state_id.split(":", 1)[1]
+    buy = direction_text == "buy"
+    return QuantityQuote(
+        contract_version=ROUTE_QUANTITY_CONTRACT_VERSION,
+        market_id=market_rules.market_id,
+        direction=direction_text,
+        status="calculation_complete",
+        reason_code="fixed_block_fee_proof_not_authenticated",
+        complete=True,
+        calculation_complete=True,
+        strict_eligible=False,
+        target_base_asset=target_token_quantity.asset,
+        target_token_address=target_address,
+        quote_token_address=quote_address,
+        target_base_raw=target_token_quantity.raw_quantity,
+        target_base_unit_decimals=target_token_quantity.unit_decimals,
+        target_lattice_raw=target_token_quantity.lattice_raw,
+        target_base_quantity=target_token_quantity.quantity,
+        market_base_unit_decimals=market_rules.base_unit_decimals,
+        order_base_quantity=target_decimal,
+        order_base_raw=target_raw,
+        filled_gross_base_quantity=target_decimal,
+        filled_gross_base_raw=target_raw,
+        gross_base_received_quantity=target_decimal if buy else None,
+        gross_base_received_raw=target_raw if buy else None,
+        net_base_received_quantity=target_decimal if buy else None,
+        net_base_received_raw=target_raw if buy else None,
+        base_debit_quantity=None if buy else target_decimal,
+        base_debit_raw=None if buy else target_raw,
+        gross_quote_quantity=quote_decimal,
+        net_quote_quantity=quote_decimal,
+        quote_debit_asset=market_rules.quote_asset if buy else None,
+        quote_debit_quantity=quote_decimal if buy else None,
+        quote_received_asset=None if buy else market_rules.quote_asset,
+        quote_received_quantity=None if buy else quote_decimal,
+        fee_debit_asset=(
+            market_rules.quote_asset if buy else market_rules.base_asset
+        ),
+        fee_debit_quantity=Decimal(0),
+        fee_application="embedded_in_quote",
+        levels_or_ticks_consumed=1,
+        ending_price=ending_decimal,
+        ending_price_numerator=ending_fraction.numerator,
+        ending_price_denominator=ending_fraction.denominator,
+        vwap_quote_per_base=vwap_decimal,
+        vwap_quote_numerator=vwap_fraction.numerator,
+        vwap_quote_denominator=vwap_fraction.denominator,
+        state_id=pool_state.state_id,
+        snapshot_id="",
+        state_observed_at=pool_state.observed_at,
+        cohort_now=cohort_text,
+        raw_response_sha256=pool_state.raw_response_sha256,
+        levels_binding_sha256=state_binding,
+        market_rules_sha256=market_rules.source_record_sha256,
+        fee_source_sha256=pool_state.fee_proof_sha256,
+        market_rules_binding_sha256=market_rules_record_binding_sha256(
+            market_rules
+        ),
+        fee_binding_sha256=_v2_fee_binding_sha256(pool_state),
+    )
+
+
+def validate_v2_quantity_quote_against_state(
+    quote: QuantityQuote,
+    pool_state: V2PoolState,
+    target_token_quantity: CommonTarget,
+    market_rules: MarketRules,
+    *,
+    direction: str,
+    target_token_address: str,
+    quote_token_address: str,
+    cohort_now: str,
+) -> QuantityQuote:
+    """Recompute a V2 quote from frozen evidence and reject any mutation.
+
+    ``validate_quantity_quote`` checks the self-contained structural contract.
+    It cannot authenticate reserve math because ``QuantityQuote`` deliberately
+    does not duplicate the complete pool state.  Every evidence-consuming
+    boundary must therefore call this validator with the frozen state.
+    """
+    if not isinstance(quote, QuantityQuote):
+        raise ValueError("quote must be QuantityQuote")
+    expected = quote_v2_pool_quantity(
+        pool_state,
+        target_token_quantity,
+        market_rules,
+        direction=direction,
+        target_token_address=target_token_address,
+        quote_token_address=quote_token_address,
+        cohort_now=cohort_now,
+    )
+    if quote != expected:
+        raise ValueError("V2 quote evidence does not reproduce the quote")
+    return quote

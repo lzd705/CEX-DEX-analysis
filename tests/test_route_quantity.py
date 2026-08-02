@@ -9,6 +9,7 @@ from dataclasses import replace
 from decimal import Decimal, localcontext
 
 import scripts.route_quantity as route_quantity_module
+from scripts.dex_route_costs import CHAIN_ID_BY_NAME
 from scripts.fetch_cex_depth import (
     cex_quantity_state_id,
     execution_rows_for_book,
@@ -19,8 +20,11 @@ from scripts.route_quantity import (
     FeeSemantics,
     MarketRules,
     QuantityQuote,
+    V2PoolState,
     common_net_target_quantity,
     quote_cex_book_quantity,
+    quote_v2_pool_quantity,
+    validate_v2_quantity_quote_against_state,
 )
 
 
@@ -28,6 +32,9 @@ HASH = "a" * 64
 OTHER_HASH = "b" * 64
 OBSERVED_AT = "2026-08-01T12:00:00Z"
 VALID_UNTIL = "2026-08-01T12:05:00Z"
+POOL = "0x3333333333333333333333333333333333333333"
+TOKEN0 = "0x1111111111111111111111111111111111111111"
+TOKEN1 = "0x2222222222222222222222222222222222222222"
 
 
 def rules(**overrides):
@@ -74,6 +81,65 @@ def target(quantity="1", *, decimals=2, lattice_raw=1):
         unit_decimals=decimals,
         raw_quantity=raw,
         lattice_raw=lattice_raw,
+    )
+
+
+def dex_rules(**overrides):
+    values = {
+        "market_id": f"dex:eth:uniswap_v2:{POOL}:AAVE",
+        "base_asset": "AAVE",
+        "quote_asset": "USDC",
+        "base_unit_decimals": 18,
+        "quote_unit_decimals": 6,
+        "base_increment": Decimal("0.000000000000000001"),
+        "quote_increment": Decimal("0.000001"),
+        "min_base_quantity": Decimal("0"),
+        "min_quote_notional": Decimal("0"),
+        "observed_at": OBSERVED_AT,
+        "valid_until": VALID_UNTIL,
+        "source_record_sha256": HASH,
+    }
+    values.update(overrides)
+    return MarketRules(**values)
+
+
+def v2_state(**overrides):
+    values = {
+        "chain": "eth",
+        "chain_id": 1,
+        "dex": "uniswap_v2",
+        "pool_address": POOL,
+        "token0_address": TOKEN0,
+        "token1_address": TOKEN1,
+        "token0_decimals": 18,
+        "token1_decimals": 6,
+        "reserve0_raw": 100 * 10**18,
+        "reserve1_raw": 10_000_000_000,
+        "reserve_timestamp_last_raw": 1_704_067_200,
+        "fee_bps": 30,
+        "fee_numerator": 9_970,
+        "fee_denominator": 10_000,
+        "fee_formula": (
+            "amount_in_with_fee=amount_in*fee_numerator;"
+            "denominator=reserve_in*fee_denominator+amount_in_with_fee"
+        ),
+        "fee_proof_sha256": "c" * 64,
+        "block_number": 123,
+        "block_hash": "0x" + "d" * 64,
+        "block_header_sha256": "e" * 64,
+        "observed_at": "2026-08-01T12:00:00.0000005Z",
+        "raw_response_sha256": "f" * 64,
+    }
+    values.update(overrides)
+    return V2PoolState(**values)
+
+
+def dex_target(raw=10 * 10**18, *, decimals=18):
+    return CommonTarget(
+        asset="AAVE",
+        unit_decimals=decimals,
+        raw_quantity=raw,
+        lattice_raw=1,
     )
 
 
@@ -240,6 +306,9 @@ class CexQuantityQuoteTests(unittest.TestCase):
         self.assertEqual(buy.net_base_received_raw, 100)
         self.assertEqual(buy.gross_quote_quantity, Decimal("101.6"))
         self.assertEqual(buy.quote_debit_quantity, Decimal("101.6"))
+        self.assertEqual(buy.fee_application, "additional_debit")
+        self.assertIsNone(buy.target_token_address)
+        self.assertIsNone(buy.quote_token_address)
         self.assertEqual(buy.levels_or_ticks_consumed, 2)
         self.assertEqual(buy.ending_price, Decimal("102"))
 
@@ -249,6 +318,7 @@ class CexQuantityQuoteTests(unittest.TestCase):
         self.assertEqual(sell.base_debit_raw, 100)
         self.assertEqual(sell.gross_quote_quantity, Decimal("99.7"))
         self.assertEqual(sell.quote_received_quantity, Decimal("99.7"))
+        self.assertEqual(sell.fee_application, "additional_debit")
         self.assertEqual(sell.levels_or_ticks_consumed, 2)
 
     def test_partial_book_retains_observed_fill_but_is_not_strict(self):
@@ -1396,6 +1466,457 @@ class CexQuantityQuoteTests(unittest.TestCase):
         self.assertEqual(result.reason_code, "target_asset_mismatch")
         self.assertEqual(result.state_id, expected_state_id)
         self.assertRegex(result.raw_response_sha256, r"^[0-9a-f]{64}$")
+
+
+class V2PoolQuantityQuoteTests(unittest.TestCase):
+    def quote(
+        self,
+        *,
+        direction,
+        state=None,
+        current_target=None,
+        current_rules=None,
+        target_address=TOKEN0,
+        quote_address=TOKEN1,
+        cohort_now="2026-08-01T12:02:00.0000005Z",
+    ):
+        return quote_v2_pool_quantity(
+            state or v2_state(),
+            current_target or dex_target(),
+            current_rules or dex_rules(),
+            direction=direction,
+            target_token_address=target_address,
+            quote_token_address=quote_address,
+            cohort_now=cohort_now,
+        )
+
+    def test_known_answers_sell_exact_input_and_buy_exact_output(self):
+        sell = self.quote(direction="sell")
+        buy = self.quote(direction="buy")
+
+        self.assertEqual(sell.status, "calculation_complete")
+        self.assertEqual(sell.reason_code, "fixed_block_fee_proof_not_authenticated")
+        self.assertFalse(sell.strict_eligible)
+        self.assertEqual(sell.base_debit_quantity, Decimal("10"))
+        self.assertEqual(sell.base_debit_raw, 10 * 10**18)
+        self.assertEqual(sell.gross_quote_quantity, Decimal("906.610893"))
+        self.assertEqual(sell.quote_received_asset, "USDC")
+        self.assertEqual(sell.quote_received_quantity, Decimal("906.610893"))
+        self.assertEqual(sell.fee_debit_asset, "AAVE")
+        self.assertEqual(sell.fee_debit_quantity, Decimal("0"))
+        self.assertEqual(sell.fee_application, "embedded_in_quote")
+        self.assertEqual(sell.vwap_quote_per_base, Decimal("90.6610893"))
+        self.assertEqual(sell.ending_price, Decimal("82.6671737"))
+        self.assertEqual(
+            (sell.ending_price_numerator, sell.ending_price_denominator),
+            (826_671_737, 10_000_000),
+        )
+
+        self.assertEqual(buy.status, "calculation_complete")
+        self.assertEqual(buy.gross_base_received_quantity, Decimal("10"))
+        self.assertEqual(buy.net_base_received_quantity, Decimal("10"))
+        self.assertEqual(buy.quote_debit_asset, "USDC")
+        self.assertEqual(buy.quote_debit_quantity, Decimal("1114.454475"))
+        self.assertEqual(buy.gross_quote_quantity, Decimal("1114.454475"))
+        self.assertEqual(buy.fee_debit_asset, "USDC")
+        self.assertEqual(buy.fee_debit_quantity, Decimal("0"))
+        self.assertEqual(buy.fee_application, "embedded_in_quote")
+        self.assertEqual(buy.vwap_quote_per_base, Decimal("111.4454475"))
+        self.assertIsNone(buy.ending_price)
+        self.assertEqual(
+            (buy.ending_price_numerator, buy.ending_price_denominator),
+            (444_578_179, 3_600_000),
+        )
+
+        for result in (sell, buy):
+            self.assertEqual(result.levels_or_ticks_consumed, 1)
+            self.assertEqual(result.target_token_address, TOKEN0)
+            self.assertEqual(result.quote_token_address, TOKEN1)
+            self.assertTrue(result.state_id.startswith("dex-v2-quantity:"))
+            self.assertEqual(result.raw_response_sha256, "f" * 64)
+            self.assertEqual(result.levels_binding_sha256, result.state_id.split(":", 1)[1])
+
+    def test_token1_direction_uses_addresses_not_symbols(self):
+        state = v2_state(
+            token0_address=TOKEN1,
+            token1_address=TOKEN0,
+            token0_decimals=6,
+            token1_decimals=18,
+            reserve0_raw=10_000_000_000,
+            reserve1_raw=100 * 10**18,
+        )
+        sell = self.quote(
+            direction="sell",
+            state=state,
+            target_address=TOKEN0,
+            quote_address=TOKEN1,
+        )
+        buy = self.quote(
+            direction="buy",
+            state=state,
+            target_address=TOKEN0,
+            quote_address=TOKEN1,
+        )
+
+        self.assertEqual(sell.quote_received_quantity, Decimal("906.610893"))
+        self.assertEqual(buy.quote_debit_quantity, Decimal("1114.454475"))
+        self.assertEqual(sell.fee_debit_asset, "AAVE")
+        self.assertEqual(buy.fee_debit_asset, "USDC")
+
+    def test_one_raw_target_is_quoted_with_integer_math(self):
+        state = v2_state(
+            token1_decimals=18,
+            reserve0_raw=10**18,
+            reserve1_raw=10**24,
+        )
+        current_rules = dex_rules(
+            quote_unit_decimals=18,
+            quote_increment=Decimal("0.000000000000000001"),
+        )
+        one_raw = dex_target(raw=1)
+
+        sell = self.quote(
+            direction="sell",
+            state=state,
+            current_target=one_raw,
+            current_rules=current_rules,
+        )
+        buy = self.quote(
+            direction="buy",
+            state=state,
+            current_target=one_raw,
+            current_rules=current_rules,
+        )
+
+        self.assertEqual(sell.base_debit_raw, 1)
+        self.assertEqual(sell.quote_received_quantity, Decimal("0.000000000000996999"))
+        self.assertEqual(buy.net_base_received_raw, 1)
+        self.assertEqual(buy.quote_debit_quantity, Decimal("0.000000000001003010"))
+
+        zero_output = self.quote(
+            direction="sell",
+            current_target=dex_target(raw=1),
+        )
+        self.assertEqual(zero_output.status, "unavailable")
+        self.assertEqual(zero_output.reason_code, "pool_output_below_one_raw")
+        self.assertIsNone(zero_output.quote_received_quantity)
+        self.assertIsNone(zero_output.fee_application)
+
+    def test_insufficient_reserve_is_controlled_unavailable_without_residue(self):
+        result = self.quote(
+            direction="buy",
+            current_target=dex_target(raw=100 * 10**18),
+        )
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.reason_code, "pool_reserve_insufficient")
+        self.assertFalse(result.calculation_complete)
+        self.assertFalse(result.strict_eligible)
+        for field_name in (
+            "order_base_quantity",
+            "filled_gross_base_quantity",
+            "gross_base_received_quantity",
+            "net_base_received_quantity",
+            "base_debit_quantity",
+            "gross_quote_quantity",
+            "net_quote_quantity",
+            "quote_debit_asset",
+            "quote_debit_quantity",
+            "quote_received_asset",
+            "quote_received_quantity",
+            "fee_debit_asset",
+            "fee_debit_quantity",
+            "fee_application",
+            "target_token_address",
+            "quote_token_address",
+            "ending_price",
+            "ending_price_numerator",
+            "ending_price_denominator",
+            "vwap_quote_per_base",
+        ):
+            self.assertIsNone(getattr(result, field_name), field_name)
+        self.assertEqual(result.levels_or_ticks_consumed, 0)
+
+    def test_identity_mismatches_fail_closed_with_controlled_reasons(self):
+        cases = (
+            (
+                {"target_address": "0x" + "9" * 40},
+                "pool_state_token_address_mismatch",
+            ),
+            (
+                {
+                    "current_rules": dex_rules(
+                        base_unit_decimals=17,
+                        base_increment=Decimal("0.00000000000000001"),
+                    )
+                },
+                "pool_state_token_decimals_mismatch",
+            ),
+            (
+                {
+                    "current_rules": dex_rules(
+                        market_id=f"dex:eth:sushiswap:{POOL}:AAVE"
+                    )
+                },
+                "pool_state_market_mismatch",
+            ),
+            (
+                {
+                    "current_rules": dex_rules(
+                        market_id=(
+                            "dex:eth:uniswap_v2:"
+                            "0x4444444444444444444444444444444444444444:AAVE"
+                        )
+                    )
+                },
+                "pool_state_market_mismatch",
+            ),
+        )
+        for kwargs, reason in cases:
+            with self.subTest(reason=reason):
+                result = self.quote(direction="sell", **kwargs)
+                self.assertEqual(result.status, "unavailable")
+                self.assertEqual(result.reason_code, reason)
+                self.assertIsNone(result.gross_quote_quantity)
+
+    def test_v2_adapter_rejects_a_cex_market_contract_without_assertions(self):
+        with self.assertRaisesRegex(ValueError, "DEX MarketRules"):
+            self.quote(direction="sell", current_rules=rules())
+
+    def test_pool_state_rejects_malformed_block_hash_and_fee_proof(self):
+        cases = (
+            ({"block_number": 0}, "block_number"),
+            ({"block_hash": "0x1234"}, "block_hash"),
+            ({"block_header_sha256": "bad"}, "block_header"),
+            ({"fee_proof_sha256": "bad"}, "fee_proof"),
+            ({"fee_formula": "different-formula/v1"}, "fee_formula"),
+            ({"raw_response_sha256": "bad"}, "raw_response"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    v2_state(**overrides)
+
+    def test_pool_state_rejects_noncanonical_or_zero_evm_identities(self):
+        cases = (
+            ({"pool_address": "0x" + "A" * 40}, "pool_address"),
+            ({"token0_address": "0x" + "B" * 40}, "token0_address"),
+            ({"token1_address": "0x" + "0" * 40}, "token1_address"),
+            ({"pool_address": "0x" + "0" * 40}, "pool_address"),
+            ({"block_hash": "0x" + "D" * 64}, "block_hash"),
+            ({"block_hash": "0x" + "0" * 64}, "block_hash"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    v2_state(**overrides)
+
+    def test_pool_state_binds_supported_chain_name_to_chain_id(self):
+        self.assertEqual(
+            route_quantity_module.EVM_CHAIN_ID_BY_NAME,
+            CHAIN_ID_BY_NAME,
+        )
+        with self.assertRaisesRegex(ValueError, "chain_id"):
+            v2_state(chain_id=8453)
+        self.assertEqual(
+            v2_state(chain="base", chain_id=8453).chain_id,
+            8453,
+        )
+
+    def test_pool_state_reserves_must_fit_the_v2_uint112_abi(self):
+        for field_name in ("reserve0_raw", "reserve1_raw"):
+            with self.subTest(field_name=field_name):
+                self.assertEqual(
+                    getattr(v2_state(**{field_name: (1 << 112) - 1}), field_name),
+                    (1 << 112) - 1,
+                )
+                with self.assertRaisesRegex(ValueError, field_name):
+                    v2_state(**{field_name: 1 << 112})
+
+    def test_state_id_binds_exact_submicrosecond_time_and_all_evidence(self):
+        fresh = v2_state(observed_at="2026-08-01T12:00:00.0000005Z")
+        stale = v2_state(observed_at="2026-08-01T12:00:00.0000004Z")
+        equivalent = v2_state(observed_at="2026-08-01T12:00:00.0000005000Z")
+
+        self.assertNotEqual(fresh.state_id, stale.state_id)
+        self.assertEqual(fresh.state_id, equivalent.state_id)
+        for field_name, replacement in (
+            ("chain", "base"),
+            ("reserve_timestamp_last_raw", 1_704_067_201),
+            ("block_number", 124),
+            ("block_hash", "0x" + "1" * 64),
+            ("block_header_sha256", "2" * 64),
+            ("fee_proof_sha256", "3" * 64),
+            ("raw_response_sha256", "4" * 64),
+        ):
+            with self.subTest(field_name=field_name):
+                self.assertNotEqual(
+                    fresh.state_id,
+                    v2_state(
+                        **(
+                            {"chain": replacement, "chain_id": 8453}
+                            if field_name == "chain"
+                            else {field_name: replacement}
+                        )
+                    ).state_id,
+                )
+        self.assertNotEqual(
+            fresh.state_id,
+            v2_state(fee_bps=25, fee_numerator=9_975).state_id,
+        )
+        self.assertNotEqual(
+            fresh.state_id,
+            v2_state(fee_numerator=19_940, fee_denominator=20_000).state_id,
+        )
+
+    def test_pool_age_uses_exact_120_second_boundary(self):
+        boundary = self.quote(
+            direction="sell",
+            cohort_now="2026-08-01T12:02:00.0000005Z",
+        )
+        stale = self.quote(
+            direction="sell",
+            cohort_now="2026-08-01T12:02:00.0000006Z",
+        )
+        future = self.quote(
+            direction="sell",
+            cohort_now="2026-08-01T11:59:59Z",
+        )
+
+        self.assertEqual(boundary.status, "calculation_complete")
+        for result in (stale, future):
+            self.assertEqual(result.status, "unavailable")
+            self.assertEqual(result.reason_code, "pool_state_not_current")
+            self.assertIsNone(result.gross_quote_quantity)
+
+    def test_v2_market_rules_window_is_observed_inclusive_and_expiry_exclusive(self):
+        at_observed = self.quote(
+            direction="sell",
+            state=v2_state(observed_at="2026-08-01T12:02:00Z"),
+            current_rules=dex_rules(
+                observed_at="2026-08-01T12:02:00Z",
+                valid_until="2026-08-01T12:03:00Z",
+            ),
+            cohort_now="2026-08-01T12:02:00Z",
+        )
+        before_expiry = self.quote(
+            direction="sell",
+            current_rules=dex_rules(
+                observed_at="2026-08-01T12:00:00Z",
+                valid_until="2026-08-01T12:02:00.0000006Z",
+            ),
+            cohort_now="2026-08-01T12:02:00.0000005Z",
+        )
+        expired = self.quote(
+            direction="sell",
+            current_rules=dex_rules(
+                observed_at="2026-08-01T11:00:00Z",
+                valid_until="2026-08-01T12:01:00Z",
+            ),
+        )
+        at_expiry = self.quote(
+            direction="sell",
+            current_rules=dex_rules(
+                observed_at="2026-08-01T12:00:00Z",
+                valid_until="2026-08-01T12:02:00.0000005Z",
+            ),
+        )
+        future = self.quote(
+            direction="sell",
+            current_rules=dex_rules(
+                observed_at="2026-08-01T12:03:00Z",
+                valid_until="2026-08-01T12:05:00Z",
+            ),
+        )
+
+        for result in (at_observed, before_expiry):
+            self.assertEqual(result.status, "calculation_complete")
+        for result in (expired, at_expiry, future):
+            self.assertEqual(result.status, "unavailable")
+            self.assertEqual(result.reason_code, "market_rules_not_current")
+            self.assertIsNone(result.gross_quote_quantity)
+
+    def test_shared_validator_rejects_exact_ending_price_forgery_for_cex_and_dex(self):
+        cex = quote_cex_book_quantity(
+            [(Decimal("101"), Decimal("2"))],
+            target(),
+            rules(),
+            fee(),
+            direction="buy",
+            source_quote_asset="USDT",
+            full_book_reported=False,
+            state_id="book-state-1",
+        )
+        dex = self.quote(direction="sell")
+
+        for current in (cex, dex):
+            with self.subTest(market_id=current.market_id):
+                with self.assertRaisesRegex(ValueError, "ending price"):
+                    replace(current, ending_price_numerator=1)
+        with self.assertRaisesRegex(ValueError, "fee_application"):
+            replace(dex, fee_application="additional_debit")
+        with self.assertRaisesRegex(ValueError, "token address"):
+            replace(dex, quote_token_address=TOKEN0)
+
+    def test_v2_evidence_validator_rejects_self_consistent_quote_forgery(self):
+        state = v2_state()
+        current_target = dex_target()
+        current_rules = dex_rules()
+        quote = self.quote(
+            direction="sell",
+            state=state,
+            current_target=current_target,
+            current_rules=current_rules,
+        )
+        doubled_quote = Decimal("1813.221786")
+        forged_output = replace(
+            quote,
+            gross_quote_quantity=doubled_quote,
+            net_quote_quantity=doubled_quote,
+            quote_received_quantity=doubled_quote,
+            vwap_quote_per_base=Decimal("181.3221786"),
+            vwap_quote_numerator=906_610_893,
+            vwap_quote_denominator=5_000_000,
+        )
+        forged_addresses = replace(
+            quote,
+            target_token_address="0x" + "4" * 40,
+            quote_token_address="0x" + "5" * 40,
+        )
+        forged_market = replace(
+            quote,
+            market_id=(
+                "dex:eth:uniswap_v2:"
+                "0x4444444444444444444444444444444444444444:AAVE"
+            ),
+        )
+
+        self.assertIs(
+            validate_v2_quantity_quote_against_state(
+                quote,
+                state,
+                current_target,
+                current_rules,
+                direction="sell",
+                target_token_address=TOKEN0,
+                quote_token_address=TOKEN1,
+                cohort_now="2026-08-01T12:02:00.0000005Z",
+            ),
+            quote,
+        )
+        for forged in (forged_output, forged_addresses, forged_market):
+            with self.subTest(forged=forged):
+                with self.assertRaisesRegex(ValueError, "V2 quote evidence"):
+                    validate_v2_quantity_quote_against_state(
+                        forged,
+                        state,
+                        current_target,
+                        current_rules,
+                        direction="sell",
+                        target_token_address=TOKEN0,
+                        quote_token_address=TOKEN1,
+                        cohort_now="2026-08-01T12:02:00.0000005Z",
+                    )
 
 
 class V1NonRegressionTests(unittest.TestCase):
