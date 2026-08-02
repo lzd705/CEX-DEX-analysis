@@ -94,6 +94,39 @@ const comparisonFixture = {
 
 
 class CompareChartFrontendTest(unittest.TestCase):
+    def test_daily_price_gap_copy_uses_same_utc_closes_and_never_claims_execution(self):
+        result = run_app_javascript(
+            FIXTURE
+            + r"""
+const model = comparisonChartModel(comparisonFixture, "spread");
+const point = model.series[0].points.find((row) => row.date === "2026-01-01");
+console.log(JSON.stringify({
+  definition: model.definition,
+  seriesLabel: model.series[0].label,
+  tooltip: comparisonChartTooltipText(model, point),
+}));
+"""
+        )
+        self.assertEqual(result["definition"]["title"], "Daily Price Gap")
+        self.assertEqual(result["definition"]["axisTitle"], "Daily Price Gap (bps)")
+        self.assertIn("same-UTC-date closes", result["definition"]["note"])
+        self.assertEqual(result["seriesLabel"], "A ↔ B Daily Price Gap")
+        self.assertIn("Daily Price Gap 50 bps", result["tooltip"])
+        self.assertIn("same-UTC-date closes", result["tooltip"])
+        for prohibited in ("arbitrage", "live spread", "quoted spread"):
+            self.assertNotIn(prohibited, result["tooltip"].lower())
+
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        compare_start = index.index('data-workspace-view="compare"')
+        compare_end = index.index('data-workspace-view="events"', compare_start)
+        compare = index[compare_start:compare_end]
+        self.assertIn(">Daily Price Gap</button>", compare)
+        self.assertIn("Absolute Daily Price Gap", compare)
+        self.assertIn("Daily Price Gap (bps)", compare)
+        self.assertIn("same UTC date closing prices", compare)
+        self.assertNotIn(">Spread</button>", compare)
+        self.assertNotIn("midpoint-relative spread", compare.lower())
+
     def test_chart_contract_is_accessible_and_keeps_exact_table(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
         styles = STYLES_PATH.read_text(encoding="utf-8")

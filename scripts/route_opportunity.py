@@ -103,6 +103,7 @@ _ROUTE_MODES = frozenset(
         "research_only",
     }
 )
+ROUTE_OPPORTUNITY_MODES = _ROUTE_MODES
 _MODE_REASON_CODES_BY_MODE = {
     "prepositioned_inventory": frozenset(
         {
@@ -178,6 +179,11 @@ _PRIMARY_REASON_PRIORITY = (
     "cost_component_estimated",
     "non_positive_net_edge",
     "publication_evidence_unverified",
+)
+ROUTE_OPPORTUNITY_REASON_CODES = (
+    frozenset(_PRIMARY_REASON_PRIORITY)
+    | frozenset().union(*_MODE_REASON_CODES_BY_MODE.values())
+    | frozenset({"positive_strict_net_edge"})
 )
 _REASON_RANK = {
     reason: index for index, reason in enumerate(_PRIMARY_REASON_PRIORITY)

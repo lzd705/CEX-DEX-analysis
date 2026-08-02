@@ -28,6 +28,140 @@ def run_navigation_javascript(source: str):
 
 
 class MarketMonitorNavigationTest(unittest.TestCase):
+    def test_opportunity_volume_sort_round_trips(self):
+        result = run_navigation_javascript(
+            """
+const parsed = navigation.parseRoute(
+  "/opportunities", "?sort=volume&dir=desc"
+);
+const built = navigation.buildOpportunitiesPath(parsed.filters);
+console.log(JSON.stringify({ parsed, built }));
+"""
+        )
+
+        self.assertEqual(result["parsed"], {
+            "kind": "opportunities",
+            "filters": {"sort": "volume", "dir": "desc"},
+        })
+        self.assertIn("sort=volume", result["built"])
+
+    def test_opportunities_route_round_trip_is_independent_from_market_pair_state(self):
+        result = run_navigation_javascript(
+            """
+const parsed = navigation.parseRoute(
+  "/opportunities",
+  "?token=AAVE&notional=10000&class=strict&route_type=cex_dex"
+    + "&venue=uniswap-v3&availability=available&sort=net_edge_usd&dir=desc"
+    + "&marketA=cex%3Abinance%3AAAVE%2FUSDT",
+);
+const path = navigation.buildOpportunitiesPath(parsed.filters);
+const url = new URL(path, "https://example.test");
+console.log(JSON.stringify({
+  parsed,
+  path,
+  reparsed: navigation.parseRoute(url.pathname, url.search),
+}));
+"""
+        )
+        expected = {
+            "token": "AAVE",
+            "venue": "uniswap-v3",
+            "notionalUsd": 10000,
+            "opportunityClass": "strict",
+            "routeType": "cex_dex",
+            "availability": "available",
+            "sort": "net_edge_usd",
+            "dir": "desc",
+        }
+        self.assertEqual(result["parsed"], {
+            "kind": "opportunities",
+            "filters": expected,
+        })
+        self.assertEqual(result["reparsed"], result["parsed"])
+        self.assertTrue(result["path"].startswith("/opportunities?"))
+        self.assertIn("route_type=cex_dex", result["path"])
+        self.assertIn("venue=uniswap-v3", result["path"])
+        self.assertNotIn("marketA", result["path"])
+
+    def test_opportunities_invalid_token_and_venue_are_explicit_not_all_scope(self):
+        result = run_navigation_javascript(
+            """
+const parsedToken = navigation.parseRoute(
+  "/opportunities",
+  "?token=AAVE%3FBAD&venue=kraken",
+);
+const parsedVenue = navigation.parseRoute(
+  "/opportunities",
+  "?token=AAVE&venue=kraken%2Fbinance",
+);
+let tokenBuildError = null;
+let venueBuildError = null;
+try {
+  navigation.buildOpportunitiesPath({ token: "AAVE?BAD" });
+} catch (error) {
+  tokenBuildError = error.message;
+}
+try {
+  navigation.buildOpportunitiesPath({ token: "AAVE", venue: "kraken/binance" });
+} catch (error) {
+  venueBuildError = error.message;
+}
+console.log(JSON.stringify({
+  parsedToken,
+  parsedVenue,
+  tokenBuildError,
+  venueBuildError,
+}));
+"""
+        )
+
+        self.assertEqual(result["parsedToken"]["filters"]["token"], "AAVE?BAD")
+        self.assertEqual(result["parsedToken"]["filters"]["venue"], "kraken")
+        self.assertEqual(result["parsedToken"]["validationErrors"], [{
+            "code": "invalid_token",
+            "field": "token",
+            "value": "AAVE?BAD",
+        }])
+        self.assertEqual(result["parsedVenue"]["filters"]["token"], "AAVE")
+        self.assertEqual(
+            result["parsedVenue"]["filters"]["venue"],
+            "kraken/binance",
+        )
+        self.assertEqual(result["parsedVenue"]["validationErrors"], [{
+            "code": "invalid_venue",
+            "field": "venue",
+            "value": "kraken/binance",
+        }])
+        self.assertIn("Token", result["tokenBuildError"])
+        self.assertIn("venue", result["venueBuildError"])
+
+    def test_opportunities_route_drops_unknown_filters_and_uncollected_notional(self):
+        result = run_navigation_javascript(
+            """
+const parsed = navigation.parseRoute(
+  "/opportunities/",
+  "?token=%20&notional=12345&class=profit&route_type=bridge"
+    + "&availability=maybe&sort=roi&dir=sideways&start=2026-07-01",
+);
+const built = navigation.buildOpportunitiesPath({
+  token: "",
+  notionalUsd: 12345,
+  opportunityClass: "profit",
+  routeType: "bridge",
+  availability: "maybe",
+  sort: "roi",
+  dir: "sideways",
+  marketA: "cex:binance:AAVE/USDT",
+});
+console.log(JSON.stringify({ parsed, built }));
+"""
+        )
+        self.assertEqual(result["parsed"], {
+            "kind": "opportunities",
+            "filters": {},
+        })
+        self.assertEqual(result["built"], "/opportunities")
+
     def test_workspace_route_round_trip_preserves_encoded_market_ids_and_case(self):
         result = run_navigation_javascript(
             """

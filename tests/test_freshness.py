@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from dashboard.freshness import (
     build_source_freshness,
     daily_freshness,
+    route_opportunity_freshness,
     snapshot_freshness,
 )
 
@@ -12,6 +13,53 @@ NOW = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 
 
 class FreshnessTest(unittest.TestCase):
+    def test_route_opportunity_freshness_enforces_second_level_age_boundary(self):
+        boundary = route_opportunity_freshness(
+            "2026-07-27T11:58:00Z",
+            "2026-07-27T11:58:00Z",
+            now=NOW,
+        )
+        stale = route_opportunity_freshness(
+            "2026-07-27T11:57:59.999Z",
+            "2026-07-27T11:57:59.999Z",
+            now=NOW,
+        )
+
+        self.assertEqual(boundary["status"], "current")
+        self.assertEqual(boundary["age_seconds"], 120.0)
+        self.assertEqual(stale["status"], "stale")
+        self.assertEqual(stale["reason"], "cohort_stale")
+        self.assertGreater(stale["age_seconds"], 120)
+
+    def test_route_opportunity_freshness_enforces_skew_boundary(self):
+        boundary = route_opportunity_freshness(
+            "2026-07-27T11:58:00Z",
+            "2026-07-27T11:59:00Z",
+            now=NOW,
+        )
+        outside = route_opportunity_freshness(
+            "2026-07-27T11:57:59.999Z",
+            "2026-07-27T11:59:00Z",
+            now=NOW,
+        )
+
+        self.assertEqual(boundary["status"], "current")
+        self.assertEqual(boundary["skew_seconds"], 60.0)
+        self.assertEqual(outside["status"], "unavailable")
+        self.assertEqual(outside["reason"], "snapshot_skew_exceeded")
+
+    def test_route_opportunity_freshness_preserves_missing_and_invalid_time(self):
+        missing = route_opportunity_freshness(None, None, now=NOW)
+
+        self.assertEqual(missing["status"], "unavailable")
+        self.assertEqual(missing["reason"], "route_timestamp_absent")
+        with self.assertRaises(ValueError):
+            route_opportunity_freshness(
+                "2026-07-27T12:00:01Z",
+                "2026-07-27T12:00:00Z",
+                now=NOW,
+            )
+
     def test_daily_freshness_uses_latest_completed_utc_day(self):
         current = daily_freshness(
             "cex_daily",

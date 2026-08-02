@@ -2070,6 +2070,138 @@ th.sticky-token { z-index: 12; background: #1c2027; }
   color: #9ce3bd;
 }
 
+.opportunities-view { display: grid; gap: 12px; }
+.opportunities-heading { min-width: 0; }
+.opportunities-heading > .contract-badge {
+  max-width: min(42vw, 320px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.opportunity-class-chip.strict {
+  border-color: #2b7351;
+  background: #153828;
+  color: #9ce3bd;
+}
+.opportunity-class-chip.estimate {
+  border-color: #806335;
+  background: #362a17;
+  color: #f0cc87;
+}
+.opportunity-class-chip.unavailable {
+  border-color: #586171;
+  background: #242a33;
+  color: #c7ced7;
+}
+.opportunity-filter-toolbar {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(110px, 1fr)) auto;
+  align-items: end;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+.opportunity-filter-toolbar label { min-width: 0; }
+.opportunity-filter-toolbar label > span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.opportunity-filter-toolbar input,
+.opportunity-filter-toolbar select {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--text);
+}
+.opportunity-filter-toolbar [aria-invalid="true"] {
+  border-color: var(--negative);
+  box-shadow: 0 0 0 1px var(--negative);
+}
+.opportunity-filter-error {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+.opportunity-inventories { display: grid; gap: 12px; }
+.opportunity-inventory {
+  min-width: 0;
+  padding: 15px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+.opportunity-section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 11px;
+}
+.opportunity-section-heading h3 { margin: 0 0 3px; font-size: 17px; }
+.opportunity-section-heading p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.opportunity-empty { margin-bottom: 10px; }
+.opportunity-table-scroll {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--line-soft);
+}
+.opportunity-table {
+  width: 100%;
+  min-width: 1040px;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.opportunity-table th,
+.opportunity-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  text-align: right;
+  vertical-align: top;
+}
+.opportunity-table th {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.opportunity-table th:first-child,
+.opportunity-table th:nth-child(2),
+.opportunity-table td:first-child,
+.opportunity-table td:nth-child(2),
+.opportunity-table th:last-child,
+.opportunity-table td:last-child { text-align: left; }
+.opportunity-table tbody tr:last-child td { border-bottom: 0; }
+.opportunity-unavailable-state {
+  border-color: #806335;
+  background: #362a17;
+  color: #f0cc87;
+}
+.opportunity-na-disclosure { display: inline-block; margin-left: 4px; }
+.opportunity-na-disclosure > summary { min-width: 28px; min-height: 28px; }
+.opportunity-cost-disclosure { min-width: 180px; }
+.opportunity-reason-code {
+  display: inline-flex;
+  max-width: 100%;
+  margin-top: 5px;
+  padding: 2px 6px;
+  border: 1px solid #59616c;
+  border-radius: 999px;
+  color: #c8ced6;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
 footer {
   display: flex;
   flex-wrap: wrap;
@@ -2082,6 +2214,7 @@ footer {
 
 @media (max-width: 1250px) {
   .facts-controls { grid-template-columns: 1fr 1fr; }
+  .opportunity-filter-toolbar { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .compare-command { width: 100%; }
   .app-header { height: auto; min-height: 76px; flex-wrap: wrap; padding-block: 10px; }
   .primary-navigation { order: 3; width: 100%; }
@@ -2117,6 +2250,7 @@ footer {
   .liquidity-summary { grid-template-columns: 1fr 1fr; }
   .table-scroll { max-height: none; }
   .quality-legend-grid { grid-template-columns: 1fr 1fr; }
+  .opportunity-filter-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 700px) {
@@ -2191,8 +2325,70 @@ footer {
     overflow: visible;
   }
   .workspace-tabs a { min-width: 0; }
+  .opportunity-filter-toolbar { grid-template-columns: minmax(0, 1fr); }
+  .opportunity-filter-toolbar .icon-command { width: 100%; justify-content: center; }
+  .opportunity-section-heading { display: block; }
+  .opportunity-section-heading .contract-badge { margin-top: 7px; }
+  .opportunity-table-scroll {
+    border: 0;
+    overflow: visible;
+  }
+  .opportunity-table {
+    display: block;
+    min-width: 0;
+  }
+  .opportunity-table thead,
+  .opportunity-table tbody,
+  .opportunity-table tr,
+  .opportunity-table td { display: block; }
+  .opportunity-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .opportunity-table tbody { display: grid; gap: 9px; }
+  .opportunity-table tr {
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    background: var(--surface-2);
+  }
+  .opportunity-table td {
+    display: grid;
+    grid-template-columns: minmax(92px, .65fr) minmax(0, 1fr);
+    gap: 10px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--line-soft);
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .opportunity-table td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: .03em;
+    text-transform: uppercase;
+  }
+  .opportunity-table td:last-child { border-bottom: 0; }
+  .opportunity-na-disclosure {
+    position: static;
+    margin-top: 3px;
+  }
+  .opportunity-na-disclosure .na-disclosure-panel,
+  .opportunity-cost-disclosure .na-disclosure-panel {
+    position: static;
+    width: 100%;
+    max-width: none;
+  }
   .view-heading { display: block; padding: 14px 11px; }
   .view-heading .contract-badge { margin-top: 9px; }
+  .context-info > summary { width: 44px; height: 44px; }
   .contract-badge { display: inline-block; margin-top: 10px; }
   .facts-controls { grid-template-columns: 1fr; }
   .research-pair-context .route-action { width: 100%; margin-left: 0; }

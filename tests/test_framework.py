@@ -1,5 +1,7 @@
 import ast
 import io
+import subprocess
+import sys
 import tokenize
 import unittest
 from pathlib import Path
@@ -48,6 +50,23 @@ def parenthesized_multi_context_with_lines(source):
 
 
 class FrameworkStructureTest(unittest.TestCase):
+    def test_release_checker_supports_documented_direct_script_execution(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(PROJECT_ROOT / "scripts/check_dashboard_release.py"),
+                "--help",
+            ],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--base-url", result.stdout)
+
     def test_parenthesized_multi_context_guard_distinguishes_single_context_expressions(self):
         unsupported = "with (first_context, second_context):\n    pass\n"
         supported = (
@@ -165,6 +184,28 @@ class FrameworkStructureTest(unittest.TestCase):
         self.assertEqual(runbook.count("--expected-application-sha"), 2)
         self.assertEqual(runbook.count("--expected-asset-sha"), 2)
         self.assertIn("from dashboard.server import static_asset_sha", runbook)
+
+    def test_opportunity_release_gate_is_bounded_and_has_no_collection_side_effect(self):
+        checker = (
+            PROJECT_ROOT / "scripts/check_dashboard_release.py"
+        ).read_text(encoding="utf-8")
+        operations = (
+            PROJECT_ROOT / "docs/collection-operations.md"
+        ).read_text(encoding="utf-8")
+        design = (
+            PROJECT_ROOT / "docs/market-monitor-design.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("/api/markets/opportunities", checker)
+        self.assertIn("--opportunity-raw-max", checker)
+        self.assertIn("--opportunity-gzip-max", checker)
+        self.assertIn("cold", operations.lower())
+        self.assertIn("warm", operations.lower())
+        self.assertIn("filter parity", operations.lower())
+        self.assertIn("does not start collection", operations.lower())
+        self.assertIn("does not install or enable a timer", operations.lower())
+        self.assertIn("opportunity API", design)
+        self.assertIn("complete_pointer_absent", design)
 
     def test_market_monitor_has_no_factor_or_admin_surface(self):
         html = (PROJECT_ROOT / "dashboard/static/index.html").read_text(encoding="utf-8")

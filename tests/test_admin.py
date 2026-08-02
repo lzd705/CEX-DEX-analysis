@@ -1777,31 +1777,44 @@ class AdminServiceTest(unittest.TestCase):
         server.ensure_source_cache_generation(second_signature)
         self.assertEqual(server._build_enriched_payload_cached.cache_info().currsize, 0)
 
-    def test_source_generation_clear_waits_for_payload_cache_write_back(self):
+    def test_source_generation_clear_does_not_wait_for_old_payload_build(self):
         server.clear_runtime_caches()
         first_signature = (("facts.sqlite3", 1, 100),)
         second_signature = (("facts.sqlite3", 2, 100),)
+        current_signature = [first_signature]
         build_started = Event()
         release_build = Event()
         generation_change_started = Event()
         generation_change_finished = Event()
-        payload = {"metadata": {}, "cex_markets": [], "dex_pools": []}
+        old_payload = {
+            "metadata": {"generation": "old"},
+            "cex_markets": [],
+            "dex_pools": [],
+        }
+        new_payload = {
+            "metadata": {"generation": "new"},
+            "cex_markets": [],
+            "dex_pools": [],
+        }
 
-        def slow_build(_cache_key, _freshness_bucket):
-            build_started.set()
-            if not release_build.wait(timeout=2):
-                raise TimeoutError("test did not release the payload build")
-            return payload
+        def slow_build(_cache_key, source_signature, _freshness_bucket):
+            if source_signature == first_signature:
+                build_started.set()
+                if not release_build.wait(timeout=2):
+                    raise TimeoutError("test did not release the payload build")
+                return old_payload
+            return new_payload
 
         def change_generation():
             generation_change_started.set()
+            current_signature[0] = second_signature
             server.ensure_source_cache_generation(second_signature)
             generation_change_finished.set()
 
         with patch.object(
             server,
             "api_source_signature",
-            return_value=first_signature,
+            side_effect=lambda: current_signature[0],
         ), patch.object(
             server,
             "market_payload_cache_key",
@@ -1821,10 +1834,10 @@ class AdminServiceTest(unittest.TestCase):
                 generation_future = executor.submit(change_generation)
                 self.assertTrue(generation_change_started.wait(timeout=1))
                 try:
-                    self.assertFalse(generation_change_finished.wait(timeout=0.1))
+                    self.assertTrue(generation_change_finished.wait(timeout=1))
                 finally:
                     release_build.set()
-                self.assertEqual(build_future.result(timeout=1), payload)
+                self.assertEqual(build_future.result(timeout=1), new_payload)
                 generation_future.result(timeout=1)
 
         self.assertEqual(server._SOURCE_CACHE_GENERATION, second_signature)

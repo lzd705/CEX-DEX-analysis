@@ -1,5 +1,6 @@
 import argparse
 import copy
+import gzip
 import hashlib
 import json
 import shutil
@@ -7,10 +8,17 @@ import tempfile
 import inspect
 import unittest
 from contextlib import ExitStack
+from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from dashboard import server
+from dashboard.opportunity_facts import (
+    build_opportunity_payload,
+    build_unavailable_opportunity_payload,
+)
 import scripts.check_dashboard_release as release_checker
 from scripts.check_dashboard_release import (
     DAILY_FACT_EVIDENCE_FIELDS,
@@ -32,6 +40,137 @@ from scripts.check_dashboard_release import (
 from scripts.cex_instrument_lifecycle import configured_market_ids_sha256
 from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_SOURCES
 import scripts.route_publication as route_publication
+import scripts.route_opportunity as route_opportunity
+from tests import test_opportunity_api as opportunity_fixture
+
+
+def _opportunity_inventory_sha256(rows):
+    members = [
+        {
+            "opportunity_id": str(row.get("opportunity_id")),
+            "route_id": str(row.get("route_id")),
+            "token_symbol": str(row.get("token_symbol")),
+            "requested_notional_usd": str(row.get("requested_notional_usd")),
+            "opportunity_class": str(row.get("opportunity_class")),
+        }
+        for row in rows
+    ]
+    members.sort(key=lambda row: row["opportunity_id"])
+    return hashlib.sha256(json.dumps(
+        members,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _route_candidates_for_rows(rows):
+    route_ids = sorted({str(row["route_id"]) for row in rows})
+    volumes = [
+        ("500", "700", "500"),
+        ("100", "300", "100"),
+        ("100", None, None),
+    ]
+    return [
+        {
+            "route_id": route_id,
+            "buy_reference_volume_usd": values[0],
+            "sell_reference_volume_usd": values[1],
+            "route_volume_usd": values[2],
+            "route_volume_basis": "minimum_leg_source_horizon_usd",
+        }
+        for route_id, values in zip(route_ids, volumes)
+    ]
+
+
+def _opportunity_metrics(
+    path,
+    payload,
+    *,
+    raw_bytes=None,
+    wire_bytes=None,
+    compressed=True,
+    request_started_at=None,
+    response_completed_at=None,
+    elapsed_ms=7.5,
+):
+    raw = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    wire = gzip.compress(raw) if compressed else raw
+    checked_at = (payload.get("metadata") or {}).get("checked_at")
+    if checked_at and (
+        request_started_at is None or response_completed_at is None
+    ):
+        try:
+            checked_at_datetime = datetime.fromisoformat(
+                str(checked_at).replace("Z", "+00:00")
+            )
+        except ValueError:
+            checked_at_datetime = None
+        if checked_at_datetime is not None:
+            if request_started_at is None:
+                request_started_at = checked_at_datetime
+            if response_completed_at is None:
+                response_completed_at = checked_at_datetime
+    return ResponseMetrics(
+        path=path,
+        elapsed_ms=elapsed_ms,
+        wire_bytes=len(wire) if wire_bytes is None else wire_bytes,
+        raw_bytes=len(raw) if raw_bytes is None else raw_bytes,
+        compressed=compressed,
+        request_started_at=request_started_at,
+        response_completed_at=response_completed_at,
+    )
+
+
+def _add_public_cost_provenance(payload, source_costs, source_rows):
+    """Mirror the non-sensitive cost provenance exposed by the public API."""
+
+    costs_by_key = {
+        (
+            str(item["opportunity_id"]),
+            str(item["leg"]),
+            str(item["component_type"]),
+        ): item
+        for item in source_costs
+    }
+    rows_by_id = {
+        str(item["opportunity_id"]): item for item in source_rows
+    }
+    for route in payload.get("routes", []):
+        opportunity_id = str(route["opportunity_id"])
+        for component in route.get("cost_components", []):
+            source = costs_by_key[
+                (
+                    opportunity_id,
+                    str(component["leg"]),
+                    str(component["component_type"]),
+                )
+            ]
+            component["strict_eligible"] = (
+                False
+                if component.get("value_status") == "stale"
+                else source["strict_eligible"]
+            )
+            component["embedded_in_leg_quote"] = source[
+                "embedded_in_leg_quote"
+            ]
+            reflected = set(
+                rows_by_id[opportunity_id].get(
+                    "reflected_or_embedded_component_keys", []
+                )
+            )
+            component["reflected_or_embedded"] = bool(
+                source["embedded_in_leg_quote"]
+                or "{}:{}".format(
+                    component["leg"], component["component_type"]
+                ) in reflected
+            )
+    return payload
 
 
 def _opportunity_binding(row):
@@ -155,13 +294,1082 @@ class RouteOpportunityReleaseGateTest(unittest.TestCase):
             now=now or self.validated_at,
         )
 
+    def _public_payload_for_path(self, loaded, path):
+        query = {
+            key: values[-1]
+            for key, values in parse_qs(urlsplit(path).query).items()
+        }
+        payload = build_opportunity_payload(
+            loaded["bundle"]["opportunities"],
+            manifest=loaded["manifest"],
+            legs=loaded["legs"],
+            cost_components=loaded["cost_components"],
+            route_candidates=loaded["bundle"]["routes"],
+            token=query.get("token"),
+            venue=query.get("venue"),
+            notional_usd=query.get("notional"),
+            opportunity_class=query.get("class"),
+            route_type=query.get("route_type"),
+            availability=query.get("availability"),
+            sort=query.get("sort"),
+            direction=query.get("dir"),
+            now=datetime.fromisoformat(
+                self.validated_at.replace("Z", "+00:00")
+            ),
+            manifest_sha256=loaded["manifest_sha256"],
+        )
+        return _add_public_cost_provenance(
+            payload,
+            loaded["cost_components"],
+            loaded["bundle"]["opportunities"],
+        )
+
     def test_valid_complete_public_bundle_passes_and_reports_strict_counts(self):
         result = self._validate()
+        loaded = self._loaded()
 
         self.assertEqual(result["status"], "validated")
         self.assertEqual(result["bundle_stage"], "route_opportunity/v1")
         self.assertEqual(result["strict_opportunity_count"], 5)
         self.assertEqual(result["research_opportunity_count"], 0)
+        self.assertEqual(
+            result["opportunity_inventory_sha256"],
+            _opportunity_inventory_sha256(
+                loaded["bundle"]["opportunities"]
+            ),
+        )
+
+    def test_checker_reason_registry_covers_every_canonical_mode_reason(self):
+        canonical_mode_reasons = set().union(
+            *route_opportunity._MODE_REASON_CODES_BY_MODE.values()
+        )
+
+        self.assertTrue(
+            canonical_mode_reasons
+            <= release_checker._OPPORTUNITY_REASON_CODES
+        )
+
+    def test_checker_accepts_canonical_hyphenated_dex_venue(self):
+        self.assertEqual(
+            release_checker._route_public_leg_venue(
+                "dex:ethereum:uniswap-v3:0xPool:AAVE"
+            ),
+            "uniswap-v3",
+        )
+
+    def test_missing_pointer_api_is_200_unavailable_with_no_route_values(self):
+        (self.routes_root / "latest.json").unlink()
+        route_release = self._validate(required=False)
+        payload = build_unavailable_opportunity_payload(
+            sort="route_id",
+            direction="asc",
+        )
+        requested = []
+
+        def fake_fetch(_base_url, path, *, timeout):
+            self.assertEqual(timeout, 1.0)
+            requested.append(path)
+            return payload, _opportunity_metrics(
+                path, payload, compressed=False
+            )
+
+        with patch(
+            "scripts.check_dashboard_release.fetch_json",
+            side_effect=fake_fetch,
+        ):
+            result, metrics = release_checker.validate_opportunity_api_release(
+                "https://dashboard.test",
+                timeout=1.0,
+                route_release=route_release,
+                raw_max=2_000_000,
+                gzip_max=300_000,
+            )
+
+        self.assertEqual(result, {
+            "status": "unavailable",
+            "reason": "complete_pointer_absent",
+            "cold_elapsed_ms": 7.5,
+            "warm_elapsed_ms": 7.5,
+            "request_count": 2,
+        })
+        self.assertEqual(len(metrics), 2)
+        self.assertEqual(requested[0], requested[1])
+        self.assertTrue(
+            requested[0].startswith("/api/markets/opportunities?")
+        )
+
+        invalid_cases = {
+            "fixed reason": {
+                **copy.deepcopy(payload),
+                "availability": {
+                    "status": "unavailable",
+                    "reason": "network_failed",
+                },
+            },
+            "route values": {
+                **copy.deepcopy(payload),
+                "routes": [{"route_id": "route:x", "net_edge_usd": "0"}],
+            },
+        }
+        for label, invalid in invalid_cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ReleaseCheckError,
+                "complete_pointer_absent|route rows",
+            ):
+                release_checker._validate_opportunity_api_payload(
+                    invalid,
+                    _opportunity_metrics(
+                        "/api/markets/opportunities", invalid
+                    ),
+                    route_release=route_release,
+                    expected_filters=payload["filters"],
+                    raw_max=2_000_000,
+                    gzip_max=300_000,
+                    require_complete_inventory=True,
+                )
+
+    def test_complete_bundle_api_cross_checks_filters_inventory_and_lineage(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        for row, opportunity_class, reason in (
+            (
+                bundle["opportunities"][-2],
+                "research_estimate",
+                "cost_component_estimated",
+            ),
+            (
+                bundle["opportunities"][-1],
+                "unavailable",
+                "buy_leg_unavailable",
+            ),
+        ):
+            row.update({
+                "strict_eligible": False,
+                "strict_ready_for_publication": False,
+                "publication_attestation_sha256": None,
+                "opportunity_class": opportunity_class,
+                "primary_reason": reason,
+                "reason_codes": [reason],
+            })
+            _reseal_complete_opportunity(bundle, row["opportunity_id"])
+        self._rewrite(bundle)
+        loaded = self._loaded()
+        route_release = self._validate()
+        requested = []
+
+        def fake_fetch(_base_url, path, *, timeout):
+            self.assertEqual(timeout, 1.0)
+            requested.append(path)
+            payload = self._public_payload_for_path(loaded, path)
+            return payload, _opportunity_metrics(
+                path, payload, elapsed_ms=0
+            )
+
+        with patch(
+            "scripts.check_dashboard_release.fetch_json",
+            side_effect=fake_fetch,
+        ):
+            result, metrics = release_checker.validate_opportunity_api_release(
+                "https://dashboard.test",
+                timeout=1.0,
+                route_release=route_release,
+                raw_max=2_000_000,
+                gzip_max=300_000,
+            )
+
+        self.assertEqual(result["status"], "validated")
+        self.assertEqual(
+            result["route_cohort_id"], route_release["route_cohort_id"]
+        )
+        self.assertEqual(
+            result["manifest_sha256"], route_release["manifest_sha256"]
+        )
+        self.assertEqual(result["class_counts"], {
+            "executable_candidate": 3,
+            "research_estimate": 1,
+            "unavailable": 1,
+        })
+        self.assertEqual(result["filter_check_count"], 6)
+        self.assertEqual(result["request_count"], 8)
+        self.assertEqual(len(metrics), 8)
+        self.assertEqual(requested[0], requested[1])
+        self.assertTrue(any("class=strict" in path for path in requested))
+        self.assertTrue(any("class=estimate" in path for path in requested))
+        self.assertTrue(any(
+            "sort=volume" in path and "dir=asc" in path
+            for path in requested
+        ))
+        self.assertTrue(any(
+            "sort=volume" in path and "dir=desc" in path
+            for path in requested
+        ))
+        self.assertTrue(
+            any("availability=unavailable" in path for path in requested)
+        )
+        self.assertTrue(any("token=AAVE" in path for path in requested))
+        self.assertTrue(any("venue=binance" in path for path in requested))
+        self.assertEqual(
+            result["opportunity_inventory_sha256"],
+            route_release["opportunity_inventory_sha256"],
+        )
+
+    def test_cross_request_age_boundary_is_not_a_generation_change(self):
+        loaded = self._loaded()
+        route_release = self._validate()
+        boundary = datetime.fromisoformat("2026-08-01T12:03:00+00:00")
+        after_boundary = datetime.fromisoformat(
+            "2026-08-01T12:03:00.000001+00:00"
+        )
+        request_times = [boundary] + [after_boundary] * 7
+
+        def fake_fetch(_base_url, path, *, timeout):
+            self.assertEqual(timeout, 1.0)
+            now = request_times.pop(0)
+            query = {
+                key: values[-1]
+                for key, values in parse_qs(urlsplit(path).query).items()
+            }
+            payload = build_opportunity_payload(
+                loaded["bundle"]["opportunities"],
+                manifest=loaded["manifest"],
+                legs=loaded["legs"],
+                cost_components=loaded["cost_components"],
+                route_candidates=loaded["bundle"]["routes"],
+                token=query.get("token"),
+                venue=query.get("venue"),
+                notional_usd=query.get("notional"),
+                opportunity_class=query.get("class"),
+                route_type=query.get("route_type"),
+                availability=query.get("availability"),
+                sort=query.get("sort"),
+                direction=query.get("dir"),
+                now=now,
+                manifest_sha256=loaded["manifest_sha256"],
+            )
+            _add_public_cost_provenance(
+                payload,
+                loaded["cost_components"],
+                loaded["bundle"]["opportunities"],
+            )
+            return payload, _opportunity_metrics(
+                path, payload, elapsed_ms=0
+            )
+
+        with patch(
+            "scripts.check_dashboard_release.fetch_json",
+            side_effect=fake_fetch,
+        ):
+            result, metrics = release_checker.validate_opportunity_api_release(
+                "https://dashboard.test",
+                timeout=1.0,
+                route_release=route_release,
+                raw_max=2_000_000,
+                gzip_max=300_000,
+            )
+
+        self.assertEqual(result["status"], "validated")
+        self.assertEqual(len(metrics), 8)
+        self.assertEqual(request_times, [])
+
+    def test_public_routes_are_exactly_bound_to_the_complete_bundle(self):
+        loaded = self._loaded()
+        route_release = self._validate()
+
+        def wrong_allowlisted_source(payload):
+            route = next(
+                row for row in payload["routes"]
+                if row["availability"]["status"] == "available"
+            )
+            link = route["source_links"][0]
+            link["url"] = (
+                "https://api.kraken.com"
+                if link["url"] != "https://api.kraken.com"
+                else "https://api.binance.com"
+            )
+
+        def forged_economics(payload):
+            route = next(
+                row for row in payload["routes"]
+                if row["availability"]["status"] == "available"
+            )
+            route["gross_edge_usd"] = str(
+                Decimal(route["gross_edge_usd"]) + Decimal("100")
+            )
+            route["net_edge_usd"] = str(
+                Decimal(route["net_edge_usd"]) + Decimal("100")
+            )
+
+        def forged_cost_provenance(payload):
+            route = next(
+                row for row in payload["routes"]
+                if row["availability"]["status"] == "available"
+            )
+            component = next(
+                item for item in route["cost_components"]
+                if item["amount_usd"] is not None
+                and item["reflected_or_embedded"] is True
+            )
+            component["reflected_or_embedded"] = False
+            amount = Decimal(component["amount_usd"])
+            strict_cost = Decimal(
+                route["cost_breakdown"]["strict_nonembedded_usd"]
+            ) + amount
+            route["cost_breakdown"]["strict_nonembedded_usd"] = str(
+                strict_cost
+            )
+            route["net_edge_usd"] = str(
+                Decimal(route["gross_edge_usd"]) - strict_cost
+            )
+
+        for label, mutate in (
+            ("wrong allowlisted source host", wrong_allowlisted_source),
+            ("coherently forged economics", forged_economics),
+            ("coherently forged cost provenance", forged_cost_provenance),
+        ):
+            with self.subTest(label=label):
+                def fake_fetch(_base_url, path, *, timeout):
+                    self.assertEqual(timeout, 1.0)
+                    payload = self._public_payload_for_path(loaded, path)
+                    if any(
+                        row["availability"]["status"] == "available"
+                        for row in payload["routes"]
+                    ):
+                        mutate(payload)
+                    return payload, _opportunity_metrics(path, payload)
+
+                with patch(
+                    "scripts.check_dashboard_release.fetch_json",
+                    side_effect=fake_fetch,
+                ), self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "public row differs from the complete bundle",
+                ):
+                    release_checker.validate_opportunity_api_release(
+                        "https://dashboard.test",
+                        timeout=1.0,
+                        route_release=route_release,
+                        raw_max=2_000_000,
+                        gzip_max=300_000,
+                    )
+
+    def test_complete_route_volume_cannot_diverge_from_pinned_core(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        route = bundle["routes"][0]
+        route["buy_reference_volume_usd"] = "8000"
+        route["sell_reference_volume_usd"] = "6000"
+        route["route_volume_usd"] = "6000"
+        self._rewrite(bundle)
+
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "complete.*core|core.*complete|lineage",
+        ):
+            self._validate()
+
+    def test_complete_core_pointer_hash_must_match_canonical_core_pointer(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        bundle["core_pointer_sha256"] = "f" * 64
+        self._rewrite(bundle)
+
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "core pointer.*lineage|lineage.*core pointer",
+        ):
+            self._validate()
+
+    def test_complete_core_context_must_match_pinned_core(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        bundle["core_context"]["collection_input_generation"] = (
+            "forged-generation"
+        )
+        bundle["input_generations"]["collection_input_generation"] = (
+            "forged-generation"
+        )
+        self._rewrite(bundle)
+
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "core context.*lineage|lineage.*core context",
+        ):
+            self._validate()
+
+    def test_complete_route_legs_must_match_pinned_core(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        bundle["legs"][0]["source_endpoint"] = (
+            "https://api.bybit.com/v5/market/orderbook"
+        )
+        self._rewrite(bundle)
+
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "route legs.*lineage|lineage.*route legs",
+        ):
+            self._validate()
+
+    def test_filtered_public_route_body_is_bound_to_the_complete_bundle(self):
+        loaded = self._loaded()
+        route_release = self._validate()
+        request_count = {"value": 0}
+
+        def fake_fetch(_base_url, path, *, timeout):
+            self.assertEqual(timeout, 1.0)
+            request_count["value"] += 1
+            payload = self._public_payload_for_path(loaded, path)
+            if request_count["value"] > 2:
+                available = next(
+                    (
+                        row for row in payload["routes"]
+                        if row["availability"]["status"] == "available"
+                    ),
+                    None,
+                )
+                if available is not None:
+                    available["gross_edge_usd"] = str(
+                        Decimal(available["gross_edge_usd"])
+                        + Decimal("100")
+                    )
+                    available["net_edge_usd"] = str(
+                        Decimal(available["net_edge_usd"])
+                        + Decimal("100")
+                    )
+            return payload, _opportunity_metrics(path, payload)
+
+        with patch(
+            "scripts.check_dashboard_release.fetch_json",
+            side_effect=fake_fetch,
+        ), self.assertRaisesRegex(
+            ReleaseCheckError,
+            "public row differs from the complete bundle",
+        ):
+            release_checker.validate_opportunity_api_release(
+                "https://dashboard.test",
+                timeout=1.0,
+                route_release=route_release,
+                raw_max=2_000_000,
+                gzip_max=300_000,
+            )
+
+    def test_filtered_api_views_cannot_diverge_from_full_inventory_metadata(self):
+        loaded = self._loaded()
+        route_release = self._validate()
+        mutations = {
+            "route count": lambda payload: payload["metadata"]["coverage"].update(
+                route_count=payload["metadata"]["coverage"]["route_count"] + 1
+            ),
+            "availability counts": lambda payload: payload["metadata"][
+                "coverage"
+            ]["availability_counts"].update(
+                available=payload["metadata"]["coverage"][
+                    "availability_counts"
+                ].get("available", 0) + 1
+            ),
+            "freshness deadline": lambda payload: payload["metadata"].update(
+                next_freshness_deadline_at=None
+            ),
+        }
+
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                request_count = 0
+
+                def fake_fetch(_base_url, path, *, timeout):
+                    nonlocal request_count
+                    self.assertEqual(timeout, 1.0)
+                    request_count += 1
+                    payload = self._public_payload_for_path(loaded, path)
+                    if request_count > 2 and "availability=unavailable" in path:
+                        mutate(payload)
+                    return payload, _opportunity_metrics(path, payload)
+
+                with patch(
+                    "scripts.check_dashboard_release.fetch_json",
+                    side_effect=fake_fetch,
+                ), self.assertRaisesRegex(
+                    ReleaseCheckError,
+                (
+                    "full view|generation|complete bundle|checked_at|"
+                    "boundary mode"
+                ),
+                ):
+                    release_checker.validate_opportunity_api_release(
+                        "https://dashboard.test",
+                        timeout=1.0,
+                        route_release=route_release,
+                        raw_max=2_000_000,
+                        gzip_max=300_000,
+                    )
+
+    def test_api_payload_rejects_release_counterexamples(self):
+        rows = opportunity_fixture.OpportunityPayloadTests()._rows()
+        manifest = opportunity_fixture._manifest(rows)
+        manifest_sha256 = "b" * 64
+        public_costs = [
+            component
+            for row in rows
+            for component in opportunity_fixture._route_costs(row)
+        ]
+        route_candidates = _route_candidates_for_rows(rows)
+        payload = build_opportunity_payload(
+            rows,
+            manifest=manifest,
+            legs=opportunity_fixture.LEGS,
+            cost_components=public_costs,
+            route_candidates=route_candidates,
+            opportunity_class="all",
+            availability="all",
+            sort="route_id",
+            direction="asc",
+            now=opportunity_fixture.NOW,
+            manifest_sha256=manifest_sha256,
+        )
+        _add_public_cost_provenance(payload, public_costs, rows)
+        route_release = {
+            "status": "validated",
+            "reason": None,
+            "route_cohort_id": opportunity_fixture.COHORT_ID,
+            "manifest_sha256": manifest_sha256,
+            "strict_opportunity_count": 1,
+            "research_opportunity_count": 1,
+            "unavailable_opportunity_count": 1,
+            "opportunity_inventory_sha256": _opportunity_inventory_sha256(
+                rows
+            ),
+            release_checker._OPPORTUNITY_PUBLIC_BINDING_ROWS: (
+                release_checker._route_public_binding_inventory(
+                    rows,
+                    opportunity_fixture.LEGS,
+                    public_costs,
+                    route_candidates,
+                )
+            ),
+        }
+        expected_filters = payload["filters"]
+
+        null_source = copy.deepcopy(payload)
+        null_source["routes"][0]["source_links"][0]["url"] = None
+        invalid = {"missing exact source origin": null_source}
+        mixed = copy.deepcopy(payload)
+        mixed["filters"]["opportunity_class"] = "strict"
+        invalid["mixed strict and estimate rows"] = mixed
+
+        invalid_counts = copy.deepcopy(payload)
+        invalid_counts["metadata"]["coverage"]["class_counts"][
+            "executable_candidate"
+        ] = 2
+        invalid["invalid class counts"] = invalid_counts
+
+        forged_volume = copy.deepcopy(payload)
+        forged_volume["routes"][0]["route_volume_usd"] = "999999"
+        invalid["forged route reference volume"] = forged_volume
+
+        unknown_reason = copy.deepcopy(payload)
+        unavailable = next(
+            row for row in unknown_reason["routes"]
+            if row["opportunity_class"] == "unavailable"
+        )
+        unavailable["availability"]["reason"] = "mystery_reason"
+        unavailable["primary_reason"] = "mystery_reason"
+        unavailable["reason_codes"] = ["mystery_reason"]
+        invalid["unknown reason"] = unknown_reason
+
+        stale_numeric = copy.deepcopy(payload)
+        strict = next(
+            row for row in stale_numeric["routes"]
+            if row["opportunity_class"] == "executable_candidate"
+        )
+        strict["availability"] = {
+            "status": "unavailable",
+            "reason": "cohort_stale",
+        }
+        invalid["stale strict numeric"] = stale_numeric
+
+        unavailable_residue = copy.deepcopy(payload)
+        unavailable = next(
+            row for row in unavailable_residue["routes"]
+            if row["opportunity_class"] == "unavailable"
+        )
+        unavailable.update({
+            "gross_edge_usd": "100",
+            "gross_edge_bps": "100",
+            "target_token_quantity": "5",
+            "capacity_quantity": "10",
+        })
+        unavailable["cost_breakdown"] = {
+            "strict_nonembedded_usd": "1",
+            "research_bounded_usd": "2",
+            "research_assumed_usd": "3",
+        }
+        for component in unavailable["cost_components"]:
+            component["amount_usd"] = "1"
+            component["rate_bps"] = "1"
+        invalid["unavailable economic residue"] = unavailable_residue
+
+        generation = copy.deepcopy(payload)
+        generation["metadata"]["route_cohort_id"] = "cohort:" + "c" * 64
+        invalid["generation mismatch"] = generation
+
+        manifest_mismatch = copy.deepcopy(payload)
+        manifest_mismatch["metadata"]["manifest_sha256"] = "d" * 64
+        invalid["manifest mismatch"] = manifest_mismatch
+
+        inventory = copy.deepcopy(payload)
+        inventory["routes"].pop()
+        inventory["metadata"]["coverage"]["returned_count"] -= 1
+        invalid["route inventory divergence"] = inventory
+
+        wrong_age = copy.deepcopy(payload)
+        research = next(
+            row for row in wrong_age["routes"]
+            if row["opportunity_class"] == "research_estimate"
+        )
+        research["route_age_seconds"] = 999
+        invalid["recomputed route age"] = wrong_age
+
+        wrong_skew = copy.deepcopy(payload)
+        strict = next(
+            row for row in wrong_skew["routes"]
+            if row["opportunity_class"] == "executable_candidate"
+        )
+        strict["skew_seconds"] = 29.999999
+        invalid["recomputed route skew"] = wrong_skew
+
+        stale_wrong_reason = copy.deepcopy(payload)
+        research = next(
+            row for row in stale_wrong_reason["routes"]
+            if row["opportunity_class"] == "research_estimate"
+        )
+        research["leg_timestamps"] = {
+            "buy": "2026-08-01T11:58:30Z",
+            "sell": "2026-08-01T11:58:00Z",
+        }
+        research["skew_seconds"] = 30
+        research["route_age_seconds"] = 180
+        research["availability"] = {
+            "status": "unavailable",
+            "reason": "snapshot_skew_exceeded",
+        }
+        research["target_token_quantity"] = None
+        research["gross_edge_usd"] = None
+        research["gross_edge_bps"] = None
+        research["net_edge_usd"] = None
+        research["net_edge_bps"] = None
+        research["capacity_quantity"] = None
+        research["cost_breakdown"] = {
+            "strict_nonembedded_usd": None,
+            "research_bounded_usd": None,
+            "research_assumed_usd": None,
+        }
+        for component in research["cost_components"]:
+            component["amount_usd"] = None
+            component["rate_bps"] = None
+        invalid["stale route wrong reason"] = stale_wrong_reason
+
+        skew_wrong_reason = copy.deepcopy(payload)
+        research = next(
+            row for row in skew_wrong_reason["routes"]
+            if row["opportunity_class"] == "research_estimate"
+        )
+        research["leg_timestamps"] = {
+            "buy": "2026-08-01T12:01:00Z",
+            "sell": "2026-08-01T11:59:30Z",
+        }
+        research["skew_seconds"] = 90
+        research["route_age_seconds"] = 30
+        research["availability"] = {
+            "status": "unavailable",
+            "reason": "cohort_stale",
+        }
+        research["target_token_quantity"] = None
+        research["gross_edge_usd"] = None
+        research["gross_edge_bps"] = None
+        research["net_edge_usd"] = None
+        research["net_edge_bps"] = None
+        research["capacity_quantity"] = None
+        research["cost_breakdown"] = {
+            "strict_nonembedded_usd": None,
+            "research_bounded_usd": None,
+            "research_assumed_usd": None,
+        }
+        for component in research["cost_components"]:
+            component["amount_usd"] = None
+            component["rate_bps"] = None
+        invalid["skewed route wrong reason"] = skew_wrong_reason
+
+        wrong_source_market = copy.deepcopy(payload)
+        wrong_source_market["routes"][0]["source_links"][0][
+            "market_id"
+        ] = "cex:kraken:AAVE/USD"
+        invalid["source link leg mismatch"] = wrong_source_market
+
+        missing_cost = copy.deepcopy(payload)
+        strict = next(
+            row for row in missing_cost["routes"]
+            if row["opportunity_class"] == "executable_candidate"
+        )
+        strict["cost_components"].pop()
+        invalid["missing strict cost topology"] = missing_cost
+
+        wrong_cost_market = copy.deepcopy(payload)
+        strict = next(
+            row for row in wrong_cost_market["routes"]
+            if row["opportunity_class"] == "executable_candidate"
+        )
+        strict["cost_components"][0]["market_id"] = strict["sell_market_id"]
+        invalid["strict cost leg market mismatch"] = wrong_cost_market
+
+        duplicate_cost = copy.deepcopy(payload)
+        strict = next(
+            row for row in duplicate_cost["routes"]
+            if row["opportunity_class"] == "executable_candidate"
+        )
+        strict["cost_components"].append(
+            copy.deepcopy(strict["cost_components"][0])
+        )
+        invalid["duplicate strict cost topology"] = duplicate_cost
+
+        wrong_breakdown = copy.deepcopy(payload)
+        strict = next(
+            row for row in wrong_breakdown["routes"]
+            if row["opportunity_class"] == "executable_candidate"
+        )
+        strict["cost_breakdown"]["strict_nonembedded_usd"] = "19"
+        strict["net_edge_usd"] = "181"
+        invalid["strict cost breakdown mismatch"] = wrong_breakdown
+
+        false_embedded = copy.deepcopy(payload)
+        strict = next(
+            row for row in false_embedded["routes"]
+            if row["opportunity_class"] == "executable_candidate"
+        )
+        strict["cost_components"][0]["reflected_or_embedded"] = True
+        invalid["strict embedded breakdown mismatch"] = false_embedded
+
+        invalid_cost_flags = copy.deepcopy(payload)
+        strict = next(
+            row for row in invalid_cost_flags["routes"]
+            if row["opportunity_class"] == "executable_candidate"
+        )
+        strict["cost_components"][0]["strict_eligible"] = "true"
+        invalid["invalid strict cost provenance flags"] = invalid_cost_flags
+
+        inconsistent_embedded = copy.deepcopy(payload)
+        strict = next(
+            row for row in inconsistent_embedded["routes"]
+            if row["opportunity_class"] == "executable_candidate"
+        )
+        strict["cost_components"][0]["embedded_in_leg_quote"] = True
+        strict["cost_components"][0]["reflected_or_embedded"] = False
+        invalid["inconsistent embedded cost marker"] = inconsistent_embedded
+
+        missing_reason = copy.deepcopy(payload)
+        unavailable = next(
+            row for row in missing_reason["routes"]
+            if row["opportunity_class"] == "unavailable"
+        )
+        unavailable["availability"]["reason"] = None
+        unavailable["primary_reason"] = None
+        unavailable["reason_codes"] = []
+        invalid["missing N/A reason"] = missing_reason
+
+        secret = copy.deepcopy(payload)
+        secret["routes"][0]["source_links"][0]["url"] = (
+            "https://example.test?api_key=SECRET_SENTINEL"
+        )
+        invalid["secret material"] = secret
+
+        private_path = copy.deepcopy(payload)
+        private_path["routes"][0]["source_links"][0]["url"] = (
+            "/private/runtime/routes/manifest.json"
+        )
+        invalid["absolute path"] = private_path
+
+        unsafe_origins = {
+            "http source origin": "http://api.binance.com",
+            "loopback source origin": "https://127.0.0.1",
+            "private source origin": "https://10.0.0.5",
+            "internal source origin": "https://metadata.google.internal",
+            "unapproved source origin": "https://api.evil.example.org",
+        }
+        for label, url in unsafe_origins.items():
+            candidate = copy.deepcopy(payload)
+            candidate["routes"][0]["source_links"][0]["url"] = url
+            invalid[label] = candidate
+
+        for label, candidate in invalid.items():
+            filters = (
+                candidate["filters"] if label.startswith("mixed")
+                else expected_filters
+            )
+            with self.subTest(label=label), self.assertRaises(ReleaseCheckError):
+                release_checker._validate_opportunity_api_payload(
+                    candidate,
+                    _opportunity_metrics(
+                        "/api/markets/opportunities", candidate
+                    ),
+                    route_release=route_release,
+                    expected_filters=filters,
+                    raw_max=2_000_000,
+                    gzip_max=300_000,
+                    require_complete_inventory=(
+                        not label.startswith("mixed")
+                    ),
+                )
+
+        with self.assertRaisesRegex(ReleaseCheckError, "raw payload"):
+            release_checker._validate_opportunity_api_payload(
+                payload,
+                _opportunity_metrics(
+                    "/api/markets/opportunities",
+                    payload,
+                    raw_bytes=2_000_001,
+                ),
+                route_release=route_release,
+                expected_filters=expected_filters,
+                raw_max=2_000_000,
+                gzip_max=300_000,
+                require_complete_inventory=True,
+            )
+
+    def test_api_timing_sla_accepts_exact_boundary_and_fails_closed_after(self):
+        rows = opportunity_fixture.OpportunityPayloadTests()._rows()
+        manifest = opportunity_fixture._manifest(rows)
+        manifest_sha256 = "b" * 64
+        public_costs = [
+            component
+            for row in rows
+            for component in opportunity_fixture._route_costs(row)
+        ]
+        route_candidates = _route_candidates_for_rows(rows)
+        route_release = {
+            "status": "validated",
+            "reason": None,
+            "route_cohort_id": opportunity_fixture.COHORT_ID,
+            "manifest_sha256": manifest_sha256,
+            "strict_opportunity_count": 1,
+            "research_opportunity_count": 1,
+            "unavailable_opportunity_count": 1,
+            "opportunity_inventory_sha256": _opportunity_inventory_sha256(
+                rows
+            ),
+            release_checker._OPPORTUNITY_PUBLIC_BINDING_ROWS: (
+                release_checker._route_public_binding_inventory(
+                    rows,
+                    opportunity_fixture.LEGS,
+                    public_costs,
+                    route_candidates,
+                )
+            ),
+        }
+
+        for checked_at, expected_status, expected_reason in (
+            (
+                datetime.fromisoformat("2026-08-01T12:03:00+00:00"),
+                "available",
+                None,
+            ),
+            (
+                datetime.fromisoformat("2026-08-01T12:03:00.000001+00:00"),
+                "unavailable",
+                "cohort_stale",
+            ),
+        ):
+            with self.subTest(checked_at=checked_at.isoformat()):
+                payload = build_opportunity_payload(
+                    rows,
+                    manifest=manifest,
+                    legs=opportunity_fixture.LEGS,
+                    cost_components=public_costs,
+                    route_candidates=route_candidates,
+                    opportunity_class="all",
+                    availability="all",
+                    sort="route_id",
+                    direction="asc",
+                    now=checked_at,
+                    manifest_sha256=manifest_sha256,
+                )
+                _add_public_cost_provenance(payload, public_costs, rows)
+                validated = release_checker._validate_opportunity_api_payload(
+                    payload,
+                    _opportunity_metrics(
+                        "/api/markets/opportunities",
+                        payload,
+                        elapsed_ms=0,
+                    ),
+                    route_release=route_release,
+                    expected_filters=payload["filters"],
+                    raw_max=2_000_000,
+                    gzip_max=300_000,
+                    require_complete_inventory=True,
+                )
+                strict = next(
+                    row for row in validated["rows"]
+                    if row["opportunity_class"] == "executable_candidate"
+                )
+                self.assertEqual(
+                    strict["availability"],
+                    {"status": expected_status, "reason": expected_reason},
+                )
+
+    def test_api_rejects_cached_checked_at_outside_request_wall_clock(self):
+        loaded = self._loaded()
+        route_release = self._validate()
+        path = release_checker._opportunity_api_path(
+            release_checker._opportunity_filters()
+        )
+        payload = self._public_payload_for_path(loaded, path)
+        request_started_at = datetime.fromisoformat(
+            "2026-08-01T12:05:01+00:00"
+        )
+
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "checked_at.*request wall clock",
+        ):
+            release_checker._validate_opportunity_api_payload(
+                payload,
+                _opportunity_metrics(
+                    path,
+                    payload,
+                    request_started_at=request_started_at,
+                    response_completed_at=request_started_at,
+                ),
+                route_release=route_release,
+                expected_filters=payload["filters"],
+                raw_max=2_000_000,
+                gzip_max=300_000,
+                require_complete_inventory=True,
+            )
+
+    def test_api_rejects_response_that_crosses_freshness_after_projection(self):
+        loaded = self._loaded()
+        route_release = self._validate()
+        path = release_checker._opportunity_api_path(
+            release_checker._opportunity_filters()
+        )
+        checked_at = datetime.fromisoformat("2026-08-01T12:02:56+00:00")
+        request_started_at = datetime.fromisoformat(
+            "2026-08-01T12:03:00+00:00"
+        )
+        response_completed_at = datetime.fromisoformat(
+            "2026-08-01T12:03:01+00:00"
+        )
+        payload = build_opportunity_payload(
+            loaded["bundle"]["opportunities"],
+            manifest=loaded["manifest"],
+            legs=loaded["legs"],
+            cost_components=loaded["cost_components"],
+            route_candidates=loaded["bundle"]["routes"],
+            now=checked_at,
+            manifest_sha256=loaded["manifest_sha256"],
+            sort="route_id",
+            direction="asc",
+        )
+        _add_public_cost_provenance(
+            payload,
+            loaded["cost_components"],
+            loaded["bundle"]["opportunities"],
+        )
+
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "response completion.*freshness",
+        ):
+            release_checker._validate_opportunity_api_payload(
+                payload,
+                _opportunity_metrics(
+                    path,
+                    payload,
+                    request_started_at=request_started_at,
+                    response_completed_at=response_completed_at,
+                    elapsed_ms=1_000,
+                ),
+                route_release=route_release,
+                expected_filters=payload["filters"],
+                raw_max=2_000_000,
+                gzip_max=300_000,
+                require_complete_inventory=True,
+            )
+
+    def test_api_rechecks_sealed_cost_expiry_at_response_time(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        affected = set()
+        for component in bundle["cost_components"]:
+            if component["component_type"] == "venue_taker_fee":
+                component["valid_until"] = (
+                    "2026-08-01T12:02:00.500000Z"
+                )
+                affected.add(component["opportunity_id"])
+        for opportunity_id in sorted(affected):
+            _reseal_complete_opportunity(bundle, opportunity_id)
+        self._rewrite(bundle)
+        loaded = self._loaded()
+        route_release = self._validate(now="2026-08-01T12:02:00Z")
+        checked_at = datetime.fromisoformat("2026-08-01T12:02:01+00:00")
+        path = release_checker._opportunity_api_path(
+            release_checker._opportunity_filters()
+        )
+        correct = build_opportunity_payload(
+            loaded["bundle"]["opportunities"],
+            manifest=loaded["manifest"],
+            legs=loaded["legs"],
+            cost_components=loaded["cost_components"],
+            route_candidates=loaded["bundle"]["routes"],
+            now=checked_at,
+            manifest_sha256=loaded["manifest_sha256"],
+            sort="route_id",
+            direction="asc",
+        )
+        _add_public_cost_provenance(
+            correct,
+            loaded["cost_components"],
+            loaded["bundle"]["opportunities"],
+        )
+        validated = release_checker._validate_opportunity_api_payload(
+            correct,
+            _opportunity_metrics(path, correct),
+            route_release=route_release,
+            expected_filters=correct["filters"],
+            raw_max=2_000_000,
+            gzip_max=300_000,
+            require_complete_inventory=True,
+        )
+        self.assertTrue(all(
+            row["availability"]["reason"] == "cost_component_stale"
+            for row in validated["rows"]
+        ))
+
+        forged_costs = copy.deepcopy(loaded["cost_components"])
+        for component in forged_costs:
+            if component["component_type"] == "venue_taker_fee":
+                component["valid_until"] = "2026-08-01T13:00:00Z"
+        forged = build_opportunity_payload(
+            loaded["bundle"]["opportunities"],
+            manifest=loaded["manifest"],
+            legs=loaded["legs"],
+            cost_components=forged_costs,
+            route_candidates=loaded["bundle"]["routes"],
+            now=checked_at,
+            manifest_sha256=loaded["manifest_sha256"],
+            sort="route_id",
+            direction="asc",
+        )
+        _add_public_cost_provenance(
+            forged,
+            forged_costs,
+            loaded["bundle"]["opportunities"],
+        )
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "complete bundle|checked_at|cost",
+        ):
+            release_checker._validate_opportunity_api_payload(
+                forged,
+                _opportunity_metrics(path, forged),
+                route_release=route_release,
+                expected_filters=forged["filters"],
+                raw_max=2_000_000,
+                gzip_max=300_000,
+                require_complete_inventory=True,
+            )
 
     def test_valid_non_ascii_cost_evidence_uses_task7_canonical_encoding(self):
         bundle = copy.deepcopy(self._loaded()["bundle"])
@@ -515,6 +1723,18 @@ class RouteOpportunityReleaseGateTest(unittest.TestCase):
 
 
 class DashboardReleaseSmokeTest(unittest.TestCase):
+    def test_release_checker_uses_dashboard_route_root_override(self):
+        with patch.dict(
+            release_checker.os.environ,
+            {
+                "MARKET_DATA_DIR": "/runtime/market-data",
+                "MARKET_ROUTE_DATA_DIR": "/runtime/custom-routes",
+            },
+        ):
+            route_root = release_checker.configured_route_root()
+
+        self.assertEqual(route_root, Path("/runtime/custom-routes"))
+
     def test_release_cli_parses_required_route_cohort_flag(self):
         for flag in (
             "--require-route-cohort",
@@ -526,6 +1746,8 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 args = release_checker.parse_args()
 
             self.assertTrue(args.require_route_cohort)
+            self.assertEqual(args.opportunity_raw_max, 2_000_000)
+            self.assertEqual(args.opportunity_gzip_max, 300_000)
 
     def test_release_checks_required_complete_bundle_before_remote_requests(self):
         args = argparse.Namespace(
@@ -1507,7 +2729,22 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
 
         def fake_fetch(_base_url, path, *, timeout):
             fetched_paths.append(path)
-            if path == "/health":
+            if path.startswith("/api/markets/opportunities?"):
+                payload = build_unavailable_opportunity_payload(
+                    opportunity_class=(
+                        "strict" if "class=strict" in path
+                        else "estimate" if "class=estimate" in path
+                        else "all"
+                    ),
+                    availability=(
+                        "unavailable"
+                        if "availability=unavailable" in path
+                        else "all"
+                    ),
+                    sort="route_id",
+                    direction="asc",
+                )
+            elif path == "/health":
                 payload = copy.deepcopy(health_payload)
             elif path == "/api/markets/summary":
                 summary_state["count"] += 1

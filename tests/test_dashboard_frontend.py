@@ -34,6 +34,31 @@ def run_app_javascript(source: str, prelude: str = ""):
 
 
 class DashboardFrontendContractTest(unittest.TestCase):
+    def test_screener_daily_gap_labels_are_explicitly_research_only(self):
+        result = run_app_javascript(
+            """
+console.log(JSON.stringify(Object.fromEntries(
+  ["spread", "spread_max", "spread_mean", "spread_median"].map(
+    (key) => [key, SCREENER_SORT_DEFINITIONS[key].label],
+  ),
+)));
+"""
+        )
+        self.assertEqual(result, {
+            "spread": "Latest Daily Price Gap",
+            "spread_max": "Maximum Daily Price Gap",
+            "spread_mean": "Average Daily Price Gap",
+            "spread_median": "Median Daily Price Gap",
+        })
+
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        screener_start = index.index('id="screener-view"')
+        screener = index[screener_start:]
+        for label in result.values():
+            self.assertIn(f">{label}</option>", screener)
+        self.assertNotIn("Symmetric Price Gap", screener)
+        self.assertIn("quoted spread", APP_PATH.read_text(encoding="utf-8"))
+
     def test_public_pages_and_asset_manifest_have_the_same_versioned_bundle(self):
         asset_pattern = re.compile(
             r'(?:href|src)="/([^"?]+)\?v=__ASSET_VERSION__"'

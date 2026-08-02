@@ -6,6 +6,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, wait
 import argparse
 import ctypes
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import errno
 import hashlib
 import json
@@ -347,6 +348,79 @@ def _validated_routes(
         route_ids.add(route_id)
         normalized.append(dict(route))
     return normalized
+
+
+def _canonical_reference_volume(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("route volume lineage is invalid")
+    try:
+        amount = Decimal(value)
+    except (InvalidOperation, ValueError):
+        raise ValueError("route volume lineage is invalid") from None
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("route volume lineage is invalid")
+    text = format(amount, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _validate_route_volume_lineage(
+    routes: Iterable[Mapping[str, Any]],
+    selected_by_id: Mapping[str, Mapping[str, Any]],
+) -> None:
+    expected_by_market: Dict[str, Optional[str]] = {}
+    for market_id, leg in selected_by_id.items():
+        inputs = leg.get("selection_inputs")
+        if not isinstance(inputs, Mapping):
+            raise ValueError("route volume lineage is invalid")
+        market_type = _market_type(leg)
+        source_field = (
+            "cex_selected_window_usd"
+            if market_type == "cex"
+            else "dex_24h_usd"
+        )
+        if source_field not in inputs:
+            raise ValueError("route volume lineage is invalid")
+        expected_by_market[market_id] = _canonical_reference_volume(
+            inputs.get(source_field)
+        )
+
+    for route in routes:
+        buy_id = str(route.get("buy_market_id") or "")
+        sell_id = str(route.get("sell_market_id") or "")
+        if buy_id not in expected_by_market or sell_id not in expected_by_market:
+            raise ValueError("route volume lineage is invalid")
+        buy_volume = expected_by_market[buy_id]
+        sell_volume = expected_by_market[sell_id]
+        expected_route_volume = None
+        if buy_volume is not None and sell_volume is not None:
+            expected_route_volume = _canonical_reference_volume(
+                str(min(Decimal(buy_volume), Decimal(sell_volume)))
+            )
+        if (
+            route.get("buy_reference_volume_usd") != buy_volume
+            or route.get("sell_reference_volume_usd") != sell_volume
+            or route.get("route_volume_usd") != expected_route_volume
+            or route.get("route_volume_basis")
+            != "minimum_leg_source_horizon_usd"
+        ):
+            raise ValueError("route volume lineage is invalid")
+
+
+def _has_route_volume_lineage(
+    routes: Iterable[Mapping[str, Any]],
+    selected_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    route_fields = {
+        "buy_reference_volume_usd",
+        "sell_reference_volume_usd",
+        "route_volume_usd",
+        "route_volume_basis",
+    }
+    return any(
+        bool(route_fields & set(route)) for route in routes
+    ) or any("selection_inputs" in leg for leg in selected_by_id.values())
 
 
 def materialize_route_leg_rows(
@@ -1538,6 +1612,8 @@ def collect_route_cohort(
     market_ids = collect_unique_route_legs(routes)
     if set(market_ids) - set(legs_by_market):
         raise ValueError("route references an unselected leg")
+    if _has_route_volume_lineage(routes, legs_by_market):
+        _validate_route_volume_lineage(routes, legs_by_market)
     has_dex = any(_market_type(legs_by_market[item]) == "dex" for item in market_ids)
     if has_dex and dex_block_resolver is None:
         raise ValueError("DEX fixed block resolver is required")
@@ -2171,6 +2247,7 @@ def _validated_universe(
         if requested_end is not None and window.get("end") != requested_end:
             raise ValueError("requested date range does not match universe selection_window")
     normalized_routes = _validated_routes(routes)
+    _validate_route_volume_lineage(normalized_routes, selected_by_id)
     filtered_routes = [
         route for route in normalized_routes
         if tokens is None or route.get("token_symbol") in tokens

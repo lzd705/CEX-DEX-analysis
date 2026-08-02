@@ -91,8 +91,28 @@
     "current_window",
     "past",
   ]);
-  const PAIR_MODES = new Set(["manual"]);
+  const PAIR_MODES = new Set(["manual", "transient"]);
   const EXECUTION_NOTIONALS = new Set([1000, 5000, 10000, 50000, 100000]);
+  const OPPORTUNITY_CLASSES = new Set(["all", "strict", "estimate"]);
+  const OPPORTUNITY_ROUTE_TYPES = new Set([
+    "all",
+    "cex_cex",
+    "cex_dex",
+    "dex_dex",
+  ]);
+  const OPPORTUNITY_AVAILABILITY = new Set(["all", "available", "unavailable"]);
+  const OPPORTUNITY_SORTS = new Set([
+    "net_edge_usd",
+    "net_edge_bps",
+    "capacity_quantity",
+    "skew_seconds",
+    "route_age_seconds",
+    "volume",
+    "requested_notional_usd",
+    "token_symbol",
+    "route_id",
+  ]);
+  const OPPORTUNITY_DIRECTIONS = new Set(["asc", "desc"]);
   const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
   function stringValue(value) {
@@ -192,6 +212,77 @@
     return { kind: "screener", filters };
   }
 
+  function canonicalToken(value) {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().toUpperCase();
+    return /^[A-Z0-9][A-Z0-9._-]{0,63}$/.test(normalized)
+      ? normalized
+      : null;
+  }
+
+  function canonicalOpportunityVenue(value) {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().toLowerCase();
+    return normalized !== "all"
+      && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(normalized)
+      ? normalized
+      : null;
+  }
+
+  function validateOpportunityFilters(filters = {}) {
+    const normalized = {};
+    const errors = [];
+    const tokenInput = typeof filters.token === "string" ? filters.token.trim() : "";
+    if (tokenInput) {
+      normalized.token = tokenInput.toUpperCase();
+      if (canonicalToken(tokenInput) === null) {
+        errors.push(validationError("invalid_token", "token", normalized.token));
+      }
+    }
+    const venueInput = typeof filters.venue === "string" ? filters.venue.trim() : "";
+    if (venueInput) {
+      normalized.venue = venueInput.toLowerCase();
+      if (canonicalOpportunityVenue(venueInput) === null) {
+        errors.push(validationError("invalid_venue", "venue", normalized.venue));
+      }
+    }
+    return { valid: errors.length === 0, normalized, errors };
+  }
+
+  function parseOpportunities(params) {
+    const filters = {};
+    const tokenInput = firstParam(params, ["token"]);
+    const venueInput = firstParam(params, ["venue"]);
+    const filterValidation = validateOpportunityFilters({
+      token: tokenInput || "",
+      venue: venueInput || "",
+    });
+    const notional = collectedNotional(firstParam(params, ["notional"]));
+    const opportunityClass = firstParam(params, ["class"]);
+    const routeType = firstParam(params, ["route_type", "route"]);
+    const availability = firstParam(params, ["availability"]);
+    const sort = firstParam(params, ["sort"]);
+    const direction = firstParam(params, ["dir"]);
+    Object.assign(filters, filterValidation.normalized);
+    if (notional !== null) filters.notionalUsd = notional;
+    if (opportunityClass !== null && OPPORTUNITY_CLASSES.has(opportunityClass)) {
+      filters.opportunityClass = opportunityClass;
+    }
+    if (routeType !== null && OPPORTUNITY_ROUTE_TYPES.has(routeType)) {
+      filters.routeType = routeType;
+    }
+    if (availability !== null && OPPORTUNITY_AVAILABILITY.has(availability)) {
+      filters.availability = availability;
+    }
+    if (sort !== null && OPPORTUNITY_SORTS.has(sort)) filters.sort = sort;
+    if (direction !== null && OPPORTUNITY_DIRECTIONS.has(direction)) {
+      filters.dir = direction;
+    }
+    const route = { kind: "opportunities", filters };
+    if (!filterValidation.valid) route.validationErrors = filterValidation.errors;
+    return route;
+  }
+
   function parseWorkspaceState(page, params) {
     const state = {};
     const marketA = firstParam(params, ["marketA", "a"]);
@@ -255,6 +346,9 @@
     if (path === "/" || path === "/screener") {
       return parseScreener(params);
     }
+    if (path === "/opportunities") {
+      return parseOpportunities(params);
+    }
 
     const rawSegments = path.split("/").filter(Boolean);
     const segments = rawSegments.map(safeDecode);
@@ -306,6 +400,32 @@
     setDate(params, "start", filters.start);
     setDate(params, "end", filters.end);
     return withQuery("/screener", params);
+  }
+
+  function buildOpportunitiesPath(filters = {}) {
+    const params = new URLSearchParams();
+    const validation = validateOpportunityFilters(filters);
+    if (!validation.valid) {
+      const field = validation.errors[0]?.field || "filter";
+      throw new TypeError(`Opportunity ${field === "token" ? "Token" : field} is invalid`);
+    }
+    const token = validation.normalized.token || null;
+    const venue = validation.normalized.venue || null;
+    const notional = collectedNotional(filters.notionalUsd ?? filters.notional);
+    if (token !== null) params.set("token", token);
+    if (venue !== null) params.set("venue", venue);
+    if (notional !== null) params.set("notional", String(notional));
+    setEnum(params, "class", filters.opportunityClass, OPPORTUNITY_CLASSES);
+    setEnum(params, "route_type", filters.routeType, OPPORTUNITY_ROUTE_TYPES);
+    setEnum(
+      params,
+      "availability",
+      filters.availability,
+      OPPORTUNITY_AVAILABILITY,
+    );
+    setEnum(params, "sort", filters.sort, OPPORTUNITY_SORTS);
+    setEnum(params, "dir", filters.dir, OPPORTUNITY_DIRECTIONS);
+    return withQuery("/opportunities", params);
   }
 
   function buildWorkspacePath(token, page, state = {}) {
@@ -420,6 +540,8 @@
     WORKSPACE_PAGES,
     parseRoute,
     buildScreenerPath,
+    buildOpportunitiesPath,
+    validateOpportunityFilters,
     buildWorkspacePath,
     validatePair,
   });

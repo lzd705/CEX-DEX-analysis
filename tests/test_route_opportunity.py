@@ -665,6 +665,16 @@ class CommonQuantityTests(unittest.TestCase):
 
 
 class RouteOpportunityTests(unittest.TestCase):
+    def test_public_reason_registry_covers_every_mode_reason(self):
+        expected_mode_reasons = frozenset().union(
+            *route_opportunity._MODE_REASON_CODES_BY_MODE.values()
+        )
+
+        self.assertLessEqual(
+            expected_mode_reasons,
+            route_opportunity.ROUTE_OPPORTUNITY_REASON_CODES,
+        )
+
     def test_complete_positive_route_is_locally_ready_but_not_published_without_attestation(self):
         kwargs = strict_fixture()
 

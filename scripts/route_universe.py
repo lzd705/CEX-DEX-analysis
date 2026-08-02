@@ -20,6 +20,7 @@ ROUTE_UNIVERSE_SCHEMA = "route_universe/v1"
 REQUESTED_NOTIONALS_USD = (1000, 5000, 10000, 50000, 100000)
 _MARKET_TYPES = ("cex", "dex")
 _CAPABILITY_ORDER = {"unsupported": 0, "supported": 1, "proved": 2}
+_ROUTE_VOLUME_BASIS = "minimum_leg_source_horizon_usd"
 
 
 def _valid_timestamp(value: Any) -> bool:
@@ -44,6 +45,15 @@ def _decimal_text(value: Optional[Decimal]) -> Optional[str]:
     if value is None:
         return None
     return format(value, "f")
+
+
+def _canonical_decimal_text(value: Optional[Decimal]) -> Optional[str]:
+    if value is None:
+        return None
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -227,6 +237,13 @@ def _selection_key(row: Mapping[str, Any]) -> Tuple[int, Decimal, Decimal, Decim
     )
 
 
+def _reference_volume_usd(leg: Mapping[str, Any]) -> Optional[Decimal]:
+    inputs = leg["selection_inputs"]
+    if leg["market_type"] == "cex":
+        return _positive_decimal(inputs["cex_selected_window_usd"])
+    return _positive_decimal(inputs["dex_24h_usd"])
+
+
 def select_route_legs(
     catalog: Iterable[Mapping[str, Any]],
     depth_rows: Iterable[Mapping[str, Any]],
@@ -347,6 +364,14 @@ def build_route_universe(
                     "sell_market_id": sell_leg["market_id"],
                     "route_mode": route_mode,
                 }
+                buy_reference_volume = _reference_volume_usd(buy_leg)
+                sell_reference_volume = _reference_volume_usd(sell_leg)
+                route_volume = (
+                    min(buy_reference_volume, sell_reference_volume)
+                    if buy_reference_volume is not None
+                    and sell_reference_volume is not None
+                    else None
+                )
                 routes.append({
                     **identity,
                     "route_id": canonical_route_id(identity),
@@ -354,6 +379,14 @@ def build_route_universe(
                     "settlement_reason": settlement_reason,
                     "requested_notionals_usd": list(REQUESTED_NOTIONALS_USD),
                     "candidate_source_generation": candidate_source_generation,
+                    "buy_reference_volume_usd": _canonical_decimal_text(
+                        buy_reference_volume
+                    ),
+                    "sell_reference_volume_usd": _canonical_decimal_text(
+                        sell_reference_volume
+                    ),
+                    "route_volume_usd": _canonical_decimal_text(route_volume),
+                    "route_volume_basis": _ROUTE_VOLUME_BASIS,
                 })
     routes.sort(key=lambda row: row["route_id"])
     return {

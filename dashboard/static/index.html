@@ -18,6 +18,7 @@
       </div>
       <nav class="primary-navigation" aria-label="Primary navigation">
         <a href="/screener" data-app-route="screener">Screener</a>
+        <a href="/opportunities" data-app-route="opportunities">Opportunities</a>
         <a href="/tokens/AAVE/markets" data-app-route="markets">Markets</a>
         <a href="/tokens/AAVE/compare" data-app-route="research">Token Research</a>
         <a href="/actions.html">Data Actions</a>
@@ -559,7 +560,7 @@
                 </summary>
                 <div class="context-tooltip" role="tooltip">
                   <strong>Comparison method</strong>
-                  <p>Only source observations inside the selected UTC date window are compared. Prices and volumes are never filled, and the spread exists only when both markets have a value on the same date.</p>
+                  <p>Only source observations inside the selected UTC date window are compared. Prices and volumes are never filled. Daily Price Gap exists only when both markets have valid closing prices on the same UTC date.</p>
                   <p>Straight segments connect consecutive daily observations. Missing or invalid values and calendar gaps break the line; no interpolation or forward fill is applied. Verified event overlays show timing only and do not claim return impact or causality.</p>
                 </div>
               </details>
@@ -574,11 +575,11 @@
             <strong id="compare-date">—</strong>
           </div>
           <div>
-            <span>Absolute spread</span>
+            <span>Absolute Daily Price Gap</span>
             <strong id="compare-absolute">—</strong>
           </div>
           <div>
-            <span>Midpoint-relative spread</span>
+            <span>Daily Price Gap (midpoint-relative bps)</span>
             <strong id="compare-bps">—</strong>
           </div>
           <div>
@@ -619,7 +620,7 @@
               type="button"
               data-comparison-metric="spread"
               aria-pressed="false"
-            >Spread</button>
+            >Daily Price Gap</button>
             <button
               type="button"
               data-comparison-metric="volume"
@@ -671,7 +672,7 @@
           </figcaption>
         </figure>
         <p id="comparison-chart-description" class="sr-only">
-          Daily comparison chart. Choose Price, Spread, or Volume. Exact source observations remain
+          Daily comparison chart. Choose Price, Daily Price Gap, or Volume. Daily Price Gap uses same UTC date closing prices. Exact source observations remain
           available in the table below.
         </p>
 
@@ -691,7 +692,7 @@
                 <th scope="col" id="market-b-price-heading">B Price (USD)</th>
                 <th scope="col" id="market-b-volume-heading">B Volume (USD)</th>
                 <th scope="col">Absolute Price Difference (USD)</th>
-                <th scope="col">Midpoint-relative Spread (bps)</th>
+                <th scope="col">Daily Price Gap (bps)</th>
                 <th scope="col">Missing-value Rule</th>
               </tr>
             </thead>
@@ -874,6 +875,174 @@
       </section>
 
       <section
+        id="opportunities-view"
+        class="app-view opportunities-view"
+        data-app-view="opportunities"
+        aria-labelledby="opportunities-title"
+        aria-busy="false"
+        hidden
+      >
+        <div class="view-heading opportunities-heading">
+          <div>
+            <span class="eyebrow">Synchronized route research</span>
+            <h2 id="opportunities-title">Route Opportunities</h2>
+            <p>Rank synchronized routes only after route timing, execution, cost, capacity, and evidence gates are applied.</p>
+            <div class="module-context" aria-label="Opportunity classification legend">
+              <span class="module-chip opportunity-class-chip strict">Strict executable candidate</span>
+              <span class="module-chip opportunity-class-chip estimate">Research estimate</span>
+              <span class="module-chip opportunity-class-chip unavailable">Unavailable route</span>
+              <details class="context-info">
+                <summary aria-label="Opportunity classification details">
+                  <i data-lucide="info"></i>
+                </summary>
+                <div class="context-tooltip context-tooltip-wide" role="tooltip">
+                  <strong>Exact boundary</strong>
+                  <p>Strict candidates pass every published timing, evidence, cost, capacity, and route-mode gate. Research estimates retain explicit assumptions. Unavailable routes publish a reason instead of a numeric opportunity.</p>
+                  <p>Daily Price Gap remains a separate same-UTC-date close comparison; it is not an executable route.</p>
+                </div>
+              </details>
+            </div>
+          </div>
+          <div id="opportunity-cohort-status" class="contract-badge">Cohort not loaded</div>
+        </div>
+
+        <form id="opportunity-filter-form" class="opportunity-filter-toolbar" novalidate>
+          <label>
+            <span>Token</span>
+            <input id="opportunity-token" type="search" inputmode="text" autocomplete="off" placeholder="All Tokens" aria-label="Opportunity Token filter" aria-describedby="opportunity-filter-error" aria-invalid="false">
+          </label>
+          <label>
+            <span>Venue</span>
+            <input id="opportunity-venue" type="search" inputmode="text" autocomplete="off" list="opportunity-venue-options" placeholder="All venues" aria-label="Opportunity venue filter" aria-describedby="opportunity-filter-error" aria-invalid="false">
+            <datalist id="opportunity-venue-options"></datalist>
+          </label>
+          <label>
+            <span>Notional</span>
+            <select id="opportunity-notional" aria-label="Opportunity notional">
+              <option value="">All collected notionals</option>
+              <option value="1000">$1,000</option>
+              <option value="5000">$5,000</option>
+              <option value="10000">$10,000</option>
+              <option value="50000">$50,000</option>
+              <option value="100000">$100,000</option>
+            </select>
+          </label>
+          <label>
+            <span>Class</span>
+            <select id="opportunity-class" aria-label="Opportunity class">
+              <option value="all">All classes</option>
+              <option value="strict">Strict only</option>
+              <option value="estimate">Estimates only</option>
+            </select>
+          </label>
+          <label>
+            <span>Route</span>
+            <select id="opportunity-route-type" aria-label="Opportunity route type">
+              <option value="all">All route types</option>
+              <option value="cex_cex">CEX → CEX</option>
+              <option value="cex_dex">CEX ↔ DEX</option>
+              <option value="dex_dex">DEX → DEX</option>
+            </select>
+          </label>
+          <label>
+            <span>Availability</span>
+            <select id="opportunity-availability" aria-label="Opportunity availability">
+              <option value="all">All states</option>
+              <option value="available">Available</option>
+              <option value="unavailable">Unavailable</option>
+            </select>
+          </label>
+          <label>
+            <span>Rank by</span>
+            <select id="opportunity-sort" aria-label="Opportunity ranking metric">
+              <option value="net_edge_usd">Net edge (USD)</option>
+              <option value="net_edge_bps">Net edge (bps)</option>
+              <option value="capacity_quantity">Proved capacity</option>
+              <option value="skew_seconds">Snapshot skew</option>
+              <option value="route_age_seconds">Route age (seconds)</option>
+              <option value="volume">Route volume (USD)</option>
+              <option value="requested_notional_usd">Notional</option>
+              <option value="token_symbol">Token</option>
+              <option value="route_id">Route ID</option>
+            </select>
+          </label>
+          <label>
+            <span>Direction</span>
+            <select id="opportunity-direction" aria-label="Opportunity ranking direction">
+              <option value="desc">Highest first</option>
+              <option value="asc">Lowest first</option>
+            </select>
+          </label>
+          <button id="apply-opportunity-filters" class="icon-command" type="submit">
+            <i data-lucide="list-filter"></i>
+            <span>Apply filters</span>
+          </button>
+          <div id="opportunity-filter-error" class="opportunity-filter-error error-banner" role="alert" aria-live="assertive" hidden></div>
+        </form>
+
+        <div id="opportunity-loading" class="status-banner" role="status" aria-live="polite" hidden>Loading synchronized route opportunities…</div>
+        <div id="opportunity-status" class="status-banner" role="status" aria-live="polite" hidden></div>
+        <div id="opportunity-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+        <div id="opportunity-bundle-unavailable" class="status-banner opportunity-unavailable-state" role="status" aria-live="polite" hidden></div>
+
+        <div class="opportunity-inventories">
+          <section id="strict-opportunities" class="opportunity-inventory" aria-labelledby="strict-opportunities-title">
+            <div class="opportunity-section-heading">
+              <div>
+                <h3 id="strict-opportunities-title">Strict executable candidates</h3>
+                <p>Every published execution, timing, cost, capacity, and evidence gate passed.</p>
+              </div>
+              <span id="strict-opportunity-count" class="contract-badge">0 routes</span>
+            </div>
+            <div id="strict-opportunity-empty" class="status-banner opportunity-empty" hidden>No route currently satisfies every strict gate. This does not mean there is no Daily Price Gap or no market.</div>
+            <div class="opportunity-table-scroll" role="region" aria-label="Strict executable route rankings" tabindex="0">
+              <table class="opportunity-table">
+                <caption>Strict executable candidate routes.</caption>
+                <thead><tr><th scope="col">Token</th><th scope="col">Route</th><th scope="col">Notional</th><th scope="col">Route volume</th><th scope="col">Net edge</th><th scope="col">Net bps</th><th scope="col">Capacity</th><th scope="col">Skew</th><th scope="col">Age</th><th scope="col">Costs &amp; evidence</th></tr></thead>
+                <tbody id="strict-opportunity-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="estimate-opportunities" class="opportunity-inventory" aria-labelledby="estimate-opportunities-title">
+            <div class="opportunity-section-heading">
+              <div>
+                <h3 id="estimate-opportunities-title">Research estimates</h3>
+                <p>At least one route input is bounded, assumed, or not strict-publication eligible. Stale routes remain unavailable.</p>
+              </div>
+              <span id="estimate-opportunity-count" class="contract-badge">0 routes</span>
+            </div>
+            <div id="estimate-opportunity-empty" class="status-banner opportunity-empty" hidden>No research estimates match the current filters.</div>
+            <div class="opportunity-table-scroll" role="region" aria-label="Research-estimate route rankings" tabindex="0">
+              <table class="opportunity-table">
+                <caption>Research-estimate routes.</caption>
+                <thead><tr><th scope="col">Token</th><th scope="col">Route</th><th scope="col">Notional</th><th scope="col">Route volume</th><th scope="col">Net edge</th><th scope="col">Net bps</th><th scope="col">Capacity</th><th scope="col">Skew</th><th scope="col">Age</th><th scope="col">Costs &amp; evidence</th></tr></thead>
+                <tbody id="estimate-opportunity-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="unavailable-opportunities" class="opportunity-inventory" aria-labelledby="unavailable-opportunities-title">
+            <div class="opportunity-section-heading">
+              <div>
+                <h3 id="unavailable-opportunities-title">Unavailable routes</h3>
+                <p>Routes retained for coverage, with exact reason codes and no invented numeric edge.</p>
+              </div>
+              <span id="unavailable-opportunity-count" class="contract-badge">0 routes</span>
+            </div>
+            <div id="unavailable-opportunity-empty" class="status-banner opportunity-empty" hidden>No unavailable routes match the current filters.</div>
+            <div class="opportunity-table-scroll" role="region" aria-label="Unavailable route inventory" tabindex="0">
+              <table class="opportunity-table">
+                <caption>Unavailable routes with explicit reasons.</caption>
+                <thead><tr><th scope="col">Token</th><th scope="col">Route</th><th scope="col">Notional</th><th scope="col">Route volume</th><th scope="col">Net edge</th><th scope="col">Net bps</th><th scope="col">Capacity</th><th scope="col">Skew</th><th scope="col">Age</th><th scope="col">Costs &amp; evidence</th></tr></thead>
+                <tbody id="unavailable-opportunity-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section
         id="screener-view"
         class="app-view"
         data-app-view="screener"
@@ -914,10 +1083,10 @@
           <span>Rank by</span>
           <select id="sort-field">
             <option value="volume">USD Volume</option>
-            <option value="spread">Latest Symmetric Price Gap</option>
-            <option value="spread_max">Maximum Symmetric Price Gap</option>
-            <option value="spread_mean">Average Symmetric Price Gap</option>
-            <option value="spread_median">Median Symmetric Price Gap</option>
+            <option value="spread">Latest Daily Price Gap</option>
+            <option value="spread_max">Maximum Daily Price Gap</option>
+            <option value="spread_mean">Average Daily Price Gap</option>
+            <option value="spread_median">Median Daily Price Gap</option>
             <option value="return">Window Return</option>
             <option value="volatility">Daily Volatility</option>
             <option value="depth_100bps">Primary ±100 bps Depth</option>

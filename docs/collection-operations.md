@@ -339,6 +339,15 @@ bytes, and only then replaces `MARKET_DATA_DIR/routes/latest.json` with a
 `route_opportunity_pointer/v1` pointer. A failed finalization leaves the prior
 complete pointer and its original timestamp intact.
 
+Each sealed route candidate also carries its two ranking-volume inputs and a
+derived `route_volume_usd`. CEX legs bind the route-universe selected-window
+USD volume; DEX legs bind latest 24-hour USD volume. The route value is the
+exact minimum only when both inputs are positive, otherwise it is null. The
+basis is fixed to `minimum_leg_source_horizon_usd`, is projected into CSV and
+SQLite, and is rechecked against the public API by the release gate. It must
+not be relabeled as route capacity, a synchronized flow measure, or a fill
+guarantee.
+
 The private `MARKET_DATA_DIR/routes/core/latest.json` pointer may advance while
 finalization is in progress. Readers never use that core pointer as a public
 opportunity generation. They continue to use the last validated complete
@@ -371,8 +380,28 @@ the Task 7 publication attestation. Authenticated/estimated status cannot be
 rewritten, a reflected pool fee cannot be charged twice, and an authenticated
 gas row with a fabricated zero amount fails closed.
 
-This release-gate change installs no collection timer and exposes no public
-route API. Funding Rate remains excluded and Upbit inputs remain unchanged.
+The same release run now performs a cold and warm read of the public
+`/api/markets/opportunities` projection. It requires exact cohort and manifest
+lineage, strict/research/unavailable count parity, full opportunity-inventory
+hash parity, and filter parity for strict, estimate, unavailable, and one
+Token/Venue/notional/route-type slice. Filtered responses must preserve the
+full cohort, manifest, count, Venue inventory, and next-freshness-deadline
+metadata. The checker independently recomputes route age/skew from the response
+clock and both leg timestamps, binds source links to those exact legs, validates
+the complete cost-component topology, and reproduces each public cost total
+from its strict/reflected provenance flags. Every N/A route value retains a
+public reason; stale strict rows retain identity but no numeric rank. Public
+payloads are rejected if they contain absolute filesystem paths, secret-bearing
+fields or values, or exceed the default 2,000,000-byte raw / 300,000-byte gzip
+budgets. The JSON release report records cold/warm latency and byte counts.
+
+When no complete pointer exists, the checker still requests the endpoint and
+requires HTTP 200 with `availability.status=unavailable`, the fixed
+`complete_pointer_absent` reason, an empty route array, and zero coverage. It
+does not reinterpret absence as an empty profitable inventory or numeric zero.
+
+This read-only release gate does not start collection. It does not install or enable a timer.
+Funding Rate remains excluded and Upbit inputs remain unchanged.
 
 ## Lock and manifest
 

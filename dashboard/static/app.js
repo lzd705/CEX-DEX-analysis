@@ -10,6 +10,7 @@ const app = {
   execution: null,
   eventFacts: null,
   quality: null,
+  opportunities: null,
   scope: "combined",
   sortDirection: "desc",
   workspaceMarketType: "all",
@@ -40,6 +41,7 @@ const app = {
   qualityRequestId: 0,
   eventRequestId: 0,
   snapshotRefreshRequestId: 0,
+  opportunityRequestId: 0,
   marketController: null,
   catalogController: null,
   marketRequestWindowKey: "",
@@ -48,6 +50,7 @@ const app = {
   qualityController: null,
   eventController: null,
   snapshotRefreshController: null,
+  opportunityController: null,
   liquidityLayoutMode: null,
   liquidityResizeScheduled: false,
   liquidityResizeObserver: null,
@@ -172,25 +175,25 @@ const SCREENER_SORT_DEFINITIONS = Object.freeze({
     snapshot: false,
   }),
   spread: Object.freeze({
-    label: "Latest Symmetric Price Gap",
+    label: "Latest Daily Price Gap",
     allowedScopes: Object.freeze(["cross"]),
     defaultScope: "cross",
     snapshot: false,
   }),
   spread_max: Object.freeze({
-    label: "Maximum Symmetric Price Gap",
+    label: "Maximum Daily Price Gap",
     allowedScopes: Object.freeze(["cross"]),
     defaultScope: "cross",
     snapshot: false,
   }),
   spread_mean: Object.freeze({
-    label: "Average Symmetric Price Gap",
+    label: "Average Daily Price Gap",
     allowedScopes: Object.freeze(["cross"]),
     defaultScope: "cross",
     snapshot: false,
   }),
   spread_median: Object.freeze({
-    label: "Median Symmetric Price Gap",
+    label: "Median Daily Price Gap",
     allowedScopes: Object.freeze(["cross"]),
     defaultScope: "cross",
     snapshot: false,
@@ -219,6 +222,38 @@ const SCREENER_SORT_DEFINITIONS = Object.freeze({
     defaultScope: "dex",
     snapshot: true,
   }),
+});
+const OPPORTUNITY_REASON_LABELS = Object.freeze({
+  complete_pointer_absent: "The complete opportunity bundle is not published.",
+  complete_bundle_published: "The complete opportunity bundle is published.",
+  positive_strict_net_edge: "Every strict route and publication gate passed.",
+  route_deadline_exceeded: "The synchronized route collection deadline expired.",
+  execution_adapter_unsupported: "At least one route leg lacks a supported execution adapter.",
+  buy_leg_unavailable: "The buy-leg execution observation is unavailable.",
+  sell_leg_unavailable: "The sell-leg execution observation is unavailable.",
+  leg_not_completely_filled: "At least one route leg could not fill the common Token quantity.",
+  invalid_state_timestamp: "A route-leg timestamp is invalid.",
+  snapshot_skew_exceeded: "Snapshot skew exceeds the synchronized route SLA.",
+  common_quantity_unavailable: "The route legs do not share a proved Token quantity.",
+  quantity_quote_evidence_mismatch: "Quantity-quote evidence could not be replayed exactly.",
+  usd_conversion_unavailable: "A route-leg USD conversion is unavailable.",
+  cohort_stale: "The synchronized route cohort is older than the strict freshness SLA.",
+  unsupported_cross_chain_settlement: "Cross-chain settlement is not proved for this route.",
+  atomic_route_simulation_unavailable: "Atomic route simulation evidence is unavailable.",
+  mode_expected_request_unavailable: "Required route-mode request evidence is unavailable.",
+  inventory_unavailable: "Pre-positioned inventory evidence is unavailable.",
+  inventory_request_mismatch: "Inventory evidence does not match this route request.",
+  inventory_insufficient: "Proved inventory is insufficient for the common quantity.",
+  dex_buy_quantity_quote_unavailable: "The DEX buy leg has no quantity-specific quote evidence.",
+  dex_buy_authoritative_upstream_unavailable: "The DEX buy quote lacks authoritative upstream evidence.",
+  rebalance_transfer_evidence_unavailable: "Rebalance or transfer evidence is unavailable.",
+  quantity_quote_evidence_not_strict: "Quantity-quote evidence is estimate-only.",
+  usd_conversion_not_strict: "USD conversion evidence is estimate-only.",
+  cost_components_incomplete: "Required route costs are incomplete.",
+  cost_component_stale: "At least one route cost component is stale.",
+  cost_component_estimated: "At least one route cost component is estimated.",
+  non_positive_net_edge: "The proved net edge is not positive.",
+  publication_evidence_unverified: "Strict publication attestation is not verified.",
 });
 
 const byId = (id) => document.getElementById(id);
@@ -427,6 +462,7 @@ function currentWorkspaceRouteState(
     state.marketA ||= app.route.state?.marketA || "";
     state.marketB ||= app.route.state?.marketB || "";
   }
+  if (app.pairSelectionSource === "transient") state.pairMode = "transient";
   if (!state.marketA || !state.marketB) state.pairMode = "manual";
   state.start = window.start || "";
   state.end = window.end || "";
@@ -534,9 +570,16 @@ function replaceCurrentRoute({
   allowBeforeReady = false,
 } = {}) {
   if (!navigation || (!app.routeReady && !allowBeforeReady)) return;
+  if (
+    app.route?.kind === "opportunities"
+    && Array.isArray(app.route.validationErrors)
+    && app.route.validationErrors.length
+  ) return;
   let path;
   if (app.route.kind === "workspace") {
     path = currentWorkspacePath(app.route.page, { window });
+  } else if (app.route.kind === "opportunities") {
+    path = navigation.buildOpportunitiesPath(app.route.filters || {});
   } else {
     path = navigation.buildScreenerPath(currentScreenerFilters({ window }));
   }
@@ -560,9 +603,16 @@ function navigateTo(path, { replace = false } = {}) {
 
 function canonicalizeCurrentRoute() {
   if (!navigation || !app.routeReady) return;
+  if (
+    app.route?.kind === "opportunities"
+    && Array.isArray(app.route.validationErrors)
+    && app.route.validationErrors.length
+  ) return;
   let path;
   if (app.route.kind === "workspace") {
     path = currentWorkspacePath(app.route.page);
+  } else if (app.route.kind === "opportunities") {
+    path = navigation.buildOpportunitiesPath(app.route.filters || {});
   } else {
     path = navigation.buildScreenerPath(currentScreenerFilters());
   }
@@ -868,6 +918,9 @@ function routeTitle(route) {
     };
     return `${route.token} ${labels[route.page]} · CEX / DEX Market Monitor`;
   }
+  if (route.kind === "opportunities") {
+    return "Opportunities · CEX / DEX Market Monitor";
+  }
   return "Market Screener · CEX / DEX Market Monitor";
 }
 
@@ -875,6 +928,8 @@ function announceRoute(route) {
   document.title = routeTitle(route);
   const label = route.kind === "workspace"
     ? `${route.token} ${route.page} page`
+    : route.kind === "opportunities"
+      ? "Opportunities page"
     : "Market Screener page";
   byId("route-announcer").textContent = `Showing ${label}.`;
 }
@@ -915,6 +970,18 @@ function applyScreenerRoute(route) {
   syncMarketPayloadForWindow(window.start, window.end);
 }
 
+function applyOpportunitiesRoute(route) {
+  app.route = route;
+  const filters = hydrateOpportunityControls(route);
+  setActiveAppView("opportunities");
+  byId("time-toolbar").hidden = true;
+  if (Array.isArray(route?.validationErrors) && route.validationErrors.length) {
+    clearOpportunityFilterResult(route.validationErrors);
+    return Promise.resolve(false);
+  }
+  return loadOpportunities(filters);
+}
+
 function applyWorkspaceRoute(route) {
   const exactToken = app.payload.tokens
     .map((token) => token.token_symbol)
@@ -931,6 +998,9 @@ function applyWorkspaceRoute(route) {
   }
   hideError(byId("error-banner"));
   app.route = { ...route, token: exactToken };
+  app.pairSelectionSource = route.state?.pairMode === "transient"
+    ? "transient"
+    : "";
   byId("facts-token").value = exactToken;
   const markets = factsMarketsForToken(exactToken);
   const routeProvidedPair = Boolean(route.state?.marketA || route.state?.marketB);
@@ -946,6 +1016,7 @@ function applyWorkspaceRoute(route) {
       requestedA: validation.marketA?.market_id || "",
       requestedB: validation.marketB?.market_id || "",
       allowDefaults: false,
+      persistSelection: app.pairSelectionSource !== "transient",
     });
     const invalidReferenceErrors = validation.errors.filter((error) => (
       !["market_a_required", "market_b_required"].includes(error.code)
@@ -1236,6 +1307,11 @@ async function applyRouteFromLocation({ preserveWorkspaceError = false } = {}) {
   );
   let route = navigation.parseRoute(window.location.pathname, window.location.search);
   if (route.kind !== "unknown") app.route = route;
+  if (route.kind === "opportunities") {
+    finalizeRoutePresentation();
+    return applyOpportunitiesRoute(route);
+  }
+  invalidateOpportunityRequest();
   if (route.kind === "workspace") {
     const provisionalToken = String(route.token || "").toUpperCase();
     const provisionalWindow = app.payload
@@ -2044,6 +2120,502 @@ function naFactMarkup(reason, {
     <summary aria-label="${escapeHtml(naFactAriaLabel(context))}"><span>N/A</span><i data-lucide="info"></i></summary>
     <div class="na-disclosure-panel"><p>${escapeHtml(reason)}</p>${action}</div>
   </details>`;
+}
+
+function opportunityNumber(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function opportunityReason(code, fallback = "The published route value is unavailable.") {
+  return OPPORTUNITY_REASON_LABELS[code] || fallback;
+}
+
+function opportunityNaMarkup(reason, context = {}) {
+  return naFactMarkup(reason, context).replace(
+    'class="na-disclosure"',
+    'class="na-disclosure opportunity-na-disclosure"',
+  );
+}
+
+function opportunityValueMarkup(value, formatter, reason, context = {}) {
+  const number = opportunityNumber(value);
+  if (number === null) return opportunityNaMarkup(reason, context);
+  return `<span data-opportunity-value="${escapeHtml(String(number))}">`
+    + `${escapeHtml(formatter(number))}</span>`;
+}
+
+function opportunityRouteReason(route) {
+  const code = route?.availability?.reason
+    || route?.primary_reason
+    || route?.reason_codes?.[0]
+    || "";
+  return opportunityReason(code);
+}
+
+function opportunityComponentReason(component, route) {
+  const status = String(component?.value_status || "");
+  if (status === "not_applicable") {
+    return "Not applicable under this route contract; no numeric cost is inferred.";
+  }
+  if (component?.reason_code) {
+    const known = OPPORTUNITY_REASON_LABELS[component.reason_code];
+    return known || (
+      `Cost component status: ${status || "unavailable"}. `
+      + `Reason code: ${component.reason_code}.`
+    );
+  }
+  if (route?.availability?.status === "unavailable") {
+    return opportunityRouteReason(route);
+  }
+  if (["unavailable", "unsupported", "failed", "stale"].includes(status)) {
+    return `Cost component status: ${status}. No numeric cost is inferred.`;
+  }
+  return "No numeric amount was published for this cost component.";
+}
+
+function opportunityComponentEvidence(component) {
+  const status = String(component?.value_status || "status unavailable");
+  const strictness = component?.strict_eligible === true
+    ? "strict eligible"
+    : "not strict eligible";
+  const reflection = component?.reflected_or_embedded === true
+    ? "reflected or embedded"
+    : "not reflected or embedded";
+  const reason = component?.reason_code
+    ? ` · reason ${component.reason_code}`
+    : "";
+  return `${status} · ${strictness} · ${reflection}${reason}`;
+}
+
+function formatOpportunityTimestamp(value) {
+  if (!value) return "time unavailable";
+  const exact = String(value).trim().match(
+    /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?:Z|\+00:00)$/,
+  );
+  if (exact) return `${exact[1]} ${exact[2]} UTC`;
+  return String(value);
+}
+
+function formatOpportunitySeconds(value) {
+  return String(value);
+}
+
+function opportunitySourceLinks(route) {
+  const links = Array.isArray(route?.source_links) ? route.source_links : [];
+  const safe = links.filter((link) => (
+    typeof link?.url === "string"
+    && /^https:\/\//i.test(link.url)
+  ));
+  if (!safe.length) return "";
+  return `<div class="opportunity-source-links">${safe.map((link) => (
+    `<a href="${escapeHtml(link.url)}" target="_blank" rel="noopener noreferrer">`
+      + `${escapeHtml(link.market_id || "Source evidence")}</a>`
+  )).join("")}</div>`;
+}
+
+function opportunityCostMarkup(route) {
+  const reason = opportunityRouteReason(route);
+  const context = {
+    token: route?.token_symbol || "",
+    marketLabel: route?.route_id || "",
+  };
+  const gross = opportunityNumber(route?.gross_edge_usd);
+  const strictCost = opportunityNumber(route?.cost_breakdown?.strict_nonembedded_usd);
+  const boundedCost = opportunityNumber(route?.cost_breakdown?.research_bounded_usd);
+  const assumedCost = opportunityNumber(route?.cost_breakdown?.research_assumed_usd);
+  const net = opportunityNumber(route?.net_edge_usd);
+  const costs = [strictCost, boundedCost, assumedCost];
+  const totalCost = costs.every((value) => value !== null)
+    ? costs.reduce((total, value) => total + value, 0)
+    : null;
+  const reconciled = gross !== null && totalCost !== null && net !== null
+    && Math.abs((gross - totalCost) - net) <= 1e-8;
+  const components = Array.isArray(route?.cost_components)
+    ? route.cost_components
+    : [];
+  const componentMarkup = components.length
+    ? `<ul class="opportunity-cost-components">${components.map((component) => {
+        const label = [component.leg, component.component_type]
+          .filter(Boolean).join(" · ") || "Cost component";
+        return `<li><span>${escapeHtml(label)}</span>`
+          + `<span class="metric-note opportunity-cost-evidence">${escapeHtml(opportunityComponentEvidence(component))}</span>`
+          + opportunityValueMarkup(
+            component.amount_usd,
+            formatRawUsd,
+            opportunityComponentReason(component, route),
+            { ...context, factLabel: label },
+          )
+          + "</li>";
+      }).join("")}</ul>`
+    : "";
+  const attr = (value) => value === null ? "" : escapeHtml(String(value));
+  return `<details class="opportunity-cost-disclosure"
+      data-gross-edge-usd="${attr(gross)}"
+      data-total-cost-usd="${attr(totalCost)}"
+      data-net-edge-usd="${attr(net)}">
+    <summary aria-label="Cost and evidence details for ${escapeHtml(route?.route_id || "route")}">Cost details</summary>
+    <div class="na-disclosure-panel opportunity-cost-panel">
+      <dl>
+        <div><dt>Gross edge</dt><dd>${opportunityValueMarkup(gross, formatRawUsd, reason, { ...context, factLabel: "gross edge" })}</dd></div>
+        <div><dt>Strict published costs</dt><dd>${opportunityValueMarkup(strictCost, formatRawUsd, reason, { ...context, factLabel: "strict published costs" })}</dd></div>
+        <div><dt>Bounded research costs</dt><dd>${opportunityValueMarkup(boundedCost, formatRawUsd, reason, { ...context, factLabel: "bounded research costs" })}</dd></div>
+        <div><dt>Assumed research costs</dt><dd>${opportunityValueMarkup(assumedCost, formatRawUsd, reason, { ...context, factLabel: "assumed research costs" })}</dd></div>
+        <div><dt>Total applied costs</dt><dd>${opportunityValueMarkup(totalCost, formatRawUsd, reason, { ...context, factLabel: "total applied costs" })}</dd></div>
+        <div><dt>Published net edge</dt><dd>${opportunityValueMarkup(net, formatRawUsd, reason, { ...context, factLabel: "published net edge" })}</dd></div>
+      </dl>
+      <p class="metric-note">${reconciled
+        ? "Reconciled: gross edge − published costs = net edge."
+        : "Cost reconciliation is unavailable because at least one published input is missing."}</p>
+      ${componentMarkup}
+      ${opportunitySourceLinks(route)}
+    </div>
+  </details>`;
+}
+
+function opportunityRowMarkup(route) {
+  const reason = opportunityRouteReason(route);
+  const reasonCode = route?.availability?.reason
+    || route?.primary_reason
+    || route?.reason_codes?.[0]
+    || "reason_unavailable";
+  const token = route?.token_symbol || "Unknown Token";
+  const routeId = route?.route_id || "Unknown route";
+  const context = { token, marketLabel: routeId };
+  const buy = route?.buy_market_id || "Buy leg unavailable";
+  const sell = route?.sell_market_id || "Sell leg unavailable";
+  const routePath = typeof navigation?.buildWorkspacePath === "function"
+    ? navigation.buildWorkspacePath(token, "liquidity", {
+      marketA: route?.buy_market_id || "",
+      marketB: route?.sell_market_id || "",
+      pairMode: "transient",
+    })
+    : "";
+  const routeIdentity = routePath
+    ? `<a class="opportunity-route-id route-action" href="${escapeHtml(routePath)}">${escapeHtml(routeId)}</a>`
+    : `<span class="opportunity-route-id">${escapeHtml(routeId)}</span>`;
+  const buyObserved = route?.leg_timestamps?.buy
+    ? formatOpportunityTimestamp(route.leg_timestamps.buy)
+    : "unavailable";
+  const sellObserved = route?.leg_timestamps?.sell
+    ? formatOpportunityTimestamp(route.leg_timestamps.sell)
+    : "unavailable";
+  const routeVolumeReason = [
+    "One or both route legs lack a positive source-horizon USD volume; no zero is inferred.",
+    "CEX uses selected-window USD volume and DEX uses latest 24-hour USD volume.",
+    "This value is a ranking reference, not executable capacity.",
+  ].join(" ");
+  return `<tr data-opportunity-class="${escapeHtml(route?.opportunity_class || "unavailable")}" data-route-id="${escapeHtml(routeId)}">
+    <td data-label="Token"><strong>${escapeHtml(token)}</strong></td>
+    <td data-label="Route">${routeIdentity}<span class="metric-note">${escapeHtml(buy)} → ${escapeHtml(sell)}</span><span class="metric-note">Buy ${escapeHtml(buyObserved)} · Sell ${escapeHtml(sellObserved)}</span><span class="metric-note">${escapeHtml(route?.route_type || "route type unavailable")} · ${escapeHtml(route?.route_mode || "mode unavailable")}</span></td>
+    <td data-label="Notional">${opportunityValueMarkup(route?.requested_notional_usd, formatRawUsd, reason, { ...context, factLabel: "requested notional" })}</td>
+    <td data-label="Route volume">${opportunityValueMarkup(route?.route_volume_usd, formatRawVolume, routeVolumeReason, { ...context, factLabel: "route reference volume" })}</td>
+    <td data-label="Net edge">${opportunityValueMarkup(route?.net_edge_usd, formatRawUsd, reason, { ...context, factLabel: "net edge" })}</td>
+    <td data-label="Net bps">${opportunityValueMarkup(route?.net_edge_bps, (value) => `${bpsFormat.format(value)} bps`, reason, { ...context, factLabel: "net edge bps" })}</td>
+    <td data-label="Capacity">${opportunityValueMarkup(route?.capacity_quantity, (value) => rawVolume.format(value), reason, { ...context, factLabel: "proved capacity" })}</td>
+    <td data-label="Skew">${opportunityValueMarkup(route?.skew_seconds, (value) => `${formatOpportunitySeconds(value)} s`, reason, { ...context, factLabel: "snapshot skew" })}</td>
+    <td data-label="Age">${opportunityValueMarkup(route?.route_age_seconds, (value) => `${formatOpportunitySeconds(value)} s`, reason, { ...context, factLabel: "route age" })}</td>
+    <td data-label="Costs & evidence">${opportunityCostMarkup(route)}<span class="opportunity-reason-code">${escapeHtml(reasonCode)}</span><span class="metric-note">${escapeHtml(reason)}</span></td>
+  </tr>`;
+}
+
+function opportunityInventoryVisibility(filters = {}) {
+  const opportunityClass = filters.opportunity_class || "all";
+  const availability = filters.availability || "all";
+  return {
+    strict: opportunityClass !== "estimate" && availability !== "unavailable",
+    estimate: opportunityClass !== "strict" && availability !== "unavailable",
+    unavailable: availability !== "available",
+  };
+}
+
+function renderOpportunityInventory(name, routes, visible) {
+  const section = byId(`${name}-opportunities`);
+  const body = byId(`${name}-opportunity-body`);
+  const count = byId(`${name}-opportunity-count`);
+  const empty = byId(`${name}-opportunity-empty`);
+  section.hidden = !visible;
+  body.innerHTML = routes.map(opportunityRowMarkup).join("");
+  count.textContent = `${routes.length} ${routes.length === 1 ? "route" : "routes"}`;
+  const emptyMessages = {
+    strict: "No route currently satisfies every strict gate. This does not mean there is no Daily Price Gap or no market.",
+    estimate: "No research estimates match the current filters.",
+    unavailable: "No unavailable routes match the current filters.",
+  };
+  empty.textContent = emptyMessages[name];
+  empty.hidden = !visible || routes.length > 0;
+}
+
+function renderOpportunities(payload) {
+  app.opportunities = payload;
+  const venueOptions = Array.isArray(payload?.metadata?.available_venues)
+    ? payload.metadata.available_venues.filter((venue) => (
+        typeof venue === "string" && venue.length
+      ))
+    : [];
+  const venueList = byId("opportunity-venue-options");
+  if (venueList) {
+    venueList.innerHTML = venueOptions
+      .map((venue) => `<option value="${escapeHtml(venue)}"></option>`)
+      .join("");
+  }
+  byId("opportunities-view")?.setAttribute("aria-busy", "false");
+  hideStatus(byId("opportunity-loading"));
+  hideError(byId("opportunity-error"));
+  const bundleAvailable = payload?.availability?.status === "available";
+  if (!bundleAvailable) {
+    const reasonCode = payload?.availability?.reason || "complete_pointer_absent";
+    const cohortBadge = byId("opportunity-cohort-status");
+    cohortBadge.textContent = "Bundle unavailable";
+    cohortBadge.removeAttribute("title");
+    cohortBadge.setAttribute("aria-label", "Route opportunity cohort unavailable");
+    showStatus(
+      byId("opportunity-bundle-unavailable"),
+      `${opportunityReason(reasonCode)} No route inventory is inferred. No numeric zero is inferred.`,
+      "warning",
+    );
+    ["strict", "estimate", "unavailable"].forEach((name) => {
+      byId(`${name}-opportunities`).hidden = true;
+      byId(`${name}-opportunity-body`).innerHTML = "";
+      byId(`${name}-opportunity-empty`).hidden = true;
+      byId(`${name}-opportunity-count`).textContent = "Unavailable";
+    });
+    showStatus(
+      byId("opportunity-status"),
+      "Synchronized route opportunity publication is unavailable.",
+      "warning",
+    );
+    if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
+    return;
+  }
+
+  hideStatus(byId("opportunity-bundle-unavailable"));
+  const routes = Array.isArray(payload.routes) ? payload.routes : [];
+  const strict = routes.filter((route) => (
+    route?.opportunity_class === "executable_candidate"
+    && route?.availability?.status === "available"
+  ));
+  const estimates = routes.filter((route) => (
+    route?.opportunity_class === "research_estimate"
+    && route?.availability?.status === "available"
+  ));
+  const unavailable = routes.filter((route) => (
+    route?.opportunity_class === "unavailable"
+    || route?.availability?.status !== "available"
+  ));
+  const visible = opportunityInventoryVisibility(payload.filters || {});
+  renderOpportunityInventory("strict", strict, visible.strict);
+  renderOpportunityInventory("estimate", estimates, visible.estimate);
+  renderOpportunityInventory("unavailable", unavailable, visible.unavailable);
+  const cohortId = payload?.metadata?.route_cohort_id || "Published cohort";
+  const cohortBadge = byId("opportunity-cohort-status");
+  const compactCohortId = cohortId.length > 30
+    ? `${cohortId.slice(0, 15)}…${cohortId.slice(-10)}`
+    : cohortId;
+  cohortBadge.textContent = compactCohortId;
+  cohortBadge.setAttribute("title", cohortId);
+  cohortBadge.setAttribute("aria-label", `Route opportunity cohort ${cohortId}`);
+  const checkedAt = payload?.metadata?.checked_at
+    ? ` · checked ${formatUtcTimestamp(payload.metadata.checked_at)}`
+    : "";
+  const maxAge = Number(payload?.metadata?.max_route_age_seconds);
+  const maxSkew = Number(payload?.metadata?.max_route_skew_seconds);
+  const sla = Number.isFinite(maxAge) && Number.isFinite(maxSkew)
+    ? ` · SLA age ≤ ${rawVolume.format(maxAge)}s · skew ≤ ${rawVolume.format(maxSkew)}s`
+    : "";
+  showStatus(
+    byId("opportunity-status"),
+    `${routes.length} published route ${routes.length === 1 ? "scenario" : "scenarios"} match the current filters${checkedAt}${sla}.`,
+    routes.length ? "success" : "warning",
+  );
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
+}
+
+function defaultOpportunityDirection(sort) {
+  return ["route_age_seconds", "skew_seconds"].includes(sort)
+    ? "asc"
+    : "desc";
+}
+
+function normalizedOpportunityFilters(filters = {}) {
+  const sort = filters.sort || "net_edge_usd";
+  return {
+    token: filters.token || "",
+    venue: filters.venue || "",
+    notionalUsd: filters.notionalUsd || "",
+    opportunityClass: filters.opportunityClass || "all",
+    routeType: filters.routeType || "all",
+    availability: filters.availability || "all",
+    sort,
+    dir: ["asc", "desc"].includes(filters.dir)
+      ? filters.dir
+      : defaultOpportunityDirection(sort),
+  };
+}
+
+function hydrateOpportunityControls(route) {
+  const filters = normalizedOpportunityFilters(route?.filters || {});
+  const values = {
+    "opportunity-token": filters.token,
+    "opportunity-venue": filters.venue,
+    "opportunity-notional": filters.notionalUsd ? String(filters.notionalUsd) : "",
+    "opportunity-class": filters.opportunityClass,
+    "opportunity-route-type": filters.routeType,
+    "opportunity-availability": filters.availability,
+    "opportunity-sort": filters.sort,
+    "opportunity-direction": filters.dir,
+  };
+  Object.entries(values).forEach(([id, value]) => {
+    const control = byId(id);
+    if (control) control.value = value;
+  });
+  setOpportunityFilterValidation(route?.validationErrors || []);
+  return filters;
+}
+
+function opportunityFilterErrorMessage(errors = []) {
+  const fields = new Set(errors.map((error) => error?.field));
+  if (fields.has("token")) {
+    return "Token is invalid. Use 1–64 letters, numbers, dots, underscores, or hyphens.";
+  }
+  if (fields.has("venue")) {
+    return "Venue is invalid. Use one exact CEX or DEX label shown by this publication.";
+  }
+  return "Opportunity filters are invalid. Correct them before applying.";
+}
+
+function setOpportunityFilterValidation(errors = []) {
+  const rows = Array.isArray(errors) ? errors : [];
+  ["token", "venue"].forEach((field) => {
+    const control = byId(`opportunity-${field}`);
+    if (!control) return;
+    control.setAttribute(
+      "aria-invalid",
+      String(rows.some((error) => error?.field === field)),
+    );
+  });
+  const banner = byId("opportunity-filter-error");
+  if (!banner) return rows.length === 0;
+  if (rows.length) showError(banner, opportunityFilterErrorMessage(rows));
+  else hideError(banner);
+  return rows.length === 0;
+}
+
+function opportunityFiltersFromControls() {
+  return normalizedOpportunityFilters({
+    token: byId("opportunity-token")?.value.trim().toUpperCase() || "",
+    venue: byId("opportunity-venue")?.value.trim().toLowerCase() || "",
+    notionalUsd: byId("opportunity-notional")?.value || "",
+    opportunityClass: byId("opportunity-class")?.value || "all",
+    routeType: byId("opportunity-route-type")?.value || "all",
+    availability: byId("opportunity-availability")?.value || "all",
+    sort: byId("opportunity-sort")?.value || "net_edge_usd",
+    dir: byId("opportunity-direction")?.value || "desc",
+  });
+}
+
+function clearOpportunityFilterResult(errors) {
+  invalidateOpportunityRequest();
+  app.opportunities = null;
+  byId("opportunities-view")?.setAttribute("aria-busy", "false");
+  hideStatus(byId("opportunity-loading"));
+  hideStatus(byId("opportunity-status"));
+  hideStatus(byId("opportunity-bundle-unavailable"));
+  hideError(byId("opportunity-error"));
+  setOpportunityFilterValidation(errors);
+  const badge = byId("opportunity-cohort-status");
+  badge.textContent = "Filters invalid";
+  badge.removeAttribute("title");
+  badge.setAttribute("aria-label", "Route opportunity filters invalid");
+  ["strict", "estimate", "unavailable"].forEach((name) => {
+    byId(`${name}-opportunities`).hidden = true;
+    byId(`${name}-opportunity-body`).innerHTML = "";
+    byId(`${name}-opportunity-empty`).hidden = true;
+    byId(`${name}-opportunity-count`).textContent = "Unavailable";
+  });
+}
+
+function opportunityRequestKey(filters) {
+  return navigation?.buildOpportunitiesPath(normalizedOpportunityFilters(filters))
+    || "/opportunities";
+}
+
+function opportunityRequestIsOwned(requestId, requestKey) {
+  return requestId === app.opportunityRequestId
+    && app.route?.kind === "opportunities"
+    && opportunityRequestKey(app.route.filters || {}) === requestKey;
+}
+
+function invalidateOpportunityRequest() {
+  if (app.opportunityController) app.opportunityController.abort();
+  app.opportunityController = null;
+  app.opportunityRequestId += 1;
+  return app.opportunityRequestId;
+}
+
+function clearOpportunityResult(message) {
+  app.opportunities = null;
+  byId("opportunities-view")?.setAttribute("aria-busy", "false");
+  hideStatus(byId("opportunity-loading"));
+  showError(byId("opportunity-error"), message);
+  showStatus(
+    byId("opportunity-bundle-unavailable"),
+    "The published opportunity bundle could not be validated. No route inventory or numeric zero is inferred.",
+    "critical",
+  );
+  byId("opportunity-cohort-status").textContent = "Bundle invalid";
+  ["strict", "estimate", "unavailable"].forEach((name) => {
+    byId(`${name}-opportunities`).hidden = true;
+    byId(`${name}-opportunity-body`).innerHTML = "";
+    byId(`${name}-opportunity-empty`).hidden = true;
+    byId(`${name}-opportunity-count`).textContent = "Unavailable";
+  });
+}
+
+async function loadOpportunities(filters = app.route?.filters || {}) {
+  const normalized = normalizedOpportunityFilters(filters);
+  const requestKey = opportunityRequestKey(normalized);
+  const requestId = invalidateOpportunityRequest();
+  const controller = new AbortController();
+  app.opportunityController = controller;
+  const pageUrl = new URL(requestKey, "https://dashboard.invalid");
+  const apiUrl = `/api/markets/opportunities${pageUrl.search}`;
+  byId("opportunities-view")?.setAttribute("aria-busy", "true");
+  hideError(byId("opportunity-error"));
+  showStatus(byId("opportunity-loading"), "Loading synchronized route opportunities…");
+  try {
+    const response = await fetch(apiUrl, { signal: controller.signal });
+    const payload = await responseJson(response);
+    if (!response.ok) {
+      throw new Error(
+        payload.message
+        || payload.error
+        || "Opportunity publication failed to load.",
+      );
+    }
+    if (!opportunityRequestIsOwned(requestId, requestKey)) return false;
+    if (
+      !payload?.availability
+      || !["available", "unavailable"].includes(payload.availability.status)
+      || !Array.isArray(payload.routes)
+    ) {
+      throw new Error("The opportunity response failed its compact payload contract.");
+    }
+    renderOpportunities(payload);
+    return true;
+  } catch (error) {
+    if (error.name === "AbortError" || !opportunityRequestIsOwned(requestId, requestKey)) {
+      return false;
+    }
+    clearOpportunityResult(
+      publicErrorMessage(error, "Opportunity publication failed to load."),
+    );
+    return false;
+  } finally {
+    if (requestId === app.opportunityRequestId) app.opportunityController = null;
+  }
 }
 
 function setFactValue(
@@ -4941,6 +5513,7 @@ function populateFactsMarkets({
   requestedA = null,
   requestedB = null,
   allowDefaults = true,
+  persistSelection = app.pairSelectionSource !== "transient",
 } = {}) {
   if (!app.catalog) return;
   const token = byId("facts-token").value;
@@ -4965,7 +5538,7 @@ function populateFactsMarkets({
   byId("facts-market-b").innerHTML = factsOptions(markets, marketB?.market_id);
   byId("facts-market-a").value = marketA?.market_id || "";
   byId("facts-market-b").value = marketB?.market_id || "";
-  if (marketA && marketB) {
+  if (marketA && marketB && persistSelection) {
     app.pairSelections[token] = {
       marketA: marketA.market_id,
       marketB: marketB.market_id,
@@ -5036,9 +5609,9 @@ function comparisonMetricDefinition(metric) {
     },
     spread: {
       key: "spread",
-      title: "Daily midpoint-relative price spread",
-      note: "Midpoint-relative A/B gap · not a bid/ask spread",
-      axisTitle: "Midpoint-relative spread (bps)",
+      title: "Daily Price Gap",
+      note: "Symmetric midpoint gap from same-UTC-date closes · research metric only",
+      axisTitle: "Daily Price Gap (bps)",
       scaleLabel: "Linear bps",
     },
     volume: {
@@ -5143,7 +5716,7 @@ function comparisonChartModel(payload, metric = "price", eventPayload = null) {
     ? [{
         slot: "spread",
         className: "series-spread",
-        label: "A ↔ B midpoint-relative spread",
+        label: "A ↔ B Daily Price Gap",
       }]
     : [
         {
@@ -5258,11 +5831,12 @@ function comparisonChartTooltipText(model, point) {
   if (metric === "spread") {
     return [
       `${point.date} UTC`,
-      `midpoint-relative spread ${formatComparisonChartValue("spread", point.value)}`,
+      `Daily Price Gap ${formatComparisonChartValue("spread", point.value)}`,
+      "same-UTC-date closes",
       `A price ${formatComparisonChartValue("price", comparisonChartValue(row, "price", "A"))}`,
       `B price ${formatComparisonChartValue("price", comparisonChartValue(row, "price", "B"))}`,
-      `absolute difference ${formatComparisonChartValue("price", row.absolute_spread_usd)}`,
-      "not a bid/ask spread",
+      `absolute closing-price difference ${formatComparisonChartValue("price", row.absolute_spread_usd)}`,
+      "research metric only",
       eventText,
     ].join(" · ");
   }
@@ -5701,8 +6275,8 @@ function renderComparison(payload) {
     "compare-bps",
     finite(latest?.spread_bps),
     finite(latest?.spread_bps) ? `${bpsFormat.format(latest.spread_bps)} bps` : "",
-    "Midpoint-relative spread requires valid Market A and B prices on the same UTC date.",
-    { token: payload.token_symbol, factLabel: "midpoint-relative spread" },
+    "Daily Price Gap requires valid Market A and B closing prices on the same UTC date.",
+    { token: payload.token_symbol, factLabel: "Daily Price Gap" },
   );
   byId("compare-days").textContent = `${payload.metadata.comparison_days} / ${payload.metadata.union_observation_days}`;
   [
@@ -5741,8 +6315,8 @@ function renderComparison(payload) {
         <td>${comparisonValueMarkup(row.market_a.volume_usd, formatRawVolume, "Market A has no valid daily USD volume on this UTC date.", { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_a), factLabel: `daily USD volume on ${row.date}` })}</td>
         <td>${comparisonValueMarkup(row.market_b.price_usd, formatRawUsd, "Market B has no valid daily USD price on this UTC date.", { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_b), factLabel: `daily USD price on ${row.date}` })}</td>
         <td>${comparisonValueMarkup(row.market_b.volume_usd, formatRawVolume, "Market B has no valid daily USD volume on this UTC date.", { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_b), factLabel: `daily USD volume on ${row.date}` })}</td>
-        <td>${comparisonValueMarkup(row.absolute_spread_usd, formatRawUsd, "Absolute spread requires valid Market A and B prices on the same UTC date.", { token: payload.token_symbol, factLabel: `absolute price difference on ${row.date}` })}</td>
-        <td>${comparisonValueMarkup(row.spread_bps, (value) => bpsFormat.format(value), "Spread bps requires valid Market A and B prices on the same UTC date.", { token: payload.token_symbol, factLabel: `midpoint-relative spread on ${row.date}` })}</td>
+        <td>${comparisonValueMarkup(row.absolute_spread_usd, formatRawUsd, "Absolute Daily Price Gap requires valid Market A and B closing prices on the same UTC date.", { token: payload.token_symbol, factLabel: `absolute Daily Price Gap on ${row.date}` })}</td>
+        <td>${comparisonValueMarkup(row.spread_bps, (value) => bpsFormat.format(value), "Daily Price Gap requires valid Market A and B closing prices on the same UTC date.", { token: payload.token_symbol, factLabel: `Daily Price Gap on ${row.date}` })}</td>
         <td class="${row.missing_reason ? "missing" : ""}">${escapeHtml(missingLabels[row.missing_reason] || "Comparable")}</td>
       </tr>`).join("")
     : '<tr><td colspan="8" class="missing">No observations in this window.</td></tr>';
@@ -6214,6 +6788,7 @@ function persistSelectedPair() {
   const token = selectedWorkspaceToken();
   const { marketA, marketB } = selectedPairState();
   if (token && marketA && marketB && marketA !== marketB) {
+    app.pairSelectionSource = "";
     app.pairSelections[token] = { marketA, marketB };
     writePairSelections();
     return true;
@@ -6423,12 +6998,32 @@ function exportVisibleCsv() {
   showStatus(byId("market-status"), `Exported ${app.visibleTokens.length} visible Tokens as CSV.`, "success");
 }
 
+function bindOpportunityFilterEvents() {
+  byId("opportunity-filter-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const filters = opportunityFiltersFromControls();
+    const validation = navigation.validateOpportunityFilters(filters);
+    if (!setOpportunityFilterValidation(validation.errors)) return;
+    const path = navigation.buildOpportunitiesPath(filters);
+    navigateTo(path);
+  });
+  byId("opportunity-sort").addEventListener("change", () => {
+    byId("opportunity-direction").value = defaultOpportunityDirection(
+      byId("opportunity-sort").value,
+    );
+  });
+  ["opportunity-token", "opportunity-venue"].forEach((id) => {
+    byId(id).addEventListener("input", () => setOpportunityFilterValidation([]));
+  });
+}
+
 function bindEvents() {
   const applyTokenSearch = () => {
     app.searchQuery = byId("token-search").value.trim().toUpperCase();
     renderTable();
     replaceCurrentRoute();
   };
+  bindOpportunityFilterEvents();
   byId("date-window-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const applied = await applyWindow(draftTimeWindow());
@@ -6669,8 +7264,14 @@ function primeInitialRouteView(route) {
   if (route.kind === "screener") {
     hydrateScreenerControls(route, { normalizeWindow: false });
   }
-  setActiveAppView("screener");
-  byId("time-toolbar").hidden = false;
+  if (route.kind === "opportunities") {
+    hydrateOpportunityControls(route);
+    setActiveAppView("opportunities");
+    byId("time-toolbar").hidden = true;
+  } else {
+    setActiveAppView("screener");
+    byId("time-toolbar").hidden = false;
+  }
 }
 
 async function initialize() {
@@ -6681,6 +7282,11 @@ async function initialize() {
     : { kind: "unknown" };
   if (initialRoute.kind !== "unknown") app.route = initialRoute;
   primeInitialRouteView(initialRoute);
+  if (initialRoute.kind === "opportunities") {
+    await applyRouteFromLocation();
+    if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
+    return;
+  }
   const initialStart = initialRoute.kind === "screener"
     ? initialRoute.filters?.start || ""
     : initialRoute.kind === "workspace"

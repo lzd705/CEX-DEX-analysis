@@ -251,6 +251,91 @@ class RouteUniverseSelectionTests(unittest.TestCase):
 
 
 class RouteUniverseDeterminismTests(unittest.TestCase):
+    def test_equal_reference_volumes_use_direction_independent_decimal_text(self):
+        cex_id = "cex:alpha:UNI/USDT"
+        dex_id = "dex:eth:swap:0xequal:UNI"
+        catalog = [market(cex_id, "cex"), market(dex_id, "dex")]
+        depths = [depth(row["market_id"], 5000) for row in catalog]
+        execution_rows = execution(cex_id, 10000) + execution(dex_id, 10000)
+
+        universe = build_route_universe(
+            catalog,
+            depths,
+            execution_rows,
+            [cex_volume(cex_id, "1200.00")],
+            [dex_volume(dex_id, "1200.0")],
+            [],
+            selection_window={"start": "2026-07-25", "end": "2026-08-01"},
+            candidate_source_generation="catalog-volume-canonical",
+        )
+
+        self.assertEqual(
+            {
+                (
+                    row["buy_reference_volume_usd"],
+                    row["sell_reference_volume_usd"],
+                    row["route_volume_usd"],
+                )
+                for row in universe["routes"]
+            },
+            {("1200", "1200", "1200")},
+        )
+
+    def test_routes_seal_conservative_reference_volume_and_keep_na_basis(self):
+        cex_id = "cex:alpha:UNI/USDT"
+        liquid_dex_id = "dex:eth:swap:0xliquid:UNI"
+        missing_dex_id = "dex:eth:swap:0xmissing:UNI"
+        catalog = [
+            market(cex_id, "cex"),
+            market(liquid_dex_id, "dex"),
+            market(missing_dex_id, "dex"),
+        ]
+        depths = [depth(row["market_id"], 5000) for row in catalog]
+        execution_rows = []
+        for row in catalog:
+            execution_rows.extend(execution(row["market_id"], 10000))
+
+        universe = build_route_universe(
+            catalog,
+            depths,
+            execution_rows,
+            [cex_volume(cex_id, 1200)],
+            [dex_volume(liquid_dex_id, 800)],
+            [],
+            selection_window={"start": "2026-07-25", "end": "2026-08-01"},
+            candidate_source_generation="catalog-volume-lineage",
+        )
+
+        routes = {row["route_id"]: row for row in universe["routes"]}
+        cex_to_liquid = routes[
+            "route:UNI:{}->{}:prepositioned_inventory".format(
+                cex_id, liquid_dex_id
+            )
+        ]
+        liquid_to_cex = routes[
+            "route:UNI:{}->{}:prepositioned_inventory".format(
+                liquid_dex_id, cex_id
+            )
+        ]
+        cex_to_missing = routes[
+            "route:UNI:{}->{}:prepositioned_inventory".format(
+                cex_id, missing_dex_id
+            )
+        ]
+
+        self.assertEqual(cex_to_liquid["buy_reference_volume_usd"], "1200")
+        self.assertEqual(cex_to_liquid["sell_reference_volume_usd"], "800")
+        self.assertEqual(cex_to_liquid["route_volume_usd"], "800")
+        self.assertEqual(liquid_to_cex["buy_reference_volume_usd"], "800")
+        self.assertEqual(liquid_to_cex["sell_reference_volume_usd"], "1200")
+        self.assertEqual(liquid_to_cex["route_volume_usd"], "800")
+        self.assertIsNone(cex_to_missing["sell_reference_volume_usd"])
+        self.assertIsNone(cex_to_missing["route_volume_usd"])
+        self.assertTrue(all(
+            row["route_volume_basis"] == "minimum_leg_source_horizon_usd"
+            for row in routes.values()
+        ))
+
     def test_shuffled_inputs_produce_identical_legs_routes_json_bytes_and_sha256(self):
         catalog = [
             market("cex:zeta:UNI/USDT", "cex"),

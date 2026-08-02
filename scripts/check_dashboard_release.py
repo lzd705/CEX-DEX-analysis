@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gzip
 import hashlib
 import json
 import math
 import os
 import re
+import sys
 import time
 import unicodedata
 from collections import Counter
@@ -18,10 +20,19 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+
+if __package__ in {None, ""}:  # pragma: no cover - direct script bootstrap
+    _PROJECT_ROOT_TEXT = str(Path(__file__).resolve().parents[1])
+    if _PROJECT_ROOT_TEXT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT_TEXT)
+
+from dashboard.opportunity_facts import (
+    APPROVED_OPPORTUNITY_SOURCE_HOSTS,
+)
 
 try:
     from scripts.cex_instrument_lifecycle import (
@@ -45,6 +56,7 @@ try:
     from scripts.route_opportunity import (
         MAX_ROUTE_AGE_SECONDS,
         MAX_ROUTE_SKEW_SECONDS,
+        ROUTE_OPPORTUNITY_REASON_CODES,
     )
     from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
     from scripts.event_facts import effective_datetime_interval
@@ -68,6 +80,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from route_opportunity import (  # type: ignore[no-redef]
         MAX_ROUTE_AGE_SECONDS,
         MAX_ROUTE_SKEW_SECONDS,
+        ROUTE_OPPORTUNITY_REASON_CODES,
     )
     from timestamp_contract import (  # type: ignore[no-redef]
         exact_rfc3339_epoch_seconds,
@@ -83,6 +96,8 @@ class ResponseMetrics:
     wire_bytes: int
     raw_bytes: int
     compressed: bool
+    request_started_at: Optional[datetime] = None
+    response_completed_at: Optional[datetime] = None
 
 
 class ReleaseCheckError(RuntimeError):
@@ -107,6 +122,141 @@ _ROUTE_SCENARIO_VALUE_STATUSES = frozenset(
 _ROUTE_TERMINAL_VALUE_STATUSES = frozenset(
     {"unavailable", "unsupported", "failed", "stale"}
 )
+_ROUTE_DYNAMIC_COST_STATUSES = (
+    (_ROUTE_STRICT_VALUE_STATUSES - {"not_applicable"})
+    | _ROUTE_SCENARIO_VALUE_STATUSES
+)
+
+OPPORTUNITY_API_CONTRACT = "opportunity_summary/v1"
+_ROUTE_VOLUME_BASIS = "minimum_leg_source_horizon_usd"
+DEFAULT_OPPORTUNITY_RAW_MAX = 2_000_000
+DEFAULT_OPPORTUNITY_GZIP_MAX = 300_000
+_OPPORTUNITY_CLASSES = frozenset(
+    {"executable_candidate", "research_estimate", "unavailable"}
+)
+_OPPORTUNITY_CLASS_FILTERS = frozenset({"strict", "estimate", "all"})
+_OPPORTUNITY_CLASS_ALIASES = {
+    "strict": "executable_candidate",
+    "estimate": "research_estimate",
+}
+_OPPORTUNITY_ROUTE_TYPES = frozenset(
+    {"cex_cex", "cex_dex", "dex_dex", "all"}
+)
+_OPPORTUNITY_AVAILABILITIES = frozenset(
+    {"available", "unavailable", "all"}
+)
+_OPPORTUNITY_SORT_FIELDS = frozenset({
+    "net_edge_usd",
+    "net_edge_bps",
+    "capacity_quantity",
+    "skew_seconds",
+    "route_age_seconds",
+    "volume",
+    "requested_notional_usd",
+    "token_symbol",
+    "route_id",
+})
+_OPPORTUNITY_NUMERIC_SORT_FIELDS = _OPPORTUNITY_SORT_FIELDS - {
+    "token_symbol",
+    "route_id",
+}
+_OPPORTUNITY_DIRECTIONS = frozenset({"asc", "desc"})
+_OPPORTUNITY_REASON_CODES = (
+    ROUTE_OPPORTUNITY_REASON_CODES | frozenset({"route_unavailable"})
+)
+_OPPORTUNITY_PUBLIC_ROOT_FIELDS = frozenset({
+    "availability", "metadata", "filters", "routes"
+})
+_OPPORTUNITY_METADATA_FIELDS = frozenset({
+    "contract_version",
+    "route_cohort_id",
+    "manifest_sha256",
+    "publication_status",
+    "checked_at",
+    "next_freshness_deadline_at",
+    "next_freshness_deadline_exclusive",
+    "max_route_age_seconds",
+    "max_route_skew_seconds",
+    "available_notionals_usd",
+    "available_venues",
+    "coverage",
+})
+_OPPORTUNITY_COVERAGE_FIELDS = frozenset({
+    "route_count",
+    "scenario_count",
+    "returned_count",
+    "class_counts",
+    "availability_counts",
+})
+_OPPORTUNITY_FILTER_FIELDS = frozenset({
+    "token",
+    "venue",
+    "notional_usd",
+    "opportunity_class",
+    "route_type",
+    "availability",
+    "sort",
+    "direction",
+})
+_OPPORTUNITY_ROUTE_FIELDS = frozenset({
+    "route_id",
+    "opportunity_id",
+    "token_symbol",
+    "buy_market_id",
+    "sell_market_id",
+    "leg_venues",
+    "route_type",
+    "route_mode",
+    "requested_notional_usd",
+    "target_token_quantity",
+    "opportunity_class",
+    "availability",
+    "gross_edge_usd",
+    "gross_edge_bps",
+    "net_edge_usd",
+    "net_edge_bps",
+    "cost_breakdown",
+    "cost_components",
+    "cost_completeness",
+    "scenario_cost_completeness",
+    "leg_timestamps",
+    "skew_seconds",
+    "route_age_seconds",
+    "route_volume_usd",
+    "route_volume_basis",
+    "capacity_quantity",
+    "primary_reason",
+    "reason_codes",
+    "source_links",
+})
+_OPPORTUNITY_COST_FIELDS = frozenset({
+    "leg",
+    "market_id",
+    "component_type",
+    "value_status",
+    "strict_eligible",
+    "embedded_in_leg_quote",
+    "reflected_or_embedded",
+    "amount_usd",
+    "rate_bps",
+    "reason_code",
+})
+_OPPORTUNITY_FORBIDDEN_KEY = re.compile(
+    r"(?:api[_-]?key|secret|password|authorization|credential|"
+    r"private[_-]?key|access[_-]?key)",
+    flags=re.IGNORECASE,
+)
+_OPPORTUNITY_FORBIDDEN_VALUE = re.compile(
+    r"(?:secret_sentinel|bearer\s+|authorization\s*[:=]|"
+    r"api[_-]?key\s*[=:]|password\s*[=:]|secret\s*[=:])",
+    flags=re.IGNORECASE,
+)
+_OPPORTUNITY_ABSOLUTE_PATH = re.compile(
+    r"(?:^|[\s'\"])(?:/Users/|/home/|/private/|/var/|/tmp/|"
+    r"[A-Za-z]:\\)",
+)
+_OPPORTUNITY_VENUE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z", re.ASCII)
+OPPORTUNITY_RESPONSE_CLOCK_TOLERANCE_SECONDS = Decimal("5")
 
 
 def _route_decimal(value: Any, field: str, *, positive: bool = False) -> Decimal:
@@ -132,6 +282,42 @@ def _route_timestamp(value: Any, field: str) -> Decimal:
         return exact_rfc3339_epoch_seconds(value)
     except (OverflowError, ValueError) as error:
         raise ReleaseCheckError("{} timestamp is invalid".format(field)) from error
+
+
+def _opportunity_response_wall_clock(
+    metrics: ResponseMetrics,
+    checked_at_epoch: Decimal,
+) -> tuple[Decimal, Decimal]:
+    """Bind a dynamic opportunity projection to the request wall clock."""
+    started = metrics.request_started_at
+    completed = metrics.response_completed_at
+    require(
+        isinstance(started, datetime)
+        and started.utcoffset() is not None
+        and isinstance(completed, datetime)
+        and completed.utcoffset() is not None,
+        "Opportunity request wall clock is unavailable",
+    )
+    started_epoch = _route_timestamp(
+        started.astimezone(timezone.utc).isoformat(),
+        "Opportunity request start",
+    )
+    completed_epoch = _route_timestamp(
+        completed.astimezone(timezone.utc).isoformat(),
+        "Opportunity response completion",
+    )
+    require(
+        completed_epoch >= started_epoch,
+        "Opportunity request wall clock is reversed",
+    )
+    tolerance = OPPORTUNITY_RESPONSE_CLOCK_TOLERANCE_SECONDS
+    require(
+        started_epoch - tolerance
+        <= checked_at_epoch
+        <= completed_epoch + tolerance,
+        "Opportunity checked_at is outside the request wall clock tolerance",
+    )
+    return started_epoch, completed_epoch
 
 
 def _route_integer(value: Any, field: str, *, positive: bool = False) -> int:
@@ -168,6 +354,451 @@ def _route_publication_sha256(value: Any) -> str:
     except (TypeError, ValueError) as error:
         raise ReleaseCheckError("route publication evidence is invalid") from error
     return hashlib.sha256(payload).hexdigest()
+
+
+def _route_opportunity_inventory_sha256(
+    rows: Iterable[Mapping[str, Any]],
+) -> str:
+    """Hash only the immutable identities exposed by the compact API."""
+    members = [
+        {
+            "opportunity_id": str(row.get("opportunity_id")),
+            "route_id": str(row.get("route_id")),
+            "token_symbol": str(row.get("token_symbol")),
+            "requested_notional_usd": str(
+                row.get("requested_notional_usd")
+            ),
+            "opportunity_class": str(row.get("opportunity_class")),
+        }
+        for row in rows
+    ]
+    members.sort(key=lambda row: row["opportunity_id"])
+    return _route_canonical_sha256(members)
+
+
+_OPPORTUNITY_PUBLIC_BINDING_ROWS = "_opportunity_public_binding_rows"
+_OPPORTUNITY_PRIVATE_COST_TIMING = "_private_cost_timing"
+
+
+def _route_public_source_origin(value: Any) -> Optional[str]:
+    """Independently reproduce the API's public source-origin policy."""
+
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    normalized_host = hostname.lower().rstrip(".")
+    if (
+        normalized_host not in APPROVED_OPPORTUNITY_SOURCE_HOSTS
+        or port not in (None, 443)
+    ):
+        return None
+    return "https://{}".format(normalized_host)
+
+
+def _route_public_leg_venue(market_id: Any) -> str:
+    if not isinstance(market_id, str):
+        raise ReleaseCheckError("Opportunity binding market identity is invalid")
+    parts = market_id.split(":")
+    if len(parts) >= 3 and parts[0] == "cex":
+        venue = parts[1]
+    elif len(parts) >= 5 and parts[0] == "dex":
+        venue = parts[2]
+    else:
+        raise ReleaseCheckError("Opportunity binding market identity is invalid")
+    if (
+        not venue
+        or venue == "all"
+        or _OPPORTUNITY_VENUE.fullmatch(venue) is None
+    ):
+        raise ReleaseCheckError("Opportunity binding venue is invalid")
+    return venue
+
+
+def _route_public_route_type(row: Mapping[str, Any]) -> str:
+    market_types = set()
+    for side in ("buy", "sell"):
+        market_id = str(row.get(side + "_market_id") or "")
+        if market_id.startswith("cex:"):
+            market_types.add("cex")
+        elif market_id.startswith("dex:"):
+            market_types.add("dex")
+        else:
+            raise ReleaseCheckError(
+                "Opportunity binding market identity is invalid"
+            )
+    if market_types == {"cex"}:
+        return "cex_cex"
+    if market_types == {"dex"}:
+        return "dex_dex"
+    if market_types == {"cex", "dex"}:
+        return "cex_dex"
+    raise ReleaseCheckError("Opportunity binding route type is invalid")
+
+
+def _route_public_binding_inventory(
+    opportunities: Iterable[Mapping[str, Any]],
+    legs: Iterable[Mapping[str, Any]],
+    cost_components: Iterable[Mapping[str, Any]],
+    route_candidates: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Build an independent, public-only baseline from the sealed bundle."""
+
+    opportunity_rows = list(opportunities)
+    volumes_by_route: dict[str, dict[str, Any]] = {}
+    for candidate in route_candidates:
+        if not isinstance(candidate, Mapping):
+            raise ReleaseCheckError("Opportunity route candidate is invalid")
+        route_id = str(candidate.get("route_id") or "")
+        if not route_id or route_id in volumes_by_route:
+            raise ReleaseCheckError(
+                "Opportunity route candidates contain duplicates"
+            )
+        require(
+            candidate.get("route_volume_basis") == _ROUTE_VOLUME_BASIS,
+            "Opportunity route volume basis is invalid",
+        )
+        buy_volume = _opportunity_decimal(
+            candidate.get("buy_reference_volume_usd"),
+            "Opportunity buy reference volume",
+            allow_none=True,
+            positive=True,
+        )
+        sell_volume = _opportunity_decimal(
+            candidate.get("sell_reference_volume_usd"),
+            "Opportunity sell reference volume",
+            allow_none=True,
+            positive=True,
+        )
+        route_volume = _opportunity_decimal(
+            candidate.get("route_volume_usd"),
+            "Opportunity route volume",
+            allow_none=True,
+            positive=True,
+        )
+        expected_volume = (
+            min(buy_volume, sell_volume)
+            if buy_volume is not None and sell_volume is not None
+            else None
+        )
+        require(
+            route_volume == expected_volume,
+            "Opportunity route volume differs from its leg lineage",
+        )
+        canonical_volume = None
+        if route_volume is not None:
+            canonical_volume = format(route_volume, "f")
+            if "." in canonical_volume:
+                canonical_volume = canonical_volume.rstrip("0").rstrip(".")
+        volumes_by_route[route_id] = {
+            "route_volume_usd": canonical_volume,
+            "route_volume_basis": _ROUTE_VOLUME_BASIS,
+        }
+
+    legs_by_market: dict[str, Mapping[str, Any]] = {}
+    for leg in legs:
+        if not isinstance(leg, Mapping):
+            raise ReleaseCheckError("Opportunity binding leg is invalid")
+        market_id = str(leg.get("market_id") or "")
+        if not market_id or market_id in legs_by_market:
+            raise ReleaseCheckError("Opportunity binding legs contain duplicates")
+        legs_by_market[market_id] = leg
+
+    components_by_opportunity: dict[str, list[Mapping[str, Any]]] = {}
+    for component in cost_components:
+        if not isinstance(component, Mapping):
+            raise ReleaseCheckError("Opportunity binding component is invalid")
+        opportunity_id = str(component.get("opportunity_id") or "")
+        if not opportunity_id:
+            raise ReleaseCheckError("Opportunity binding component has no owner")
+        components_by_opportunity.setdefault(opportunity_id, []).append(
+            component
+        )
+
+    bindings: dict[str, dict[str, Any]] = {}
+    for row in opportunity_rows:
+        if not isinstance(row, Mapping):
+            raise ReleaseCheckError("Opportunity binding row is invalid")
+        opportunity_id = str(row.get("opportunity_id") or "")
+        if not opportunity_id or opportunity_id in bindings:
+            raise ReleaseCheckError("Opportunity binding rows contain duplicates")
+        component_rows = components_by_opportunity.get(opportunity_id)
+        if not component_rows:
+            raise ReleaseCheckError("Opportunity binding costs are unavailable")
+        route_id = str(row.get("route_id") or "")
+        route_volume = volumes_by_route.get(route_id)
+        if route_volume is None:
+            raise ReleaseCheckError(
+                "Opportunity binding route volume is unavailable"
+            )
+        reflected = set(
+            row.get("reflected_or_embedded_component_keys") or []
+        )
+        public_components = []
+        private_cost_timing = []
+        for component in sorted(
+            component_rows,
+            key=lambda item: (
+                str(item.get("leg") or ""),
+                str(item.get("component_type") or ""),
+                str(item.get("market_id") or ""),
+            ),
+        ):
+            component_key = "{}:{}".format(
+                component.get("leg"), component.get("component_type")
+            )
+            embedded = component.get("embedded_in_leg_quote")
+            private_cost_timing.append({
+                "leg": component.get("leg"),
+                "market_id": component.get("market_id"),
+                "component_type": component.get("component_type"),
+                "value_status": component.get("value_status"),
+                "observed_at": component.get("observed_at"),
+                "valid_until": component.get("valid_until"),
+            })
+            public_components.append({
+                "leg": component.get("leg"),
+                "market_id": component.get("market_id"),
+                "component_type": component.get("component_type"),
+                "value_status": component.get("value_status"),
+                "strict_eligible": component.get("strict_eligible"),
+                "embedded_in_leg_quote": embedded,
+                "reflected_or_embedded": (
+                    embedded is True or component_key in reflected
+                ),
+                "amount_usd": component.get("amount_usd"),
+                "rate_bps": component.get("rate_bps"),
+                "reason_code": component.get("reason_code"),
+            })
+
+        source_links = []
+        observed_markets = set()
+        for side in ("buy", "sell"):
+            market_id = str(row.get(side + "_market_id") or "")
+            if market_id in observed_markets:
+                continue
+            observed_markets.add(market_id)
+            leg = legs_by_market.get(market_id, {})
+            source_links.append({
+                "market_id": market_id,
+                "url": _route_public_source_origin(
+                    leg.get("source_endpoint")
+                ),
+            })
+
+        opportunity_class = str(row.get("opportunity_class") or "")
+        if opportunity_class == "executable_candidate":
+            net_edge_usd = row.get("strict_net_edge_usd")
+            net_edge_bps = row.get("strict_net_edge_bps")
+        elif opportunity_class == "research_estimate":
+            net_edge_usd = row.get("research_net_edge_usd")
+            net_edge_bps = row.get("research_net_edge_bps")
+        elif opportunity_class == "unavailable":
+            net_edge_usd = None
+            net_edge_bps = None
+        else:
+            raise ReleaseCheckError("Opportunity binding class is invalid")
+
+        bindings[opportunity_id] = {
+            "route_id": row.get("route_id"),
+            "opportunity_id": opportunity_id,
+            "token_symbol": row.get("token_symbol"),
+            "buy_market_id": row.get("buy_market_id"),
+            "sell_market_id": row.get("sell_market_id"),
+            "leg_venues": {
+                "buy": _route_public_leg_venue(row.get("buy_market_id")),
+                "sell": _route_public_leg_venue(row.get("sell_market_id")),
+            },
+            "route_type": _route_public_route_type(row),
+            "route_mode": row.get("route_mode"),
+            "requested_notional_usd": row.get("requested_notional_usd"),
+            "target_token_quantity": row.get("target_token_quantity"),
+            "opportunity_class": opportunity_class,
+            "availability": {"status": "available", "reason": None},
+            "gross_edge_usd": row.get("gross_edge_usd"),
+            "gross_edge_bps": row.get("gross_edge_bps"),
+            "net_edge_usd": net_edge_usd,
+            "net_edge_bps": net_edge_bps,
+            "cost_breakdown": {
+                "strict_nonembedded_usd": row.get(
+                    "strict_nonembedded_cost_usd"
+                ),
+                "research_bounded_usd": row.get(
+                    "research_bounded_cost_usd"
+                ),
+                "research_assumed_usd": row.get(
+                    "research_assumed_cost_usd"
+                ),
+            },
+            "cost_components": public_components,
+            "cost_completeness": row.get("cost_completeness"),
+            "scenario_cost_completeness": row.get(
+                "scenario_cost_completeness"
+            ),
+            "leg_timestamps": {
+                "buy": row.get("buy_state_observed_at"),
+                "sell": row.get("sell_state_observed_at"),
+            },
+            "skew_seconds": None,
+            "route_age_seconds": None,
+            "route_volume_usd": route_volume["route_volume_usd"],
+            "route_volume_basis": route_volume["route_volume_basis"],
+            "capacity_quantity": row.get(
+                "maximum_proved_capacity_quantity"
+            ),
+            "primary_reason": row.get("primary_reason"),
+            "reason_codes": list(row.get("reason_codes") or []),
+            "source_links": source_links,
+            _OPPORTUNITY_PRIVATE_COST_TIMING: private_cost_timing,
+        }
+
+    if set(components_by_opportunity) != set(bindings):
+        raise ReleaseCheckError("Opportunity binding costs have unknown owners")
+    if set(volumes_by_route) != {
+        str(row.get("route_id") or "") for row in opportunity_rows
+    }:
+        raise ReleaseCheckError(
+            "Opportunity route-volume inventory differs from opportunities"
+        )
+    return bindings
+
+
+def _route_expected_public_row(
+    base_row: Mapping[str, Any], checked_at_epoch: Decimal
+) -> dict[str, Any]:
+    """Project one sealed public baseline at the API response timestamp."""
+
+    expected = copy.deepcopy(dict(base_row))
+    cost_timing = expected.pop(_OPPORTUNITY_PRIVATE_COST_TIMING, None)
+    if not isinstance(cost_timing, list) or not cost_timing:
+        raise ReleaseCheckError(
+            "Opportunity binding cost timing is unavailable"
+        )
+    timing_by_key: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    current_by_key: dict[tuple[str, str, str], bool] = {}
+    for timing in cost_timing:
+        if not isinstance(timing, Mapping):
+            raise ReleaseCheckError("Opportunity binding cost timing is invalid")
+        key = (
+            str(timing.get("leg") or ""),
+            str(timing.get("component_type") or ""),
+            str(timing.get("market_id") or ""),
+        )
+        if not all(key[:2]) or key in timing_by_key:
+            raise ReleaseCheckError("Opportunity binding cost timing is invalid")
+        timing_by_key[key] = timing
+        current_by_key[key] = _route_cost_is_current(
+            timing, checked_at_epoch
+        )
+    timestamps = expected["leg_timestamps"]
+    buy_value = timestamps.get("buy")
+    sell_value = timestamps.get("sell")
+    if buy_value is None or sell_value is None:
+        skew_seconds = None
+        age_seconds = None
+        dynamic_reason = "route_timestamp_absent"
+    else:
+        buy_epoch = _route_timestamp(buy_value, "Opportunity binding buy leg")
+        sell_epoch = _route_timestamp(
+            sell_value, "Opportunity binding sell leg"
+        )
+        if buy_epoch > checked_at_epoch or sell_epoch > checked_at_epoch:
+            raise ReleaseCheckError(
+                "Opportunity binding timestamp is in the future"
+            )
+        skew_raw = abs(buy_epoch - sell_epoch)
+        age_raw = checked_at_epoch - max(buy_epoch, sell_epoch)
+        skew_seconds = round(float(skew_raw), 6)
+        age_seconds = round(float(age_raw), 6)
+        dynamic_reason = (
+            "snapshot_skew_exceeded"
+            if skew_raw > Decimal(str(MAX_ROUTE_SKEW_SECONDS))
+            else "cohort_stale"
+            if age_raw > Decimal(str(MAX_ROUTE_AGE_SECONDS))
+            else None
+        )
+
+    opportunity_class = expected["opportunity_class"]
+    if (
+        opportunity_class != "unavailable"
+        and dynamic_reason is None
+        and not all(current_by_key.values())
+    ):
+        dynamic_reason = "cost_component_stale"
+    if opportunity_class == "unavailable":
+        dynamic_reason = str(
+            expected.get("primary_reason") or "route_unavailable"
+        )
+    status = "unavailable" if dynamic_reason is not None else "available"
+    if (
+        opportunity_class == "research_estimate"
+        and expected.get("net_edge_usd") is None
+        and dynamic_reason is None
+    ):
+        status = "unavailable"
+        dynamic_reason = str(
+            expected.get("primary_reason") or "route_unavailable"
+        )
+    if opportunity_class == "unavailable":
+        status = "unavailable"
+
+    expected["availability"] = {
+        "status": status,
+        "reason": dynamic_reason,
+    }
+    expected["skew_seconds"] = skew_seconds
+    expected["route_age_seconds"] = age_seconds
+    seen_component_keys = set()
+    for component in expected["cost_components"]:
+        key = (
+            str(component.get("leg") or ""),
+            str(component.get("component_type") or ""),
+            str(component.get("market_id") or ""),
+        )
+        timing = timing_by_key.get(key)
+        if timing is None or key in seen_component_keys:
+            raise ReleaseCheckError(
+                "Opportunity binding cost timing differs from components"
+            )
+        seen_component_keys.add(key)
+        if (
+            timing.get("value_status") in _ROUTE_DYNAMIC_COST_STATUSES
+            and not current_by_key[key]
+        ):
+            component["value_status"] = "stale"
+            component["strict_eligible"] = False
+            component["reason_code"] = "cost_component_stale"
+    if seen_component_keys != set(timing_by_key):
+        raise ReleaseCheckError(
+            "Opportunity binding cost timing differs from components"
+        )
+    if status == "unavailable":
+        for field in (
+            "target_token_quantity",
+            "gross_edge_usd",
+            "gross_edge_bps",
+            "net_edge_usd",
+            "net_edge_bps",
+            "capacity_quantity",
+        ):
+            expected[field] = None
+        for field in expected["cost_breakdown"]:
+            expected["cost_breakdown"][field] = None
+        for component in expected["cost_components"]:
+            component["amount_usd"] = None
+            component["rate_bps"] = None
+    return expected
 
 
 def _route_rounded_ratio(value: Fraction, places: int = 8) -> str:
@@ -235,6 +866,33 @@ def _route_cost_is_current(
     if valid_until is not None:
         return now_epoch < _route_timestamp(valid_until, "cost valid_until")
     return Fraction(now_epoch - observed_epoch) <= MAX_ROUTE_AGE_SECONDS
+
+
+def _route_cost_next_deadline(
+    row: Mapping[str, Any], now_epoch: Decimal
+) -> tuple[Optional[Decimal], bool]:
+    """Return the next cost transition and whether equality is expired."""
+    if row.get("value_status") == "not_applicable":
+        return None, False
+    observed_at = row.get("observed_at")
+    if observed_at is None:
+        return None, False
+    observed_epoch = _route_timestamp(observed_at, "cost observed_at")
+    if observed_epoch > now_epoch:
+        return None, False
+    valid_until = row.get("valid_until")
+    if valid_until is not None:
+        valid_epoch = _route_timestamp(valid_until, "cost valid_until")
+        return (valid_epoch, True) if now_epoch < valid_epoch else (None, True)
+    deadline = observed_epoch + Decimal(str(MAX_ROUTE_AGE_SECONDS))
+    return (deadline, False) if now_epoch <= deadline else (None, False)
+
+
+def _route_projection_boundary_sha256(row: Mapping[str, Any]) -> str:
+    """Hash response-time state while ignoring continuous age progression."""
+    projection = copy.deepcopy(dict(row))
+    projection["route_age_seconds"] = None
+    return _route_canonical_sha256(projection)
 
 
 def _route_not_applicable_is_proved(
@@ -850,6 +1508,12 @@ def _validate_loaded_route_opportunity_release(
         row.get("opportunity_class") == "unavailable"
         for row in opportunities
     )
+    public_binding_rows = _route_public_binding_inventory(
+        opportunities,
+        legs,
+        costs,
+        bundle.get("routes", []),
+    )
     return {
         "status": "validated",
         "reason": None,
@@ -860,6 +1524,10 @@ def _validate_loaded_route_opportunity_release(
         "strict_opportunity_count": len(strict_rows),
         "research_opportunity_count": research_count,
         "unavailable_opportunity_count": unavailable_count,
+        "opportunity_inventory_sha256": (
+            _route_opportunity_inventory_sha256(opportunities)
+        ),
+        _OPPORTUNITY_PUBLIC_BINDING_ROWS: public_binding_rows,
         "cost_component_count": len(costs),
         "validated_at": now_text,
     }
@@ -886,7 +1554,10 @@ def validate_route_opportunity_release(
             "complete route opportunity pointer cannot be inspected"
         ) from error
     try:
-        loaded = load_latest_complete_route_bundle(Path(routes_root))
+        loaded = load_latest_complete_route_bundle(
+            Path(routes_root),
+            core_root=Path(routes_root) / "core",
+        )
     except OSError as error:
         raise ReleaseCheckError(
             "complete route opportunity validation failed: I/O unavailable"
@@ -909,6 +1580,9 @@ def validate_route_opportunity_release(
 
 def configured_route_root() -> Path:
     """Return the complete public opportunity root used by release checks."""
+    configured_route_root = os.environ.get("MARKET_ROUTE_DATA_DIR")
+    if configured_route_root:
+        return Path(configured_route_root).expanduser()
     configured_data_root = os.environ.get("MARKET_DATA_DIR")
     if configured_data_root:
         return Path(configured_data_root).expanduser() / "routes"
@@ -1314,6 +1988,7 @@ def fetch_json(
         f"{base_url.rstrip('/')}{path}",
         headers={"Accept": "application/json", "Accept-Encoding": "gzip"},
     )
+    request_started_at = datetime.now(timezone.utc)
     started = time.perf_counter()
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -1327,6 +2002,7 @@ def fetch_json(
         ) from error
     except URLError as error:
         raise ReleaseCheckError(f"{path} request failed: {error.reason}") from error
+    response_completed_at = datetime.now(timezone.utc)
     elapsed_ms = (time.perf_counter() - started) * 1000
     require(status == 200, f"{path} returned HTTP {status}")
     compressed = encoding == "gzip"
@@ -1345,7 +2021,1482 @@ def fetch_json(
         wire_bytes=len(body),
         raw_bytes=len(raw),
         compressed=compressed,
+        request_started_at=request_started_at,
+        response_completed_at=response_completed_at,
     )
+
+
+def _opportunity_exact_keys(
+    value: Any,
+    expected: frozenset[str],
+    label: str,
+) -> Mapping[str, Any]:
+    require(isinstance(value, Mapping), "{} is not an object".format(label))
+    require(
+        set(value) == set(expected),
+        "{} fields differ from the public contract".format(label),
+    )
+    return value
+
+
+def _validate_opportunity_public_value(value: Any, path: str = "payload") -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            require(
+                isinstance(key, str)
+                and _OPPORTUNITY_FORBIDDEN_KEY.search(key) is None,
+                "Opportunity API leaked a secret-bearing field",
+            )
+            _validate_opportunity_public_value(item, "{}.{}".format(path, key))
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_opportunity_public_value(
+                item, "{}[{}]".format(path, index)
+            )
+        return
+    if isinstance(value, str):
+        require(
+            _OPPORTUNITY_FORBIDDEN_VALUE.search(value) is None,
+            "Opportunity API leaked secret material",
+        )
+        require(
+            _OPPORTUNITY_ABSOLUTE_PATH.search(value) is None,
+            "Opportunity API leaked an absolute filesystem path",
+        )
+
+
+def _opportunity_decimal(
+    value: Any,
+    label: str,
+    *,
+    allow_none: bool = False,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> Optional[Decimal]:
+    if value is None and allow_none:
+        return None
+    require(
+        not isinstance(value, (bool, float))
+        and isinstance(value, (str, int, Decimal)),
+        "{} is not exact decimal evidence".format(label),
+    )
+    try:
+        result = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ReleaseCheckError(
+            "{} is not exact decimal evidence".format(label)
+        ) from error
+    require(result.is_finite(), "{} is not finite".format(label))
+    if positive:
+        require(result > 0, "{} must be positive".format(label))
+    if nonnegative:
+        require(result >= 0, "{} must be non-negative".format(label))
+    return result
+
+
+def _opportunity_number(
+    value: Any,
+    label: str,
+    *,
+    allow_none: bool = False,
+) -> Optional[Decimal]:
+    if value is None and allow_none:
+        return None
+    require(
+        not isinstance(value, bool) and isinstance(value, (str, int, float)),
+        "{} is not numeric".format(label),
+    )
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ReleaseCheckError("{} is not numeric".format(label)) from error
+    require(
+        result.is_finite() and result >= 0,
+        "{} is invalid".format(label),
+    )
+    return result
+
+
+def _opportunity_count_map(
+    value: Any,
+    *,
+    keys: frozenset[str],
+    label: str,
+) -> dict[str, int]:
+    require(isinstance(value, Mapping), "{} is not an object".format(label))
+    require(
+        set(value) <= set(keys),
+        "{} contains an unknown category".format(label),
+    )
+    result = {}
+    for key in keys:
+        count = value.get(key, 0)
+        require(
+            type(count) is int and count >= 0,
+            "{} contains an invalid count".format(label),
+        )
+        result[key] = count
+    return result
+
+
+def _validate_opportunity_filters(
+    value: Any,
+    *,
+    expected: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    filters = _opportunity_exact_keys(
+        value, _OPPORTUNITY_FILTER_FIELDS, "Opportunity filters"
+    )
+    require(
+        dict(filters) == dict(expected),
+        "Opportunity API filter echo differs from the requested filters",
+    )
+    token = filters.get("token")
+    require(
+        token is None
+        or (
+            isinstance(token, str)
+            and bool(token)
+            and token == token.strip().upper()
+        ),
+        "Opportunity Token filter is invalid",
+    )
+    venue = filters.get("venue")
+    require(
+        venue is None
+        or (
+            isinstance(venue, str)
+            and venue != "all"
+            and _OPPORTUNITY_VENUE.fullmatch(venue) is not None
+        ),
+        "Opportunity venue filter is invalid",
+    )
+    notional = filters.get("notional_usd")
+    if notional is not None:
+        _opportunity_decimal(
+            notional, "Opportunity notional filter", positive=True
+        )
+    require(
+        filters.get("opportunity_class") in _OPPORTUNITY_CLASS_FILTERS,
+        "Opportunity class filter is invalid",
+    )
+    require(
+        filters.get("route_type") in _OPPORTUNITY_ROUTE_TYPES,
+        "Opportunity route-type filter is invalid",
+    )
+    require(
+        filters.get("availability") in _OPPORTUNITY_AVAILABILITIES,
+        "Opportunity availability filter is invalid",
+    )
+    require(
+        filters.get("sort") in _OPPORTUNITY_SORT_FIELDS,
+        "Opportunity sort field is invalid",
+    )
+    require(
+        filters.get("direction") in _OPPORTUNITY_DIRECTIONS,
+        "Opportunity sort direction is invalid",
+    )
+    return filters
+
+
+def _validate_opportunity_source_links(
+    value: Any,
+    *,
+    expected_market_ids: frozenset[str],
+) -> None:
+    require(isinstance(value, list), "Opportunity source_links is not an array")
+    seen = set()
+    for link in value:
+        link = _opportunity_exact_keys(
+            link, frozenset({"market_id", "url"}), "Opportunity source link"
+        )
+        market_id = link.get("market_id")
+        url = link.get("url")
+        require(
+            isinstance(market_id, str)
+            and bool(market_id)
+            and market_id not in seen,
+            "Opportunity source-link market identity is invalid",
+        )
+        seen.add(market_id)
+        if url is None:
+            continue
+        require(
+            isinstance(url, str) and bool(url),
+            "Opportunity source URL is invalid",
+        )
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except ValueError as error:
+            raise ReleaseCheckError("Opportunity source URL is invalid") from error
+        require(
+            parsed.scheme == "https"
+            and parsed.hostname in APPROVED_OPPORTUNITY_SOURCE_HOSTS
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path == ""
+            and not parsed.query
+            and not parsed.fragment
+            and port is None
+            and url == "https://{}".format(parsed.hostname),
+            "Opportunity source URL is not an approved public origin",
+        )
+    require(
+        seen == set(expected_market_ids),
+        "Opportunity source links differ from the buy/sell legs",
+    )
+
+
+def _opportunity_expected_component_keys(
+    row: Mapping[str, Any],
+) -> set[tuple[str, str]]:
+    expected = {("route", "rebalancing_or_transfer")}
+    has_dex = False
+    for leg in ("buy", "sell"):
+        market_id = str(row.get(leg + "_market_id") or "")
+        if market_id.startswith("cex:"):
+            expected.add((leg, "venue_taker_fee"))
+        elif market_id.startswith("dex:"):
+            has_dex = True
+            expected.update({
+                (leg, "pool_swap_fee"),
+                (leg, "network_gas"),
+                (leg, "router_or_integrator_fee"),
+                (leg, "token_transfer_tax"),
+            })
+        else:
+            raise ReleaseCheckError(
+                "Opportunity cost component market type is unsupported"
+            )
+    if has_dex:
+        expected.add(("route", "mev_buffer"))
+    return expected
+
+
+def _opportunity_rounded_seconds(value: Decimal) -> Decimal:
+    """Reproduce freshness.py's float total_seconds + round(..., 6)."""
+
+    try:
+        rounded = round(float(value), 6)
+        result = Decimal(str(rounded))
+    except (InvalidOperation, OverflowError, TypeError, ValueError) as error:
+        raise ReleaseCheckError(
+            "Opportunity timing arithmetic is invalid"
+        ) from error
+    require(result.is_finite(), "Opportunity timing arithmetic is invalid")
+    return result
+
+
+def _validate_opportunity_route(row: Any, *, metadata: Mapping[str, Any]) -> None:
+    row = _opportunity_exact_keys(
+        row, _OPPORTUNITY_ROUTE_FIELDS, "Opportunity route"
+    )
+    for field in (
+        "route_id",
+        "opportunity_id",
+        "token_symbol",
+        "buy_market_id",
+        "sell_market_id",
+        "route_mode",
+    ):
+        value = row.get(field)
+        require(
+            isinstance(value, str) and bool(value) and value == value.strip(),
+            "Opportunity {} is invalid".format(field),
+        )
+    require(
+        row["token_symbol"] == row["token_symbol"].upper(),
+        "Opportunity Token identity is not canonical",
+    )
+    leg_venues = _opportunity_exact_keys(
+        row.get("leg_venues"),
+        frozenset({"buy", "sell"}),
+        "Opportunity leg venues",
+    )
+    market_types = set()
+    for field in ("buy_market_id", "sell_market_id"):
+        market_id = str(row[field])
+        if market_id.startswith("cex:"):
+            market_types.add("cex")
+            parts = market_id.split(":")
+            expected_venue = parts[1] if len(parts) >= 3 else ""
+        elif market_id.startswith("dex:"):
+            market_types.add("dex")
+            parts = market_id.split(":")
+            expected_venue = parts[2] if len(parts) >= 5 else ""
+        else:
+            raise ReleaseCheckError("Opportunity market identity is invalid")
+        side = field.split("_", 1)[0]
+        require(
+            _OPPORTUNITY_VENUE.fullmatch(expected_venue) is not None
+            and leg_venues.get(side) == expected_venue,
+            "Opportunity leg venue conflicts with its market identity",
+        )
+    expected_route_type = (
+        "cex_cex" if market_types == {"cex"}
+        else "dex_dex" if market_types == {"dex"}
+        else "cex_dex"
+    )
+    require(
+        row.get("route_type") == expected_route_type,
+        "Opportunity route type conflicts with its markets",
+    )
+    opportunity_class = row.get("opportunity_class")
+    require(
+        opportunity_class in _OPPORTUNITY_CLASSES,
+        "Opportunity class is unknown",
+    )
+    requested_notional = _opportunity_decimal(
+        row.get("requested_notional_usd"),
+        "Opportunity requested notional",
+        positive=True,
+    )
+    _opportunity_decimal(
+        row.get("target_token_quantity"),
+        "Opportunity target quantity",
+        allow_none=True,
+        positive=True,
+    )
+    _opportunity_decimal(
+        row.get("route_volume_usd"),
+        "Opportunity route volume",
+        allow_none=True,
+        positive=True,
+    )
+    require(
+        row.get("route_volume_basis") == _ROUTE_VOLUME_BASIS,
+        "Opportunity route volume basis is invalid",
+    )
+
+    availability = _opportunity_exact_keys(
+        row.get("availability"),
+        frozenset({"status", "reason"}),
+        "Opportunity route availability",
+    )
+    status = availability.get("status")
+    reason = availability.get("reason")
+    require(
+        status in {"available", "unavailable"},
+        "Opportunity route availability is invalid",
+    )
+    if status == "available":
+        require(reason is None, "Available Opportunity route has a reason")
+    else:
+        require(
+            reason in _OPPORTUNITY_REASON_CODES,
+            "Unavailable Opportunity route has an unknown reason",
+        )
+
+    primary_reason = row.get("primary_reason")
+    reason_codes = row.get("reason_codes")
+    require(
+        primary_reason in _OPPORTUNITY_REASON_CODES,
+        "Opportunity primary reason is unknown or missing",
+    )
+    require(
+        isinstance(reason_codes, list)
+        and len(reason_codes) == len(set(reason_codes))
+        and all(code in _OPPORTUNITY_REASON_CODES for code in reason_codes),
+        "Opportunity reason inventory is invalid",
+    )
+    if opportunity_class == "executable_candidate":
+        require(
+            primary_reason == "positive_strict_net_edge",
+            "Strict Opportunity has a non-strict primary reason",
+        )
+
+    decimal_values = {}
+    for field in (
+        "gross_edge_usd",
+        "gross_edge_bps",
+        "net_edge_usd",
+        "net_edge_bps",
+        "capacity_quantity",
+    ):
+        decimal_values[field] = _opportunity_decimal(
+            row.get(field),
+            "Opportunity {}".format(field),
+            allow_none=True,
+            nonnegative=(field == "capacity_quantity"),
+        )
+    if status == "unavailable":
+        require(
+            row.get("target_token_quantity") is None
+            and row.get("gross_edge_usd") is None
+            and row.get("gross_edge_bps") is None
+            and row.get("net_edge_usd") is None
+            and row.get("net_edge_bps") is None
+            and row.get("capacity_quantity") is None,
+            "Unavailable or stale Opportunity retained economic values",
+        )
+    else:
+        require(
+            row.get("net_edge_usd") is not None
+            and row.get("net_edge_bps") is not None,
+            "Available Opportunity is missing numeric rank values",
+        )
+    if opportunity_class == "unavailable":
+        require(
+            status == "unavailable",
+            "Stored unavailable Opportunity became available",
+        )
+    if opportunity_class == "executable_candidate" and status == "available":
+        require(
+            decimal_values["net_edge_usd"] is not None
+            and decimal_values["net_edge_usd"] > 0,
+            "Strict Opportunity has no positive net edge",
+        )
+
+    breakdown = _opportunity_exact_keys(
+        row.get("cost_breakdown"),
+        frozenset({
+            "strict_nonembedded_usd",
+            "research_bounded_usd",
+            "research_assumed_usd",
+        }),
+        "Opportunity cost breakdown",
+    )
+    cost_values = {}
+    for field in (
+        "strict_nonembedded_usd",
+        "research_bounded_usd",
+        "research_assumed_usd",
+    ):
+        cost_values[field] = _opportunity_decimal(
+            breakdown.get(field),
+            "Opportunity {}".format(field),
+            allow_none=True,
+            nonnegative=True,
+        )
+    if status == "unavailable":
+        require(
+            all(value is None for value in cost_values.values()),
+            "Unavailable or stale Opportunity retained cost breakdown values",
+        )
+    if status == "available":
+        require(
+            decimal_values["gross_edge_usd"] is not None
+            and all(value is not None for value in cost_values.values()),
+            "Available Opportunity has incomplete cost arithmetic",
+        )
+        expected_net = (
+            decimal_values["gross_edge_usd"]
+            - cost_values["strict_nonembedded_usd"]
+        )
+        if opportunity_class == "research_estimate":
+            expected_net -= (
+                cost_values["research_bounded_usd"]
+                + cost_values["research_assumed_usd"]
+            )
+        require(
+            expected_net == decimal_values["net_edge_usd"],
+            "Opportunity public cost arithmetic does not reproduce",
+        )
+
+    components = row.get("cost_components")
+    require(
+        isinstance(components, list),
+        "Opportunity cost_components is not an array",
+    )
+    observed_component_keys = set()
+    component_totals = {
+        "strict_nonembedded_usd": Decimal("0"),
+        "research_bounded_usd": Decimal("0"),
+        "research_assumed_usd": Decimal("0"),
+    }
+    strict_component_inventory_complete = True
+    scenario_component_inventory_complete = True
+    for component in components:
+        component = _opportunity_exact_keys(
+            component,
+            _OPPORTUNITY_COST_FIELDS,
+            "Opportunity cost component",
+        )
+        for field in ("leg", "market_id", "component_type", "value_status"):
+            require(
+                isinstance(component.get(field), str),
+                "Opportunity cost component {} is invalid".format(field),
+            )
+        leg = str(component["leg"])
+        component_type = str(component["component_type"])
+        component_key = (leg, component_type)
+        require(
+            component_key not in observed_component_keys,
+            "Opportunity cost component topology is duplicated",
+        )
+        observed_component_keys.add(component_key)
+        require(
+            leg in {"buy", "sell", "route"},
+            "Opportunity cost component leg is invalid",
+        )
+        expected_market_id = (
+            "" if leg == "route" else str(row[leg + "_market_id"])
+        )
+        require(
+            component.get("market_id") == expected_market_id,
+            "Opportunity cost component leg/market binding differs",
+        )
+        strict_eligible = component.get("strict_eligible")
+        embedded_in_leg_quote = component.get("embedded_in_leg_quote")
+        reflected_or_embedded = component.get("reflected_or_embedded")
+        require(
+            type(strict_eligible) is bool
+            and type(embedded_in_leg_quote) is bool
+            and type(reflected_or_embedded) is bool,
+            "Opportunity cost component provenance flags are invalid",
+        )
+        require(
+            not embedded_in_leg_quote or reflected_or_embedded,
+            "Opportunity embedded cost is missing its reflected marker",
+        )
+        value_status = str(component["value_status"])
+        require(
+            value_status
+            in (
+                _ROUTE_STRICT_VALUE_STATUSES
+                | _ROUTE_SCENARIO_VALUE_STATUSES
+                | _ROUTE_TERMINAL_VALUE_STATUSES
+            ),
+            "Opportunity cost component value status is invalid",
+        )
+        component_amount = _opportunity_decimal(
+            component.get("amount_usd"),
+            "Opportunity component amount",
+            allow_none=True,
+            nonnegative=True,
+        )
+        component_rate = _opportunity_decimal(
+            component.get("rate_bps"),
+            "Opportunity component rate",
+            allow_none=True,
+            nonnegative=True,
+        )
+        if status == "unavailable":
+            require(
+                component_amount is None and component_rate is None,
+                "Unavailable or stale Opportunity retained component values",
+            )
+        else:
+            if value_status == "not_applicable":
+                require(
+                    component_amount is None and component_rate is None,
+                    "Not-applicable Opportunity cost retained numeric values",
+                )
+            else:
+                require(
+                    value_status
+                    in (
+                        _ROUTE_STRICT_VALUE_STATUSES
+                        | _ROUTE_SCENARIO_VALUE_STATUSES
+                    )
+                    and component_amount is not None
+                    and component_rate is not None,
+                    "Available Opportunity retained incomplete cost evidence",
+                )
+                require(
+                    component_amount
+                    == requested_notional * component_rate / Decimal("10000"),
+                    "Opportunity component amount does not reproduce from rate",
+                )
+            strict_component = (
+                value_status in _ROUTE_STRICT_VALUE_STATUSES
+                and strict_eligible is True
+            )
+            scenario_component = (
+                strict_component
+                or value_status in _ROUTE_SCENARIO_VALUE_STATUSES
+            )
+            strict_component_inventory_complete = (
+                strict_component_inventory_complete and strict_component
+            )
+            scenario_component_inventory_complete = (
+                scenario_component_inventory_complete and scenario_component
+            )
+            if component_amount is not None and not reflected_or_embedded:
+                if strict_component:
+                    component_totals["strict_nonembedded_usd"] += (
+                        component_amount
+                    )
+                elif value_status == "bounded_estimate":
+                    component_totals["research_bounded_usd"] += (
+                        component_amount
+                    )
+                elif value_status == "assumed":
+                    component_totals["research_assumed_usd"] += (
+                        component_amount
+                    )
+        component_reason = component.get("reason_code")
+        require(
+            component_reason is None
+            or (isinstance(component_reason, str) and bool(component_reason)),
+            "Opportunity component reason is invalid",
+        )
+
+    require(
+        observed_component_keys == _opportunity_expected_component_keys(row),
+        "Opportunity cost component topology differs from the route",
+    )
+    if status == "available":
+        require(
+            all(
+                cost_values[field] == component_totals[field]
+                for field in component_totals
+            ),
+            "Opportunity cost breakdown differs from exact components",
+        )
+        require(
+            row.get("cost_completeness")
+            == (
+                "complete"
+                if strict_component_inventory_complete
+                else "incomplete"
+            )
+            and row.get("scenario_cost_completeness")
+            == (
+                "complete"
+                if scenario_component_inventory_complete
+                else "incomplete"
+            ),
+            "Opportunity cost completeness differs from exact components",
+        )
+        require(
+            scenario_component_inventory_complete,
+            "Available Opportunity has incomplete scenario costs",
+        )
+        if opportunity_class == "executable_candidate":
+            require(
+                strict_component_inventory_complete,
+                "Strict Opportunity has non-strict cost components",
+            )
+
+    timestamps = _opportunity_exact_keys(
+        row.get("leg_timestamps"),
+        frozenset({"buy", "sell"}),
+        "Opportunity leg timestamps",
+    )
+    buy_epoch = _route_timestamp(
+        timestamps.get("buy"), "Opportunity buy timestamp"
+    )
+    sell_epoch = _route_timestamp(
+        timestamps.get("sell"), "Opportunity sell timestamp"
+    )
+    checked_at_epoch = _route_timestamp(
+        metadata.get("checked_at"), "Opportunity API checked_at"
+    )
+    expected_age_raw = checked_at_epoch - max(buy_epoch, sell_epoch)
+    expected_skew_raw = abs(buy_epoch - sell_epoch)
+    require(
+        expected_age_raw >= 0,
+        "Opportunity route timestamp is in the future",
+    )
+    skew = _opportunity_number(row.get("skew_seconds"), "Opportunity skew")
+    age = _opportunity_number(
+        row.get("route_age_seconds"),
+        "Opportunity route age",
+    )
+    require(
+        skew == _opportunity_rounded_seconds(expected_skew_raw)
+        and age == _opportunity_rounded_seconds(expected_age_raw),
+        "Opportunity route timing does not reproduce from timestamps",
+    )
+    max_skew = Decimal(str(metadata["max_route_skew_seconds"]))
+    max_age = Decimal(str(metadata["max_route_age_seconds"]))
+    timing_reason = (
+        "snapshot_skew_exceeded"
+        if expected_skew_raw > max_skew
+        else "cohort_stale"
+        if expected_age_raw > max_age
+        else None
+    )
+    if timing_reason is not None and opportunity_class != "unavailable":
+        require(
+            status == "unavailable" and reason == timing_reason,
+            "Opportunity timing SLA failure has the wrong availability reason",
+        )
+    if opportunity_class == "executable_candidate" and status == "available":
+        require(
+            skew is not None
+            and skew <= Decimal(str(metadata["max_route_skew_seconds"])),
+            "Strict Opportunity exceeds the skew SLA",
+        )
+        require(
+            age is not None
+            and age <= Decimal(str(metadata["max_route_age_seconds"])),
+            "Strict Opportunity is stale",
+        )
+
+    _validate_opportunity_source_links(
+        row.get("source_links"),
+        expected_market_ids=frozenset({
+            str(row["buy_market_id"]),
+            str(row["sell_market_id"]),
+        }),
+    )
+    missing_display_value = any(
+        value is None
+        for value in (
+            row.get("gross_edge_usd"),
+            row.get("gross_edge_bps"),
+            row.get("net_edge_usd"),
+            row.get("net_edge_bps"),
+            row.get("capacity_quantity"),
+            row.get("route_age_seconds"),
+            breakdown.get("strict_nonembedded_usd"),
+            breakdown.get("research_bounded_usd"),
+            breakdown.get("research_assumed_usd"),
+        )
+    )
+    require(
+        not missing_display_value
+        or reason in _OPPORTUNITY_REASON_CODES
+        or primary_reason in _OPPORTUNITY_REASON_CODES,
+        "Opportunity N/A value has no public reason",
+    )
+
+
+def _opportunity_row_matches_filters(
+    row: Mapping[str, Any], filters: Mapping[str, Any]
+) -> bool:
+    requested_class = filters["opportunity_class"]
+    canonical_class = _OPPORTUNITY_CLASS_ALIASES.get(str(requested_class))
+    if canonical_class is not None and row["opportunity_class"] != canonical_class:
+        return False
+    if filters["token"] is not None and row["token_symbol"] != filters["token"]:
+        return False
+    if (
+        filters["venue"] is not None
+        and filters["venue"] not in row["leg_venues"].values()
+    ):
+        return False
+    if (
+        filters["notional_usd"] is not None
+        and Decimal(str(row["requested_notional_usd"]))
+        != Decimal(str(filters["notional_usd"]))
+    ):
+        return False
+    if filters["route_type"] != "all" and row["route_type"] != filters["route_type"]:
+        return False
+    if (
+        filters["availability"] != "all"
+        and row["availability"]["status"] != filters["availability"]
+    ):
+        return False
+    return True
+
+
+def _opportunity_sorted_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    sort_field: str,
+    direction: str,
+) -> list[Mapping[str, Any]]:
+    rows = list(rows)
+    row_field = (
+        "route_volume_usd" if sort_field == "volume" else sort_field
+    )
+    present = [row for row in rows if row.get(row_field) is not None]
+    missing = [row for row in rows if row.get(row_field) is None]
+    present.sort(key=lambda row: (
+        str(row["route_id"]), str(row["opportunity_id"])
+    ))
+    if sort_field in _OPPORTUNITY_NUMERIC_SORT_FIELDS:
+        present.sort(
+            key=lambda row: Decimal(str(row[row_field])),
+            reverse=direction == "desc",
+        )
+    else:
+        present.sort(
+            key=lambda row: str(row[row_field]),
+            reverse=direction == "desc",
+        )
+    missing.sort(key=lambda row: (
+        str(row["route_id"]), str(row["opportunity_id"])
+    ))
+    return present + missing
+
+
+def _validate_opportunity_api_payload(
+    payload: dict[str, Any],
+    metrics: ResponseMetrics,
+    *,
+    route_release: Mapping[str, Any],
+    expected_filters: Mapping[str, Any],
+    raw_max: int,
+    gzip_max: int,
+    require_complete_inventory: bool,
+) -> dict[str, Any]:
+    """Validate one public Opportunities projection without trusting the API."""
+    require(
+        type(raw_max) is int and raw_max > 0,
+        "Opportunity raw payload budget is invalid",
+    )
+    require(
+        type(gzip_max) is int and gzip_max > 0,
+        "Opportunity gzip payload budget is invalid",
+    )
+    require(
+        isinstance(metrics.elapsed_ms, (int, float))
+        and not isinstance(metrics.elapsed_ms, bool)
+        and math.isfinite(float(metrics.elapsed_ms))
+        and metrics.elapsed_ms >= 0,
+        "Opportunity response elapsed time is invalid",
+    )
+    require(
+        type(metrics.raw_bytes) is int
+        and metrics.raw_bytes >= 0
+        and metrics.raw_bytes <= raw_max,
+        "Opportunity raw payload exceeds its compact budget",
+    )
+    require(
+        type(metrics.wire_bytes) is int and metrics.wire_bytes >= 0,
+        "Opportunity wire payload size is invalid",
+    )
+    if metrics.compressed:
+        require(
+            metrics.wire_bytes <= gzip_max,
+            "Opportunity gzip payload exceeds its compact budget",
+        )
+    else:
+        require(
+            metrics.wire_bytes == metrics.raw_bytes,
+            "Uncompressed Opportunity payload byte counts diverge",
+        )
+
+    _validate_opportunity_public_value(payload)
+    payload = dict(_opportunity_exact_keys(
+        payload, _OPPORTUNITY_PUBLIC_ROOT_FIELDS, "Opportunity payload"
+    ))
+    filters = _validate_opportunity_filters(
+        payload.get("filters"), expected=expected_filters
+    )
+    availability = _opportunity_exact_keys(
+        payload.get("availability"),
+        frozenset({"status", "reason"}),
+        "Opportunity publication availability",
+    )
+    metadata = _opportunity_exact_keys(
+        payload.get("metadata"),
+        _OPPORTUNITY_METADATA_FIELDS,
+        "Opportunity metadata",
+    )
+    coverage = _opportunity_exact_keys(
+        metadata.get("coverage"),
+        _OPPORTUNITY_COVERAGE_FIELDS,
+        "Opportunity coverage",
+    )
+    routes = payload.get("routes")
+    require(isinstance(routes, list), "Opportunity routes is not an array")
+    require(
+        metadata.get("contract_version") == OPPORTUNITY_API_CONTRACT,
+        "Opportunity API contract version is invalid",
+    )
+    require(
+        metadata.get("max_route_age_seconds") == int(MAX_ROUTE_AGE_SECONDS)
+        and metadata.get("max_route_skew_seconds") == int(MAX_ROUTE_SKEW_SECONDS),
+        "Opportunity API route SLA differs from the evaluator",
+    )
+
+    if route_release.get("status") == "unavailable":
+        require(
+            route_release.get("reason") == "complete_pointer_absent",
+            "Optional local Opportunity release has an unknown reason",
+        )
+        require(
+            dict(availability) == {
+                "status": "unavailable",
+                "reason": "complete_pointer_absent",
+            },
+            "Missing Opportunity API must use complete_pointer_absent",
+        )
+        require(routes == [], "Missing Opportunity API returned route rows")
+        require(
+            metadata.get("route_cohort_id") is None
+            and metadata.get("manifest_sha256") is None
+            and metadata.get("publication_status") == "missing"
+            and metadata.get("checked_at") is None
+            and metadata.get("next_freshness_deadline_at") is None
+            and metadata.get("next_freshness_deadline_exclusive") is None
+            and metadata.get("available_notionals_usd") == []
+            and metadata.get("available_venues") == [],
+            "Missing Opportunity API retained publication lineage",
+        )
+        require(
+            dict(coverage) == {
+                "route_count": 0,
+                "scenario_count": 0,
+                "returned_count": 0,
+                "class_counts": {},
+                "availability_counts": {},
+            },
+            "Missing Opportunity API retained numeric inventory",
+        )
+        return {
+            "status": "unavailable",
+            "reason": "complete_pointer_absent",
+            "rows": [],
+            "route_cohort_id": None,
+            "manifest_sha256": None,
+            "checked_at": None,
+            "next_freshness_deadline_at": None,
+            "next_freshness_deadline_exclusive": None,
+            "route_count": 0,
+            "scenario_count": 0,
+            "available_venues": [],
+            "class_counts": {
+                "executable_candidate": 0,
+                "research_estimate": 0,
+                "unavailable": 0,
+            },
+            "availability_counts": {"available": 0, "unavailable": 0},
+            "opportunity_inventory_sha256": (
+                _route_opportunity_inventory_sha256([])
+            ),
+        }
+
+    require(
+        route_release.get("status") == "validated",
+        "Local Opportunity release status is invalid",
+    )
+    require(
+        dict(availability) == {"status": "available", "reason": None},
+        "Validated Opportunity API is not available",
+    )
+    require(
+        metadata.get("publication_status") == "available",
+        "Opportunity publication status is invalid",
+    )
+    require(
+        metadata.get("route_cohort_id") == route_release.get("route_cohort_id"),
+        "Opportunity API generation differs from the complete pointer",
+    )
+    require(
+        metadata.get("manifest_sha256") == route_release.get("manifest_sha256"),
+        "Opportunity API manifest differs from the complete pointer",
+    )
+    checked_at = metadata.get("checked_at")
+    checked_at_epoch = _route_timestamp(
+        checked_at, "Opportunity API checked_at"
+    )
+    request_started_epoch, response_completed_epoch = (
+        _opportunity_response_wall_clock(metrics, checked_at_epoch)
+    )
+    elapsed_seconds = Decimal(str(metrics.elapsed_ms)) / Decimal("1000")
+    completion_projection_epoch = max(
+        checked_at_epoch + elapsed_seconds,
+        request_started_epoch + elapsed_seconds,
+        response_completed_epoch,
+    )
+    public_binding_rows = route_release.get(
+        _OPPORTUNITY_PUBLIC_BINDING_ROWS
+    )
+    require(
+        isinstance(public_binding_rows, Mapping)
+        and all(
+            isinstance(key, str) and isinstance(value, Mapping)
+            for key, value in public_binding_rows.items()
+        ),
+        "Local Opportunity public-row binding is unavailable",
+    )
+    next_deadline = metadata.get("next_freshness_deadline_at")
+    next_deadline_exclusive = metadata.get(
+        "next_freshness_deadline_exclusive"
+    )
+    next_deadline_epoch = (
+        _route_timestamp(
+            next_deadline,
+            "Opportunity API next_freshness_deadline_at",
+        )
+        if next_deadline is not None
+        else None
+    )
+    require(
+        next_deadline_epoch is None or next_deadline_epoch >= checked_at_epoch,
+        "Opportunity API freshness deadline precedes checked_at",
+    )
+    require(
+        (
+            next_deadline_epoch is None
+            and next_deadline_exclusive is None
+        )
+        or (
+            next_deadline_epoch is not None
+            and type(next_deadline_exclusive) is bool
+        ),
+        "Opportunity API freshness deadline boundary mode is invalid",
+    )
+    notionals = metadata.get("available_notionals_usd")
+    require(
+        isinstance(notionals, list) and len(notionals) == len(set(notionals)),
+        "Opportunity available notional inventory is invalid",
+    )
+    notional_decimals = [
+        _opportunity_decimal(
+            value, "Opportunity available notional", positive=True
+        )
+        for value in notionals
+    ]
+    require(
+        notional_decimals == sorted(notional_decimals),
+        "Opportunity available notionals are not ordered",
+    )
+    available_venues = metadata.get("available_venues")
+    require(
+        isinstance(available_venues, list)
+        and available_venues == sorted(set(available_venues))
+        and all(
+            isinstance(value, str)
+            and _OPPORTUNITY_VENUE.fullmatch(value) is not None
+            for value in available_venues
+        ),
+        "Opportunity available venue inventory is invalid",
+    )
+
+    class_counts = _opportunity_count_map(
+        coverage.get("class_counts"),
+        keys=_OPPORTUNITY_CLASSES,
+        label="Opportunity class counts",
+    )
+    expected_class_counts = {
+        "executable_candidate": route_release.get(
+            "strict_opportunity_count"
+        ),
+        "research_estimate": route_release.get(
+            "research_opportunity_count"
+        ),
+        "unavailable": route_release.get(
+            "unavailable_opportunity_count"
+        ),
+    }
+    require(
+        all(type(value) is int and value >= 0 for value in expected_class_counts.values()),
+        "Local Opportunity class counts are invalid",
+    )
+    require(
+        class_counts == expected_class_counts,
+        "Opportunity API class counts differ from the complete bundle",
+    )
+    availability_counts = _opportunity_count_map(
+        coverage.get("availability_counts"),
+        keys=frozenset({"available", "unavailable"}),
+        label="Opportunity availability counts",
+    )
+    for field in ("route_count", "scenario_count", "returned_count"):
+        require(
+            type(coverage.get(field)) is int and coverage[field] >= 0,
+            "Opportunity {} is invalid".format(field),
+        )
+    require(
+        coverage["scenario_count"] == sum(class_counts.values()),
+        "Opportunity scenario count differs from class counts",
+    )
+    require(
+        coverage["returned_count"] == len(routes),
+        "Opportunity returned count differs from route rows",
+    )
+
+    expected_inventory = [
+        _route_expected_public_row(base_row, checked_at_epoch)
+        for _, base_row in sorted(public_binding_rows.items())
+    ]
+    expected_route_count = len({
+        str(row["route_id"]) for row in expected_inventory
+    })
+    require(
+        coverage["route_count"] == expected_route_count
+        and coverage["scenario_count"] == len(expected_inventory),
+        "Opportunity API inventory counts differ from the complete bundle",
+    )
+    expected_availability_counts = _opportunity_count_map(
+        Counter(
+            str(row["availability"]["status"])
+            for row in expected_inventory
+        ),
+        keys=frozenset({"available", "unavailable"}),
+        label="Expected Opportunity availability counts",
+    )
+    require(
+        availability_counts == expected_availability_counts,
+        "Opportunity availability counts differ at checked_at",
+    )
+    expected_venues = sorted({
+        venue
+        for row in expected_inventory
+        for venue in row["leg_venues"].values()
+    })
+    require(
+        available_venues == expected_venues,
+        "Opportunity available venues differ from the complete bundle",
+    )
+    current_deadlines: list[tuple[Decimal, bool]] = []
+    max_skew_seconds = Decimal(int(MAX_ROUTE_SKEW_SECONDS))
+    max_age_seconds = Decimal(int(MAX_ROUTE_AGE_SECONDS))
+    for row in expected_inventory:
+        timestamps = row["leg_timestamps"]
+        buy_epoch = _route_timestamp(
+            timestamps["buy"], "Opportunity binding buy leg"
+        )
+        sell_epoch = _route_timestamp(
+            timestamps["sell"], "Opportunity binding sell leg"
+        )
+        latest_epoch = max(buy_epoch, sell_epoch)
+        if (
+            abs(buy_epoch - sell_epoch) <= max_skew_seconds
+            and Decimal("0")
+            <= checked_at_epoch - latest_epoch
+            <= max_age_seconds
+        ):
+            current_deadlines.append((
+                latest_epoch + max_age_seconds,
+                False,
+            ))
+            base_row = public_binding_rows[str(row["opportunity_id"])]
+            for timing in base_row[_OPPORTUNITY_PRIVATE_COST_TIMING]:
+                cost_deadline, cost_exclusive = _route_cost_next_deadline(
+                    timing, checked_at_epoch
+                )
+                if cost_deadline is not None:
+                    current_deadlines.append((
+                        cost_deadline,
+                        cost_exclusive,
+                    ))
+    expected_deadline = (
+        min(deadline for deadline, _ in current_deadlines)
+        if current_deadlines
+        else None
+    )
+    expected_deadline_exclusive = (
+        any(
+            deadline == expected_deadline and exclusive
+            for deadline, exclusive in current_deadlines
+        )
+        if expected_deadline is not None
+        else None
+    )
+    require(
+        next_deadline_epoch == expected_deadline,
+        "Opportunity API freshness deadline differs at checked_at",
+    )
+    require(
+        next_deadline_exclusive is expected_deadline_exclusive,
+        "Opportunity API freshness deadline boundary differs at checked_at",
+    )
+    completion_inventory = {
+        opportunity_id: _route_expected_public_row(
+            base_row, completion_projection_epoch
+        )
+        for opportunity_id, base_row in public_binding_rows.items()
+    }
+    require(
+        all(
+            _route_projection_boundary_sha256(row)
+            == _route_projection_boundary_sha256(
+                completion_inventory[str(row["opportunity_id"])]
+            )
+            for row in expected_inventory
+        ),
+        "Opportunity response completion crossed a freshness boundary",
+    )
+    expected_filtered_rows = _opportunity_sorted_rows(
+        (
+            row for row in expected_inventory
+            if _opportunity_row_matches_filters(row, filters)
+        ),
+        sort_field=str(filters["sort"]),
+        direction=str(filters["direction"]),
+    )
+    require(
+        [row["opportunity_id"] for row in routes]
+        == [row["opportunity_id"] for row in expected_filtered_rows],
+        "Opportunity API filtered inventory differs at checked_at",
+    )
+
+    seen_opportunity_ids = set()
+    for row in routes:
+        _validate_opportunity_route(row, metadata=metadata)
+        opportunity_id = str(row["opportunity_id"])
+        require(
+            opportunity_id not in seen_opportunity_ids,
+            "Opportunity API contains duplicate opportunity IDs",
+        )
+        seen_opportunity_ids.add(opportunity_id)
+        expected_base_row = public_binding_rows.get(opportunity_id)
+        require(
+            isinstance(expected_base_row, Mapping),
+            "Opportunity public row is absent from the complete bundle",
+        )
+        expected_public_row = _route_expected_public_row(
+            expected_base_row,
+            checked_at_epoch,
+        )
+        require(
+            _route_canonical_sha256(row)
+            == _route_canonical_sha256(expected_public_row),
+            "Opportunity public row differs from the complete bundle",
+        )
+        require(
+            _opportunity_row_matches_filters(row, filters),
+            "Opportunity API mixed rows outside its declared filter",
+        )
+        require(
+            Decimal(str(row["requested_notional_usd"]))
+            in set(notional_decimals),
+            "Opportunity route notional is absent from the manifest grid",
+        )
+    expected_order = _opportunity_sorted_rows(
+        routes,
+        sort_field=str(filters["sort"]),
+        direction=str(filters["direction"]),
+    )
+    require(
+        [row["opportunity_id"] for row in routes]
+        == [row["opportunity_id"] for row in expected_order],
+        "Opportunity API sort order does not reproduce",
+    )
+
+    if require_complete_inventory:
+        require(
+            filters["opportunity_class"] == "all"
+            and filters["availability"] == "all"
+            and filters["token"] is None
+            and filters["venue"] is None
+            and filters["notional_usd"] is None
+            and filters["route_type"] == "all",
+            "Complete Opportunity inventory used a narrowing filter",
+        )
+        require(
+            len(routes) == coverage["scenario_count"],
+            "Opportunity API full inventory differs from scenario_count",
+        )
+        require(
+            seen_opportunity_ids == set(public_binding_rows),
+            "Opportunity API full inventory differs from the complete bundle",
+        )
+        require(
+            len({row["route_id"] for row in routes}) == coverage["route_count"],
+            "Opportunity API route count differs from exact route identities",
+        )
+        require(
+            _opportunity_count_map(
+                Counter(row["opportunity_class"] for row in routes),
+                keys=_OPPORTUNITY_CLASSES,
+                label="Opportunity returned class counts",
+            ) == class_counts,
+            "Opportunity API full class inventory diverges",
+        )
+        require(
+            _opportunity_count_map(
+                Counter(row["availability"]["status"] for row in routes),
+                keys=frozenset({"available", "unavailable"}),
+                label="Opportunity returned availability counts",
+            ) == availability_counts,
+            "Opportunity API full availability inventory diverges",
+        )
+        require(
+            sorted({
+                venue
+                for row in routes
+                for venue in row["leg_venues"].values()
+            }) == available_venues,
+            "Opportunity API full venue inventory diverges",
+        )
+        inventory_sha256 = _route_opportunity_inventory_sha256(routes)
+        require(
+            inventory_sha256
+            == route_release.get("opportunity_inventory_sha256"),
+            "Opportunity API exact inventory differs from the complete bundle",
+        )
+    else:
+        inventory_sha256 = _route_opportunity_inventory_sha256(routes)
+
+    return {
+        "status": "validated",
+        "reason": None,
+        "rows": routes,
+        "route_cohort_id": metadata.get("route_cohort_id"),
+        "manifest_sha256": metadata.get("manifest_sha256"),
+        "checked_at": checked_at,
+        "next_freshness_deadline_at": next_deadline,
+        "next_freshness_deadline_exclusive": next_deadline_exclusive,
+        "route_count": coverage["route_count"],
+        "scenario_count": coverage["scenario_count"],
+        "available_venues": available_venues,
+        "class_counts": class_counts,
+        "availability_counts": availability_counts,
+        "opportunity_inventory_sha256": inventory_sha256,
+    }
+
+
+def _opportunity_filters(
+    *,
+    token: Optional[str] = None,
+    venue: Optional[str] = None,
+    notional_usd: Optional[str] = None,
+    opportunity_class: str = "all",
+    route_type: str = "all",
+    availability: str = "all",
+    sort: str = "route_id",
+    direction: str = "asc",
+) -> dict[str, Any]:
+    return {
+        "token": token,
+        "venue": venue,
+        "notional_usd": notional_usd,
+        "opportunity_class": opportunity_class,
+        "route_type": route_type,
+        "availability": availability,
+        "sort": sort,
+        "direction": direction,
+    }
+
+
+def _opportunity_api_path(filters: Mapping[str, Any]) -> str:
+    query = {}
+    if filters.get("token") is not None:
+        query["token"] = filters["token"]
+    if filters.get("venue") is not None:
+        query["venue"] = filters["venue"]
+    if filters.get("notional_usd") is not None:
+        query["notional"] = filters["notional_usd"]
+    query["class"] = filters["opportunity_class"]
+    if filters.get("route_type") != "all":
+        query["route_type"] = filters["route_type"]
+    query["availability"] = filters["availability"]
+    query["sort"] = filters["sort"]
+    query["dir"] = filters["direction"]
+    return "/api/markets/opportunities?" + urlencode(query)
+
+
+def validate_opportunity_api_release(
+    base_url: str,
+    *,
+    timeout: float,
+    route_release: Mapping[str, Any],
+    raw_max: int,
+    gzip_max: int,
+) -> tuple[dict[str, Any], list[ResponseMetrics]]:
+    """Cross-check cold, warm, and filtered API views against one pointer."""
+    metrics = []
+    base_filters = _opportunity_filters()
+    base_path = _opportunity_api_path(base_filters)
+    cold_payload, cold_metrics = fetch_json(
+        base_url, base_path, timeout=timeout
+    )
+    metrics.append(cold_metrics)
+    cold = _validate_opportunity_api_payload(
+        cold_payload,
+        cold_metrics,
+        route_release=route_release,
+        expected_filters=base_filters,
+        raw_max=raw_max,
+        gzip_max=gzip_max,
+        require_complete_inventory=True,
+    )
+    warm_payload, warm_metrics = fetch_json(
+        base_url, base_path, timeout=timeout
+    )
+    metrics.append(warm_metrics)
+    warm = _validate_opportunity_api_payload(
+        warm_payload,
+        warm_metrics,
+        route_release=route_release,
+        expected_filters=base_filters,
+        raw_max=raw_max,
+        gzip_max=gzip_max,
+        require_complete_inventory=True,
+    )
+    require(
+        warm["opportunity_inventory_sha256"]
+        == cold["opportunity_inventory_sha256"]
+        and warm["route_cohort_id"] == cold["route_cohort_id"]
+        and warm["manifest_sha256"] == cold["manifest_sha256"]
+        and warm["route_count"] == cold["route_count"]
+        and warm["scenario_count"] == cold["scenario_count"]
+        and warm["available_venues"] == cold["available_venues"]
+        and warm["class_counts"] == cold["class_counts"]
+        and warm["opportunity_inventory_sha256"]
+        == cold["opportunity_inventory_sha256"],
+        "Opportunity API generation changed between cold and warm reads",
+    )
+
+    if route_release.get("status") == "unavailable":
+        return {
+            "status": "unavailable",
+            "reason": "complete_pointer_absent",
+            "cold_elapsed_ms": round(cold_metrics.elapsed_ms, 2),
+            "warm_elapsed_ms": round(warm_metrics.elapsed_ms, 2),
+            "request_count": 2,
+        }, metrics
+
+    base_rows = list(cold["rows"])
+    filter_checks = [
+        _opportunity_filters(opportunity_class="strict"),
+        _opportunity_filters(opportunity_class="estimate"),
+        _opportunity_filters(availability="unavailable"),
+        _opportunity_filters(sort="volume", direction="desc"),
+        _opportunity_filters(sort="volume", direction="asc"),
+    ]
+    if base_rows:
+        seed = base_rows[0]
+        filter_checks.append(_opportunity_filters(
+            token=str(seed["token_symbol"]),
+            venue=str(seed["leg_venues"]["buy"]),
+            notional_usd=str(seed["requested_notional_usd"]),
+            route_type=str(seed["route_type"]),
+            availability=str(seed["availability"]["status"]),
+        ))
+    else:
+        filter_checks.append(_opportunity_filters(route_type="cex_cex"))
+
+    for filters in filter_checks:
+        path = _opportunity_api_path(filters)
+        payload, response_metrics = fetch_json(
+            base_url, path, timeout=timeout
+        )
+        metrics.append(response_metrics)
+        validated = _validate_opportunity_api_payload(
+            payload,
+            response_metrics,
+            route_release=route_release,
+            expected_filters=filters,
+            raw_max=raw_max,
+            gzip_max=gzip_max,
+            require_complete_inventory=False,
+        )
+        require(
+            validated["route_cohort_id"] == cold["route_cohort_id"]
+            and validated["manifest_sha256"] == cold["manifest_sha256"]
+            and validated["route_count"] == cold["route_count"]
+            and validated["scenario_count"] == cold["scenario_count"]
+            and validated["available_venues"] == cold["available_venues"]
+            and validated["class_counts"] == cold["class_counts"]
+            and validated["opportunity_inventory_sha256"]
+            == _route_opportunity_inventory_sha256(validated["rows"]),
+            "Opportunity API filtered metadata differs from the full view",
+        )
+
+    return {
+        "status": "validated",
+        "reason": None,
+        "route_cohort_id": route_release["route_cohort_id"],
+        "manifest_sha256": route_release["manifest_sha256"],
+        "opportunity_inventory_sha256": cold[
+            "opportunity_inventory_sha256"
+        ],
+        "route_count": len({row["route_id"] for row in base_rows}),
+        "scenario_count": len(base_rows),
+        "class_counts": cold["class_counts"],
+        "availability_counts": cold["availability_counts"],
+        "filter_check_count": len(filter_checks),
+        "cold_elapsed_ms": round(cold_metrics.elapsed_ms, 2),
+        "warm_elapsed_ms": round(warm_metrics.elapsed_ms, 2),
+        "cold_raw_bytes": cold_metrics.raw_bytes,
+        "cold_wire_bytes": cold_metrics.wire_bytes,
+        "warm_raw_bytes": warm_metrics.raw_bytes,
+        "warm_wire_bytes": warm_metrics.wire_bytes,
+        "request_count": len(metrics),
+    }, metrics
 
 
 def fetch_static_asset_bundle(
@@ -3893,7 +6044,24 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         configured_route_root(),
         required=getattr(args, "require_route_cohort", False),
     )
-    metrics: list[ResponseMetrics] = []
+    opportunity_api_validation, opportunity_api_metrics = (
+        validate_opportunity_api_release(
+            args.base_url,
+            timeout=args.timeout,
+            route_release=route_opportunity_validation,
+            raw_max=getattr(
+                args,
+                "opportunity_raw_max",
+                DEFAULT_OPPORTUNITY_RAW_MAX,
+            ),
+            gzip_max=getattr(
+                args,
+                "opportunity_gzip_max",
+                DEFAULT_OPPORTUNITY_GZIP_MAX,
+            ),
+        )
+    )
+    metrics: list[ResponseMetrics] = list(opportunity_api_metrics)
     health, health_metrics = fetch_json(
         args.base_url,
         "/health",
@@ -4370,7 +6538,12 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "event_count": len(event_rows),
         "event_covered_token_count": event_coverage["covered_token_count"],
         "event_bundle_id": all_events["bundle_id"],
-        "route_opportunities": route_opportunity_validation,
+        "route_opportunities": {
+            key: value
+            for key, value in route_opportunity_validation.items()
+            if key != _OPPORTUNITY_PUBLIC_BINDING_ROWS
+        },
+        "opportunity_api": opportunity_api_validation,
         "requests": [
             {
                 "path": item.path,
@@ -4392,6 +6565,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-gzip-max", type=int, default=25_000)
     parser.add_argument("--token-raw-max", type=int, default=250_000)
     parser.add_argument("--token-gzip-max", type=int, default=50_000)
+    parser.add_argument(
+        "--opportunity-raw-max",
+        type=int,
+        default=DEFAULT_OPPORTUNITY_RAW_MAX,
+        help="Maximum uncompressed Opportunities API bytes per response",
+    )
+    parser.add_argument(
+        "--opportunity-gzip-max",
+        type=int,
+        default=DEFAULT_OPPORTUNITY_GZIP_MAX,
+        help="Maximum gzip Opportunities API bytes per response",
+    )
     parser.add_argument(
         "--expected-application-sha",
         help="Require /health to report this exact deployed Git SHA",

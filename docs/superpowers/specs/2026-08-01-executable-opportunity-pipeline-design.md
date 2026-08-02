@@ -352,6 +352,14 @@ API returns route-level unavailable states with HTTP 200; a structurally
 invalid bundle returns 503. Frontend requests keep route ownership and cannot
 overwrite a newer filter/navigation state.
 
+The volume rank is deliberately a heterogeneous source-horizon reference:
+selected-window USD volume for CEX legs and latest 24-hour USD volume for DEX
+legs. `route_volume_usd` is the smaller positive leg value; if either leg is
+missing it is `N/A` and ranks last for both ascending and descending order.
+`route_volume_basis=minimum_leg_source_horizon_usd` remains explicit. This
+ranking prior is not synchronized executable capacity and never replaces the
+proved capacity, depth, or same-quantity route quote.
+
 ## 7. DEX adapter order
 
 Development follows measured production value, not protocol count.

@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from collections import Counter
@@ -928,61 +929,416 @@ class MarketMonitorServerTest(unittest.TestCase):
             server.clear_runtime_caches()
 
     def test_warm_default_market_summary_uses_current_cache_generation(self):
-        source_signature = (("market_facts.sqlite3", 10, 20),)
         with patch.object(
             server,
-            "api_source_signature",
-            return_value=source_signature,
-        ), patch.object(
-            server, "api_freshness_bucket", return_value=12345
-        ), \
-            patch.object(
-                server,
-                "_build_public_api_response_cached",
-                return_value=(b"{}", True),
-            ) as build_response:
+            "build_public_api_response",
+            return_value=(b"{}", False),
+        ) as build_response:
             server.warm_default_market_summary()
 
         build_response.assert_called_once_with(
             "summary",
             (),
-            source_signature,
-            12345,
+            True,
         )
 
-    def test_warm_default_market_summary_failure_does_not_prevent_startup(self):
-        source_signature = (("market_facts.sqlite3", 10, 20),)
+    def test_warm_default_market_summary_contains_best_effort_failure(self):
+        with patch.object(
+            server,
+            "build_public_api_response",
+            side_effect=RuntimeError("private details"),
+        ), patch("builtins.print") as print_warning:
+            server.warm_default_market_summary()
+
+        print_warning.assert_called_once_with(
+            "Default summary warmup failed: RuntimeError"
+        )
+
+    def test_default_summary_warmup_thread_is_daemon(self):
+        warmup_release = threading.Event()
+
+        def waiting_warmup():
+            warmup_release.wait(1)
+
+        with patch.object(
+            server,
+            "warm_default_market_summary",
+            side_effect=waiting_warmup,
+        ):
+            worker = server.start_default_market_summary_warmup()
+            try:
+                self.assertTrue(worker.daemon)
+                self.assertEqual(worker.name, "market-summary-warmup")
+            finally:
+                warmup_release.set()
+                worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+
+    def test_default_summary_warmup_runs_in_background_after_socket_creation(self):
+        warmup_release = threading.Event()
+        warmup_started = threading.Event()
+        warmup_finished = threading.Event()
+
+        def slow_warmup():
+            warmup_started.set()
+            warmup_release.wait(1)
+            warmup_finished.set()
+
+        def serve_without_waiting_for_warmup():
+            self.assertFalse(warmup_finished.is_set())
+            warmup_release.set()
+            raise KeyboardInterrupt
+
         http_server = Mock()
-        http_server.serve_forever.side_effect = KeyboardInterrupt
+        http_server.serve_forever.side_effect = serve_without_waiting_for_warmup
         args = server.argparse.Namespace(host="127.0.0.1", port=8765, data_dir=None)
 
         with patch.object(server, "parse_args", return_value=args), \
             patch.object(server, "ThreadingHTTPServer", return_value=http_server), \
             patch.object(
                 server,
-                "api_source_signature",
-                return_value=source_signature,
-            ), \
-            patch.object(server, "api_freshness_bucket", return_value=12345), \
-            patch.object(
-                server,
-                "_build_public_api_response_cached",
-                side_effect=RuntimeError("private details"),
-            ) as build_response, \
-            patch("builtins.print") as print_warning:
+                "warm_default_market_summary",
+                side_effect=slow_warmup,
+            ):
             server.main()
 
-        build_response.assert_called_once_with(
-            "summary",
-            (),
-            source_signature,
-            12345,
-        )
-        print_warning.assert_any_call(
-            "Default summary warmup failed: RuntimeError"
-        )
+        self.assertTrue(warmup_started.wait(1))
+        self.assertTrue(warmup_finished.wait(1))
         http_server.serve_forever.assert_called_once_with()
         http_server.server_close.assert_called_once_with()
+
+    def test_summary_warmup_does_not_block_an_independent_public_route(self):
+        signature = (("warmup-independence.sqlite3", 1, 100),)
+        summary_started = threading.Event()
+        summary_release = threading.Event()
+        catalog_finished = threading.Event()
+
+        def slow_summary(*_args, **_kwargs):
+            summary_started.set()
+            summary_release.wait(2)
+            return {"metadata": {}, "tokens": []}
+
+        def public_payload(route, *_args, **_kwargs):
+            self.assertEqual(route, "catalog")
+            catalog_finished.set()
+            return {"metadata": {}, "markets": []}
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_source_signature",
+                return_value=signature,
+            ), patch.object(
+                server,
+                "api_freshness_bucket",
+                return_value=100,
+            ), patch.object(
+                server,
+                "_build_summary_response_payload",
+                side_effect=slow_summary,
+            ), patch.object(
+                server,
+                "_build_public_api_payload",
+                side_effect=public_payload,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    summary_future = executor.submit(
+                        server.build_public_api_response,
+                        "summary",
+                        (),
+                        True,
+                    )
+                    self.assertTrue(summary_started.wait(1))
+                    catalog_future = executor.submit(
+                        server.build_public_api_response,
+                        "catalog",
+                        (),
+                        True,
+                    )
+                    try:
+                        self.assertTrue(catalog_finished.wait(0.5))
+                    finally:
+                        summary_release.set()
+                    summary_future.result(1)
+                    catalog_future.result(1)
+        finally:
+            summary_release.set()
+            server.clear_runtime_caches()
+
+    def test_market_payload_cold_build_does_not_hold_generation_lock(self):
+        signature = (("market-payload-independence.sqlite3", 1, 100),)
+        build_started = threading.Event()
+        build_release = threading.Event()
+        generation_check_finished = threading.Event()
+
+        def slow_payload(*_args, **_kwargs):
+            build_started.set()
+            build_release.wait(2)
+            return {"metadata": {}}
+
+        def check_generation():
+            server.ensure_source_cache_generation(signature)
+            generation_check_finished.set()
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_source_signature",
+                return_value=signature,
+            ), patch.object(
+                server,
+                "market_payload_cache_key",
+                return_value=("cold-key",),
+            ), patch.object(
+                server,
+                "_build_lifecycle_payload_cached",
+                side_effect=slow_payload,
+            ), patch.object(
+                server,
+                "attach_freshness_metadata",
+                side_effect=lambda payload: payload,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    payload_future = executor.submit(server.build_market_payload)
+                    self.assertTrue(build_started.wait(1))
+                    generation_future = executor.submit(check_generation)
+                    try:
+                        self.assertTrue(generation_check_finished.wait(0.5))
+                    finally:
+                        build_release.set()
+                    payload_future.result(1)
+                    generation_future.result(1)
+        finally:
+            build_release.set()
+            server.clear_runtime_caches()
+
+    def test_lifecycle_cache_does_not_reuse_an_old_miss_after_generation_clear(self):
+        signature_a = (("lifecycle-generation-a.sqlite3", 1, 100),)
+        signature_b = (("lifecycle-generation-b.sqlite3", 2, 100),)
+        current_signature = [signature_a]
+        build_count = 0
+        build_count_lock = threading.Lock()
+        old_started = threading.Event()
+        old_release = threading.Event()
+        new_started = threading.Event()
+        new_release = threading.Event()
+        cache_key = (
+            None,
+            None,
+            "",
+            "cex.csv",
+            "dex.csv",
+            (("daily", 1, 1),),
+            "",
+            (),
+            "",
+            (),
+            "",
+            (),
+        )
+
+        def source_signature():
+            return current_signature[0]
+
+        def controlled_enriched_payload(_cache_key):
+            nonlocal build_count
+            with build_count_lock:
+                build_count += 1
+                call_number = build_count
+            if call_number == 1:
+                old_started.set()
+                old_release.wait(2)
+                marker = "old"
+            elif call_number == 2:
+                new_started.set()
+                new_release.wait(2)
+                marker = "new"
+            else:
+                marker = "new"
+            return {
+                "metadata": {"generation_marker": marker},
+                "cex_markets": [],
+                "dex_pools": [],
+            }
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_source_signature",
+                side_effect=source_signature,
+            ), patch.object(
+                server,
+                "market_payload_cache_key",
+                return_value=cache_key,
+            ), patch.object(
+                server,
+                "_build_enriched_payload_cached",
+                side_effect=controlled_enriched_payload,
+            ), patch.object(
+                server,
+                "_load_cex_historical_lineage_cached",
+                return_value={},
+            ), patch.object(
+                server,
+                "overlay_cex_instrument_lifecycle",
+                side_effect=lambda payload, **_kwargs: payload,
+            ), patch.object(
+                server,
+                "attach_configured_cex_identity_metadata",
+                side_effect=lambda payload: payload,
+            ), patch.object(
+                server,
+                "finalize_fact_contract",
+                side_effect=lambda payload: payload,
+            ), patch.object(
+                server,
+                "attach_freshness_metadata",
+                side_effect=lambda payload: payload,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    old_future = executor.submit(
+                        server.build_market_payload,
+                        _freshness_bucket=100,
+                    )
+                    self.assertTrue(old_started.wait(1))
+                    current_signature[0] = signature_b
+                    new_future = executor.submit(
+                        server.build_market_payload,
+                        _freshness_bucket=100,
+                    )
+                    self.assertTrue(new_started.wait(1))
+                    old_release.set()
+                    old_result = old_future.result(1)
+                    new_release.set()
+                    new_result = new_future.result(1)
+
+            self.assertEqual(
+                old_result["metadata"]["generation_marker"],
+                "new",
+            )
+            self.assertEqual(
+                new_result["metadata"]["generation_marker"],
+                "new",
+            )
+        finally:
+            old_release.set()
+            new_release.set()
+            server.clear_runtime_caches()
+
+    def test_catalog_cache_does_not_reuse_an_old_miss_after_generation_clear(self):
+        signature_a = (("catalog-generation-a.sqlite3", 1, 100),)
+        signature_b = (("catalog-generation-b.sqlite3", 2, 100),)
+        current_signature = [signature_a]
+        build_count = 0
+        build_count_lock = threading.Lock()
+        old_started = threading.Event()
+        old_release = threading.Event()
+        new_started = threading.Event()
+        new_release = threading.Event()
+        cache_key = ("same-catalog-key",)
+
+        def controlled_market_payload(*_args, **_kwargs):
+            server.ensure_source_cache_generation(current_signature[0])
+            return {
+                "metadata": {
+                    "available_start": "2026-01-01",
+                    "available_end": "2026-01-02",
+                    "freshness": {},
+                    "cex_instrument_lifecycle": {
+                        "stale_evidence_market_count": 0,
+                    },
+                }
+            }
+
+        def controlled_lifecycle_payload(*_args, **_kwargs):
+            nonlocal build_count
+            with build_count_lock:
+                build_count += 1
+                call_number = build_count
+            if call_number == 1:
+                old_started.set()
+                old_release.wait(2)
+                marker = "old"
+            elif call_number == 2:
+                new_started.set()
+                new_release.wait(2)
+                marker = "new"
+            else:
+                marker = "new"
+            return {
+                "metadata": {
+                    "generation_marker": marker,
+                    "catalog_version": 1,
+                    "available_end": "2026-01-02",
+                    "sources": [],
+                },
+                "markets": [],
+            }
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_freshness_bucket",
+                return_value=100,
+            ), patch.object(
+                server,
+                "build_market_payload",
+                side_effect=controlled_market_payload,
+            ), patch.object(
+                server,
+                "market_payload_cache_key",
+                return_value=cache_key,
+            ), patch.object(
+                server,
+                "_build_lifecycle_payload_cached",
+                side_effect=controlled_lifecycle_payload,
+            ), patch.object(
+                server,
+                "catalog_from_market_payload",
+                side_effect=lambda payload: payload,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    old_future = executor.submit(
+                        server.build_market_catalog,
+                        source_signature=signature_a,
+                    )
+                    self.assertTrue(old_started.wait(1))
+                    current_signature[0] = signature_b
+                    new_future = executor.submit(
+                        server.build_market_catalog,
+                        source_signature=signature_b,
+                    )
+                    self.assertTrue(new_started.wait(1))
+                    old_release.set()
+                    old_result = old_future.result(1)
+
+                    current_result = server.build_market_catalog(
+                        source_signature=signature_b,
+                    )
+                    new_release.set()
+                    new_result = new_future.result(1)
+
+            self.assertEqual(
+                old_result["metadata"]["generation_marker"],
+                "old",
+            )
+            self.assertEqual(
+                current_result["metadata"]["generation_marker"],
+                "new",
+            )
+            self.assertEqual(
+                new_result["metadata"]["generation_marker"],
+                "new",
+            )
+        finally:
+            old_release.set()
+            new_release.set()
+            server.clear_runtime_caches()
 
     @staticmethod
     def execution_rows(
@@ -3716,8 +4072,17 @@ class MarketMonitorServerTest(unittest.TestCase):
             "finalize_fact_contract",
             side_effect=lambda value: value,
         ):
-            fresh = server._build_lifecycle_payload_cached(cache_key, 100)
-            stale = server._build_lifecycle_payload_cached(cache_key, 200)
+            source_signature = (("lifecycle-manifest.json", 1, 1),)
+            fresh = server._build_lifecycle_payload_cached(
+                cache_key,
+                source_signature,
+                100,
+            )
+            stale = server._build_lifecycle_payload_cached(
+                cache_key,
+                source_signature,
+                200,
+            )
 
         self.assertEqual(fresh["lifecycle_projection"], "fresh")
         self.assertEqual(stale["lifecycle_projection"], "stale")
@@ -3809,6 +4174,9 @@ class MarketMonitorServerTest(unittest.TestCase):
             "start_date": "2026-01-01",
             "end_date": "2026-01-02",
             "sources": [],
+            "cex_instrument_lifecycle": {
+                "stale_evidence_market_count": 0,
+            },
         }
         first_signature = (
             ("market_facts.sqlite3", 100, 1000),
@@ -3828,6 +4196,15 @@ class MarketMonitorServerTest(unittest.TestCase):
             {**metadata, "start_date": "2025-12-01"},
             first_signature,
         )
+        changed_lifecycle_projection = server._public_data_generation(
+            {
+                **metadata,
+                "cex_instrument_lifecycle": {
+                    "stale_evidence_market_count": 5,
+                },
+            },
+            first_signature,
+        )
         with patch.object(server, "CATALOG_SUMMARY_VERSION", 4):
             changed_contract = server._public_data_generation(
                 metadata,
@@ -3835,6 +4212,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             )
 
         self.assertNotEqual(first, changed_execution)
+        self.assertNotEqual(first, changed_lifecycle_projection)
         self.assertNotEqual(first, changed_contract)
         self.assertEqual(first, changed_window)
         same_stat_different_path = server._public_data_generation(
@@ -5045,6 +5423,627 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(first, invalidated)
         self.assertEqual(build_catalog.call_count, 2)
 
+    def test_summary_reuses_expensive_core_across_freshness_buckets(self):
+        signature = (("summary-core.sqlite3", 1, 100),)
+        refresh_count = 0
+
+        def refresh_freshness(payload):
+            nonlocal refresh_count
+            refresh_count += 1
+            return {
+                **payload,
+                "metadata": {
+                    **payload["metadata"],
+                    "freshness": {"checked_at_utc": f"refresh-{refresh_count}"},
+                },
+            }
+
+        def decode(response):
+            body, compressed = response
+            return json.loads(gzip.decompress(body) if compressed else body)
+
+        server._build_public_api_response_cached.cache_clear()
+        with patch.object(
+            server,
+            "_build_public_api_payload",
+            return_value={"metadata": {}, "tokens": []},
+        ) as build_payload, patch.object(
+            server,
+            "attach_freshness_metadata",
+            side_effect=refresh_freshness,
+        ), patch.object(
+            server,
+            "api_source_signature",
+            return_value=signature,
+        ):
+            first = decode(
+                server._build_public_api_response_cached(
+                    "summary", (), signature, 100
+                )
+            )
+            second = decode(
+                server._build_public_api_response_cached(
+                    "summary", (), signature, 101
+                )
+            )
+
+        self.assertEqual(build_payload.call_count, 1)
+        self.assertEqual(
+            first["metadata"]["freshness"]["checked_at_utc"],
+            "refresh-1",
+        )
+        self.assertEqual(
+            second["metadata"]["freshness"]["checked_at_utc"],
+            "refresh-2",
+        )
+
+    def test_summary_rebuilds_core_when_lifecycle_projection_becomes_stale(self):
+        signature = (("summary-lifecycle.sqlite3", 1, 100),)
+        checked_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        checked_bucket = int(checked_at.timestamp() // 60)
+        manifest = {"checked_at_utc": checked_at.isoformat()}
+
+        server._build_public_api_response_cached.cache_clear()
+        with patch.object(
+            server,
+            "resolve_cex_instrument_lifecycle_path",
+            return_value=self.cex_path,
+        ), patch.object(
+            server,
+            "_load_cex_instrument_lifecycle_cached",
+            return_value=manifest,
+        ), patch.object(
+            server,
+            "_build_public_api_payload",
+            return_value={"metadata": {}, "tokens": []},
+        ) as build_payload, patch.object(
+            server,
+            "attach_freshness_metadata",
+            side_effect=lambda payload: payload,
+        ) as refresh_freshness, patch.object(
+            server,
+            "api_source_signature",
+            return_value=signature,
+        ):
+            server._build_public_api_response_cached(
+                "summary", (), signature, checked_bucket
+            )
+            server._build_public_api_response_cached(
+                "summary", (), signature, checked_bucket + (36 * 60) + 1
+            )
+
+        self.assertEqual(build_payload.call_count, 2)
+        self.assertEqual(refresh_freshness.call_count, 2)
+
+    def test_summary_rebuilds_core_when_source_signature_changes(self):
+        signature_a = (("summary-source.sqlite3", 1, 100),)
+        signature_b = (("summary-source.sqlite3", 2, 100),)
+
+        server._build_public_api_response_cached.cache_clear()
+        with patch.object(
+            server,
+            "_build_public_api_payload",
+            return_value={"metadata": {}, "tokens": []},
+        ) as build_payload, patch.object(
+            server,
+            "attach_freshness_metadata",
+            side_effect=lambda payload: payload,
+        ) as refresh_freshness, patch.object(
+            server,
+            "api_source_signature",
+            side_effect=[signature_a, signature_b],
+        ):
+            server._build_public_api_response_cached(
+                "summary", (), signature_a, 100
+            )
+            server._build_public_api_response_cached(
+                "summary", (), signature_b, 101
+            )
+
+        self.assertEqual(build_payload.call_count, 2)
+        self.assertEqual(refresh_freshness.call_count, 2)
+
+    def test_clear_runtime_caches_drops_reusable_summary_core(self):
+        signature = (("summary-clear.sqlite3", 1, 100),)
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "_build_public_api_payload",
+                return_value={"metadata": {}, "tokens": []},
+            ) as build_payload, patch.object(
+                server,
+                "attach_freshness_metadata",
+                side_effect=lambda payload: payload,
+            ), patch.object(
+                server,
+                "api_source_signature",
+                return_value=signature,
+            ):
+                server._build_public_api_response_cached(
+                    "summary", (), signature, 100
+                )
+                server._build_public_api_response_cached(
+                    "summary", (), signature, 101
+                )
+                server.clear_runtime_caches()
+                server._build_public_api_response_cached(
+                    "summary", (), signature, 102
+                )
+
+            self.assertEqual(build_payload.call_count, 2)
+        finally:
+            server.clear_runtime_caches()
+
+    def test_opportunity_response_crosses_deadline_without_serialized_cache_lag(self):
+        signature = (("opportunity-deadline.sqlite3", 1, 100),)
+        before_deadline = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {"checked_at": "2026-08-01T00:01:59+00:00"},
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "availability": {"status": "available", "reason": None},
+                    "leg_timestamps": {
+                        "buy": "2026-08-01T00:00:00+00:00",
+                        "sell": "2026-08-01T00:00:00+00:00",
+                    },
+                    "net_edge_bps": 4.2,
+                }
+            ],
+        }
+        after_deadline = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {"checked_at": "2026-08-01T00:02:01+00:00"},
+            "routes": [],
+        }
+
+        def decode(response):
+            body, compressed = response
+            return json.loads(gzip.decompress(body) if compressed else body)
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_source_signature",
+                return_value=signature,
+            ), patch.object(
+                server,
+                "api_freshness_bucket",
+                return_value=100,
+            ), patch.object(
+                server,
+                "_build_public_api_payload",
+                side_effect=[before_deadline, after_deadline],
+            ) as build_payload, patch.object(
+                server,
+                "opportunity_response_clock",
+                create=True,
+                side_effect=[
+                    datetime(
+                        2026,
+                        8,
+                        1,
+                        0,
+                        1,
+                        59,
+                        tzinfo=timezone.utc,
+                    ),
+                    datetime(
+                        2026,
+                        8,
+                        1,
+                        0,
+                        2,
+                        1,
+                        tzinfo=timezone.utc,
+                    ),
+                ],
+            ):
+                first = decode(
+                    server.build_public_api_response(
+                        "opportunities", (), True
+                    )
+                )
+                second = decode(
+                    server.build_public_api_response(
+                        "opportunities", (), True
+                    )
+                )
+
+            self.assertEqual(build_payload.call_count, 2)
+            self.assertEqual(len(first["routes"]), 1)
+            self.assertEqual(second["routes"], [])
+        finally:
+            server.clear_runtime_caches()
+
+    def test_opportunity_response_reprojects_after_encode_crosses_deadline(self):
+        signature = (("opportunity-post-build.sqlite3", 1, 100),)
+        before_deadline = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {
+                "checked_at": "2026-08-01T00:01:59.900000+00:00",
+                "padding": "x" * 2048,
+            },
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "availability": {"status": "available", "reason": None},
+                    "leg_timestamps": {
+                        "buy": "2026-08-01T00:00:00+00:00",
+                        "sell": "2026-08-01T00:00:00+00:00",
+                    },
+                    "net_edge_usd": "4.2",
+                }
+            ],
+        }
+        after_deadline = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {
+                "checked_at": "2026-08-01T00:02:00.100000+00:00",
+                "padding": "x" * 2048,
+            },
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "availability": {
+                        "status": "unavailable",
+                        "reason": "cohort_stale",
+                    },
+                    "leg_timestamps": {
+                        "buy": "2026-08-01T00:00:00+00:00",
+                        "sell": "2026-08-01T00:00:00+00:00",
+                    },
+                    "net_edge_usd": None,
+                }
+            ],
+        }
+
+        def decode(response):
+            body, compressed = response
+            return (
+                json.loads(gzip.decompress(body) if compressed else body),
+                compressed,
+            )
+
+        for accepts_gzip in (False, True):
+            with self.subTest(accepts_gzip=accepts_gzip):
+                server.clear_runtime_caches()
+                try:
+                    with patch.object(
+                        server,
+                        "api_source_signature",
+                        return_value=signature,
+                    ), patch.object(
+                        server,
+                        "api_freshness_bucket",
+                        return_value=100,
+                    ), patch.object(
+                        server,
+                        "_build_public_api_payload",
+                        side_effect=[before_deadline, after_deadline],
+                    ) as build_payload, patch.object(
+                        server,
+                        "opportunity_response_clock",
+                        create=True,
+                        side_effect=[
+                            datetime(
+                                2026,
+                                8,
+                                1,
+                                0,
+                                2,
+                                0,
+                                100_000,
+                                tzinfo=timezone.utc,
+                            ),
+                            datetime(
+                                2026,
+                                8,
+                                1,
+                                0,
+                                2,
+                                0,
+                                200_000,
+                                tzinfo=timezone.utc,
+                            ),
+                        ],
+                    ):
+                        payload, compressed = decode(
+                            server.build_public_api_response(
+                                "opportunities",
+                                (),
+                                accepts_gzip,
+                            )
+                        )
+
+                    self.assertEqual(build_payload.call_count, 2)
+                    self.assertEqual(compressed, accepts_gzip)
+                    self.assertEqual(
+                        payload["routes"][0]["availability"]["status"],
+                        "unavailable",
+                    )
+                    self.assertIsNone(payload["routes"][0]["net_edge_usd"])
+                finally:
+                    server.clear_runtime_caches()
+
+    def test_unavailable_filter_reprojects_when_omitted_route_crosses_deadline(self):
+        signature = (("opportunity-filter-deadline.sqlite3", 1, 100),)
+        before_deadline = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {
+                "checked_at": "2026-08-01T00:01:59.900000+00:00",
+                "next_freshness_deadline_at": "2026-08-01T00:02:00+00:00",
+            },
+            "filters": {"availability": "unavailable"},
+            "routes": [],
+        }
+        after_deadline = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {
+                "checked_at": "2026-08-01T00:02:00.100000+00:00",
+                "next_freshness_deadline_at": None,
+            },
+            "filters": {"availability": "unavailable"},
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "availability": {
+                        "status": "unavailable",
+                        "reason": "cohort_stale",
+                    },
+                    "leg_timestamps": {
+                        "buy": "2026-08-01T00:00:00+00:00",
+                        "sell": "2026-08-01T00:00:00+00:00",
+                    },
+                    "net_edge_usd": None,
+                }
+            ],
+        }
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_source_signature",
+                return_value=signature,
+            ), patch.object(
+                server,
+                "api_freshness_bucket",
+                return_value=100,
+            ), patch.object(
+                server,
+                "_build_public_api_payload",
+                side_effect=[before_deadline, after_deadline],
+            ) as build_payload, patch.object(
+                server,
+                "opportunity_response_clock",
+                side_effect=[
+                    datetime(
+                        2026, 8, 1, 0, 2, 0, 100_000, tzinfo=timezone.utc
+                    ),
+                    datetime(
+                        2026, 8, 1, 0, 2, 0, 200_000, tzinfo=timezone.utc
+                    ),
+                ],
+            ):
+                body, compressed = server.build_public_api_response(
+                    "opportunities",
+                    (("availability", "unavailable"),),
+                    True,
+                )
+
+            payload = json.loads(gzip.decompress(body) if compressed else body)
+            self.assertEqual(build_payload.call_count, 2)
+            self.assertEqual(len(payload["routes"]), 1)
+            self.assertEqual(
+                payload["routes"][0]["availability"]["reason"],
+                "cohort_stale",
+            )
+        finally:
+            server.clear_runtime_caches()
+
+    def test_opportunity_post_build_gate_keeps_exact_120_second_boundary(self):
+        signature = (("opportunity-exact-deadline.sqlite3", 1, 100),)
+        exact_boundary = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {"padding": "x" * 2048},
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "availability": {"status": "available", "reason": None},
+                    "leg_timestamps": {
+                        "buy": "2026-08-01T00:00:00+00:00",
+                        "sell": "2026-08-01T00:00:00+00:00",
+                    },
+                    "net_edge_usd": "4.2",
+                }
+            ],
+        }
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_source_signature",
+                return_value=signature,
+            ), patch.object(
+                server,
+                "api_freshness_bucket",
+                return_value=100,
+            ), patch.object(
+                server,
+                "_build_public_api_payload",
+                return_value=exact_boundary,
+            ) as build_payload, patch.object(
+                server,
+                "opportunity_response_clock",
+                create=True,
+                return_value=datetime(
+                    2026,
+                    8,
+                    1,
+                    0,
+                    2,
+                    tzinfo=timezone.utc,
+                ),
+            ):
+                body, compressed = server.build_public_api_response(
+                    "opportunities", (), True
+                )
+
+            payload = json.loads(gzip.decompress(body) if compressed else body)
+            self.assertEqual(build_payload.call_count, 1)
+            self.assertEqual(
+                payload["routes"][0]["availability"]["status"],
+                "available",
+            )
+        finally:
+            server.clear_runtime_caches()
+
+    def test_opportunity_post_build_gate_reprojects_at_exact_cost_expiry(self):
+        signature = (("opportunity-cost-expiry.sqlite3", 1, 100),)
+        before_expiry = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {
+                "checked_at": "2026-08-01T00:01:59.900000+00:00",
+                "next_freshness_deadline_at": (
+                    "2026-08-01T00:02:00+00:00"
+                ),
+                "next_freshness_deadline_exclusive": True,
+            },
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "availability": {"status": "available", "reason": None},
+                    "leg_timestamps": {
+                        "buy": "2026-08-01T00:01:00+00:00",
+                        "sell": "2026-08-01T00:01:00+00:00",
+                    },
+                    "net_edge_usd": "4.2",
+                }
+            ],
+        }
+        after_expiry = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {
+                "checked_at": "2026-08-01T00:02:00+00:00",
+                "next_freshness_deadline_at": (
+                    "2026-08-01T00:03:00+00:00"
+                ),
+                "next_freshness_deadline_exclusive": False,
+            },
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "availability": {
+                        "status": "unavailable",
+                        "reason": "cost_component_stale",
+                    },
+                    "leg_timestamps": {
+                        "buy": "2026-08-01T00:01:00+00:00",
+                        "sell": "2026-08-01T00:01:00+00:00",
+                    },
+                    "net_edge_usd": None,
+                }
+            ],
+        }
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_source_signature",
+                return_value=signature,
+            ), patch.object(
+                server,
+                "api_freshness_bucket",
+                return_value=100,
+            ), patch.object(
+                server,
+                "_build_public_api_payload",
+                side_effect=[before_expiry, after_expiry],
+            ) as build_payload, patch.object(
+                server,
+                "opportunity_response_clock",
+                side_effect=[
+                    datetime(2026, 8, 1, 0, 2, tzinfo=timezone.utc),
+                    datetime(
+                        2026, 8, 1, 0, 2, 0, 1_000,
+                        tzinfo=timezone.utc,
+                    ),
+                ],
+            ):
+                body, compressed = server.build_public_api_response(
+                    "opportunities", (), True
+                )
+
+            payload = json.loads(gzip.decompress(body) if compressed else body)
+            self.assertEqual(build_payload.call_count, 2)
+            self.assertEqual(
+                payload["routes"][0]["availability"]["reason"],
+                "cost_component_stale",
+            )
+        finally:
+            server.clear_runtime_caches()
+
+    def test_opportunity_post_build_deadline_retry_is_bounded(self):
+        signature = (("opportunity-deadline-loop.sqlite3", 1, 100),)
+        incorrectly_current = {
+            "availability": {"status": "available", "reason": None},
+            "metadata": {},
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "availability": {"status": "available", "reason": None},
+                    "leg_timestamps": {
+                        "buy": "2026-08-01T00:00:00+00:00",
+                        "sell": "2026-08-01T00:00:00+00:00",
+                    },
+                    "net_edge_usd": "4.2",
+                }
+            ],
+        }
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_source_signature",
+                return_value=signature,
+            ), patch.object(
+                server,
+                "api_freshness_bucket",
+                return_value=100,
+            ), patch.object(
+                server,
+                "_build_public_api_payload",
+                return_value=incorrectly_current,
+            ) as build_payload, patch.object(
+                server,
+                "opportunity_response_clock",
+                create=True,
+                return_value=datetime(
+                    2026,
+                    8,
+                    1,
+                    0,
+                    2,
+                    1,
+                    tzinfo=timezone.utc,
+                ),
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    server.build_public_api_response(
+                        "opportunities", (), False
+                    )
+
+            self.assertEqual(build_payload.call_count, 3)
+        finally:
+            server.clear_runtime_caches()
+
     def test_public_response_discards_a_generation_that_changes_mid_build(self):
         signature_a = (("/release-a/facts.sqlite3", 1, 100),)
         signature_b = (("/release-b/facts.sqlite3", 1, 100),)
@@ -5426,6 +6425,8 @@ class MarketMonitorServerTest(unittest.TestCase):
         shell = str(server.STATIC_ROOT / "index.html")
         for path in (
             "/screener",
+            "/opportunities",
+            "/opportunities/",
             "/tokens/aave/markets",
             "/tokens/AAVE/compare?marketA=encoded",
             "/tokens/1INCH/liquidity",
@@ -5455,7 +6456,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertIn('id="comparison-status"', index)
         self.assertIn('role="alert"', index)
         self.assertIn('aria-busy="true"', index)
-        self.assertIn("Midpoint-relative Spread (bps)", index)
+        self.assertIn("Daily Price Gap (bps)", index)
         self.assertIn("Primary DEX/CEX Basis", index)
         self.assertIn('class="column-info"', index)
         self.assertIn(

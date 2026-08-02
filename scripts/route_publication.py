@@ -14,7 +14,7 @@ import ctypes
 import csv
 from dataclasses import fields, is_dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import errno
 import fcntl
 import hashlib
@@ -257,6 +257,10 @@ _ROUTE_FIELDS = frozenset({
     "settlement_reason",
     "requested_notionals_usd",
     "candidate_source_generation",
+    "buy_reference_volume_usd",
+    "sell_reference_volume_usd",
+    "route_volume_usd",
+    "route_volume_basis",
 })
 
 CANDIDATE_COLUMNS = (
@@ -268,6 +272,10 @@ CANDIDATE_COLUMNS = (
     "route_mode",
     "route_class",
     "settlement_reason",
+    "buy_reference_volume_usd",
+    "sell_reference_volume_usd",
+    "route_volume_usd",
+    "route_volume_basis",
     "requested_notionals_usd",
     "candidate_source_generation",
     "row_json",
@@ -575,6 +583,59 @@ def _validate_route_candidate(
         or list(requested_notionals) != REQUESTED_NOTIONALS_USD
     ):
         raise RoutePublicationError("route requested notional lineage conflict")
+
+    reference_volumes: List[Optional[Decimal]] = []
+    for field in ("buy_reference_volume_usd", "sell_reference_volume_usd"):
+        value = route.get(field)
+        if value is None:
+            reference_volumes.append(None)
+            continue
+        if not isinstance(value, str):
+            raise RoutePublicationError("route volume lineage is invalid")
+        try:
+            amount = Decimal(value)
+        except (InvalidOperation, ValueError):
+            raise RoutePublicationError("route volume lineage is invalid")
+        canonical_amount = format(amount, "f")
+        if "." in canonical_amount:
+            canonical_amount = canonical_amount.rstrip("0").rstrip(".")
+        if (
+            not amount.is_finite()
+            or amount <= 0
+            or value != canonical_amount
+        ):
+            raise RoutePublicationError("route volume lineage is invalid")
+        reference_volumes.append(amount)
+    route_volume_value = route.get("route_volume_usd")
+    if route_volume_value is None:
+        route_volume = None
+    else:
+        if not isinstance(route_volume_value, str):
+            raise RoutePublicationError("route volume lineage is invalid")
+        try:
+            route_volume = Decimal(route_volume_value)
+        except (InvalidOperation, ValueError):
+            raise RoutePublicationError("route volume lineage is invalid")
+        canonical_route_volume = format(route_volume, "f")
+        if "." in canonical_route_volume:
+            canonical_route_volume = canonical_route_volume.rstrip("0").rstrip(".")
+        if (
+            not route_volume.is_finite()
+            or route_volume <= 0
+            or route_volume_value != canonical_route_volume
+        ):
+            raise RoutePublicationError("route volume lineage is invalid")
+    expected_route_volume = (
+        min(value for value in reference_volumes if value is not None)
+        if all(value is not None for value in reference_volumes)
+        else None
+    )
+    if (
+        route.get("route_volume_basis")
+        != "minimum_leg_source_horizon_usd"
+        or route_volume != expected_route_volume
+    ):
+        raise RoutePublicationError("route volume lineage is invalid")
 
     buy = str(route["buy_market_id"])
     sell = str(route["sell_market_id"])
@@ -925,6 +986,10 @@ def _candidate_csv_row(route_cohort_id: str, row: Mapping[str, Any]) -> Dict[str
         "route_mode": row["route_mode"],
         "route_class": row["route_class"],
         "settlement_reason": "" if row.get("settlement_reason") is None else row["settlement_reason"],
+        "buy_reference_volume_usd": row.get("buy_reference_volume_usd") or "",
+        "sell_reference_volume_usd": row.get("sell_reference_volume_usd") or "",
+        "route_volume_usd": row.get("route_volume_usd") or "",
+        "route_volume_basis": row["route_volume_basis"],
         "requested_notionals_usd": _canonical_json_text(row["requested_notionals_usd"]),
         "candidate_source_generation": row["candidate_source_generation"],
         "row_json": _canonical_json_text(row),
@@ -1618,6 +1683,10 @@ def _build_route_cohort_sqlite_file(
                 route_mode TEXT NOT NULL,
                 route_class TEXT NOT NULL,
                 settlement_reason TEXT NOT NULL,
+                buy_reference_volume_usd TEXT NOT NULL,
+                sell_reference_volume_usd TEXT NOT NULL,
+                route_volume_usd TEXT NOT NULL,
+                route_volume_basis TEXT NOT NULL,
                 requested_notionals_usd TEXT NOT NULL,
                 candidate_source_generation TEXT NOT NULL,
                 row_json TEXT NOT NULL
@@ -5056,6 +5125,19 @@ def _pointer_payload_bytes(payload: Mapping[str, Any]) -> bytes:
     ).encode("utf-8") + b"\n"
 
 
+def _canonical_core_pointer_sha256(
+    route_cohort_id: str,
+    core_manifest_sha256: str,
+) -> str:
+    """Hash the only canonical pointer bytes for one immutable core bundle."""
+    return _sha256_bytes(_pointer_payload_bytes({
+        "schema": ROUTE_CORE_POINTER_SCHEMA,
+        "bundle_stage": ROUTE_CORE_BUNDLE_STAGE,
+        "route_cohort_id": route_cohort_id,
+        "manifest_sha256": core_manifest_sha256,
+    }))
+
+
 def _commit_complete_pointer_at_locked(
     routes_fd: int,
     routes_path: Path,
@@ -5248,6 +5330,8 @@ def publish_complete_route_bundle(
 
 def load_latest_complete_route_bundle(
     routes_root: Path = DEFAULT_ROUTE_ROOT,
+    *,
+    core_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Resolve only the public complete-bundle pointer and fully validate it."""
     routes, routes_fd, routes_details = _open_verified_directory(
@@ -5292,6 +5376,39 @@ def load_latest_complete_route_bundle(
             != pointer.get("core_pointer_sha256")
         ):
             raise RoutePublicationError("complete route pointer core lineage mismatch")
+        if validated["bundle"]["core_pointer_sha256"] != (
+            _canonical_core_pointer_sha256(
+                cohort_id,
+                validated["bundle"]["core_manifest_sha256"],
+            )
+        ):
+            raise RoutePublicationError(
+                "complete core pointer lineage hash is invalid"
+            )
+        if core_root is not None:
+            core = validate_route_cohort_bundle(
+                Path(core_root) / "bundles" / cohort_id,
+                expected_route_cohort_id=cohort_id,
+                expected_manifest_sha256=validated["bundle"][
+                    "core_manifest_sha256"
+                ],
+            )
+            if core["candidates"] != validated["bundle"]["routes"]:
+                raise RoutePublicationError(
+                    "complete routes differ from pinned core lineage"
+                )
+            if core["legs"] != validated["bundle"]["legs"]:
+                raise RoutePublicationError(
+                    "complete route legs differ from pinned core lineage"
+                )
+            expected_core_context = {
+                field: core["cohort"][field]
+                for field in _COMPLETE_CONTEXT_FIELDS
+            }
+            if expected_core_context != validated["bundle"]["core_context"]:
+                raise RoutePublicationError(
+                    "complete core context differs from pinned core lineage"
+                )
         if _optional_pointer_bytes_at(routes_fd) != pointer_bytes:
             raise RoutePublicationError("complete route pointer changed during validation")
         _verify_directory_entry(

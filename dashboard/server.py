@@ -37,7 +37,21 @@ try:
         AdminWorkerStartError,
         environment_flag,
     )
-    from dashboard.freshness import build_source_freshness
+    from dashboard.freshness import (
+        build_source_freshness,
+        route_opportunity_freshness,
+    )
+    from dashboard.opportunity_facts import (
+        OpportunityBundleInvalid,
+        OpportunityBundleUnavailable,
+        OpportunityQueryError,
+        build_opportunity_payload,
+        build_unavailable_opportunity_payload,
+        load_latest_opportunities,
+        normalize_opportunity_filters,
+        opportunity_publication_health,
+        resolve_opportunity_bundle,
+    )
     from dashboard.market_facts import (
         LIFECYCLE_QUALITY_FLAG_MESSAGES,
         MARKET_QUALITY_THRESHOLDS,
@@ -91,7 +105,21 @@ except ModuleNotFoundError:
         AdminWorkerStartError,
         environment_flag,
     )
-    from freshness import build_source_freshness
+    from freshness import (  # type: ignore[no-redef]
+        build_source_freshness,
+        route_opportunity_freshness,
+    )
+    from opportunity_facts import (  # type: ignore[no-redef]
+        OpportunityBundleInvalid,
+        OpportunityBundleUnavailable,
+        OpportunityQueryError,
+        build_opportunity_payload,
+        build_unavailable_opportunity_payload,
+        load_latest_opportunities,
+        normalize_opportunity_filters,
+        opportunity_publication_health,
+        resolve_opportunity_bundle,
+    )
     from market_facts import (
         LIFECYCLE_QUALITY_FLAG_MESSAGES,
         MARKET_QUALITY_THRESHOLDS,
@@ -342,6 +370,13 @@ PUBLIC_DATA_VALIDATION_ERROR_MESSAGE = (
     "Published market fact data failed validation. "
     "Retry after the next refresh."
 )
+OPPORTUNITY_DATA_VALIDATION_ERROR_CODE = (
+    "opportunity_bundle_validation_failed"
+)
+OPPORTUNITY_DATA_VALIDATION_ERROR_MESSAGE = (
+    "Published route opportunity data failed validation. "
+    "Retry after the next complete publication."
+)
 NON_RETRYABLE_CEX_DEPTH_REASON_CODES = {
     "source_no_two_sided_book",
     "source_no_order_book",
@@ -362,9 +397,10 @@ CEX_DEPTH_REASON_CODES = NON_RETRYABLE_CEX_DEPTH_REASON_CODES | {
 API_FRESHNESS_CACHE_SECONDS = 60
 LARGE_PAYLOAD_CACHE_SIZE = 8
 SERIALIZED_RESPONSE_CACHE_SIZE = 64
+OPPORTUNITY_RESPONSE_MAX_PROJECTIONS = 3
 CATALOG_SUMMARY_VERSION = 3
 SourceSignature = Tuple[Tuple[Any, ...], ...]
-PUBLIC_API_CACHE_LOCK = threading.RLock()
+PUBLIC_API_ROUTE_LOCKS = defaultdict(threading.RLock)
 SOURCE_CACHE_GENERATION_LOCK = threading.RLock()
 _SOURCE_CACHE_GENERATION: SourceSignature | None = None
 _PUBLIC_RESPONSE_CACHE_GENERATION: (
@@ -385,11 +421,25 @@ PUBLIC_API_QUERY_FIELDS = {
         "end",
     ),
     "events": ("token", "start", "end", "lifecycle", "clock_state"),
+    "opportunities": (
+        "token",
+        "venue",
+        "notional",
+        "class",
+        "route_type",
+        "availability",
+        "sort",
+        "dir",
+    ),
 }
 
 
 class SourceGenerationChanged(FileNotFoundError):
     """Signal temporary source unavailability across one response build."""
+
+
+class OpportunityResponseUnstable(FileNotFoundError):
+    """Fail closed when route deadlines keep crossing during serialization."""
 
 
 class DepthExecutionCohortError(RuntimeError):
@@ -2710,6 +2760,7 @@ def _build_enriched_payload_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]
 @lru_cache(maxsize=LARGE_PAYLOAD_CACHE_SIZE)
 def _build_lifecycle_payload_cached(
     cache_key: tuple[Any, ...],
+    _source_signature: SourceSignature,
     freshness_bucket: int,
 ) -> dict[str, Any]:
     """Project wall-clock lifecycle evidence outside source-only caches.
@@ -2746,35 +2797,75 @@ def _build_lifecycle_payload_cached(
     return finalize_fact_contract(payload)
 
 
+def summary_lifecycle_projection_state(freshness_bucket: int) -> str:
+    """Return the wall-clock state that can change the compact Summary core.
+
+    The Summary projection does not expose the continuously changing lifecycle
+    evidence age.  Its expensive market core therefore only needs rebuilding
+    when the validated official-catalog evidence crosses the same fresh/stale
+    boundary used by ``overlay_cex_instrument_lifecycle``.
+    """
+    lifecycle_path = resolve_cex_instrument_lifecycle_path()
+    manifest = _load_cex_instrument_lifecycle_cached(
+        str(lifecycle_path),
+        data_signature([lifecycle_path]),
+    )
+    checked_at = parse_rfc3339_utc(manifest["checked_at_utc"])
+    reference_time = datetime.fromtimestamp(
+        freshness_bucket * API_FRESHNESS_CACHE_SECONDS,
+        tz=timezone.utc,
+    )
+    evidence_age_seconds = (reference_time - checked_at).total_seconds()
+    if -300 <= evidence_age_seconds <= CEX_LIFECYCLE_MAX_AGE_SECONDS:
+        return "fresh"
+    return "stale"
+
+
 def build_market_payload(
     start: str | None = None,
     end: str | None = None,
     *,
     _freshness_bucket: int | None = None,
 ) -> dict[str, Any]:
-    # Keep generation validation, assembly, and the lru_cache write-back in one
-    # critical section. Otherwise a concurrent cache clear can finish while an
-    # old miss is still computing, allowing that old key to be inserted again.
-    with SOURCE_CACHE_GENERATION_LOCK:
-        ensure_source_cache_generation(api_source_signature())
+    # Source-bearing cache keys and the final signature check make a cold build
+    # safe without holding the generation lock for its full duration.  An old
+    # in-flight LRU insertion remains unreachable by a newer signature and is
+    # bounded by the cache size.
+    for _attempt in range(3):
+        source_signature = api_source_signature()
+        ensure_source_cache_generation(source_signature)
         cache_key = market_payload_cache_key(start, end)
         freshness_bucket = (
             api_freshness_bucket()
             if _freshness_bucket is None
             else _freshness_bucket
         )
-        return attach_freshness_metadata(
-            _build_lifecycle_payload_cached(cache_key, freshness_bucket)
+        payload = attach_freshness_metadata(
+            _build_lifecycle_payload_cached(
+                cache_key,
+                source_signature,
+                freshness_bucket,
+            )
         )
+        if api_source_signature() == source_signature:
+            return payload
+    raise SourceGenerationChanged(
+        "Published fact sources changed repeatedly during market assembly"
+    )
 
 
 @lru_cache(maxsize=8)
 def _build_market_catalog_cached(
     cache_key: tuple[Any, ...],
+    source_signature: SourceSignature,
     freshness_bucket: int,
 ) -> dict[str, Any]:
     return catalog_from_market_payload(
-        _build_lifecycle_payload_cached(cache_key, freshness_bucket)
+        _build_lifecycle_payload_cached(
+            cache_key,
+            source_signature,
+            freshness_bucket,
+        )
     )
 
 
@@ -2783,33 +2874,42 @@ def build_market_catalog(
     source_signature: SourceSignature | None = None,
 ) -> dict[str, Any]:
     """Return every observed market plus the versioned fact contract."""
-    with SOURCE_CACHE_GENERATION_LOCK:
-        freshness_bucket = api_freshness_bucket()
-        default_payload = build_market_payload(
-            _freshness_bucket=freshness_bucket,
-        )
-        metadata = default_payload["metadata"]
-        cache_key = market_payload_cache_key(
-            metadata["available_start"],
-            metadata["available_end"],
-        )
-        catalog = _build_market_catalog_cached(cache_key, freshness_bucket)
-        generation_signature = (
-            source_signature
-            if source_signature is not None
-            else api_source_signature()
-        )
-        return {
-            **catalog,
-            "metadata": {
-                **catalog["metadata"],
-                "freshness": metadata.get("freshness"),
-                "data_generation": _public_data_generation(
-                    catalog["metadata"],
-                    generation_signature,
-                ),
-            },
-        }
+    freshness_bucket = api_freshness_bucket()
+    default_payload = build_market_payload(
+        _freshness_bucket=freshness_bucket,
+    )
+    metadata = default_payload["metadata"]
+    cache_key = market_payload_cache_key(
+        metadata["available_start"],
+        metadata["available_end"],
+    )
+    generation_signature = (
+        source_signature
+        if source_signature is not None
+        else api_source_signature()
+    )
+    catalog = _build_market_catalog_cached(
+        cache_key,
+        generation_signature,
+        freshness_bucket,
+    )
+    generation_metadata = {
+        **catalog["metadata"],
+        "cex_instrument_lifecycle": metadata.get(
+            "cex_instrument_lifecycle"
+        ),
+    }
+    return {
+        **catalog,
+        "metadata": {
+            **catalog["metadata"],
+            "freshness": metadata.get("freshness"),
+            "data_generation": _public_data_generation(
+                generation_metadata,
+                generation_signature,
+            ),
+        },
+    }
 
 
 def _catalog_default_workspace_token(
@@ -3223,11 +3323,21 @@ def _public_data_generation(
             if len(file_identity) > 1:
                 source["inode"] = file_identity[1]
             sources.append(source)
+    lifecycle = metadata.get("cex_instrument_lifecycle")
+    lifecycle_projection_state = (
+        lifecycle.get("stale_evidence_market_count")
+        if isinstance(lifecycle, dict)
+        else None
+    )
     material = {
         "response_contract": "screener-summary-and-token-catalog",
         "summary_version": CATALOG_SUMMARY_VERSION,
         "catalog_version": metadata.get("catalog_version"),
         "available_end": metadata.get("available_end"),
+        # The official-catalog evidence can cross its TTL without any source
+        # file changing.  Bind that dynamic fail-closed projection so browser
+        # catalog caches cannot survive a fresh -> stale transition.
+        "lifecycle_stale_evidence_market_count": lifecycle_projection_state,
         "sources": sources,
     }
     return hashlib.sha256(
@@ -3387,16 +3497,9 @@ def build_market_summary(
     """Return one compact, window-aware response for the all-Token Screener."""
     payload = build_market_payload(start, end)
     catalog = build_market_catalog(source_signature=source_signature)
-    generation_signature = (
-        source_signature if source_signature is not None else api_source_signature()
-    )
-    generation = _public_data_generation(
-        {
-            **payload.get("metadata", {}),
-            "catalog_version": catalog.get("metadata", {}).get("catalog_version"),
-        },
-        generation_signature,
-    )
+    generation = catalog.get("metadata", {}).get("data_generation")
+    if not isinstance(generation, str) or not generation:
+        raise ValueError("Market catalog is missing its public data generation")
     return market_summary_from_payload(
         payload,
         catalog,
@@ -3488,9 +3591,6 @@ def build_token_market_catalog(
             }
         )
     token = token_catalog["token_symbol"]
-    generation_signature = (
-        source_signature if source_signature is not None else api_source_signature()
-    )
     token_summary = next(
         (
             summary
@@ -3507,10 +3607,7 @@ def build_token_market_catalog(
             "window_end": window_payload["metadata"].get("end_date"),
             "window_metric_scope": "selected_start_end_utc_window",
             "snapshot_scope": "latest_independent_point_in_time_snapshots",
-            "data_generation": _public_data_generation(
-                token_catalog["metadata"],
-                generation_signature,
-            ),
+            "data_generation": token_catalog["metadata"]["data_generation"],
         },
         "token_summary": token_summary,
         "markets": markets,
@@ -6148,6 +6245,43 @@ def event_source_signature() -> SourceSignature:
     return tuple(signature)
 
 
+def route_source_signature() -> SourceSignature:
+    """Track one optional complete route generation without validating it.
+
+    The endpoint owns full five-file validation.  Signature discovery remains
+    non-throwing so a missing or corrupt optional route feed cannot make the
+    independent market-fact APIs unavailable.
+    """
+
+    root = resolve_opportunity_bundle()
+    pointer_path = root / "latest.json"
+    signature = list(_safe_path_signature(pointer_path))
+    try:
+        pointer_stat = pointer_path.stat()
+        if not pointer_path.is_file() or pointer_stat.st_size > 65_536:
+            return tuple(signature)
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        cohort_id = (
+            str(pointer.get("route_cohort_id") or "")
+            if isinstance(pointer, dict)
+            else ""
+        )
+    except (OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError):
+        return tuple(signature)
+    if re.fullmatch(r"cohort:[0-9a-f]{64}", cohort_id) is None:
+        return tuple(signature)
+    bundle_path = root / "bundles" / cohort_id
+    for filename in (
+        "manifest.json",
+        "route_legs.csv",
+        "cost_components.csv",
+        "route_opportunities.csv",
+        "route_cohort.sqlite3",
+    ):
+        signature.extend(_safe_path_signature(bundle_path / filename))
+    return tuple(signature)
+
+
 def build_event_facts(
     *,
     token: str | None = None,
@@ -6222,6 +6356,50 @@ def build_event_facts(
     return payload
 
 
+def build_route_opportunities(
+    *,
+    token: str | None = None,
+    venue: str | None = None,
+    notional: str | None = None,
+    opportunity_class: str | None = None,
+    route_type: str | None = None,
+    availability: str | None = None,
+    sort: str | None = None,
+    direction: str | None = None,
+) -> dict[str, Any]:
+    """Return a compact view of only the validated complete route pointer."""
+
+    arguments = {
+        "token": token,
+        "venue": venue,
+        "notional_usd": notional,
+        "opportunity_class": opportunity_class,
+        "route_type": route_type,
+        "availability": availability,
+        "sort": sort,
+        "direction": direction,
+    }
+    try:
+        loaded = load_latest_opportunities()
+    except OpportunityBundleUnavailable as error:
+        return build_unavailable_opportunity_payload(
+            reason=error.reason,
+            **arguments,
+        )
+    try:
+        return build_opportunity_payload(
+            loaded["opportunities"],
+            manifest=loaded["manifest"],
+            legs=loaded["legs"],
+            cost_components=loaded["cost_components"],
+            route_candidates=loaded["bundle"]["routes"],
+            manifest_sha256=loaded["manifest_sha256"],
+            **arguments,
+        )
+    except OpportunityQueryError as error:
+        raise PublicClientRequestError(str(error)) from None
+
+
 def api_source_signature() -> SourceSignature:
     """Return one signature covering every source that can change public facts."""
     database_path = resolve_database_path()
@@ -6258,6 +6436,7 @@ def api_source_signature() -> SourceSignature:
         + lifecycle_signature
         + configured_catalog_signature
         + event_source_signature()
+        + route_source_signature()
     )
 
 
@@ -6269,6 +6448,11 @@ def api_freshness_bucket() -> int:
 def event_response_clock() -> datetime:
     """Own one exact UTC clock for each uncached Event API response."""
     return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def opportunity_response_clock() -> datetime:
+    """Return the exact completion clock used by the route deadline gate."""
+    return datetime.now(timezone.utc)
 
 
 def _public_payload_projection(value: Any) -> Any:
@@ -6437,11 +6621,54 @@ def _build_public_api_payload(
             clock_state=query.get("clock_state"),
             clock_as_of=event_response_clock(),
         )
+    elif route == "opportunities":
+        try:
+            payload = build_route_opportunities(
+                token=query.get("token"),
+                venue=query.get("venue"),
+                notional=query.get("notional"),
+                opportunity_class=query.get("class"),
+                route_type=query.get("route_type"),
+                availability=query.get("availability"),
+                sort=query.get("sort"),
+                direction=query.get("dir"),
+            )
+        except OpportunityQueryError as error:
+            raise PublicClientRequestError(str(error)) from None
     else:
         raise ValueError(f"Unknown public API route: {route}")
     return _public_payload_projection(
         attach_public_action_capabilities(payload)
     )
+
+
+@lru_cache(maxsize=LARGE_PAYLOAD_CACHE_SIZE)
+def _build_summary_core_cached(
+    query_items: tuple[tuple[str, str], ...],
+    source_signature: SourceSignature,
+    _lifecycle_projection_state: str,
+) -> dict[str, Any]:
+    """Build the compact Summary core once per fact and lifecycle state."""
+    return _build_public_api_payload(
+        "summary",
+        query_items,
+        source_signature=source_signature,
+    )
+
+
+def _build_summary_response_payload(
+    query_items: tuple[tuple[str, str], ...],
+    source_signature: SourceSignature,
+    freshness_bucket: int,
+) -> dict[str, Any]:
+    """Reuse Summary facts while refreshing wall-clock metadata per response."""
+    lifecycle_state = summary_lifecycle_projection_state(freshness_bucket)
+    core = _build_summary_core_cached(
+        query_items,
+        source_signature,
+        lifecycle_state,
+    )
+    return attach_freshness_metadata(core)
 
 
 @lru_cache(maxsize=SERIALIZED_RESPONSE_CACHE_SIZE)
@@ -6451,34 +6678,44 @@ def _build_public_api_response_cached(
     _source_signature: SourceSignature,
     _freshness_bucket: int,
 ) -> tuple[bytes, bool]:
-    payload = _build_public_api_payload(
-        route,
-        query_items,
-        source_signature=_source_signature,
-    )
+    if route == "summary":
+        payload = _build_summary_response_payload(
+            query_items,
+            _source_signature,
+            _freshness_bucket,
+        )
+    else:
+        payload = _build_public_api_payload(
+            route,
+            query_items,
+            source_signature=_source_signature,
+        )
     if api_source_signature() != _source_signature:
         raise SourceGenerationChanged
     return encode_json_payload(payload, "gzip")
 
 
 def warm_default_market_summary() -> None:
-    """Populate the default Summary response cache without blocking startup."""
+    """Populate the default Summary response through the normal cache path."""
     try:
-        source_signature = api_source_signature()
-        freshness_bucket = api_freshness_bucket()
-        ensure_source_cache_generation(source_signature)
-        ensure_public_response_cache_generation(
-            source_signature,
-            freshness_bucket,
-        )
-        _build_public_api_response_cached(
+        build_public_api_response(
             "summary",
             (),
-            source_signature,
-            freshness_bucket,
+            True,
         )
     except Exception as error:
         print(f"Default summary warmup failed: {type(error).__name__}")
+
+
+def start_default_market_summary_warmup() -> threading.Thread:
+    """Start the best-effort Summary warmup without delaying HTTP serving."""
+    thread = threading.Thread(
+        target=warm_default_market_summary,
+        name="market-summary-warmup",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def clear_runtime_caches() -> None:
@@ -6497,6 +6734,7 @@ def clear_runtime_caches() -> None:
             _build_enriched_payload_cached,
             _build_lifecycle_payload_cached,
             _build_market_catalog_cached,
+            _build_summary_core_cached,
             _build_public_api_response_cached,
         ):
             cached_builder.cache_clear()
@@ -6526,6 +6764,7 @@ def ensure_source_cache_generation(
             _build_enriched_payload_cached,
             _build_lifecycle_payload_cached,
             _build_market_catalog_cached,
+            _build_summary_core_cached,
             _build_public_api_response_cached,
         ):
             cached_builder.cache_clear()
@@ -6547,58 +6786,162 @@ def ensure_public_response_cache_generation(
         _PUBLIC_RESPONSE_CACHE_GENERATION = generation
 
 
+def _opportunity_payload_requires_reprojection(
+    payload: dict[str, Any],
+    completed_at: datetime,
+) -> bool:
+    """Recheck every publicly available route at response completion time."""
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise OpportunityBundleInvalid()
+    next_deadline = metadata.get("next_freshness_deadline_at")
+    deadline_exclusive = metadata.get("next_freshness_deadline_exclusive")
+    if next_deadline is not None:
+        if not isinstance(next_deadline, str) or not next_deadline:
+            raise OpportunityBundleInvalid()
+        try:
+            parsed_deadline = parse_rfc3339_utc(next_deadline)
+        except (TypeError, ValueError):
+            raise OpportunityBundleInvalid() from None
+        if deadline_exclusive not in (None, True, False):
+            raise OpportunityBundleInvalid()
+        # Exact 120-second evidence remains current.  Reprojection begins only
+        # after the unfiltered inventory crosses that inclusive boundary.
+        # Cost valid_until is exclusive and must reproject at equality.
+        if completed_at > parsed_deadline or (
+            deadline_exclusive is True and completed_at == parsed_deadline
+        ):
+            return True
+    elif deadline_exclusive is not None:
+        raise OpportunityBundleInvalid()
+    routes = payload.get("routes")
+    if not isinstance(routes, list):
+        raise OpportunityBundleInvalid()
+    for route in routes:
+        if not isinstance(route, dict):
+            raise OpportunityBundleInvalid()
+        availability = route.get("availability")
+        if not isinstance(availability, dict):
+            raise OpportunityBundleInvalid()
+        status = availability.get("status")
+        if status == "unavailable":
+            continue
+        if status != "available":
+            raise OpportunityBundleInvalid()
+        timestamps = route.get("leg_timestamps")
+        if not isinstance(timestamps, dict):
+            raise OpportunityBundleInvalid()
+        try:
+            freshness = route_opportunity_freshness(
+                timestamps.get("buy"),
+                timestamps.get("sell"),
+                now=completed_at,
+            )
+        except (TypeError, ValueError):
+            raise OpportunityBundleInvalid() from None
+        if freshness.get("status") != "current":
+            return True
+    return False
+
+
+def _build_deadline_safe_opportunity_response(
+    query_items: tuple[tuple[str, str], ...],
+    source_signature: SourceSignature,
+    accepts_gzip: bool,
+) -> tuple[bytes, bool]:
+    """Serialize only a route projection that is current when assembly ends."""
+    for _attempt in range(OPPORTUNITY_RESPONSE_MAX_PROJECTIONS):
+        payload = _build_public_api_payload(
+            "opportunities",
+            query_items,
+            source_signature=source_signature,
+        )
+        response = encode_json_payload(
+            payload,
+            "gzip" if accepts_gzip else "",
+        )
+        if api_source_signature() != source_signature:
+            raise SourceGenerationChanged
+        completed_at = opportunity_response_clock()
+        if not _opportunity_payload_requires_reprojection(
+            payload,
+            completed_at,
+        ):
+            return response
+    raise OpportunityResponseUnstable(
+        "Route opportunity deadlines changed repeatedly during response assembly"
+    )
+
+
 def build_public_api_response(
     route: str,
     query_items: tuple[tuple[str, str], ...],
     accepts_gzip: bool,
 ) -> tuple[bytes, bool]:
-    """Use one cold-cache builder so concurrent misses do not duplicate work."""
-    with PUBLIC_API_CACHE_LOCK:
-        with SOURCE_CACHE_GENERATION_LOCK:
-            for _attempt in range(3):
-                source_signature = api_source_signature()
-                freshness_bucket = api_freshness_bucket()
-                ensure_source_cache_generation(source_signature)
-                ensure_public_response_cache_generation(
-                    source_signature,
-                    freshness_bucket,
-                )
-                try:
-                    if route == "events":
-                        payload = _build_public_api_payload(
-                            route,
-                            query_items,
-                            source_signature=source_signature,
-                        )
-                        if api_source_signature() != source_signature:
-                            raise SourceGenerationChanged
-                        response = encode_json_payload(
-                            payload,
-                            "gzip" if accepts_gzip else "",
-                        )
-                    elif accepts_gzip:
-                        response = _build_public_api_response_cached(
-                            route,
-                            query_items,
-                            source_signature,
-                            freshness_bucket,
-                        )
-                    else:
-                        payload = _build_public_api_payload(
-                            route,
-                            query_items,
-                            source_signature=source_signature,
-                        )
-                        if api_source_signature() != source_signature:
-                            raise SourceGenerationChanged
-                        response = encode_json_payload(payload, "")
-                except SourceGenerationChanged:
-                    continue
-                if api_source_signature() == source_signature:
-                    return response
-            raise SourceGenerationChanged(
-                "Published fact sources changed repeatedly during response assembly"
+    """Single-flight one route without blocking independent public endpoints."""
+    with PUBLIC_API_ROUTE_LOCKS[route]:
+        for _attempt in range(3):
+            source_signature = api_source_signature()
+            freshness_bucket = api_freshness_bucket()
+            ensure_source_cache_generation(source_signature)
+            ensure_public_response_cache_generation(
+                source_signature,
+                freshness_bucket,
             )
+            try:
+                # These routes own second-level wall clocks.  Reusing the
+                # minute-bucket serialized cache could retain a route past
+                # its 120-second deadline or misclassify an Event clock.
+                if route == "opportunities":
+                    return _build_deadline_safe_opportunity_response(
+                        query_items,
+                        source_signature,
+                        accepts_gzip,
+                    )
+                if route == "events":
+                    payload = _build_public_api_payload(
+                        route,
+                        query_items,
+                        source_signature=source_signature,
+                    )
+                    if api_source_signature() != source_signature:
+                        raise SourceGenerationChanged
+                    response = encode_json_payload(
+                        payload,
+                        "gzip" if accepts_gzip else "",
+                    )
+                elif route == "summary" and not accepts_gzip:
+                    payload = _build_summary_response_payload(
+                        query_items,
+                        source_signature,
+                        freshness_bucket,
+                    )
+                    if api_source_signature() != source_signature:
+                        raise SourceGenerationChanged
+                    response = encode_json_payload(payload, "")
+                elif accepts_gzip:
+                    response = _build_public_api_response_cached(
+                        route,
+                        query_items,
+                        source_signature,
+                        freshness_bucket,
+                    )
+                else:
+                    payload = _build_public_api_payload(
+                        route,
+                        query_items,
+                        source_signature=source_signature,
+                    )
+                    if api_source_signature() != source_signature:
+                        raise SourceGenerationChanged
+                    response = encode_json_payload(payload, "")
+            except SourceGenerationChanged:
+                continue
+            if api_source_signature() == source_signature:
+                return response
+        raise SourceGenerationChanged(
+            "Published fact sources changed repeatedly during response assembly"
+        )
 
 
 def public_api_query_items(
@@ -6609,6 +6952,53 @@ def public_api_query_items(
     fields = PUBLIC_API_QUERY_FIELDS.get(route)
     if fields is None:
         raise ValueError(f"Unknown public API route: {route}")
+    if route == "opportunities":
+        raw = {
+            name: (
+                query[name][0]
+                if query.get(name) and query[name][0] is not None
+                else None
+            )
+            for name in fields
+        }
+        try:
+            normalized = normalize_opportunity_filters(
+                token=raw["token"] if "token" in query else None,
+                venue=raw["venue"] if "venue" in query else None,
+                notional_usd=(
+                    raw["notional"] if "notional" in query else None
+                ),
+                opportunity_class=(
+                    raw["class"] if "class" in query else None
+                ),
+                route_type=(
+                    raw["route_type"] if "route_type" in query else None
+                ),
+                availability=(
+                    raw["availability"]
+                    if "availability" in query
+                    else None
+                ),
+                sort=raw["sort"] if "sort" in query else None,
+                direction=raw["dir"] if "dir" in query else None,
+            )
+        except OpportunityQueryError as error:
+            raise PublicClientRequestError(str(error)) from None
+        normalized_by_query_name = {
+            "token": normalized["token"],
+            "venue": normalized["venue"],
+            "notional": normalized["notional_usd"],
+            "class": normalized["opportunity_class"],
+            "route_type": normalized["route_type"],
+            "availability": normalized["availability"],
+            "sort": normalized["sort"],
+            "dir": normalized["direction"],
+        }
+        return tuple(
+            (name, str(normalized_by_query_name[name]))
+            for name in fields
+            if name in query and normalized_by_query_name[name] is not None
+        )
     if route == "catalog" and "token" not in query:
         fields = ()
     items = []
@@ -6649,7 +7039,14 @@ def write_surface_enabled() -> bool:
 def is_spa_shell_path(path: str) -> bool:
     """Return true only for the dashboard's declared client-side routes."""
     decoded = unquote(urlparse(path).path)
-    if decoded in {"/screener", "/screener/", "/methodology", "/methodology/"}:
+    if decoded in {
+        "/screener",
+        "/screener/",
+        "/opportunities",
+        "/opportunities/",
+        "/methodology",
+        "/methodology/",
+    }:
         return True
     token_match = SPA_TOKEN_ROUTE.fullmatch(decoded)
     if token_match:
@@ -6725,6 +7122,17 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             {
                 "code": PUBLIC_DATA_VALIDATION_ERROR_CODE,
                 "message": PUBLIC_DATA_VALIDATION_ERROR_MESSAGE,
+            },
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+    def send_opportunity_data_validation_error(self) -> None:
+        """Return one fixed response for protected route publication failures."""
+
+        self.send_json(
+            {
+                "code": OPPORTUNITY_DATA_VALIDATION_ERROR_CODE,
+                "message": OPPORTUNITY_DATA_VALIDATION_ERROR_MESSAGE,
             },
             HTTPStatus.SERVICE_UNAVAILABLE,
         )
@@ -7387,6 +7795,22 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 )
             )
             return
+        if parsed.path == "/api/markets/opportunities":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            try:
+                self.send_public_api("opportunities", query)
+            except PublicClientRequestError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except OpportunityBundleInvalid:
+                self.send_opportunity_data_validation_error()
+            except FileNotFoundError:
+                self.send_json(
+                    {"error": PUBLIC_DATA_UNAVAILABLE_MESSAGE},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            except (TypeError, ValueError):
+                self.send_opportunity_data_validation_error()
+            return
         if parsed.path == "/api/markets/catalog":
             query = parse_qs(parsed.query, keep_blank_values=True)
             try:
@@ -7575,6 +7999,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                         "data_status": data_status,
                         "freshness": metadata["freshness"],
                         "cex_instrument_lifecycle": lifecycle,
+                        "route_opportunities": opportunity_publication_health(),
                         "application_sha": application_release_sha(),
                         "asset_sha": static_asset_sha(),
                         "asset_version": static_asset_version(),
@@ -7837,7 +8262,7 @@ def main() -> None:
         )
     server = ThreadingHTTPServer((args.host, args.port), MarketMonitorHandler)
     print(f"Market Monitor running at http://{args.host}:{args.port}")
-    warm_default_market_summary()
+    start_default_market_summary_warmup()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

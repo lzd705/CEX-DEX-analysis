@@ -18,6 +18,8 @@ DEX_DEPTH_MAX_AGE_HOURS = 2.0
 CEX_EXECUTION_MAX_AGE_HOURS = 2.0
 DEX_EXECUTION_MAX_AGE_HOURS = 2.0
 MAX_FUTURE_CLOCK_SKEW_MINUTES = 5
+ROUTE_OPPORTUNITY_MAX_AGE_SECONDS = 120.0
+ROUTE_OPPORTUNITY_MAX_SKEW_SECONDS = 60.0
 
 
 def utc_now() -> datetime:
@@ -97,6 +99,62 @@ def snapshot_freshness(
         "age_hours": round(age_hours, 3),
         "max_age_hours": max_age_hours,
     }
+
+
+def route_opportunity_freshness(
+    buy_observed_at: str | None,
+    sell_observed_at: str | None,
+    *,
+    now: datetime | None = None,
+    max_age_seconds: float = ROUTE_OPPORTUNITY_MAX_AGE_SECONDS,
+    max_skew_seconds: float = ROUTE_OPPORTUNITY_MAX_SKEW_SECONDS,
+) -> dict[str, Any]:
+    """Evaluate synchronized route evidence with second-level strict gates."""
+
+    checked_at = (now or utc_now()).astimezone(timezone.utc)
+    buy = parse_utc_timestamp(buy_observed_at)
+    sell = parse_utc_timestamp(sell_observed_at)
+    base = {
+        "source": "route_opportunities",
+        "checked_at": checked_at.isoformat(),
+        "buy_observed_at": buy.isoformat() if buy is not None else None,
+        "sell_observed_at": sell.isoformat() if sell is not None else None,
+        "observed_at": None,
+        "age_seconds": None,
+        "skew_seconds": None,
+        "max_age_seconds": max_age_seconds,
+        "max_skew_seconds": max_skew_seconds,
+    }
+    if buy is None or sell is None:
+        return {
+            **base,
+            "status": "unavailable",
+            "reason": "route_timestamp_absent",
+        }
+    if buy > checked_at or sell > checked_at:
+        raise ValueError("route opportunity timestamp is in the future")
+    latest = max(buy, sell)
+    age_seconds = (checked_at - latest).total_seconds()
+    skew_seconds = abs((buy - sell).total_seconds())
+    result = {
+        **base,
+        "observed_at": latest.isoformat(),
+        "age_seconds": round(age_seconds, 6),
+        "skew_seconds": round(skew_seconds, 6),
+    }
+    if skew_seconds > max_skew_seconds:
+        return {
+            **result,
+            "status": "unavailable",
+            "reason": "snapshot_skew_exceeded",
+        }
+    if age_seconds > max_age_seconds:
+        return {
+            **result,
+            "status": "stale",
+            "reason": "cohort_stale",
+        }
+    return {**result, "status": "current", "reason": None}
 
 
 def build_source_freshness(

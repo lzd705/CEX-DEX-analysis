@@ -82,6 +82,10 @@ def _route(token_symbol, buy_market_id, sell_market_id):
         "settlement_reason": None,
         "requested_notionals_usd": [1000, 5000, 10000, 50000, 100000],
         "candidate_source_generation": "candidate-generation-a",
+        "buy_reference_volume_usd": "9000" if ":alpha:" in buy_market_id else "7000",
+        "sell_reference_volume_usd": "9000" if ":alpha:" in sell_market_id else "7000",
+        "route_volume_usd": "7000",
+        "route_volume_basis": "minimum_leg_source_horizon_usd",
     }
 
 
@@ -342,6 +346,10 @@ def _task7_cex_inputs(core_root, raw_root, source_root, private_root):
         **route,
         "requested_notionals_usd": [1000, 5000, 10000, 50000, 100000],
         "candidate_source_generation": "candidate-generation-a",
+        "buy_reference_volume_usd": "9000",
+        "sell_reference_volume_usd": "7000",
+        "route_volume_usd": "7000",
+        "route_volume_basis": "minimum_leg_source_horizon_usd",
     }
     cohort = _cohort()
     cohort.update({
@@ -735,6 +743,10 @@ def _dex_cohort(block_numbers=("100", "100")):
             "settlement_reason": None,
             "requested_notionals_usd": [1000, 5000, 10000, 50000, 100000],
             "candidate_source_generation": "candidate-generation-a",
+            "buy_reference_volume_usd": "9000" if buy == first else "7000",
+            "sell_reference_volume_usd": "9000" if sell == first else "7000",
+            "route_volume_usd": "7000",
+            "route_volume_basis": "minimum_leg_source_horizon_usd",
         }
 
     routes = [route(first, second), route(second, first)]
@@ -809,6 +821,39 @@ class RoutePublicationInterfaceTests(unittest.TestCase):
 
 
 class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
+    def test_builder_preserves_route_volume_lineage_from_pinned_core(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root,
+            raw_root,
+            Path(self.temporary.name) / "typed-sources",
+            Path(self.temporary.name) / "private-profiles",
+        )
+
+        routes_root = Path(self.temporary.name) / "data/local/routes"
+        route_publication.publish_complete_route_bundle(
+            core_root=self.root,
+            raw_root=raw_root,
+            routes_root=routes_root,
+            source_root=fixture["source_root"],
+            fee_profile_path=fixture["fee_profile_path"],
+            fee_profile_id=fixture["fee_profile_id"],
+            inventory_profile_path=fixture["inventory_profile_path"],
+            opportunity_inputs=fixture["opportunity_inputs"],
+        )
+        complete = route_publication.load_latest_complete_route_bundle(
+            routes_root
+        )["bundle"]
+
+        self.assertEqual(len(complete["routes"]), 1)
+        self.assertEqual(complete["routes"][0]["buy_reference_volume_usd"], "9000")
+        self.assertEqual(complete["routes"][0]["sell_reference_volume_usd"], "7000")
+        self.assertEqual(complete["routes"][0]["route_volume_usd"], "7000")
+        self.assertEqual(
+            complete["routes"][0]["route_volume_basis"],
+            "minimum_leg_source_horizon_usd",
+        )
+
     def test_builder_rejects_a_core_without_exactly_five_scenarios_per_route(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"
         _cohort_value, pointer = _publish_core_with_raw_members(
@@ -1627,6 +1672,68 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
 
 
 class DeterministicRoutePublicationTests(TemporaryRouteRootTestCase):
+    def test_route_volume_lineage_round_trips_candidate_csv_and_sqlite(self):
+        cohort = _cohort()
+
+        publish_route_cohort_bundle(cohort, core_root=self.root)
+        loaded = load_latest_route_cohort(self.root)
+        bundle = self.root / "bundles" / cohort["route_cohort_id"]
+
+        candidate = loaded["candidates"][0]
+        self.assertEqual(candidate["buy_reference_volume_usd"], "9000")
+        self.assertEqual(candidate["sell_reference_volume_usd"], "7000")
+        self.assertEqual(candidate["route_volume_usd"], "7000")
+        self.assertEqual(
+            candidate["route_volume_basis"],
+            "minimum_leg_source_horizon_usd",
+        )
+        with (bundle / "route_candidates.csv").open(
+            newline="", encoding="utf-8"
+        ) as handle:
+            csv_row = next(csv.DictReader(handle))
+        self.assertEqual(csv_row["buy_reference_volume_usd"], "9000")
+        self.assertEqual(csv_row["sell_reference_volume_usd"], "7000")
+        self.assertEqual(csv_row["route_volume_usd"], "7000")
+        self.assertEqual(
+            csv_row["route_volume_basis"],
+            "minimum_leg_source_horizon_usd",
+        )
+        connection = sqlite3.connect(str(bundle / "route_cohort.sqlite3"))
+        try:
+            sqlite_row = connection.execute(
+                "SELECT buy_reference_volume_usd, sell_reference_volume_usd, "
+                "route_volume_usd, route_volume_basis "
+                "FROM route_candidates ORDER BY route_id LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(
+            sqlite_row,
+            ("9000", "7000", "7000", "minimum_leg_source_horizon_usd"),
+        )
+
+    def test_route_volume_must_equal_positive_minimum_or_na(self):
+        cases = []
+        wrong_minimum = _cohort()
+        wrong_minimum["routes"][0]["route_volume_usd"] = "9000"
+        wrong_minimum["route_rows"][0]["route_volume_usd"] = "9000"
+        cases.append(wrong_minimum)
+
+        invented_missing_leg_volume = _cohort()
+        invented_missing_leg_volume["routes"][0]["sell_reference_volume_usd"] = None
+        invented_missing_leg_volume["route_rows"][0]["sell_reference_volume_usd"] = None
+        cases.append(invented_missing_leg_volume)
+
+        noncanonical_decimal = _cohort()
+        noncanonical_decimal["routes"][0]["route_volume_usd"] = "7000.0"
+        noncanonical_decimal["route_rows"][0]["route_volume_usd"] = "7000.0"
+        cases.append(noncanonical_decimal)
+
+        for cohort in cases:
+            with self.subTest(route=cohort["routes"][0]):
+                with self.assertRaisesRegex(ValueError, "route volume lineage"):
+                    publish_route_cohort_bundle(_rehash(cohort), core_root=self.root)
+
     def test_shuffled_rows_publish_identical_five_file_bundles(self):
         first_root = self.root / "first"
         second_root = self.root / "second"

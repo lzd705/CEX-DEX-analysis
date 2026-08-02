@@ -2,14 +2,17 @@
 
 ## Page structure
 
-1. `Screener` is the cross-Token entry point. The global start/end, 7D, 30D,
+1. `Screener` is the cross-Token daily-fact entry point. The global start/end, 7D, 30D,
    90D, and All controls apply only to daily facts.
-2. `Markets` is the Token-level market catalog and the only page that edits
+2. `Opportunities` is an independent synchronized-route workspace. It never
+   reads or changes Token Research Market A/B and does not use the daily date
+   toolbar.
+3. `Markets` is the Token-level market catalog and the only page that edits
    Market A/B. `Token Research` then contains four peer pages: `Compare`,
    `Liquidity & Execution`, `Events`, and `Data Quality`.
-3. Market A and Market B are exact market IDs for the selected Token and remain
+4. Market A and Market B are exact market IDs for the selected Token and remain
    in the URL while the user moves between the four research pages.
-4. Shared definitions, source lineage, and snapshot timing live in the
+5. Shared definitions, source lineage, and snapshot timing live in the
    `Data Quality` page as a compact disclosure; there is no separate
    Methodology page.
 
@@ -24,8 +27,19 @@ collection cadence.
 
 - `Markets` lists every cataloged CEX pair and DEX pool for the Token and sets
   exact Market A/B identities.
+- `Opportunities` separates strict executable candidates, research estimates,
+  and unavailable routes. A missing complete publication is unavailable; it is
+  never rendered as an empty or zero opportunity inventory. Token and Venue
+  filters are exact, fail-closed scopes: a Venue matches either canonical route
+  leg, while malformed input remains visible with an inline error and cannot
+  silently expand into an all-market query. Route-volume ranking uses the
+  smaller of the two legs' positive source-horizon USD volumes: selected-window
+  volume for a CEX leg and latest 24-hour volume for a DEX leg. If either leg is
+  missing, the route value remains `N/A` and sorts last in either direction.
+  This is a discovery prior, not synchronized executable capacity; depth and
+  same-quantity execution evidence remain the capacity authority.
 - `Compare` aligns A/B daily observations and provides selectable Price,
-  Spread, and Volume line charts plus the raw table.
+  Daily Price Gap, and Volume line charts plus the raw table.
 - `Liquidity & Execution` compares the latest 10/25/50/100 bps depth and
   fixed-notional quoted-cost scenarios with source-state timestamps.
 - `Events` lists the latest verified revision of matching Event Facts, with
@@ -36,16 +50,17 @@ collection cadence.
   pair. Capability limits and observed market conditions are kept separate
   from collection or validation failures.
 
-## Spread placement
+## Daily Price Gap placement
 
-In the Screener, cross-venue is a fixed context of each Spread ranking metric,
-not a fourth peer scope button. Latest absolute gap, maximum absolute gap,
-mean absolute gap, and median absolute gap are independently sortable over the
-selected UTC window. All four use the primary CEX/DEX pair and only common
-valid observation dates; missing comparisons remain null and rank last.
+In the Screener, cross-venue is a fixed context of each Daily Price Gap ranking
+metric, not a fourth peer scope button. Latest, maximum, mean, and median Daily
+Price Gap are independently sortable over the selected UTC window. All four
+use the primary CEX/DEX pair and only common valid observation dates; missing
+comparisons remain null and rank last.
 
-Spread is not a property of either market alone. For the selected Token, Market
-A, Market B, and date window, each same-date comparison is:
+Daily Price Gap is a research metric derived from two same-UTC-date closing
+prices. It is not an order-book quote or an executable route. For the selected
+Token, Market A, Market B, and date window, each comparison remains:
 
 ```text
 absolute_spread_usd = abs(price_a_usd - price_b_usd)
@@ -53,14 +68,16 @@ spread_bps =
   absolute_spread_usd / ((price_a_usd + price_b_usd) / 2) * 10,000
 ```
 
-The two prices must come from the same UTC date. If either price is missing or
-invalid, spread is `N/A`. The Compare chart treats missing, invalid, and
+The two closing prices must come from the same UTC date. If either price is
+missing or invalid, Daily Price Gap is `N/A`. The Compare chart treats missing, invalid, and
 nonconsecutive dates as gaps and never draws through them.
 
-Price and Volume show both A and B; Spread is one derived series. A/B use
-different marker shapes and full type/venue/instrument labels in addition to
-color. This keeps the comparison legible in grayscale and for users who cannot
-distinguish the palette.
+Price and Volume show both A and B; Daily Price Gap is one derived series. A/B
+use different marker shapes and full type/venue/instrument labels in addition
+to color. This keeps the comparison legible in grayscale and for users who
+cannot distinguish the palette. The internal `spread`, `spread_max`,
+`spread_mean`, and `spread_median` keys remain unchanged for URL and API
+backward compatibility; only user-visible terminology changes.
 
 ## Event placement
 
@@ -178,9 +195,24 @@ strict gate. Estimated, assumed, stale, missing, and unsupported components
 cannot be defaulted to zero or promoted by ranking or cache code. Pool fees
 already reflected by pool mechanics are excluded from nonembedded-cost sums.
 
-This gate does not activate a public route API or collection timer. It validates
-an already finalized immutable bundle; it does not accept caller-supplied rows
-and does not run a collection step.
+The compact opportunity API is a projection of that already finalized bundle;
+it is not a second generation source. The release checker makes cold and warm
+reads, reproduces the exact identity inventory, compares cohort and manifest
+hashes, validates strict/research/unavailable counts, and cross-checks strict,
+estimate, unavailable, and representative Token/Venue/notional/route filters.
+Filtered views retain the full cohort, manifest, count, venue, and next-deadline
+lineage of the unfiltered publication. Each public cost component exposes only
+the non-sensitive audit flags needed to prove strict eligibility and whether it
+is already reflected in the leg quote; the checker uses those flags to
+reproduce strict, bounded, and assumed cost totals exactly. It also rejects
+mixed classes, stale strict numerics, source links bound to the wrong market,
+unknown or missing N/A reasons, private paths/secrets, and oversized payloads.
+If no complete pointer exists, HTTP 200 is valid only with
+`complete_pointer_absent`, zero coverage, and no route rows.
+
+This gate does not activate collection or a collection timer. It validates an
+already finalized immutable bundle and its public projection; it does not
+accept caller-supplied rows and does not run a collection step.
 
 Funding Rate is fully excluded: there is no derivatives catalog, funding
 collector, funding Fact, placeholder field, quality state, or UI control in

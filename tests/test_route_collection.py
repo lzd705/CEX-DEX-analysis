@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from scripts.collect_route_cohort import (
     _safe_leg_projection,
+    _validated_universe,
     collect_route_cohort as _collect_route_cohort,
     collect_unique_route_legs,
     finalize_route_opportunity_bundle,
@@ -65,6 +66,30 @@ class CompleteFinalizationOrchestrationTest(unittest.TestCase):
 
 def _complete_test_routes(universe):
     normalized = dict(universe)
+    route_volume_by_market = {}
+    for route in universe.get("routes", []):
+        for side in ("buy", "sell"):
+            market_id = route.get(side + "_market_id")
+            volume = route.get(side + "_reference_volume_usd")
+            if isinstance(market_id, str) and volume is not None:
+                route_volume_by_market.setdefault(market_id, volume)
+    normalized["selected_legs"] = []
+    for source in universe.get("selected_legs", []):
+        leg = dict(source)
+        market_id = leg.get("market_id")
+        reference_volume = route_volume_by_market.get(market_id, "10000")
+        inputs = dict(leg.get("selection_inputs") or {})
+        if leg.get("market_type") == "dex":
+            inputs.setdefault("dex_24h_usd", reference_volume)
+            inputs.setdefault("cex_selected_window_usd", None)
+        else:
+            inputs.setdefault("cex_selected_window_usd", reference_volume)
+            inputs.setdefault("dex_24h_usd", None)
+        leg["selection_inputs"] = inputs
+        normalized["selected_legs"].append(leg)
+    selected_by_id = {
+        leg.get("market_id"): leg for leg in normalized["selected_legs"]
+    }
     normalized["routes"] = []
     for source in universe.get("routes", []):
         route = dict(source)
@@ -80,6 +105,33 @@ def _complete_test_routes(universe):
                 route["sell_market_id"],
                 route["route_mode"],
             )
+        buy_leg = selected_by_id.get(route.get("buy_market_id"), {})
+        sell_leg = selected_by_id.get(route.get("sell_market_id"), {})
+        buy_inputs = buy_leg.get("selection_inputs", {})
+        sell_inputs = sell_leg.get("selection_inputs", {})
+        buy_field = (
+            "dex_24h_usd"
+            if buy_leg.get("market_type") == "dex"
+            else "cex_selected_window_usd"
+        )
+        sell_field = (
+            "dex_24h_usd"
+            if sell_leg.get("market_type") == "dex"
+            else "cex_selected_window_usd"
+        )
+        buy_volume = buy_inputs.get(buy_field)
+        sell_volume = sell_inputs.get(sell_field)
+        route.setdefault("buy_reference_volume_usd", buy_volume)
+        route.setdefault("sell_reference_volume_usd", sell_volume)
+        route.setdefault(
+            "route_volume_usd",
+            str(min(int(buy_volume), int(sell_volume)))
+            if buy_volume is not None and sell_volume is not None
+            else None,
+        )
+        route.setdefault(
+            "route_volume_basis", "minimum_leg_source_horizon_usd"
+        )
         normalized["routes"].append(route)
     return normalized
 
@@ -318,6 +370,59 @@ class RpcClientIsolationTest(unittest.TestCase):
 
 
 class RouteLegCollectionTests(unittest.TestCase):
+    def test_route_volume_lineage_is_bound_before_cli_or_direct_collection(self):
+        alpha = "cex:alpha:UNI/USDT"
+        beta = "cex:beta:UNI/USDT"
+        route_id = "route:UNI:{}->{}:prepositioned_inventory".format(
+            alpha, beta
+        )
+        forged = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {
+                    "market_id": alpha,
+                    "market_type": "cex",
+                    "selection_inputs": {
+                        "cex_selected_window_usd": "100",
+                        "dex_24h_usd": None,
+                    },
+                },
+                {
+                    "market_id": beta,
+                    "market_type": "cex",
+                    "selection_inputs": {
+                        "cex_selected_window_usd": "200",
+                        "dex_24h_usd": None,
+                    },
+                },
+            ],
+            "routes": [{
+                "route_id": route_id,
+                "token_symbol": "UNI",
+                "buy_market_id": alpha,
+                "sell_market_id": beta,
+                "route_mode": "prepositioned_inventory",
+                "buy_reference_volume_usd": "999999",
+                "sell_reference_volume_usd": "999999",
+                "route_volume_usd": "999999",
+                "route_volume_basis": "minimum_leg_source_horizon_usd",
+            }],
+        }
+
+        with self.assertRaisesRegex(ValueError, "route volume lineage"):
+            _validated_universe(forged, None)
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ValueError, "route volume lineage"):
+                _collect_route_cohort(
+                    forged,
+                    cex_collector=_write_observed_raw,
+                    source_generation_reader=lambda: "generation-a",
+                    expected_source_generation="generation-a",
+                    raw_root=Path(directory_name),
+                    executor_factory=ThreadPoolExecutor,
+                )
+
     def test_completion_time_rejects_future_observations_and_is_retained(self):
         universe = _strict_cex_universe()
         wall_times = iter([
@@ -1607,7 +1712,7 @@ class RouteLegCollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory_name:
             data_dir = Path(directory_name)
             (data_dir / "route_universe.json").write_text(
-                json.dumps(universe), encoding="utf-8"
+                json.dumps(_complete_test_routes(universe)), encoding="utf-8"
             )
             with patch(
                 "scripts.collect_route_cohort.load_cataloged_markets",
@@ -2307,6 +2412,10 @@ class RouteLegCollectionTests(unittest.TestCase):
                         100000,
                     ],
                     "candidate_source_generation": "generation-a",
+                    "buy_reference_volume_usd": "9000",
+                    "sell_reference_volume_usd": "7000",
+                    "route_volume_usd": "7000",
+                    "route_volume_basis": "minimum_leg_source_horizon_usd",
                 }
             )
         inventory = [
@@ -2329,7 +2438,7 @@ class RouteLegCollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory_name:
             data_dir = Path(directory_name)
             (data_dir / "route_universe.json").write_text(
-                json.dumps(universe), encoding="utf-8"
+                json.dumps(_complete_test_routes(universe)), encoding="utf-8"
             )
 
             with patch(
