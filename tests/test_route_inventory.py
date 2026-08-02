@@ -834,6 +834,8 @@ class RouteModeEvidenceTests(unittest.TestCase, InventoryProfileFixture):
         self.assertEqual(executable["classification"], "mode_evidence_eligible")
         self.assertTrue(executable["mode_evidence_eligible"])
         self.assertEqual(executable["reason_codes"], [])
+        self.assertEqual(executable["maximum_proved_capacity_quantity"], "99.5")
+        self.assertIsNone(unavailable["maximum_proved_capacity_quantity"])
         self.assertEqual(unavailable["classification"], "research_estimate")
         self.assertFalse(unavailable["mode_evidence_eligible"])
         self.assertEqual(unavailable["reason_code"], "inventory_unavailable")
@@ -871,6 +873,7 @@ class RouteModeEvidenceTests(unittest.TestCase, InventoryProfileFixture):
         self.assertEqual(result["classification"], "mode_evidence_eligible")
         self.assertTrue(result["mode_evidence_eligible"])
         self.assertIsNone(result["reason_code"])
+        self.assertEqual(result["maximum_proved_capacity_quantity"], "99.5")
 
     def test_atomic_evidence_is_bound_to_expected_state_target_call_and_outcome(self):
         route = _atomic_route()
@@ -1012,6 +1015,7 @@ class RouteModeEvidenceTests(unittest.TestCase, InventoryProfileFixture):
         self.assertEqual(missing_inventory["reason_code"], "inventory_unavailable")
         self.assertEqual(complete["classification"], "mode_evidence_eligible")
         self.assertTrue(complete["mode_evidence_eligible"])
+        self.assertEqual(complete["maximum_proved_capacity_quantity"], "99.5")
 
     def test_rebalance_transfer_binds_route_asset_quantity_markets_states_and_capacity(self):
         route = _route("rebalance_required")

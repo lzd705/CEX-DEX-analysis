@@ -1125,6 +1125,7 @@ def _classification(
     identity: Mapping[str, Any],
     reasons: List[str],
     inventory_evidence: Any,
+    maximum_proved_capacity_quantity: Optional[str] = None,
 ) -> Dict[str, Any]:
     profile_hash = None
     if isinstance(inventory_evidence, Mapping):
@@ -1133,6 +1134,12 @@ def _classification(
             profile_hash = _opaque_hash(candidate, "profile_id")
         except (TypeError, ValueError):
             profile_hash = None
+    capacity = None
+    if maximum_proved_capacity_quantity is not None:
+        capacity = _quantity_text(
+            maximum_proved_capacity_quantity,
+            "maximum_proved_capacity_quantity",
+        )
     return {
         "route_id": identity["route_id"],
         "route_mode": identity["route_mode"],
@@ -1143,6 +1150,7 @@ def _classification(
         "reason_code": reasons[0] if reasons else None,
         "reason_codes": list(reasons),
         "inventory_profile_hash": profile_hash,
+        "maximum_proved_capacity_quantity": capacity,
     }
 
 
@@ -1178,6 +1186,7 @@ def classify_route_mode_evidence(
             identity,
             [] if reason is None else [reason],
             inventory_evidence,
+            expected["target_quantity"] if reason is None else None,
         )
 
     if mode == "atomic_onchain":
@@ -1198,7 +1207,12 @@ def classify_route_mode_evidence(
             now_epoch=now_epoch,
         ):
             reasons.append("atomic_route_simulation_unavailable")
-        return _classification(identity, reasons, inventory_evidence)
+        return _classification(
+            identity,
+            reasons,
+            inventory_evidence,
+            expected["target_quantity"] if not reasons else None,
+        )
 
     inventory_reason = _current_inventory_reason(
         inventory_evidence,
@@ -1214,4 +1228,9 @@ def classify_route_mode_evidence(
         now_epoch=now_epoch,
     ):
         reasons.append("rebalance_transfer_evidence_unavailable")
-    return _classification(identity, reasons, inventory_evidence)
+    return _classification(
+        identity,
+        reasons,
+        inventory_evidence,
+        expected["target_quantity"] if not reasons else None,
+    )
