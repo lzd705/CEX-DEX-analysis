@@ -1,5 +1,6 @@
 import gzip
 import http.client
+import json
 import shutil
 import tempfile
 import threading
@@ -226,6 +227,17 @@ class StaticHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assert_exact_asset_headers(headers, body, encoded=False)
 
+    def test_wildcard_q_zero_serves_raw_immutable_bytes(self):
+        # Replacing the real quality negotiation with a truthy-header check
+        # would incorrectly compress this client-visible response.
+        version = server.static_asset_version()
+        status, headers, body = self.request(
+            "GET", f"/app.js?v={version}", "*;q=0"
+        )
+
+        self.assertEqual(status, 200)
+        self.assert_exact_asset_headers(headers, body, encoded=False)
+
     def test_exact_version_conditional_get_is_not_modified(self):
         version = server.static_asset_version()
         _, initial_headers, _ = self.request(
@@ -256,6 +268,16 @@ class StaticHttpTests(unittest.TestCase):
                 )
                 self.assert_single_cache_control(headers, "no-cache")
                 self.assertIsNone(headers.get("Content-Encoding"))
+
+    def test_admin_api_error_has_exactly_one_no_store_cache_policy(self):
+        # A direct header from an API helper plus the shared boundary default
+        # would produce multiple policies; this route is data-independent.
+        status, headers, body = self.request("GET", "/api/admin/session")
+
+        self.assertIn(status, (200, 404))
+        self.assertEqual(headers.get("Content-Type"), "application/json; charset=utf-8")
+        self.assertIsInstance(json.loads(body), dict)
+        self.assert_single_cache_control(headers, "no-store")
 
     def test_unversioned_wrong_and_duplicate_asset_versions_are_no_cache(self):
         version = server.static_asset_version()
