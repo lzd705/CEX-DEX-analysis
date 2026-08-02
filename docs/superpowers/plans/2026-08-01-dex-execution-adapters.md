@@ -22,6 +22,14 @@
   common-net-quantity conformance suite.
 - Funding Rate and Upbit mutation are excluded.
 
+## Current Release Boundary (2026-08-02)
+
+This branch executes Tasks 1-3 only, followed by the V3-specific portions of
+Task 9. Tasks 4-8 remain future plans and must not widen this release to V4,
+Balancer, or Solana. V3 publication below means the existing
+`dex_depth_latest.csv` / `dex_execution_cost_latest.csv` fact snapshot boundary;
+it never means the public route pointer `routes/latest.json`.
+
 Production priority snapshot `20260801T082050Z-cde2a0cf`:
 
 - Batch 0: 65 V3 markets with depth but 650 unsupported execution scenarios.
@@ -158,6 +166,7 @@ Add a GitHub commit comment with exact-vector hashes and rounding coverage.
 ### Task 3: V3 fixed-block Quoter parity and publication integration
 
 **Files:**
+- Create: `config/dex_protocol_deployments.csv`
 - Create: `scripts/check_dex_adapter_parity.py`
 - Create: `tests/test_dex_adapter_parity.py`
 - Modify: `scripts/fetch_dex_depth.py`
@@ -169,6 +178,9 @@ Add a GitHub commit comment with exact-vector hashes and rounding coverage.
 **Interfaces:**
 - Consumes: Task 2 SwapMath.
 - Produces: ten observed/partial execution scenarios for parity-approved V3 deployments.
+- Produces exact deployment identity fields: chain ID, factory address/code
+  hash, Quoter address/code hash, SwapRouter address/code hash, and pool
+  factory-lineage proof.
 
 - [ ] **Step 1: Add failing same-block parity fixtures**
 
@@ -176,6 +188,10 @@ Every fixture records chain, pool, fixed block, raw RPC hash, protocol reference
 URL/commit, and Quoter exact-input/output raw integers. Standard Uniswap V3
 must match exactly; fork-specific deployment remains unsupported until its own
 fixture passes.
+
+Add negative fixtures for a right DEX label with a wrong factory, Quoter,
+SwapRouter, code hash, or pool-factory lineage. A V3-like ABI or source label
+must never enable strict execution.
 
 - [ ] **Step 2: Replace the old all-V3-unsupported expectation**
 
@@ -191,8 +207,9 @@ Expected: FAIL because parity/integration is absent.
 
 - [ ] **Step 4: Enable only parity-approved deployment families**
 
-Use explicit deployment allowlists. A Quoter mismatch or revert is failed for
-declared capability; an unapproved fork stays unsupported with no numeric rows.
+Use the exact deployment registry, not a DEX-name allowlist. A Quoter mismatch,
+code-identity mismatch, lineage mismatch, or revert is failed for a declared
+capability; an unapproved fork stays unsupported with no numeric rows.
 
 - [ ] **Step 5: Run V3 integration and full suite**
 
@@ -205,11 +222,13 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add scripts/check_dex_adapter_parity.py scripts/fetch_dex_depth.py scripts/execution_cost.py tests/test_dex_adapter_parity.py tests/test_fetch_dex_depth.py tests/test_execution_cost.py docs/execution-cost-data-contract.md
+git add config/dex_protocol_deployments.csv scripts/check_dex_adapter_parity.py scripts/fetch_dex_depth.py scripts/execution_cost.py tests/test_dex_adapter_parity.py tests/test_fetch_dex_depth.py tests/test_execution_cost.py docs/execution-cost-data-contract.md
 git commit -m "feat(dex): publish parity-checked V3 execution"
 ```
 
-Add a GitHub commit comment with exact parity counts and newly usable scenarios.
+Add a GitHub commit comment with exact parity counts, deployment code hashes,
+newly usable scenarios, and confirmation that `routes/latest.json` was not
+written.
 
 ### Task 4: General pool identity and state-sequence schema
 
