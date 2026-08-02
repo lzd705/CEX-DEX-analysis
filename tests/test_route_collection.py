@@ -19,6 +19,7 @@ from scripts.collect_route_cohort import (
     _safe_leg_projection,
     collect_route_cohort as _collect_route_cohort,
     collect_unique_route_legs,
+    finalize_route_opportunity_bundle,
     main,
     materialize_route_leg_rows,
 )
@@ -26,6 +27,40 @@ from scripts.route_publication import load_latest_route_cohort
 
 
 _TEST_RAW_DIRECTORY = tempfile.TemporaryDirectory(prefix="route-cohort-tests-")
+
+
+class CompleteFinalizationOrchestrationTest(unittest.TestCase):
+    def test_finalization_forwards_existing_artifacts_without_recollecting(self):
+        data_dir = Path("/tmp/task7-existing-data")
+        inputs = [{"already": "classified"}]
+        expected = {"schema": "route_opportunity_pointer/v1"}
+        with patch(
+            "scripts.collect_route_cohort.publish_complete_route_bundle",
+            return_value=expected,
+        ) as publisher, patch(
+            "scripts.collect_route_cohort.collect_route_cohort"
+        ) as collector:
+            actual = finalize_route_opportunity_bundle(
+                data_dir=data_dir,
+                opportunity_inputs=inputs,
+                source_root=Path("/tmp/task7-sources"),
+                fee_profile_path=Path("/private/tmp/task7-fees.csv"),
+                fee_profile_id="9" * 64,
+                inventory_profile_path=Path("/private/tmp/task7-inventory.csv"),
+            )
+
+        self.assertEqual(actual, expected)
+        collector.assert_not_called()
+        publisher.assert_called_once_with(
+            core_root=data_dir / "routes/core",
+            routes_root=data_dir / "routes",
+            raw_root=data_dir / "raw/route-cohort",
+            opportunity_inputs=inputs,
+            source_root=Path("/tmp/task7-sources"),
+            fee_profile_path=Path("/private/tmp/task7-fees.csv"),
+            fee_profile_id="9" * 64,
+            inventory_profile_path=Path("/private/tmp/task7-inventory.csv"),
+        )
 
 
 def _complete_test_routes(universe):

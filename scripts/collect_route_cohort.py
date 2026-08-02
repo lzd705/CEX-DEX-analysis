@@ -29,7 +29,10 @@ try:
         CollectionDeadlineExceeded,
     )
     from scripts.route_cohort import canonical_route_id, classify_route_timing
-    from scripts.route_publication import publish_route_cohort_bundle
+    from scripts.route_publication import (
+        publish_complete_route_bundle,
+        publish_route_cohort_bundle,
+    )
     from scripts.fetch_cex_depth import (
         cex_market_id,
         collect_cex_market_observation,
@@ -46,7 +49,10 @@ try:
 except ModuleNotFoundError:
     from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
     from route_cohort import canonical_route_id, classify_route_timing
-    from route_publication import publish_route_cohort_bundle
+    from route_publication import (
+        publish_complete_route_bundle,
+        publish_route_cohort_bundle,
+    )
     from fetch_cex_depth import (
         cex_market_id,
         collect_cex_market_observation,
@@ -2284,6 +2290,29 @@ def _default_dex_block_resolver(chain: str, *, deadline: CollectionDeadline) -> 
         "block_number": number,
         "block_timestamp": block_timestamp_text(client.block(hex(number))),
     }
+
+
+def finalize_route_opportunity_bundle(
+    *,
+    data_dir: Path,
+    opportunity_inputs: Iterable[Mapping[str, Any]],
+    source_root: Optional[Path] = None,
+    fee_profile_path: Optional[Path] = None,
+    fee_profile_id: Optional[str] = None,
+    inventory_profile_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Finalize the already-published core without invoking collection again."""
+    root = Path(data_dir)
+    return publish_complete_route_bundle(
+        core_root=root / "routes/core",
+        routes_root=root / "routes",
+        raw_root=root / "raw/route-cohort",
+        opportunity_inputs=opportunity_inputs,
+        source_root=source_root,
+        fee_profile_path=fee_profile_path,
+        fee_profile_id=fee_profile_id,
+        inventory_profile_path=inventory_profile_path,
+    )
 
 
 def main(

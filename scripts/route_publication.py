@@ -12,7 +12,9 @@ from __future__ import annotations
 from collections import Counter
 import ctypes
 import csv
+from dataclasses import fields, is_dataclass
 from datetime import date
+from decimal import Decimal
 import errno
 import fcntl
 import hashlib
@@ -31,17 +33,73 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 try:
+    from scripts.cex_fee_facts import (
+        collect_cex_fee_snapshot,
+        load_validated_fee_profile,
+    )
+    from scripts.execution_cost_components import (
+        COST_COMPONENT_COLUMNS,
+        validate_cost_components,
+    )
+    from scripts.fetch_cex_depth import (
+        parse_book,
+        route_quantity_quote_for_book,
+        source_request,
+    )
     from scripts.route_cohort import (
         canonical_route_id,
         classify_route_timing,
         validate_route_cohort_rows,
     )
+    from scripts.route_inventory import (
+        classify_route_mode_evidence,
+        inventory_capacity_for_route,
+        load_validated_inventory_profile,
+    )
+    from scripts.route_opportunity import (
+        OPPORTUNITY_FIELDS,
+        _issue_publication_attestation,
+        _publication_binding_sha256,
+        build_route_opportunity,
+        route_opportunity_id,
+    )
+    from scripts.route_quantity import FeeSemantics, MarketRules, QuantityQuote
     from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
 except ModuleNotFoundError:
+    from cex_fee_facts import (  # type: ignore[no-redef]
+        collect_cex_fee_snapshot,
+        load_validated_fee_profile,
+    )
+    from execution_cost_components import (  # type: ignore[no-redef]
+        COST_COMPONENT_COLUMNS,
+        validate_cost_components,
+    )
+    from fetch_cex_depth import (  # type: ignore[no-redef]
+        parse_book,
+        route_quantity_quote_for_book,
+        source_request,
+    )
     from route_cohort import (  # type: ignore[no-redef]
         canonical_route_id,
         classify_route_timing,
         validate_route_cohort_rows,
+    )
+    from route_inventory import (  # type: ignore[no-redef]
+        classify_route_mode_evidence,
+        inventory_capacity_for_route,
+        load_validated_inventory_profile,
+    )
+    from route_opportunity import (  # type: ignore[no-redef]
+        OPPORTUNITY_FIELDS,
+        _issue_publication_attestation,
+        _publication_binding_sha256,
+        build_route_opportunity,
+        route_opportunity_id,
+    )
+    from route_quantity import (  # type: ignore[no-redef]
+        FeeSemantics,
+        MarketRules,
+        QuantityQuote,
     )
     from timestamp_contract import (  # type: ignore[no-redef]
         exact_rfc3339_epoch_seconds,
@@ -50,6 +108,7 @@ except ModuleNotFoundError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ROUTE_CORE_ROOT = PROJECT_ROOT / "data/local/routes/core"
+DEFAULT_ROUTE_ROOT = PROJECT_ROOT / "data/local/routes"
 
 ROUTE_COHORT_SCHEMA = "route_cohort_collection/v1"
 ROUTE_CORE_BUNDLE_STAGE = "route_cohort_core/v1"
@@ -65,6 +124,27 @@ ROUTE_LEGS_FILENAME = "route_legs.csv"
 ROUTE_TIMING_FILENAME = "route_timing.csv"
 ROUTE_SQLITE_FILENAME = "route_cohort.sqlite3"
 MANIFEST_FILENAME = "manifest.json"
+
+ROUTE_OPPORTUNITY_BUNDLE_STAGE = "route_opportunity/v1"
+ROUTE_OPPORTUNITY_MANIFEST_SCHEMA = "route_opportunity_manifest/v1"
+ROUTE_OPPORTUNITY_POINTER_SCHEMA = "route_opportunity_pointer/v1"
+ROUTE_OPPORTUNITY_SQLITE_SCHEMA = "route_opportunity_sqlite/v1"
+COST_COMPONENT_CSV_SCHEMA = "route_cost_components/v1"
+ROUTE_OPPORTUNITY_CSV_SCHEMA = "route_opportunities/v1"
+COST_COMPONENTS_FILENAME = "cost_components.csv"
+ROUTE_OPPORTUNITIES_FILENAME = "route_opportunities.csv"
+ROUTE_OPPORTUNITY_SQLITE_FILENAME = ROUTE_SQLITE_FILENAME
+
+ROUTE_COMPLETE_FILENAMES = frozenset({
+    ROUTE_LEGS_FILENAME,
+    COST_COMPONENTS_FILENAME,
+    ROUTE_OPPORTUNITIES_FILENAME,
+    ROUTE_OPPORTUNITY_SQLITE_FILENAME,
+    MANIFEST_FILENAME,
+})
+_COMPLETE_MANIFEST_ARTIFACT_FILENAMES = frozenset(
+    ROUTE_COMPLETE_FILENAMES - {MANIFEST_FILENAME}
+)
 
 ROUTE_CORE_FILENAMES = frozenset({
     ROUTE_CANDIDATES_FILENAME,
@@ -103,6 +183,7 @@ _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 _ROUTE_MODES = frozenset({
     "prepositioned_inventory",
     "atomic_onchain",
+    "rebalance_required",
     "research_only",
 })
 _ROUTE_CLASSES = frozenset({"candidate", "research_only"})
@@ -510,11 +591,15 @@ def _validate_route_candidate(
             raise RoutePublicationError("route mode lineage is invalid")
         if buy.split(":", 2)[1] != sell.split(":", 2)[1]:
             raise RoutePublicationError("route mode lineage is invalid")
-    else:
+    elif mode == "research_only":
         if not (buy.startswith("dex:") and sell.startswith("dex:")):
             raise RoutePublicationError("route mode lineage is invalid")
         if buy.split(":", 2)[1] == sell.split(":", 2)[1]:
             raise RoutePublicationError("route mode lineage is invalid")
+    elif mode == "rebalance_required":
+        if buy.startswith("dex:") and sell.startswith("dex:"):
+            if buy.split(":", 2)[1] != sell.split(":", 2)[1]:
+                raise RoutePublicationError("route mode lineage is invalid")
     return route_id
 
 
@@ -2256,9 +2341,10 @@ def _verify_bundle_file_snapshots(
     file_details: Mapping[str, os.stat_result],
     file_bytes: Mapping[str, bytes],
     file_hashes: Mapping[str, str],
+    expected_inventory: frozenset = ROUTE_CORE_FILENAMES,
 ) -> None:
     try:
-        if set(os.listdir(bundle_fd)) != ROUTE_CORE_FILENAMES:
+        if set(os.listdir(bundle_fd)) != expected_inventory:
             raise RoutePublicationError(
                 "route cohort bundle file inventory changed during validation"
             )
@@ -2302,7 +2388,7 @@ def _verify_bundle_file_snapshots(
             )
 
     try:
-        if set(os.listdir(bundle_fd)) != ROUTE_CORE_FILENAMES:
+        if set(os.listdir(bundle_fd)) != expected_inventory:
             raise RoutePublicationError(
                 "route cohort bundle file inventory changed during validation"
             )
@@ -3109,3 +3195,2112 @@ def load_latest_route_cohort(
         if bundles_fd is not None:
             os.close(bundles_fd)
         os.close(core_fd)
+
+
+_COMPLETE_INPUT_FIELDS = frozenset({
+    "classified_opportunity",
+    "build_inputs",
+    "source_members",
+})
+_OPPORTUNITY_BUILD_FIELDS = frozenset({
+    "cohort_id",
+    "route",
+    "requested_notional_usd",
+    "common_target",
+    "buy_leg",
+    "sell_leg",
+    "buy_quote",
+    "sell_quote",
+    "buy_quote_evidence",
+    "sell_quote_evidence",
+    "buy_usd_projection",
+    "sell_usd_projection",
+    "cost_components",
+    "mode_evidence",
+    "now",
+})
+_STRICT_CEX_SOURCE_MEMBERS = frozenset({
+    "buy_market_rules",
+    "sell_market_rules",
+    "buy_usd_conversion",
+    "sell_usd_conversion",
+})
+_MARKET_RULES_SOURCE_FIELDS = frozenset({
+    "schema",
+    "market_id",
+    "base_asset",
+    "quote_asset",
+    "base_unit_decimals",
+    "quote_unit_decimals",
+    "base_increment",
+    "quote_increment",
+    "min_base_quantity",
+    "min_quote_notional",
+    "observed_at",
+    "valid_until",
+})
+_USD_SOURCE_FIELDS = frozenset({
+    "schema",
+    "quote_asset",
+    "usd_per_quote",
+    "observed_at",
+    "valid_until",
+    "source",
+})
+_COMPLETE_ADAPTER_VERSIONS = {
+    "cex_request": "fetch_cex_depth/source_request/v1",
+    "cex_book_parser": "fetch_cex_depth/parse_book/v1",
+    "cex_quantity": "route_quantity_quote_for_book/v1",
+    "cex_fee": "cex_fee_facts/private_profile/v1",
+    "inventory": "route_inventory/private_profile/v1",
+    "usd_conversion": "route_usd_conversion_source/v1",
+}
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        text = format(value, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return "0" if text in {"", "-0"} else text
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _json_safe_value(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_value(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    raise RoutePublicationError("complete route input is not JSON-normalizable")
+
+
+def _canonical_input_sha256(value: Any) -> str:
+    return _sha256_bytes(_canonical_json_bytes(_json_safe_value(value)))
+
+
+def _read_member_from_root(
+    root_fd: int,
+    name: Any,
+    *,
+    label: str,
+) -> Tuple[Dict[str, Any], bytes, str]:
+    filename = _require_relative_basename(str(name), label)
+    value, physical_sha256, _details = _read_bounded_bytes_at(
+        root_fd,
+        filename,
+        limit=_MAX_JSON_BYTES,
+        label=label,
+    )
+    return _decode_json_object_bytes(value, label=label), value, physical_sha256
+
+
+def _read_core_raw_members(
+    raw_root: Path,
+    cohort: Mapping[str, Any],
+) -> Dict[str, Tuple[Dict[str, Any], bytes, str]]:
+    raw, raw_fd, raw_details = _open_verified_directory(
+        Path(raw_root),
+        "route raw root",
+    )
+    run_fd: Optional[int] = None
+    accepted_fd: Optional[int] = None
+    members: Dict[str, Tuple[Dict[str, Any], bytes, str]] = {}
+    try:
+        run_name = _require_relative_basename(
+            str(cohort["raw_evidence_run_id"]),
+            "route raw run ID",
+        )
+        run_fd, run_details = _open_directory_at(
+            raw_fd,
+            run_name,
+            "route raw run",
+        )
+        accepted_fd, accepted_details = _open_directory_at(
+            run_fd,
+            "accepted",
+            "route accepted raw root",
+        )
+        for leg in cohort["legs"]:
+            if leg.get("status") not in {"observed", "partial"}:
+                continue
+            market_id = str(leg["market_id"])
+            entry = hashlib.sha256(market_id.encode("utf-8")).hexdigest()
+            member_fd, member_details = _open_directory_at(
+                accepted_fd,
+                entry,
+                "route raw market member",
+            )
+            try:
+                if set(os.listdir(member_fd)) != {"response.json"}:
+                    raise RoutePublicationError(
+                        "route raw market member inventory is invalid"
+                    )
+                value, physical_sha256, _file_details = _read_bounded_bytes_at(
+                    member_fd,
+                    "response.json",
+                    limit=_MAX_JSON_BYTES,
+                    label="route raw response",
+                )
+                if physical_sha256 != leg.get("raw_response_sha256"):
+                    raise RoutePublicationError(
+                        "route raw response hash does not match core leg"
+                    )
+                payload = _decode_json_object_bytes(
+                    value,
+                    label="route raw response",
+                )
+                members[market_id] = (payload, value, physical_sha256)
+                _verify_directory_entry(
+                    accepted_fd,
+                    entry,
+                    member_details,
+                    "route raw market member",
+                )
+            finally:
+                os.close(member_fd)
+        _verify_directory_entry(
+            run_fd,
+            "accepted",
+            accepted_details,
+            "route accepted raw root",
+        )
+        _verify_directory_entry(raw_fd, run_name, run_details, "route raw run")
+        _verify_open_path_identity(raw, raw_details, "route raw root")
+        return members
+    finally:
+        if accepted_fd is not None:
+            os.close(accepted_fd)
+        if run_fd is not None:
+            os.close(run_fd)
+        os.close(raw_fd)
+
+
+def _parse_cex_book_source(
+    payload: Mapping[str, Any],
+    raw_bytes: bytes,
+    *,
+    market_id: str,
+    state_observed_at: str,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    parts = market_id.split(":", 2)
+    if len(parts) != 3 or parts[0] != "cex":
+        raise RoutePublicationError("typed CEX book source market is invalid")
+    venue = parts[1]
+    instrument = parts[2]
+    if venue == "upbit":
+        raise RoutePublicationError("typed CEX book source identity is invalid")
+    try:
+        endpoint, requested_instrument, quote_asset, full_book = source_request(
+            venue,
+            instrument,
+        )
+        normalized = parse_book(
+            venue,
+            payload,
+            requested_instrument=requested_instrument,
+        )
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("typed CEX book source cannot be replayed") from error
+    observed_at = normalized.get("source_observed_at") or state_observed_at
+    observed_at = _validate_timestamp(observed_at, "typed CEX observed_at")
+    market = {
+        "token_symbol": instrument.split("/", 1)[0],
+        "exchange": venue,
+        "cex_symbol": instrument,
+    }
+    book = {
+        "bids": normalized["bids"],
+        "asks": normalized["asks"],
+        "source_instrument": normalized["source_instrument"],
+        "source_quote_asset": quote_asset,
+        "source_sequence": normalized["source_sequence"],
+        "source_observed_at": observed_at,
+        "source_endpoint": endpoint,
+        "full_book_reported": full_book,
+        "raw": raw_bytes,
+    }
+    return market, book
+
+
+def _parse_market_rules_source(
+    payload: Mapping[str, Any],
+    physical_sha256: str,
+    *,
+    market_id: str,
+) -> MarketRules:
+    if (
+        set(payload) != _MARKET_RULES_SOURCE_FIELDS
+        or payload.get("schema") != "route_market_rules_source/v1"
+        or payload.get("market_id") != market_id
+    ):
+        raise RoutePublicationError("typed market-rules source schema is invalid")
+    try:
+        return MarketRules(
+            market_id=payload["market_id"],
+            base_asset=payload["base_asset"],
+            quote_asset=payload["quote_asset"],
+            base_unit_decimals=payload["base_unit_decimals"],
+            quote_unit_decimals=payload["quote_unit_decimals"],
+            base_increment=Decimal(payload["base_increment"]),
+            quote_increment=Decimal(payload["quote_increment"]),
+            min_base_quantity=Decimal(payload["min_base_quantity"]),
+            min_quote_notional=Decimal(payload["min_quote_notional"]),
+            observed_at=payload["observed_at"],
+            valid_until=payload["valid_until"],
+            source_record_sha256=physical_sha256,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise RoutePublicationError("typed market-rules source is invalid") from error
+
+
+def _expected_component_keys_for_complete_route(
+    route: Mapping[str, Any],
+) -> set[Tuple[str, str]]:
+    expected = {("route", "rebalancing_or_transfer")}
+    for leg in ("buy", "sell"):
+        market_id = str(route[leg + "_market_id"])
+        if market_id.startswith("cex:"):
+            expected.add((leg, "venue_taker_fee"))
+        elif market_id.startswith("dex:"):
+            expected.update({
+                (leg, "pool_swap_fee"),
+                (leg, "network_gas"),
+                (leg, "router_or_integrator_fee"),
+                (leg, "token_transfer_tax"),
+            })
+        else:
+            raise RoutePublicationError("complete route market type is invalid")
+    if any(str(route[key]).startswith("dex:") for key in ("buy_market_id", "sell_market_id")):
+        expected.add(("route", "mev_buffer"))
+    return expected
+
+
+def _canonical_cost_set_sha256(rows: Sequence[Mapping[str, Any]]) -> str:
+    canonical = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (row["leg"], row["component_type"]),
+    )
+    return _canonical_input_sha256(canonical)
+
+
+def _validated_prepublication_input(
+    raw: Mapping[str, Any],
+    *,
+    cohort: Mapping[str, Any],
+    core_manifest_sha256: str,
+    routes_by_id: Mapping[str, Mapping[str, Any]],
+    legs_by_market: Mapping[str, Mapping[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    if not isinstance(raw, Mapping) or set(raw) != _COMPLETE_INPUT_FIELDS:
+        raise RoutePublicationError("complete opportunity input schema is invalid")
+    build_inputs = raw.get("build_inputs")
+    classified = raw.get("classified_opportunity")
+    if not isinstance(build_inputs, Mapping) or set(build_inputs) != _OPPORTUNITY_BUILD_FIELDS:
+        raise RoutePublicationError("opportunity build input schema is invalid")
+    if not isinstance(classified, Mapping) or set(classified) != OPPORTUNITY_FIELDS:
+        raise RoutePublicationError("classified opportunity schema is invalid")
+    if (
+        classified.get("strict_eligible") is not False
+        or classified.get("publication_attestation_sha256") is not None
+    ):
+        raise RoutePublicationError("prepublication opportunity must not be attested")
+    try:
+        rebuilt = build_route_opportunity(**dict(build_inputs))
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("classified opportunity cannot be replayed") from error
+    if dict(classified) != rebuilt:
+        raise RoutePublicationError("classified opportunity replay mismatch")
+
+    route_id = str(classified["route_id"])
+    route = routes_by_id.get(route_id)
+    if route is None:
+        raise RoutePublicationError("opportunity route is absent from core")
+    for field in (
+        "route_id", "token_symbol", "buy_market_id", "sell_market_id", "route_mode"
+    ):
+        if classified.get(field) != route.get(field):
+            raise RoutePublicationError("opportunity route lineage mismatch")
+    if classified.get("cohort_id") != cohort["route_cohort_id"]:
+        raise RoutePublicationError("opportunity cohort lineage mismatch")
+    notional = classified.get("requested_notional_usd")
+    if str(notional) not in {str(value) for value in cohort["requested_notionals_usd"]}:
+        raise RoutePublicationError("opportunity notional lineage mismatch")
+    if classified.get("opportunity_id") != route_opportunity_id(route_id, notional):
+        raise RoutePublicationError("opportunity identity is not canonical")
+    if (
+        classified.get("buy_core_manifest_sha256") != core_manifest_sha256
+        or classified.get("sell_core_manifest_sha256") != core_manifest_sha256
+    ):
+        raise RoutePublicationError("opportunity core manifest lineage mismatch")
+
+    for direction in ("buy", "sell"):
+        quote = build_inputs.get(direction + "_quote")
+        leg = build_inputs.get(direction + "_leg")
+        market_id = str(route[direction + "_market_id"])
+        core_leg = legs_by_market.get(market_id)
+        if not isinstance(quote, QuantityQuote) or not isinstance(leg, Mapping) or core_leg is None:
+            raise RoutePublicationError("opportunity leg input is invalid")
+        if any(leg.get(key) != value for key, value in core_leg.items()):
+            raise RoutePublicationError("opportunity leg does not match core")
+        if (
+            quote.market_id != market_id
+            or quote.direction != direction
+            or quote.raw_response_sha256 != core_leg.get("raw_response_sha256")
+            or quote.snapshot_id != core_leg.get("snapshot_id")
+            or quote.state_observed_at != core_leg.get("state_observed_at")
+            or leg.get("state_id") != quote.state_id
+            or classified.get(direction + "_state_id") != quote.state_id
+        ):
+            raise RoutePublicationError("opportunity quote lineage mismatch")
+
+    raw_costs = build_inputs.get("cost_components")
+    if isinstance(raw_costs, (str, bytes, Mapping)):
+        raise RoutePublicationError("opportunity cost inventory is invalid")
+    costs = [dict(row) for row in raw_costs]
+    try:
+        validate_cost_components(costs)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("opportunity cost inventory is invalid") from error
+    keys = {(str(row["leg"]), str(row["component_type"])) for row in costs}
+    expected_keys = _expected_component_keys_for_complete_route(route)
+    if len(keys) != len(costs) or keys != expected_keys:
+        raise RoutePublicationError("opportunity cost component set is not exact")
+    if classified.get("cost_component_set_sha256") != _canonical_cost_set_sha256(costs):
+        raise RoutePublicationError("opportunity cost component binding mismatch")
+    return dict(classified), dict(build_inputs), costs
+
+
+def _strict_cex_replay(
+    *,
+    classified: Mapping[str, Any],
+    build_inputs: Mapping[str, Any],
+    costs: Sequence[Mapping[str, Any]],
+    source_members: Any,
+    source_fd: int,
+    raw_members: Mapping[str, Tuple[Dict[str, Any], bytes, str]],
+    core_manifest_sha256: str,
+    fee_profile_path: Path,
+    fee_profile_id: str,
+    inventory_rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    route = build_inputs["route"]
+    if not _strict_cex_route_identity(route):
+        return dict(classified)
+    if (
+        not isinstance(source_members, Mapping)
+        or set(source_members) != _STRICT_CEX_SOURCE_MEMBERS
+    ):
+        return dict(classified)
+
+    replayed_quotes: Dict[str, QuantityQuote] = {}
+    for direction in ("buy", "sell"):
+        market_id = str(route[direction + "_market_id"])
+        raw_payload, raw_bytes, _raw_sha256 = raw_members[market_id]
+        market, book = _parse_cex_book_source(
+            raw_payload,
+            raw_bytes,
+            market_id=market_id,
+            state_observed_at=build_inputs[direction + "_quote"].state_observed_at,
+        )
+        parsed_endpoint = urlsplit(book["source_endpoint"])
+        safe_endpoint = urlunsplit((
+            parsed_endpoint.scheme,
+            parsed_endpoint.netloc,
+            parsed_endpoint.path,
+            "",
+            "",
+        ))
+        if build_inputs[direction + "_leg"].get("source_endpoint") != safe_endpoint:
+            raise RoutePublicationError("typed CEX endpoint does not match core leg")
+        rules_payload, _rules_bytes, rules_sha256 = _read_member_from_root(
+            source_fd,
+            source_members[direction + "_market_rules"],
+            label=direction + " market-rules source",
+        )
+        rules = _parse_market_rules_source(
+            rules_payload,
+            rules_sha256,
+            market_id=market_id,
+        )
+        evidence = build_inputs[direction + "_quote_evidence"]
+        supplied_fee = evidence.get("fee_semantics") if isinstance(evidence, Mapping) else None
+        supplied_rules = evidence.get("market_rules") if isinstance(evidence, Mapping) else None
+        supplied_book = evidence.get("book") if isinstance(evidence, Mapping) else None
+        if supplied_rules != rules or supplied_book != book or not isinstance(supplied_fee, FeeSemantics):
+            raise RoutePublicationError("typed CEX quote evidence does not match source")
+
+        matching_costs = [
+            row for row in costs
+            if row["leg"] == direction and row["component_type"] == "venue_taker_fee"
+        ]
+        if len(matching_costs) != 1:
+            raise RoutePublicationError("CEX venue fee component is not exact")
+        venue = market_id.split(":", 2)[1]
+        actual_fee = collect_cex_fee_snapshot(
+            cohort_id=classified["cohort_id"],
+            opportunity_id=classified["opportunity_id"],
+            leg=direction,
+            market_id=market_id,
+            venue=venue,
+            instrument=market_id.split(":", 2)[2],
+            side=direction,
+            requested_notional_usd=classified["requested_notional_usd"],
+            target_token_quantity=classified["target_token_quantity"],
+            now=build_inputs["now"],
+            private_profile_path=fee_profile_path,
+            profile_id=fee_profile_id,
+        )
+        if dict(actual_fee) != dict(matching_costs[0]):
+            raise RoutePublicationError("CEX fee profile does not reproduce component")
+        expected_basis = "received_base" if direction == "buy" else "received_quote"
+        expected_increment = rules.base_increment if direction == "buy" else rules.quote_increment
+        actual_basis = str(actual_fee["basis"])
+        if "; fee_asset=" not in actual_basis:
+            raise RoutePublicationError("CEX fee component has no exact fee asset")
+        actual_fee_asset = actual_basis.rsplit("; fee_asset=", 1)[1]
+        if (
+            str(supplied_fee.rate_bps) != str(actual_fee["rate_bps"])
+            or supplied_fee.fee_asset != actual_fee_asset
+            or supplied_fee.source_record_sha256 != actual_fee["source_record_sha256"]
+            or supplied_fee.observed_at != actual_fee["observed_at"]
+            or supplied_fee.valid_until != actual_fee["valid_until"]
+            or supplied_fee.charge_basis != expected_basis
+            or supplied_fee.fee_increment != expected_increment
+            or supplied_fee.rounding_mode != "ceiling"
+            or supplied_fee.third_asset_quote_price is not None
+        ):
+            raise RoutePublicationError("CEX fee semantics do not match private profile")
+        quote = route_quantity_quote_for_book(
+            market,
+            book,
+            direction=direction,
+            target_token_quantity=build_inputs["common_target"],
+            market_rules=rules,
+            fee_semantics=supplied_fee,
+            snapshot_id=build_inputs[direction + "_quote"].snapshot_id,
+            observed_at=build_inputs[direction + "_quote"].state_observed_at,
+            cohort_now=build_inputs[direction + "_quote"].cohort_now,
+            expected_state_id=build_inputs[direction + "_quote"].state_id,
+        )
+        if quote != build_inputs[direction + "_quote"]:
+            raise RoutePublicationError("typed CEX book replay does not reproduce quote")
+        replayed_quotes[direction] = quote
+
+        usd_payload, _usd_bytes, usd_sha256 = _read_member_from_root(
+            source_fd,
+            source_members[direction + "_usd_conversion"],
+            label=direction + " USD conversion source",
+        )
+        projection = build_inputs[direction + "_usd_projection"]
+        if (
+            set(usd_payload) != _USD_SOURCE_FIELDS
+            or usd_payload.get("schema") != "route_usd_conversion_source/v1"
+            or projection.get("source_record_sha256") != usd_sha256
+            or projection.get("quote_asset") != usd_payload.get("quote_asset")
+            or projection.get("usd_per_quote") != usd_payload.get("usd_per_quote")
+            or projection.get("observed_at") != usd_payload.get("observed_at")
+            or projection.get("valid_until") != usd_payload.get("valid_until")
+            or projection.get("source") != usd_payload.get("source")
+            or projection.get("core_manifest_sha256") != core_manifest_sha256
+        ):
+            raise RoutePublicationError("typed USD conversion does not reproduce projection")
+
+    buy_quote = replayed_quotes["buy"]
+    sell_quote = replayed_quotes["sell"]
+    inventory = inventory_capacity_for_route(
+        route,
+        inventory_rows,
+        buy_quote_asset=buy_quote.quote_debit_asset,
+        buy_quote_quantity=buy_quote.quote_debit_quantity,
+        sell_token_asset=sell_quote.target_base_asset,
+        sell_net_token_quantity=sell_quote.base_debit_quantity,
+        now=build_inputs["now"],
+    )
+    expected_request = {
+        key: inventory[key]
+        for key in (
+            "route_id", "buy_market_id", "sell_market_id",
+            "buy_quote_asset", "buy_quote_quantity", "sell_token_asset",
+            "sell_net_token_quantity", "target_asset", "target_quantity",
+        )
+    }
+    mode = classify_route_mode_evidence(
+        route,
+        expected_request=expected_request,
+        inventory_evidence=inventory,
+        now=build_inputs["now"],
+    )
+    if mode != build_inputs["mode_evidence"] or not mode.get("mode_evidence_eligible"):
+        raise RoutePublicationError("inventory profile does not reproduce mode evidence")
+
+    attestation = _issue_publication_attestation(
+        cohort_id=classified["cohort_id"],
+        opportunity_id=classified["opportunity_id"],
+        route_id=classified["route_id"],
+        target_token_quantity=classified["target_token_quantity"],
+        buy_state_id=classified["buy_state_id"],
+        sell_state_id=classified["sell_state_id"],
+        buy_usd_projection_sha256=classified["buy_usd_projection_sha256"],
+        sell_usd_projection_sha256=classified["sell_usd_projection_sha256"],
+        cost_component_set_sha256=classified["cost_component_set_sha256"],
+        mode_evidence_sha256=classified["mode_evidence_sha256"],
+        core_manifest_sha256=core_manifest_sha256,
+    )
+    try:
+        result = build_route_opportunity(
+            **dict(build_inputs),
+            publication_attestation=attestation,
+        )
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("attested opportunity cannot be rebuilt") from error
+    if not result.get("strict_eligible") or result.get("opportunity_class") != "executable_candidate":
+        raise RoutePublicationError("attested opportunity did not become executable")
+    return result
+
+
+def build_complete_route_bundle(
+    *,
+    core_root: Path = DEFAULT_ROUTE_CORE_ROOT,
+    raw_root: Path,
+    opportunity_inputs: Iterable[Mapping[str, Any]],
+    source_root: Optional[Path] = None,
+    fee_profile_path: Optional[Path] = None,
+    fee_profile_id: Optional[str] = None,
+    inventory_profile_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Replay one pinned core into a closed complete opportunity generation."""
+    core, core_fd, core_details = _open_verified_directory(
+        Path(core_root),
+        "route core root",
+    )
+    source_fd: Optional[int] = None
+    source_details: Optional[os.stat_result] = None
+    source_path: Optional[Path] = None
+    try:
+        try:
+            fcntl.flock(core_fd, fcntl.LOCK_SH)
+        except Exception as error:
+            raise RoutePublicationError("route core lock acquisition failed") from error
+        pointer_snapshot = _optional_pointer_snapshot_at(core_fd)
+        if pointer_snapshot is None:
+            raise RoutePublicationError("route core pointer is missing")
+        loaded = load_latest_route_cohort(core)
+        if not _pointer_snapshot_is_owned(
+            _optional_pointer_snapshot_at(core_fd),
+            pointer_snapshot,
+        ):
+            raise RoutePublicationError("route core pointer changed during finalization")
+        cohort = loaded["cohort"]
+        inputs = list(opportunity_inputs)
+        expected_count = (
+            len(cohort["routes"])
+            * len(cohort["requested_notionals_usd"])
+        )
+        if (
+            cohort["requested_notionals_usd"] != REQUESTED_NOTIONALS_USD
+            or len(inputs) != expected_count
+        ):
+            raise RoutePublicationError(
+                "every route must contain exactly five notional scenarios"
+            )
+        opportunity_now_values = {
+            str(item.get("build_inputs", {}).get("now"))
+            for item in inputs
+            if isinstance(item, Mapping)
+            and isinstance(item.get("build_inputs"), Mapping)
+        }
+        if len(opportunity_now_values) != 1:
+            raise RoutePublicationError("opportunity evaluation time is not exact")
+        opportunity_now = next(iter(opportunity_now_values))
+        raw_members = _read_core_raw_members(raw_root, cohort)
+        routes_by_id = {str(row["route_id"]): row for row in cohort["routes"]}
+        legs_by_market = {str(row["market_id"]): row for row in cohort["legs"]}
+
+        if source_root is not None:
+            source_path, source_fd, source_details = _open_verified_directory(
+                Path(source_root),
+                "route typed-source root",
+            )
+        inventory_rows: Sequence[Mapping[str, Any]] = []
+        if inventory_profile_path is not None:
+            try:
+                inventory_rows = load_validated_inventory_profile(
+                    inventory_profile_path,
+                    now=opportunity_now,
+                )
+            except (TypeError, ValueError) as error:
+                raise RoutePublicationError("private inventory profile is invalid") from error
+        fee_profile_rows: Sequence[Mapping[str, Any]] = []
+        if fee_profile_path is not None:
+            try:
+                fee_profile_rows = load_validated_fee_profile(
+                    fee_profile_path,
+                    now=opportunity_now,
+                )
+            except (TypeError, ValueError) as error:
+                raise RoutePublicationError("private fee profile is invalid") from error
+
+        typed_source_records: Dict[Tuple[str, str], Dict[str, str]] = {}
+        if source_fd is not None:
+            for raw in inputs:
+                members = raw.get("source_members") if isinstance(raw, Mapping) else None
+                if not isinstance(members, Mapping):
+                    continue
+                for role, filename in members.items():
+                    source_name = _require_relative_basename(
+                        str(filename),
+                        "typed source member",
+                    )
+                    _payload, _source_bytes, source_sha256 = _read_member_from_root(
+                        source_fd,
+                        source_name,
+                        label="typed source member",
+                    )
+                    typed_source_records[(str(role), source_name)] = {
+                        "role": str(role),
+                        "filename": source_name,
+                        "sha256": source_sha256,
+                    }
+
+        final_rows: List[Dict[str, Any]] = []
+        all_costs: List[Dict[str, Any]] = []
+        quote_inputs: List[Tuple[str, Decimal, str, Any]] = []
+        scenario_keys = set()
+        for raw in inputs:
+            classified, build_inputs, costs = _validated_prepublication_input(
+                raw,
+                cohort=cohort,
+                core_manifest_sha256=loaded["manifest_sha256"],
+                routes_by_id=routes_by_id,
+                legs_by_market=legs_by_market,
+            )
+            scenario_key = (
+                classified["route_id"],
+                str(classified["requested_notional_usd"]),
+            )
+            if scenario_key in scenario_keys:
+                raise RoutePublicationError("duplicate route notional scenario")
+            scenario_keys.add(scenario_key)
+            source_members = raw.get("source_members")
+            if classified.get("strict_ready_for_publication"):
+                if (
+                    source_fd is None
+                    or fee_profile_path is None
+                    or fee_profile_id is None
+                    or inventory_profile_path is None
+                ):
+                    final = dict(classified)
+                else:
+                    final = _strict_cex_replay(
+                        classified=classified,
+                        build_inputs=build_inputs,
+                        costs=costs,
+                        source_members=source_members,
+                        source_fd=source_fd,
+                        raw_members=raw_members,
+                        core_manifest_sha256=loaded["manifest_sha256"],
+                        fee_profile_path=fee_profile_path,
+                        fee_profile_id=fee_profile_id,
+                        inventory_rows=inventory_rows,
+                    )
+            else:
+                final = dict(classified)
+            final_rows.append(final)
+            all_costs.extend(costs)
+            quote_inputs.extend([
+                (
+                    str(classified["route_id"]),
+                    Decimal(str(classified["requested_notional_usd"])),
+                    direction,
+                    build_inputs[direction + "_quote"],
+                )
+                for direction in ("buy", "sell")
+            ])
+
+        expected_scenarios = {
+            (str(route["route_id"]), str(notional))
+            for route in cohort["routes"]
+            for notional in cohort["requested_notionals_usd"]
+        }
+        if scenario_keys != expected_scenarios:
+            raise RoutePublicationError(
+                "every route must contain exactly five notional scenarios"
+            )
+        final_rows.sort(key=lambda row: (row["route_id"], Decimal(row["requested_notional_usd"])))
+        all_costs.sort(key=lambda row: (
+            row["opportunity_id"], row["leg"], row["component_type"]
+        ))
+        raw_members_after = _read_core_raw_members(raw_root, cohort)
+        if any(
+            raw_members_after[key][1:] != value[1:]
+            for key, value in raw_members.items()
+        ):
+            raise RoutePublicationError("route raw evidence changed during finalization")
+        if inventory_profile_path is not None:
+            try:
+                inventory_rows_after = load_validated_inventory_profile(
+                    inventory_profile_path,
+                    now=opportunity_now,
+                )
+            except (TypeError, ValueError) as error:
+                raise RoutePublicationError("private inventory profile changed") from error
+            if inventory_rows_after != inventory_rows:
+                raise RoutePublicationError("private inventory profile changed")
+        if fee_profile_path is not None:
+            try:
+                fee_profile_rows_after = load_validated_fee_profile(
+                    fee_profile_path,
+                    now=opportunity_now,
+                )
+            except (TypeError, ValueError) as error:
+                raise RoutePublicationError("private fee profile changed") from error
+            if fee_profile_rows_after != fee_profile_rows:
+                raise RoutePublicationError("private fee profile changed")
+        if source_fd is not None:
+            for key in sorted(typed_source_records):
+                record = typed_source_records[key]
+                _payload, _value, digest = _read_member_from_root(
+                    source_fd,
+                    record["filename"],
+                    label="typed source member",
+                )
+                if digest != record["sha256"]:
+                    raise RoutePublicationError(
+                        "typed source member changed during finalization"
+                    )
+            if source_path is None or source_details is None:
+                raise RoutePublicationError("typed source root identity is invalid")
+            _verify_open_path_identity(
+                source_path, source_details, "route typed-source root"
+            )
+        reloaded = load_latest_route_cohort(core)
+        if (
+            reloaded["manifest_sha256"] != loaded["manifest_sha256"]
+            or reloaded["cohort"] != cohort
+            or not _pointer_snapshot_is_owned(
+                _optional_pointer_snapshot_at(core_fd),
+                pointer_snapshot,
+            )
+        ):
+            raise RoutePublicationError("route core changed during finalization")
+        _verify_open_path_identity(core, core_details, "route core root")
+
+        generations = {
+            "candidate_source_generation": cohort["candidate_source_generation"],
+            "collection_input_generation": cohort["collection_input_generation"],
+            "raw_evidence_run_id": cohort["raw_evidence_run_id"],
+            "raw_evidence_generation": _canonical_input_sha256([
+                {"market_id": market_id, "sha256": raw_members[market_id][2]}
+                for market_id in sorted(raw_members)
+            ]),
+            "quantity_quote_generation": _canonical_input_sha256([
+                record[3]
+                for record in sorted(
+                    quote_inputs,
+                    key=lambda record: (record[0], record[1], record[2]),
+                )
+            ]),
+            "cost_component_generation": _canonical_input_sha256(all_costs),
+            "classified_opportunity_generation": _canonical_input_sha256(
+                sorted(
+                    (item["classified_opportunity"] for item in inputs),
+                    key=lambda row: (
+                        str(row["route_id"]),
+                        Decimal(str(row["requested_notional_usd"])),
+                    ),
+                )
+            ),
+            "fee_profile_generation": _canonical_input_sha256(sorted(
+                fee_profile_rows,
+                key=_canonical_json_text,
+            )),
+            "inventory_profile_generation": _canonical_input_sha256(inventory_rows),
+            "typed_source_generation": _canonical_input_sha256([
+                typed_source_records[key] for key in sorted(typed_source_records)
+            ]),
+            "adapter_versions": dict(_COMPLETE_ADAPTER_VERSIONS),
+        }
+        return {
+            "schema": "route_opportunity/v1",
+            "route_cohort_id": cohort["route_cohort_id"],
+            "core_manifest_sha256": loaded["manifest_sha256"],
+            "core_pointer_sha256": _sha256_bytes(pointer_snapshot[0]),
+            "core_context": {
+                "candidate_source_generation": cohort["candidate_source_generation"],
+                "collection_input_generation": cohort["collection_input_generation"],
+                "raw_evidence_run_id": cohort["raw_evidence_run_id"],
+                "collection_completed_at": cohort["collection_completed_at"],
+                "collection_deadline_at": cohort["collection_deadline_at"],
+            },
+            "input_generations": generations,
+            "routes": [dict(row) for row in cohort["routes"]],
+            "legs": [dict(row) for row in cohort["legs"]],
+            "cost_components": all_costs,
+            "opportunities": final_rows,
+        }
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        try:
+            fcntl.flock(core_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        os.close(core_fd)
+
+
+COMPLETE_COST_COLUMNS = tuple(COST_COMPONENT_COLUMNS) + ("row_json",)
+COMPLETE_OPPORTUNITY_COLUMNS = tuple(sorted(OPPORTUNITY_FIELDS)) + ("row_json",)
+
+
+def _complete_csv_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if type(value) is bool:
+        return "true" if value else "false"
+    if isinstance(value, (list, dict)):
+        return _canonical_json_text(value)
+    return str(value)
+
+
+def _complete_cost_csv_row(row: Mapping[str, Any]) -> Dict[str, str]:
+    result = {
+        column: _complete_csv_value(row[column])
+        for column in COST_COMPONENT_COLUMNS
+    }
+    result["row_json"] = _canonical_json_text(row)
+    return result
+
+
+def _complete_opportunity_csv_row(row: Mapping[str, Any]) -> Dict[str, str]:
+    result = {
+        column: _complete_csv_value(row[column])
+        for column in sorted(OPPORTUNITY_FIELDS)
+    }
+    result["row_json"] = _canonical_json_text(row)
+    return result
+
+
+def _complete_database_logical_sha256(bundle: Mapping[str, Any]) -> str:
+    return _sha256_bytes(_canonical_json_bytes({
+        "schema": ROUTE_OPPORTUNITY_SQLITE_SCHEMA,
+        "bundle": bundle,
+    }))
+
+
+def _build_complete_sqlite_file(
+    path: Path,
+    bundle: Mapping[str, Any],
+) -> str:
+    connection: Optional[sqlite3.Connection] = None
+    try:
+        connection = sqlite3.connect(str(path))
+        connection.execute("PRAGMA page_size = 4096")
+        connection.execute("PRAGMA auto_vacuum = NONE")
+        connection.execute("PRAGMA journal_mode = DELETE")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA application_id = 1380929615")
+        connection.execute("PRAGMA user_version = 1")
+        connection.executescript(
+            """
+            CREATE TABLE bundle_metadata (
+                key TEXT PRIMARY KEY NOT NULL,
+                value_json TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE route_legs (
+                route_cohort_id TEXT NOT NULL,
+                market_id TEXT PRIMARY KEY NOT NULL,
+                row_json TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE route_opportunities (
+                cohort_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                opportunity_id TEXT PRIMARY KEY NOT NULL,
+                requested_notional_usd TEXT NOT NULL,
+                buy_market_id TEXT NOT NULL,
+                sell_market_id TEXT NOT NULL,
+                strict_eligible TEXT NOT NULL,
+                row_json TEXT NOT NULL,
+                FOREIGN KEY (buy_market_id) REFERENCES route_legs(market_id),
+                FOREIGN KEY (sell_market_id) REFERENCES route_legs(market_id)
+            ) WITHOUT ROWID;
+            CREATE TABLE cost_components (
+                cohort_id TEXT NOT NULL,
+                opportunity_id TEXT NOT NULL,
+                leg TEXT NOT NULL,
+                component_type TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                requested_notional_usd TEXT NOT NULL,
+                row_json TEXT NOT NULL,
+                PRIMARY KEY (opportunity_id, leg, component_type),
+                FOREIGN KEY (opportunity_id)
+                    REFERENCES route_opportunities(opportunity_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX route_opportunities_route_idx
+                ON route_opportunities(route_id, requested_notional_usd);
+            CREATE INDEX route_opportunities_strict_idx
+                ON route_opportunities(strict_eligible, route_id);
+            CREATE INDEX cost_components_market_idx
+                ON cost_components(market_id, component_type);
+            """
+        )
+        connection.execute(
+            "INSERT INTO bundle_metadata (key, value_json) VALUES (?, ?)",
+            ("bundle", _canonical_json_text(bundle)),
+        )
+        cohort_id = str(bundle["route_cohort_id"])
+        connection.executemany(
+            "INSERT INTO route_legs VALUES (?, ?, ?)",
+            (
+                (cohort_id, row["market_id"], _canonical_json_text(row))
+                for row in bundle["legs"]
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO route_opportunities VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    row["cohort_id"], row["route_id"], row["opportunity_id"],
+                    row["requested_notional_usd"], row["buy_market_id"],
+                    row["sell_market_id"], _complete_csv_value(row["strict_eligible"]),
+                    _canonical_json_text(row),
+                )
+                for row in bundle["opportunities"]
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO cost_components VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    row["cohort_id"], row["opportunity_id"], row["leg"],
+                    row["component_type"], row["market_id"],
+                    row["requested_notional_usd"], _canonical_json_text(row),
+                )
+                for row in bundle["cost_components"]
+            ),
+        )
+        connection.commit()
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise RoutePublicationError("complete SQLite foreign keys are invalid")
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise RoutePublicationError("complete SQLite integrity check failed")
+        connection.execute("VACUUM")
+        connection.close()
+        connection = None
+        _fsync_file(path)
+        return _complete_database_logical_sha256(bundle)
+    except Exception:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+        _remove_sqlite_artifacts(path)
+        raise
+
+
+def _complete_manifest_payload(
+    bundle: Mapping[str, Any],
+    files: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Any]:
+    opportunities = bundle["opportunities"]
+    return {
+        "schema": ROUTE_OPPORTUNITY_MANIFEST_SCHEMA,
+        "bundle_stage": ROUTE_OPPORTUNITY_BUNDLE_STAGE,
+        "route_cohort_id": bundle["route_cohort_id"],
+        "core_manifest_sha256": bundle["core_manifest_sha256"],
+        "core_pointer_sha256": bundle["core_pointer_sha256"],
+        "input_generations": dict(bundle["input_generations"]),
+        "requested_notionals_usd": list(REQUESTED_NOTIONALS_USD),
+        "counts": {
+            "routes": len(bundle["routes"]),
+            "markets": len(bundle["legs"]),
+            "legs": len(bundle["legs"]),
+            "opportunities": len(bundle["opportunities"]),
+            "cost_components": len(bundle["cost_components"]),
+            "classification": {
+                "strict": sum(
+                    row.get("strict_eligible") is True for row in opportunities
+                ),
+                "research": sum(
+                    row.get("opportunity_class") == "research_estimate"
+                    for row in opportunities
+                ),
+                "unavailable": sum(
+                    row.get("opportunity_class") == "unavailable"
+                    for row in opportunities
+                ),
+            },
+            "cost_completeness": {
+                "complete": sum(
+                    row.get("cost_completeness") == "complete"
+                    for row in opportunities
+                ),
+                "incomplete": sum(
+                    row.get("cost_completeness") == "incomplete"
+                    for row in opportunities
+                ),
+            },
+            "scenario_cost_completeness": {
+                "complete": sum(
+                    row.get("scenario_cost_completeness") == "complete"
+                    for row in opportunities
+                ),
+                "incomplete": sum(
+                    row.get("scenario_cost_completeness") == "incomplete"
+                    for row in opportunities
+                ),
+            },
+        },
+        "files": {name: dict(files[name]) for name in sorted(files)},
+    }
+
+
+def _complete_artifact_bytes(
+    bundle: Mapping[str, Any],
+) -> Tuple[Dict[str, bytes], Dict[str, Any]]:
+    leg_bytes = _csv_bytes(
+        LEG_COLUMNS,
+        (_leg_csv_row(bundle["route_cohort_id"], row) for row in bundle["legs"]),
+    )
+    cost_bytes = _csv_bytes(
+        COMPLETE_COST_COLUMNS,
+        (_complete_cost_csv_row(row) for row in bundle["cost_components"]),
+    )
+    opportunity_bytes = _csv_bytes(
+        COMPLETE_OPPORTUNITY_COLUMNS,
+        (_complete_opportunity_csv_row(row) for row in bundle["opportunities"]),
+    )
+    with tempfile.TemporaryDirectory(prefix="route-opportunity-sqlite-build-") as temporary:
+        database = Path(temporary) / ROUTE_OPPORTUNITY_SQLITE_FILENAME
+        sqlite_logical = _build_complete_sqlite_file(database, bundle)
+        database_bytes = _read_bounded_bytes(
+            database,
+            limit=_MAX_SQLITE_BYTES,
+            label="controlled complete route SQLite",
+        )
+    files = {
+        ROUTE_LEGS_FILENAME: _artifact_details_bytes(
+            leg_bytes,
+            schema=ROUTE_LEG_CSV_SCHEMA,
+            logical_sha256=_logical_rows_sha256(ROUTE_LEG_CSV_SCHEMA, bundle["legs"]),
+            row_count=len(bundle["legs"]),
+        ),
+        COST_COMPONENTS_FILENAME: _artifact_details_bytes(
+            cost_bytes,
+            schema=COST_COMPONENT_CSV_SCHEMA,
+            logical_sha256=_logical_rows_sha256(COST_COMPONENT_CSV_SCHEMA, bundle["cost_components"]),
+            row_count=len(bundle["cost_components"]),
+        ),
+        ROUTE_OPPORTUNITIES_FILENAME: _artifact_details_bytes(
+            opportunity_bytes,
+            schema=ROUTE_OPPORTUNITY_CSV_SCHEMA,
+            logical_sha256=_logical_rows_sha256(ROUTE_OPPORTUNITY_CSV_SCHEMA, bundle["opportunities"]),
+            row_count=len(bundle["opportunities"]),
+        ),
+        ROUTE_OPPORTUNITY_SQLITE_FILENAME: _artifact_details_bytes(
+            database_bytes,
+            schema=ROUTE_OPPORTUNITY_SQLITE_SCHEMA,
+            logical_sha256=sqlite_logical,
+            row_count=(
+                len(bundle["legs"])
+                + len(bundle["cost_components"])
+                + len(bundle["opportunities"])
+            ),
+        ),
+    }
+    manifest = _complete_manifest_payload(bundle, files)
+    return {
+        ROUTE_LEGS_FILENAME: leg_bytes,
+        COST_COMPONENTS_FILENAME: cost_bytes,
+        ROUTE_OPPORTUNITIES_FILENAME: opportunity_bytes,
+        ROUTE_OPPORTUNITY_SQLITE_FILENAME: database_bytes,
+        MANIFEST_FILENAME: json.dumps(
+            manifest,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8") + b"\n",
+    }, manifest
+
+
+_COMPLETE_BUNDLE_FIELDS = frozenset({
+    "schema",
+    "route_cohort_id",
+    "core_manifest_sha256",
+    "core_pointer_sha256",
+    "core_context",
+    "input_generations",
+    "routes",
+    "legs",
+    "cost_components",
+    "opportunities",
+})
+_COMPLETE_GENERATION_FIELDS = frozenset({
+    "candidate_source_generation",
+    "collection_input_generation",
+    "raw_evidence_run_id",
+    "raw_evidence_generation",
+    "quantity_quote_generation",
+    "cost_component_generation",
+    "classified_opportunity_generation",
+    "fee_profile_generation",
+    "inventory_profile_generation",
+    "typed_source_generation",
+    "adapter_versions",
+})
+_COMPLETE_CONTEXT_FIELDS = frozenset({
+    "candidate_source_generation",
+    "collection_input_generation",
+    "raw_evidence_run_id",
+    "collection_completed_at",
+    "collection_deadline_at",
+})
+
+
+def _opportunity_binding_sha256(row: Mapping[str, Any]) -> str:
+    try:
+        value = json.dumps(
+            row,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError(
+            "route opportunity contains invalid JSON data"
+        ) from error
+    return _sha256_bytes(value)
+
+
+def _strict_cex_route_identity(route: Mapping[str, Any]) -> bool:
+    buy_market_id = str(route.get("buy_market_id"))
+    sell_market_id = str(route.get("sell_market_id"))
+    return (
+        route.get("route_mode") == "prepositioned_inventory"
+        and buy_market_id.startswith("cex:")
+        and sell_market_id.startswith("cex:")
+        and not buy_market_id.startswith("cex:upbit:")
+        and not sell_market_id.startswith("cex:upbit:")
+        and buy_market_id.split(":", 2)[1]
+        != sell_market_id.split(":", 2)[1]
+    )
+
+
+def _complete_opportunity_sort_key(row: Any) -> Tuple[str, Decimal]:
+    if not isinstance(row, Mapping):
+        raise RoutePublicationError("route opportunity must be an object")
+    try:
+        notional = Decimal(str(row.get("requested_notional_usd")))
+    except Exception as error:
+        raise RoutePublicationError("route opportunity notional is invalid") from error
+    if not notional.is_finite():
+        raise RoutePublicationError("route opportunity notional is invalid")
+    return str(row.get("route_id")), notional
+
+
+def _validate_complete_logical_bundle(bundle: Any) -> Dict[str, Any]:
+    if not isinstance(bundle, Mapping) or set(bundle) != _COMPLETE_BUNDLE_FIELDS:
+        raise RoutePublicationError("complete route bundle schema is invalid")
+    normalized = _clone_json(bundle)
+    if _forbidden_row_keys(normalized):
+        raise RoutePublicationError("complete route bundle contains unsafe evidence")
+    if normalized.get("schema") != ROUTE_OPPORTUNITY_BUNDLE_STAGE:
+        raise RoutePublicationError("complete route bundle stage is unsupported")
+    cohort_id = normalized.get("route_cohort_id")
+    if not isinstance(cohort_id, str) or _COHORT_ID.fullmatch(cohort_id) is None:
+        raise RoutePublicationError("complete route cohort ID is invalid")
+    for field in ("core_manifest_sha256", "core_pointer_sha256"):
+        value = normalized.get(field)
+        if not isinstance(value, str) or _HEX_SHA256.fullmatch(value) is None:
+            raise RoutePublicationError("complete route core lineage is invalid")
+
+    context = normalized.get("core_context")
+    generations = normalized.get("input_generations")
+    if not isinstance(context, dict) or set(context) != _COMPLETE_CONTEXT_FIELDS:
+        raise RoutePublicationError("complete route core context is invalid")
+    if not isinstance(generations, dict) or set(generations) != _COMPLETE_GENERATION_FIELDS:
+        raise RoutePublicationError("complete route input generations are invalid")
+    if (
+        generations["candidate_source_generation"]
+        != context["candidate_source_generation"]
+        or generations["collection_input_generation"]
+        != context["collection_input_generation"]
+        or generations["raw_evidence_run_id"] != context["raw_evidence_run_id"]
+    ):
+        raise RoutePublicationError("complete route generation lineage conflicts")
+    for field in (
+        "raw_evidence_generation",
+        "quantity_quote_generation",
+        "cost_component_generation",
+        "classified_opportunity_generation",
+        "fee_profile_generation",
+        "inventory_profile_generation",
+        "typed_source_generation",
+    ):
+        value = generations.get(field)
+        if not isinstance(value, str) or _HEX_SHA256.fullmatch(value) is None:
+            raise RoutePublicationError("complete route generation hash is invalid")
+    adapters = generations.get("adapter_versions")
+    if adapters != _COMPLETE_ADAPTER_VERSIONS:
+        raise RoutePublicationError("complete route adapter generation is invalid")
+
+    routes = normalized.get("routes")
+    legs = normalized.get("legs")
+    costs = normalized.get("cost_components")
+    opportunities = normalized.get("opportunities")
+    if not all(isinstance(value, list) for value in (routes, legs, costs, opportunities)):
+        raise RoutePublicationError("complete route inventories are invalid")
+    if any(not isinstance(row, Mapping) for rows in (routes, legs, costs) for row in rows):
+        raise RoutePublicationError("complete route inventory row is invalid")
+    routes = sorted(routes, key=lambda row: str(row.get("route_id")))
+    legs = sorted(legs, key=lambda row: str(row.get("market_id")))
+    costs = sorted(costs, key=lambda row: (
+        str(row.get("opportunity_id")), str(row.get("leg")),
+        str(row.get("component_type")),
+    ))
+    opportunities = sorted(opportunities, key=_complete_opportunity_sort_key)
+    if routes != normalized["routes"] or legs != normalized["legs"]:
+        raise RoutePublicationError("complete route inventories are not canonical")
+    if costs != normalized["cost_components"] or opportunities != normalized["opportunities"]:
+        raise RoutePublicationError("complete opportunity inventories are not canonical")
+
+    route_ids = set()
+    for route in routes:
+        route_id = _validate_route_candidate(
+            route,
+            candidate_generation=context["candidate_source_generation"],
+            requested_notionals=REQUESTED_NOTIONALS_USD,
+        )
+        if route_id in route_ids:
+            raise RoutePublicationError("duplicate complete route")
+        route_ids.add(route_id)
+    legs_by_market = _validate_leg_rows(
+        legs,
+        raw_evidence_run_id=context["raw_evidence_run_id"],
+        collection_completed_at=context["collection_completed_at"],
+        collection_deadline_at=context["collection_deadline_at"],
+    )
+    for route in routes:
+        if (
+            route["buy_market_id"] not in legs_by_market
+            or route["sell_market_id"] not in legs_by_market
+        ):
+            raise RoutePublicationError("complete route leg inventory is not closed")
+
+    try:
+        validate_cost_components(costs)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("complete cost inventory is invalid") from error
+    costs_by_opportunity: Dict[str, List[Dict[str, Any]]] = {}
+    for row in costs:
+        costs_by_opportunity.setdefault(str(row["opportunity_id"]), []).append(row)
+
+    routes_by_id = {str(row["route_id"]): row for row in routes}
+    observed_scenarios = set()
+    opportunity_ids = set()
+    for row in opportunities:
+        if not isinstance(row, dict) or set(row) != OPPORTUNITY_FIELDS:
+            raise RoutePublicationError("route opportunity schema is invalid")
+        provided = dict(row)
+        binding = provided.pop("evidence_binding_sha256", None)
+        if (
+            not isinstance(binding, str)
+            or _HEX_SHA256.fullmatch(binding) is None
+            or binding != _opportunity_binding_sha256(provided)
+        ):
+            raise RoutePublicationError("route opportunity evidence binding mismatch")
+        route = routes_by_id.get(str(row["route_id"]))
+        if route is None or any(
+            row.get(field) != route.get(field)
+            for field in (
+                "route_id", "token_symbol", "buy_market_id",
+                "sell_market_id", "route_mode",
+            )
+        ):
+            raise RoutePublicationError("route opportunity lineage is invalid")
+        if (
+            row.get("cohort_id") != cohort_id
+            or row.get("buy_core_manifest_sha256") != normalized["core_manifest_sha256"]
+            or row.get("sell_core_manifest_sha256") != normalized["core_manifest_sha256"]
+        ):
+            raise RoutePublicationError("route opportunity core binding is invalid")
+        if (
+            type(row.get("strict_eligible")) is not bool
+            or type(row.get("strict_ready_for_publication")) is not bool
+            or row.get("opportunity_class") not in {
+                "executable_candidate", "research_estimate", "unavailable"
+            }
+            or row.get("cost_completeness") not in {"complete", "incomplete"}
+            or row.get("scenario_cost_completeness") not in {"complete", "incomplete"}
+        ):
+            raise RoutePublicationError("route opportunity classification is invalid")
+        notional = str(row.get("requested_notional_usd"))
+        scenario = (str(row["route_id"]), notional)
+        if scenario in observed_scenarios:
+            raise RoutePublicationError("duplicate route opportunity scenario")
+        observed_scenarios.add(scenario)
+        opportunity_id = route_opportunity_id(row["route_id"], notional)
+        if row.get("opportunity_id") != opportunity_id or opportunity_id in opportunity_ids:
+            raise RoutePublicationError("route opportunity identity is invalid")
+        opportunity_ids.add(opportunity_id)
+        component_rows = costs_by_opportunity.get(opportunity_id, [])
+        if (
+            {(item["leg"], item["component_type"]) for item in component_rows}
+            != _expected_component_keys_for_complete_route(route)
+            or row.get("cost_component_set_sha256")
+            != _canonical_cost_set_sha256(component_rows)
+        ):
+            raise RoutePublicationError("route opportunity cost binding is invalid")
+        if row.get("strict_eligible"):
+            strict_cex_route = _strict_cex_route_identity(route)
+            try:
+                expected_attestation = _publication_binding_sha256(
+                    cohort_id=row["cohort_id"],
+                    opportunity_id=row["opportunity_id"],
+                    route_id=row["route_id"],
+                    target_token_quantity=row["target_token_quantity"],
+                    buy_state_id=row["buy_state_id"],
+                    sell_state_id=row["sell_state_id"],
+                    buy_usd_projection_sha256=row["buy_usd_projection_sha256"],
+                    sell_usd_projection_sha256=row["sell_usd_projection_sha256"],
+                    cost_component_set_sha256=row["cost_component_set_sha256"],
+                    mode_evidence_sha256=row["mode_evidence_sha256"],
+                    core_manifest_sha256=normalized["core_manifest_sha256"],
+                )
+            except (TypeError, ValueError) as error:
+                raise RoutePublicationError(
+                    "strict route opportunity attestation binding is invalid"
+                ) from error
+            if row.get("publication_attestation_sha256") != expected_attestation:
+                raise RoutePublicationError(
+                    "strict route opportunity attestation binding is invalid"
+                )
+            if (
+                not strict_cex_route
+                or row.get("opportunity_class") != "executable_candidate"
+                or row.get("strict_ready_for_publication") is not True
+                or not isinstance(row.get("publication_attestation_sha256"), str)
+                or _HEX_SHA256.fullmatch(row["publication_attestation_sha256"]) is None
+            ):
+                raise RoutePublicationError("strict route opportunity is invalid")
+        elif (
+            row.get("publication_attestation_sha256") is not None
+            or row.get("opportunity_class") == "executable_candidate"
+        ):
+            raise RoutePublicationError("research route opportunity is unexpectedly attested")
+
+    expected_scenarios = {
+        (str(route["route_id"]), str(notional))
+        for route in routes for notional in REQUESTED_NOTIONALS_USD
+    }
+    if observed_scenarios != expected_scenarios:
+        raise RoutePublicationError("every route must contain exactly five notional scenarios")
+    if set(costs_by_opportunity) != opportunity_ids:
+        raise RoutePublicationError("complete cost inventory contains orphan rows")
+    normalized["routes"] = routes
+    normalized["legs"] = legs
+    normalized["cost_components"] = costs
+    normalized["opportunities"] = opportunities
+    return normalized
+
+
+def _read_complete_sqlite(
+    value: bytes,
+) -> Tuple[
+    Dict[str, Any],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
+    with tempfile.TemporaryDirectory(prefix="route-complete-sqlite-read-") as temporary:
+        database = Path(temporary) / ROUTE_OPPORTUNITY_SQLITE_FILENAME
+        _write_new_bytes(database, value)
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            connection = sqlite3.connect(_sqlite_read_only_uri(database), uri=True)
+            connection.execute("PRAGMA query_only = ON")
+            if connection.execute("PRAGMA application_id").fetchone()[0] != 1380929615:
+                raise RoutePublicationError("complete SQLite application ID is invalid")
+            if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
+                raise RoutePublicationError("complete SQLite version is invalid")
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise RoutePublicationError("complete SQLite integrity check failed")
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise RoutePublicationError("complete SQLite foreign keys are invalid")
+            objects = set(connection.execute(
+                "SELECT type, name, tbl_name FROM sqlite_schema "
+                "WHERE name NOT LIKE 'sqlite_%'"
+            ).fetchall())
+            expected_objects = {
+                ("table", "bundle_metadata", "bundle_metadata"),
+                ("table", "route_legs", "route_legs"),
+                ("table", "route_opportunities", "route_opportunities"),
+                ("table", "cost_components", "cost_components"),
+                ("index", "route_opportunities_route_idx", "route_opportunities"),
+                ("index", "route_opportunities_strict_idx", "route_opportunities"),
+                ("index", "cost_components_market_idx", "cost_components"),
+            }
+            if objects != expected_objects:
+                raise RoutePublicationError("complete SQLite schema is invalid")
+            table_sql = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    "SELECT name, sql FROM sqlite_schema WHERE type = 'table'"
+                ).fetchall()
+            }
+            expected_columns = {
+                "bundle_metadata": (
+                    (0, "key", "TEXT", 1, None, 1),
+                    (1, "value_json", "TEXT", 1, None, 0),
+                ),
+                "route_legs": (
+                    (0, "route_cohort_id", "TEXT", 1, None, 0),
+                    (1, "market_id", "TEXT", 1, None, 1),
+                    (2, "row_json", "TEXT", 1, None, 0),
+                ),
+                "route_opportunities": (
+                    (0, "cohort_id", "TEXT", 1, None, 0),
+                    (1, "route_id", "TEXT", 1, None, 0),
+                    (2, "opportunity_id", "TEXT", 1, None, 1),
+                    (3, "requested_notional_usd", "TEXT", 1, None, 0),
+                    (4, "buy_market_id", "TEXT", 1, None, 0),
+                    (5, "sell_market_id", "TEXT", 1, None, 0),
+                    (6, "strict_eligible", "TEXT", 1, None, 0),
+                    (7, "row_json", "TEXT", 1, None, 0),
+                ),
+                "cost_components": (
+                    (0, "cohort_id", "TEXT", 1, None, 0),
+                    (1, "opportunity_id", "TEXT", 1, None, 1),
+                    (2, "leg", "TEXT", 1, None, 2),
+                    (3, "component_type", "TEXT", 1, None, 3),
+                    (4, "market_id", "TEXT", 1, None, 0),
+                    (5, "requested_notional_usd", "TEXT", 1, None, 0),
+                    (6, "row_json", "TEXT", 1, None, 0),
+                ),
+            }
+            for table, expected in expected_columns.items():
+                actual = tuple(tuple(row[:6]) for row in connection.execute(
+                    "PRAGMA table_info({})".format(table)
+                ).fetchall())
+                if actual != expected:
+                    raise RoutePublicationError("complete SQLite schema is invalid")
+                if "WITHOUT ROWID" not in str(table_sql.get(table, "")).upper():
+                    raise RoutePublicationError("complete SQLite schema is invalid")
+            expected_indexes = {
+                "route_opportunities_route_idx": (
+                    "route_id", "requested_notional_usd"
+                ),
+                "route_opportunities_strict_idx": (
+                    "strict_eligible", "route_id"
+                ),
+                "cost_components_market_idx": (
+                    "market_id", "component_type"
+                ),
+            }
+            for index, expected in expected_indexes.items():
+                actual = tuple(
+                    row[2] for row in connection.execute(
+                        "PRAGMA index_info({})".format(index)
+                    ).fetchall()
+                )
+                if actual != expected:
+                    raise RoutePublicationError("complete SQLite schema is invalid")
+            foreign_keys = {
+                table: {
+                    (row[3], row[2], row[4])
+                    for row in connection.execute(
+                        "PRAGMA foreign_key_list({})".format(table)
+                    ).fetchall()
+                }
+                for table in ("route_legs", "route_opportunities", "cost_components")
+            }
+            if foreign_keys != {
+                "route_legs": set(),
+                "route_opportunities": {
+                    ("buy_market_id", "route_legs", "market_id"),
+                    ("sell_market_id", "route_legs", "market_id"),
+                },
+                "cost_components": {
+                    ("opportunity_id", "route_opportunities", "opportunity_id"),
+                },
+            }:
+                raise RoutePublicationError("complete SQLite foreign keys are invalid")
+            metadata = connection.execute(
+                "SELECT key, value_json FROM bundle_metadata"
+            ).fetchall()
+            if len(metadata) != 1 or metadata[0][0] != "bundle":
+                raise RoutePublicationError("complete SQLite metadata inventory is invalid")
+            bundle = _decode_json_object_bytes(
+                metadata[0][1].encode("utf-8"),
+                label="complete SQLite bundle metadata",
+            )
+            if _canonical_json_text(bundle) != metadata[0][1]:
+                raise RoutePublicationError("complete SQLite metadata is not canonical")
+
+            leg_records = connection.execute(
+                "SELECT route_cohort_id, market_id, row_json FROM route_legs"
+            ).fetchall()
+            opportunity_records = connection.execute(
+                "SELECT cohort_id, route_id, opportunity_id, requested_notional_usd, "
+                "buy_market_id, sell_market_id, strict_eligible, row_json "
+                "FROM route_opportunities"
+            ).fetchall()
+            cost_records = connection.execute(
+                "SELECT cohort_id, opportunity_id, leg, component_type, market_id, "
+                "requested_notional_usd, row_json FROM cost_components"
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise RoutePublicationError("complete SQLite is invalid") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+    legs = [_decode_row_json(row[-1], "complete SQLite route leg") for row in leg_records]
+    opportunities = [
+        _decode_row_json(row[-1], "complete SQLite opportunity")
+        for row in opportunity_records
+    ]
+    costs = [_decode_row_json(row[-1], "complete SQLite cost") for row in cost_records]
+    for record, row in zip(leg_records, legs):
+        if record[:-1] != (bundle["route_cohort_id"], row["market_id"]):
+            raise RoutePublicationError("complete SQLite route leg projection mismatch")
+    for record, row in zip(opportunity_records, opportunities):
+        if record[:-1] != (
+            row["cohort_id"], row["route_id"], row["opportunity_id"],
+            row["requested_notional_usd"], row["buy_market_id"],
+            row["sell_market_id"], _complete_csv_value(row["strict_eligible"]),
+        ):
+            raise RoutePublicationError("complete SQLite opportunity projection mismatch")
+    for record, row in zip(cost_records, costs):
+        if record[:-1] != (
+            row["cohort_id"], row["opportunity_id"], row["leg"],
+            row["component_type"], row["market_id"],
+            row["requested_notional_usd"],
+        ):
+            raise RoutePublicationError("complete SQLite cost projection mismatch")
+    return (
+        bundle,
+        sorted(legs, key=lambda row: row["market_id"]),
+        sorted(costs, key=lambda row: (
+            row["opportunity_id"], row["leg"], row["component_type"],
+        )),
+        sorted(opportunities, key=_complete_opportunity_sort_key),
+    )
+
+
+def _validate_complete_route_bundle_at(
+    parent_fd: int,
+    bundle_name: str,
+    bundle_path: Path,
+    *,
+    expected_route_cohort_id: Optional[str],
+    expected_manifest_sha256: Optional[str],
+    require_directory_identity: bool,
+) -> Dict[str, Any]:
+    bundle_fd, bundle_details = _open_directory_at(
+        parent_fd, bundle_name, "complete route bundle"
+    )
+    file_fds: Dict[str, int] = {}
+    try:
+        if set(os.listdir(bundle_fd)) != ROUTE_COMPLETE_FILENAMES:
+            raise RoutePublicationError("complete route bundle file inventory is invalid")
+        read_specs = {
+            MANIFEST_FILENAME: (_MAX_JSON_BYTES, "complete route manifest"),
+            ROUTE_LEGS_FILENAME: (_MAX_CSV_BYTES, "complete route leg CSV"),
+            COST_COMPONENTS_FILENAME: (_MAX_CSV_BYTES, "complete cost CSV"),
+            ROUTE_OPPORTUNITIES_FILENAME: (_MAX_CSV_BYTES, "complete opportunity CSV"),
+            ROUTE_OPPORTUNITY_SQLITE_FILENAME: (_MAX_SQLITE_BYTES, "complete route SQLite"),
+        }
+        file_bytes: Dict[str, bytes] = {}
+        file_hashes: Dict[str, str] = {}
+        file_details: Dict[str, os.stat_result] = {}
+        for filename, (limit, label) in read_specs.items():
+            source_fd, before = _open_regular_file_at(bundle_fd, filename, label=label)
+            file_fds[filename] = source_fd
+            value, digest, after = _read_bounded_open_file(
+                source_fd, before, limit=limit, label=label
+            )
+            current = os.stat(filename, dir_fd=bundle_fd, follow_symlinks=False)
+            if _stable_file_metadata(current) != _stable_file_metadata(after):
+                raise RoutePublicationError(label + " changed during validation")
+            file_bytes[filename] = value
+            file_hashes[filename] = digest
+            file_details[filename] = after
+
+        manifest_sha256 = file_hashes[MANIFEST_FILENAME]
+        if expected_manifest_sha256 is not None and manifest_sha256 != expected_manifest_sha256:
+            raise RoutePublicationError("complete route manifest hash does not match pointer")
+        manifest = _decode_json_object_bytes(
+            file_bytes[MANIFEST_FILENAME], label="complete route manifest"
+        )
+        if set(manifest) != {
+            "schema", "bundle_stage", "route_cohort_id", "core_manifest_sha256",
+            "core_pointer_sha256", "input_generations", "requested_notionals_usd",
+            "counts", "files",
+        }:
+            raise RoutePublicationError("complete route manifest schema is invalid")
+        cohort_id = manifest.get("route_cohort_id")
+        if not isinstance(cohort_id, str) or _COHORT_ID.fullmatch(cohort_id) is None:
+            raise RoutePublicationError("complete route manifest cohort ID is invalid")
+        if expected_route_cohort_id is not None and cohort_id != expected_route_cohort_id:
+            raise RoutePublicationError("complete route manifest cohort ID does not match pointer")
+        if require_directory_identity and bundle_name != cohort_id:
+            raise RoutePublicationError("complete route bundle directory identity is invalid")
+        files = manifest.get("files")
+        if not isinstance(files, dict) or set(files) != _COMPLETE_MANIFEST_ARTIFACT_FILENAMES:
+            raise RoutePublicationError("complete route manifest file inventory is invalid")
+        for filename, details in files.items():
+            if not isinstance(details, dict) or set(details) != {
+                "schema", "sha256", "logical_sha256", "row_count"
+            } or details.get("sha256") != file_hashes[filename]:
+                raise RoutePublicationError("complete route file checksum is invalid")
+
+        raw_legs = _read_csv_rows_bytes(
+            file_bytes[ROUTE_LEGS_FILENAME], columns=LEG_COLUMNS,
+            label="complete route leg CSV",
+        )
+        raw_costs = _read_csv_rows_bytes(
+            file_bytes[COST_COMPONENTS_FILENAME], columns=COMPLETE_COST_COLUMNS,
+            label="complete cost CSV",
+        )
+        raw_opportunities = _read_csv_rows_bytes(
+            file_bytes[ROUTE_OPPORTUNITIES_FILENAME],
+            columns=COMPLETE_OPPORTUNITY_COLUMNS,
+            label="complete opportunity CSV",
+        )
+        legs = [_decode_row_json(row["row_json"], "complete route leg CSV") for row in raw_legs]
+        costs = [_decode_row_json(row["row_json"], "complete cost CSV") for row in raw_costs]
+        opportunities = [
+            _decode_row_json(row["row_json"], "complete opportunity CSV")
+            for row in raw_opportunities
+        ]
+        _validate_csv_projection(
+            raw_legs, legs, route_cohort_id=cohort_id,
+            projector=_leg_csv_row, label="complete route leg CSV",
+        )
+        if any(
+            dict(csv_row) != _complete_cost_csv_row(row)
+            for csv_row, row in zip(raw_costs, costs)
+        ):
+            raise RoutePublicationError("complete cost CSV projection mismatch")
+        if any(
+            dict(csv_row) != _complete_opportunity_csv_row(row)
+            for csv_row, row in zip(raw_opportunities, opportunities)
+        ):
+            raise RoutePublicationError("complete opportunity CSV projection mismatch")
+
+        (
+            bundle,
+            sqlite_legs,
+            sqlite_costs,
+            sqlite_opportunities,
+        ) = _read_complete_sqlite(
+            file_bytes[ROUTE_OPPORTUNITY_SQLITE_FILENAME],
+        )
+        bundle = _validate_complete_logical_bundle(bundle)
+        if (
+            legs != bundle["legs"] or costs != bundle["cost_components"]
+            or opportunities != bundle["opportunities"]
+            or sqlite_legs != legs or sqlite_costs != costs
+            or sqlite_opportunities != opportunities
+        ):
+            raise RoutePublicationError("complete CSV and SQLite inventories do not match")
+        expected_files = {
+            ROUTE_LEGS_FILENAME: _artifact_details_bytes(
+                file_bytes[ROUTE_LEGS_FILENAME], schema=ROUTE_LEG_CSV_SCHEMA,
+                logical_sha256=_logical_rows_sha256(ROUTE_LEG_CSV_SCHEMA, legs),
+                row_count=len(legs),
+            ),
+            COST_COMPONENTS_FILENAME: _artifact_details_bytes(
+                file_bytes[COST_COMPONENTS_FILENAME], schema=COST_COMPONENT_CSV_SCHEMA,
+                logical_sha256=_logical_rows_sha256(COST_COMPONENT_CSV_SCHEMA, costs),
+                row_count=len(costs),
+            ),
+            ROUTE_OPPORTUNITIES_FILENAME: _artifact_details_bytes(
+                file_bytes[ROUTE_OPPORTUNITIES_FILENAME], schema=ROUTE_OPPORTUNITY_CSV_SCHEMA,
+                logical_sha256=_logical_rows_sha256(ROUTE_OPPORTUNITY_CSV_SCHEMA, opportunities),
+                row_count=len(opportunities),
+            ),
+            ROUTE_OPPORTUNITY_SQLITE_FILENAME: _artifact_details_bytes(
+                file_bytes[ROUTE_OPPORTUNITY_SQLITE_FILENAME], schema=ROUTE_OPPORTUNITY_SQLITE_SCHEMA,
+                logical_sha256=_complete_database_logical_sha256(bundle),
+                row_count=len(legs) + len(costs) + len(opportunities),
+            ),
+        }
+        expected_manifest = _complete_manifest_payload(bundle, expected_files)
+        if manifest != expected_manifest:
+            raise RoutePublicationError("complete route manifest does not match bundle content")
+        _verify_bundle_file_snapshots(
+            bundle_fd, read_specs, file_fds, file_details, file_bytes, file_hashes,
+            ROUTE_COMPLETE_FILENAMES,
+        )
+        _verify_directory_entry(
+            parent_fd, bundle_name, bundle_details, "complete route bundle"
+        )
+        return {
+            "path": bundle_path,
+            "manifest_sha256": manifest_sha256,
+            "manifest": manifest,
+            "bundle": bundle,
+            "legs": legs,
+            "cost_components": costs,
+            "opportunities": opportunities,
+            "database_path": bundle_path / ROUTE_OPPORTUNITY_SQLITE_FILENAME,
+        }
+    finally:
+        for file_fd in file_fds.values():
+            os.close(file_fd)
+        os.close(bundle_fd)
+
+
+def _validate_complete_route_bundle(
+    bundle_path: Path,
+    *,
+    expected_route_cohort_id: Optional[str],
+    expected_manifest_sha256: Optional[str],
+    require_directory_identity: bool,
+    parent_fd: Optional[int] = None,
+) -> Dict[str, Any]:
+    bundle = _absolute_without_symlink_resolution(Path(bundle_path))
+    _require_relative_basename(bundle.name, "complete route bundle name")
+    owned_fd: Optional[int] = None
+    parent_path: Optional[Path] = None
+    parent_details: Optional[os.stat_result] = None
+    try:
+        if parent_fd is None:
+            parent_path, owned_fd, parent_details = _open_verified_directory(
+                bundle.parent, "complete route bundles root"
+            )
+            parent_fd = owned_fd
+        result = _validate_complete_route_bundle_at(
+            parent_fd, bundle.name, bundle,
+            expected_route_cohort_id=expected_route_cohort_id,
+            expected_manifest_sha256=expected_manifest_sha256,
+            require_directory_identity=require_directory_identity,
+        )
+        if parent_path is not None and parent_details is not None:
+            _verify_open_path_identity(
+                parent_path, parent_details, "complete route bundles root"
+            )
+        return result
+    finally:
+        if owned_fd is not None:
+            os.close(owned_fd)
+
+
+def validate_complete_route_bundle(
+    bundle_path: Path,
+    *,
+    expected_route_cohort_id: Optional[str] = None,
+    expected_manifest_sha256: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fully reread all five members of one immutable opportunity bundle."""
+    return _validate_complete_route_bundle(
+        bundle_path,
+        expected_route_cohort_id=expected_route_cohort_id,
+        expected_manifest_sha256=expected_manifest_sha256,
+        require_directory_identity=True,
+    )
+
+
+def _write_complete_bundle_artifacts_at(
+    stage_fd: int,
+    artifacts: Mapping[str, bytes],
+) -> None:
+    if set(artifacts) != ROUTE_COMPLETE_FILENAMES:
+        raise RoutePublicationError("complete route artifact inventory is invalid")
+    for filename in sorted(artifacts):
+        _write_new_bytes_at(stage_fd, filename, artifacts[filename])
+
+
+def _restore_pointer_after_failure(
+    routes_fd: int,
+    routes_path: Path,
+    old_pointer: Optional[Tuple[bytes, os.stat_result]],
+    attempted_pointer_bytes: bytes,
+) -> None:
+    current = _optional_pointer_snapshot_at(routes_fd)
+    old_bytes = None if old_pointer is None else old_pointer[0]
+    if (None if current is None else current[0]) == old_bytes:
+        return
+    if current is None or current[0] != attempted_pointer_bytes:
+        raise RoutePublicationError(
+            "complete route pointer commit is uncertain due to a concurrent writer"
+        )
+    if old_bytes is None:
+        os.unlink("latest.json", dir_fd=routes_fd)
+    else:
+        _replace_pointer_bytes_at(routes_fd, old_bytes)
+    _fsync_directory(routes_path, directory_fd=routes_fd)
+    restored = _optional_pointer_snapshot_at(routes_fd)
+    if (None if restored is None else restored[0]) != old_bytes:
+        raise RoutePublicationError("complete route pointer rollback failed")
+
+
+def _pointer_payload_bytes(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+
+
+def _commit_complete_pointer_at_locked(
+    routes_fd: int,
+    routes_path: Path,
+    pointer_bytes: bytes,
+) -> None:
+    _replace_pointer_bytes_at(routes_fd, pointer_bytes)
+    committed = _optional_pointer_snapshot_at(routes_fd)
+    if committed is None or committed[0] != pointer_bytes:
+        raise RoutePublicationError("complete route pointer commit is uncertain")
+    _fsync_directory(routes_path, directory_fd=routes_fd)
+    if not _pointer_snapshot_is_owned(
+        _optional_pointer_snapshot_at(routes_fd), committed
+    ):
+        raise RoutePublicationError("complete route pointer commit is uncertain")
+
+
+def _verify_complete_core_lineage(
+    core_root: Path,
+    *,
+    expected_manifest_sha256: str,
+    expected_pointer_sha256: str,
+) -> None:
+    core, core_fd, core_details = _open_verified_directory(
+        Path(core_root), "route core root"
+    )
+    try:
+        try:
+            fcntl.flock(core_fd, fcntl.LOCK_SH)
+        except Exception as error:
+            raise RoutePublicationError("route core lock acquisition failed") from error
+        snapshot = _optional_pointer_snapshot_at(core_fd)
+        if snapshot is None:
+            raise RoutePublicationError("route core pointer is missing")
+        loaded = load_latest_route_cohort(core)
+        if (
+            loaded["manifest_sha256"] != expected_manifest_sha256
+            or _sha256_bytes(snapshot[0]) != expected_pointer_sha256
+            or not _pointer_snapshot_is_owned(
+                _optional_pointer_snapshot_at(core_fd), snapshot
+            )
+        ):
+            raise RoutePublicationError("route core changed before public pointer commit")
+        _verify_open_path_identity(core, core_details, "route core root")
+    finally:
+        try:
+            fcntl.flock(core_fd, fcntl.LOCK_UN)
+        except Exception as error:
+            os.close(core_fd)
+            raise RoutePublicationError("route core lock release failed") from error
+        os.close(core_fd)
+
+
+def publish_complete_route_bundle(
+    *,
+    core_root: Path = DEFAULT_ROUTE_CORE_ROOT,
+    routes_root: Path = DEFAULT_ROUTE_ROOT,
+    raw_root: Path,
+    opportunity_inputs: Iterable[Mapping[str, Any]],
+    source_root: Optional[Path] = None,
+    fee_profile_path: Optional[Path] = None,
+    fee_profile_id: Optional[str] = None,
+    inventory_profile_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Build, stage, validate, atomically install, reread, then move latest."""
+    inputs = list(opportunity_inputs)
+    bundle = build_complete_route_bundle(
+        core_root=core_root,
+        raw_root=raw_root,
+        source_root=source_root,
+        fee_profile_path=fee_profile_path,
+        fee_profile_id=fee_profile_id,
+        inventory_profile_path=inventory_profile_path,
+        opportunity_inputs=inputs,
+    )
+    bundle = _validate_complete_logical_bundle(bundle)
+    artifacts, _manifest = _complete_artifact_bytes(bundle)
+    expected_manifest_sha256 = _sha256_bytes(artifacts[MANIFEST_FILENAME])
+
+    routes = _ensure_real_directory(Path(routes_root))
+    routes, routes_fd, routes_details = _open_verified_directory(
+        routes, "complete routes root"
+    )
+    bundles_fd: Optional[int] = None
+    stage_fd: Optional[int] = None
+    stage_name: Optional[str] = None
+    stage_details: Optional[os.stat_result] = None
+    renamed = False
+    routes_locked = False
+    old_pointer: Optional[Tuple[bytes, os.stat_result]] = None
+    try:
+        try:
+            fcntl.flock(routes_fd, fcntl.LOCK_EX)
+            routes_locked = True
+        except Exception as error:
+            raise RoutePublicationError(
+                "complete routes lock acquisition failed"
+            ) from error
+        old_pointer = _optional_pointer_snapshot_at(routes_fd)
+        bundles_fd, bundles_details = _ensure_directory_at(
+            routes_fd, "bundles", "complete route bundles root"
+        )
+        bundles = routes / "bundles"
+        cohort_id = bundle["route_cohort_id"]
+        final_path = bundles / cohort_id
+        if _entry_exists_at(bundles_fd, cohort_id):
+            validated = _validate_complete_route_bundle(
+                final_path,
+                expected_route_cohort_id=cohort_id,
+                expected_manifest_sha256=expected_manifest_sha256,
+                require_directory_identity=True,
+                parent_fd=bundles_fd,
+            )
+        else:
+            stage_name, stage_path, stage_fd, stage_details = _make_unique_directory_at(
+                bundles_fd, prefix=".route-opportunity-", display_parent=bundles
+            )
+            _write_complete_bundle_artifacts_at(stage_fd, artifacts)
+            _validate_complete_route_bundle(
+                stage_path,
+                expected_route_cohort_id=cohort_id,
+                expected_manifest_sha256=expected_manifest_sha256,
+                require_directory_identity=False,
+                parent_fd=bundles_fd,
+            )
+            _fsync_directory(stage_path, directory_fd=stage_fd)
+            _rename_directory_noreplace(
+                stage_path, final_path,
+                source_dir_fd=bundles_fd, destination_dir_fd=bundles_fd,
+            )
+            renamed = True
+            _verify_directory_entry(
+                bundles_fd, cohort_id, stage_details, "complete route bundle"
+            )
+            _fsync_directory(bundles, directory_fd=bundles_fd)
+            validated = _validate_complete_route_bundle(
+                final_path,
+                expected_route_cohort_id=cohort_id,
+                expected_manifest_sha256=expected_manifest_sha256,
+                require_directory_identity=True,
+                parent_fd=bundles_fd,
+            )
+
+        # The public pointer may only bind the exact core pointer observed by build.
+        _verify_complete_core_lineage(
+            Path(core_root),
+            expected_manifest_sha256=bundle["core_manifest_sha256"],
+            expected_pointer_sha256=bundle["core_pointer_sha256"],
+        )
+        pointer = {
+            "schema": ROUTE_OPPORTUNITY_POINTER_SCHEMA,
+            "bundle_stage": ROUTE_OPPORTUNITY_BUNDLE_STAGE,
+            "route_cohort_id": cohort_id,
+            "manifest_sha256": validated["manifest_sha256"],
+            "core_manifest_sha256": bundle["core_manifest_sha256"],
+            "core_pointer_sha256": bundle["core_pointer_sha256"],
+        }
+        _verify_directory_entry(
+            routes_fd, "bundles", bundles_details, "complete route bundles root"
+        )
+        _verify_open_path_identity(routes, routes_details, "complete routes root")
+        pointer_bytes = _pointer_payload_bytes(pointer)
+        try:
+            _commit_complete_pointer_at_locked(routes_fd, routes, pointer_bytes)
+        except BaseException:
+            _restore_pointer_after_failure(
+                routes_fd, routes, old_pointer, pointer_bytes
+            )
+            raise
+        return pointer
+    finally:
+        if stage_fd is not None:
+            os.close(stage_fd)
+        if (
+            not renamed and bundles_fd is not None and stage_name is not None
+            and stage_details is not None
+        ):
+            _remove_stage_directory_at(bundles_fd, stage_name, stage_details)
+        if bundles_fd is not None:
+            os.close(bundles_fd)
+        if routes_locked:
+            try:
+                fcntl.flock(routes_fd, fcntl.LOCK_UN)
+            except Exception as error:
+                os.close(routes_fd)
+                raise RoutePublicationError(
+                    "complete routes lock release failed"
+                ) from error
+        os.close(routes_fd)
+
+
+def load_latest_complete_route_bundle(
+    routes_root: Path = DEFAULT_ROUTE_ROOT,
+) -> Dict[str, Any]:
+    """Resolve only the public complete-bundle pointer and fully validate it."""
+    routes, routes_fd, routes_details = _open_verified_directory(
+        Path(routes_root), "complete routes root"
+    )
+    bundles_fd: Optional[int] = None
+    try:
+        pointer_bytes = _optional_pointer_bytes_at(routes_fd)
+        if pointer_bytes is None:
+            raise RoutePublicationError("complete route pointer is missing")
+        pointer = _decode_json_object_bytes(
+            pointer_bytes, label="complete route pointer"
+        )
+        if set(pointer) != {
+            "schema", "bundle_stage", "route_cohort_id", "manifest_sha256",
+            "core_manifest_sha256", "core_pointer_sha256",
+        } or (
+            pointer.get("schema") != ROUTE_OPPORTUNITY_POINTER_SCHEMA
+            or pointer.get("bundle_stage") != ROUTE_OPPORTUNITY_BUNDLE_STAGE
+        ):
+            raise RoutePublicationError("complete route pointer schema is unsupported")
+        cohort_id = pointer.get("route_cohort_id")
+        manifest_sha256 = pointer.get("manifest_sha256")
+        if not isinstance(cohort_id, str) or _COHORT_ID.fullmatch(cohort_id) is None:
+            raise RoutePublicationError("complete route pointer cohort ID is path-unsafe")
+        if not isinstance(manifest_sha256, str) or _HEX_SHA256.fullmatch(manifest_sha256) is None:
+            raise RoutePublicationError("complete route pointer manifest hash is invalid")
+        bundles_fd, bundles_details = _open_directory_at(
+            routes_fd, "bundles", "complete route bundles root"
+        )
+        validated = _validate_complete_route_bundle(
+            routes / "bundles" / cohort_id,
+            expected_route_cohort_id=cohort_id,
+            expected_manifest_sha256=manifest_sha256,
+            require_directory_identity=True,
+            parent_fd=bundles_fd,
+        )
+        if (
+            validated["bundle"]["core_manifest_sha256"]
+            != pointer.get("core_manifest_sha256")
+            or validated["bundle"]["core_pointer_sha256"]
+            != pointer.get("core_pointer_sha256")
+        ):
+            raise RoutePublicationError("complete route pointer core lineage mismatch")
+        if _optional_pointer_bytes_at(routes_fd) != pointer_bytes:
+            raise RoutePublicationError("complete route pointer changed during validation")
+        _verify_directory_entry(
+            routes_fd, "bundles", bundles_details, "complete route bundles root"
+        )
+        _verify_open_path_identity(routes, routes_details, "complete routes root")
+        validated["pointer"] = pointer
+        return validated
+    finally:
+        if bundles_fd is not None:
+            os.close(bundles_fd)
+        os.close(routes_fd)

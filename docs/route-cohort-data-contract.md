@@ -7,6 +7,74 @@ calculate costs, rank routes, or infer an opportunity from a shared snapshot
 identifier. A `snapshot_id` is lineage only; timing is measured from the two
 actual `state_observed_at` values.
 
+## Complete opportunity publication
+
+The private core and the public opportunity generation are separate immutable
+namespaces. `routes/core/latest.json` selects only a validated
+`route_cohort_core/v1` bundle. `routes/latest.json` selects only a validated
+`route_opportunity/v1` bundle; the public loader rejects a core pointer and an
+incomplete directory. Finalization never adds files to, rewrites, or otherwise
+uses the private core directory as a public bundle.
+
+`build_complete_route_bundle()` begins by resolving the actual private pointer
+with `load_latest_route_cohort()`. It pins the pointer bytes, core manifest,
+cohort, descriptors, and the exact five-notional grid. For each observed leg it
+then resolves only
+`<raw-root>/<raw_evidence_run_id>/accepted/<sha256(market_id)>/response.json`
+through descriptor-relative non-symlink reads and requires its physical hash
+to equal the published core leg. Caller-supplied core hashes are checked only
+as lineage claims; they never establish membership.
+
+Strict publication is currently bounded to prepositioned CEX-to-CEX routes on
+two distinct non-Upbit venues. The finalizer replays the actual Binance or
+Bybit response with the declared source request and parser, typed market rules,
+the owner-only fee profile, exact fee asset and rounding semantics, the typed
+USD conversion member, and the owner-only inventory profile. It reruns the
+quantity and route-mode classifiers, calls the private Task 6 attestation
+issuer only after those checks, and rebuilds the opportunity. A missing typed
+adapter or source member leaves the already classified row non-strict; DEX,
+gas, router, tax, MEV, atomic, transfer, same-venue, Upbit, and other unsupported
+strict replay paths are not promoted. `rebalance_required` remains an explicit
+route mode and round-trips unchanged, but it is not silently remapped into a
+strict prepositioned route.
+
+One complete bundle lives at `routes/bundles/<route_cohort_id>` and contains
+exactly:
+
+```text
+route_legs.csv
+cost_components.csv
+route_opportunities.csv
+route_cohort.sqlite3
+manifest.json
+```
+
+Each route has exactly `[1000, 5000, 10000, 50000, 100000]` USD scenarios.
+Every opportunity binds one core cohort and manifest, two published legs, its
+canonical route/notional identity, an exact topology-dependent component set,
+and a recomputed evidence and publication-attestation hash. Extra, missing,
+duplicate, transplanted, or orphan component rows fail closed. The manifest
+records physical and logical hashes, exact row counts, strict/research/
+unavailable counts, both cost-completeness count pairs, the raw/quote/cost/
+classified/fee/inventory/typed-source generations, and named adapter versions.
+CSV projections, SQLite columns/keys/foreign keys/indexes/metadata, and the
+manifest are fully reread and required to agree exactly. Public artifacts are
+recursively checked for paths, secrets, credentials, unsafe endpoints, and
+other private evidence.
+
+`publish_complete_route_bundle()` writes the five members into a hidden
+same-filesystem directory, fsyncs them, validates by full reread, performs an
+atomic no-replace directory rename, fsyncs the parent, and rereads the final
+directory. It holds the public routes lock across staging and pointer commit,
+rechecks the private core through one shared-locked descriptor snapshot, and
+only then atomically replaces the public pointer. Failures before commit keep
+the old pointer byte-for-byte. If the attempted pointer cannot be distinguished
+from a concurrent writer after an error, finalization reports commit uncertainty
+and never overwrites the other writer. A retry may select an already complete,
+byte-identical orphan left after a pointer failure; it does not mutate that
+bundle. `finalize_route_opportunity_bundle()` only forwards already collected
+Task 1-6 artifacts to this boundary and never recollects market data.
+
 ## Deterministic bounded route universe
 
 `scripts.route_universe` is a pure, collection-free input-selection boundary.
