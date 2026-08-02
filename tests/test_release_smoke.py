@@ -1949,9 +1949,10 @@ class ReleaseAssetTests(unittest.TestCase):
         class AssetResponse:
             status = 200
 
-            def __init__(self, body, headers):
+            def __init__(self, body, headers, final_url):
                 self.body = body
                 self.headers = AssetHeaders(headers)
+                self.final_url = final_url
 
             def __enter__(self):
                 return self
@@ -1961,6 +1962,9 @@ class ReleaseAssetTests(unittest.TestCase):
 
             def read(self, _limit=None):
                 return self.body
+
+            def geturl(self):
+                return self.final_url
 
         with tempfile.TemporaryDirectory() as directory_name:
             static_root = Path(directory_name)
@@ -1983,11 +1987,15 @@ class ReleaseAssetTests(unittest.TestCase):
                 requested.append(served_name)
                 self.assertIn(served_name, source_by_name)
                 body = body_by_name[served_name]
-                return AssetResponse(body, [
-                    ("Content-Length", str(len(body))),
-                    ("Cache-Control", "public, max-age=31536000, immutable"),
-                    ("Vary", "Accept-Encoding"),
-                ])
+                return AssetResponse(
+                    body,
+                    [
+                        ("Content-Length", str(len(body))),
+                        ("Cache-Control", "public, max-age=31536000, immutable"),
+                        ("Vary", "Accept-Encoding"),
+                    ],
+                    request.full_url,
+                )
 
             with patch.object(server, "STATIC_ROOT", static_root):
                 expected_sha = server._compute_static_asset_sha()
@@ -2031,9 +2039,10 @@ class ReleaseAssetTests(unittest.TestCase):
         class AssetResponse:
             status = 200
 
-            def __init__(self, body, headers):
+            def __init__(self, body, headers, final_url):
                 self.body = body
                 self.headers = AssetHeaders(headers)
+                self.final_url = final_url
 
             def __enter__(self):
                 return self
@@ -2043,6 +2052,9 @@ class ReleaseAssetTests(unittest.TestCase):
 
             def read(self, _limit=None):
                 return self.body
+
+            def geturl(self):
+                return self.final_url
 
         version = "a" * 12 + "-" + "b" * 12
         cache_control = "public, max-age=31536000, immutable"
@@ -2066,11 +2078,22 @@ class ReleaseAssetTests(unittest.TestCase):
                 ("Vary", "Accept-Encoding"),
             ]
 
+        def with_actual_content_length(body, headers):
+            return body, [
+                ("Content-Length", str(len(body)) if key == "Content-Length" else value)
+                for key, value in headers
+            ]
+
         cases = {
             "identity large asset": lambda body, headers: (body, [
                 item for item in headers if item[0] != "Content-Encoding"
             ]),
-            "corrupt gzip": lambda _body, headers: (b"not-gzip", headers),
+            "bad gzip magic": lambda _body, headers: with_actual_content_length(
+                b"not-gzip", headers
+            ),
+            "truncated gzip": lambda body, headers: with_actual_content_length(
+                body[:-8], headers
+            ),
             "wrong content length": lambda body, headers: (body, [
                 (key, str(len(body) + 1) if key == "Content-Length" else value)
                 for key, value in headers
@@ -2115,7 +2138,7 @@ class ReleaseAssetTests(unittest.TestCase):
                             ]
                         else:
                             body, headers = mutate(body, headers)
-                    return AssetResponse(body, headers)
+                    return AssetResponse(body, headers, request.full_url)
 
                 with patch(
                     "scripts.check_dashboard_release.urlopen",
@@ -2141,12 +2164,16 @@ class ReleaseAssetTests(unittest.TestCase):
                 "https://dashboard.test/", 1
             )[1].split("?", 1)[0]
             body = gzip.compress(budget_raw_by_name[name])
-            return AssetResponse(body, [
-                ("Content-Encoding", "gzip"),
-                ("Content-Length", str(len(body))),
-                ("Cache-Control", cache_control),
-                ("Vary", "Accept-Encoding"),
-            ])
+            return AssetResponse(
+                body,
+                [
+                    ("Content-Encoding", "gzip"),
+                    ("Content-Length", str(len(body))),
+                    ("Cache-Control", cache_control),
+                    ("Vary", "Accept-Encoding"),
+                ],
+                request.full_url,
+            )
 
         with patch(
             "scripts.check_dashboard_release.urlopen", side_effect=budget_urlopen
@@ -2154,6 +2181,110 @@ class ReleaseAssetTests(unittest.TestCase):
             fetch_static_asset_bundle(
                 "https://dashboard.test", version, timeout=1.0
             )
+
+    def test_checker_rejects_redirected_static_assets(self):
+        class AssetHeaders:
+            def get_all(self, name):
+                return {
+                    "Cache-Control": [
+                        "public, max-age=31536000, immutable"
+                    ],
+                    "Content-Length": ["4"],
+                    "Vary": ["Accept-Encoding"],
+                }.get(name, [])
+
+        class AssetResponse:
+            status = 200
+            headers = AssetHeaders()
+
+            def __init__(self, final_url):
+                self.final_url = final_url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit=None):
+                return b"tiny"
+
+            def geturl(self):
+                return self.final_url
+
+        version = "a" * 12 + "-" + "b" * 12
+        for label, final_url in {
+            "unversioned": "https://dashboard.test/actions.css",
+            "wrong version": "https://dashboard.test/actions.css?v=wrong",
+        }.items():
+            with self.subTest(label=label), patch(
+                "scripts.check_dashboard_release.urlopen",
+                side_effect=lambda _request, timeout: AssetResponse(final_url),
+            ), self.assertRaises(ReleaseCheckError):
+                fetch_static_asset_bundle(
+                    "https://dashboard.test", version, timeout=1.0
+                )
+
+    def test_checker_allows_identity_at_one_kib_and_rejects_one_byte_over(self):
+        class AssetHeaders:
+            def __init__(self, body):
+                self.body = body
+
+            def get_all(self, name):
+                return {
+                    "Cache-Control": [
+                        "public, max-age=31536000, immutable"
+                    ],
+                    "Content-Length": [str(len(self.body))],
+                    "Vary": ["Accept-Encoding"],
+                }.get(name, [])
+
+        class AssetResponse:
+            status = 200
+
+            def __init__(self, body, final_url):
+                self.body = body
+                self.headers = AssetHeaders(body)
+                self.final_url = final_url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit=None):
+                return self.body
+
+            def geturl(self):
+                return self.final_url
+
+        version = "a" * 12 + "-" + "b" * 12
+
+        for raw_size, should_pass in ((1024, True), (1025, False)):
+            with self.subTest(raw_size=raw_size):
+                def fake_urlopen(request, timeout):
+                    self.assertEqual(timeout, 1.0)
+                    return AssetResponse(b"x" * raw_size, request.full_url)
+
+                with patch(
+                    "scripts.check_dashboard_release.urlopen",
+                    side_effect=fake_urlopen,
+                ):
+                    if should_pass:
+                        _sha, metrics = fetch_static_asset_bundle(
+                            "https://dashboard.test", version, timeout=1.0
+                        )
+                        self.assertTrue(all(
+                            metric.raw_bytes == 1024
+                            and not metric.compressed
+                            for metric in metrics
+                        ))
+                    else:
+                        with self.assertRaises(ReleaseCheckError):
+                            fetch_static_asset_bundle(
+                                "https://dashboard.test", version, timeout=1.0
+                            )
 
 
 class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):

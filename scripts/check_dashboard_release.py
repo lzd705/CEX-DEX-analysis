@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import unicodedata
+import zlib
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -3767,8 +3768,9 @@ def fetch_static_asset_bundle(
     metrics: list[ResponseMetrics] = []
     for filename in STATIC_ASSET_FILENAMES:
         path = "/{}?v={}".format(filename, asset_version)
+        requested_url = "{}{}".format(base_url.rstrip("/"), path)
         request = Request(
-            "{}{}".format(base_url.rstrip("/"), path),
+            requested_url,
             headers={"Accept-Encoding": "gzip"},
         )
         started = time.perf_counter()
@@ -3782,6 +3784,7 @@ def fetch_static_asset_bundle(
                 content_lengths = response.headers.get_all("Content-Length") or []
                 cache_controls = response.headers.get_all("Cache-Control") or []
                 vary = response.headers.get_all("Vary") or []
+                final_url = response.geturl()
                 status = response.status
         except HTTPError as error:
             raise ReleaseCheckError(
@@ -3793,6 +3796,10 @@ def fetch_static_asset_bundle(
             ) from error
         elapsed_ms = (time.perf_counter() - started) * 1000
         require(status == 200, "{} returned HTTP {}".format(path, status))
+        require(
+            final_url == requested_url,
+            "{} redirected away from its exact version URL".format(path),
+        )
         require(
             len(content_encodings) <= 1
             and (not content_encodings or content_encodings == ["gzip"]),
@@ -3814,7 +3821,7 @@ def fetch_static_asset_bundle(
         )
         try:
             raw = gzip.decompress(body) if compressed else body
-        except gzip.BadGzipFile as error:
+        except (gzip.BadGzipFile, EOFError, zlib.error) as error:
             raise ReleaseCheckError(
                 "{} declared invalid gzip".format(path)
             ) from error
@@ -3823,7 +3830,7 @@ def fetch_static_asset_bundle(
             "{} exceeds the static asset size limit".format(path),
         )
         require(
-            compressed or len(raw) < STATIC_ASSET_GZIP_THRESHOLD_BYTES,
+            compressed or len(raw) <= STATIC_ASSET_GZIP_THRESHOLD_BYTES,
             "{} was not gzip compressed after requesting gzip".format(path),
         )
         digest.update(filename.encode("utf-8"))
