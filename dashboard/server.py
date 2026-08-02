@@ -498,6 +498,9 @@ _SOURCE_CACHE_GENERATION: SourceSignature | None = None
 _PUBLIC_RESPONSE_CACHE_GENERATION: (
     tuple[SourceSignature, int] | None
 ) = None
+SUMMARY_WARMUP_STATE_LOCK = threading.RLock()
+_SUMMARY_WARMUP_STATE: dict[str, Any] | None = None
+_SUMMARY_WARMUP_RUN_ID = 0
 PUBLIC_API_QUERY_FIELDS = {
     "catalog": ("token", "start", "end"),
     "summary": ("start", "end"),
@@ -6769,6 +6772,7 @@ def _build_public_api_response_cached(
     query_items: tuple[tuple[str, str], ...],
     _source_signature: SourceSignature,
     _freshness_bucket: int,
+    encoding: str = "gzip",
 ) -> tuple[bytes, bool]:
     if route == "summary":
         payload = _build_summary_response_payload(
@@ -6784,19 +6788,120 @@ def _build_public_api_response_cached(
         )
     if api_source_signature() != _source_signature:
         raise SourceGenerationChanged
-    return encode_json_payload(payload, "gzip")
+    return encode_json_payload(payload, "gzip" if encoding == "gzip" else "")
+
+
+def _summary_warmup_timestamp() -> str:
+    """Return the public warmup clock in canonical UTC form."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _summary_warmup_generation(response: tuple[bytes, bool]) -> str | None:
+    """Read only the bounded public generation from a completed Summary."""
+    body, compressed = response
+    try:
+        raw = gzip.decompress(body) if compressed else body
+        payload = json.loads(raw)
+        generation = payload.get("metadata", {}).get("data_generation")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if isinstance(generation, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", generation):
+        return generation
+    return None
+
+
+def _begin_summary_warmup() -> int:
+    """Publish a new in-process warmup attempt before its Summary build starts."""
+    global _SUMMARY_WARMUP_STATE, _SUMMARY_WARMUP_RUN_ID
+    started_at = _summary_warmup_timestamp()
+    started_monotonic = time.perf_counter()
+    with SUMMARY_WARMUP_STATE_LOCK:
+        _SUMMARY_WARMUP_RUN_ID += 1
+        run_id = _SUMMARY_WARMUP_RUN_ID
+        _SUMMARY_WARMUP_STATE = {
+            "run_id": run_id,
+            "status": "warming",
+            "generation": None,
+            "started_at": started_at,
+            "finished_at": None,
+            "elapsed_ms": None,
+            "started_monotonic": started_monotonic,
+        }
+        return run_id
+
+
+def _finish_summary_warmup(
+    run_id: int,
+    *,
+    status: str,
+    generation: str | None,
+) -> None:
+    """Complete only the newest warmup so an older worker cannot regress health."""
+    global _SUMMARY_WARMUP_STATE
+    finished_at = _summary_warmup_timestamp()
+    with SUMMARY_WARMUP_STATE_LOCK:
+        state = _SUMMARY_WARMUP_STATE
+        if not isinstance(state, dict) or state.get("run_id") != run_id:
+            return
+        elapsed = max(
+            0,
+            int(round((time.perf_counter() - state["started_monotonic"]) * 1000)),
+        )
+        _SUMMARY_WARMUP_STATE = {
+            "run_id": run_id,
+            "status": status,
+            "generation": generation,
+            "started_at": state["started_at"],
+            "finished_at": finished_at,
+            "elapsed_ms": elapsed,
+            "started_monotonic": state["started_monotonic"],
+        }
+
+
+def summary_warmup_health() -> dict[str, Any]:
+    """Return the bounded, exception-free readiness metadata for `/health`."""
+    with SUMMARY_WARMUP_STATE_LOCK:
+        state = _SUMMARY_WARMUP_STATE
+        if not isinstance(state, dict):
+            return {
+                "status": "warming",
+                "generation": None,
+                "started_at": None,
+                "finished_at": None,
+                "elapsed_ms": None,
+            }
+        return {
+            field: state.get(field)
+            for field in (
+                "status",
+                "generation",
+                "started_at",
+                "finished_at",
+                "elapsed_ms",
+            )
+        }
 
 
 def warm_default_market_summary() -> None:
     """Populate the default Summary response through the normal cache path."""
+    run_id = _begin_summary_warmup()
     try:
-        build_public_api_response(
+        response = build_public_api_response(
             "summary",
             (),
             True,
         )
     except Exception as error:
+        _finish_summary_warmup(run_id, status="failed", generation=None)
         print(f"Default summary warmup failed: {type(error).__name__}")
+    else:
+        _finish_summary_warmup(
+            run_id,
+            status="ready",
+            generation=_summary_warmup_generation(response),
+        )
 
 
 def start_default_market_summary_warmup() -> threading.Thread:
@@ -7002,15 +7107,14 @@ def build_public_api_response(
                         payload,
                         "gzip" if accepts_gzip else "",
                     )
-                elif route == "summary" and not accepts_gzip:
-                    payload = _build_summary_response_payload(
+                elif route == "summary":
+                    response = _build_public_api_response_cached(
+                        route,
                         query_items,
                         source_signature,
                         freshness_bucket,
+                        "gzip" if accepts_gzip else "identity",
                     )
-                    if api_source_signature() != source_signature:
-                        raise SourceGenerationChanged
-                    response = encode_json_payload(payload, "")
                 elif accepts_gzip:
                     response = _build_public_api_response_cached(
                         route,
@@ -8134,6 +8238,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                         "data_status": data_status,
                         "freshness": metadata["freshness"],
                         "cex_instrument_lifecycle": lifecycle,
+                        "summary_warmup": summary_warmup_health(),
                         "route_opportunities": opportunity_publication_health(),
                         "application_sha": application_release_sha(),
                         "asset_sha": static_asset_sha(),

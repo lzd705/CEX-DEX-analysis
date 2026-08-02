@@ -954,6 +954,189 @@ class MarketMonitorServerTest(unittest.TestCase):
             "Default summary warmup failed: RuntimeError"
         )
 
+    def test_summary_warmup_health_reports_bounded_current_generation_state(self):
+        # Removing the state transition guard could let an older failed warmup
+        # overwrite a newer successful source generation.
+        older_started = threading.Event()
+        release_older = threading.Event()
+        older_finished = threading.Event()
+
+        def response_for(generation):
+            return (
+                json.dumps(
+                    {"metadata": {"data_generation": generation}}
+                ).encode("utf-8"),
+                False,
+            )
+
+        main_outcomes = [
+            response_for("generation-previous"),
+            RuntimeError("private /srv/facts.sqlite3 provider failure"),
+            response_for("generation-current"),
+        ]
+
+        def warm_response(*_args, **_kwargs):
+            if threading.current_thread().name == "older-summary-warmup":
+                older_started.set()
+                release_older.wait(1)
+                older_finished.set()
+                raise RuntimeError(
+                    "private /srv/facts.sqlite3 provider failure"
+                )
+            outcome = main_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        def health_payload():
+            handler = object.__new__(server.MarketMonitorHandler)
+            handler.path = "/health"
+            payload = {
+                "metadata": {
+                    "storage": {"engine": "sqlite"},
+                    "freshness": {"overall_status": "current"},
+                    "cex_instrument_lifecycle": {
+                        "absence_market_count": 1,
+                        "applied_market_count": 1,
+                        "stale_evidence_market_count": 0,
+                    },
+                }
+            }
+            with patch.object(
+                server,
+                "build_market_payload",
+                return_value=payload,
+            ), patch.object(
+                server.MarketMonitorHandler,
+                "send_json",
+            ) as send_json:
+                handler.do_GET()
+            return send_json.call_args.args[0]
+
+        with patch.object(server, "_SUMMARY_WARMUP_STATE", None), patch.object(
+            server,
+            "build_public_api_response",
+            side_effect=warm_response,
+        ), patch("builtins.print"):
+            server.warm_default_market_summary()
+            previous = health_payload()["summary_warmup"]
+            self.assertEqual(previous["status"], "ready")
+            self.assertEqual(previous["generation"], "generation-previous")
+
+            server.warm_default_market_summary()
+            failed = health_payload()["summary_warmup"]
+            self.assertEqual(failed["status"], "failed")
+            self.assertIsNone(failed["generation"])
+            self.assertIsNotNone(failed["finished_at"])
+            self.assertIsInstance(failed["elapsed_ms"], int)
+            self.assertNotIn("private", json.dumps(failed))
+            self.assertNotIn("sqlite3", json.dumps(failed))
+            self.assertNotIn("provider", json.dumps(failed))
+
+            older = threading.Thread(
+                target=server.warm_default_market_summary,
+                name="older-summary-warmup",
+            )
+            older.start()
+            self.assertTrue(older_started.wait(1))
+
+            warming = health_payload()["summary_warmup"]
+            self.assertEqual(warming["status"], "warming")
+            self.assertEqual(
+                set(warming),
+                {"status", "generation", "started_at", "finished_at", "elapsed_ms"},
+            )
+            self.assertIsNone(warming["finished_at"])
+            self.assertIsNone(warming["elapsed_ms"])
+
+            server.warm_default_market_summary()
+            current = health_payload()["summary_warmup"]
+            self.assertEqual(current["status"], "ready")
+            self.assertEqual(current["generation"], "generation-current")
+            self.assertRegex(current["started_at"], r"^\d{4}-\d{2}-\d{2}T.*Z$")
+            self.assertRegex(current["finished_at"], r"^\d{4}-\d{2}-\d{2}T.*Z$")
+            self.assertIsInstance(current["elapsed_ms"], int)
+            self.assertGreaterEqual(current["elapsed_ms"], 0)
+
+            release_older.set()
+            older.join(1)
+            self.assertTrue(older_finished.is_set())
+
+            recovered = health_payload()["summary_warmup"]
+            self.assertEqual(recovered, current)
+            self.assertNotIn("private", json.dumps(recovered))
+            self.assertNotIn("sqlite3", json.dumps(recovered))
+            self.assertNotIn("provider", json.dumps(recovered))
+
+    def test_summary_identity_response_uses_a_distinct_bounded_cache_entry(self):
+        # Removing identity from the encoded-response key must rebuild the
+        # identity Summary on every request, while merging it with gzip would
+        # return the wrong content coding.
+        signature = [("summary-cache.sqlite3", 1, 100)]
+        freshness_bucket = [100]
+        payload_builds = 0
+
+        def build_payload(*_args, **_kwargs):
+            nonlocal payload_builds
+            payload_builds += 1
+            return {
+                "metadata": {"data_generation": f"generation-{payload_builds}"},
+                "tokens": ["summary-cache-entry" * 100],
+            }
+
+        server.clear_runtime_caches()
+        try:
+            with patch.object(
+                server,
+                "api_source_signature",
+                side_effect=lambda: tuple(signature),
+            ), patch.object(
+                server,
+                "api_freshness_bucket",
+                side_effect=lambda: freshness_bucket[0],
+            ), patch.object(
+                server,
+                "_build_summary_response_payload",
+                side_effect=build_payload,
+            ) as build_payload:
+                first_identity = server.build_public_api_response(
+                    "summary", (), False
+                )
+                second_identity = server.build_public_api_response(
+                    "summary", (), False
+                )
+                self.assertEqual(first_identity, second_identity)
+                self.assertFalse(first_identity[1])
+                self.assertEqual(build_payload.call_count, 1)
+
+                signature[0] = ("summary-cache.sqlite3", 2, 100)
+                changed_generation = server.build_public_api_response(
+                    "summary", (), False
+                )
+                self.assertEqual(build_payload.call_count, 2)
+                self.assertNotEqual(changed_generation, first_identity)
+
+                freshness_bucket[0] = 101
+                changed_freshness = server.build_public_api_response(
+                    "summary", (), False
+                )
+                self.assertEqual(build_payload.call_count, 3)
+                self.assertNotEqual(changed_freshness, changed_generation)
+
+                gzip_response = server.build_public_api_response(
+                    "summary", (), True
+                )
+                self.assertTrue(gzip_response[1])
+                self.assertEqual(build_payload.call_count, 4)
+                self.assertEqual(
+                    json.loads(gzip.decompress(gzip_response[0]))["metadata"][
+                        "data_generation"
+                    ],
+                    "generation-4",
+                )
+        finally:
+            server.clear_runtime_caches()
+
     def test_default_summary_warmup_thread_is_daemon(self):
         warmup_release = threading.Event()
 
