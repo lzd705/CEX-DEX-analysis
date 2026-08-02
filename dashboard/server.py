@@ -23,13 +23,13 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from email.utils import formatdate
+from email.utils import formatdate, parsedate_to_datetime
 from functools import lru_cache
 from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable, Tuple
+from typing import Any, BinaryIO, Iterable, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 try:
@@ -375,6 +375,7 @@ STATIC_CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
 }
+IMMUTABLE_STATIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 
 def _build_static_representations() -> dict[str, StaticRepresentation]:
@@ -7163,6 +7164,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
     sys_version = ""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._cache_control: str | None = None
         super().__init__(*args, directory=str(STATIC_ROOT), **kwargs)
 
     def send_json(
@@ -7178,7 +7180,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self._cache_control = "no-store"
         self.send_header("Vary", "Accept-Encoding")
         if compressed:
             self.send_header("Content-Encoding", "gzip")
@@ -7191,7 +7193,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self._cache_control = "no-store"
         self.send_header("Vary", "Accept-Encoding")
         if compressed:
             self.send_header("Content-Encoding", "gzip")
@@ -7802,9 +7804,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         return "; ".join(parts)
 
     def end_headers(self) -> None:
-        request_path = urlparse(self.path).path
-        if not request_path.startswith("/api/") and request_path != "/health":
-            self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", self._cache_control or "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -7832,6 +7832,12 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
     def send_head(self):
         """Render HTML asset fingerprints at request time; stream other files normally."""
 
+        if (
+            static_representation(self.path) is not None
+            and exact_static_version(self.path)
+        ):
+            return self.send_static_representation(self.command == "HEAD")
+
         translated = Path(self.translate_path(self.path))
         try:
             is_static_html = (
@@ -7857,6 +7863,44 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         )
         self.end_headers()
         return io.BytesIO(body)
+
+    def send_static_representation(self, head_only: bool) -> BinaryIO | None:
+        """Send the negotiated immutable representation for an exact asset URL."""
+
+        representation = static_representation(self.path)
+        if representation is None:  # pragma: no cover - guarded by send_head.
+            return None
+        compressed = client_accepts_gzip(self.headers.get("Accept-Encoding", ""))
+        body = representation.gzip if compressed else representation.raw
+        self._cache_control = IMMUTABLE_STATIC_CACHE_CONTROL
+        modified_since = self.headers.get("If-Modified-Since")
+        if modified_since:
+            try:
+                request_time = parsedate_to_datetime(modified_since)
+                representation_time = parsedate_to_datetime(
+                    representation.last_modified
+                )
+            except (IndexError, OverflowError, TypeError, ValueError):
+                pass
+            else:
+                if (
+                    request_time.tzinfo is not None
+                    and representation_time <= request_time
+                ):
+                    self.send_response(HTTPStatus.NOT_MODIFIED)
+                    self.send_header("Last-Modified", representation.last_modified)
+                    self.send_header("Vary", "Accept-Encoding")
+                    self.end_headers()
+                    return None
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", representation.content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Last-Modified", representation.last_modified)
+        self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+        self.end_headers()
+        return None if head_only else io.BytesIO(body)
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)

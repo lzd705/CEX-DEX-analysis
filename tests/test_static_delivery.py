@@ -1,6 +1,12 @@
 import gzip
+import http.client
+import shutil
+import tempfile
+import threading
 import unittest
 from email.utils import formatdate
+from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 from dashboard import server
 from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_SOURCES
@@ -87,3 +93,192 @@ class StaticRepresentationTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertIsNone(server.static_representation(path))
+
+
+class StaticHttpTests(unittest.TestCase):
+    IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.bundle = Path(self.temporary_directory.name) / "public"
+        self.original_static_root = server.STATIC_ROOT
+        self.original_vendor_files = server.VENDOR_FILES
+        self.original_representations = server._STATIC_REPRESENTATIONS
+        shutil.copytree(self.original_static_root, self.bundle)
+        server.STATIC_ROOT = self.bundle
+        server.VENDOR_FILES = {
+            "/vendor/lucide.js": self.bundle / "vendor/lucide.min.js",
+        }
+        server._STATIC_REPRESENTATIONS = server._build_static_representations()
+        self.app_raw = (self.bundle / "app.js").read_bytes()
+        self.app_last_modified = formatdate(
+            (self.bundle / "app.js").stat().st_mtime,
+            usegmt=True,
+        )
+        self.http_server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), server.MarketMonitorHandler
+        )
+        self.server_thread = threading.Thread(
+            target=self.http_server.serve_forever,
+            daemon=True,
+        )
+        self.server_thread.start()
+
+    def tearDown(self):
+        self.http_server.shutdown()
+        self.http_server.server_close()
+        self.server_thread.join()
+        server.STATIC_ROOT = self.original_static_root
+        server.VENDOR_FILES = self.original_vendor_files
+        server._STATIC_REPRESENTATIONS = self.original_representations
+        self.temporary_directory.cleanup()
+
+    def request(self, method, path, accept_encoding=None, extra_headers=None):
+        connection = http.client.HTTPConnection(*self.http_server.server_address)
+        headers = dict(extra_headers or {})
+        if accept_encoding is not None:
+            headers["Accept-Encoding"] = accept_encoding
+        connection.request(method, path, headers=headers)
+        response = connection.getresponse()
+        status, response_headers, body = (
+            response.status,
+            response.headers,
+            response.read(),
+        )
+        connection.close()
+        return status, response_headers, body
+
+    def assert_single_cache_control(self, headers, value):
+        self.assertEqual(headers.get_all("Cache-Control"), [value])
+
+    def assert_exact_asset_headers(self, headers, body, encoded, *, includes_body=True):
+        self.assertEqual(headers.get("Content-Type"), "text/javascript; charset=utf-8")
+        self.assertEqual(headers.get("Last-Modified"), self.app_last_modified)
+        self.assertEqual(headers.get_all("Vary"), ["Accept-Encoding"])
+        self.assert_single_cache_control(headers, self.IMMUTABLE_CACHE_CONTROL)
+        if not includes_body:
+            return
+        self.assertEqual(headers.get("Content-Length"), str(len(body)))
+        if encoded:
+            self.assertEqual(headers.get_all("Content-Encoding"), ["gzip"])
+            self.assertEqual(gzip.decompress(body), self.app_raw)
+        else:
+            self.assertIsNone(headers.get("Content-Encoding"))
+            self.assertEqual(body, self.app_raw)
+
+    def test_exact_version_gzip_get_is_immutable_and_round_trips(self):
+        # Removing the exact-version route or gzip selection must fail this
+        # boundary assertion rather than merely changing an implementation detail.
+        version = server.static_asset_version()
+        status, headers, body = self.request(
+            "GET", f"/app.js?v={version}", "gzip"
+        )
+
+        self.assertEqual(status, 200)
+        self.assert_exact_asset_headers(headers, body, encoded=True)
+
+    def test_exact_version_identity_get_serves_raw_immutable_bytes(self):
+        version = server.static_asset_version()
+        status, headers, body = self.request(
+            "GET", f"/app.js?v={version}", "identity"
+        )
+
+        self.assertEqual(status, 200)
+        self.assert_exact_asset_headers(headers, body, encoded=False)
+
+    def test_exact_version_head_matches_get_for_gzip_and_identity(self):
+        version = server.static_asset_version()
+        fields = (
+            "Content-Type",
+            "Content-Length",
+            "Content-Encoding",
+            "Vary",
+            "Last-Modified",
+            "Cache-Control",
+        )
+
+        for accept_encoding, encoded in (("gzip", True), ("identity", False)):
+            with self.subTest(accept_encoding=accept_encoding):
+                get_status, get_headers, get_body = self.request(
+                    "GET", f"/app.js?v={version}", accept_encoding
+                )
+                head_status, head_headers, head_body = self.request(
+                    "HEAD", f"/app.js?v={version}", accept_encoding
+                )
+
+                self.assertEqual((get_status, head_status), (200, 200))
+                self.assert_exact_asset_headers(get_headers, get_body, encoded)
+                self.assert_exact_asset_headers(
+                    head_headers, head_body, encoded, includes_body=False
+                )
+                self.assertEqual(head_body, b"")
+                self.assertEqual(
+                    {field: get_headers.get_all(field) for field in fields},
+                    {field: head_headers.get_all(field) for field in fields},
+                )
+
+    def test_q_zero_does_not_select_gzip(self):
+        version = server.static_asset_version()
+        status, headers, body = self.request(
+            "GET", f"/app.js?v={version}", "gzip;q=0, *;q=1"
+        )
+
+        self.assertEqual(status, 200)
+        self.assert_exact_asset_headers(headers, body, encoded=False)
+
+    def test_exact_version_conditional_get_is_not_modified(self):
+        version = server.static_asset_version()
+        _, initial_headers, _ = self.request(
+            "GET", f"/app.js?v={version}", "gzip"
+        )
+        status, headers, body = self.request(
+            "GET",
+            f"/app.js?v={version}",
+            "gzip",
+            {"If-Modified-Since": initial_headers["Last-Modified"]},
+        )
+
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(headers.get("Last-Modified"), initial_headers["Last-Modified"])
+        self.assertEqual(headers.get_all("Vary"), ["Accept-Encoding"])
+        self.assert_single_cache_control(headers, self.IMMUTABLE_CACHE_CONTROL)
+
+    def test_html_and_spa_shell_are_no_cache(self):
+        for path in ("/index.html", "/screener"):
+            with self.subTest(path=path):
+                status, headers, body = self.request("GET", path)
+
+                self.assertEqual(status, 200)
+                self.assertTrue(body)
+                self.assertEqual(
+                    headers.get("Content-Type"), "text/html; charset=utf-8"
+                )
+                self.assert_single_cache_control(headers, "no-cache")
+                self.assertIsNone(headers.get("Content-Encoding"))
+
+    def test_unversioned_wrong_and_duplicate_asset_versions_are_no_cache(self):
+        version = server.static_asset_version()
+        for path in (
+            "/app.js",
+            "/app.js?v=wrong",
+            f"/app.js?v={version}&v={version}",
+        ):
+            with self.subTest(path=path):
+                status, headers, body = self.request("GET", path, "gzip")
+
+                self.assertEqual(status, 200)
+                self.assertTrue(body)
+                self.assert_single_cache_control(headers, "no-cache")
+                self.assertIsNone(headers.get("Content-Encoding"))
+
+    def test_missing_and_admin_assets_remain_no_cache_and_unavailable(self):
+        version = server.static_asset_version()
+        for path in ("/missing.js", f"/admin.js?v={version}"):
+            with self.subTest(path=path):
+                status, headers, body = self.request("GET", path, "gzip")
+
+                self.assertEqual(status, 404)
+                self.assertTrue(body)
+                self.assert_single_cache_control(headers, "no-cache")
+                self.assertIsNone(headers.get("Content-Encoding"))
