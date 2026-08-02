@@ -821,6 +821,127 @@ class RoutePublicationInterfaceTests(unittest.TestCase):
 
 
 class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
+    def test_complete_sqlite_reader_supports_legacy_sqlite_catalog_name(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root,
+            raw_root,
+            Path(self.temporary.name) / "typed-sources",
+            Path(self.temporary.name) / "private-profiles",
+        )
+        bundle = route_publication.build_complete_route_bundle(
+            core_root=self.root,
+            raw_root=raw_root,
+            source_root=fixture["source_root"],
+            fee_profile_path=fixture["fee_profile_path"],
+            fee_profile_id=fixture["fee_profile_id"],
+            inventory_profile_path=fixture["inventory_profile_path"],
+            opportunity_inputs=fixture["opportunity_inputs"],
+        )
+        artifacts, _manifest = route_publication._complete_artifact_bytes(bundle)
+        database_bytes = artifacts[
+            route_publication.ROUTE_OPPORTUNITY_SQLITE_FILENAME
+        ]
+        real_connect = sqlite3.connect
+
+        class LegacyCatalogConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, statement, *args, **kwargs):
+                if "sqlite_schema" in statement:
+                    raise sqlite3.OperationalError(
+                        "no such table: sqlite_schema"
+                    )
+                return self.connection.execute(statement, *args, **kwargs)
+
+            def close(self):
+                return self.connection.close()
+
+        def legacy_connect(*args, **kwargs):
+            return LegacyCatalogConnection(real_connect(*args, **kwargs))
+
+        with patch.object(
+            route_publication.sqlite3,
+            "connect",
+            side_effect=legacy_connect,
+        ):
+            loaded, legs, costs, opportunities = (
+                route_publication._read_complete_sqlite(database_bytes)
+            )
+
+        self.assertEqual(loaded, bundle)
+        self.assertEqual(legs, bundle["legs"])
+        self.assertEqual(costs, bundle["cost_components"])
+        self.assertEqual(opportunities, bundle["opportunities"])
+
+    def test_complete_sqlite_reader_rejects_semantically_forged_ddl(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root,
+            raw_root,
+            Path(self.temporary.name) / "typed-sources",
+            Path(self.temporary.name) / "private-profiles",
+        )
+        bundle = route_publication.build_complete_route_bundle(
+            core_root=self.root,
+            raw_root=raw_root,
+            source_root=fixture["source_root"],
+            fee_profile_path=fixture["fee_profile_path"],
+            fee_profile_id=fixture["fee_profile_id"],
+            inventory_profile_path=fixture["inventory_profile_path"],
+            opportunity_inputs=fixture["opportunity_inputs"],
+        )
+        artifacts, _manifest = route_publication._complete_artifact_bytes(bundle)
+        database_bytes = artifacts[
+            route_publication.ROUTE_OPPORTUNITY_SQLITE_FILENAME
+        ]
+        mutations = {
+            "rowid table disguised by CHECK text": """
+                ALTER TABLE bundle_metadata RENAME TO old_bundle_metadata;
+                CREATE TABLE bundle_metadata (
+                    key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    PRIMARY KEY (key),
+                    CHECK ('WITHOUT ROWID' IS NOT NULL)
+                );
+                INSERT INTO bundle_metadata SELECT * FROM old_bundle_metadata;
+                DROP TABLE old_bundle_metadata;
+            """,
+            "partial descending unique index": """
+                DROP INDEX route_opportunities_route_idx;
+                CREATE UNIQUE INDEX route_opportunities_route_idx
+                    ON route_opportunities(
+                        route_id COLLATE NOCASE DESC,
+                        requested_notional_usd
+                    )
+                    WHERE strict_eligible = 'true';
+            """,
+            "unexpected internal statistics table": """
+                ANALYZE;
+            """,
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                database = Path(self.temporary.name) / (
+                    "tampered-{}.sqlite3".format(len(label))
+                )
+                database.write_bytes(database_bytes)
+                connection = sqlite3.connect(str(database))
+                try:
+                    connection.executescript(mutation)
+                    connection.commit()
+                    connection.execute("VACUUM")
+                finally:
+                    connection.close()
+                with self.assertRaisesRegex(
+                    route_publication.RoutePublicationError,
+                    "schema",
+                ):
+                    route_publication._read_complete_sqlite(
+                        database.read_bytes()
+                    )
+
     def test_builder_preserves_route_volume_lineage_from_pinned_core(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"
         fixture = _task7_cex_inputs(

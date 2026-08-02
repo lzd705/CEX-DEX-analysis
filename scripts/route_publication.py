@@ -4162,6 +4162,76 @@ def _complete_database_logical_sha256(bundle: Mapping[str, Any]) -> str:
     }))
 
 
+_COMPLETE_SQLITE_DDL = (
+    (
+        "bundle_metadata",
+        """CREATE TABLE bundle_metadata (
+            key TEXT PRIMARY KEY NOT NULL,
+            value_json TEXT NOT NULL
+        ) WITHOUT ROWID""",
+    ),
+    (
+        "route_legs",
+        """CREATE TABLE route_legs (
+            route_cohort_id TEXT NOT NULL,
+            market_id TEXT PRIMARY KEY NOT NULL,
+            row_json TEXT NOT NULL
+        ) WITHOUT ROWID""",
+    ),
+    (
+        "route_opportunities",
+        """CREATE TABLE route_opportunities (
+            cohort_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            opportunity_id TEXT PRIMARY KEY NOT NULL,
+            requested_notional_usd TEXT NOT NULL,
+            buy_market_id TEXT NOT NULL,
+            sell_market_id TEXT NOT NULL,
+            strict_eligible TEXT NOT NULL,
+            row_json TEXT NOT NULL,
+            FOREIGN KEY (buy_market_id) REFERENCES route_legs(market_id),
+            FOREIGN KEY (sell_market_id) REFERENCES route_legs(market_id)
+        ) WITHOUT ROWID""",
+    ),
+    (
+        "cost_components",
+        """CREATE TABLE cost_components (
+            cohort_id TEXT NOT NULL,
+            opportunity_id TEXT NOT NULL,
+            leg TEXT NOT NULL,
+            component_type TEXT NOT NULL,
+            market_id TEXT NOT NULL,
+            requested_notional_usd TEXT NOT NULL,
+            row_json TEXT NOT NULL,
+            PRIMARY KEY (opportunity_id, leg, component_type),
+            FOREIGN KEY (opportunity_id)
+                REFERENCES route_opportunities(opportunity_id)
+        ) WITHOUT ROWID""",
+    ),
+    (
+        "route_opportunities_route_idx",
+        """CREATE INDEX route_opportunities_route_idx
+            ON route_opportunities(route_id, requested_notional_usd)""",
+    ),
+    (
+        "route_opportunities_strict_idx",
+        """CREATE INDEX route_opportunities_strict_idx
+            ON route_opportunities(strict_eligible, route_id)""",
+    ),
+    (
+        "cost_components_market_idx",
+        """CREATE INDEX cost_components_market_idx
+            ON cost_components(market_id, component_type)""",
+    ),
+)
+
+
+def _canonical_sqlite_ddl(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RoutePublicationError("complete SQLite schema is invalid")
+    return " ".join(value.split())
+
+
 def _build_complete_sqlite_file(
     path: Path,
     bundle: Mapping[str, Any],
@@ -4177,47 +4247,8 @@ def _build_complete_sqlite_file(
         connection.execute("PRAGMA application_id = 1380929615")
         connection.execute("PRAGMA user_version = 1")
         connection.executescript(
-            """
-            CREATE TABLE bundle_metadata (
-                key TEXT PRIMARY KEY NOT NULL,
-                value_json TEXT NOT NULL
-            ) WITHOUT ROWID;
-            CREATE TABLE route_legs (
-                route_cohort_id TEXT NOT NULL,
-                market_id TEXT PRIMARY KEY NOT NULL,
-                row_json TEXT NOT NULL
-            ) WITHOUT ROWID;
-            CREATE TABLE route_opportunities (
-                cohort_id TEXT NOT NULL,
-                route_id TEXT NOT NULL,
-                opportunity_id TEXT PRIMARY KEY NOT NULL,
-                requested_notional_usd TEXT NOT NULL,
-                buy_market_id TEXT NOT NULL,
-                sell_market_id TEXT NOT NULL,
-                strict_eligible TEXT NOT NULL,
-                row_json TEXT NOT NULL,
-                FOREIGN KEY (buy_market_id) REFERENCES route_legs(market_id),
-                FOREIGN KEY (sell_market_id) REFERENCES route_legs(market_id)
-            ) WITHOUT ROWID;
-            CREATE TABLE cost_components (
-                cohort_id TEXT NOT NULL,
-                opportunity_id TEXT NOT NULL,
-                leg TEXT NOT NULL,
-                component_type TEXT NOT NULL,
-                market_id TEXT NOT NULL,
-                requested_notional_usd TEXT NOT NULL,
-                row_json TEXT NOT NULL,
-                PRIMARY KEY (opportunity_id, leg, component_type),
-                FOREIGN KEY (opportunity_id)
-                    REFERENCES route_opportunities(opportunity_id)
-            ) WITHOUT ROWID;
-            CREATE INDEX route_opportunities_route_idx
-                ON route_opportunities(route_id, requested_notional_usd);
-            CREATE INDEX route_opportunities_strict_idx
-                ON route_opportunities(strict_eligible, route_id);
-            CREATE INDEX cost_components_market_idx
-                ON cost_components(market_id, component_type);
-            """
+            ";\n".join(statement for _name, statement in _COMPLETE_SQLITE_DDL)
+            + ";\n"
         )
         connection.execute(
             "INSERT INTO bundle_metadata (key, value_json) VALUES (?, ?)",
@@ -4706,10 +4737,10 @@ def _read_complete_sqlite(
                 raise RoutePublicationError("complete SQLite integrity check failed")
             if connection.execute("PRAGMA foreign_key_check").fetchall():
                 raise RoutePublicationError("complete SQLite foreign keys are invalid")
-            objects = set(connection.execute(
-                "SELECT type, name, tbl_name FROM sqlite_schema "
-                "WHERE name NOT LIKE 'sqlite_%'"
-            ).fetchall())
+            schema_rows = connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master"
+            ).fetchall()
+            objects = {tuple(row[:3]) for row in schema_rows}
             expected_objects = {
                 ("table", "bundle_metadata", "bundle_metadata"),
                 ("table", "route_legs", "route_legs"),
@@ -4721,12 +4752,16 @@ def _read_complete_sqlite(
             }
             if objects != expected_objects:
                 raise RoutePublicationError("complete SQLite schema is invalid")
-            table_sql = {
-                row[0]: row[1]
-                for row in connection.execute(
-                    "SELECT name, sql FROM sqlite_schema WHERE type = 'table'"
-                ).fetchall()
+            actual_ddl = {
+                row[1]: _canonical_sqlite_ddl(row[3])
+                for row in schema_rows
             }
+            expected_ddl = {
+                name: _canonical_sqlite_ddl(statement)
+                for name, statement in _COMPLETE_SQLITE_DDL
+            }
+            if actual_ddl != expected_ddl:
+                raise RoutePublicationError("complete SQLite schema is invalid")
             expected_columns = {
                 "bundle_metadata": (
                     (0, "key", "TEXT", 1, None, 1),
@@ -4762,8 +4797,6 @@ def _read_complete_sqlite(
                     "PRAGMA table_info({})".format(table)
                 ).fetchall())
                 if actual != expected:
-                    raise RoutePublicationError("complete SQLite schema is invalid")
-                if "WITHOUT ROWID" not in str(table_sql.get(table, "")).upper():
                     raise RoutePublicationError("complete SQLite schema is invalid")
             expected_indexes = {
                 "route_opportunities_route_idx": (

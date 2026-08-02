@@ -2205,15 +2205,19 @@ function formatOpportunitySeconds(value) {
 
 function opportunitySourceLinks(route) {
   const links = Array.isArray(route?.source_links) ? route.source_links : [];
-  const safe = links.filter((link) => (
-    typeof link?.url === "string"
-    && /^https:\/\//i.test(link.url)
-  ));
-  if (!safe.length) return "";
-  return `<div class="opportunity-source-links">${safe.map((link) => (
-    `<a href="${escapeHtml(link.url)}" target="_blank" rel="noopener noreferrer">`
-      + `${escapeHtml(link.market_id || "Source evidence")}</a>`
-  )).join("")}</div>`;
+  if (!links.length) return "";
+  return `<div class="opportunity-source-links">${links.map((link) => {
+    const marketId = escapeHtml(link?.market_id || "Source evidence");
+    const safeUrl = typeof link?.url === "string"
+      && /^https:\/\//i.test(link.url)
+      ? link.url
+      : null;
+    if (safeUrl) {
+      return `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${marketId}</a>`;
+    }
+    return `<span class="opportunity-source-identity" aria-label="Source URL withheld for ${marketId}">`
+      + `<span>${marketId}</span><span class="metric-note">Source URL withheld</span></span>`;
+  }).join("")}</div>`;
 }
 
 function opportunityCostMarkup(route) {
@@ -2548,6 +2552,178 @@ function opportunityRequestIsOwned(requestId, requestKey) {
     && opportunityRequestKey(app.route.filters || {}) === requestKey;
 }
 
+function opportunityResponseFiltersMatch(payloadFilters, requestedFilters) {
+  if (
+    !payloadFilters
+    || typeof payloadFilters !== "object"
+    || Array.isArray(payloadFilters)
+  ) return false;
+  const expected = {
+    token: requestedFilters.token || null,
+    venue: requestedFilters.venue || null,
+    notional_usd: requestedFilters.notionalUsd
+      ? String(requestedFilters.notionalUsd)
+      : null,
+    opportunity_class: requestedFilters.opportunityClass,
+    route_type: requestedFilters.routeType,
+    availability: requestedFilters.availability,
+    sort: requestedFilters.sort,
+    direction: requestedFilters.dir,
+  };
+  const actualFields = Object.keys(payloadFilters).sort();
+  const expectedFields = Object.keys(expected).sort();
+  if (
+    actualFields.length !== expectedFields.length
+    || actualFields.some((field, index) => field !== expectedFields[index])
+  ) return false;
+  return Object.entries(expected).every(([field, value]) => {
+    const actual = payloadFilters[field];
+    return actual === value;
+  });
+}
+
+function opportunityVenueFromMarketId(marketId) {
+  if (typeof marketId !== "string") return null;
+  const parts = marketId.split(":");
+  if (parts[0] === "cex" && parts.length >= 3) return parts[1];
+  if (parts[0] === "dex" && parts.length >= 5) return parts[2];
+  return null;
+}
+
+function opportunityRowMatchesRequest(row, filters) {
+  if (!row || typeof row !== "object") return false;
+  if (typeof row.requested_notional_usd !== "string") return false;
+  if (filters.token && row.token_symbol !== filters.token) return false;
+  if (filters.venue) {
+    const venues = [row.buy_market_id, row.sell_market_id]
+      .map(opportunityVenueFromMarketId);
+    if (!venues.includes(filters.venue)) return false;
+  }
+  if (
+    filters.notionalUsd
+    && row.requested_notional_usd !== String(filters.notionalUsd)
+  ) return false;
+  const classByFilter = {
+    strict: "executable_candidate",
+    estimate: "research_estimate",
+  };
+  if (
+    filters.opportunityClass !== "all"
+    && row.opportunity_class !== classByFilter[filters.opportunityClass]
+  ) return false;
+  if (filters.routeType !== "all" && row.route_type !== filters.routeType) {
+    return false;
+  }
+  if (
+    filters.availability !== "all"
+    && row?.availability?.status !== filters.availability
+  ) return false;
+  return true;
+}
+
+function opportunityIdentityComparison(left, right) {
+  for (const field of ["route_id", "opportunity_id"]) {
+    const leftValue = String(left?.[field] || "");
+    const rightValue = String(right?.[field] || "");
+    if (leftValue < rightValue) return -1;
+    if (leftValue > rightValue) return 1;
+  }
+  return 0;
+}
+
+function opportunityDecimalParts(value) {
+  if (!["string", "number"].includes(typeof value)) return null;
+  if (
+    typeof value === "number"
+    && (
+      !Number.isFinite(value)
+      || (Number.isInteger(value) && !Number.isSafeInteger(value))
+    )
+  ) return null;
+  const match = String(value).match(/^([+-]?)(\d+)(?:\.(\d+))?$/);
+  if (!match) return null;
+  const integer = match[2].replace(/^0+(?=\d)/, "");
+  const fraction = (match[3] || "").replace(/0+$/, "");
+  const zero = integer === "0" && !fraction;
+  return {
+    negative: match[1] === "-" && !zero,
+    integer,
+    fraction,
+  };
+}
+
+function opportunityDecimalComparison(left, right) {
+  const leftParts = opportunityDecimalParts(left);
+  const rightParts = opportunityDecimalParts(right);
+  if (!leftParts || !rightParts) return null;
+  if (leftParts.negative !== rightParts.negative) {
+    return leftParts.negative ? -1 : 1;
+  }
+  let magnitude = 0;
+  if (leftParts.integer.length !== rightParts.integer.length) {
+    magnitude = leftParts.integer.length < rightParts.integer.length ? -1 : 1;
+  } else if (leftParts.integer !== rightParts.integer) {
+    magnitude = leftParts.integer < rightParts.integer ? -1 : 1;
+  } else {
+    const width = Math.max(
+      leftParts.fraction.length,
+      rightParts.fraction.length,
+    );
+    const leftFraction = leftParts.fraction.padEnd(width, "0");
+    const rightFraction = rightParts.fraction.padEnd(width, "0");
+    if (leftFraction !== rightFraction) {
+      magnitude = leftFraction < rightFraction ? -1 : 1;
+    }
+  }
+  return leftParts.negative ? -magnitude : magnitude;
+}
+
+function opportunitySortComparison(left, right, filters) {
+  const field = filters.sort === "volume"
+    ? "route_volume_usd"
+    : filters.sort;
+  const leftRaw = left?.[field];
+  const rightRaw = right?.[field];
+  const leftMissing = leftRaw === null || leftRaw === undefined;
+  const rightMissing = rightRaw === null || rightRaw === undefined;
+  if (leftMissing || rightMissing) {
+    if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+    return opportunityIdentityComparison(left, right);
+  }
+  let comparison = 0;
+  if (["token_symbol", "route_id"].includes(filters.sort)) {
+    const leftValue = String(leftRaw);
+    const rightValue = String(rightRaw);
+    comparison = leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+  } else {
+    comparison = opportunityDecimalComparison(leftRaw, rightRaw);
+    if (comparison === null) return null;
+  }
+  if (comparison !== 0 && filters.dir === "desc") comparison *= -1;
+  return comparison || opportunityIdentityComparison(left, right);
+}
+
+function opportunityResponseMatchesRequest(payload, requestedFilters) {
+  if (!opportunityResponseFiltersMatch(payload?.filters, requestedFilters)) {
+    return false;
+  }
+  const routes = Array.isArray(payload?.routes) ? payload.routes : [];
+  if (!routes.every((row) => opportunityRowMatchesRequest(row, requestedFilters))) {
+    return false;
+  }
+  const returnedCount = payload?.metadata?.coverage?.returned_count;
+  if (!Number.isInteger(returnedCount) || returnedCount !== routes.length) {
+    return false;
+  }
+  for (let index = 1; index < routes.length; index += 1) {
+    const comparison = opportunitySortComparison(
+      routes[index - 1], routes[index], requestedFilters,
+    );
+    if (comparison === null || comparison > 0) return false;
+  }
+  return true;
+}
+
 function invalidateOpportunityRequest() {
   if (app.opportunityController) app.opportunityController.abort();
   app.opportunityController = null;
@@ -2602,6 +2778,11 @@ async function loadOpportunities(filters = app.route?.filters || {}) {
       || !Array.isArray(payload.routes)
     ) {
       throw new Error("The opportunity response failed its compact payload contract.");
+    }
+    if (!opportunityResponseMatchesRequest(payload, normalized)) {
+      throw new Error(
+        "The opportunity response failed its request-bound payload contract.",
+      );
     }
     renderOpportunities(payload);
     return true;

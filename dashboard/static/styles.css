@@ -2189,6 +2189,21 @@ th.sticky-token { z-index: 12; background: #1c2027; }
 .opportunity-na-disclosure { display: inline-block; margin-left: 4px; }
 .opportunity-na-disclosure > summary { min-width: 28px; min-height: 28px; }
 .opportunity-cost-disclosure { min-width: 180px; }
+.opportunity-source-links {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+.opportunity-source-links a,
+.opportunity-source-identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  overflow-wrap: anywhere;
+}
+.opportunity-source-identity { color: var(--muted); }
+.opportunity-source-identity .metric-note { margin: 0; }
 .opportunity-reason-code {
   display: inline-flex;
   max-width: 100%;

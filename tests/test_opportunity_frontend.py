@@ -88,7 +88,7 @@ const opportunityPayload = {
     },
   },
   filters: {
-    token: null, venue: null, notional_usd: 10000, opportunity_class: "all",
+    token: null, venue: null, notional_usd: "10000", opportunity_class: "all",
     route_type: "all", availability: "all", sort: "net_edge_usd",
     direction: "desc",
   },
@@ -97,7 +97,7 @@ const opportunityPayload = {
       route_id: "route:strict", opportunity_id: "route:strict:10000",
       token_symbol: "AAVE", buy_market_id: "cex:alpha:AAVE/USD",
       sell_market_id: "cex:beta:AAVE/USD", route_type: "cex_cex",
-      route_mode: "prepositioned_inventory", requested_notional_usd: 10000,
+      route_mode: "prepositioned_inventory", requested_notional_usd: "10000",
       target_token_quantity: 100, opportunity_class: "executable_candidate",
       availability: { status: "available", reason: null },
       gross_edge_usd: 120, gross_edge_bps: 120, net_edge_usd: 100,
@@ -116,7 +116,7 @@ const opportunityPayload = {
       route_id: "route:estimate", opportunity_id: "route:estimate:10000",
       token_symbol: "ETH", buy_market_id: "cex:alpha:ETH/USD",
       sell_market_id: "dex:eth:swap:pool:ETH", route_type: "cex_dex",
-      route_mode: "prepositioned_inventory", requested_notional_usd: 10000,
+      route_mode: "prepositioned_inventory", requested_notional_usd: "10000",
       target_token_quantity: 4, opportunity_class: "research_estimate",
       availability: { status: "available", reason: null },
       gross_edge_usd: 80, gross_edge_bps: 80, net_edge_usd: 50,
@@ -136,7 +136,7 @@ const opportunityPayload = {
       route_id: "route:stale-zero", opportunity_id: "route:stale-zero:10000",
       token_symbol: "UNI", buy_market_id: "cex:alpha:UNI/USD",
       sell_market_id: "cex:beta:UNI/USD", route_type: "cex_cex",
-      route_mode: "prepositioned_inventory", requested_notional_usd: 10000,
+      route_mode: "prepositioned_inventory", requested_notional_usd: "10000",
       target_token_quantity: null, opportunity_class: "research_estimate",
       availability: { status: "unavailable", reason: "cohort_stale" },
       gross_edge_usd: null, gross_edge_bps: null, net_edge_usd: null,
@@ -155,7 +155,7 @@ const opportunityPayload = {
       route_id: "route:unavailable", opportunity_id: "route:unavailable:10000",
       token_symbol: "LINK", buy_market_id: "cex:alpha:LINK/USD",
       sell_market_id: "dex:eth:swap:pool:LINK", route_type: "cex_dex",
-      route_mode: "research_only", requested_notional_usd: 10000,
+      route_mode: "research_only", requested_notional_usd: "10000",
       target_token_quantity: null, opportunity_class: "unavailable",
       availability: { status: "unavailable", reason: "snapshot_skew_exceeded" },
       gross_edge_usd: null, gross_edge_bps: null, net_edge_usd: null,
@@ -456,6 +456,22 @@ globalThis.MarketMonitorNavigation = require(
 
 
 class OpportunityRendererTest(unittest.TestCase):
+    def test_withheld_source_url_keeps_market_identity_visible(self):
+        result = run_app_javascript(
+            r"""
+const markup = opportunitySourceLinks({ source_links: [
+  { market_id: "cex:alpha:AAVE/USD", url: null },
+  { market_id: "cex:beta:AAVE/USD", url: "https://api.binance.com" },
+] });
+console.log(JSON.stringify({ markup }));
+""",
+        )
+        self.assertIn("cex:alpha:AAVE/USD", result["markup"])
+        self.assertIn("Source URL withheld", result["markup"])
+        self.assertIn("cex:beta:AAVE/USD", result["markup"])
+        self.assertIn('href="https://api.binance.com"', result["markup"])
+        self.assertNotIn('href="null"', result["markup"])
+
     def test_cost_na_reasons_and_fractional_timing_remain_exact(self):
         result = run_app_javascript(
             r"""
@@ -839,10 +855,12 @@ function response(payload) {
 function payloadFor(token, routeId) {
   const payload = JSON.parse(JSON.stringify(opportunityPayload));
   payload.filters.token = token;
-  payload.filters.notional_usd = token === "AAVE" ? 10000 : 50000;
+  payload.filters.venue = "alpha";
+  payload.filters.notional_usd = token === "AAVE" ? "10000" : "50000";
   payload.routes = [payload.routes[0]];
   payload.routes[0].token_symbol = token;
   payload.routes[0].route_id = routeId;
+  payload.routes[0].requested_notional_usd = payload.filters.notional_usd;
   payload.metadata.coverage.returned_count = 1;
   return payload;
 }
@@ -891,6 +909,152 @@ globalThis.MarketMonitorNavigation = require(
         self.assertNotIn("route:late-old", result["rendered"])
         self.assertNotIn("route:after-navigation", result["rendered"])
 
+    def test_response_filters_row_scope_and_order_must_match_request(self):
+        result = run_app_javascript(
+            DOM_FIXTURE
+            + PAYLOAD_FIXTURE
+            + r"""
+global.AbortController = class {
+  constructor() { this.signal = {}; }
+  abort() {}
+};
+const responses = [];
+global.fetch = async () => ({
+  ok: true,
+  status: 200,
+  async json() { return responses.shift(); },
+});
+function clonePayload() {
+  return JSON.parse(JSON.stringify(opportunityPayload));
+}
+(async () => {
+  const tokenFilters = {
+    token: "AAVE", venue: "", notionalUsd: 10000,
+    opportunityClass: "all", routeType: "all", availability: "all",
+    sort: "net_edge_usd", dir: "desc",
+  };
+  const wrongFilters = clonePayload();
+  wrongFilters.filters.token = "ETH";
+  wrongFilters.filters.notional_usd = "10000";
+  wrongFilters.routes = [wrongFilters.routes[0]];
+  wrongFilters.metadata.coverage.returned_count = 1;
+  responses.push(wrongFilters);
+  app.route = { kind: "opportunities", filters: tokenFilters };
+  const filterResult = await loadOpportunities(tokenFilters);
+
+  const wrongScope = clonePayload();
+  wrongScope.filters.token = "AAVE";
+  wrongScope.filters.notional_usd = "10000";
+  wrongScope.routes = [wrongScope.routes[0]];
+  wrongScope.routes[0].token_symbol = "ETH";
+  wrongScope.metadata.coverage.returned_count = 1;
+  responses.push(wrongScope);
+  app.route = { kind: "opportunities", filters: tokenFilters };
+  const scopeResult = await loadOpportunities(tokenFilters);
+
+  const allFilters = {
+    token: "", venue: "", notionalUsd: 10000,
+    opportunityClass: "all", routeType: "all", availability: "all",
+    sort: "net_edge_usd", dir: "desc",
+  };
+  const wrongOrder = clonePayload();
+  wrongOrder.filters.notional_usd = "10000";
+  wrongOrder.routes = [wrongOrder.routes[1], wrongOrder.routes[0]];
+  wrongOrder.metadata.coverage.returned_count = 2;
+  responses.push(wrongOrder);
+  app.route = { kind: "opportunities", filters: allFilters };
+  const orderResult = await loadOpportunities(allFilters);
+
+  console.log(JSON.stringify({
+    filterResult, scopeResult, orderResult,
+    rendered: opportunityElements["strict-opportunity-body"].innerHTML,
+    error: opportunityElements["opportunity-error"].textContent,
+  }));
+})();
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = require(
+  '/private/tmp/CEX-DEX-analysis-critical-round/dashboard/static/navigation.js'
+);
+""",
+        )
+        self.assertFalse(result["filterResult"])
+        self.assertFalse(result["scopeResult"])
+        self.assertFalse(result["orderResult"])
+        self.assertEqual(result["rendered"], "")
+        self.assertIn("failed", result["error"].lower())
+
+    def test_request_binding_uses_exact_filter_keys_and_decimal_order(self):
+        result = run_app_javascript(
+            r"""
+const filters = normalizedOpportunityFilters({
+  token: "", venue: "", notionalUsd: 10000,
+  opportunityClass: "all", routeType: "all", availability: "all",
+  sort: "volume", dir: "desc",
+});
+function basePayload() {
+  return {
+    availability: { status: "available", reason: null },
+    metadata: { coverage: { returned_count: 2 } },
+    filters: {
+      token: null, venue: null, notional_usd: "10000",
+      opportunity_class: "all", route_type: "all", availability: "all",
+      sort: "volume", direction: "desc",
+    },
+    routes: [
+      {
+        route_id: "route:a", opportunity_id: "opportunity:a",
+        token_symbol: "AAVE", buy_market_id: "cex:alpha:AAVE/USD",
+        sell_market_id: "cex:beta:AAVE/USD", route_type: "cex_cex",
+        requested_notional_usd: "10000", opportunity_class: "research_estimate",
+        availability: { status: "available" },
+        route_volume_usd: "9007199254740992",
+      },
+      {
+        route_id: "route:b", opportunity_id: "opportunity:b",
+        token_symbol: "AAVE", buy_market_id: "cex:alpha:AAVE/USD",
+        sell_market_id: "cex:beta:AAVE/USD", route_type: "cex_cex",
+        requested_notional_usd: "10000", opportunity_class: "research_estimate",
+        availability: { status: "available" },
+        route_volume_usd: "9007199254740993",
+      },
+    ],
+  };
+}
+const wrongOrder = basePayload();
+const correctOrder = basePayload();
+correctOrder.routes.reverse();
+const extraFilter = basePayload();
+extraFilter.routes.reverse();
+extraFilter.filters.unexpected = "forged";
+const wrongFilterType = basePayload();
+wrongFilterType.routes.reverse();
+wrongFilterType.filters.notional_usd = ["10000"];
+const wrongSortType = basePayload();
+wrongSortType.routes.reverse();
+wrongSortType.routes[0].route_volume_usd = ["9007199254740993"];
+const wrongRowNotionalType = basePayload();
+wrongRowNotionalType.routes.reverse();
+wrongRowNotionalType.routes[0].requested_notional_usd = ["10000"];
+console.log(JSON.stringify({
+  wrongOrder: opportunityResponseMatchesRequest(wrongOrder, filters),
+  correctOrder: opportunityResponseMatchesRequest(correctOrder, filters),
+  extraFilter: opportunityResponseMatchesRequest(extraFilter, filters),
+  wrongFilterType: opportunityResponseMatchesRequest(wrongFilterType, filters),
+  wrongSortType: opportunityResponseMatchesRequest(wrongSortType, filters),
+  wrongRowNotionalType: opportunityResponseMatchesRequest(
+    wrongRowNotionalType, filters,
+  ),
+}));
+""",
+        )
+        self.assertFalse(result["wrongOrder"])
+        self.assertTrue(result["correctOrder"])
+        self.assertFalse(result["extraFilter"])
+        self.assertFalse(result["wrongFilterType"])
+        self.assertFalse(result["wrongSortType"])
+        self.assertFalse(result["wrongRowNotionalType"])
+
     def test_route_application_loads_api_and_server_error_replaces_previous_rows(self):
         result = run_app_javascript(
             DOM_FIXTURE
@@ -904,9 +1068,14 @@ const requests = [];
 global.fetch = async (url) => {
   requests.push(url);
   if (requests.length === 1) {
+    const payload = JSON.parse(JSON.stringify(opportunityPayload));
+    payload.filters.token = "AAVE";
+    payload.filters.notional_usd = "10000";
+    payload.routes = [payload.routes[0]];
+    payload.metadata.coverage.returned_count = 1;
     return {
       ok: true, status: 200,
-      async json() { return opportunityPayload; },
+      async json() { return payload; },
     };
   }
   return {
