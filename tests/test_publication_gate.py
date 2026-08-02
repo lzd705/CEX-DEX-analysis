@@ -1,4 +1,5 @@
 import json
+import inspect
 from copy import deepcopy
 from pathlib import Path
 import tempfile
@@ -13,6 +14,7 @@ from scripts.publication_gate import (
     evaluate_publication_coverage,
     validate_passing_coverage_report,
 )
+from scripts.check_dashboard_release import validate_route_opportunity_release
 
 
 def row(market_id, status="observed", venue="main"):
@@ -36,6 +38,16 @@ class PublicationCoverageGateTest(unittest.TestCase):
         }
         options.update(kwargs)
         return evaluate_publication_coverage(candidate, baseline, **options)
+
+    def test_route_release_entrypoint_cannot_accept_caller_supplied_rows(self):
+        signature = inspect.signature(validate_route_opportunity_release)
+
+        self.assertEqual(
+            tuple(signature.parameters),
+            ("routes_root", "required", "now"),
+        )
+        self.assertNotIn("opportunities", signature.parameters)
+        self.assertNotIn("cost_components", signature.parameters)
 
     def test_first_publish_is_allowed_and_reports_missing_baseline(self):
         report = self.evaluate([row("a"), row("b")])

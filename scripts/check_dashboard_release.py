@@ -15,8 +15,10 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -35,9 +37,16 @@ try:
         canonical_quality_fact_rule,
     )
     from scripts.route_publication import (
-        DEFAULT_ROUTE_CORE_ROOT,
-        load_latest_route_cohort,
+        DEFAULT_ROUTE_ROOT,
+        RoutePublicationError,
+        load_latest_complete_route_bundle,
     )
+    from scripts.execution_cost_components import validate_cost_components
+    from scripts.route_opportunity import (
+        MAX_ROUTE_AGE_SECONDS,
+        MAX_ROUTE_SKEW_SECONDS,
+    )
+    from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
     from scripts.event_facts import effective_datetime_interval
     from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
@@ -48,7 +57,21 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
     )
-    from route_publication import DEFAULT_ROUTE_CORE_ROOT, load_latest_route_cohort
+    from route_publication import (  # type: ignore[no-redef]
+        DEFAULT_ROUTE_ROOT,
+        RoutePublicationError,
+        load_latest_complete_route_bundle,
+    )
+    from execution_cost_components import (  # type: ignore[no-redef]
+        validate_cost_components,
+    )
+    from route_opportunity import (  # type: ignore[no-redef]
+        MAX_ROUTE_AGE_SECONDS,
+        MAX_ROUTE_SKEW_SECONDS,
+    )
+    from timestamp_contract import (  # type: ignore[no-redef]
+        exact_rfc3339_epoch_seconds,
+    )
     from event_facts import effective_datetime_interval
     from static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
 
@@ -75,49 +98,821 @@ def require(condition: bool, message: str) -> None:
         raise ReleaseCheckError(message)
 
 
-def validate_route_cohort_release(
-    core_root: Path,
+_ROUTE_STRICT_VALUE_STATUSES = frozenset(
+    {"measured", "authenticated", "quoted", "not_applicable"}
+)
+_ROUTE_SCENARIO_VALUE_STATUSES = frozenset(
+    {"bounded_estimate", "assumed"}
+)
+_ROUTE_TERMINAL_VALUE_STATUSES = frozenset(
+    {"unavailable", "unsupported", "failed", "stale"}
+)
+
+
+def _route_decimal(value: Any, field: str, *, positive: bool = False) -> Decimal:
+    if isinstance(value, (bool, float)) or not isinstance(
+        value, (str, int, Decimal)
+    ):
+        raise ReleaseCheckError("{} is not exact decimal evidence".format(field))
+    try:
+        result = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ReleaseCheckError(
+            "{} is not exact decimal evidence".format(field)
+        ) from error
+    if not result.is_finite() or (positive and result <= 0):
+        raise ReleaseCheckError("{} is not valid decimal evidence".format(field))
+    return result
+
+
+def _route_timestamp(value: Any, field: str) -> Decimal:
+    if not isinstance(value, str) or not value:
+        raise ReleaseCheckError("{} timestamp is unavailable".format(field))
+    try:
+        return exact_rfc3339_epoch_seconds(value)
+    except (OverflowError, ValueError) as error:
+        raise ReleaseCheckError("{} timestamp is invalid".format(field)) from error
+
+
+def _route_integer(value: Any, field: str, *, positive: bool = False) -> int:
+    number = _route_decimal(value, field, positive=positive)
+    if number != number.to_integral_value():
+        raise ReleaseCheckError("{} is not exact integer evidence".format(field))
+    return int(number)
+
+
+def _route_canonical_sha256(value: Any) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ReleaseCheckError("route generation evidence is invalid") from error
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _route_publication_sha256(value: Any) -> str:
+    """Reproduce Task 7 input-generation and cost-set canonical bytes."""
+    try:
+        payload = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ReleaseCheckError("route publication evidence is invalid") from error
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _route_rounded_ratio(value: Fraction, places: int = 8) -> str:
+    sign = -1 if value < 0 else 1
+    absolute = abs(value)
+    scale = 10**places
+    quotient, remainder = divmod(
+        absolute.numerator * scale,
+        absolute.denominator,
+    )
+    if remainder * 2 > absolute.denominator or (
+        remainder * 2 == absolute.denominator and quotient % 2
+    ):
+        quotient += 1
+    quotient *= sign
+    if quotient == 0:
+        return "0"
+    digits = str(abs(quotient)).rjust(places + 1, "0")
+    text = digits[:-places] + "." + digits[-places:]
+    text = text.rstrip("0").rstrip(".")
+    return ("-" if quotient < 0 else "") + text
+
+
+def _route_ratio_fields(edge: Fraction, buy_cost: Fraction) -> tuple[str, str, str]:
+    ratio = edge * 10_000 / buy_cost
+    return (
+        _route_rounded_ratio(ratio),
+        str(ratio.numerator),
+        str(ratio.denominator),
+    )
+
+
+def _route_expected_component_keys(
+    route: Mapping[str, Any],
+) -> set[tuple[str, str]]:
+    expected = {("route", "rebalancing_or_transfer")}
+    for leg in ("buy", "sell"):
+        market_id = str(route.get(leg + "_market_id", ""))
+        if market_id.startswith("cex:"):
+            expected.add((leg, "venue_taker_fee"))
+        elif market_id.startswith("dex:"):
+            expected.update({
+                (leg, "pool_swap_fee"),
+                (leg, "network_gas"),
+                (leg, "router_or_integrator_fee"),
+                (leg, "token_transfer_tax"),
+            })
+        else:
+            raise ReleaseCheckError("route market type is unsupported")
+    return expected
+
+
+def _route_cost_is_current(
+    row: Mapping[str, Any], now_epoch: Decimal
+) -> bool:
+    if row.get("value_status") == "not_applicable":
+        return row.get("observed_at") is None and row.get("valid_until") is None
+    observed_at = row.get("observed_at")
+    if observed_at is None:
+        return row.get("value_status") in _ROUTE_SCENARIO_VALUE_STATUSES
+    observed_epoch = _route_timestamp(observed_at, "cost observed_at")
+    if observed_epoch > now_epoch:
+        return False
+    valid_until = row.get("valid_until")
+    if valid_until is not None:
+        return now_epoch < _route_timestamp(valid_until, "cost valid_until")
+    return Fraction(now_epoch - observed_epoch) <= MAX_ROUTE_AGE_SECONDS
+
+
+def _route_not_applicable_is_proved(
+    row: Mapping[str, Any], route: Mapping[str, Any]
+) -> bool:
+    component_type = row.get("component_type")
+    if component_type == "rebalancing_or_transfer":
+        return (
+            row.get("leg") == "route"
+            and route.get("route_mode") in {
+                "prepositioned_inventory", "atomic_onchain"
+            }
+            and row.get("source") == "validated route topology"
+        )
+    if component_type in {"router_or_integrator_fee", "token_transfer_tax"}:
+        return (
+            row.get("leg") in {"buy", "sell"}
+            and row.get("source") == "validated route adapter contract"
+            and isinstance(row.get("source_record_sha256"), str)
+        )
+    return False
+
+
+def _route_cost_inventory(
+    bundle: Mapping[str, Any],
+    *,
+    now_epoch: Decimal,
+) -> dict[str, list[Mapping[str, Any]]]:
+    rows = bundle.get("cost_components")
+    opportunities = bundle.get("opportunities")
+    routes = bundle.get("routes")
+    if not isinstance(rows, list) or not isinstance(opportunities, list):
+        raise ReleaseCheckError("route cost inventory is unavailable")
+    if not isinstance(routes, list):
+        raise ReleaseCheckError("route inventory is unavailable")
+    try:
+        validate_cost_components(rows)
+    except (TypeError, ValueError) as error:
+        raise ReleaseCheckError(str(error)) from error
+
+    opportunity_ids = {
+        str(row.get("opportunity_id")) for row in opportunities
+        if isinstance(row, Mapping)
+    }
+    by_opportunity: dict[str, list[Mapping[str, Any]]] = {}
+    seen: set[tuple[str, str, str]] = set()
+    for row in rows:
+        opportunity_id = str(row.get("opportunity_id"))
+        if opportunity_id not in opportunity_ids:
+            raise ReleaseCheckError("orphan cost component is not publishable")
+        key = (
+            opportunity_id,
+            str(row.get("leg")),
+            str(row.get("component_type")),
+        )
+        if key in seen:
+            raise ReleaseCheckError("duplicate cost component is not publishable")
+        seen.add(key)
+        if (
+            row.get("component_type") == "network_gas"
+            and row.get("value_status") in _ROUTE_STRICT_VALUE_STATUSES
+            and row.get("amount_usd") is not None
+            and _route_decimal(row["amount_usd"], "network gas amount") == 0
+        ):
+            raise ReleaseCheckError("fake zero gas cost is not publishable")
+        if row.get("value_status") in _ROUTE_TERMINAL_VALUE_STATUSES and (
+            row.get("amount_usd") is not None or row.get("rate_bps") is not None
+        ):
+            raise ReleaseCheckError(
+                "missing or unsupported cost must remain null"
+            )
+        by_opportunity.setdefault(opportunity_id, []).append(row)
+
+    routes_by_id = {
+        str(route.get("route_id")): route
+        for route in routes
+        if isinstance(route, Mapping)
+    }
+    for opportunity in opportunities:
+        opportunity_id = str(opportunity.get("opportunity_id"))
+        route = routes_by_id.get(str(opportunity.get("route_id")))
+        if route is None:
+            raise ReleaseCheckError("route opportunity has no exact route")
+        component_rows = by_opportunity.get(opportunity_id, [])
+        actual = {
+            (str(row.get("leg")), str(row.get("component_type")))
+            for row in component_rows
+            if row.get("component_type") != "mev_buffer"
+        }
+        expected = _route_expected_component_keys(route)
+        if expected - actual:
+            raise ReleaseCheckError("missing cost component is not publishable")
+        if actual - expected:
+            raise ReleaseCheckError("unexpected cost component is not publishable")
+        for row in component_rows:
+            if row.get("requested_notional_usd") != opportunity.get(
+                "requested_notional_usd"
+            ):
+                raise ReleaseCheckError("cost component notional conflicts")
+            if row.get("target_token_quantity") != opportunity.get(
+                "target_token_quantity"
+            ):
+                raise ReleaseCheckError("cost component quantity conflicts")
+            if row.get("value_status") == "not_applicable" and not (
+                _route_not_applicable_is_proved(row, route)
+            ):
+                raise ReleaseCheckError(
+                    "not-applicable cost lacks route proof"
+                )
+            if (
+                opportunity.get("strict_eligible") is True
+                and row.get("strict_eligible") is True
+                and not _route_cost_is_current(row, now_epoch)
+            ):
+                raise ReleaseCheckError("stale cost evidence is not strict")
+    return by_opportunity
+
+
+def _route_now_epoch(now: Any) -> tuple[Decimal, str]:
+    if now is None:
+        current = datetime.now(timezone.utc)
+        text = current.isoformat().replace("+00:00", "Z")
+        return _route_timestamp(text, "route validation"), text
+    if isinstance(now, datetime):
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ReleaseCheckError("route validation timestamp is naive")
+        text = now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return _route_timestamp(text, "route validation"), text
+    if isinstance(now, str):
+        return _route_timestamp(now, "route validation"), now
+    raise ReleaseCheckError("route validation timestamp is invalid")
+
+
+def _route_assert_ratio(
+    row: Mapping[str, Any],
+    *,
+    prefix: str,
+    edge: Fraction,
+    buy_cost: Fraction,
+) -> None:
+    expected = _route_ratio_fields(edge, buy_cost)
+    actual = (
+        row.get(prefix + "_bps"),
+        row.get(prefix + "_bps_numerator"),
+        row.get(prefix + "_bps_denominator"),
+    )
+    if actual != expected:
+        raise ReleaseCheckError("{} bps arithmetic does not reproduce".format(prefix))
+
+
+def _validate_route_opportunity_row(
+    row: Mapping[str, Any],
+    *,
+    route: Mapping[str, Any],
+    legs_by_market: Mapping[str, Mapping[str, Any]],
+    components: Iterable[Mapping[str, Any]],
+    core_manifest_sha256: str,
+    now_epoch: Decimal,
+) -> None:
+    provided = dict(row)
+    evidence_binding = provided.pop("evidence_binding_sha256", None)
+    if evidence_binding != _route_canonical_sha256(provided):
+        raise ReleaseCheckError("opportunity evidence binding does not reproduce")
+    if any(
+        row.get(field) != route.get(field)
+        for field in (
+            "route_id", "token_symbol", "buy_market_id", "sell_market_id",
+            "route_mode",
+        )
+    ):
+        raise ReleaseCheckError("route opportunity lineage does not reproduce")
+    if (
+        row.get("buy_core_manifest_sha256") != core_manifest_sha256
+        or row.get("sell_core_manifest_sha256") != core_manifest_sha256
+    ):
+        raise ReleaseCheckError("route opportunity core binding conflicts")
+    strict = row.get("strict_eligible") is True
+    ready = row.get("strict_ready_for_publication") is True
+    opportunity_class = row.get("opportunity_class")
+    if ready and not strict:
+        raise ReleaseCheckError(
+            "prepublication strict-ready opportunity is not public"
+        )
+    if (opportunity_class == "executable_candidate") != (ready and strict):
+        raise ReleaseCheckError(
+            "executable candidate requires strict-ready and strict-eligible"
+        )
+    buy_market_id = str(route.get("buy_market_id", ""))
+    sell_market_id = str(route.get("sell_market_id", ""))
+    strict_cex_identity = (
+        route.get("route_mode") == "prepositioned_inventory"
+        and buy_market_id.startswith("cex:")
+        and sell_market_id.startswith("cex:")
+        and len(buy_market_id.split(":", 2)) == 3
+        and len(sell_market_id.split(":", 2)) == 3
+        and buy_market_id.split(":", 2)[1] != sell_market_id.split(":", 2)[1]
+    )
+    if strict and not strict_cex_identity:
+        raise ReleaseCheckError("strict route identity is unsupported")
+    if strict and (
+        str(route.get("buy_market_id", "")).startswith("cex:upbit:")
+        or str(route.get("sell_market_id", "")).startswith("cex:upbit:")
+    ):
+        raise ReleaseCheckError("Upbit route must never be strict")
+
+    target = Fraction(_route_decimal(
+        row.get("target_token_quantity"), "target quantity", positive=True
+    ))
+    raw_quantity = _route_integer(
+        row.get("target_base_raw"), "target raw quantity", positive=True
+    )
+    unit_decimals = row.get("target_base_unit_decimals")
+    lattice_raw = _route_integer(
+        row.get("target_lattice_raw"), "target lattice", positive=True
+    )
+    if type(unit_decimals) is not int or not 0 <= unit_decimals <= 36:
+        raise ReleaseCheckError("quantity unit decimals are invalid")
+    if raw_quantity % lattice_raw or target != Fraction(
+        raw_quantity, 10**unit_decimals
+    ):
+        raise ReleaseCheckError("quantity lattice does not reproduce target")
+
+    state_epochs: dict[str, Decimal | None] = {}
+    for side in ("buy", "sell"):
+        market_id = str(row.get(side + "_market_id"))
+        leg = legs_by_market.get(market_id)
+        if leg is None:
+            raise ReleaseCheckError("state lineage has no exact published leg")
+        observed_at = row.get(side + "_state_observed_at")
+        if observed_at != leg.get("state_observed_at"):
+            raise ReleaseCheckError("state lineage timestamp conflicts with leg")
+        if observed_at is None:
+            if strict:
+                raise ReleaseCheckError("strict state timestamp is unavailable")
+            state_epochs[side] = None
+            continue
+        if leg.get("available") is not True or leg.get("status") != "observed":
+            if strict:
+                raise ReleaseCheckError("strict state leg is unavailable")
+        state_epochs[side] = _route_timestamp(
+            observed_at, side + " state"
+        )
+    available_epochs = [
+        epoch for epoch in state_epochs.values() if epoch is not None
+    ]
+    if any(epoch > now_epoch for epoch in available_epochs):
+        raise ReleaseCheckError("state timestamp is in the future")
+    if len(available_epochs) != 2:
+        if row.get("skew_seconds") is not None or row.get("route_age_seconds") is not None:
+            raise ReleaseCheckError("unavailable state has timing residue")
+    else:
+        skew = abs(available_epochs[0] - available_epochs[1])
+        stored_skew = Fraction(_route_decimal(row.get("skew_seconds"), "skew"))
+        if stored_skew != Fraction(skew):
+            raise ReleaseCheckError("skew does not reproduce state timestamps")
+        if strict and stored_skew > MAX_ROUTE_SKEW_SECONDS:
+            raise ReleaseCheckError("skew exceeds strict route SLA")
+        current_age = Fraction(now_epoch - max(available_epochs))
+        stored_age = Fraction(_route_decimal(
+            row.get("route_age_seconds"), "route age"
+        ))
+        if stored_age < 0:
+            raise ReleaseCheckError("route age is invalid")
+        if strict and (
+            stored_age > MAX_ROUTE_AGE_SECONDS
+            or current_age > MAX_ROUTE_AGE_SECONDS
+        ):
+            raise ReleaseCheckError(
+                "stale inventory and route evidence is not strict"
+            )
+
+    if strict:
+        if row.get("mode_evidence_eligible") is not True:
+            raise ReleaseCheckError("strict route mode evidence is unavailable")
+        profile_hash = row.get("inventory_profile_hash")
+        if not isinstance(profile_hash, str) or re.fullmatch(
+            r"[0-9a-f]{64}", profile_hash
+        ) is None:
+            raise ReleaseCheckError("strict inventory profile is unavailable")
+        capacity = Fraction(_route_decimal(
+            row.get("maximum_proved_capacity_quantity"),
+            "inventory capacity",
+            positive=True,
+        ))
+        if capacity < target:
+            raise ReleaseCheckError("strict inventory capacity is insufficient")
+        expected_mode_hash = _route_canonical_sha256({
+            "route_id": row.get("route_id"),
+            "route_mode": row.get("route_mode"),
+            "classification": "mode_evidence_eligible",
+            "mode_evidence_eligible": True,
+            "reason_code": None,
+            "reason_codes": [],
+            "inventory_profile_hash": profile_hash,
+            "maximum_proved_capacity_quantity": row.get(
+                "maximum_proved_capacity_quantity"
+            ),
+        })
+        if row.get("mode_evidence_sha256") != expected_mode_hash:
+            raise ReleaseCheckError("strict mode evidence hash does not reproduce")
+
+    component_rows = list(components)
+    canonical_components = sorted(
+        component_rows,
+        key=lambda item: (
+            str(item.get("opportunity_id")),
+            str(item.get("leg")),
+            str(item.get("component_type")),
+        ),
+    )
+    expected_cost_set_hash = _route_publication_sha256(canonical_components)
+    if row.get("cost_component_set_sha256") != expected_cost_set_hash:
+        raise ReleaseCheckError("opportunity cost-set binding does not reproduce")
+    if strict:
+        expected_attestation = _route_canonical_sha256({
+            "cohort_id": row.get("cohort_id"),
+            "opportunity_id": row.get("opportunity_id"),
+            "route_id": row.get("route_id"),
+            "target_token_quantity": row.get("target_token_quantity"),
+            "buy_state_id": row.get("buy_state_id"),
+            "sell_state_id": row.get("sell_state_id"),
+            "buy_usd_projection_sha256": row.get("buy_usd_projection_sha256"),
+            "sell_usd_projection_sha256": row.get("sell_usd_projection_sha256"),
+            "cost_component_set_sha256": row.get("cost_component_set_sha256"),
+            "mode_evidence_sha256": row.get("mode_evidence_sha256"),
+            "core_manifest_sha256": core_manifest_sha256,
+        })
+        if row.get("publication_attestation_sha256") != expected_attestation:
+            raise ReleaseCheckError("publication attestation does not reproduce")
+    reflected_values = row.get("reflected_or_embedded_component_keys")
+    if not isinstance(reflected_values, list) or any(
+        not isinstance(value, str) for value in reflected_values
+    ) or reflected_values != sorted(set(reflected_values)):
+        raise ReleaseCheckError("reflected cost inventory is invalid")
+    reflected = set(reflected_values)
+    required_keys = _route_expected_component_keys(route)
+    by_key = {
+        (str(item.get("leg")), str(item.get("component_type"))): item
+        for item in component_rows
+        if item.get("component_type") != "mev_buffer"
+    }
+    strict_complete = True
+    scenario_complete = True
+    strict_total = Fraction(0)
+    bounded_total = Fraction(0)
+    assumed_total = Fraction(0)
+    estimated = False
+    for key in required_keys:
+        component = by_key[key]
+        status = str(component.get("value_status"))
+        current = _route_cost_is_current(component, now_epoch)
+        strict_component = (
+            status in _ROUTE_STRICT_VALUE_STATUSES
+            and component.get("strict_eligible") is True
+            and current
+        )
+        scenario_component = (
+            strict_component
+            or (status in _ROUTE_SCENARIO_VALUE_STATUSES and current)
+        )
+        strict_complete = strict_complete and strict_component
+        scenario_complete = scenario_complete and scenario_component
+        if status in _ROUTE_SCENARIO_VALUE_STATUSES:
+            estimated = True
+        key_text = "{}:{}".format(*key)
+        if component.get("embedded_in_leg_quote") is True and key_text not in reflected:
+            raise ReleaseCheckError("reflected embedded cost is missing")
+        if (
+            component.get("component_type") == "pool_swap_fee"
+            and component.get("amount_usd") is not None
+            and key_text not in reflected
+        ):
+            raise ReleaseCheckError("reflected pool fee would be double counted")
+        amount_value = component.get("amount_usd")
+        if amount_value is None or key_text in reflected:
+            continue
+        amount = Fraction(_route_decimal(amount_value, "cost amount"))
+        if strict_component:
+            strict_total += amount
+        elif status == "bounded_estimate":
+            bounded_total += amount
+        elif status == "assumed":
+            assumed_total += amount
+
+    if any(
+        str(item.get("component_type")) == "mev_buffer"
+        for item in component_rows
+    ):
+        for component in component_rows:
+            if component.get("component_type") != "mev_buffer":
+                continue
+            status = str(component.get("value_status"))
+            current = _route_cost_is_current(component, now_epoch)
+            if status not in _ROUTE_SCENARIO_VALUE_STATUSES or not current:
+                scenario_complete = False
+            elif component.get("amount_usd") is not None:
+                estimated = True
+                if status == "bounded_estimate":
+                    bounded_total += Fraction(_route_decimal(
+                        component["amount_usd"], "MEV bounded cost"
+                    ))
+                else:
+                    assumed_total += Fraction(_route_decimal(
+                        component["amount_usd"], "MEV assumed cost"
+                    ))
+    elif any(
+        str(route.get(side + "_market_id", "")).startswith("dex:")
+        for side in ("buy", "sell")
+    ):
+        strict_complete = False
+        scenario_complete = False
+
+    if strict and (not strict_complete or estimated):
+        raise ReleaseCheckError("strict opportunity uses incomplete or estimated cost")
+    expected_cost_completeness = "complete" if strict_complete else "incomplete"
+    expected_scenario_completeness = (
+        "complete" if scenario_complete else "incomplete"
+    )
+    if row.get("cost_completeness") != expected_cost_completeness:
+        raise ReleaseCheckError("strict cost completeness does not reproduce")
+    if row.get("scenario_cost_completeness") != expected_scenario_completeness:
+        raise ReleaseCheckError("scenario cost completeness does not reproduce")
+
+    gross_buy_value = row.get("gross_buy_cost_usd")
+    gross_sell_value = row.get("gross_sell_proceeds_usd")
+    if gross_buy_value is None or gross_sell_value is None:
+        if strict or opportunity_class == "executable_candidate":
+            raise ReleaseCheckError("strict opportunity cashflow is unavailable")
+        numeric_fields = (
+            "gross_edge_usd", "strict_net_edge_usd", "research_net_edge_usd",
+            "gross_edge_bps", "strict_net_edge_bps", "research_net_edge_bps",
+        )
+        if any(row.get(field) is not None for field in numeric_fields):
+            raise ReleaseCheckError("unavailable cost was coerced into a number")
+        return
+
+    gross_buy = Fraction(_route_decimal(
+        gross_buy_value, "gross buy cost", positive=True
+    ))
+    gross_sell = Fraction(_route_decimal(
+        gross_sell_value, "gross sell proceeds", positive=True
+    ))
+    gross_edge = gross_sell - gross_buy
+    if Fraction(_route_decimal(row.get("gross_edge_usd"), "gross edge")) != gross_edge:
+        raise ReleaseCheckError("gross edge arithmetic does not reproduce")
+    _route_assert_ratio(
+        row, prefix="gross_edge", edge=gross_edge, buy_cost=gross_buy
+    )
+    if Fraction(_route_decimal(
+        row.get("strict_nonembedded_cost_usd"), "strict cost"
+    )) != strict_total:
+        raise ReleaseCheckError("strict cost arithmetic does not reproduce")
+    if Fraction(_route_decimal(
+        row.get("research_bounded_cost_usd"), "bounded cost"
+    )) != bounded_total:
+        raise ReleaseCheckError("bounded cost arithmetic does not reproduce")
+    if Fraction(_route_decimal(
+        row.get("research_assumed_cost_usd"), "assumed cost"
+    )) != assumed_total:
+        raise ReleaseCheckError("assumed cost arithmetic does not reproduce")
+
+    strict_net = gross_edge - strict_total
+    if Fraction(_route_decimal(
+        row.get("strict_net_edge_usd"), "strict net edge"
+    )) != strict_net:
+        raise ReleaseCheckError("strict net edge arithmetic does not reproduce")
+    _route_assert_ratio(
+        row, prefix="strict_net_edge", edge=strict_net, buy_cost=gross_buy
+    )
+    if scenario_complete:
+        research_net = strict_net - bounded_total - assumed_total
+        if Fraction(_route_decimal(
+            row.get("research_net_edge_usd"), "research net edge"
+        )) != research_net:
+            raise ReleaseCheckError("research net edge arithmetic does not reproduce")
+        _route_assert_ratio(
+            row, prefix="research_net_edge", edge=research_net,
+            buy_cost=gross_buy,
+        )
+    elif any(row.get(field) is not None for field in (
+        "research_net_edge_usd", "research_net_edge_bps",
+        "research_net_edge_bps_numerator", "research_net_edge_bps_denominator",
+    )):
+        raise ReleaseCheckError("missing scenario cost was coerced into zero")
+    if strict and strict_net <= 0:
+        raise ReleaseCheckError("strict opportunity has no positive net edge")
+
+
+def _validate_loaded_route_opportunity_release(
+    loaded: Mapping[str, Any],
+    *,
+    now: Any = None,
+) -> dict[str, Any]:
+    bundle = loaded.get("bundle")
+    manifest = loaded.get("manifest")
+    pointer = loaded.get("pointer")
+    if not all(isinstance(value, Mapping) for value in (
+        bundle, manifest, pointer
+    )):
+        raise ReleaseCheckError("complete route opportunity envelope is invalid")
+    if (
+        manifest.get("bundle_stage") != "route_opportunity/v1"
+        or bundle.get("schema") != "route_opportunity/v1"
+        or pointer.get("bundle_stage") != "route_opportunity/v1"
+    ):
+        raise ReleaseCheckError("core-only or partial route bundle is not public")
+    now_epoch, now_text = _route_now_epoch(now)
+    routes = bundle.get("routes")
+    legs = bundle.get("legs")
+    opportunities = bundle.get("opportunities")
+    costs = bundle.get("cost_components")
+    if not all(isinstance(value, list) for value in (
+        routes, legs, opportunities, costs
+    )):
+        raise ReleaseCheckError("complete route inventories are invalid")
+    routes_by_id = {
+        str(route.get("route_id")): route
+        for route in routes if isinstance(route, Mapping)
+    }
+    legs_by_market = {
+        str(leg.get("market_id")): leg
+        for leg in legs if isinstance(leg, Mapping)
+    }
+    if len(routes_by_id) != len(routes) or len(legs_by_market) != len(legs):
+        raise ReleaseCheckError("complete route inventories contain duplicates")
+    components_by_opportunity = _route_cost_inventory(
+        bundle, now_epoch=now_epoch
+    )
+    for row in opportunities:
+        if not isinstance(row, Mapping):
+            raise ReleaseCheckError("route opportunity row is invalid")
+        route = routes_by_id.get(str(row.get("route_id")))
+        if route is None:
+            raise ReleaseCheckError("route opportunity lineage is missing")
+        _validate_route_opportunity_row(
+            row,
+            route=route,
+            legs_by_market=legs_by_market,
+            components=components_by_opportunity.get(
+                str(row.get("opportunity_id")), []
+            ),
+            core_manifest_sha256=str(bundle.get("core_manifest_sha256")),
+            now_epoch=now_epoch,
+        )
+
+    generations = bundle.get("input_generations")
+    if not isinstance(generations, Mapping):
+        raise ReleaseCheckError("route input generations are unavailable")
+    expected_cost_generation = _route_publication_sha256(costs)
+    if generations.get("cost_component_generation") != expected_cost_generation:
+        raise ReleaseCheckError("cost component generation does not reproduce")
+    raw_generation_members = [
+        {
+            "market_id": str(leg.get("market_id")),
+            "sha256": str(leg.get("raw_response_sha256")),
+        }
+        for leg in sorted(legs, key=lambda item: str(item.get("market_id")))
+    ]
+    if generations.get("raw_evidence_generation") != _route_publication_sha256(
+        raw_generation_members
+    ):
+        raise ReleaseCheckError("raw evidence generation does not reproduce")
+    if manifest.get("input_generations") != generations:
+        raise ReleaseCheckError("manifest input generations diverge")
+    if (
+        pointer.get("core_manifest_sha256")
+        != bundle.get("core_manifest_sha256")
+        or manifest.get("core_manifest_sha256")
+        != bundle.get("core_manifest_sha256")
+        or pointer.get("core_pointer_sha256")
+        != bundle.get("core_pointer_sha256")
+        or manifest.get("core_pointer_sha256")
+        != bundle.get("core_pointer_sha256")
+    ):
+        raise ReleaseCheckError("complete bundle core lineage diverges")
+    context = bundle.get("core_context")
+    if not isinstance(context, Mapping):
+        raise ReleaseCheckError("complete bundle core context is invalid")
+    completed = _route_timestamp(
+        context.get("collection_completed_at"), "core completion"
+    )
+    deadline = _route_timestamp(
+        context.get("collection_deadline_at"), "core deadline"
+    )
+    if completed > deadline:
+        raise ReleaseCheckError("core collection exceeded its deadline")
+
+    for inventory_name, bundle_name in (
+        ("legs", "legs"),
+        ("cost_components", "cost_components"),
+        ("opportunities", "opportunities"),
+    ):
+        if loaded.get(inventory_name) != bundle.get(bundle_name):
+            raise ReleaseCheckError("CSV and SQLite route inventories diverge")
+    strict_rows = [
+        row for row in opportunities if row.get("strict_eligible") is True
+    ]
+    empty_generation = _route_canonical_sha256([])
+    if strict_rows and any(
+        generations.get(field) == empty_generation
+        for field in (
+            "fee_profile_generation",
+            "inventory_profile_generation",
+            "typed_source_generation",
+        )
+    ):
+        raise ReleaseCheckError("strict route source generation is empty")
+    research_count = sum(
+        row.get("opportunity_class") == "research_estimate"
+        for row in opportunities
+    )
+    unavailable_count = sum(
+        row.get("opportunity_class") == "unavailable"
+        for row in opportunities
+    )
+    return {
+        "status": "validated",
+        "reason": None,
+        "bundle_stage": "route_opportunity/v1",
+        "route_cohort_id": bundle["route_cohort_id"],
+        "manifest_sha256": loaded.get("manifest_sha256"),
+        "core_manifest_sha256": bundle["core_manifest_sha256"],
+        "strict_opportunity_count": len(strict_rows),
+        "research_opportunity_count": research_count,
+        "unavailable_opportunity_count": unavailable_count,
+        "cost_component_count": len(costs),
+        "validated_at": now_text,
+    }
+
+
+def validate_route_opportunity_release(
+    routes_root: Path,
     *,
     required: bool,
+    now: Any = None,
 ) -> dict[str, Any]:
-    """Validate the one private route-core pointer when it is available."""
-    pointer_path = Path(core_root) / "latest.json"
+    """Validate only the complete public opportunity pointer and its five files."""
+    pointer_path = Path(routes_root) / "latest.json"
     try:
         pointer_path.lstat()
     except FileNotFoundError:
         if required:
             raise ReleaseCheckError(
-                "required route cohort pointer is unavailable"
+                "required complete route opportunity pointer is unavailable"
             )
-        return {
-            "status": "unavailable",
-            "reason": "core_pointer_absent",
-        }
+        return {"status": "unavailable", "reason": "complete_pointer_absent"}
     except OSError as error:
         raise ReleaseCheckError(
-            "route cohort core pointer cannot be inspected: {}".format(error)
+            "complete route opportunity pointer cannot be inspected"
         ) from error
     try:
-        loaded = load_latest_route_cohort(Path(core_root))
-    except (OSError, ValueError) as error:
+        loaded = load_latest_complete_route_bundle(Path(routes_root))
+    except OSError as error:
         raise ReleaseCheckError(
-            "route cohort core validation failed: {}".format(error)
+            "complete route opportunity validation failed: I/O unavailable"
         ) from error
-    manifest = loaded["manifest"]
-    return {
-        "status": "validated",
-        "reason": None,
-        "route_cohort_id": manifest["route_cohort_id"],
-        "timing_status_counts": dict(manifest["timing_status_counts"]),
-    }
+    except (TypeError, ValueError, RoutePublicationError) as error:
+        raise ReleaseCheckError(
+            "complete route opportunity validation failed: {}".format(error)
+        ) from error
+    try:
+        return _validate_loaded_route_opportunity_release(loaded, now=now)
+    except ReleaseCheckError:
+        raise
+    except (ArithmeticError, KeyError, TypeError, ValueError) as error:
+        raise ReleaseCheckError(
+            "complete route opportunity semantic validation failed: {}".format(
+                error
+            )
+        ) from error
 
 
-def configured_route_core_root() -> Path:
-    """Return the private route-core root used by collection operations."""
+def configured_route_root() -> Path:
+    """Return the complete public opportunity root used by release checks."""
     configured_data_root = os.environ.get("MARKET_DATA_DIR")
     if configured_data_root:
-        return Path(configured_data_root).expanduser() / "routes/core"
-    return DEFAULT_ROUTE_CORE_ROOT
+        return Path(configured_data_root).expanduser() / "routes"
+    return DEFAULT_ROUTE_ROOT
 
 
 def validate_release_health(
@@ -3094,8 +3889,8 @@ def validate_events(
 
 
 def release_check(args: argparse.Namespace) -> dict[str, Any]:
-    route_cohort_validation = validate_route_cohort_release(
-        configured_route_core_root(),
+    route_opportunity_validation = validate_route_opportunity_release(
+        configured_route_root(),
         required=getattr(args, "require_route_cohort", False),
     )
     metrics: list[ResponseMetrics] = []
@@ -3575,7 +4370,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "event_count": len(event_rows),
         "event_covered_token_count": event_coverage["covered_token_count"],
         "event_bundle_id": all_events["bundle_id"],
-        "route_cohort": route_cohort_validation,
+        "route_opportunities": route_opportunity_validation,
         "requests": [
             {
                 "path": item.path,
@@ -3607,8 +4402,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--require-route-cohort",
+        "--require-route-opportunities",
+        dest="require_route_cohort",
         action="store_true",
-        help="Fail unless the immutable core route cohort pointer is available and valid",
+        help=(
+            "Fail unless the complete public route-opportunity pointer and "
+            "all-in cost bundle are available and valid"
+        ),
     )
     return parser.parse_args()
 

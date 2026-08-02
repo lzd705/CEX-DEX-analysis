@@ -327,6 +327,53 @@ recomputed before use. The route-mode gate reports only component eligibility:
 that after validating every other component and positive net edge. This layer
 does not add Funding Rate support or change Upbit data or identities.
 
+## Complete route-opportunity finalization and release gate
+
+Route finalization is deliberately separate from live collection. The
+`finalize_route_opportunity_bundle()` orchestration entry point receives an
+already published core cohort plus its retained raw, typed-source, fee, and
+inventory evidence. It does not call a collector. It replays those pinned
+inputs, publishes an immutable five-file bundle under
+`MARKET_DATA_DIR/routes/bundles/<route_cohort_id>/`, validates the installed
+bytes, and only then replaces `MARKET_DATA_DIR/routes/latest.json` with a
+`route_opportunity_pointer/v1` pointer. A failed finalization leaves the prior
+complete pointer and its original timestamp intact.
+
+The private `MARKET_DATA_DIR/routes/core/latest.json` pointer may advance while
+finalization is in progress. Readers never use that core pointer as a public
+opportunity generation. They continue to use the last validated complete
+pointer; a core-only directory, partial complete directory, or caller-supplied
+row list cannot become public by defaulting, sorting, or caching.
+
+Run the deployment release checker after finalization with:
+
+```bash
+python3 scripts/check_dashboard_release.py \
+  --base-url http://127.0.0.1:8765 \
+  --require-route-opportunities
+```
+
+`--require-route-cohort` remains a backward-compatible spelling for the same
+complete-bundle requirement; it no longer validates the private core pointer.
+Without either flag, an absent complete pointer is reported as unavailable so
+deployments that have not launched the route product can proceed. A present
+pointer is never ignored: malformed, partial, stale, divergent, or core-schema
+content fails release validation even in optional mode.
+
+The checker rereads the complete pointer, manifest, three CSV projections, and
+SQLite. It then independently reproduces quantity lattice, leg timestamps,
+skew and age, required component inventory, component freshness, exact gross
+and net cost arithmetic, bps rational fields, raw/cost generations, core
+binding, strict classification, and manifest/CSV/SQLite parity. Missing,
+unsupported, failed, and stale cost amounts must remain null with their reason;
+zero is never a fallback. An executable row requires both strict readiness and
+the Task 7 publication attestation. Authenticated/estimated status cannot be
+rewritten, a reflected pool fee cannot be charged twice, and an authenticated
+gas row with a fabricated zero amount fails closed.
+
+This release-gate change installs no collection timer and exposes no public
+route API. Funding Rate remains excluded and Upbit inputs remain unchanged.
+
 ## Lock and manifest
 
 Every profile acquires `data/local/collection/collection.lock`. A second run
@@ -811,6 +858,10 @@ retention requirement before applying or enabling
   adapter set is a failed step.
 - Raw responses and collector manifests remain available for audit.
 - Collection and publication failures never zero-fill missing values.
+- When route opportunities are required, `routes/latest.json` selects a
+  complete five-file opportunity bundle; strict rows pass all-in cost,
+  quantity, timing, attestation, generation, and cross-format checks. A newer
+  core-only pointer does not substitute for that complete generation.
 - The public API and rendered page display separate source dates and stale
   states.
 - When Event Facts are published, the selected bundle passes source-record,
@@ -820,9 +871,9 @@ retention requirement before applying or enabling
   requests a non-empty scoped Event response for every covered Token.
   An unavailable Event bundle is not reported as a verified zero-event result.
 
-Funding rates, gas, DEX V3 fixed-notional execution, and event-study outputs
-remain unsupported. Existing depth execution rows also continue to exclude
-account-specific CEX fees; only the synchronized route pipeline may add one
-when it has current authenticated or validated-private evidence. Collection
-operations must not manufacture any of these values from spot prices, depth,
-TVL, pool swap fees, public fee defaults, or Event Facts.
+Funding rates, DEX V3 fixed-notional execution, and event-study outputs remain
+unsupported. Existing depth execution rows also continue to exclude
+account-specific CEX fees and gas; only the synchronized route pipeline may
+add authenticated or validated-private CEX fees and adapter-bound gas evidence.
+Collection operations must not manufacture any of these values from spot
+prices, depth, TVL, pool swap fees, public fee defaults, or Event Facts.

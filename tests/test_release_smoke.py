@@ -1,5 +1,8 @@
 import argparse
 import copy
+import hashlib
+import json
+import shutil
 import tempfile
 import inspect
 import unittest
@@ -28,162 +31,503 @@ from scripts.check_dashboard_release import (
 )
 from scripts.cex_instrument_lifecycle import configured_market_ids_sha256
 from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_SOURCES
+import scripts.route_publication as route_publication
+
+
+def _opportunity_binding(row):
+    payload = dict(row)
+    payload.pop("evidence_binding_sha256", None)
+    return hashlib.sha256(json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _reseal_complete_opportunity(bundle, opportunity_id):
+    row = next(
+        item for item in bundle["opportunities"]
+        if item["opportunity_id"] == opportunity_id
+    )
+    components = [
+        item for item in bundle["cost_components"]
+        if item["opportunity_id"] == opportunity_id
+    ]
+    row["cost_component_set_sha256"] = (
+        route_publication._canonical_cost_set_sha256(components)
+    )
+    if row["strict_eligible"]:
+        row["publication_attestation_sha256"] = (
+            route_publication._publication_binding_sha256(
+                cohort_id=row["cohort_id"],
+                opportunity_id=row["opportunity_id"],
+                route_id=row["route_id"],
+                target_token_quantity=row["target_token_quantity"],
+                buy_state_id=row["buy_state_id"],
+                sell_state_id=row["sell_state_id"],
+                buy_usd_projection_sha256=row["buy_usd_projection_sha256"],
+                sell_usd_projection_sha256=row["sell_usd_projection_sha256"],
+                cost_component_set_sha256=row["cost_component_set_sha256"],
+                mode_evidence_sha256=row["mode_evidence_sha256"],
+                core_manifest_sha256=bundle["core_manifest_sha256"],
+            )
+        )
+    row["evidence_binding_sha256"] = _opportunity_binding(row)
+    bundle["cost_components"].sort(key=lambda item: (
+        item["opportunity_id"], item["leg"], item["component_type"]
+    ))
+    bundle["input_generations"]["cost_component_generation"] = (
+        route_publication._canonical_input_sha256(bundle["cost_components"])
+    )
+
+
+class RouteOpportunityReleaseGateTest(unittest.TestCase):
+    """Release checks consume only Task 7's complete public generation."""
+
+    @classmethod
+    def setUpClass(cls):
+        from tests.test_route_publication import _task7_cex_inputs
+
+        cls.base_temporary = tempfile.TemporaryDirectory()
+        base = Path(cls.base_temporary.name)
+        cls.base_routes = base / "data/local/routes"
+        fixture = _task7_cex_inputs(
+            cls.base_routes / "core",
+            base / "data/raw/route-cohort",
+            base / "data/local/route-sources",
+            base / "private",
+        )
+        route_publication.publish_complete_route_bundle(
+            core_root=cls.base_routes / "core",
+            routes_root=cls.base_routes,
+            raw_root=base / "data/raw/route-cohort",
+            source_root=fixture["source_root"],
+            fee_profile_path=fixture["fee_profile_path"],
+            fee_profile_id=fixture["fee_profile_id"],
+            inventory_profile_path=fixture["inventory_profile_path"],
+            opportunity_inputs=fixture["opportunity_inputs"],
+        )
+        cls.validated_at = "2026-08-01T12:02:00Z"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.base_temporary.cleanup()
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.routes_root = Path(self.temporary.name) / "routes"
+        shutil.copytree(self.base_routes, self.routes_root)
+
+    def _loaded(self):
+        return route_publication.load_latest_complete_route_bundle(
+            self.routes_root
+        )
+
+    def _rewrite(self, bundle):
+        artifacts, _manifest = route_publication._complete_artifact_bytes(
+            bundle
+        )
+        bundle_path = (
+            self.routes_root / "bundles" / bundle["route_cohort_id"]
+        )
+        for filename, value in artifacts.items():
+            (bundle_path / filename).write_bytes(value)
+        manifest_sha = hashlib.sha256(artifacts["manifest.json"]).hexdigest()
+        pointer = {
+            "schema": route_publication.ROUTE_OPPORTUNITY_POINTER_SCHEMA,
+            "bundle_stage": route_publication.ROUTE_OPPORTUNITY_BUNDLE_STAGE,
+            "route_cohort_id": bundle["route_cohort_id"],
+            "manifest_sha256": manifest_sha,
+            "core_manifest_sha256": bundle["core_manifest_sha256"],
+            "core_pointer_sha256": bundle["core_pointer_sha256"],
+        }
+        (self.routes_root / "latest.json").write_text(
+            json.dumps(pointer, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def _validate(self, *, required=True, now=None):
+        return release_checker.validate_route_opportunity_release(
+            self.routes_root,
+            required=required,
+            now=now or self.validated_at,
+        )
+
+    def test_valid_complete_public_bundle_passes_and_reports_strict_counts(self):
+        result = self._validate()
+
+        self.assertEqual(result["status"], "validated")
+        self.assertEqual(result["bundle_stage"], "route_opportunity/v1")
+        self.assertEqual(result["strict_opportunity_count"], 5)
+        self.assertEqual(result["research_opportunity_count"], 0)
+
+    def test_valid_non_ascii_cost_evidence_uses_task7_canonical_encoding(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        opportunity_id = bundle["opportunities"][0]["opportunity_id"]
+        component = next(
+            item for item in bundle["cost_components"]
+            if item["opportunity_id"] == opportunity_id
+            and item["component_type"] == "venue_taker_fee"
+            and item["leg"] == "buy"
+        )
+        component["source"] = "已验证的 CEX 费率证据"
+        component["basis"] += "；账户等级已验证"
+        _reseal_complete_opportunity(bundle, opportunity_id)
+        self._rewrite(bundle)
+
+        result = self._validate()
+
+        self.assertEqual(result["status"], "validated")
+        self.assertEqual(result["strict_opportunity_count"], 5)
+
+    def test_prepublication_strict_ready_row_is_not_a_public_candidate(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        row = bundle["opportunities"][0]
+        row.update({
+            "strict_eligible": False,
+            "opportunity_class": "research_estimate",
+            "primary_reason": "publication_evidence_unverified",
+            "reason_codes": ["publication_evidence_unverified"],
+            "publication_attestation_sha256": None,
+        })
+        row["evidence_binding_sha256"] = _opportunity_binding(row)
+        self._rewrite(bundle)
+
+        with self.assertRaisesRegex(ReleaseCheckError, "prepublication"):
+            self._validate()
+
+    def test_missing_cost_stays_null_and_cannot_be_promoted_to_zero(self):
+        loaded = self._loaded()
+        bundle = copy.deepcopy(loaded["bundle"])
+        row = bundle["opportunities"][0]
+        component = next(
+            item for item in bundle["cost_components"]
+            if item["opportunity_id"] == row["opportunity_id"]
+            and item["leg"] == "buy"
+        )
+        component.update({
+            "value_status": "unsupported",
+            "amount_usd": "0",
+            "rate_bps": "0",
+            "strict_eligible": False,
+            "observed_at": None,
+            "valid_until": None,
+            "source_record_sha256": None,
+            "reason_code": "cost_source_unsupported",
+        })
+        candidate = dict(loaded)
+        candidate["bundle"] = bundle
+        candidate["cost_components"] = bundle["cost_components"]
+
+        with self.assertRaisesRegex(ReleaseCheckError, "cannot contain numeric"):
+            release_checker._validate_loaded_route_opportunity_release(
+                candidate, now=self.validated_at
+            )
+
+    def test_absent_complete_pointer_is_optional_but_core_pointer_is_never_public(self):
+        (self.routes_root / "latest.json").unlink()
+        self.assertEqual(
+            self._validate(required=False),
+            {"status": "unavailable", "reason": "complete_pointer_absent"},
+        )
+        with self.assertRaisesRegex(
+            ReleaseCheckError, "required complete route opportunity.*unavailable"
+        ):
+            self._validate(required=True)
+
+        core_pointer = json.loads(
+            (self.routes_root / "core/latest.json").read_text(encoding="utf-8")
+        )
+        (self.routes_root / "latest.json").write_text(
+            json.dumps(core_pointer) + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            ReleaseCheckError, "complete route opportunity validation failed"
+        ):
+            self._validate(required=False)
+
+    def test_partial_or_divergent_bundle_never_counts_as_public(self):
+        loaded = self._loaded()
+        bundle_path = loaded["path"]
+        (bundle_path / "cost_components.csv").unlink()
+        with self.assertRaisesRegex(ReleaseCheckError, "validation failed"):
+            self._validate()
+
+        shutil.rmtree(self.routes_root)
+        shutil.copytree(self.base_routes, self.routes_root)
+        loaded = self._loaded()
+        with (loaded["path"] / "route_opportunities.csv").open("ab") as handle:
+            handle.write(b"\n")
+        with self.assertRaisesRegex(ReleaseCheckError, "validation failed"):
+            self._validate()
+
+    def test_coordinated_row_and_binding_rehash_cannot_change_common_quantity(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        row = bundle["opportunities"][0]
+        row["target_token_quantity"] = "11"
+        row["target_base_raw"] = "1100"
+        for component in bundle["cost_components"]:
+            if component["opportunity_id"] == row["opportunity_id"]:
+                component["target_token_quantity"] = "11"
+        _reseal_complete_opportunity(bundle, row["opportunity_id"])
+        self._rewrite(bundle)
+
+        with self.assertRaisesRegex(
+            ReleaseCheckError, "inventory capacity|quantity"
+        ):
+            self._validate()
+
+    def test_exact_opportunity_arithmetic_is_rebuilt_not_trusted(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        row = bundle["opportunities"][0]
+        row["gross_edge_usd"] = "7.96"
+        row["evidence_binding_sha256"] = _opportunity_binding(row)
+        self._rewrite(bundle)
+
+        with self.assertRaisesRegex(ReleaseCheckError, "gross edge"):
+            self._validate()
+
+    def test_state_quantity_skew_and_age_counterexamples_fail_closed(self):
+        mutations = {
+            "quantity lattice": lambda row: row.update(target_base_raw="1001"),
+            "state lineage": lambda row: row.update(
+                buy_state_observed_at="2026-08-01T12:00:01Z"
+            ),
+            "skew": lambda row: row.update(skew_seconds="61"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                shutil.rmtree(self.routes_root)
+                shutil.copytree(self.base_routes, self.routes_root)
+                bundle = copy.deepcopy(self._loaded()["bundle"])
+                row = bundle["opportunities"][0]
+                mutate(row)
+                row["evidence_binding_sha256"] = _opportunity_binding(row)
+                self._rewrite(bundle)
+                with self.assertRaisesRegex(ReleaseCheckError, label.split()[0]):
+                    self._validate()
+
+        shutil.rmtree(self.routes_root)
+        shutil.copytree(self.base_routes, self.routes_root)
+        with self.assertRaisesRegex(ReleaseCheckError, "stale"):
+            self._validate(now="2026-08-01T12:03:01Z")
+
+    def test_stale_fee_evidence_cannot_remain_strict(self):
+        bundle = copy.deepcopy(self._loaded()["bundle"])
+        row = bundle["opportunities"][0]
+        fee = next(
+            item for item in bundle["cost_components"]
+            if item["opportunity_id"] == row["opportunity_id"]
+            and item["component_type"] == "venue_taker_fee"
+        )
+        fee["valid_until"] = "2026-08-01T12:01:59Z"
+        _reseal_complete_opportunity(bundle, row["opportunity_id"])
+        self._rewrite(bundle)
+
+        with self.assertRaisesRegex(ReleaseCheckError, "stale cost"):
+            self._validate()
+
+    def test_missing_duplicate_or_orphan_costs_fail_closed(self):
+        loaded = self._loaded()
+        base = loaded["bundle"]
+        opportunity_id = base["opportunities"][0]["opportunity_id"]
+        variants = {}
+        missing = copy.deepcopy(base)
+        missing["cost_components"] = [
+            item for item in missing["cost_components"]
+            if not (
+                item["opportunity_id"] == opportunity_id
+                and item["component_type"] == "venue_taker_fee"
+                and item["leg"] == "buy"
+            )
+        ]
+        variants["missing"] = missing
+        duplicate = copy.deepcopy(base)
+        duplicate["cost_components"].append(
+            copy.deepcopy(duplicate["cost_components"][0])
+        )
+        variants["duplicate"] = duplicate
+        orphan = copy.deepcopy(base)
+        orphan_row = copy.deepcopy(orphan["cost_components"][0])
+        orphan_row["opportunity_id"] = "orphan-opportunity"
+        orphan["cost_components"].append(orphan_row)
+        variants["orphan"] = orphan
+
+        validator = release_checker._validate_loaded_route_opportunity_release
+        for label, bundle in variants.items():
+            with self.subTest(label=label):
+                candidate = dict(loaded)
+                candidate["bundle"] = bundle
+                candidate["cost_components"] = bundle["cost_components"]
+                with self.assertRaisesRegex(ReleaseCheckError, label):
+                    validator(candidate, now=self.validated_at)
+
+    def test_fake_zero_gas_assumption_promotion_and_pool_fee_double_count_fail(self):
+        loaded = self._loaded()
+        base = loaded["bundle"]
+        row = base["opportunities"][0]
+        opportunity_id = row["opportunity_id"]
+        fee = next(
+            item for item in base["cost_components"]
+            if item["opportunity_id"] == opportunity_id
+            and item["leg"] == "buy"
+        )
+        cases = []
+
+        fake_gas = copy.deepcopy(base)
+        gas = next(
+            item for item in fake_gas["cost_components"]
+            if item["opportunity_id"] == opportunity_id and item["leg"] == "buy"
+        )
+        gas["component_type"] = "network_gas"
+        gas["amount_usd"] = "0"
+        gas["rate_bps"] = "0"
+        cases.append(("fake zero gas", fake_gas))
+
+        promoted = copy.deepcopy(base)
+        assumed = next(
+            item for item in promoted["cost_components"]
+            if item["opportunity_id"] == opportunity_id and item["leg"] == "buy"
+        )
+        assumed["value_status"] = "assumed"
+        assumed["strict_eligible"] = True
+        cases.append(("assumed cost promoted to strict", promoted))
+
+        validator = release_checker._validate_loaded_route_opportunity_release
+        for label, bundle in cases:
+            with self.subTest(label=label):
+                candidate = dict(loaded)
+                candidate["bundle"] = bundle
+                candidate["cost_components"] = bundle["cost_components"]
+                candidate["opportunities"] = bundle["opportunities"]
+                with self.assertRaisesRegex(ReleaseCheckError, label.split()[0]):
+                    validator(candidate, now=self.validated_at)
+
+        pool_row = copy.deepcopy(row)
+        pool_row.update({
+            "strict_eligible": False,
+            "strict_ready_for_publication": False,
+            "opportunity_class": "research_estimate",
+        })
+        pool_route = copy.deepcopy(base["routes"][0])
+        pool_route.update({
+            "route_mode": "atomic_onchain",
+            "buy_market_id": "dex:eth:uniswap:0xbuy:AAVE",
+            "sell_market_id": "dex:eth:uniswap:0xsell:AAVE",
+        })
+        pool_row.update({
+            "buy_market_id": pool_route["buy_market_id"],
+            "sell_market_id": pool_route["sell_market_id"],
+            "route_mode": pool_route["route_mode"],
+        })
+        route_component = next(
+            item for item in base["cost_components"]
+            if item["opportunity_id"] == opportunity_id
+            and item["leg"] == "route"
+        )
+        pool_components = []
+        for leg, component_type in release_checker._route_expected_component_keys(
+            pool_route
+        ):
+            component = copy.deepcopy(
+                route_component if leg == "route" else fee
+            )
+            component.update({
+                "leg": leg,
+                "component_type": component_type,
+                "market_id": (
+                    "" if leg == "route" else pool_route[leg + "_market_id"]
+                ),
+            })
+            pool_components.append(component)
+        pool_row["cost_component_set_sha256"] = release_checker._route_canonical_sha256(
+            sorted(
+                pool_components,
+                key=lambda item: (
+                    item["opportunity_id"], item["leg"], item["component_type"]
+                ),
+            )
+        )
+        pool_row["evidence_binding_sha256"] = _opportunity_binding(pool_row)
+        pool_legs = []
+        for side, source_leg in zip(("buy", "sell"), base["legs"]):
+            leg = copy.deepcopy(source_leg)
+            leg["market_id"] = pool_route[side + "_market_id"]
+            pool_legs.append(leg)
+        with self.assertRaisesRegex(ReleaseCheckError, "reflected pool fee"):
+            release_checker._validate_route_opportunity_row(
+                pool_row,
+                route=pool_route,
+                legs_by_market={
+                    item["market_id"]: item for item in pool_legs
+                },
+                components=pool_components,
+                core_manifest_sha256=base["core_manifest_sha256"],
+                now_epoch=release_checker._route_now_epoch(
+                    self.validated_at
+                )[0],
+            )
+
+    def test_attestation_transplant_wrong_core_and_secret_sentinel_fail(self):
+        loaded = self._loaded()
+        mutations = {}
+        transplant = copy.deepcopy(loaded["bundle"])
+        transplant["opportunities"][0]["publication_attestation_sha256"] = (
+            transplant["opportunities"][1]["publication_attestation_sha256"]
+        )
+        transplant["opportunities"][0]["evidence_binding_sha256"] = (
+            _opportunity_binding(transplant["opportunities"][0])
+        )
+        mutations["attestation"] = transplant
+        wrong_core = copy.deepcopy(loaded["bundle"])
+        wrong_core["opportunities"][0]["buy_core_manifest_sha256"] = "f" * 64
+        wrong_core["opportunities"][0]["evidence_binding_sha256"] = (
+            _opportunity_binding(wrong_core["opportunities"][0])
+        )
+        mutations["core"] = wrong_core
+        secret = copy.deepcopy(loaded["bundle"])
+        secret["input_generations"]["adapter_versions"]["api_key"] = (
+            "SECRET_SENTINEL"
+        )
+        mutations["unsafe"] = secret
+
+        for label, bundle in mutations.items():
+            with self.subTest(label=label):
+                shutil.rmtree(self.routes_root)
+                shutil.copytree(self.base_routes, self.routes_root)
+                self._rewrite(bundle)
+                with self.assertRaisesRegex(ReleaseCheckError, "validation failed"):
+                    self._validate()
+
+    def test_newer_core_only_generation_does_not_replace_last_complete_bundle(self):
+        from tests.test_route_publication import _second_cohort
+
+        before = self._validate()
+        route_publication.publish_route_cohort_bundle(
+            _second_cohort(), core_root=self.routes_root / "core"
+        )
+        after = self._validate()
+
+        self.assertEqual(after["route_cohort_id"], before["route_cohort_id"])
+        self.assertEqual(after["manifest_sha256"], before["manifest_sha256"])
 
 
 class DashboardReleaseSmokeTest(unittest.TestCase):
-    def test_route_core_pointer_absence_is_optional_but_can_be_required(self):
-        validator = getattr(
-            release_checker,
-            "validate_route_cohort_release",
-            None,
-        )
-        self.assertTrue(callable(validator))
-        with tempfile.TemporaryDirectory() as directory_name:
-            data_root = Path(directory_name)
-            core_root = data_root / "routes/core"
-            orphan = data_root / "routes/bundles/orphan"
-            orphan.mkdir(parents=True)
-            (orphan / "manifest.json").write_text("{}", encoding="utf-8")
-            (data_root / "routes/latest.json").write_text(
-                "{}",
-                encoding="utf-8",
-            )
-
-            self.assertEqual(
-                validator(core_root, required=False),
-                {
-                    "status": "unavailable",
-                    "reason": "core_pointer_absent",
-                },
-            )
-            with self.assertRaisesRegex(
-                ReleaseCheckError,
-                "required route cohort.*unavailable",
-            ):
-                validator(core_root, required=True)
-
-    def test_present_invalid_route_core_pointer_fails_even_when_optional(self):
-        with tempfile.TemporaryDirectory() as directory_name:
-            core_root = Path(directory_name) / "routes/core"
-            core_root.mkdir(parents=True)
-            (core_root / "latest.json").write_text("{}", encoding="utf-8")
-
-            with self.assertRaisesRegex(
-                ReleaseCheckError,
-                "route cohort core validation failed",
-            ):
-                release_checker.validate_route_cohort_release(
-                    core_root,
-                    required=False,
-                )
-
-    def test_optional_route_pointer_probe_fails_on_permission_or_io_error(self):
-        from scripts.route_publication import publish_route_cohort_bundle
-        from tests.test_route_publication import _cohort
-
-        with tempfile.TemporaryDirectory() as directory_name:
-            core_root = Path(directory_name) / "routes/core"
-            publish_route_cohort_bundle(_cohort(), core_root=core_root)
-
-            for error in (
-                PermissionError("route pointer denied"),
-                OSError("route pointer I/O failure"),
-            ):
-                with self.subTest(error=type(error).__name__):
-                    with patch(
-                        "scripts.check_dashboard_release.Path.lstat",
-                        side_effect=error,
-                    ):
-                        with self.assertRaisesRegex(
-                            ReleaseCheckError,
-                            "route cohort core pointer cannot be inspected",
-                        ):
-                            release_checker.validate_route_cohort_release(
-                                core_root,
-                                required=False,
-                            )
-
-    def test_route_release_rejects_a_tampered_pointed_bundle(self):
-        from scripts.route_publication import publish_route_cohort_bundle
-        from tests.test_route_publication import _cohort
-
-        cohort = _cohort()
-        with tempfile.TemporaryDirectory() as directory_name:
-            core_root = Path(directory_name) / "routes/core"
-            publish_route_cohort_bundle(cohort, core_root=core_root)
-            route_legs = (
-                core_root
-                / "bundles"
-                / cohort["route_cohort_id"]
-                / "route_legs.csv"
-            )
-            with route_legs.open("ab") as handle:
-                handle.write(b"\n")
-
-            with self.assertRaisesRegex(
-                ReleaseCheckError,
-                "route cohort core validation failed.*checksum",
-            ):
-                release_checker.validate_route_cohort_release(
-                    core_root,
-                    required=False,
-                )
-
-    def test_route_release_accepts_valid_terminal_unavailable_bundle(self):
-        from scripts.route_publication import publish_route_cohort_bundle
-        from tests.test_route_publication import _cohort, _rehash
-
-        cohort = _cohort()
-        cohort["legs"][0].update(
-            {
-                "status": "deadline_exceeded",
-                "available": False,
-                "reason_code": "route_deadline_exceeded",
-            }
-        )
-        for row in cohort["route_rows"]:
-            row.update(
-                {
-                    "skew_seconds": None,
-                    "timing_status": "unavailable",
-                    "reason_code": "route_deadline_exceeded",
-                }
-            )
-        cohort = _rehash(cohort)
-
-        with tempfile.TemporaryDirectory() as directory_name:
-            core_root = Path(directory_name) / "routes/core"
-            publish_route_cohort_bundle(cohort, core_root=core_root)
-
-            result = release_checker.validate_route_cohort_release(
-                core_root,
-                required=True,
-            )
-
-        self.assertEqual(
-            result,
-            {
-                "status": "validated",
-                "reason": None,
-                "route_cohort_id": cohort["route_cohort_id"],
-                "timing_status_counts": {
-                    "outside_sla": 0,
-                    "unavailable": 2,
-                    "within_sla": 0,
-                },
-            },
-        )
-
     def test_release_cli_parses_required_route_cohort_flag(self):
-        with patch(
-            "sys.argv",
-            ["check_dashboard_release.py", "--require-route-cohort"],
+        for flag in (
+            "--require-route-cohort",
+            "--require-route-opportunities",
         ):
-            args = release_checker.parse_args()
+            with self.subTest(flag=flag), patch(
+                "sys.argv", ["check_dashboard_release.py", flag]
+            ):
+                args = release_checker.parse_args()
 
-        self.assertTrue(args.require_route_cohort)
+            self.assertTrue(args.require_route_cohort)
 
-    def test_release_checks_required_route_core_before_remote_requests(self):
+    def test_release_checks_required_complete_bundle_before_remote_requests(self):
         args = argparse.Namespace(
             base_url="https://dashboard.test",
             timeout=1.0,
@@ -199,7 +543,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 )
                 route_validator = stack.enter_context(
                     patch(
-                        "scripts.check_dashboard_release.validate_route_cohort_release",
+                        "scripts.check_dashboard_release.validate_route_opportunity_release",
                         side_effect=ReleaseCheckError("required route sentinel"),
                     )
                 )
@@ -214,7 +558,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     release_check(args)
 
             route_validator.assert_called_once_with(
-                Path(directory_name) / "routes/core",
+                Path(directory_name) / "routes",
                 required=True,
             )
             fetch_json.assert_not_called()
@@ -1273,10 +1617,10 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         self.assertEqual(result["application_sha"], "a" * 40)
         self.assertEqual(result["asset_sha"], "b" * 64)
         self.assertEqual(
-            result["route_cohort"],
+            result["route_opportunities"],
             {
                 "status": "unavailable",
-                "reason": "core_pointer_absent",
+                "reason": "complete_pointer_absent",
             },
         )
         self.assertEqual(

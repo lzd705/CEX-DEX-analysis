@@ -154,7 +154,37 @@ unknown (`excluded_unknown_account_tier`). Supported DEX V2 execution includes
 the pool swap fee in pool mechanics; this is not a claim about protocol
 treasury or revenue fee.
 
+## Executable-opportunity release boundary
+
+The synchronized route pipeline is a separate fact product from the dashboard's
+per-market depth execution table. Its public generation is selected only by
+`data/local/routes/latest.json` (or the matching runtime-data path) when that
+pointer has schema `route_opportunity_pointer/v1` and stage
+`route_opportunity/v1`. A newer core-only cohort under `routes/core` is normal
+in-progress work; it neither becomes public nor invalidates the last complete
+generation merely because the private core pointer moved.
+
+One complete generation contains exactly five files: route legs, cost
+components, opportunities, SQLite, and manifest. The release checker rereads
+all five through the complete pointer and then independently checks exact
+quantity lattice, Market/leg state timestamps, 60-second skew, 120-second
+route age, component topology, null terminal costs, cost freshness, exact
+gross/net arithmetic, bps numerators and denominators, source generations,
+core binding, attestation, manifest counts/hashes, and CSV/SQLite parity.
+`executable_candidate` is accepted only when both
+`strict_ready_for_publication=true` and `strict_eligible=true`; a locally ready
+but unattested prepublication row remains research-only and fails the public
+strict gate. Estimated, assumed, stale, missing, and unsupported components
+cannot be defaulted to zero or promoted by ranking or cache code. Pool fees
+already reflected by pool mechanics are excluded from nonembedded-cost sums.
+
+This gate does not activate a public route API or collection timer. It validates
+an already finalized immutable bundle; it does not accept caller-supplied rows
+and does not run a collection step.
+
 Funding Rate is fully excluded: there is no derivatives catalog, funding
 collector, funding Fact, placeholder field, quality state, or UI control in
-this round. Numeric CEX account fees, gas, DEX V3 fixed-notional execution, and
-event-study outputs also remain unsupported.
+this round. Authenticated CEX fee evidence and adapter-bound gas may exist only
+inside the synchronized route-cost bundle; they are not inferred for the
+ordinary spot-market execution table. DEX V3 fixed-notional execution and
+event-study outputs remain unsupported.
