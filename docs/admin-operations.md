@@ -185,6 +185,25 @@ Dates before the first observed row are never inferred to be failures or
 historical gaps. A newly listed or otherwise sparse market also does not enter
 the D-1 retry queue until it meets the activity threshold.
 
+The report distinguishes the trailing retry-window grain from the actual
+latest completed day:
+
+- `summary.trailing_active_gap_count` counts every `d1_active_gap` issue record
+  from the bounded trailing retry window through
+  `latest_completed_utc_day`. One market missing two trailing dates therefore
+  contributes two records.
+- `summary.latest_completed_day_gap_count` counts only `d1_active_gap` issue
+  records whose `date` equals `latest_completed_utc_day`. The same market
+  contributes one record here.
+- `summary.d1_active_gap_count` is a deprecated, backward-compatible alias of
+  `trailing_active_gap_count`; it does not mean latest-day-only. The report's
+  `policy.gap_count_semantics` publishes this alias and both date scopes in
+  machine-readable form.
+
+`--fail-on-d1` continues to evaluate the deprecated alias, preserving the
+existing trailing-gap blocking contract. The additional latest-day count is
+diagnostic and does not weaken publication or CLI failure behavior.
+
 Missing-row causes are evidence-based, not inferred from absence alone:
 
 - no matching accepted attempt: `status=backfill_pending`,

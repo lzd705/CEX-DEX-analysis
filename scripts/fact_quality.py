@@ -1797,7 +1797,13 @@ def build_report(
     status_counts = Counter(str(issue["status"]) for issue in issues)
     reason_counts = Counter(str(issue["reason_code"]) for issue in issues)
     hard_count = category_counts.get("hard_invalid", 0)
-    d1_count = category_counts.get("d1_active_gap", 0)
+    trailing_active_gap_count = category_counts.get("d1_active_gap", 0)
+    latest_completed_day_gap_count = sum(
+        issue.get("category") == "d1_active_gap"
+        and issue.get("date") == latest_completed_day.isoformat()
+        for issue in issues
+    )
+    d1_count = trailing_active_gap_count
     stale_count = category_counts.get("stale_market_unknown", 0)
     source_no_observation_count = sum(
         issue.get("status") == "source_no_observation"
@@ -1858,6 +1864,26 @@ def build_report(
                 "specific collection outcome."
             ),
             "maximum_retry_window_days": MAX_RETRY_WINDOW_DAYS,
+            "gap_count_semantics": {
+                "d1_active_gap_count": {
+                    "alias_of": "trailing_active_gap_count",
+                    "deprecated": True,
+                },
+                "trailing_active_gap_count": {
+                    "date_scope": (
+                        "retry_window_through_latest_completed_utc_day"
+                    ),
+                    "unit": "d1_active_gap_issue_records",
+                },
+                "latest_completed_day_gap_count": {
+                    "date_scope": "latest_completed_utc_day_only",
+                    "unit": "d1_active_gap_issue_records",
+                },
+                "fail_on_d1": {
+                    "field": "d1_active_gap_count",
+                    "semantics": "backward_compatible_trailing_gap_block",
+                },
+            },
         },
         "sources": [cex_source, dex_source],
         "attempt_sources": [cex_attempt_source, dex_attempt_source],
@@ -1887,6 +1913,10 @@ def build_report(
             "hard_invalid_count": hard_count,
             "historical_gap_count": historical_count,
             "d1_active_gap_count": d1_count,
+            "trailing_active_gap_count": trailing_active_gap_count,
+            "latest_completed_day_gap_count": (
+                latest_completed_day_gap_count
+            ),
             "stale_market_unknown_count": stale_count,
             "source_no_observation_count": source_no_observation_count,
             "retryable_issue_count": retryable_count,

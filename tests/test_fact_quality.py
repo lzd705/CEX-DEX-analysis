@@ -1138,6 +1138,59 @@ class FactQualityTest(unittest.TestCase):
             True,
         )
 
+    def test_summary_separates_trailing_gap_records_from_latest_day_gap(self):
+        write_csv(
+            self.cex_path,
+            CEX_COLUMNS,
+            [
+                cex_row("2026-07-03"),
+                cex_row("2026-07-04"),
+                cex_row("2026-07-05"),
+                cex_row("2026-07-06"),
+                cex_row("2026-07-07"),
+                cex_row("2026-07-08"),
+            ],
+        )
+
+        report = self.report(today=date(2026, 7, 11))
+        trailing_dates = [
+            issue["date"]
+            for issue in report["issues"]
+            if issue["category"] == "d1_active_gap"
+        ]
+
+        self.assertEqual(trailing_dates, ["2026-07-09", "2026-07-10"])
+        self.assertEqual(report["latest_completed_utc_day"], "2026-07-10")
+        summary = report["summary"]
+        self.assertIn("trailing_active_gap_count", summary)
+        self.assertIn("latest_completed_day_gap_count", summary)
+        self.assertEqual(summary["trailing_active_gap_count"], 2)
+        self.assertEqual(summary["latest_completed_day_gap_count"], 1)
+        self.assertEqual(summary["d1_active_gap_count"], 2)
+        self.assertEqual(
+            report["policy"]["gap_count_semantics"],
+            {
+                "d1_active_gap_count": {
+                    "alias_of": "trailing_active_gap_count",
+                    "deprecated": True,
+                },
+                "trailing_active_gap_count": {
+                    "date_scope": (
+                        "retry_window_through_latest_completed_utc_day"
+                    ),
+                    "unit": "d1_active_gap_issue_records",
+                },
+                "latest_completed_day_gap_count": {
+                    "date_scope": "latest_completed_utc_day_only",
+                    "unit": "d1_active_gap_issue_records",
+                },
+                "fail_on_d1": {
+                    "field": "d1_active_gap_count",
+                    "semantics": "backward_compatible_trailing_gap_block",
+                },
+            },
+        )
+
     def test_stale_market_moves_to_manual_review_instead_of_disappearing(self):
         write_csv(
             self.cex_path,
