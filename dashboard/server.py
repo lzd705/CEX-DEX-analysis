@@ -6798,6 +6798,15 @@ def _summary_warmup_timestamp() -> str:
     )
 
 
+def _summary_warmup_source_generation_token() -> str | None:
+    """Fingerprint the active source generation without exposing its paths."""
+    try:
+        signature = api_source_signature()
+    except Exception:
+        return None
+    return hashlib.sha256(repr(signature).encode("utf-8")).hexdigest()
+
+
 def _summary_warmup_generation(response: tuple[bytes, bool]) -> str | None:
     """Read only the bounded public generation from a completed Summary."""
     body, compressed = response
@@ -6817,6 +6826,7 @@ def _begin_summary_warmup() -> int:
     global _SUMMARY_WARMUP_STATE, _SUMMARY_WARMUP_RUN_ID
     started_at = _summary_warmup_timestamp()
     started_monotonic = time.perf_counter()
+    source_generation_token = _summary_warmup_source_generation_token()
     with SUMMARY_WARMUP_STATE_LOCK:
         _SUMMARY_WARMUP_RUN_ID += 1
         run_id = _SUMMARY_WARMUP_RUN_ID
@@ -6824,6 +6834,7 @@ def _begin_summary_warmup() -> int:
             "run_id": run_id,
             "status": "warming",
             "generation": None,
+            "source_generation_token": source_generation_token,
             "started_at": started_at,
             "finished_at": None,
             "elapsed_ms": None,
@@ -6841,10 +6852,18 @@ def _finish_summary_warmup(
     """Complete only the newest warmup so an older worker cannot regress health."""
     global _SUMMARY_WARMUP_STATE
     finished_at = _summary_warmup_timestamp()
+    current_source_generation_token = _summary_warmup_source_generation_token()
     with SUMMARY_WARMUP_STATE_LOCK:
         state = _SUMMARY_WARMUP_STATE
         if not isinstance(state, dict) or state.get("run_id") != run_id:
             return
+        if status == "ready" and (
+            state.get("source_generation_token") is None
+            or state.get("source_generation_token")
+            != current_source_generation_token
+        ):
+            status = "failed"
+            generation = None
         elapsed = max(
             0,
             int(round((time.perf_counter() - state["started_monotonic"]) * 1000)),
@@ -6853,6 +6872,7 @@ def _finish_summary_warmup(
             "run_id": run_id,
             "status": status,
             "generation": generation,
+            "source_generation_token": current_source_generation_token,
             "started_at": state["started_at"],
             "finished_at": finished_at,
             "elapsed_ms": elapsed,
@@ -6872,7 +6892,7 @@ def summary_warmup_health() -> dict[str, Any]:
                 "finished_at": None,
                 "elapsed_ms": None,
             }
-        return {
+        result = {
             field: state.get(field)
             for field in (
                 "status",
@@ -6882,6 +6902,14 @@ def summary_warmup_health() -> dict[str, Any]:
                 "elapsed_ms",
             )
         }
+        source_generation_token = state.get("source_generation_token")
+    if result["status"] == "ready" and (
+        source_generation_token is None
+        or source_generation_token != _summary_warmup_source_generation_token()
+    ):
+        result["status"] = "failed"
+        result["generation"] = None
+    return result
 
 
 def warm_default_market_summary() -> None:

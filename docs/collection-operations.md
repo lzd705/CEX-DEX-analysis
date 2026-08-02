@@ -803,7 +803,9 @@ Summary `generation` when available, canonical UTC `started_at` and
 `finished_at`, and integer `elapsed_ms`. It never exposes the warmup exception,
 filesystem paths, SQL, or provider details. A newer warmup attempt replaces an
 older attempt's state; a late result from an older worker cannot overwrite the
-current generation. The warmup uses the normal request cache path and does not
+current generation. If source generation changes during or after warmup,
+`/health` fails closed rather than reporting stale `ready` until a matching
+warmup completes. The warmup uses the normal request cache path and does not
 create a Summary artifact, pointer, or full-Catalog preload.
 
 Incremental DEX collection reuses the published token-pool inventory and its

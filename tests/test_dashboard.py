@@ -1,5 +1,6 @@
 import csv
 import gzip
+import hashlib
 import inspect
 import json
 import shutil
@@ -1015,6 +1016,10 @@ class MarketMonitorServerTest(unittest.TestCase):
 
         with patch.object(server, "_SUMMARY_WARMUP_STATE", None), patch.object(
             server,
+            "api_source_signature",
+            return_value=(("warmup-facts.sqlite3", 1, 100),),
+        ), patch.object(
+            server,
             "build_public_api_response",
             side_effect=warm_response,
         ), patch("builtins.print"):
@@ -1136,6 +1141,68 @@ class MarketMonitorServerTest(unittest.TestCase):
                 )
         finally:
             server.clear_runtime_caches()
+
+    def test_summary_warmup_never_exposes_ready_after_source_changes_at_completion(self):
+        # Removing the generation token check after the response build would
+        # publish a stale ready state when a new source lands just before the
+        # warmup state transition.
+        active_signature = [("summary-facts.sqlite3", 1, 100)]
+        response = (
+            json.dumps(
+                {"metadata": {"data_generation": "generation-obsolete"}}
+            ).encode("utf-8"),
+            False,
+        )
+
+        def response_that_becomes_stale(*_args, **_kwargs):
+            active_signature[0] = ("summary-facts.sqlite3", 2, 100)
+            return response
+
+        with patch.object(server, "_SUMMARY_WARMUP_STATE", None), patch.object(
+            server,
+            "api_source_signature",
+            side_effect=lambda: tuple(active_signature),
+        ), patch.object(
+            server,
+            "build_public_api_response",
+            side_effect=response_that_becomes_stale,
+        ), patch("builtins.print"):
+            server.warm_default_market_summary()
+            health = server.summary_warmup_health()
+
+        self.assertEqual(health["status"], "failed")
+        self.assertIsNone(health["generation"])
+        self.assertNotIn("obsolete", json.dumps(health))
+        self.assertNotIn("sqlite", json.dumps(health))
+
+    def test_summary_warmup_health_downgrades_a_stale_ready_record(self):
+        # Removing health's generation comparison would let a startup-only
+        # warmup continue to claim readiness after its facts changed.
+        source_signature = (("summary-facts.sqlite3", 1, 100),)
+        stale_token = hashlib.sha256(
+            repr(source_signature).encode("utf-8")
+        ).hexdigest()
+        state = {
+            "run_id": 1,
+            "status": "ready",
+            "generation": "generation-obsolete",
+            "source_generation_token": stale_token,
+            "started_at": "2026-08-02T00:00:00Z",
+            "finished_at": "2026-08-02T00:00:01Z",
+            "elapsed_ms": 1,
+            "started_monotonic": 1.0,
+        }
+        with patch.object(server, "_SUMMARY_WARMUP_STATE", state), patch.object(
+            server,
+            "api_source_signature",
+            return_value=(("summary-facts.sqlite3", 2, 100),),
+        ):
+            health = server.summary_warmup_health()
+
+        self.assertEqual(health["status"], "failed")
+        self.assertIsNone(health["generation"])
+        self.assertNotIn("obsolete", json.dumps(health))
+        self.assertNotIn("sqlite", json.dumps(health))
 
     def test_default_summary_warmup_thread_is_daemon(self):
         warmup_release = threading.Event()
