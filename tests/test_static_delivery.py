@@ -17,6 +17,7 @@ class StaticDeliveryPolicyTest(unittest.TestCase):
             ("br, gzip;q=0.5", True),
             ("gzip;q=0", False),
             ("*;q=1", True),
+            ("*;q=0", False),
             ("gzip;q=0, *;q=1", False),
             ("gzip;q=wat", False),
             ("gzip;q=1.1", False),
@@ -39,6 +40,7 @@ class StaticDeliveryPolicyTest(unittest.TestCase):
             (f"/app.js?%76={version}", False),
             (f"/app.js?v={version}&x=1", False),
             (f"/app.js?x=1&v={version}", False),
+            (f"/app.js;ignored?v={version}", False),
             (f"/app.js?v={version}#fragment", False),
             (f"/admin.js?v={version}", False),
         )
@@ -77,6 +79,11 @@ class StaticRepresentationTest(unittest.TestCase):
                 )
 
     def test_protected_and_unknown_paths_have_no_public_representation(self):
-        for path in ("/admin.js", "/admin.css", "/missing.js"):
+        for path in (
+            "/admin.js",
+            "/admin.css",
+            "/app.js;ignored",
+            "/missing.js",
+        ):
             with self.subTest(path=path):
                 self.assertIsNone(server.static_representation(path))

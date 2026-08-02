@@ -397,7 +397,10 @@ _STATIC_REPRESENTATIONS = _build_static_representations()
 def static_representation(path: str) -> StaticRepresentation | None:
     """Return the immutable public representation for an exact asset path."""
 
-    return _STATIC_REPRESENTATIONS.get(urlparse(path).path)
+    parsed = urlparse(path)
+    if parsed.params:
+        return None
+    return _STATIC_REPRESENTATIONS.get(parsed.path)
 
 
 _ACCEPT_ENCODING_QUALITY = re.compile(r"(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$")
@@ -442,7 +445,7 @@ def exact_static_version(path: str) -> bool:
     """Return true only for one unescaped current version query on a public path."""
 
     parsed = urlparse(path)
-    if parsed.fragment or is_admin_surface_path(parsed.path):
+    if parsed.params or parsed.fragment or is_admin_surface_path(parsed.path):
         return False
     return parsed.query == f"v={static_asset_version()}"
 
