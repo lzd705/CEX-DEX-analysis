@@ -1804,6 +1804,36 @@ EXACT_CEX_QUOTE_ASSETS = {
     "coinbase": "USD",
     "kraken": "USD",
 }
+UPBIT_EXACT_QUOTE_ASSETS = frozenset({"KRW", "USDT"})
+UPBIT_DEPTH_SOURCE_STATUSES = frozenset({"observed", "partial"})
+UPBIT_NULL_DEPTH_STATUSES = frozenset({
+    "not_cataloged_in_snapshot",
+    "unavailable",
+})
+PRESERVED_HISTORICAL_UPBIT_KRW_MARKET_IDS = frozenset({
+    "cex:upbit:1INCH/KRW",
+    "cex:upbit:AAVE/KRW",
+    "cex:upbit:ARB/KRW",
+    "cex:upbit:BONK/KRW",
+    "cex:upbit:COMP/KRW",
+    "cex:upbit:ENA/KRW",
+    "cex:upbit:ENS/KRW",
+    "cex:upbit:ETHFI/KRW",
+    "cex:upbit:GRT/KRW",
+    "cex:upbit:JTO/KRW",
+    "cex:upbit:JUP/KRW",
+    "cex:upbit:LINK/KRW",
+    "cex:upbit:MORPHO/KRW",
+    "cex:upbit:ONDO/KRW",
+    "cex:upbit:OP/KRW",
+    "cex:upbit:PENDLE/KRW",
+    "cex:upbit:PEPE/KRW",
+    "cex:upbit:RAY/KRW",
+    "cex:upbit:SHIB/KRW",
+    "cex:upbit:UNI/KRW",
+    "cex:upbit:WLD/KRW",
+    "cex:upbit:ZK/KRW",
+})
 
 
 def validate_configured_cex_identity_metadata(
@@ -1861,6 +1891,7 @@ def validate_exact_cex_market_identity(
     token_symbol: Any,
     *,
     configured_upbit_market_ids: Any,
+    market: Any = None,
 ) -> None:
     """Reject known legacy quote aliases at the public release boundary."""
     if not isinstance(market_id, str) or not market_id.startswith("cex:"):
@@ -1890,10 +1921,188 @@ def validate_exact_cex_market_identity(
             raise ReleaseCheckError(
                 "Configured Upbit market identity inventory is invalid"
             ) from error
-        require(
-            market_id in configured_upbit,
-            "Full catalog market is not a configured Upbit exact identity",
+        quote_asset = match.group(3)
+        expected_instrument = "{}/{}".format(token_symbol, quote_asset)
+        expected_source_instrument = "{}-{}".format(
+            quote_asset, token_symbol
         )
+        depth_quote_asset = (
+            market.get("depth_source_quote_asset")
+            if isinstance(market, Mapping)
+            else None
+        )
+        depth_source_instrument = (
+            market.get("depth_source_instrument")
+            if isinstance(market, Mapping)
+            else None
+        )
+        observed_start = (
+            market.get("observed_start")
+            if isinstance(market, Mapping)
+            else None
+        )
+        observed_end = (
+            market.get("observed_end")
+            if isinstance(market, Mapping)
+            else None
+        )
+        require(
+            quote_asset in UPBIT_EXACT_QUOTE_ASSETS
+            and isinstance(market, Mapping)
+            and market.get("market_type") == "cex"
+            and market.get("exchange") == "upbit"
+            and market.get("venue") == "upbit"
+            and market.get("instrument") == expected_instrument
+            and market.get("source") == "upbit public daily OHLCV API"
+            and market.get("source_quote_asset_label") == quote_asset
+            and type(market.get("observation_days")) is int
+            and market["observation_days"] > 0
+            and _is_canonical_date(observed_start)
+            and _is_canonical_date(observed_end)
+            and observed_start <= observed_end,
+            (
+                "Upbit market lacks exact historical source "
+                "quote lineage"
+            ),
+        )
+        observed_start_date = datetime.strptime(
+            observed_start, "%Y-%m-%d"
+        ).date()
+        observed_end_date = datetime.strptime(
+            observed_end, "%Y-%m-%d"
+        ).date()
+        require(
+            market["observation_days"]
+            <= (observed_end_date - observed_start_date).days + 1,
+            "Upbit observation count exceeds its inclusive date span",
+        )
+        is_configured = market_id in configured_upbit
+        require(
+            is_configured
+            or (
+                quote_asset == "KRW"
+                and market_id
+                in PRESERVED_HISTORICAL_UPBIT_KRW_MARKET_IDS
+            ),
+            (
+                "Unconfigured Upbit market is not an approved historical "
+                "KRW identity"
+            ),
+        )
+        depth_status = market.get("depth_status")
+        depth_reason_code = market.get("depth_reason_code")
+        canonical_depth_rule = canonical_quality_fact_rule(
+            "cex",
+            "depth",
+            depth_status,
+            depth_reason_code,
+        )
+        require(
+            isinstance(depth_status, str)
+            and depth_status == depth_status.strip().lower()
+            and isinstance(depth_reason_code, str)
+            and depth_reason_code == depth_reason_code.strip().lower()
+            and canonical_depth_rule is not None,
+            "Upbit market has a noncanonical depth status and reason",
+        )
+        if depth_status in UPBIT_DEPTH_SOURCE_STATUSES:
+            expected_conversion_method = (
+                "Upbit KRW-USDT midpoint"
+                if quote_asset == "KRW"
+                else "USDT=USD proxy"
+            )
+            require(
+                depth_quote_asset == quote_asset
+                and depth_source_instrument == expected_source_instrument
+                and market.get("depth_method")
+                == "midpoint_symmetric_quote_notional"
+                and market.get("depth_requires_usd_price_alignment") is False
+                and market.get("depth_quote_conversion_method")
+                == expected_conversion_method
+                and market.get("depth_source")
+                == "upbit public spot order-book API"
+                and market.get("depth_source_endpoint")
+                == "https://api.upbit.com"
+                and isinstance(market.get("depth_raw_response_sha256"), str)
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    market["depth_raw_response_sha256"],
+                    flags=re.ASCII,
+                )
+                is not None
+                and isinstance(market.get("depth_snapshot_id"), str)
+                and bool(market["depth_snapshot_id"])
+                and market["depth_snapshot_id"]
+                == market["depth_snapshot_id"].strip(),
+                (
+                    "Upbit market has invalid depth source "
+                    "quote lineage"
+                ),
+            )
+            _route_timestamp(
+                market.get("depth_observed_at"),
+                "Upbit depth observed_at",
+            )
+        elif depth_status in UPBIT_NULL_DEPTH_STATUSES:
+            require(
+                depth_quote_asset is None
+                and depth_source_instrument is None
+                and market.get("depth_method") is None
+                and market.get("depth_requires_usd_price_alignment") is False
+                and market.get("depth_source") is None
+                and market.get("depth_source_endpoint") is None
+                and market.get("depth_quote_conversion_method") is None
+                and market.get("depth_raw_response_sha256") is None
+                and market.get("depth_snapshot_id") is None
+                and market.get("depth_observed_at") is None,
+                (
+                    "Upbit market has invalid depth source "
+                    "quote lineage"
+                ),
+            )
+        else:
+            raw_response_sha256 = market.get(
+                "depth_raw_response_sha256"
+            )
+            expected_failure_instruments = {expected_source_instrument}
+            if quote_asset == "KRW":
+                expected_failure_instruments.add("KRW-USDT")
+            require(
+                depth_source_instrument in expected_failure_instruments
+                and depth_quote_asset == quote_asset
+                and market.get("depth_method")
+                == "midpoint_symmetric_quote_notional"
+                and market.get("depth_requires_usd_price_alignment") is False
+                and market.get("depth_quote_conversion_method") is None
+                and market.get("depth_source")
+                == "upbit public spot order-book API"
+                and market.get("depth_source_endpoint")
+                == "https://api.upbit.com"
+                and (
+                    raw_response_sha256 is None
+                    or (
+                        isinstance(raw_response_sha256, str)
+                        and re.fullmatch(
+                            r"[0-9a-f]{64}",
+                            raw_response_sha256,
+                            flags=re.ASCII,
+                        )
+                        is not None
+                    )
+                )
+                and isinstance(market.get("depth_snapshot_id"), str)
+                and bool(market["depth_snapshot_id"])
+                and market["depth_snapshot_id"]
+                == market["depth_snapshot_id"].strip(),
+                (
+                    "Upbit market has invalid failed depth source "
+                    "quote lineage"
+                ),
+            )
+            _route_timestamp(
+                market.get("depth_observed_at"),
+                "Upbit failed depth observed_at",
+            )
         return
     expected_quote = EXACT_CEX_QUOTE_ASSETS.get(exchange)
     require(
@@ -3858,6 +4067,7 @@ def validate_token_catalog(
             market_id,
             row.get("token_symbol") if isinstance(row, dict) else None,
             configured_upbit_market_ids=configured_upbit_market_ids,
+            market=row,
         )
     require(metadata.get("window_start") == start, "Token catalog start window differs")
     require(metadata.get("window_end") == end, "Token catalog end window differs")
@@ -6283,6 +6493,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
             market_id,
             market_token,
             configured_upbit_market_ids=configured_upbit_market_ids,
+            market=market,
         )
     require(
         full_catalog_tokens == summary_token_set,

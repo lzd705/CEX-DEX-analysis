@@ -2254,6 +2254,37 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
 
     def test_release_exact_cex_identity_rejects_legacy_quote_aliases(self):
         def validate(market_id, token, configured_upbit_market_ids):
+            market = None
+            if str(market_id).startswith("cex:upbit:"):
+                instrument = str(market_id).split(":", 2)[-1]
+                quote_asset = instrument.rsplit("/", 1)[-1]
+                market = {
+                    "market_id": market_id,
+                    "token_symbol": token,
+                    "market_type": "cex",
+                    "exchange": "upbit",
+                    "venue": "upbit",
+                    "instrument": instrument,
+                    "source": "upbit public daily OHLCV API",
+                    "source_quote_asset_label": quote_asset,
+                    "observation_days": 1,
+                    "observed_start": "2026-07-28",
+                    "observed_end": "2026-07-28",
+                    "depth_status": "not_cataloged_in_snapshot",
+                    "depth_reason_code": (
+                        "depth_market_not_cataloged_in_snapshot"
+                    ),
+                    "depth_method": None,
+                    "depth_requires_usd_price_alignment": False,
+                    "depth_source": None,
+                    "depth_source_endpoint": None,
+                    "depth_source_quote_asset": None,
+                    "depth_source_instrument": None,
+                    "depth_quote_conversion_method": None,
+                    "depth_raw_response_sha256": None,
+                    "depth_snapshot_id": None,
+                    "depth_observed_at": None,
+                }
             try:
                 return validate_exact_cex_market_identity(
                     market_id,
@@ -2261,6 +2292,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     configured_upbit_market_ids=(
                         configured_upbit_market_ids
                     ),
+                    market=market,
                 )
             except TypeError as error:
                 self.fail(
@@ -2318,17 +2350,380 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                     },
                 )
 
-        try:
-            validate(
-                "cex:upbit:AAVE/KRW",
-                "AAVE",
-                {"cex:upbit:AAVE/USDT"},
+    def test_unconfigured_upbit_history_requires_krw_and_source_lineage(self):
+        configured = {"cex:upbit:UNI/USDT"}
+        observed = {
+            "market_id": "cex:upbit:AAVE/KRW",
+            "token_symbol": "AAVE",
+            "market_type": "cex",
+            "exchange": "upbit",
+            "venue": "upbit",
+            "instrument": "AAVE/KRW",
+            "source": "upbit public daily OHLCV API",
+            "source_quote_asset_label": "KRW",
+            "observation_days": 195,
+            "observed_start": "2026-01-17",
+            "observed_end": "2026-07-30",
+            "depth_status": "observed",
+            "depth_reason_code": "observed",
+            "depth_method": "midpoint_symmetric_quote_notional",
+            "depth_requires_usd_price_alignment": False,
+            "depth_source": "upbit public spot order-book API",
+            "depth_source_endpoint": "https://api.upbit.com",
+            "depth_source_quote_asset": "KRW",
+            "depth_source_instrument": "KRW-AAVE",
+            "depth_quote_conversion_method": "Upbit KRW-USDT midpoint",
+            "depth_raw_response_sha256": "a" * 64,
+            "depth_snapshot_id": "snapshot-upbit-krw",
+            "depth_observed_at": "2026-08-02T12:07:23+00:00",
+        }
+
+        validate_exact_cex_market_identity(
+            observed["market_id"],
+            observed["token_symbol"],
+            configured_upbit_market_ids=configured,
+            market=observed,
+        )
+        not_cataloged = copy.deepcopy(observed)
+        not_cataloged.update({
+            "depth_status": "not_cataloged_in_snapshot",
+            "depth_reason_code": "depth_market_not_cataloged_in_snapshot",
+            "depth_method": None,
+            "depth_requires_usd_price_alignment": False,
+            "depth_source": None,
+            "depth_source_endpoint": None,
+            "depth_source_quote_asset": None,
+            "depth_source_instrument": None,
+            "depth_quote_conversion_method": None,
+            "depth_raw_response_sha256": None,
+            "depth_snapshot_id": None,
+            "depth_observed_at": None,
+        })
+        validate_exact_cex_market_identity(
+            not_cataloged["market_id"],
+            not_cataloged["token_symbol"],
+            configured_upbit_market_ids=configured,
+            market=not_cataloged,
+        )
+
+        configured_observed = copy.deepcopy(observed)
+        configured_observed.update({
+            "market_id": "cex:upbit:AAVE/USDT",
+            "instrument": "AAVE/USDT",
+            "source_quote_asset_label": "USDT",
+            "depth_source_quote_asset": "USDT",
+            "depth_source_instrument": "USDT-AAVE",
+            "depth_quote_conversion_method": "USDT=USD proxy",
+        })
+        configured_aave = {configured_observed["market_id"]}
+        validate_exact_cex_market_identity(
+            configured_observed["market_id"],
+            configured_observed["token_symbol"],
+            configured_upbit_market_ids=configured_aave,
+            market=configured_observed,
+        )
+        configured_partial = copy.deepcopy(configured_observed)
+        configured_partial.update({
+            "depth_status": "partial",
+            "depth_reason_code": "source_level_limit",
+        })
+        validate_exact_cex_market_identity(
+            configured_partial["market_id"],
+            configured_partial["token_symbol"],
+            configured_upbit_market_ids=configured_aave,
+            market=configured_partial,
+        )
+        configured_failure = copy.deepcopy(configured_observed)
+        configured_failure.update({
+            "depth_method": "midpoint_symmetric_quote_notional",
+            "depth_requires_usd_price_alignment": False,
+            "depth_quote_conversion_method": None,
+            "depth_raw_response_sha256": None,
+        })
+        for depth_status, depth_reason_code in (
+            ("collection_failed", "network"),
+            ("source_no_observation", "source_no_order_book"),
+            ("needs_review", "not_listed"),
+            ("unsupported", "unsupported_source"),
+            ("invalid", "source_invalid_order_book"),
+        ):
+            with self.subTest(
+                valid_status=depth_status,
+                valid_reason=depth_reason_code,
+            ):
+                canonical_failure = copy.deepcopy(configured_failure)
+                canonical_failure.update({
+                    "depth_status": depth_status,
+                    "depth_reason_code": depth_reason_code,
+                })
+                validate_exact_cex_market_identity(
+                    canonical_failure["market_id"],
+                    canonical_failure["token_symbol"],
+                    configured_upbit_market_ids=configured_aave,
+                    market=canonical_failure,
+                )
+        unavailable = copy.deepcopy(configured_observed)
+        unavailable.update({
+            "depth_status": "unavailable",
+            "depth_reason_code": "depth_snapshot_unavailable",
+            "depth_method": None,
+            "depth_requires_usd_price_alignment": False,
+            "depth_source": None,
+            "depth_source_endpoint": None,
+            "depth_source_quote_asset": None,
+            "depth_source_instrument": None,
+            "depth_quote_conversion_method": None,
+            "depth_raw_response_sha256": None,
+            "depth_snapshot_id": None,
+            "depth_observed_at": None,
+        })
+        validate_exact_cex_market_identity(
+            unavailable["market_id"],
+            unavailable["token_symbol"],
+            configured_upbit_market_ids=configured_aave,
+            market=unavailable,
+        )
+
+        unconfigured_usdt = copy.deepcopy(observed)
+        unconfigured_usdt.update({
+            "market_id": "cex:upbit:AAVE/USDT",
+            "instrument": "AAVE/USDT",
+            "source_quote_asset_label": "USDT",
+            "depth_source_quote_asset": "USDT",
+            "depth_source_instrument": "USDT-AAVE",
+        })
+        unapproved_krw = copy.deepcopy(observed)
+        unapproved_krw.update({
+            "market_id": "cex:upbit:FAKE/KRW",
+            "token_symbol": "FAKE",
+            "instrument": "FAKE/KRW",
+            "depth_source_instrument": "KRW-FAKE",
+        })
+        missing_raw_hash = copy.deepcopy(observed)
+        missing_raw_hash["depth_raw_response_sha256"] = None
+        wrong_conversion = copy.deepcopy(observed)
+        wrong_conversion[
+            "depth_quote_conversion_method"
+        ] = "USDT=USD proxy"
+        observed_without_depth_lineage = copy.deepcopy(observed)
+        observed_without_depth_lineage["depth_source_quote_asset"] = None
+        observed_without_depth_lineage["depth_source_instrument"] = None
+        one_sided_not_cataloged = copy.deepcopy(not_cataloged)
+        one_sided_not_cataloged["depth_source_quote_asset"] = "KRW"
+        invalid = {
+            "unconfigured USDT": unconfigured_usdt,
+            "unapproved KRW": unapproved_krw,
+            "wrong market type": {**observed, "market_type": "dex"},
+            "wrong exchange": {**observed, "exchange": "binance"},
+            "wrong venue": {**observed, "venue": "binance"},
+            "wrong instrument": {**observed, "instrument": "AAVE/USDT"},
+            "wrong daily quote": {
+                **observed,
+                "source_quote_asset_label": "USDT",
+            },
+            "no historical observations": {
+                **observed,
+                "observation_days": 0,
+            },
+            "impossible observed date": {
+                **observed,
+                "observed_start": "2026-99-99",
+                "observed_end": "2026-99-99",
+            },
+            "observation days exceed date span": {
+                **observed,
+                "observation_days": 2,
+                "observed_start": "2026-07-30",
+                "observed_end": "2026-07-30",
+            },
+            "missing depth raw hash": missing_raw_hash,
+            "wrong depth conversion": wrong_conversion,
+            "wrong depth method": {
+                **observed,
+                "depth_method": "forged",
+            },
+            "observed with partial reason": {
+                **observed,
+                "depth_reason_code": "source_level_limit",
+            },
+            "partial with observed reason": {
+                **observed,
+                "depth_status": "partial",
+                "depth_reason_code": "observed",
+            },
+            "unexpected USD price alignment": {
+                **observed,
+                "depth_requires_usd_price_alignment": True,
+            },
+            "failed depth status": {**observed, "depth_status": "failed"},
+            "wrong depth source": {
+                **observed,
+                "depth_source": "unknown",
+            },
+            "wrong depth endpoint": {
+                **observed,
+                "depth_source_endpoint": "https://example.test",
+            },
+            "empty depth snapshot": {
+                **observed,
+                "depth_snapshot_id": "",
+            },
+            "whitespace depth snapshot": {
+                **observed,
+                "depth_snapshot_id": " ",
+            },
+            "bad depth timestamp": {
+                **observed,
+                "depth_observed_at": "not-a-time",
+            },
+            "observed without depth lineage": observed_without_depth_lineage,
+            "not cataloged with one-sided lineage": one_sided_not_cataloged,
+            "not cataloged with wrong reason": {
+                **not_cataloged,
+                "depth_reason_code": "observed",
+            },
+            "not cataloged with depth method": {
+                **not_cataloged,
+                "depth_method": "forged",
+            },
+            "not cataloged with USD price alignment": {
+                **not_cataloged,
+                "depth_requires_usd_price_alignment": True,
+            },
+            "wrong depth quote": {
+                **observed,
+                "depth_source_quote_asset": "USDT",
+            },
+            "wrong depth instrument": {
+                **observed,
+                "depth_source_instrument": "USDT-AAVE",
+            },
+        }
+        for label, market in invalid.items():
+            with self.subTest(label=label), self.assertRaises(
+                ReleaseCheckError
+            ):
+                validate_exact_cex_market_identity(
+                    market["market_id"],
+                    market["token_symbol"],
+                    configured_upbit_market_ids=configured,
+                    market=market,
+                )
+
+        network_failure = {
+            **configured_failure,
+            "depth_status": "collection_failed",
+            "depth_reason_code": "network",
+        }
+        invalid_failure_lineage = {
+            "normalized observed text routed as failure": {
+                **network_failure,
+                "depth_status": " OBSERVED ",
+                "depth_reason_code": " OBSERVED ",
+            },
+            "noncanonical failure status text": {
+                **network_failure,
+                "depth_status": "COLLECTION_FAILED",
+            },
+            "noncanonical failure reason text": {
+                **network_failure,
+                "depth_reason_code": " network ",
+            },
+            "noncanonical failure reason": {
+                **network_failure,
+                "depth_reason_code": "source_no_order_book",
+            },
+            "wrong failure instrument": {
+                **network_failure,
+                "depth_source_instrument": "KRW-AAVE",
+            },
+            "wrong failure quote": {
+                **network_failure,
+                "depth_source_quote_asset": "KRW",
+            },
+            "wrong failure method": {
+                **network_failure,
+                "depth_method": "forged",
+            },
+            "failure requiring price alignment": {
+                **network_failure,
+                "depth_requires_usd_price_alignment": True,
+            },
+            "failure with conversion": {
+                **network_failure,
+                "depth_quote_conversion_method": "USDT=USD proxy",
+            },
+            "wrong failure source": {
+                **network_failure,
+                "depth_source": "unknown",
+            },
+            "wrong failure endpoint": {
+                **network_failure,
+                "depth_source_endpoint": "https://example.test",
+            },
+            "bad failure raw hash": {
+                **network_failure,
+                "depth_raw_response_sha256": "bad",
+            },
+            "empty failure snapshot": {
+                **network_failure,
+                "depth_snapshot_id": "",
+            },
+            "whitespace failure snapshot": {
+                **network_failure,
+                "depth_snapshot_id": " ",
+            },
+            "bad failure timestamp": {
+                **network_failure,
+                "depth_observed_at": "not-a-time",
+            },
+            "unavailable with source lineage": {
+                **unavailable,
+                "depth_source": "upbit public spot order-book API",
+            },
+            "unavailable with wrong reason": {
+                **unavailable,
+                "depth_reason_code": "network",
+            },
+        }
+        for label, market in invalid_failure_lineage.items():
+            with self.subTest(label=label), self.assertRaises(
+                ReleaseCheckError
+            ):
+                validate_exact_cex_market_identity(
+                    market["market_id"],
+                    market["token_symbol"],
+                    configured_upbit_market_ids=configured_aave,
+                    market=market,
+                )
+
+        configured_mislabeled = copy.deepcopy(observed)
+        configured_mislabeled["market_id"] = "cex:upbit:AAVE/USDT"
+        with self.assertRaises(ReleaseCheckError):
+            validate_exact_cex_market_identity(
+                configured_mislabeled["market_id"],
+                configured_mislabeled["token_symbol"],
+                configured_upbit_market_ids={
+                    configured_mislabeled["market_id"]
+                },
+                market=configured_mislabeled,
             )
-        except ReleaseCheckError:
-            pass
-        else:
-            self.fail(
-                "Upbit KRW must be rejected when the authoritative market is USDT"
+        configured_bad_depth = copy.deepcopy(observed)
+        configured_bad_depth.update({
+            "market_id": "cex:upbit:AAVE/USDT",
+            "instrument": "AAVE/USDT",
+            "source_quote_asset_label": "USDT",
+            "depth_source_quote_asset": "KRW",
+            "depth_source_instrument": "KRW-AAVE",
+        })
+        with self.assertRaises(ReleaseCheckError):
+            validate_exact_cex_market_identity(
+                configured_bad_depth["market_id"],
+                configured_bad_depth["token_symbol"],
+                configured_upbit_market_ids={
+                    configured_bad_depth["market_id"]
+                },
+                market=configured_bad_depth,
             )
 
     def test_screening_quality_must_match_summary_counts(self):
@@ -3059,14 +3454,41 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             full_catalog["metadata"][
                 "configured_cex_market_identities"
             ] = copy.deepcopy(configured_krw)
-            full_catalog["markets"].append({
+            exact_upbit_krw_market = {
                 "market_id": "cex:upbit:AAVE/KRW",
                 "token_symbol": "AAVE",
-            })
-            markets.append({
-                "market_id": "cex:upbit:AAVE/KRW",
                 "market_type": "cex",
-            })
+                "exchange": "upbit",
+                "venue": "upbit",
+                "instrument": "AAVE/KRW",
+                "source": "upbit public daily OHLCV API",
+                "source_quote_asset_label": "KRW",
+                "observation_days": 195,
+                "observed_start": "2026-01-17",
+                "observed_end": "2026-07-30",
+                "depth_status": "observed",
+                "depth_reason_code": "observed",
+                "depth_method": "midpoint_symmetric_quote_notional",
+                "depth_requires_usd_price_alignment": False,
+                "depth_source": "upbit public spot order-book API",
+                "depth_source_endpoint": "https://api.upbit.com",
+                "depth_source_quote_asset": "KRW",
+                "depth_source_instrument": "KRW-AAVE",
+                "depth_quote_conversion_method": (
+                    "Upbit KRW-USDT midpoint"
+                ),
+                "depth_raw_response_sha256": "a" * 64,
+                "depth_snapshot_id": "snapshot-upbit-krw",
+                "depth_observed_at": "2026-08-02T12:07:23+00:00",
+            }
+            full_catalog["markets"].append(
+                copy.deepcopy(exact_upbit_krw_market)
+            )
+            token_upbit_krw_market = {
+                **copy.deepcopy(exact_upbit_krw_market),
+                "market_type": "cex",
+            }
+            markets.append(token_upbit_krw_market)
 
             try:
                 run_release()
@@ -3097,9 +3519,45 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             full_catalog["metadata"][
                 "configured_cex_market_identities"
             ] = copy.deepcopy(configured_usdt)
+            try:
+                run_release()
+            except ReleaseCheckError as error:
+                self.fail(
+                    "Full release rejected source-bound historical Upbit KRW: "
+                    "{}".format(error)
+                )
+
+            full_catalog["markets"][-1][
+                "source_quote_asset_label"
+            ] = "USDT"
+            markets[-1]["source_quote_asset_label"] = "USDT"
             with self.assertRaisesRegex(
                 ReleaseCheckError,
-                "configured Upbit",
+                "Upbit.*source quote|source quote.*Upbit",
+            ):
+                run_release()
+
+            full_catalog["markets"][-1][
+                "source_quote_asset_label"
+            ] = "KRW"
+            markets[-1]["source_quote_asset_label"] = "KRW"
+            full_catalog["markets"][-1]["observation_days"] = 0
+            markets[-1]["observation_days"] = 0
+            with self.assertRaisesRegex(
+                ReleaseCheckError,
+                "historical source quote lineage",
+            ):
+                run_release()
+
+            full_catalog["markets"][-1]["observation_days"] = 195
+            markets[-1]["observation_days"] = 195
+            full_catalog["markets"][-1]["depth_source_quote_asset"] = None
+            full_catalog["markets"][-1]["depth_source_instrument"] = None
+            markets[-1]["depth_source_quote_asset"] = None
+            markets[-1]["depth_source_instrument"] = None
+            with self.assertRaisesRegex(
+                ReleaseCheckError,
+                "depth source quote lineage",
             ):
                 run_release()
         finally:
@@ -3507,6 +3965,27 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         configured_krw["markets"] = [{
             "token_symbol": "AAVE",
             "market_id": "cex:upbit:AAVE/KRW",
+            "market_type": "cex",
+            "exchange": "upbit",
+            "venue": "upbit",
+            "instrument": "AAVE/KRW",
+            "source": "upbit public daily OHLCV API",
+            "source_quote_asset_label": "KRW",
+            "observation_days": 1,
+            "observed_start": "2026-01-01",
+            "observed_end": "2026-01-01",
+            "depth_status": "not_cataloged_in_snapshot",
+            "depth_reason_code": "depth_market_not_cataloged_in_snapshot",
+            "depth_method": None,
+            "depth_requires_usd_price_alignment": False,
+            "depth_source": None,
+            "depth_source_endpoint": None,
+            "depth_source_quote_asset": None,
+            "depth_source_instrument": None,
+            "depth_quote_conversion_method": None,
+            "depth_raw_response_sha256": None,
+            "depth_snapshot_id": None,
+            "depth_observed_at": None,
         }]
         try:
             validate_token_catalog(
@@ -3537,9 +4016,12 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "5cd3df58dc1ad988984f0e3b61a9960"
             ),
         }
+        mismatched_upbit["markets"][0][
+            "source_quote_asset_label"
+        ] = "USDT"
         with self.assertRaisesRegex(
             ReleaseCheckError,
-            "configured Upbit",
+            "historical source quote lineage",
         ):
             validate_token_catalog(
                 mismatched_upbit,
