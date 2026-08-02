@@ -98,6 +98,8 @@ class ResponseMetrics:
     compressed: bool
     request_started_at: Optional[datetime] = None
     response_completed_at: Optional[datetime] = None
+    cache_control: Optional[str] = None
+    content_length: Optional[int] = None
 
 
 class ReleaseCheckError(RuntimeError):
@@ -106,6 +108,9 @@ class ReleaseCheckError(RuntimeError):
 
 STATIC_ASSET_FILENAMES = PUBLIC_STATIC_ASSET_FILENAMES
 MAX_STATIC_ASSET_BYTES = 4 * 1024 * 1024
+STATIC_ASSET_GZIP_BUDGET = 220_000
+IMMUTABLE_STATIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
+STATIC_ASSET_GZIP_THRESHOLD_BYTES = 1024
 
 
 def require(condition: bool, message: str) -> None:
@@ -3745,6 +3750,7 @@ def fetch_static_asset_bundle(
     asset_version: str,
     *,
     timeout: float,
+    gzip_budget: int = STATIC_ASSET_GZIP_BUDGET,
 ) -> tuple[str, list[ResponseMetrics]]:
     """Fetch the versioned first-party assets and recompute their exact hash."""
     require(
@@ -3753,8 +3759,12 @@ def fetch_static_asset_bundle(
         is not None,
         "Static asset version is invalid",
     )
+    require(
+        type(gzip_budget) is int and gzip_budget > 0,
+        "Static asset gzip budget is invalid",
+    )
     digest = hashlib.sha256()
-    metrics = []
+    metrics: list[ResponseMetrics] = []
     for filename in STATIC_ASSET_FILENAMES:
         path = "/{}?v={}".format(filename, asset_version)
         request = Request(
@@ -3765,9 +3775,13 @@ def fetch_static_asset_bundle(
         try:
             with urlopen(request, timeout=timeout) as response:
                 body = response.read(MAX_STATIC_ASSET_BYTES + 1)
-                encoding = response.headers.get(
-                    "Content-Encoding", ""
-                ).lower()
+                content_encodings = [
+                    value.lower()
+                    for value in response.headers.get_all("Content-Encoding") or []
+                ]
+                content_lengths = response.headers.get_all("Content-Length") or []
+                cache_controls = response.headers.get_all("Cache-Control") or []
+                vary = response.headers.get_all("Vary") or []
                 status = response.status
         except HTTPError as error:
             raise ReleaseCheckError(
@@ -3779,7 +3793,25 @@ def fetch_static_asset_bundle(
             ) from error
         elapsed_ms = (time.perf_counter() - started) * 1000
         require(status == 200, "{} returned HTTP {}".format(path, status))
-        compressed = encoding == "gzip"
+        require(
+            len(content_encodings) <= 1
+            and (not content_encodings or content_encodings == ["gzip"]),
+            "{} Content-Encoding is invalid".format(path),
+        )
+        compressed = content_encodings == ["gzip"]
+        require(
+            len(content_lengths) == 1
+            and content_lengths[0] == str(len(body)),
+            "{} Content-Length does not match wire bytes".format(path),
+        )
+        require(
+            cache_controls == [IMMUTABLE_STATIC_CACHE_CONTROL],
+            "{} Cache-Control is not exactly immutable".format(path),
+        )
+        require(
+            vary == ["Accept-Encoding"],
+            "{} Vary is not exactly Accept-Encoding".format(path),
+        )
         try:
             raw = gzip.decompress(body) if compressed else body
         except gzip.BadGzipFile as error:
@@ -3789,6 +3821,10 @@ def fetch_static_asset_bundle(
         require(
             len(raw) <= MAX_STATIC_ASSET_BYTES,
             "{} exceeds the static asset size limit".format(path),
+        )
+        require(
+            compressed or len(raw) < STATIC_ASSET_GZIP_THRESHOLD_BYTES,
+            "{} was not gzip compressed after requesting gzip".format(path),
         )
         digest.update(filename.encode("utf-8"))
         digest.update(b"\0")
@@ -3801,8 +3837,17 @@ def fetch_static_asset_bundle(
                 wire_bytes=len(body),
                 raw_bytes=len(raw),
                 compressed=compressed,
+                cache_control=cache_controls[0],
+                content_length=int(content_lengths[0]),
             )
         )
+    total_wire_bytes = sum(item.wire_bytes for item in metrics)
+    require(
+        total_wire_bytes <= gzip_budget,
+        "Static asset gzip bundle {} exceeds {} bytes".format(
+            total_wire_bytes, gzip_budget
+        ),
+    )
     return digest.hexdigest(), metrics
 
 
@@ -6774,6 +6819,12 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "application_sha": application_sha,
         "asset_sha": asset_sha,
         "asset_version": asset_version,
+        "static_asset_bundle": {
+            "asset_count": len(asset_metrics),
+            "raw_bytes": sum(item.raw_bytes for item in asset_metrics),
+            "wire_bytes": sum(item.wire_bytes for item in asset_metrics),
+            "gzip_budget": STATIC_ASSET_GZIP_BUDGET,
+        },
         "token_count": len(summary["tokens"]),
         "screening_quality_parity_count": screening_quality_parity_count,
         "screening_quality_market_count": screening_quality_market_count,
@@ -6794,6 +6845,8 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
                 "wire_bytes": item.wire_bytes,
                 "raw_bytes": item.raw_bytes,
                 "gzip": item.compressed,
+                "cache_control": item.cache_control,
+                "content_length": item.content_length,
             }
             for item in metrics
         ],

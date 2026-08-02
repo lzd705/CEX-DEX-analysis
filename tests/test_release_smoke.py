@@ -1860,7 +1860,7 @@ class RouteOpportunityReleaseGateTest(unittest.TestCase):
         self.assertEqual(after["manifest_sha256"], before["manifest_sha256"])
 
 
-class DashboardReleaseSmokeTest(unittest.TestCase):
+class _DashboardReleaseSmokeMixin:
     def test_release_checker_uses_dashboard_route_root_override(self):
         with patch.dict(
             release_checker.os.environ,
@@ -1923,6 +1923,8 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             )
             fetch_json.assert_not_called()
 
+
+class ReleaseAssetTests(unittest.TestCase):
     def test_public_asset_check_excludes_protected_admin_bundle(self):
         self.assertIn("actions.css", STATIC_ASSET_FILENAMES)
         self.assertIn("actions.js", STATIC_ASSET_FILENAMES)
@@ -1930,12 +1932,26 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         self.assertNotIn("admin.js", STATIC_ASSET_FILENAMES)
 
     def test_checker_fetches_exact_public_bundle_and_reproduces_server_hash(self):
+        class AssetHeaders:
+            def __init__(self, pairs):
+                self.pairs = list(pairs)
+
+            def get_all(self, name):
+                return [
+                    value for key, value in self.pairs
+                    if key.casefold() == name.casefold()
+                ]
+
+            def get(self, name, default=None):
+                values = self.get_all(name)
+                return values[0] if values else default
+
         class AssetResponse:
             status = 200
-            headers = {}
 
-            def __init__(self, body):
+            def __init__(self, body, headers):
                 self.body = body
+                self.headers = AssetHeaders(headers)
 
             def __enter__(self):
                 return self
@@ -1966,7 +1982,12 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 )[1].split("?", 1)[0]
                 requested.append(served_name)
                 self.assertIn(served_name, source_by_name)
-                return AssetResponse(body_by_name[served_name])
+                body = body_by_name[served_name]
+                return AssetResponse(body, [
+                    ("Content-Length", str(len(body))),
+                    ("Cache-Control", "public, max-age=31536000, immutable"),
+                    ("Vary", "Accept-Encoding"),
+                ])
 
             with patch.object(server, "STATIC_ROOT", static_root):
                 expected_sha = server._compute_static_asset_sha()
@@ -1983,7 +2004,159 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         self.assertEqual(actual_sha, expected_sha)
         self.assertEqual(requested, list(STATIC_ASSET_FILENAMES))
         self.assertEqual(len(metrics), len(STATIC_ASSET_FILENAMES))
+        self.assertTrue(all(not item.compressed for item in metrics))
+        self.assertTrue(all(
+            item.cache_control == "public, max-age=31536000, immutable"
+            and item.content_length == item.wire_bytes
+            for item in metrics
+        ))
 
+    def test_checker_rejects_static_delivery_contract_regressions(self):
+        # Each counterexample names a distinct release-boundary regression.
+        # Replacing a response check with permissive parsing must fail here.
+        class AssetHeaders:
+            def __init__(self, pairs):
+                self.pairs = list(pairs)
+
+            def get_all(self, name):
+                return [
+                    value for key, value in self.pairs
+                    if key.casefold() == name.casefold()
+                ]
+
+            def get(self, name, default=None):
+                values = self.get_all(name)
+                return values[0] if values else default
+
+        class AssetResponse:
+            status = 200
+
+            def __init__(self, body, headers):
+                self.body = body
+                self.headers = AssetHeaders(headers)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit=None):
+                return self.body
+
+        version = "a" * 12 + "-" + "b" * 12
+        cache_control = "public, max-age=31536000, immutable"
+        small_asset = STATIC_ASSET_FILENAMES[0]
+        raw_by_name = {
+            name: (b"tiny" if name == small_asset else b"x" * 1025)
+            for name in STATIC_ASSET_FILENAMES
+        }
+
+        def valid_response(name):
+            raw = raw_by_name[name]
+            if name == small_asset:
+                body = raw
+                headers = []
+            else:
+                body = gzip.compress(raw)
+                headers = [("Content-Encoding", "gzip")]
+            return body, headers + [
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", cache_control),
+                ("Vary", "Accept-Encoding"),
+            ]
+
+        cases = {
+            "identity large asset": lambda body, headers: (body, [
+                item for item in headers if item[0] != "Content-Encoding"
+            ]),
+            "corrupt gzip": lambda _body, headers: (b"not-gzip", headers),
+            "wrong content length": lambda body, headers: (body, [
+                (key, str(len(body) + 1) if key == "Content-Length" else value)
+                for key, value in headers
+            ]),
+            "missing cache policy": lambda body, headers: (body, [
+                item for item in headers if item[0] != "Cache-Control"
+            ]),
+            "duplicate cache policy": lambda body, headers: (
+                body, headers + [("Cache-Control", cache_control)]
+            ),
+            "conflicting cache policy": lambda body, headers: (
+                body, headers + [("Cache-Control", "no-cache")]
+            ),
+            "non-immutable cache policy": lambda body, headers: (body, [
+                (
+                    key,
+                    "public, max-age=31536000"
+                    if key == "Cache-Control" else value,
+                )
+                for key, value in headers
+            ]),
+            "missing vary": lambda body, headers: (body, [
+                item for item in headers if item[0] != "Vary"
+            ]),
+        }
+
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                def fake_urlopen(request, timeout):
+                    self.assertEqual(timeout, 1.0)
+                    name = request.full_url.split(
+                        "https://dashboard.test/", 1
+                    )[1].split("?", 1)[0]
+                    body, headers = valid_response(name)
+                    if name == STATIC_ASSET_FILENAMES[1]:
+                        if label == "identity large asset":
+                            body = raw_by_name[name]
+                            headers = [
+                                ("Content-Length", str(len(body))),
+                                ("Cache-Control", cache_control),
+                                ("Vary", "Accept-Encoding"),
+                            ]
+                        else:
+                            body, headers = mutate(body, headers)
+                    return AssetResponse(body, headers)
+
+                with patch(
+                    "scripts.check_dashboard_release.urlopen",
+                    side_effect=fake_urlopen,
+                ), self.assertRaises(ReleaseCheckError):
+                    fetch_static_asset_bundle(
+                        "https://dashboard.test", version, timeout=1.0
+                    )
+
+        budget_raw_by_name = {
+            name: b"".join(
+                hashlib.sha256(
+                    "{}:{}".format(name, index).encode("utf-8")
+                ).digest()
+                for index in range(1_300)
+            )
+            for name in STATIC_ASSET_FILENAMES
+        }
+
+        def budget_urlopen(request, timeout):
+            self.assertEqual(timeout, 1.0)
+            name = request.full_url.split(
+                "https://dashboard.test/", 1
+            )[1].split("?", 1)[0]
+            body = gzip.compress(budget_raw_by_name[name])
+            return AssetResponse(body, [
+                ("Content-Encoding", "gzip"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", cache_control),
+                ("Vary", "Accept-Encoding"),
+            ])
+
+        with patch(
+            "scripts.check_dashboard_release.urlopen", side_effect=budget_urlopen
+        ), self.assertRaisesRegex(ReleaseCheckError, "gzip bundle.*220000"):
+            fetch_static_asset_bundle(
+                "https://dashboard.test", version, timeout=1.0
+            )
+
+
+class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
     def freshness(self):
         checked_at = "2026-02-01T01:00:00+00:00"
         return {
