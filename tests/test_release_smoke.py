@@ -128,7 +128,7 @@ def _opportunity_metrics(
 
 
 def _add_public_cost_provenance(payload, source_costs, source_rows):
-    """Mirror the non-sensitive cost provenance exposed by the public API."""
+    """Mirror cost provenance, then apply the real public server envelope."""
 
     costs_by_key = {
         (
@@ -170,6 +170,7 @@ def _add_public_cost_provenance(payload, source_costs, source_rows):
                     component["leg"], component["component_type"]
                 ) in reflected
             )
+    payload.update(server.attach_public_action_capabilities(payload))
     return payload
 
 
@@ -360,9 +361,11 @@ class RouteOpportunityReleaseGateTest(unittest.TestCase):
     def test_missing_pointer_api_is_200_unavailable_with_no_route_values(self):
         (self.routes_root / "latest.json").unlink()
         route_release = self._validate(required=False)
-        payload = build_unavailable_opportunity_payload(
-            sort="route_id",
-            direction="asc",
+        payload = server.attach_public_action_capabilities(
+            build_unavailable_opportunity_payload(
+                sort="route_id",
+                direction="asc",
+            )
         )
         requested = []
 
@@ -420,6 +423,134 @@ class RouteOpportunityReleaseGateTest(unittest.TestCase):
                     invalid,
                     _opportunity_metrics(
                         "/api/markets/opportunities", invalid
+                    ),
+                    route_release=route_release,
+                    expected_filters=payload["filters"],
+                    raw_max=2_000_000,
+                    gzip_max=300_000,
+                    require_complete_inventory=True,
+                )
+
+    def test_checker_accepts_server_public_action_capability_metadata(self):
+        (self.routes_root / "latest.json").unlink()
+        route_release = self._validate(required=False)
+        with patch.dict(
+            server.os.environ,
+            {"MARKET_ROUTE_DATA_DIR": str(self.routes_root)},
+            clear=True,
+        ):
+            payload = server._build_public_api_payload(
+                "opportunities",
+                (("sort", "route_id"), ("dir", "asc")),
+            )
+
+        validated = release_checker._validate_opportunity_api_payload(
+            payload,
+            _opportunity_metrics(
+                "/api/markets/opportunities", payload
+            ),
+            route_release=route_release,
+            expected_filters=payload["filters"],
+            raw_max=2_000_000,
+            gzip_max=300_000,
+            require_complete_inventory=True,
+        )
+
+        self.assertEqual(validated["status"], "unavailable")
+
+    def test_checker_rejects_missing_server_public_action_capability_metadata(self):
+        (self.routes_root / "latest.json").unlink()
+        route_release = self._validate(required=False)
+        payload = build_unavailable_opportunity_payload(
+            sort="route_id",
+            direction="asc",
+        )
+
+        with self.assertRaisesRegex(
+            ReleaseCheckError,
+            "metadata fields differ",
+        ):
+            release_checker._validate_opportunity_api_payload(
+                payload,
+                _opportunity_metrics(
+                    "/api/markets/opportunities", payload
+                ),
+                route_release=route_release,
+                expected_filters=payload["filters"],
+                raw_max=2_000_000,
+                gzip_max=300_000,
+                require_complete_inventory=True,
+            )
+
+    def test_checker_rejects_capability_change_between_cold_and_warm(self):
+        (self.routes_root / "latest.json").unlink()
+        route_release = self._validate(required=False)
+        enabled = server.attach_public_action_capabilities(
+            build_unavailable_opportunity_payload(
+                sort="route_id",
+                direction="asc",
+            )
+        )
+        disabled = copy.deepcopy(enabled)
+        disabled["metadata"]["public_actions"] = {
+            "fact_refresh_enabled": not enabled["metadata"][
+                "public_actions"
+            ]["fact_refresh_enabled"],
+        }
+        responses = [enabled, disabled]
+
+        def fake_fetch(_base_url, path, *, timeout):
+            self.assertEqual(timeout, 1.0)
+            payload = responses.pop(0)
+            return payload, _opportunity_metrics(path, payload)
+
+        with patch(
+            "scripts.check_dashboard_release.fetch_json",
+            side_effect=fake_fetch,
+        ), self.assertRaisesRegex(
+            ReleaseCheckError,
+            "public action capability changed",
+        ):
+            release_checker.validate_opportunity_api_release(
+                "https://dashboard.test",
+                timeout=1.0,
+                route_release=route_release,
+                raw_max=2_000_000,
+                gzip_max=300_000,
+            )
+
+    def test_checker_rejects_malformed_public_action_capability_metadata(self):
+        (self.routes_root / "latest.json").unlink()
+        route_release = self._validate(required=False)
+        base_payload = build_unavailable_opportunity_payload(
+            sort="route_id",
+            direction="asc",
+        )
+        invalid_cases = {
+            "non-boolean capability": (
+                {"fact_refresh_enabled": "true"},
+                "not boolean",
+            ),
+            "unexpected capability": (
+                {
+                    "fact_refresh_enabled": True,
+                    "route_refresh_enabled": True,
+                },
+                "fields differ",
+            ),
+        }
+
+        for label, (public_actions, error) in invalid_cases.items():
+            payload = copy.deepcopy(base_payload)
+            payload["metadata"]["public_actions"] = public_actions
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ReleaseCheckError,
+                error,
+            ):
+                release_checker._validate_opportunity_api_payload(
+                    payload,
+                    _opportunity_metrics(
+                        "/api/markets/opportunities", payload
                     ),
                     route_release=route_release,
                     expected_filters=payload["filters"],
@@ -765,6 +896,13 @@ class RouteOpportunityReleaseGateTest(unittest.TestCase):
             "freshness deadline": lambda payload: payload["metadata"].update(
                 next_freshness_deadline_at=None
             ),
+            "public action capability": lambda payload: payload["metadata"][
+                "public_actions"
+            ].update(
+                fact_refresh_enabled=not payload["metadata"][
+                    "public_actions"
+                ]["fact_refresh_enabled"]
+            ),
         }
 
         for label, mutate in mutations.items():
@@ -787,7 +925,7 @@ class RouteOpportunityReleaseGateTest(unittest.TestCase):
                     ReleaseCheckError,
                 (
                     "full view|generation|complete bundle|checked_at|"
-                    "boundary mode"
+                    "boundary mode|public action capability"
                 ),
                 ):
                     release_checker.validate_opportunity_api_release(
@@ -2730,19 +2868,21 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
         def fake_fetch(_base_url, path, *, timeout):
             fetched_paths.append(path)
             if path.startswith("/api/markets/opportunities?"):
-                payload = build_unavailable_opportunity_payload(
-                    opportunity_class=(
-                        "strict" if "class=strict" in path
-                        else "estimate" if "class=estimate" in path
-                        else "all"
-                    ),
-                    availability=(
-                        "unavailable"
-                        if "availability=unavailable" in path
-                        else "all"
-                    ),
-                    sort="route_id",
-                    direction="asc",
+                payload = server.attach_public_action_capabilities(
+                    build_unavailable_opportunity_payload(
+                        opportunity_class=(
+                            "strict" if "class=strict" in path
+                            else "estimate" if "class=estimate" in path
+                            else "all"
+                        ),
+                        availability=(
+                            "unavailable"
+                            if "availability=unavailable" in path
+                            else "all"
+                        ),
+                        sort="route_id",
+                        direction="asc",
+                    )
                 )
             elif path == "/health":
                 payload = copy.deepcopy(health_payload)

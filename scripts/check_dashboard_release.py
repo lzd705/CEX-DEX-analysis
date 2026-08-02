@@ -180,6 +180,10 @@ _OPPORTUNITY_METADATA_FIELDS = frozenset({
     "available_notionals_usd",
     "available_venues",
     "coverage",
+    "public_actions",
+})
+_OPPORTUNITY_PUBLIC_ACTION_FIELDS = frozenset({
+    "fact_refresh_enabled",
 })
 _OPPORTUNITY_COVERAGE_FIELDS = frozenset({
     "route_count",
@@ -2881,6 +2885,15 @@ def _validate_opportunity_api_payload(
         _OPPORTUNITY_METADATA_FIELDS,
         "Opportunity metadata",
     )
+    public_actions = _opportunity_exact_keys(
+        metadata.get("public_actions"),
+        _OPPORTUNITY_PUBLIC_ACTION_FIELDS,
+        "Opportunity public actions",
+    )
+    require(
+        type(public_actions.get("fact_refresh_enabled")) is bool,
+        "Opportunity fact refresh capability is not boolean",
+    )
     coverage = _opportunity_exact_keys(
         metadata.get("coverage"),
         _OPPORTUNITY_COVERAGE_FIELDS,
@@ -2950,6 +2963,9 @@ def _validate_opportunity_api_payload(
                 "unavailable": 0,
             },
             "availability_counts": {"available": 0, "unavailable": 0},
+            "fact_refresh_enabled": public_actions[
+                "fact_refresh_enabled"
+            ],
             "opportunity_inventory_sha256": (
                 _route_opportunity_inventory_sha256([])
             ),
@@ -3324,6 +3340,7 @@ def _validate_opportunity_api_payload(
         "available_venues": available_venues,
         "class_counts": class_counts,
         "availability_counts": availability_counts,
+        "fact_refresh_enabled": public_actions["fact_refresh_enabled"],
         "opportunity_inventory_sha256": inventory_sha256,
     }
 
@@ -3407,6 +3424,13 @@ def validate_opportunity_api_release(
         require_complete_inventory=True,
     )
     require(
+        warm["fact_refresh_enabled"] == cold["fact_refresh_enabled"],
+        (
+            "Opportunity public action capability changed between cold and "
+            "warm reads"
+        ),
+    )
+    require(
         warm["opportunity_inventory_sha256"]
         == cold["opportunity_inventory_sha256"]
         and warm["route_cohort_id"] == cold["route_cohort_id"]
@@ -3463,6 +3487,14 @@ def validate_opportunity_api_release(
             raw_max=raw_max,
             gzip_max=gzip_max,
             require_complete_inventory=False,
+        )
+        require(
+            validated["fact_refresh_enabled"]
+            == cold["fact_refresh_enabled"],
+            (
+                "Opportunity public action capability changed across "
+                "filtered views"
+            ),
         )
         require(
             validated["route_cohort_id"] == cold["route_cohort_id"]
