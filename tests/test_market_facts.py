@@ -303,6 +303,24 @@ class MarketFactKnownAnswerTests(unittest.TestCase):
         self.assertEqual(reason["inputs"]["quote_quality_score"], 1)
         self.assertEqual(reason["inputs"]["depth_support_score"], 1)
 
+    def test_primary_market_selection_rejects_negative_volume_instead_of_zero_filling(self):
+        invalid = {
+            "market": "cex",
+            "token_symbol": "UNI",
+            "venue": "binance",
+            "instrument": "UNI/USDT",
+            "price_usd": 10,
+            "volume_usd": -1,
+            "coverage_ratio": 1,
+            "depth_status": "observed",
+        }
+
+        with self.assertRaisesRegex(ValueError, "negative volume"):
+            select_primary_market([invalid])
+
+        with self.assertRaisesRegex(ValueError, "negative volume"):
+            build_token_summaries([invalid], [])
+
     def test_primary_market_penalizes_off_market_pool_price(self):
         off_market = {
             "market": "dex",

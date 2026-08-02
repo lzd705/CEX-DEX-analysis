@@ -46,6 +46,7 @@ try:
     from scripts.quality_outcomes import (
         normalize_tvl_source_outcome,
         quality_outcome_resolution_state,
+        tvl_reason_code,
     )
     from scripts.timestamp_contract import validate_observation_bounds
 except ModuleNotFoundError:
@@ -59,6 +60,7 @@ except ModuleNotFoundError:
     from quality_outcomes import (
         normalize_tvl_source_outcome,
         quality_outcome_resolution_state,
+        tvl_reason_code,
     )
     from timestamp_contract import validate_observation_bounds
 
@@ -108,8 +110,19 @@ TVL_COLUMNS = [
     "source_endpoint",
     "raw_response_sha256",
     "status",
+    "reason_code",
     "error",
 ]
+TVL_COLLECTION_FAILURE_REASON_CODES = frozenset(
+    {
+        "network",
+        "rate_limit",
+        "source_unavailable",
+        "parse",
+        "validation",
+        "collection_failed",
+    }
+)
 
 
 def utc_now_text() -> str:
@@ -332,6 +345,7 @@ def base_row(
         "source_endpoint": source_endpoint,
         "raw_response_sha256": "",
         "status": "",
+        "reason_code": "",
         "error": "",
     }
 
@@ -360,18 +374,40 @@ def rows_from_payload(
         item = by_pool.get(pool_key(pool["chain"], pool["pool_address"]))
         if item is None:
             row["status"] = "not_found"
+            row["reason_code"] = "source_pool_not_found"
             row["error"] = "Pool was not returned by the GeckoTerminal multi-pool endpoint"
         else:
             try:
                 row.update(source_pool_fields(item))
                 row["status"] = "observed" if row["tvl_usd"] else "missing"
+                row["reason_code"] = (
+                    "observed"
+                    if row["status"] == "observed"
+                    else "source_no_tvl_observation"
+                )
                 if row["status"] == "missing":
                     row["error"] = "Source returned no reserve_in_usd value"
             except ValueError as error:
                 row["status"] = "failed"
+                row["reason_code"] = "validation"
                 row["error"] = str(error)
         rows.append(row)
     return rows
+
+
+def tvl_failure_reason_code(error: BaseException) -> str:
+    """Classify typed TVL failures without inspecting raw error text."""
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code == 429:
+            return "rate_limit"
+        return "source_unavailable"
+    if isinstance(error, (urllib.error.URLError, TimeoutError)):
+        return "network"
+    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "parse"
+    if isinstance(error, (ValueError, TypeError, KeyError)):
+        return "validation"
+    return "collection_failed"
 
 
 def failure_rows(
@@ -382,6 +418,7 @@ def failure_rows(
     response_received_at: str,
     source_endpoint: str,
     error: Exception,
+    raw_sha256: str = "",
 ) -> list[dict[str, str]]:
     rows = []
     for pool in pools:
@@ -393,6 +430,8 @@ def failure_rows(
             source_endpoint=source_endpoint,
         )
         row["status"] = "failed"
+        row["reason_code"] = tvl_failure_reason_code(error)
+        row["raw_response_sha256"] = raw_sha256
         row["error"] = f"{type(error).__name__}: {error}"
         rows.append(row)
     return rows
@@ -456,6 +495,7 @@ def collect_tvl(
                 indent=2,
             ).encode("utf-8")
             raw_path.write_bytes(error_payload)
+            raw_sha256 = hashlib.sha256(error_payload).hexdigest()
             rows.extend(
                 failure_rows(
                     batch,
@@ -464,6 +504,7 @@ def collect_tvl(
                     response_received_at=response_received_at,
                     source_endpoint=url,
                     error=error,
+                    raw_sha256=raw_sha256,
                 )
             )
         if batch_index < len(batches) and sleep_seconds > 0:
@@ -479,6 +520,12 @@ def collect_tvl(
             status: sum(row["status"] == status for row in rows)
             for status in ("observed", "missing", "not_found", "failed")
         },
+        "reason_code_counts": dict(
+            sorted(
+                (reason, sum(row["reason_code"] == reason for row in rows))
+                for reason in {row["reason_code"] for row in rows}
+            )
+        ),
         "raw_files": sorted(path.name for path in snapshot_raw_dir.glob("*.json")),
     }
     (snapshot_raw_dir / "manifest.json").write_text(
@@ -517,6 +564,21 @@ def validate_snapshot(
     accepted_statuses = {"observed", "missing", "not_found", "failed"}
     if any(row["status"] not in accepted_statuses for row in rows):
         raise ValueError("TVL snapshot contains an invalid status")
+    for row in rows:
+        status = str(row.get("status") or "").strip().lower()
+        supplied_reason = str(row.get("reason_code") or "").strip().lower()
+        if "reason_code" in row and not supplied_reason:
+            raise ValueError("TVL snapshot reason code is missing")
+        if supplied_reason and tvl_reason_code(supplied_reason) is None:
+            raise ValueError("TVL snapshot contains an invalid reason code")
+        allowed_reasons = {
+            "observed": {"observed"},
+            "missing": {"source_no_tvl_observation"},
+            "not_found": {"source_pool_not_found"},
+            "failed": set(TVL_COLLECTION_FAILURE_REASON_CODES),
+        }[status]
+        if supplied_reason and supplied_reason not in allowed_reasons:
+            raise ValueError("TVL snapshot status and reason code conflict")
     if (
         not allow_no_observed
         and not any(row["status"] == "observed" for row in rows)
@@ -527,6 +589,7 @@ def validate_snapshot(
             quality_outcome_resolution_state(
                 *normalize_tvl_source_outcome(
                     row.get("status"),
+                    row.get("reason_code"),
                     error=row.get("error"),
                 )
             ) != "confirmed_terminal_absence"
@@ -541,6 +604,19 @@ def validate_tvl_fact_rows(rows: Iterable[dict[str, str]]) -> None:
     """Bind every TVL value to an explicit source-observation status."""
     for row in rows:
         status = str(row.get("status") or "").strip().lower()
+        supplied_reason = str(row.get("reason_code") or "").strip().lower()
+        if "reason_code" in row and not supplied_reason:
+            raise ValueError("TVL snapshot reason code is missing")
+        if supplied_reason and tvl_reason_code(supplied_reason) is None:
+            raise ValueError("TVL snapshot contains an invalid reason code")
+        allowed_reasons = {
+            "observed": {"observed"},
+            "missing": {"source_no_tvl_observation"},
+            "not_found": {"source_pool_not_found"},
+            "failed": set(TVL_COLLECTION_FAILURE_REASON_CODES),
+        }.get(status, set())
+        if supplied_reason and supplied_reason not in allowed_reasons:
+            raise ValueError("TVL snapshot status and reason code conflict")
         raw_value = row.get("tvl_usd")
         has_value = raw_value not in (None, "")
         if status == "observed":
@@ -558,6 +634,13 @@ def validate_tvl_fact_rows(rows: Iterable[dict[str, str]]) -> None:
                 )
         elif has_value:
             raise ValueError("TVL snapshot non-observed TVL must be null")
+        if status == "failed":
+            source_hash = str(row.get("raw_response_sha256") or "")
+            if (
+                len(source_hash) != 64
+                or any(character not in "0123456789abcdef" for character in source_hash)
+            ):
+                raise ValueError("TVL snapshot failed row source hash is invalid")
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -567,6 +650,50 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def migrate_legacy_tvl_reason_codes(
+    rows: Iterable[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Upgrade only keyless legacy rows to the explicit bounded reason schema."""
+    source_rows = [dict(row) for row in rows]
+    reason_presence = {"reason_code" in row for row in source_rows}
+    if len(reason_presence) > 1:
+        raise ValueError("mixed TVL reason_code schema is invalid")
+    reasons_by_status = {
+        "observed": "observed",
+        "missing": "source_no_tvl_observation",
+        "not_found": "source_pool_not_found",
+        "failed": "collection_failed",
+    }
+    if reason_presence == {False}:
+        for row in source_rows:
+            status = str(row.get("status") or "").strip().lower()
+            reason = reasons_by_status.get(status)
+            if reason is None:
+                raise ValueError("legacy TVL snapshot status is invalid")
+            row["reason_code"] = reason
+        return source_rows
+
+    allowed_reasons_by_status = {
+        "observed": {"observed"},
+        "missing": {"source_no_tvl_observation"},
+        "not_found": {"source_pool_not_found"},
+        "failed": set(TVL_COLLECTION_FAILURE_REASON_CODES),
+    }
+    for row in source_rows:
+        status = str(row.get("status") or "").strip().lower()
+        reason = str(row.get("reason_code") or "").strip().lower()
+        if status not in allowed_reasons_by_status:
+            raise ValueError("TVL snapshot status is invalid")
+        if not reason:
+            raise ValueError("TVL snapshot reason_code is missing")
+        if (
+            tvl_reason_code(reason) is None
+            or reason not in allowed_reasons_by_status[status]
+        ):
+            raise ValueError("TVL snapshot status and reason_code conflict")
+    return source_rows
+
+
 def merge_exact_publication(
     rows: list[dict[str, str]],
     *,
@@ -574,7 +701,10 @@ def merge_exact_publication(
     publish_dir: Path,
 ) -> list[dict[str, str]]:
     """Merge one freshly collected pool into the full TVL latest view."""
-    baseline = read_csv_rows(publish_dir / LATEST_FILENAME)
+    baseline = migrate_legacy_tvl_reason_codes(
+        read_csv_rows(publish_dir / LATEST_FILENAME)
+    )
+    rows = migrate_legacy_tvl_reason_codes(rows)
     baseline_market_ids = {dex_market_id(row) for row in baseline}
     merged = merge_exact_market_snapshot(
         baseline,
@@ -639,7 +769,13 @@ def exact_publication_coverage_gate(
     """
     target = str(target_market_id or "").strip()
     latest_path = publish_dir / LATEST_FILENAME
-    baseline_rows = read_csv_rows(latest_path)
+    baseline_rows = migrate_legacy_tvl_reason_codes(
+        read_csv_rows(latest_path)
+    )
+    rows = migrate_legacy_tvl_reason_codes(rows)
+    history_rows_to_append = migrate_legacy_tvl_reason_codes(
+        history_rows_to_append
+    )
     report = enforce_publication_coverage(
         rows,
         baseline_rows,
@@ -728,6 +864,7 @@ def exact_publication_coverage_gate(
         resolution = quality_outcome_resolution_state(
             *normalize_tvl_source_outcome(
                 target_row.get("status"),
+                target_row.get("reason_code"),
                 error=target_row.get("error"),
             )
         )
@@ -776,6 +913,7 @@ def exact_publication_coverage_gate(
 
 
 def atomic_write_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    rows = migrate_legacy_tvl_reason_codes(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -807,7 +945,9 @@ def publish_snapshot(
 
     publish_dir.mkdir(parents=True, exist_ok=True)
     publication_gate = publication_coverage_gate(rows, publish_dir)
-    existing_history = read_csv_rows(publish_dir / HISTORY_FILENAME)
+    existing_history = migrate_legacy_tvl_reason_codes(
+        read_csv_rows(publish_dir / HISTORY_FILENAME)
+    )
     merged = {
         (
             row.get("snapshot_id", ""),
@@ -816,9 +956,10 @@ def publish_snapshot(
         ): row
         for row in existing_history
     }
-    for row in (
+    append_rows = migrate_legacy_tvl_reason_codes(
         rows if history_rows_to_append is None else history_rows_to_append
-    ):
+    )
+    for row in append_rows:
         merged[
             (
                 row["snapshot_id"],
@@ -858,6 +999,10 @@ def publish_exact_snapshot(
     publish_dir: Path,
 ) -> dict[str, Any]:
     """Failure-atomically publish one bounded TVL merge."""
+    rows = migrate_legacy_tvl_reason_codes(rows)
+    history_rows_to_append = migrate_legacy_tvl_reason_codes(
+        history_rows_to_append
+    )
     publication_gate = exact_publication_coverage_gate(
         rows,
         target_market_id=target_market_id,
@@ -869,13 +1014,16 @@ def publish_exact_snapshot(
     atomic_write_csv(current_path, rows)
 
     history_path = publish_dir / HISTORY_FILENAME
+    existing_history = migrate_legacy_tvl_reason_codes(
+        read_csv_rows(history_path)
+    )
     merged_history = {
         (
             row.get("snapshot_id", ""),
             row.get("token_symbol", ""),
             *pool_key(row.get("chain", ""), row.get("pool_address", "")),
         ): row
-        for row in read_csv_rows(history_path)
+        for row in existing_history
     }
     for row in history_rows_to_append:
         merged_history[

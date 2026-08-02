@@ -75,6 +75,7 @@ try:
         validate_passing_coverage_report,
     )
     from scripts.quality_outcomes import (
+        dex_depth_reason_code,
         normalize_dex_depth_source_outcome,
         quality_outcome_resolution_state,
     )
@@ -113,6 +114,7 @@ except ModuleNotFoundError:
         validate_passing_coverage_report,
     )
     from quality_outcomes import (
+        dex_depth_reason_code,
         normalize_dex_depth_source_outcome,
         quality_outcome_resolution_state,
     )
@@ -307,13 +309,74 @@ TRAILING_COLUMNS = [
     "source_endpoint",
     "raw_response_sha256",
     "status",
+    "reason_code",
     "error",
 ]
 DEX_DEPTH_COLUMNS = BASE_COLUMNS + DEPTH_COLUMNS + TRAILING_COLUMNS
+DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES = frozenset(
+    {
+        "network",
+        "rate_limit",
+        "source_unavailable",
+        "parse",
+        "validation",
+        "collection_failed",
+        "depth_usd_price_time_mismatch",
+    }
+)
+DEX_DEPTH_UNSUPPORTED_REASON_CODES = frozenset(
+    {
+        "source_range_unavailable",
+        "unsupported_chain",
+        "unsupported_protocol",
+        "unsupported_method",
+        "unsupported_source",
+        "unsupported_protocol_or_chain",
+    }
+)
 
 
 class RpcError(RuntimeError):
     """Raised when a JSON-RPC endpoint returns no usable result."""
+
+
+class UsdPriceTimeMismatch(ValueError):
+    """Pool state and its USD conversion evidence are not time-aligned."""
+
+
+def dex_depth_failure_reason_code(error: BaseException) -> str:
+    """Classify typed DEX-depth failures without parsing raw messages."""
+    if isinstance(error, UsdPriceTimeMismatch):
+        return "depth_usd_price_time_mismatch"
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code == 429:
+            return "rate_limit"
+        return "source_unavailable"
+    if isinstance(error, (urllib.error.URLError, TimeoutError)):
+        return "network"
+    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "parse"
+    if isinstance(error, RpcError):
+        return "source_unavailable"
+    if isinstance(error, (ValueError, TypeError, KeyError, InvalidOperation)):
+        return "validation"
+    return "collection_failed"
+
+
+def dex_unsupported_reason_code(reason: str) -> str:
+    """Map collector-owned structural outcomes to bounded public reasons."""
+    prefix = str(reason or "").strip().lower().split(":", 1)[0]
+    return {
+        "unsupported_chain": "unsupported_chain",
+        "unsupported_pool_model": "unsupported_protocol",
+        "pool_is_not_an_evm_contract_address": "unsupported_method",
+        "missing_rpc_endpoint": "unsupported_source",
+        "source_range_unavailable": "source_range_unavailable",
+        "unsupported_protocol": "unsupported_protocol",
+        "unsupported_method": "unsupported_method",
+        "unsupported_source": "unsupported_source",
+        "unsupported_protocol_or_chain": "unsupported_protocol_or_chain",
+    }.get(prefix, "unsupported_source")
 
 
 def utc_now_text() -> str:
@@ -635,7 +698,7 @@ def require_usable_pool_usd_price(
     finite_decimal(pool.get("quote_token_price_usd"), positive=True)
     timing = pool_usd_price_timing(pool, block_timestamp)
     if not timing["usable"]:
-        raise ValueError(
+        raise UsdPriceTimeMismatch(
             "usd_price_conversion_unavailable:"
             f"{timing['reason']}"
         )
@@ -1377,6 +1440,7 @@ def unsupported_row(
         {
             "protocol_model": "unsupported",
             "status": "unsupported",
+            "reason_code": dex_unsupported_reason_code(reason),
             "error": reason,
         }
     )
@@ -2044,6 +2108,9 @@ def observed_pool_row(
         if all(row[f"depth_{band}bps_complete"] == "1" for band in DEPTH_BANDS_BPS)
         else "partial"
     )
+    row["reason_code"] = (
+        "observed" if row["status"] == "observed" else "measurement_limit"
+    )
     response_received_at = row["response_received_at"]
     if protocol == "concentrated_liquidity_v3":
         # The depth bands above are valid pool-state facts, but producing an
@@ -2290,12 +2357,13 @@ def collect_dex_pool_observation(
                 "source_endpoint": active_client.endpoint,
                 "raw_response_sha256": raw_hash,
                 "status": "failed",
+                "reason_code": dex_depth_failure_reason_code(error),
                 "error": f"{type(error).__name__}: {error}",
             }
         )
         status_reason = (
             "usd_price_conversion_stale_or_unavailable"
-            if str(error).startswith("usd_price_conversion_unavailable:")
+            if isinstance(error, UsdPriceTimeMismatch)
             else "pool_state_collection_failed"
         )
         pool_execution_rows = terminal_execution_rows(
@@ -2405,6 +2473,9 @@ def collect_dex_depth_with_execution(
         "execution_row_count": len(execution_rows),
         "execution_status_counts": execution_status_counts(execution_rows),
         "status_counts": dict(Counter(row["status"] for row in rows)),
+        "reason_code_counts": dict(
+            sorted(Counter(row["reason_code"] for row in rows).items())
+        ),
         "raw_files": sorted(path.name for path in snapshot_raw_dir.glob("*.json")),
     }
     (snapshot_raw_dir / "manifest.json").write_text(
@@ -2466,10 +2537,38 @@ def validate_snapshot(
     accepted = {"observed", "partial", "unsupported", "failed"}
     if any(row["status"] not in accepted for row in rows):
         raise ValueError("DEX depth snapshot contains an invalid status")
+    for row in rows:
+        status = str(row.get("status") or "").strip().lower()
+        supplied_reason = str(row.get("reason_code") or "").strip().lower()
+        if "reason_code" in row and not supplied_reason:
+            raise ValueError("DEX depth snapshot reason code is missing")
+        if supplied_reason and dex_depth_reason_code(supplied_reason) is None:
+            raise ValueError("DEX depth snapshot contains an invalid reason code")
+        allowed_reasons = {
+            "observed": {"observed"},
+            "partial": {"measurement_limit"},
+            "unsupported": set(DEX_DEPTH_UNSUPPORTED_REASON_CODES),
+            "failed": set(DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES),
+        }[status]
+        if supplied_reason and supplied_reason not in allowed_reasons:
+            raise ValueError("DEX depth snapshot status and reason code conflict")
+        if status == "failed":
+            source_hash = str(row.get("raw_response_sha256") or "")
+            if (
+                len(source_hash) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in source_hash
+                )
+            ):
+                raise ValueError(
+                    "DEX depth snapshot failed row source hash is invalid"
+                )
     if allow_terminal_only and any(
         quality_outcome_resolution_state(
             *normalize_dex_depth_source_outcome(
                 row.get("status"),
+                row.get("reason_code"),
                 error=row.get("error"),
             )
         ) not in {"observed", "confirmed_terminal_absence"}
@@ -2488,6 +2587,7 @@ def validate_snapshot(
             quality_outcome_resolution_state(
                 *normalize_dex_depth_source_outcome(
                     row.get("status"),
+                    row.get("reason_code"),
                     error=row.get("error"),
                 )
             ) != "confirmed_terminal_absence"
@@ -2518,6 +2618,54 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def migrate_legacy_dex_depth_reason_codes(
+    rows: Iterable[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Upgrade only keyless legacy rows to the explicit bounded reason schema."""
+    source_rows = [dict(row) for row in rows]
+    reason_presence = {"reason_code" in row for row in source_rows}
+    if len(reason_presence) > 1:
+        raise ValueError("mixed DEX depth reason_code schema is invalid")
+    if reason_presence == {False}:
+        for row in source_rows:
+            status = str(row.get("status") or "").strip().lower()
+            if status in {"observed", "complete"}:
+                reason = "observed"
+            elif status == "partial":
+                reason = "measurement_limit"
+            elif status == "unsupported":
+                reason = dex_unsupported_reason_code(row.get("error", ""))
+            elif status == "failed":
+                reason = "collection_failed"
+            else:
+                raise ValueError("legacy DEX depth snapshot status is invalid")
+            row["reason_code"] = reason
+        return source_rows
+
+    allowed_reasons_by_status = {
+        "observed": {"observed"},
+        "complete": {"observed"},
+        "partial": {"measurement_limit"},
+        "unsupported": set(DEX_DEPTH_UNSUPPORTED_REASON_CODES),
+        "failed": set(DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES),
+    }
+    for row in source_rows:
+        status = str(row.get("status") or "").strip().lower()
+        reason = str(row.get("reason_code") or "").strip().lower()
+        if status not in allowed_reasons_by_status:
+            raise ValueError("DEX depth snapshot status is invalid")
+        if not reason:
+            raise ValueError("DEX depth snapshot reason_code is missing")
+        if (
+            dex_depth_reason_code(reason) is None
+            or reason not in allowed_reasons_by_status[status]
+        ):
+            raise ValueError(
+                "DEX depth snapshot status and reason_code conflict"
+            )
+    return source_rows
+
+
 def merge_exact_publication_bundle(
     depth_rows: list[dict[str, str]],
     execution_rows: list[dict[str, str]],
@@ -2526,7 +2674,10 @@ def merge_exact_publication_bundle(
     publish_dir: Path,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Merge one collected DEX pool into the validated full publication."""
-    baseline_depth = read_csv_rows(publish_dir / LATEST_FILENAME)
+    baseline_depth = migrate_legacy_dex_depth_reason_codes(
+        read_csv_rows(publish_dir / LATEST_FILENAME)
+    )
+    depth_rows = migrate_legacy_dex_depth_reason_codes(depth_rows)
     baseline_execution = read_csv_rows(
         publish_dir / EXECUTION_LATEST_FILENAME
     )
@@ -2688,7 +2839,10 @@ def exact_depth_publication_coverage_gate(
     target_market_id: str,
 ) -> dict[str, Any]:
     latest_path = publish_dir / LATEST_FILENAME
-    baseline_rows = read_csv_rows(latest_path)
+    baseline_rows = migrate_legacy_dex_depth_reason_codes(
+        read_csv_rows(latest_path)
+    )
+    rows = migrate_legacy_dex_depth_reason_codes(rows)
     scope = validate_exact_publication_scope(
         baseline_rows,
         rows,
@@ -2722,6 +2876,7 @@ def exact_depth_publication_coverage_gate(
         quality_outcome_resolution_state(
             *normalize_dex_depth_source_outcome(
                 row.get("status"),
+                row.get("reason_code"),
                 error=row.get("error"),
             )
         )
@@ -2875,6 +3030,7 @@ def preflight_publication_bundle(
 
 
 def atomic_write_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    rows = migrate_legacy_dex_depth_reason_codes(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -2952,17 +3108,21 @@ def publish_snapshot(
         else depth_publication_coverage_gate(rows, publish_dir)
     )
     history_path = publish_dir / HISTORY_FILENAME
+    existing_history = migrate_legacy_dex_depth_reason_codes(
+        read_csv_rows(history_path)
+    )
     merged = {
         (
             row.get("snapshot_id", ""),
             row.get("token_symbol", ""),
             *pool_key(row.get("chain", ""), row.get("pool_address", "")),
         ): row
-        for row in read_csv_rows(history_path)
+        for row in existing_history
     }
-    for row in (
+    append_rows = migrate_legacy_dex_depth_reason_codes(
         rows if history_rows_to_append is None else history_rows_to_append
-    ):
+    )
+    for row in append_rows:
         merged[
             (
                 row["snapshot_id"],
@@ -3075,6 +3235,7 @@ def publish_full_publication_bundle(
     preflight_reports: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Failure-atomically publish one full DEX depth/execution cohort."""
+    depth_rows = migrate_legacy_dex_depth_reason_codes(depth_rows)
     current_path = output_dir / CURRENT_FILENAME
     execution_current_path = output_dir / EXECUTION_CURRENT_FILENAME
     history_path = publish_dir / HISTORY_FILENAME
@@ -3128,13 +3289,16 @@ def publish_full_publication_bundle(
     atomic_write_csv(current_path, depth_rows)
     atomic_write_execution_csv(execution_current_path, execution_rows)
 
+    existing_history = migrate_legacy_dex_depth_reason_codes(
+        read_csv_rows(history_path)
+    )
     merged_history = {
         (
             row.get("snapshot_id", ""),
             row.get("token_symbol", ""),
             *pool_key(row.get("chain", ""), row.get("pool_address", "")),
         ): row
-        for row in read_csv_rows(history_path)
+        for row in existing_history
     }
     for row in depth_rows:
         merged_history[
@@ -3199,6 +3363,10 @@ def publish_exact_publication_bundle(
     preflight_reports: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Failure-atomically publish one bounded DEX depth/execution merge."""
+    depth_rows = migrate_legacy_dex_depth_reason_codes(depth_rows)
+    history_rows_to_append = migrate_legacy_dex_depth_reason_codes(
+        history_rows_to_append
+    )
     current_path = output_dir / CURRENT_FILENAME
     execution_current_path = output_dir / EXECUTION_CURRENT_FILENAME
     history_path = publish_dir / HISTORY_FILENAME
@@ -3280,13 +3448,16 @@ def publish_exact_publication_bundle(
     atomic_write_csv(current_path, depth_rows)
     atomic_write_execution_csv(execution_current_path, execution_rows)
 
+    existing_history = migrate_legacy_dex_depth_reason_codes(
+        read_csv_rows(history_path)
+    )
     merged_history = {
         (
             row.get("snapshot_id", ""),
             row.get("token_symbol", ""),
             *pool_key(row.get("chain", ""), row.get("pool_address", "")),
         ): row
-        for row in read_csv_rows(history_path)
+        for row in existing_history
     }
     for row in history_rows_to_append:
         merged_history[

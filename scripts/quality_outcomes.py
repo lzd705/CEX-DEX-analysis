@@ -57,6 +57,12 @@ _RULES = {
     ("collection_failed", "source_unavailable"): _rule(True, False, "retry_open"),
     ("collection_failed", "parse"): _rule(True, False, "retry_open"),
     ("collection_failed", "validation"): _rule(True, False, "retry_open"),
+    ("collection_failed", "collection_failed"): _rule(
+        True, False, "retry_open"
+    ),
+    ("collection_failed", "depth_usd_price_time_mismatch"): _rule(
+        True, False, "retry_open"
+    ),
     ("source_no_observation", "no_candles"): _rule(
         False, True, "confirmed_absence"
     ),
@@ -283,6 +289,39 @@ _DEX_UNSUPPORTED_PREFIXES = {
     "unsupported_source",
     "unsupported_protocol_or_chain",
 }
+_BOUNDED_COLLECTION_FAILURE_REASONS = {
+    "network",
+    "rate_limit",
+    "source_unavailable",
+    "parse",
+    "validation",
+    "collection_failed",
+}
+_TVL_REASON_CODES = {
+    "observed",
+    "source_no_tvl_observation",
+    "source_pool_not_found",
+    *_BOUNDED_COLLECTION_FAILURE_REASONS,
+}
+_DEX_DEPTH_REASON_CODES = {
+    "observed",
+    "measurement_limit",
+    "depth_usd_price_time_mismatch",
+    *_BOUNDED_COLLECTION_FAILURE_REASONS,
+    *_DEX_UNSUPPORTED_PREFIXES,
+}
+
+
+def tvl_reason_code(reason_code):
+    """Return one explicit bounded TVL reason or ``None``."""
+    candidate = str(reason_code or "").strip().lower()
+    return candidate if candidate in _TVL_REASON_CODES else None
+
+
+def dex_depth_reason_code(reason_code):
+    """Return one explicit bounded DEX-depth reason or ``None``."""
+    candidate = str(reason_code or "").strip().lower()
+    return candidate if candidate in _DEX_DEPTH_REASON_CODES else None
 
 
 def classify_legacy_cex_error(error):
@@ -322,19 +361,13 @@ def normalize_cex_source_outcome(status, reason_code, error):
             return ("source_no_observation", reason)
         if reason == "source_invalid_order_book":
             return ("invalid", reason)
-        if reason in {
-            "network",
-            "rate_limit",
-            "source_unavailable",
-            "parse",
-            "validation",
-        }:
+        if reason in _BOUNDED_COLLECTION_FAILURE_REASONS:
             return ("collection_failed", reason)
         if reason in {"not_listed", "source_rejected_request"}:
             return ("needs_review", reason)
         if reason == "unsupported_source":
             return ("unsupported", reason)
-        return ("collection_failed", "source_unavailable")
+        return ("collection_failed", "collection_failed")
     if raw_status == "source_no_observation" and reason in {
         "source_no_two_sided_book",
         "source_no_order_book",
@@ -372,7 +405,7 @@ def normalize_tvl_source_outcome(status, reason_code=None, error=None):
     """Map TVL collector states to bounded public quality outcomes."""
     del error
     raw_status = str(status or "").strip().lower()
-    raw_reason = str(reason_code or "").strip().lower()
+    raw_reason = tvl_reason_code(reason_code)
     if raw_status == "observed":
         pair = ("observed", "observed")
     elif raw_status == "legacy_ohlcv_snapshot":
@@ -387,7 +420,12 @@ def normalize_tvl_source_outcome(status, reason_code=None, error=None):
     }:
         pair = (raw_status, raw_reason)
     elif raw_status in {"failed", "error", "collection_failed"}:
-        pair = ("collection_failed", "source_unavailable")
+        pair = (
+            "collection_failed",
+            raw_reason
+            if raw_reason in _BOUNDED_COLLECTION_FAILURE_REASONS
+            else "collection_failed",
+        )
     elif raw_status == "unavailable":
         pair = ("unavailable", "tvl_snapshot_unavailable")
     elif raw_status == "not_cataloged_in_snapshot":
@@ -403,6 +441,7 @@ def normalize_tvl_source_outcome(status, reason_code=None, error=None):
 def normalize_dex_depth_source_outcome(status, reason_code=None, error=None):
     """Map DEX-depth collector states to bounded public quality outcomes."""
     raw_status = str(status or "").strip().lower()
+    raw_reason = dex_depth_reason_code(reason_code)
     if raw_status in {"observed", "complete"}:
         pair = ("observed", "observed")
     elif raw_status == "partial":
@@ -416,7 +455,7 @@ def normalize_dex_depth_source_outcome(status, reason_code=None, error=None):
         "unsupported_protocol_or_chain",
     }:
         bounded_reason = (
-            project_dex_unsupported_error(reason_code)
+            project_dex_unsupported_error(raw_reason)
             or project_dex_unsupported_error(error)
             or (
                 raw_status
@@ -426,7 +465,14 @@ def normalize_dex_depth_source_outcome(status, reason_code=None, error=None):
         )
         pair = ("unsupported", bounded_reason or "unsupported_source")
     elif raw_status in {"failed", "error", "collection_failed"}:
-        pair = ("collection_failed", "source_unavailable")
+        pair = (
+            "collection_failed",
+            raw_reason
+            if raw_reason
+            in _BOUNDED_COLLECTION_FAILURE_REASONS
+            | {"depth_usd_price_time_mismatch"}
+            else "collection_failed",
+        )
     elif raw_status == "unavailable":
         pair = ("unavailable", "depth_snapshot_unavailable")
     elif raw_status == "not_cataloged_in_snapshot":
@@ -435,7 +481,7 @@ def normalize_dex_depth_source_outcome(status, reason_code=None, error=None):
             "depth_market_not_cataloged_in_snapshot",
         )
     else:
-        pair = (raw_status, reason_code)
+        pair = (raw_status, raw_reason)
     return fail_closed_quality_outcome(*pair)
 
 
@@ -467,6 +513,7 @@ def normalize_execution_source_outcome(
             "source_unavailable",
             "parse",
             "validation",
+            "collection_failed",
             "not_listed",
             "source_rejected_request",
             "unsupported_source",
@@ -522,6 +569,7 @@ _DAILY_QUALITY_FACT_OUTCOMES = frozenset(
         ("collection_failed", "source_unavailable"),
         ("collection_failed", "parse"),
         ("collection_failed", "validation"),
+        ("collection_failed", "collection_failed"),
         ("collection_failed", "multiple_daily_quality_reasons"),
         ("needs_review", "multiple_daily_quality_reasons"),
         ("backfill_pending", "multiple_daily_quality_reasons"),
@@ -573,6 +621,11 @@ _DEX_TVL_FACT_OUTCOMES = frozenset(
         ("source_no_observation", "source_no_tvl_observation"),
         ("source_no_observation", "source_pool_not_found"),
         ("collection_failed", "source_unavailable"),
+        ("collection_failed", "network"),
+        ("collection_failed", "rate_limit"),
+        ("collection_failed", "parse"),
+        ("collection_failed", "validation"),
+        ("collection_failed", "collection_failed"),
         ("unavailable", "tvl_snapshot_unavailable"),
         (
             "not_cataloged_in_snapshot",
@@ -591,6 +644,7 @@ _CEX_DEPTH_FACT_OUTCOMES = frozenset(
         ("collection_failed", "source_unavailable"),
         ("collection_failed", "parse"),
         ("collection_failed", "validation"),
+        ("collection_failed", "collection_failed"),
         ("source_no_observation", "source_no_two_sided_book"),
         ("source_no_observation", "source_no_order_book"),
         (
@@ -614,7 +668,13 @@ _DEX_DEPTH_FACT_OUTCOMES = frozenset(
     {
         ("observed", "observed"),
         ("partial", "measurement_limit"),
+        ("collection_failed", "network"),
+        ("collection_failed", "rate_limit"),
         ("collection_failed", "source_unavailable"),
+        ("collection_failed", "parse"),
+        ("collection_failed", "validation"),
+        ("collection_failed", "collection_failed"),
+        ("collection_failed", "depth_usd_price_time_mismatch"),
         ("unsupported", "source_range_unavailable"),
         ("unsupported", "unsupported_chain"),
         ("unsupported", "unsupported_protocol"),
@@ -654,6 +714,7 @@ _CEX_EXECUTION_FACT_OUTCOMES = frozenset(
         ("collection_failed", "source_unavailable"),
         ("collection_failed", "parse"),
         ("collection_failed", "validation"),
+        ("collection_failed", "collection_failed"),
         ("collection_failed", "multiple_daily_quality_reasons"),
         ("source_no_observation", "source_no_two_sided_book"),
         ("source_no_observation", "source_no_order_book"),
@@ -676,6 +737,7 @@ _DEX_EXECUTION_FACT_OUTCOMES = frozenset(
         ("collection_failed", "source_unavailable"),
         ("collection_failed", "parse"),
         ("collection_failed", "validation"),
+        ("collection_failed", "collection_failed"),
         ("collection_failed", "multiple_daily_quality_reasons"),
         ("unsupported", "source_range_unavailable"),
         ("unsupported", "unsupported_chain"),

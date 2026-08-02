@@ -72,10 +72,11 @@ def cex_row(**changes):
         "source_endpoint": "https://example.invalid",
         "raw_response_sha256": "a" * 64,
         "status": "observed",
-        "reason_code": "observed",
         "error": "",
     }
     row.update(changes)
+    if "status" not in changes and "reason_code" not in changes:
+        row["reason_code"] = "observed"
     return row
 
 
@@ -117,6 +118,8 @@ def dex_depth_row(**changes):
         "error": "",
     }
     row.update(changes)
+    if "status" not in changes and "reason_code" not in changes:
+        row["reason_code"] = "observed"
     return row
 
 
@@ -137,6 +140,8 @@ def tvl_row(**changes):
         "error": "",
     }
     row.update(changes)
+    if "status" not in changes and "reason_code" not in changes:
+        row["reason_code"] = "observed"
     return row
 
 
@@ -963,7 +968,7 @@ class SnapshotFactReaderTest(unittest.TestCase):
         self.assertEqual(result.status, "unsupported")
         self.assertFalse(result.retryable)
 
-    def test_retryable_cex_and_tvl_failures_may_lack_source_hash(self):
+    def test_retryable_cex_may_lack_hash_but_failed_tvl_requires_one(self):
         cex = self.read(
             "cex_depth_latest.csv",
             {
@@ -977,20 +982,23 @@ class SnapshotFactReaderTest(unittest.TestCase):
                 raw_response_sha256="",
             ), CEX_MEASURED)],
         )
-        tvl = self.read(
-            "dex_pool_tvl_latest.csv",
-            {
-                "token_symbol": "AAVE",
-                "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
-                "fact_type": "tvl",
-            },
-            [tvl_row(status="failed", tvl_usd="", raw_response_sha256="")],
-        )
-
         self.assertEqual(cex.status, "collection_failed")
         self.assertTrue(cex.retryable)
-        self.assertEqual(tvl.status, "collection_failed")
-        self.assertTrue(tvl.retryable)
+        with self.assertRaisesRegex(ValueError, "source.*hash"):
+            self.read(
+                "dex_pool_tvl_latest.csv",
+                {
+                    "token_symbol": "AAVE",
+                    "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+                    "fact_type": "tvl",
+                },
+                [tvl_row(
+                    status="failed",
+                    reason_code="network",
+                    tvl_usd="",
+                    raw_response_sha256="",
+                )],
+            )
 
     def test_rejects_duplicate_target_non_target_and_normalized_identity(self):
         base = cex_row()
@@ -1071,7 +1079,7 @@ class SnapshotFactReaderTest(unittest.TestCase):
         }, [tvl_row(status="failed", tvl_usd="", error="private endpoint failure")])
         self.assertEqual(
             (tvl.status, tvl.reason_code),
-            ("collection_failed", "source_unavailable"),
+            ("collection_failed", "collection_failed"),
         )
         self.assertTrue(tvl.retryable)
         self.assertNotIn("private", repr(tvl))
@@ -1103,9 +1111,107 @@ class SnapshotFactReaderTest(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "collection_failed")
-        self.assertEqual(result.reason_code, "source_unavailable")
+        self.assertEqual(result.reason_code, "collection_failed")
         self.assertTrue(result.retryable)
         self.assertNotIn("private", repr(result))
+
+    def test_snapshot_refresh_preserves_bounded_tvl_and_dex_depth_reasons(self):
+        dex_request = {
+            "token_symbol": "AAVE",
+            "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+            "fact_type": "depth",
+        }
+        depth = self.read(
+            "dex_depth_latest.csv",
+            dex_request,
+            [unmeasured(dex_depth_row(
+                status="failed",
+                reason_code="depth_usd_price_time_mismatch",
+            ), DEX_MEASURED)],
+        )
+        tvl = self.read(
+            "dex_pool_tvl_latest.csv",
+            {**dex_request, "fact_type": "tvl"},
+            [tvl_row(
+                status="failed",
+                reason_code="rate_limit",
+                tvl_usd="",
+            )],
+        )
+        self.assertEqual(
+            (depth.status, depth.reason_code),
+            ("collection_failed", "depth_usd_price_time_mismatch"),
+        )
+        self.assertEqual(
+            (tvl.status, tvl.reason_code),
+            ("collection_failed", "rate_limit"),
+        )
+
+    def test_legacy_snapshot_without_reason_uses_generic_or_status_proven_reason(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+            "fact_type": "tvl",
+        }
+        legacy_failed = tvl_row(status="failed", tvl_usd="")
+        legacy_failed.pop("reason_code", None)
+        legacy_missing = tvl_row(status="missing", tvl_usd="")
+        legacy_missing.pop("reason_code", None)
+        failed = self.read(
+            "dex_pool_tvl_latest.csv", request, [legacy_failed]
+        )
+        missing = self.read(
+            "dex_pool_tvl_latest.csv", request, [legacy_missing]
+        )
+        self.assertEqual(failed.reason_code, "collection_failed")
+        self.assertEqual(missing.reason_code, "source_no_tvl_observation")
+
+    def test_snapshot_refresh_rejects_unknown_tvl_and_dex_depth_reasons(self):
+        request = {
+            "token_symbol": "AAVE",
+            "market_id": "dex:eth:uniswap_v3:0xabc:AAVE",
+            "fact_type": "depth",
+        }
+        cases = (
+            (
+                "dex_depth_latest.csv",
+                request,
+                [unmeasured(dex_depth_row(
+                    status="failed",
+                    reason_code="",
+                ), DEX_MEASURED)],
+            ),
+            (
+                "dex_pool_tvl_latest.csv",
+                {**request, "fact_type": "tvl"},
+                [tvl_row(
+                    status="failed",
+                    reason_code="",
+                    tvl_usd="",
+                )],
+            ),
+            (
+                "dex_depth_latest.csv",
+                request,
+                [unmeasured(dex_depth_row(
+                    status="failed",
+                    reason_code="private_raw_error",
+                ), DEX_MEASURED)],
+            ),
+            (
+                "dex_pool_tvl_latest.csv",
+                {**request, "fact_type": "tvl"},
+                [tvl_row(
+                    status="failed",
+                    reason_code="private_raw_error",
+                    tvl_usd="",
+                )],
+            ),
+        )
+        for filename, target, rows in cases:
+            with self.subTest(filename=filename):
+                with self.assertRaises(ValueError):
+                    self.read(filename, target, rows)
 
     def test_rejects_decreasing_dex_depth_bands(self):
         request = {
@@ -1154,7 +1260,7 @@ class SnapshotFactReaderTest(unittest.TestCase):
         )
         after = self.read("dex_depth_latest.csv", request, [failed])
         self.assertEqual(after.status, "collection_failed")
-        self.assertEqual(after.reason_code, "source_unavailable")
+        self.assertEqual(after.reason_code, "collection_failed")
         self.assertTrue(after.retryable)
         result = evaluate_snapshot_refresh(
             state("before", "a" * 64, "collection_failed", "network", retryable=True,

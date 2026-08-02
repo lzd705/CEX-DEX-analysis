@@ -3158,12 +3158,22 @@ console.log(JSON.stringify({
   unknown: snapshotMissingReason({
     tvl_status: "unavailable",
   }, "tvl", "TVL unavailable."),
+  timing: snapshotMissingReason({
+    depth_status: "collection_failed",
+    depth_na_reason: "depth_usd_price_time_mismatch",
+  }, "depth", "Depth unavailable."),
+  missingTvl: snapshotMissingReason({
+    tvl_status: "source_no_observation",
+    tvl_na_reason: "source_no_tvl_observation",
+  }, "tvl", "TVL unavailable."),
 }));
 """
         )
         self.assertIn("2026-07-31 12:34:56 UTC", result["known"])
         self.assertIn("Last collection attempt", result["known"])
         self.assertIn("Last collection attempt time is not published", result["unknown"])
+        self.assertIn("time-aligned", result["timing"])
+        self.assertIn("no TVL observation", result["missingTvl"])
 
     def test_snapshot_refresh_polls_public_job_and_reloads_current_fact_view(self):
         result = run_app_javascript(

@@ -85,6 +85,7 @@ ATTEMPT_ERROR_MESSAGES = {
     "parse": "The source response could not be decoded into the expected format.",
     "validation": "The source response did not satisfy the collector contract.",
     "source_range_unavailable": "The source endpoint cannot reach the requested date window.",
+    "collection_failed": "The collection attempt failed for an unclassified reason.",
 }
 
 
@@ -225,7 +226,7 @@ def classify_attempt_error(error):
     ):
         reason = "validation"
     else:
-        reason = "source_unavailable"
+        reason = "collection_failed"
     return {
         "reason_code": reason,
         "http_status": http_status,

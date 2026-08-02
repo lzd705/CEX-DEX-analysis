@@ -56,6 +56,7 @@ try:
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
         cex_reason_code,
+        dex_depth_reason_code,
         normalize_cex_source_outcome,
         normalize_dex_depth_source_outcome,
         normalize_execution_source_outcome,
@@ -109,6 +110,7 @@ except ModuleNotFoundError:
         canonical_quality_fact_action,
         canonical_quality_fact_rule,
         cex_reason_code,
+        dex_depth_reason_code,
         normalize_cex_source_outcome,
         normalize_dex_depth_source_outcome,
         normalize_execution_source_outcome,
@@ -2069,6 +2071,58 @@ def _load_dex_depth_snapshot_cached(
     if not rows:
         raise ValueError(f"{path.name} contains no DEX depth rows")
 
+    allowed_reasons_by_status = {
+        "observed": {"observed"},
+        "complete": {"observed"},
+        "partial": {"measurement_limit"},
+        "unsupported": {
+            "source_range_unavailable",
+            "unsupported_chain",
+            "unsupported_protocol",
+            "unsupported_method",
+            "unsupported_source",
+            "unsupported_protocol_or_chain",
+        },
+        "failed": {
+            "network",
+            "rate_limit",
+            "source_unavailable",
+            "parse",
+            "validation",
+            "collection_failed",
+            "depth_usd_price_time_mismatch",
+        },
+    }
+    for row in rows:
+        status = str(row.get("status") or "").strip().lower()
+        if status not in allowed_reasons_by_status:
+            raise ValueError("DEX depth publication status is invalid")
+        supplied_reason = str(row.get("reason_code") or "").strip().lower()
+        if "reason_code" in row and not supplied_reason:
+            raise ValueError("DEX depth publication reason code is missing")
+        bounded_reason = dex_depth_reason_code(supplied_reason)
+        if supplied_reason and bounded_reason is None:
+            raise ValueError("DEX depth publication reason code is invalid")
+        if (
+            bounded_reason
+            and bounded_reason not in allowed_reasons_by_status[status]
+        ):
+            raise ValueError(
+                "DEX depth publication status and reason code conflict"
+            )
+        if status == "failed":
+            source_hash = str(row.get("raw_response_sha256") or "")
+            if (
+                len(source_hash) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in source_hash
+                )
+            ):
+                raise ValueError(
+                    "DEX depth publication failed row source hash is invalid"
+                )
+
     snapshot_id = _one_raw_cohort_id(
         rows,
         "snapshot_id",
@@ -2255,7 +2309,9 @@ def overlay_dex_depth_snapshot(
             and not price_timing["usable"]
         ):
             pool["dex_depth_status"] = "collection_failed"
-            pool["dex_depth_reason_code"] = "source_unavailable"
+            pool["dex_depth_reason_code"] = (
+                "depth_usd_price_time_mismatch"
+            )
             pool["dex_depth_error"] = price_timing["reason"]
         for field in numeric_fields:
             pool[field] = (
@@ -4361,6 +4417,7 @@ def _load_daily_quality_report_cached(
 
     normalized_issues = []
     seen = set()
+    seen_status_by_market_day_reason = {}
     for issue in issues:
         if not isinstance(issue, dict):
             raise ValueError("Daily quality issue is not an object")
@@ -4396,6 +4453,13 @@ def _load_daily_quality_report_cached(
             # Hard-invalid details and other non-daily evidence remain in the
             # protected operator report, never in the public projection.
             continue
+        raw_key = (market_id, day_value, reason_code)
+        previous_status = seen_status_by_market_day_reason.get(raw_key)
+        if previous_status is not None and previous_status != status:
+            raise ValueError(
+                "Daily quality issue status conflicts for one market/date/reason"
+            )
+        seen_status_by_market_day_reason[raw_key] = status
         rule = quality_outcome_rule(status, reason_code)
         if rule is None or retryable is not rule.retryable:
             status = "needs_review"

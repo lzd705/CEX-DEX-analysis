@@ -2,6 +2,7 @@ import csv
 import json
 import tempfile
 import unittest
+import urllib.error
 from decimal import Decimal, localcontext
 from pathlib import Path
 from unittest.mock import patch
@@ -27,17 +28,20 @@ from scripts.fetch_dex_depth import (
     SELECTOR_TOKEN1,
     _human_token1_per_token0,
     _quantized_target,
+    atomic_write_csv,
     collect_dex_depth,
     collect_dex_depth_with_execution,
     decimal_text,
     decode_int,
     decode_symbol,
+    dex_depth_failure_reason_code,
     depth_fields,
     ensure_full_publish_scope,
     encode_signed_word,
     execution_publication_coverage_gate,
     load_pool_inventory,
     merge_exact_publication_bundle,
+    migrate_legacy_dex_depth_reason_codes,
     preflight_publication_bundle,
     publish_exact_publication_bundle,
     protocol_model,
@@ -785,6 +789,8 @@ class DexDepthCollectionTest(unittest.TestCase):
         retryable = {
             **terminal,
             "status": "failed",
+            "reason_code": "collection_failed",
+            "raw_response_sha256": "a" * 64,
             "error": "RpcError: temporary source failure",
         }
         with self.assertRaisesRegex(ValueError, "terminal non-retryable"):
@@ -797,6 +803,7 @@ class DexDepthCollectionTest(unittest.TestCase):
         partial = {
             **terminal,
             "status": "partial",
+            "reason_code": "measurement_limit",
             "error": "depth_truncated: fixture measurement limit",
         }
         with self.assertRaisesRegex(ValueError, "resolved exact candidate"):
@@ -865,6 +872,19 @@ class DexDepthCollectionTest(unittest.TestCase):
             output_dir=self.root / "processed",
             publish_dir=published,
         )
+        history_path = published / HISTORY_FILENAME
+        with history_path.open(newline="", encoding="utf-8") as handle:
+            baseline_history = list(csv.DictReader(handle))
+        legacy_columns = [
+            field for field in DEX_DEPTH_COLUMNS if field != "reason_code"
+        ]
+        with history_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=legacy_columns)
+            writer.writeheader()
+            writer.writerows(
+                {field: row.get(field, "") for field in legacy_columns}
+                for row in baseline_history
+            )
 
         merged_depth, merged_execution = merge_exact_publication_bundle(
             candidate_depth,
@@ -966,6 +986,224 @@ class DexDepthCollectionTest(unittest.TestCase):
         ) as handle:
             history = list(csv.DictReader(handle))
         self.assertEqual(len(history), 3)
+        self.assertEqual(
+            {row["reason_code"] for row in history},
+            {"observed"},
+        )
+
+    def test_exact_pool_refresh_migrates_keyless_legacy_depth_reasons(self):
+        other_pool = {
+            **self.pool,
+            "pool_address": "0x4444444444444444444444444444444444444444",
+            "pool_name": "AAVE / USDC second pool",
+        }
+        _baseline_id, baseline_depth, baseline_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool, other_pool],
+                raw_root=self.root / "raw-legacy-baseline",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        _candidate_id, candidate_depth, candidate_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-legacy-candidate",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        published = self.root / "legacy-local"
+        publish_snapshot(
+            baseline_depth,
+            output_dir=self.root / "legacy-processed",
+            publish_dir=published,
+        )
+        publish_execution_snapshot(
+            baseline_execution,
+            expected_market_ids={row["market_id"] for row in baseline_execution},
+            output_dir=self.root / "legacy-processed",
+            publish_dir=published,
+        )
+        legacy_columns = [
+            field for field in DEX_DEPTH_COLUMNS if field != "reason_code"
+        ]
+        with (published / LATEST_FILENAME).open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=legacy_columns)
+            writer.writeheader()
+            writer.writerows(
+                {
+                    field: row.get(field, "")
+                    for field in legacy_columns
+                }
+                for row in baseline_depth
+            )
+
+        try:
+            merged_depth, _merged_execution = merge_exact_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                target_market_id=(
+                    "dex:eth:uniswap_v2:"
+                    "0x3333333333333333333333333333333333333333:AAVE"
+                ),
+                publish_dir=published,
+            )
+        except ValueError as error:
+            self.fail(f"keyless legacy DEX depth migration was rejected: {error}")
+
+        self.assertTrue(
+            all(row.get("reason_code") == "observed" for row in merged_depth)
+        )
+
+    def test_legacy_dex_depth_reason_migration_rejects_mixed_schema(self):
+        _snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
+            [self.pool, {**self.pool, "pool_address": "0x" + "4" * 40}],
+            raw_root=self.root / "raw-mixed-reason-schema",
+            sleep_seconds=0,
+            rpc_factory=FakeV2Rpc,
+        )
+        rows[0].pop("reason_code")
+
+        with self.assertRaisesRegex(ValueError, "mixed.*reason_code"):
+            migrate_legacy_dex_depth_reason_codes(rows)
+
+    def test_atomic_write_migrates_keyless_legacy_dex_reason_schema(self):
+        _snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
+            [self.pool],
+            raw_root=self.root / "raw-keyless-write",
+            sleep_seconds=0,
+            rpc_factory=FakeV2Rpc,
+        )
+        rows[0].pop("reason_code")
+        path = self.root / "keyless-depth.csv"
+        atomic_write_csv(path, rows)
+        with path.open(newline="", encoding="utf-8") as handle:
+            written = list(csv.DictReader(handle))
+
+        self.assertEqual(written[0]["reason_code"], "observed")
+
+    def test_atomic_write_rejects_blank_modern_dex_reason(self):
+        _snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
+            [self.pool],
+            raw_root=self.root / "raw-blank-write",
+            sleep_seconds=0,
+            rpc_factory=FakeV2Rpc,
+        )
+        rows[0]["reason_code"] = ""
+        with self.assertRaisesRegex(ValueError, "reason_code"):
+            atomic_write_csv(self.root / "blank-depth.csv", rows)
+
+    def test_publish_snapshot_migrates_keyless_legacy_dex_history(self):
+        _snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
+            [self.pool],
+            raw_root=self.root / "raw-legacy-history",
+            sleep_seconds=0,
+            rpc_factory=FakeV2Rpc,
+        )
+        legacy = dict(rows[0])
+        legacy.update(
+            snapshot_id="legacy-snapshot",
+            observed_at="2026-07-26T00:00:01+00:00",
+            request_started_at="2026-07-26T00:00:00+00:00",
+            response_received_at="2026-07-26T00:00:01+00:00",
+        )
+        legacy.pop("reason_code")
+        published = self.root / "legacy-history-published"
+        published.mkdir()
+        history_path = published / HISTORY_FILENAME
+        legacy_columns = [
+            field for field in DEX_DEPTH_COLUMNS if field != "reason_code"
+        ]
+        with history_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=legacy_columns)
+            writer.writeheader()
+            writer.writerow(
+                {field: legacy.get(field, "") for field in legacy_columns}
+            )
+
+        publish_snapshot(
+            rows,
+            output_dir=self.root / "legacy-history-processed",
+            publish_dir=published,
+        )
+        with history_path.open(newline="", encoding="utf-8") as handle:
+            history = list(csv.DictReader(handle))
+
+        self.assertEqual(len(history), 2)
+        self.assertEqual(
+            {row["reason_code"] for row in history},
+            {"observed"},
+        )
+
+    def test_full_bundle_migrates_keyless_legacy_dex_history(self):
+        _baseline_id, baseline_depth, baseline_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-full-legacy-baseline",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        _candidate_id, candidate_depth, candidate_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-full-legacy-candidate",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        published = self.root / "full-legacy-published"
+        processed = self.root / "full-legacy-processed"
+        publish_snapshot(
+            baseline_depth,
+            output_dir=processed,
+            publish_dir=published,
+        )
+        publish_execution_snapshot(
+            baseline_execution,
+            expected_market_ids={
+                row["market_id"] for row in baseline_execution
+            },
+            output_dir=processed,
+            publish_dir=published,
+        )
+        history_path = published / HISTORY_FILENAME
+        with history_path.open(newline="", encoding="utf-8") as handle:
+            baseline_history = list(csv.DictReader(handle))
+        legacy_columns = [
+            field for field in DEX_DEPTH_COLUMNS if field != "reason_code"
+        ]
+        with history_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=legacy_columns)
+            writer.writeheader()
+            writer.writerows(
+                {field: row.get(field, "") for field in legacy_columns}
+                for row in baseline_history
+            )
+        reports = preflight_publication_bundle(
+            candidate_depth,
+            candidate_execution,
+            published,
+        )
+
+        publish_full_publication_bundle(
+            candidate_depth,
+            candidate_execution,
+            output_dir=processed,
+            publish_dir=published,
+            preflight_reports=reports,
+        )
+        with history_path.open(newline="", encoding="utf-8") as handle:
+            history = list(csv.DictReader(handle))
+
+        self.assertEqual(len(history), 2)
+        self.assertEqual(
+            {row["reason_code"] for row in history},
+            {"observed"},
+        )
 
     def test_exact_publication_bundle_rejects_resolved_private_public_path_overlap_before_write(self):
         other_pool = {
@@ -1221,6 +1459,8 @@ class DexDepthCollectionTest(unittest.TestCase):
                 {
                     "protocol_model": "constant_product_v2",
                     "status": "failed",
+                    "reason_code": "collection_failed",
+                    "raw_response_sha256": "a" * 64,
                     "error": "RuntimeError: temporary RPC failure",
                 }
             )
@@ -1317,6 +1557,7 @@ class DexDepthCollectionTest(unittest.TestCase):
                 **candidate_depth[0],
                 "snapshot_id": "baseline-failed",
                 "status": "failed",
+                "reason_code": "collection_failed",
                 "error": "RuntimeError: temporary RPC failure",
             }
         ]
@@ -1381,6 +1622,7 @@ class DexDepthCollectionTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row["status"], "observed")
+        self.assertEqual(row["reason_code"], "observed")
         self.assertEqual(row["block_number"], "123")
         self.assertEqual(row["target_token_position"], "token0")
         self.assertEqual(row["block_timestamp"], "2024-01-01T00:00:00+00:00")
@@ -1453,6 +1695,7 @@ class DexDepthCollectionTest(unittest.TestCase):
             next((self.root / "raw").glob("*/manifest.json")).read_text()
         )
         self.assertEqual(manifest["status_counts"], {"observed": 1})
+        self.assertEqual(manifest["reason_code_counts"], {"observed": 1})
         self.assertEqual(manifest["chain_blocks"], {"eth": 123})
         self.assertEqual(
             manifest["chain_block_timestamps"],
@@ -1481,6 +1724,10 @@ class DexDepthCollectionTest(unittest.TestCase):
             if row["pool_address"] == stale_pool["pool_address"]
         )
         self.assertEqual(stale_depth["status"], "failed")
+        self.assertEqual(
+            stale_depth["reason_code"],
+            "depth_usd_price_time_mismatch",
+        )
         self.assertEqual(stale_depth["usd_price_freshness_status"], "stale")
         self.assertEqual(stale_depth["total_depth_100bps_usd"], "")
         stale_execution = [
@@ -1506,6 +1753,58 @@ class DexDepthCollectionTest(unittest.TestCase):
                 for field in RESULT_NUMERIC_COLUMNS
             )
         )
+
+    def test_dex_failure_classifier_uses_exception_types_not_raw_messages(self):
+        failures = (
+            (urllib.error.HTTPError("https://example.test", 429, "", {}, None), "rate_limit"),
+            (urllib.error.HTTPError("https://example.test", 503, "", {}, None), "source_unavailable"),
+            (urllib.error.URLError("private hostname"), "network"),
+            (json.JSONDecodeError("private payload", "x", 0), "parse"),
+            (ValueError("private invalid value"), "validation"),
+            (PermissionError("/srv/private/depth"), "collection_failed"),
+        )
+        for error, expected in failures:
+            with self.subTest(expected=expected):
+                self.assertEqual(dex_depth_failure_reason_code(error), expected)
+
+    def test_unsupported_rows_keep_a_specific_bounded_reason(self):
+        cases = (
+            ("unsupported_chain:solana", "unsupported_chain"),
+            ("unsupported_pool_model:curve", "unsupported_protocol"),
+            ("pool_is_not_an_evm_contract_address", "unsupported_method"),
+            ("missing_rpc_endpoint:eth", "unsupported_source"),
+        )
+        for raw_reason, expected in cases:
+            with self.subTest(raw_reason=raw_reason):
+                row = unsupported_row(
+                    self.pool,
+                    snapshot_id="snapshot-1",
+                    request_started_at="2026-07-27T00:00:00+00:00",
+                    response_received_at="2026-07-27T00:00:01+00:00",
+                    reason=raw_reason,
+                )
+                self.assertEqual(row["reason_code"], expected)
+
+    def test_validator_accepts_legacy_missing_reason_but_rejects_unknown_reason(self):
+        _snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
+            [self.pool],
+            raw_root=self.root / "raw-reason-validation",
+            sleep_seconds=0,
+            rpc_factory=FakeV2Rpc,
+        )
+        legacy = [dict(rows[0])]
+        legacy[0].pop("reason_code")
+        validate_depth_snapshot([self.pool], legacy)
+        with self.assertRaisesRegex(ValueError, "reason code"):
+            validate_depth_snapshot(
+                [self.pool],
+                [{**rows[0], "reason_code": ""}],
+            )
+        with self.assertRaisesRegex(ValueError, "reason code"):
+            validate_depth_snapshot(
+                [self.pool],
+                [{**rows[0], "reason_code": "private_raw_error"}],
+            )
 
     def test_v3_depth_succeeds_but_execution_is_explicitly_unsupported(self):
         v3_pool = {
@@ -1695,6 +1994,20 @@ class DexDepthCollectionTest(unittest.TestCase):
 
         failed_depth = next(row for row in depth_rows if row["token_symbol"] == "COMP")
         self.assertEqual(failed_depth["status"], "failed")
+        self.assertEqual(len(failed_depth["raw_response_sha256"]), 64)
+        for invalid_hash in ("", "A" * 64):
+            with self.subTest(invalid_hash=invalid_hash):
+                corrupted = [dict(row) for row in depth_rows]
+                next(
+                    row
+                    for row in corrupted
+                    if row["token_symbol"] == "COMP"
+                )["raw_response_sha256"] = invalid_hash
+                with self.assertRaisesRegex(ValueError, "source hash"):
+                    validate_depth_snapshot(
+                        [self.pool, failed_pool],
+                        corrupted,
+                    )
         failed_execution = [
             row for row in execution_rows if row["token_symbol"] == "COMP"
         ]
@@ -1750,6 +2063,7 @@ class DexDepthCollectionTest(unittest.TestCase):
                 "chain": "eth",
                 "pool_address": self.pool["pool_address"],
                 "status": "observed",
+                "reason_code": "observed",
             }
         )
         publish_snapshot(
@@ -1789,6 +2103,7 @@ class DexDepthCollectionTest(unittest.TestCase):
                     "pool_address": "0x{:040x}".format(index + 1),
                     "protocol_model": "constant_product_v2",
                     "status": "observed",
+                    "reason_code": "observed",
                 }
             )
             baseline.append(row)
@@ -1801,6 +2116,9 @@ class DexDepthCollectionTest(unittest.TestCase):
                     "unsupported" if index < 2 else row["protocol_model"]
                 ),
                 "status": "unsupported" if index < 2 else "observed",
+                "reason_code": (
+                    "unsupported_source" if index < 2 else "observed"
+                ),
                 "error": (
                     "missing_rpc_endpoint:eth" if index < 2 else ""
                 ),
@@ -2049,6 +2367,7 @@ class DexDepthCollectionTest(unittest.TestCase):
                 "2387f7e1d1a36dd0e3b1b29496ddbbc0"
             ),
             "status": "observed",
+            "reason_code": "observed",
             "error": "",
         }
         expected_common = {

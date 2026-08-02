@@ -72,6 +72,7 @@ ATTEMPT_REASON_CODES = {
     "no_candles",
     "parse",
     "validation",
+    "collection_failed",
     "source_range_unavailable",
 }
 ATTEMPT_OUTCOMES = {
@@ -200,6 +201,7 @@ def normalize_collection_attempts(
                 "not_listed",
                 "parse",
                 "validation",
+                "collection_failed",
             }
             and outcome == "request_failed"
         )

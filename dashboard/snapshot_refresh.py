@@ -15,11 +15,13 @@ from typing import Any, Dict, Optional, Tuple
 
 from scripts.quality_outcomes import (
     cex_reason_code,
+    dex_depth_reason_code,
     normalize_cex_source_outcome,
     normalize_dex_depth_source_outcome,
     normalize_tvl_source_outcome,
     quality_outcome_resolution_state,
     quality_outcome_rule,
+    tvl_reason_code,
 )
 from scripts.timestamp_contract import canonical_rfc3339_utc
 
@@ -464,8 +466,38 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
             for field in ("depth_10bps_complete", "depth_25bps_complete", "depth_50bps_complete", "depth_100bps_complete"):
                 if _text(row.get(field)):
                     raise ValueError("unmeasured snapshot row contains a completeness flag")
+        supplied_reason = _text(row.get("reason_code")).lower()
+        if "reason_code" in row and not supplied_reason:
+            raise ValueError("snapshot DEX depth reason code is missing")
+        bounded_reason = dex_depth_reason_code(supplied_reason)
+        if supplied_reason and bounded_reason is None:
+            raise ValueError("snapshot DEX depth reason code is invalid")
+        allowed_reasons = {
+            "observed": {"observed"},
+            "complete": {"observed"},
+            "partial": {"measurement_limit"},
+            "unsupported": {
+                "source_range_unavailable",
+                "unsupported_chain",
+                "unsupported_protocol",
+                "unsupported_method",
+                "unsupported_source",
+                "unsupported_protocol_or_chain",
+            },
+            "failed": {
+                "network",
+                "rate_limit",
+                "source_unavailable",
+                "parse",
+                "validation",
+                "collection_failed",
+                "depth_usd_price_time_mismatch",
+            },
+        }[raw_status]
+        if bounded_reason and bounded_reason not in allowed_reasons:
+            raise ValueError("snapshot DEX depth status and reason conflict")
         status, reason = normalize_dex_depth_source_outcome(
-            raw_status, error=row.get("error")
+            raw_status, supplied_reason, row.get("error")
         )
     else:
         if raw_status not in {"observed", "missing", "not_found", "failed"}:
@@ -475,8 +507,29 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
         elif raw_status in {"missing", "not_found", "failed"}:
             if _text(row.get("tvl_usd")):
                 raise ValueError("non-observed TVL must not contain a measured value")
+        supplied_reason = _text(row.get("reason_code")).lower()
+        if "reason_code" in row and not supplied_reason:
+            raise ValueError("snapshot TVL reason code is missing")
+        bounded_reason = tvl_reason_code(supplied_reason)
+        if supplied_reason and bounded_reason is None:
+            raise ValueError("snapshot TVL reason code is invalid")
+        allowed_reasons = {
+            "observed": {"observed"},
+            "missing": {"source_no_tvl_observation"},
+            "not_found": {"source_pool_not_found"},
+            "failed": {
+                "network",
+                "rate_limit",
+                "source_unavailable",
+                "parse",
+                "validation",
+                "collection_failed",
+            },
+        }[raw_status]
+        if bounded_reason and bounded_reason not in allowed_reasons:
+            raise ValueError("snapshot TVL status and reason conflict")
         status, reason = normalize_tvl_source_outcome(
-            raw_status, error=row.get("error")
+            raw_status, supplied_reason, row.get("error")
         )
     _text(status)
     if reason is not None:
@@ -495,6 +548,7 @@ def _validate_row(row: Dict[str, str], family: str, fact_type: str) -> Tuple[str
     requires_source_hash = (
         measured
         or (family == "dex" and fact_type == "depth" and raw_status == "failed")
+        or (family == "dex" and fact_type == "tvl" and raw_status == "failed")
         or (
             quality_outcome_resolution_state(status, reason)
             == "confirmed_terminal_absence"
@@ -544,11 +598,11 @@ def _state_from_row(
             status, reason = normalize_cex_source_outcome(raw_status, row.get("reason_code"), row.get("error"))
     elif fact_type == "depth":
         status, reason = normalize_dex_depth_source_outcome(
-            raw_status, error=row.get("error")
+            raw_status, row.get("reason_code"), row.get("error")
         )
     else:
         status, reason = normalize_tvl_source_outcome(
-            raw_status, error=row.get("error")
+            raw_status, row.get("reason_code"), row.get("error")
         )
     rule = quality_outcome_rule(status, reason)
     return SnapshotFactState(

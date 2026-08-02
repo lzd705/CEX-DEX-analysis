@@ -1,8 +1,10 @@
 import csv
+import hashlib
 import json
 import sqlite3
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,14 +21,17 @@ from scripts.fetch_tvl import (
     atomic_write_csv,
     chunks,
     collect_tvl,
+    failure_rows,
     load_pools_from_csv,
     load_pools_from_database,
     merge_exact_publication,
+    migrate_legacy_tvl_reason_codes,
     multi_pool_url,
     pool_key,
     publish_exact_snapshot,
     publish_snapshot,
     rows_from_payload,
+    tvl_failure_reason_code,
     validate_snapshot,
 )
 from scripts.publication_gate import CoverageRegressionError
@@ -92,6 +97,7 @@ class FetchTvlTest(unittest.TestCase):
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "observed")
+        self.assertEqual(rows[0]["reason_code"], "observed")
         self.assertEqual(rows[0]["tvl_usd"], "1234.56")
         self.assertEqual(rows[0]["base_token_price_usd"], "7.25")
         self.assertEqual(rows[0]["source_dex"], "uniswap_v3")
@@ -111,8 +117,16 @@ class FetchTvlTest(unittest.TestCase):
         )
         by_address = {row["pool_address"]: row for row in rows}
         self.assertEqual(by_address["0xMissing"]["status"], "missing")
+        self.assertEqual(
+            by_address["0xMissing"]["reason_code"],
+            "source_no_tvl_observation",
+        )
         self.assertEqual(by_address["0xMissing"]["tvl_usd"], "")
         self.assertEqual(by_address["0xAbsent"]["status"], "not_found")
+        self.assertEqual(
+            by_address["0xAbsent"]["reason_code"],
+            "source_pool_not_found",
+        )
         self.assertEqual(by_address["0xAbsent"]["tvl_usd"], "")
 
     def test_database_inventory_is_unique_by_token_and_pool(self):
@@ -203,7 +217,98 @@ class FetchTvlTest(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "observed")
         self.assertEqual(manifest["pool_count"], 1)
         self.assertEqual(manifest["status_counts"]["observed"], 1)
+        self.assertEqual(manifest["reason_code_counts"], {"observed": 1})
         self.assertEqual(len(manifest["raw_files"]), 1)
+
+    def test_collect_tvl_binds_failed_rows_to_the_error_artifact_hash(self):
+        pools = [
+            pool(token="UNI", chain="eth", address="0xPool"),
+            pool(token="ARB", chain="arbitrum", address="0xArbPool"),
+        ]
+        response = json.dumps({"data": [source_item()]}).encode()
+
+        def fake_request(url):
+            if "/networks/eth/" in url:
+                return json.loads(response), response
+            raise urllib.error.URLError("private upstream hostname")
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            raw_root = Path(directory_name)
+            snapshot_id, rows = collect_tvl(
+                pools,
+                raw_root=raw_root,
+                request=fake_request,
+                sleep_seconds=0,
+            )
+            failed = next(row for row in rows if row["status"] == "failed")
+            artifact_hashes = {
+                hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (raw_root / snapshot_id).glob("*.json")
+            }
+
+        self.assertEqual(len(failed["raw_response_sha256"]), 64)
+        self.assertIn(failed["raw_response_sha256"], artifact_hashes)
+
+    def test_collection_failures_use_typed_bounded_reasons(self):
+        failures = (
+            (urllib.error.HTTPError("https://example.test", 429, "", {}, None), "rate_limit"),
+            (urllib.error.HTTPError("https://example.test", 503, "", {}, None), "source_unavailable"),
+            (urllib.error.URLError("private hostname"), "network"),
+            (json.JSONDecodeError("private payload", "x", 0), "parse"),
+            (ValueError("private invalid value"), "validation"),
+            (PermissionError("/srv/private/tvl"), "collection_failed"),
+        )
+        for error, expected_reason in failures:
+            with self.subTest(expected_reason=expected_reason):
+                self.assertEqual(tvl_failure_reason_code(error), expected_reason)
+                rows = failure_rows(
+                    [pool()],
+                    snapshot_id="snapshot-1",
+                    request_started_at="2026-07-27T00:00:00+00:00",
+                    response_received_at="2026-07-27T00:00:01+00:00",
+                    source_endpoint="https://example.test/pools",
+                    error=error,
+                )
+                self.assertEqual(rows[0]["status"], "failed")
+                self.assertEqual(rows[0]["reason_code"], expected_reason)
+                self.assertNotIn("private", rows[0]["reason_code"])
+
+    def test_validator_accepts_legacy_missing_reason_but_rejects_unknown_reason(self):
+        observed = rows_from_payload(
+            [pool()],
+            {"data": [source_item()]},
+            snapshot_id="snapshot-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="abc123",
+        )
+        legacy = [dict(observed[0])]
+        legacy[0].pop("reason_code")
+        validate_snapshot([pool()], legacy)
+        with self.assertRaisesRegex(ValueError, "reason code"):
+            validate_snapshot(
+                [pool()],
+                [{**observed[0], "reason_code": ""}],
+            )
+        with self.assertRaisesRegex(ValueError, "reason code"):
+            validate_snapshot(
+                [pool()],
+                [{**observed[0], "reason_code": "private_raw_error"}],
+            )
+
+    def test_failed_tvl_requires_a_source_artifact_hash(self):
+        row = failure_rows(
+            [pool()],
+            snapshot_id="snapshot-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            error=urllib.error.URLError("private upstream hostname"),
+        )[0]
+
+        with self.assertRaisesRegex(ValueError, "source hash"):
+            validate_snapshot([pool()], [row], allow_no_observed=True)
 
     def test_validate_snapshot_requires_complete_inventory_and_observed_fact(self):
         observed = rows_from_payload(
@@ -255,7 +360,12 @@ class FetchTvlTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-observed TVL"):
             validate_snapshot(
                 [pool()],
-                [{**observed[0], "status": "missing", "tvl_usd": "123"}],
+                [{
+                    **observed[0],
+                    "status": "missing",
+                    "reason_code": "source_no_tvl_observation",
+                    "tvl_usd": "123",
+                }],
                 allow_no_observed=True,
             )
         validate_snapshot([pool()], [{**observed[0], "tvl_usd": "0"}])
@@ -282,6 +392,7 @@ class FetchTvlTest(unittest.TestCase):
             {
                 **terminal[0],
                 "status": "failed",
+                "reason_code": "collection_failed",
                 "error": "URLError: temporary source failure",
             }
         ]
@@ -364,6 +475,22 @@ class FetchTvlTest(unittest.TestCase):
                 output_dir=root / "processed",
                 publish_dir=published,
             )
+            history_path = published / HISTORY_FILENAME
+            with history_path.open(newline="", encoding="utf-8") as handle:
+                baseline_history = list(csv.DictReader(handle))
+            legacy_columns = [
+                field for field in TVL_COLUMNS if field != "reason_code"
+            ]
+            with history_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=legacy_columns)
+                writer.writeheader()
+                writer.writerows(
+                    {
+                        field: row.get(field, "")
+                        for field in legacy_columns
+                    }
+                    for row in baseline_history
+                )
             merged = merge_exact_publication(
                 candidate,
                 target_market_id=target,
@@ -395,6 +522,169 @@ class FetchTvlTest(unittest.TestCase):
             {"candidate-2"},
         )
         self.assertEqual(len(history), 3)
+        self.assertEqual(
+            {row["reason_code"] for row in history},
+            {"observed"},
+        )
+
+    def test_exact_pool_merge_migrates_keyless_legacy_tvl_reasons(self):
+        pools = [pool(), pool(token="AAVE", address="0xAave")]
+        baseline = rows_from_payload(
+            pools,
+            {
+                "data": [
+                    source_item(address="0xPool", reserve="100"),
+                    source_item(address="0xAave", reserve="200"),
+                ]
+            },
+            snapshot_id="baseline-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        candidate = rows_from_payload(
+            [pools[1]],
+            {"data": [source_item(address="0xAave", reserve="250")]},
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            published = Path(directory_name)
+            legacy_columns = [
+                field for field in TVL_COLUMNS if field != "reason_code"
+            ]
+            with (published / LATEST_FILENAME).open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(handle, fieldnames=legacy_columns)
+                writer.writeheader()
+                writer.writerows(
+                    {
+                        field: row.get(field, "")
+                        for field in legacy_columns
+                    }
+                    for row in baseline
+                )
+            try:
+                merged = merge_exact_publication(
+                    candidate,
+                    target_market_id="dex:eth:uniswap_v3:0xaave:AAVE",
+                    publish_dir=published,
+                )
+            except ValueError as error:
+                self.fail(f"keyless legacy TVL migration was rejected: {error}")
+
+        self.assertEqual(
+            {row["token_symbol"]: row.get("reason_code") for row in merged},
+            {"AAVE": "observed", "UNI": "observed"},
+        )
+
+    def test_legacy_tvl_reason_migration_rejects_mixed_schema(self):
+        rows = rows_from_payload(
+            [pool(), pool(token="AAVE", address="0xAave")],
+            {
+                "data": [
+                    source_item(address="0xPool", reserve="100"),
+                    source_item(address="0xAave", reserve="200"),
+                ]
+            },
+            snapshot_id="snapshot-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        rows[0].pop("reason_code")
+
+        with self.assertRaisesRegex(ValueError, "mixed.*reason_code"):
+            migrate_legacy_tvl_reason_codes(rows)
+
+    def test_atomic_write_migrates_keyless_legacy_tvl_reason_schema(self):
+        rows = rows_from_payload(
+            [pool()],
+            {"data": [source_item()]},
+            snapshot_id="snapshot-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        rows[0].pop("reason_code")
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = Path(directory_name) / "tvl.csv"
+            atomic_write_csv(path, rows)
+            with path.open(newline="", encoding="utf-8") as handle:
+                written = list(csv.DictReader(handle))
+
+        self.assertEqual(written[0]["reason_code"], "observed")
+
+    def test_atomic_write_rejects_blank_modern_tvl_reason(self):
+        rows = rows_from_payload(
+            [pool()],
+            {"data": [source_item()]},
+            snapshot_id="snapshot-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="a" * 64,
+        )
+        rows[0]["reason_code"] = ""
+        with tempfile.TemporaryDirectory() as directory_name:
+            with self.assertRaisesRegex(ValueError, "reason_code"):
+                atomic_write_csv(Path(directory_name) / "tvl.csv", rows)
+
+    def test_publish_snapshot_migrates_keyless_legacy_tvl_history(self):
+        rows = rows_from_payload(
+            [pool()],
+            {"data": [source_item()]},
+            snapshot_id="snapshot-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+            source_endpoint="https://example.test/pools",
+            raw_sha256="b" * 64,
+        )
+        legacy = dict(rows[0])
+        legacy.update(
+            snapshot_id="snapshot-1",
+            observed_at="2026-07-27T00:00:01+00:00",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+        legacy.pop("reason_code")
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "published"
+            published.mkdir()
+            legacy_columns = [
+                field for field in TVL_COLUMNS if field != "reason_code"
+            ]
+            write_snapshot = published / HISTORY_FILENAME
+            with write_snapshot.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=legacy_columns)
+                writer.writeheader()
+                writer.writerow(
+                    {field: legacy.get(field, "") for field in legacy_columns}
+                )
+
+            publish_snapshot(
+                rows,
+                output_dir=root / "processed",
+                publish_dir=published,
+            )
+            with write_snapshot.open(newline="", encoding="utf-8") as handle:
+                history = list(csv.DictReader(handle))
+
+        self.assertEqual(len(history), 2)
+        self.assertEqual(
+            {row["reason_code"] for row in history},
+            {"observed"},
+        )
 
     def test_exact_pool_merge_can_insert_one_cataloged_missing_tvl_row(self):
         baseline_pool = pool()
@@ -546,7 +836,12 @@ class FetchTvlTest(unittest.TestCase):
             source_endpoint="https://example.test/pools",
             raw_sha256="a" * 64,
         )
-        baseline[1].update(status="failed", tvl_usd="", error="source outage")
+        baseline[1].update(
+            status="failed",
+            reason_code="collection_failed",
+            tvl_usd="",
+            error="source outage",
+        )
         candidate = rows_from_payload(
             [pools[1]],
             {"data": [source_item(address="0xAave", reserve="250")]},
@@ -595,7 +890,12 @@ class FetchTvlTest(unittest.TestCase):
             source_endpoint="https://example.test/pools",
             raw_sha256="a" * 64,
         )
-        baseline[0].update(status="failed", tvl_usd="", error="source outage")
+        baseline[0].update(
+            status="failed",
+            reason_code="collection_failed",
+            tvl_usd="",
+            error="source outage",
+        )
         terminal_candidate = rows_from_payload(
             [target_pool],
             {"data": []},
@@ -804,6 +1104,16 @@ class FetchTvlTest(unittest.TestCase):
                 "snapshot_id": "degraded",
                 "observed_at": "2026-07-27T01:00:01+00:00",
                 "status": "failed" if index >= 3 else "observed",
+                "reason_code": (
+                    "collection_failed"
+                    if index >= 3
+                    else row["reason_code"]
+                ),
+                "raw_response_sha256": (
+                    "f" * 64
+                    if index >= 3
+                    else row["raw_response_sha256"]
+                ),
                 "tvl_usd": "" if index >= 3 else row["tvl_usd"],
                 "error": "source outage" if index >= 3 else "",
             }

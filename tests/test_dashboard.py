@@ -1193,10 +1193,41 @@ class MarketMonitorServerTest(unittest.TestCase):
                     "source_endpoint": "https://example.test/depth",
                     "raw_response_sha256": "d" * 64,
                     "status": "observed",
+                    "reason_code": "observed",
                 }
             )
             rows.append(row)
         write_csv(self.dex_depth_path, DEX_DEPTH_COLUMNS, rows)
+
+    def test_dex_depth_loader_rejects_failed_rows_without_canonical_source_hash(self):
+        self.write_dex_depth_cohort(
+            [
+                {
+                    "chain": "eth",
+                    "dex": "uniswap",
+                    "pool_address": "0xpool",
+                }
+            ]
+        )
+        with self.dex_depth_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        rows[0].update(
+            {
+                "status": "failed",
+                "reason_code": "collection_failed",
+                "error": "fixture collection failure",
+            }
+        )
+        for invalid_hash in ("", "f" * 63, "F" * 64):
+            with self.subTest(invalid_hash=invalid_hash):
+                rows[0]["raw_response_sha256"] = invalid_hash
+                write_csv(self.dex_depth_path, DEX_DEPTH_COLUMNS, rows)
+                server._load_dex_depth_snapshot_cached.cache_clear()
+                with self.assertRaisesRegex(ValueError, "source hash"):
+                    server._load_dex_depth_snapshot_cached(
+                        str(self.dex_depth_path),
+                        server.data_signature([self.dex_depth_path]),
+                    )
 
     def test_parse_number_preserves_missing_values(self):
         self.assertIsNone(server.parse_number(""))
@@ -1204,7 +1235,7 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(server.parse_number("12.5"), 12.5)
         self.assertEqual(server.parse_number(12.5), 12.5)
 
-    def test_failed_tvl_and_dex_depth_use_same_bounded_retryable_outcome(self):
+    def test_legacy_failed_tvl_and_dex_depth_use_generic_bounded_retryable_outcome(self):
         private_error = (
             "PermissionError: /srv/private/facts.csv?credential=secret"
         )
@@ -1218,12 +1249,17 @@ class MarketMonitorServerTest(unittest.TestCase):
             "depth_status": "failed",
             "depth_error": private_error,
         })
+        cex_depth = server._depth_quality_fact({
+            "market_type": "cex",
+            "depth_status": "failed",
+            "depth_error": private_error,
+        })
 
-        for fact in (tvl, depth):
+        for fact in (tvl, depth, cex_depth):
             with self.subTest(fact=fact):
                 self.assertEqual(fact["status"], "collection_failed")
-                self.assertEqual(fact["reason"], "source_unavailable")
-                self.assertEqual(fact["reason_code"], "source_unavailable")
+                self.assertEqual(fact["reason"], "collection_failed")
+                self.assertEqual(fact["reason_code"], "collection_failed")
                 self.assertTrue(fact["retryable"])
                 self.assertIsNotNone(
                     quality_outcome_rule(fact["status"], fact["reason_code"])
@@ -1243,6 +1279,37 @@ class MarketMonitorServerTest(unittest.TestCase):
                 unavailable["status"], unavailable["reason_code"]
             )
         )
+
+    def test_tvl_and_dex_depth_quality_preserve_bounded_collector_reasons(self):
+        cases = (
+            (
+                server._tvl_quality_fact,
+                {
+                    "market_type": "dex",
+                    "tvl_status": "failed",
+                    "tvl_reason_code": "rate_limit",
+                    "tvl_error": "private raw error",
+                },
+                "rate_limit",
+            ),
+            (
+                server._depth_quality_fact,
+                {
+                    "market_type": "dex",
+                    "depth_status": "failed",
+                    "depth_reason_code": "depth_usd_price_time_mismatch",
+                    "depth_error": "private timing detail",
+                },
+                "depth_usd_price_time_mismatch",
+            ),
+        )
+        for builder, market, expected_reason in cases:
+            with self.subTest(expected_reason=expected_reason):
+                fact = builder(market)
+                self.assertEqual(fact["status"], "collection_failed")
+                self.assertEqual(fact["reason_code"], expected_reason)
+                self.assertTrue(fact["retryable"])
+                self.assertNotIn("private", json.dumps(fact))
 
     def test_public_api_projection_recursively_removes_private_collector_evidence(self):
         malicious_catalog = {
@@ -1634,6 +1701,13 @@ class MarketMonitorServerTest(unittest.TestCase):
                     **identity,
                 }
             )
+            if family == "dex":
+                row.update(
+                    {
+                        "reason_code": "collection_failed",
+                        "raw_response_sha256": "d" * 64,
+                    }
+                )
             return row
 
         write_csv(
@@ -1979,6 +2053,51 @@ class MarketMonitorServerTest(unittest.TestCase):
                         server.data_signature([self.tvl_path]),
                     )
 
+    def test_tvl_loader_rejects_failed_rows_without_canonical_source_hash(self):
+        fieldnames = [
+            "snapshot_id",
+            "observed_at",
+            "token_symbol",
+            "chain",
+            "pool_address",
+            "tvl_usd",
+            "tvl_method",
+            "source",
+            "source_endpoint",
+            "raw_response_sha256",
+            "status",
+            "reason_code",
+            "error",
+        ]
+        row = {
+            "snapshot_id": "tvl-snapshot-1",
+            "observed_at": "2026-07-27T01:02:03+00:00",
+            "token_symbol": "BTC",
+            "chain": "eth",
+            "pool_address": "0xpool",
+            "tvl_usd": "",
+            "tvl_method": "geckoterminal_reserve_in_usd",
+            "source": "GeckoTerminal API v2",
+            "source_endpoint": "https://example.test/pool",
+            "raw_response_sha256": "f" * 64,
+            "status": "failed",
+            "reason_code": "collection_failed",
+            "error": "fixture collection failure",
+        }
+        for invalid_hash in ("", "f" * 63, "F" * 64):
+            with self.subTest(invalid_hash=invalid_hash):
+                write_csv(
+                    self.tvl_path,
+                    fieldnames,
+                    [{**row, "raw_response_sha256": invalid_hash}],
+                )
+                server._load_tvl_snapshot_cached.cache_clear()
+                with self.assertRaisesRegex(ValueError, "source hash"):
+                    server._load_tvl_snapshot_cached(
+                        str(self.tvl_path),
+                        server.data_signature([self.tvl_path]),
+                    )
+
     def test_tvl_loader_rejects_status_value_contradictions_and_keeps_zero(self):
         fieldnames = [
             "snapshot_id", "observed_at", "token_symbol", "chain",
@@ -2168,6 +2287,7 @@ class MarketMonitorServerTest(unittest.TestCase):
                 "source_endpoint": "https://rpc.example.test",
                 "raw_response_sha256": "abc123",
                 "status": "observed",
+                "reason_code": "observed",
             }
         )
         write_csv(self.dex_depth_path, DEX_DEPTH_COLUMNS, [depth_row])

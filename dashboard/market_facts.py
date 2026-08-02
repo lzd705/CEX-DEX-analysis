@@ -566,10 +566,12 @@ def select_primary_market(
             "score": None,
             "components": None,
         }
-    positive_volumes = [
-        max(finite_number(row.get("volume_usd")) or 0.0, 0.0)
-        for row in rows
-    ]
+    positive_volumes = []
+    for row in rows:
+        volume = finite_number(row.get("volume_usd"))
+        if volume is not None and volume < 0:
+            raise ValueError("Primary market selection received negative volume")
+        positive_volumes.append(volume if volume is not None else 0.0)
     max_volume = max(positive_volumes, default=0.0)
     candidates = []
     for row, volume in zip(rows, positive_volumes):
@@ -730,15 +732,17 @@ def build_token_summaries(
         primary_cex, cex_reason = select_primary_market(cex_rows)
         primary_dex, dex_reason = select_primary_market(dex_rows)
         cex_volumes = [
-            max(value, 0.0)
+            value
             for row in cex_rows
             if (value := finite_number(row.get("volume_usd"))) is not None
         ]
         dex_volumes = [
-            max(value, 0.0)
+            value
             for row in dex_rows
             if (value := finite_number(row.get("volume_usd"))) is not None
         ]
+        if any(value < 0 for value in cex_volumes + dex_volumes):
+            raise ValueError("Token summary received negative volume")
         aggregate_cex = sum(cex_volumes) if cex_volumes else None
         aggregate_dex = sum(dex_volumes) if dex_volumes else None
         observed_aggregates = [

@@ -34,6 +34,12 @@ class QualityOutcomeRuleTest(unittest.TestCase):
             ("collection_failed", "network"): (
                 True, False, "retry_open"
             ),
+            ("collection_failed", "collection_failed"): (
+                True, False, "retry_open"
+            ),
+            ("collection_failed", "depth_usd_price_time_mismatch"): (
+                True, False, "retry_open"
+            ),
             ("backfill_pending", "missing_unexplained"): (
                 True, False, "retry_open"
             ),
@@ -74,7 +80,7 @@ class QualityOutcomeRuleTest(unittest.TestCase):
             (
                 normalize_tvl_source_outcome,
                 ("failed", None, "PermissionError: /srv/private/tvl.csv"),
-                ("collection_failed", "source_unavailable"),
+                ("collection_failed", "collection_failed"),
             ),
             (
                 normalize_tvl_source_outcome,
@@ -84,7 +90,7 @@ class QualityOutcomeRuleTest(unittest.TestCase):
             (
                 normalize_dex_depth_source_outcome,
                 ("failed", None, "RPCError: https://node.test/key/secret"),
-                ("collection_failed", "source_unavailable"),
+                ("collection_failed", "collection_failed"),
             ),
             (
                 normalize_dex_depth_source_outcome,
@@ -109,6 +115,75 @@ class QualityOutcomeRuleTest(unittest.TestCase):
             ("source_no_observation", "source_no_order_book"),
         )
         self.assertIsNotNone(quality_outcome_rule(*execution_pair))
+
+    def test_bounded_collector_reasons_are_preserved_without_using_raw_error_text(self):
+        normalize_cex_source_outcome = self.required_helper(
+            "normalize_cex_source_outcome"
+        )
+        normalize_tvl_source_outcome = self.required_helper(
+            "normalize_tvl_source_outcome"
+        )
+        normalize_dex_depth_source_outcome = self.required_helper(
+            "normalize_dex_depth_source_outcome"
+        )
+        cases = (
+            (
+                normalize_cex_source_outcome,
+                ("failed", "collection_failed", "network secret"),
+                ("collection_failed", "collection_failed"),
+            ),
+            (
+                normalize_cex_source_outcome,
+                ("failed", None, "PermissionError: /srv/private"),
+                ("collection_failed", "collection_failed"),
+            ),
+            (
+                normalize_tvl_source_outcome,
+                ("failed", "rate_limit", "token=secret"),
+                ("collection_failed", "rate_limit"),
+            ),
+            (
+                normalize_dex_depth_source_outcome,
+                (
+                    "failed",
+                    "depth_usd_price_time_mismatch",
+                    "private raw timing detail",
+                ),
+                (
+                    "collection_failed",
+                    "depth_usd_price_time_mismatch",
+                ),
+            ),
+        )
+        for normalizer, arguments, expected in cases:
+            with self.subTest(normalizer=normalizer.__name__):
+                self.assertEqual(normalizer(*arguments), expected)
+
+    def test_legacy_snapshot_rows_use_only_status_proven_reason_semantics(self):
+        normalize_tvl_source_outcome = self.required_helper(
+            "normalize_tvl_source_outcome"
+        )
+        normalize_dex_depth_source_outcome = self.required_helper(
+            "normalize_dex_depth_source_outcome"
+        )
+        self.assertEqual(
+            normalize_tvl_source_outcome("missing", None, "rate limit maybe"),
+            ("source_no_observation", "source_no_tvl_observation"),
+        )
+        self.assertEqual(
+            normalize_tvl_source_outcome("not_found", None, "private detail"),
+            ("source_no_observation", "source_pool_not_found"),
+        )
+        self.assertEqual(
+            normalize_tvl_source_outcome("failed", None, "timeout maybe"),
+            ("collection_failed", "collection_failed"),
+        )
+        self.assertEqual(
+            normalize_dex_depth_source_outcome(
+                "failed", None, "usd_price_conversion_unavailable:stale"
+            ),
+            ("collection_failed", "collection_failed"),
+        )
 
     def test_unknown_family_outcomes_fail_closed_to_manual_review(self):
         fail_closed_quality_outcome = self.required_helper(

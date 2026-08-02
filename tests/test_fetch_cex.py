@@ -412,6 +412,16 @@ class FetchCexTests(unittest.TestCase):
         self.assertNotIn("secret", classified["error"])
         self.assertNotIn("http", classified["error"])
 
+    def test_untyped_attempt_error_stays_generic_instead_of_guessing_source_failure(self):
+        classified = classify_attempt_error(
+            PermissionError("/srv/private/collector-secret")
+        )
+
+        self.assertEqual(classified["reason_code"], "collection_failed")
+        self.assertIsNone(classified["http_status"])
+        self.assertNotIn("private", classified["error"])
+        self.assertNotIn("secret", classified["error"])
+
     def test_build_rows_records_failed_adapter_attempt(self):
         attempts = []
         error = urllib.error.HTTPError(

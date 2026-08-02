@@ -210,6 +210,13 @@ class FactQualityTest(unittest.TestCase):
                 "source_unavailable",
                 True,
             ),
+            (
+                "generic collection failure",
+                "collection_failed",
+                "collection_failed",
+                "collection_failed",
+                True,
+            ),
             ("parse", "parse", "collection_failed", "parse", True),
             ("validation", "validation", "collection_failed", "validation", True),
             (

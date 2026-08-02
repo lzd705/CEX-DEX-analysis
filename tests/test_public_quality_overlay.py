@@ -821,6 +821,32 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
         )
         self.assertEqual(fact["affected_dates"], [])
 
+    def test_same_market_day_reason_with_conflicting_statuses_fails_closed(self):
+        first = self.issue(
+            "2026-01-02",
+            "network",
+            "collection_failed",
+            True,
+        )
+        conflicting = {
+            **first,
+            "issue_id": "conflicting-status",
+            "status": "needs_review",
+            "retryable": False,
+        }
+        self.write_report([first, conflicting])
+
+        payload, market = self.quality_for_day("2026-01-02")
+
+        self.assertEqual(
+            payload["metadata"]["daily_quality_report"]["status"],
+            "ignored_invalid",
+        )
+        self.assertNotEqual(
+            market["facts"]["daily"]["reason_code"],
+            "network",
+        )
+
     def test_malformed_oversized_and_path_content_fail_closed(self):
         cases = {
             "malformed": (
