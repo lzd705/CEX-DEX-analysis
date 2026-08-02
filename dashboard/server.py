@@ -20,8 +20,10 @@ import sys
 import threading
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from email.utils import formatdate
 from functools import lru_cache
 from http.cookies import SimpleCookie
 from http import HTTPStatus
@@ -359,6 +361,92 @@ def render_versioned_html(path: Path) -> str:
         "__ASSET_VERSION__",
         static_asset_version(),
     )
+
+
+@dataclass(frozen=True)
+class StaticRepresentation:
+    raw: bytes
+    gzip: bytes
+    content_type: str
+    last_modified: str
+
+
+STATIC_CONTENT_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+}
+
+
+def _build_static_representations() -> dict[str, StaticRepresentation]:
+    representations = {}
+    for served_name, source_name in PUBLIC_STATIC_ASSET_SOURCES:
+        source_path = STATIC_ROOT / source_name
+        raw = source_path.read_bytes()
+        representations[f"/{served_name}"] = StaticRepresentation(
+            raw=raw,
+            gzip=gzip.compress(raw, compresslevel=5, mtime=0),
+            content_type=STATIC_CONTENT_TYPES[source_path.suffix],
+            last_modified=formatdate(source_path.stat().st_mtime, usegmt=True),
+        )
+    return representations
+
+
+_STATIC_REPRESENTATIONS = _build_static_representations()
+
+
+def static_representation(path: str) -> StaticRepresentation | None:
+    """Return the immutable public representation for an exact asset path."""
+
+    return _STATIC_REPRESENTATIONS.get(urlparse(path).path)
+
+
+_ACCEPT_ENCODING_QUALITY = re.compile(r"(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$")
+
+
+def client_accepts_gzip(value: str) -> bool:
+    """Return whether an Accept-Encoding header permits gzip without ambiguity."""
+
+    gzip_qualities = []
+    wildcard_qualities = []
+    for item in value.split(","):
+        parts = [part.strip() for part in item.split(";")]
+        coding = parts[0].casefold()
+        if not coding:
+            return False
+        quality = 1.0
+        saw_quality = False
+        for parameter in parts[1:]:
+            name, separator, raw_quality = parameter.partition("=")
+            if (
+                separator != "="
+                or name.strip().casefold() != "q"
+                or saw_quality
+                or not _ACCEPT_ENCODING_QUALITY.fullmatch(raw_quality.strip())
+            ):
+                return False
+            saw_quality = True
+            quality = float(raw_quality.strip())
+        if coding == "gzip":
+            gzip_qualities.append(quality)
+        elif coding == "*":
+            wildcard_qualities.append(quality)
+
+    if gzip_qualities:
+        return all(quality > 0 for quality in gzip_qualities)
+    if wildcard_qualities:
+        return all(quality > 0 for quality in wildcard_qualities)
+    return False
+
+
+def exact_static_version(path: str) -> bool:
+    """Return true only for one unescaped current version query on a public path."""
+
+    parsed = urlparse(path)
+    if parsed.fragment or is_admin_surface_path(parsed.path):
+        return False
+    return parsed.query == f"v={static_asset_version()}"
+
+
 VENDOR_FILES = {
     "/vendor/lucide.js": STATIC_ROOT / "vendor/lucide.min.js",
 }
