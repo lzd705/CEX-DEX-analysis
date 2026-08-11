@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -7,10 +8,23 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
 from scripts import route_shadow_inputs
+from scripts.execution_cost import EXECUTION_COST_COLUMNS
+from scripts.fetch_cex_depth import (
+    DEPTH_COLUMNS_ALL as CEX_DEPTH_COLUMNS,
+    execution_rows_for_book,
+    observed_row as observed_cex_depth_row,
+)
+from scripts.fetch_dex_depth import (
+    DEX_DEPTH_COLUMNS,
+    base_row as dex_depth_base_row,
+    v2_execution_rows,
+)
+from scripts.fetch_tvl import TVL_COLUMNS, base_row as tvl_base_row
 from scripts.route_shadow_inputs import (
     SourceFileIdentity,
     build_shadow_universe,
@@ -21,8 +35,8 @@ from scripts.route_universe import route_universe_sha256
 
 
 NOW = datetime(2026, 8, 2, 13, 0, 0, tzinfo=timezone.utc)
-OBSERVED_AT = "2026-08-02T12:00:00Z"
-BLOCK_TIME = "2026-08-02T11:59:45Z"
+OBSERVED_AT = "2026-08-02T12:00:00+00:00"
+BLOCK_TIME = "2026-08-02T11:59:45+00:00"
 POOL = "0x1111111111111111111111111111111111111111"
 REQUIRED_DATA_PATHS = (
     "market_facts.sqlite3",
@@ -49,6 +63,14 @@ def canonical_bytes(value):
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+
+
+def csv_bytes(fieldnames, rows):
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode("utf-8")
 
 
 class ProductionInputFixture:
@@ -134,96 +156,158 @@ class ProductionInputFixture:
         (self.data_dir / "admin/token_registry.json").write_text(
             '{"schema_version":1,"tokens":{}}\n', encoding="utf-8"
         )
+        cex_depth = observed_cex_depth_row(
+            {"token_symbol": "UNI", "exchange": "binance", "cex_symbol": "UNI/USDT"},
+            self._cex_book(),
+            snapshot_id="cex-depth-1",
+            request_started_at="2026-08-02T11:59:59+00:00",
+            response_received_at=OBSERVED_AT,
+        )
         write_csv(
             self.data_dir / "cex_depth_latest.csv",
-            [
-                "snapshot_id", "observed_at", "token_symbol", "exchange",
-                "cex_symbol", "bid_depth_100bps_usd", "ask_depth_100bps_usd",
-                "total_depth_100bps_usd", "status",
-            ],
-            [{
-                "snapshot_id": "cex-depth-1", "observed_at": OBSERVED_AT,
-                "token_symbol": "UNI", "exchange": "binance",
-                "cex_symbol": "UNI/USDT", "bid_depth_100bps_usd": "100",
-                "ask_depth_100bps_usd": "100", "total_depth_100bps_usd": "200",
-                "status": "observed",
-            }],
+            CEX_DEPTH_COLUMNS,
+            [cex_depth],
         )
+        dex_depth = dex_depth_base_row(
+            self._dex_pool(),
+            snapshot_id="dex-depth-1",
+            request_started_at="2026-08-02T11:59:44+00:00",
+            response_received_at=BLOCK_TIME,
+        )
+        dex_depth.update({
+            "protocol_model": "constant_product_v2",
+            "block_number": "123",
+            "block_timestamp": BLOCK_TIME,
+            "status": "observed",
+            "reason_code": "observed",
+            "source_endpoint": "https://rpc.example.test",
+            "raw_response_sha256": "d" * 64,
+        })
+        for index, band in enumerate((10, 25, 50, 100), start=1):
+            dex_depth["buy_depth_{}bps_usd".format(band)] = str(index * 20)
+            dex_depth["sell_depth_{}bps_usd".format(band)] = str(index * 15)
+            dex_depth["total_depth_{}bps_usd".format(band)] = str(index * 35)
+            dex_depth["depth_{}bps_complete".format(band)] = "1"
         write_csv(
             self.data_dir / "dex_depth_latest.csv",
-            [
-                "snapshot_id", "observed_at", "token_symbol", "chain", "dex",
-                "pool_address", "block_timestamp", "buy_depth_100bps_usd",
-                "sell_depth_100bps_usd", "total_depth_100bps_usd", "status",
-            ],
-            [{
-                "snapshot_id": "dex-depth-1", "observed_at": OBSERVED_AT,
-                "token_symbol": "UNI", "chain": "eth", "dex": "uniswap_v2",
-                "pool_address": POOL, "block_timestamp": BLOCK_TIME,
-                "buy_depth_100bps_usd": "80", "sell_depth_100bps_usd": "70",
-                "total_depth_100bps_usd": "150", "status": "observed",
-            }],
+            DEX_DEPTH_COLUMNS,
+            [dex_depth],
         )
-        execution_fields = [
-            "snapshot_id", "source_snapshot_id", "observed_at",
-            "state_observed_at", "market_id", "market_type", "token_symbol",
-            "exchange", "cex_symbol", "chain", "dex", "pool_address",
-            "direction", "requested_notional_usd", "status",
-        ]
         write_csv(
             self.data_dir / "cex_execution_cost_latest.csv",
-            execution_fields,
-            [self._execution_row("cex", direction) for direction in (
-                "buy_token", "sell_token"
-            )],
+            EXECUTION_COST_COLUMNS,
+            execution_rows_for_book(
+                {"token_symbol": "UNI", "exchange": "binance", "cex_symbol": "UNI/USDT"},
+                self._cex_book(),
+                snapshot_id="cex-depth-1",
+                request_started_at="2026-08-02T11:59:59+00:00",
+                response_received_at=OBSERVED_AT,
+            ),
         )
         write_csv(
             self.data_dir / "dex_execution_cost_latest.csv",
-            execution_fields,
-            [self._execution_row("dex", direction) for direction in (
-                "buy_token", "sell_token"
-            )],
+            EXECUTION_COST_COLUMNS,
+            self._dex_execution_rows(),
         )
+        tvl = tvl_base_row(
+            self._dex_pool(),
+            snapshot_id="tvl-1",
+            request_started_at="2026-08-02T11:59:58+00:00",
+            response_received_at=OBSERVED_AT,
+            source_endpoint="https://api.example.test/pools",
+        )
+        tvl.update({
+            "tvl_usd": "0",
+            "volume_24h_usd": "",
+            "raw_response_sha256": "e" * 64,
+            "status": "observed",
+            "reason_code": "observed",
+        })
         write_csv(
             self.data_dir / "dex_pool_tvl_latest.csv",
-            [
-                "snapshot_id", "observed_at", "token_symbol", "chain", "dex",
-                "pool_address", "pool_name", "tvl_usd", "volume_24h_usd", "status",
-            ],
-            [{
-                "snapshot_id": "tvl-1", "observed_at": OBSERVED_AT,
-                "token_symbol": "UNI", "chain": "eth", "dex": "uniswap_v2",
-                "pool_address": POOL, "pool_name": "UNI / USDC",
-                "tvl_usd": "0", "volume_24h_usd": "", "status": "observed",
-            }],
+            TVL_COLUMNS,
+            [tvl],
         )
 
-    def _execution_row(self, market_type, direction):
-        if market_type == "cex":
-            return {
-                "snapshot_id": "cex-execution-1",
-                "source_snapshot_id": "cex-depth-1",
-                "observed_at": OBSERVED_AT,
-                "state_observed_at": OBSERVED_AT,
-                "market_id": "cex:binance:UNI/USDT",
-                "market_type": "cex", "token_symbol": "UNI",
-                "exchange": "binance", "cex_symbol": "UNI/USDT",
-                "chain": "", "dex": "", "pool_address": "",
-                "direction": direction, "requested_notional_usd": "1000",
-                "status": "observed",
-            }
+    def _cex_book(self):
         return {
-            "snapshot_id": "dex-execution-1",
-            "source_snapshot_id": "dex-depth-1",
-            "observed_at": OBSERVED_AT,
-            "state_observed_at": BLOCK_TIME,
-            "market_id": "dex:eth:uniswap_v2:{}:UNI".format(POOL),
-            "market_type": "dex", "token_symbol": "UNI",
-            "exchange": "", "cex_symbol": "", "chain": "eth",
-            "dex": "uniswap_v2", "pool_address": POOL,
-            "direction": direction, "requested_notional_usd": "1000",
-            "status": "observed",
+            "bids": [(Decimal("99.99"), Decimal("2000")), (Decimal("98"), Decimal("2000"))],
+            "asks": [(Decimal("100.01"), Decimal("2000")), (Decimal("102"), Decimal("2000"))],
+            "source_instrument": "UNIUSDT",
+            "source_sequence": "123",
+            "source_observed_at": OBSERVED_AT,
+            "source_endpoint": "https://api.example.test/depth",
+            "raw": b'{"book":"fixture"}',
+            "source_quote_asset": "USDT",
+            "quote_to_usd": Decimal("1"),
+            "quote_conversion_method": "USDT=USD proxy",
+            "quote_conversion_endpoint": "",
+            "quote_conversion_response_sha256": "",
+            "full_book_reported": True,
         }
+
+    def _dex_pool(self):
+        return {
+            "token_symbol": "UNI",
+            "chain": "eth",
+            "dex": "uniswap_v2",
+            "pool_address": POOL,
+            "pool_name": "UNI / USDC",
+            "snapshot_id": "tvl-1",
+            "observed_at": BLOCK_TIME,
+            "response_received_at": BLOCK_TIME,
+            "source": "GeckoTerminal API v2",
+            "source_endpoint": "https://api.example.test/pools",
+            "raw_response_sha256": "e" * 64,
+        }
+
+    def _dex_execution_rows(self):
+        pool = self._dex_pool()
+        common = {
+            "snapshot_id": "dex-depth-1",
+            "source_snapshot_id": "dex-depth-1",
+            "calculation_method": "fixed_block_pool_state_exact_target_quantity_v1",
+            "observed_at": BLOCK_TIME,
+            "state_observed_at": BLOCK_TIME,
+            "request_started_at": "2026-08-02T11:59:44+00:00",
+            "response_received_at": BLOCK_TIME,
+            "market_id": "dex:eth:uniswap_v2:{}:UNI".format(POOL),
+            "market_type": "dex",
+            "token_symbol": "UNI",
+            "chain": "eth",
+            "dex": "uniswap_v2",
+            "pool_address": POOL,
+            "block_number": "123",
+            "block_timestamp": BLOCK_TIME,
+            "protocol_model": "constant_product_v2",
+            "target_token_address": "0x" + "1" * 40,
+            "target_token_decimals": "18",
+            "quote_token_address": "0x" + "2" * 40,
+            "quote_token_decimals": "6",
+            "reference_price_method": "pre_fee_pool_state_marginal_price",
+            "usd_price_source_snapshot_id": "tvl-1",
+            "usd_price_observed_at": BLOCK_TIME,
+            "fee_status": "included_protocol_fee",
+            "fee_rate_bps": "30",
+            "usd_conversion_status": "observed_inventory_token_price",
+            "excluded_costs": "gas,router_fee,token_transfer_tax,MEV,post_block_state_changes",
+            "source": "fixed-block EVM JSON-RPC pool state",
+            "source_endpoint": "https://rpc.example.test",
+            "source_sequence": "123",
+            "raw_response_sha256": "d" * 64,
+        }
+        return v2_execution_rows(
+            pool,
+            common=common,
+            target_position_index=0,
+            token0_decimals=18,
+            token1_decimals=6,
+            token0_price=Decimal("100"),
+            token1_price=Decimal("1"),
+            reserve0=Decimal(100_000) * (Decimal(10) ** 18),
+            reserve1=Decimal(10_000_000) * (Decimal(10) ** 6),
+            fee_bps=Decimal("30"),
+        )
 
     def _write_database(self):
         database = self.data_dir / "market_facts.sqlite3"
@@ -337,10 +421,10 @@ class ShadowInputBuildTests(unittest.TestCase):
         self.assertEqual(cex["selection_inputs"]["cex_selected_window_usd"], "0")
         self.assertEqual(dex["selection_inputs"]["dex_tvl_usd"], "0")
         self.assertIsNone(dex["selection_inputs"]["dex_24h_usd"])
-        self.assertEqual(cex["selection_inputs"]["observed_100bps_depth_usd"], "200")
-        self.assertEqual(dex["selection_inputs"]["observed_100bps_depth_usd"], "150")
-        self.assertEqual(cex["selection_inputs"]["proved_execution_capacity_usd"], "1000")
-        self.assertEqual(dex["selection_inputs"]["proved_execution_capacity_usd"], "1000")
+        self.assertEqual(cex["selection_inputs"]["observed_100bps_depth_usd"], "400000")
+        self.assertEqual(dex["selection_inputs"]["observed_100bps_depth_usd"], "140")
+        self.assertEqual(cex["selection_inputs"]["proved_execution_capacity_usd"], "100000")
+        self.assertEqual(dex["selection_inputs"]["proved_execution_capacity_usd"], "100000")
         self.assertEqual(universe["candidate_source_generation"], manifest[
             "candidate_source_generation"
         ])
@@ -362,6 +446,278 @@ class ShadowInputBuildTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "CEX CSV.*SHA|SHA.*CEX CSV"):
             self.fixture.build()
+
+    def test_sqlite_parser_rejects_a_valid_private_copy_mutated_before_open(self):
+        original = route_shadow_inputs._sqlite_capture_uri
+
+        def uri_then_mutate(capture):
+            uri = original(capture)
+            original_bytes = os.pread(capture.descriptor, capture.identity.size, 0)
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "changed.sqlite3"
+                path.write_bytes(original_bytes)
+                connection = sqlite3.connect(str(path))
+                try:
+                    connection.execute(
+                        "UPDATE import_runs SET imported_at = ? WHERE run_id = 'import-1'",
+                        ("2026-08-02T12:00:01+00:00",),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                changed_bytes = path.read_bytes()
+            os.ftruncate(capture.descriptor, len(changed_bytes))
+            offset = 0
+            while offset < len(changed_bytes):
+                offset += os.pwrite(
+                    capture.descriptor,
+                    changed_bytes[offset:],
+                    offset,
+                )
+            os.fsync(capture.descriptor)
+            return uri
+
+        with patch.object(
+            route_shadow_inputs,
+            "_sqlite_capture_uri",
+            side_effect=uri_then_mutate,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "SQLite.*capture|capture.*SQLite|source capture|binding",
+            ):
+                self.fixture.build()
+
+    def test_minimal_observed_execution_rows_do_not_prove_capacity(self):
+        minimal_fields = [
+            "snapshot_id", "source_snapshot_id", "observed_at",
+            "state_observed_at", "market_id", "market_type", "token_symbol",
+            "exchange", "cex_symbol", "chain", "dex", "pool_address",
+            "direction", "requested_notional_usd", "status",
+        ]
+        for family in ("cex", "dex"):
+            path = self.fixture.data_dir / "{}_execution_cost_latest.csv".format(family)
+            original = path.read_bytes()
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            minimal = [
+                {field: row.get(field, "") for field in minimal_fields}
+                for row in rows
+                if row["requested_notional_usd"] == "1000"
+            ]
+            write_csv(path, minimal_fields, minimal)
+            with self.subTest(family=family):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Execution|notional|contract|provenance|columns|rows",
+                ):
+                    self.fixture.build()
+            path.write_bytes(original)
+
+    def test_latest_depth_and_tvl_files_reject_duplicate_market_rows(self):
+        for filename in (
+            "cex_depth_latest.csv",
+            "dex_depth_latest.csv",
+            "dex_pool_tvl_latest.csv",
+        ):
+            path = self.fixture.data_dir / filename
+            original = path.read_bytes()
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                fields = list(reader.fieldnames or [])
+                rows = list(reader)
+            write_csv(path, fields, rows + [dict(rows[0])])
+            with self.subTest(filename=filename):
+                with self.assertRaisesRegex(ValueError, "duplicate|publication"):
+                    self.fixture.build()
+            path.write_bytes(original)
+
+    def test_each_fact_family_rejects_mixed_snapshot_ids(self):
+        family_files = (
+            "cex_depth_latest.csv",
+            "dex_depth_latest.csv",
+            "cex_execution_cost_latest.csv",
+            "dex_execution_cost_latest.csv",
+            "dex_pool_tvl_latest.csv",
+        )
+        for filename in family_files:
+            path = self.fixture.data_dir / filename
+            original = path.read_bytes()
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                fields = list(reader.fieldnames or [])
+                rows = list(reader)
+            if len(rows) == 1:
+                second = dict(rows[0])
+                second["snapshot_id"] = second["snapshot_id"] + "-other"
+                rows.append(second)
+            else:
+                rows[-1]["snapshot_id"] = rows[-1]["snapshot_id"] + "-other"
+            write_csv(path, fields, rows)
+            with self.subTest(filename=filename):
+                with self.assertRaisesRegex(ValueError, "snapshot|publication|duplicate"):
+                    self.fixture.build()
+            path.write_bytes(original)
+
+    def test_depth_and_tvl_families_reject_mixed_snapshots_across_distinct_markets(self):
+        cases = []
+        for filename, fields, parser, first_id, second_id in (
+            (
+                "cex_depth_latest.csv",
+                CEX_DEPTH_COLUMNS,
+                lambda payload, expected: route_shadow_inputs._parse_depth(
+                    payload, market_type="cex", expected_market_ids=expected
+                ),
+                "cex:binance:UNI/USDT",
+                "cex:okx:UNI/USDT",
+            ),
+            (
+                "dex_depth_latest.csv",
+                DEX_DEPTH_COLUMNS,
+                lambda payload, expected: route_shadow_inputs._parse_depth(
+                    payload, market_type="dex", expected_market_ids=expected
+                ),
+                "dex:eth:uniswap_v2:{}:UNI".format(POOL),
+                "dex:eth:uniswap_v2:{}:UNI".format("0x" + "3" * 40),
+            ),
+            (
+                "dex_pool_tvl_latest.csv",
+                TVL_COLUMNS,
+                lambda payload, expected: route_shadow_inputs._parse_tvl_and_volume(
+                    payload, expected_market_ids=expected
+                ),
+                "dex:eth:uniswap_v2:{}:UNI".format(POOL),
+                "dex:eth:uniswap_v2:{}:UNI".format("0x" + "3" * 40),
+            ),
+        ):
+            path = self.fixture.data_dir / filename
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            second = dict(rows[0])
+            second["snapshot_id"] = second["snapshot_id"] + "-other"
+            if filename == "cex_depth_latest.csv":
+                second["exchange"] = "okx"
+            else:
+                second["pool_address"] = "0x" + "3" * 40
+            cases.append((filename, parser, {first_id, second_id}, rows + [second], fields))
+
+        for filename, parser, expected, rows, fields in cases:
+            with self.subTest(filename=filename):
+                with self.assertRaisesRegex(ValueError, "one nonempty snapshot|snapshot ID"):
+                    parser(csv_bytes(fields, rows), expected)
+
+    def test_execution_families_reject_duplicate_scenario_rows(self):
+        for family, market_id, depth_snapshot in (
+            ("cex", "cex:binance:UNI/USDT", "cex-depth-1"),
+            (
+                "dex",
+                "dex:eth:uniswap_v2:{}:UNI".format(POOL),
+                "dex-depth-1",
+            ),
+        ):
+            path = self.fixture.data_dir / "{}_execution_cost_latest.csv".format(family)
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            with self.subTest(family=family):
+                with self.assertRaisesRegex(ValueError, "duplicate scenario"):
+                    route_shadow_inputs._parse_execution(
+                        csv_bytes(EXECUTION_COST_COLUMNS, rows + [dict(rows[0])]),
+                        market_type=family,
+                        depth_snapshot_id=depth_snapshot,
+                        expected_market_ids={market_id},
+                    )
+
+    def test_execution_source_snapshot_matches_its_depth_family_publication(self):
+        for family in ("cex", "dex"):
+            path = self.fixture.data_dir / "{}_execution_cost_latest.csv".format(family)
+            original = path.read_bytes()
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                fields = list(reader.fieldnames or [])
+                rows = list(reader)
+            for row in rows:
+                row["source_snapshot_id"] = "other-depth-snapshot"
+            write_csv(path, fields, rows)
+            with self.subTest(family=family):
+                with self.assertRaisesRegex(ValueError, "Depth.*Execution|source.*snapshot|lineage"):
+                    self.fixture.build()
+            path.write_bytes(original)
+
+    def test_canonical_nonobserved_tvl_rows_do_not_abort_shadow_build(self):
+        path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            baseline = list(reader)[0]
+        reasons = {
+            "missing": "source_no_tvl_observation",
+            "not_found": "source_pool_not_found",
+            "failed": "collection_failed",
+        }
+        for status, reason in reasons.items():
+            row = dict(baseline)
+            row.update({
+                "status": status,
+                "reason_code": reason,
+                "tvl_usd": "",
+                "volume_24h_usd": "",
+                "error": "fixture {}".format(status),
+            })
+            write_csv(path, fields, [row])
+            with self.subTest(status=status):
+                universe, _manifest = self.fixture.build()
+                dex = next(
+                    item for item in universe["selected_legs"]
+                    if item["market_type"] == "dex"
+                )
+                self.assertIsNone(dex["selection_inputs"]["dex_tvl_usd"])
+                self.assertIsNone(dex["selection_inputs"]["dex_24h_usd"])
+
+    def test_tvl_status_value_contract_rejects_negative_or_nonobserved_values(self):
+        path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            baseline = list(reader)[0]
+        bad_rows = (
+            {**baseline, "status": "observed", "reason_code": "observed", "tvl_usd": "-1"},
+            {
+                **baseline,
+                "status": "missing",
+                "reason_code": "source_no_tvl_observation",
+                "tvl_usd": "1",
+            },
+        )
+        for row in bad_rows:
+            write_csv(path, fields, [row])
+            with self.subTest(status=row["status"], value=row["tvl_usd"]):
+                with self.assertRaisesRegex(ValueError, "TVL|tvl_usd|sign|non-observed"):
+                    self.fixture.build()
+
+    def test_aggregate_capture_budget_fails_before_retaining_all_sources(self):
+        total = sum(
+            (self.fixture.data_dir / relative).stat().st_size
+            for relative in REQUIRED_DATA_PATHS
+        ) + self.fixture.config_path.stat().st_size
+        with patch.object(
+            route_shadow_inputs,
+            "MAX_AGGREGATE_SOURCE_BYTES",
+            total - 1,
+            create=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "aggregate|budget|bounded"):
+                self.fixture.build()
+
+    def test_single_source_capture_limit_is_enforced(self):
+        source_name = "cex_instrument_lifecycle.json"
+        source_size = (self.fixture.data_dir / source_name).stat().st_size
+        constrained = tuple(
+            (logical, relative, source_size - 1 if logical == source_name else maximum)
+            for logical, relative, maximum in route_shadow_inputs._DATA_INPUTS
+        )
+        with patch.object(route_shadow_inputs, "_DATA_INPUTS", constrained):
+            with self.assertRaisesRegex(ValueError, "bounded input limit"):
+                self.fixture.build()
 
     def test_unbound_sqlite_sidecars_fail_closed(self):
         database = self.fixture.data_dir / "market_facts.sqlite3"
@@ -419,10 +775,13 @@ class ShadowInputBuildTests(unittest.TestCase):
         rows[0]["source_snapshot_id"] = "another-depth"
         write_csv(path, list(rows[0]), rows)
 
-        with self.assertRaisesRegex(ValueError, "Depth.*Execution|lineage"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "Depth.*Execution|lineage|source_snapshot|source snapshot",
+        ):
             self.fixture.build()
 
-    def test_dex_tvl_and_volume_are_selected_from_one_snapshot_row(self):
+    def test_dex_tvl_latest_rejects_multiple_publication_rows_for_one_market(self):
         path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
         with path.open(newline="", encoding="utf-8") as handle:
             fields = list(csv.DictReader(handle).fieldnames)
@@ -441,15 +800,10 @@ class ShadowInputBuildTests(unittest.TestCase):
             },
         ])
 
-        universe, _manifest = self.fixture.build()
+        with self.assertRaisesRegex(ValueError, "duplicate|publication"):
+            self.fixture.build()
 
-        dex = next(
-            row for row in universe["selected_legs"] if row["market_type"] == "dex"
-        )
-        self.assertEqual(dex["selection_inputs"]["dex_tvl_usd"], "0")
-        self.assertEqual(dex["selection_inputs"]["dex_24h_usd"], "7")
-
-    def test_latest_tvl_row_is_chosen_by_instant_not_timestamp_text(self):
+    def test_dex_tvl_latest_does_not_pick_between_multiple_snapshot_instants(self):
         path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
         with path.open(newline="", encoding="utf-8") as handle:
             fields = list(csv.DictReader(handle).fieldnames)
@@ -468,13 +822,8 @@ class ShadowInputBuildTests(unittest.TestCase):
             },
         ])
 
-        universe, _manifest = self.fixture.build()
-
-        dex = next(
-            row for row in universe["selected_legs"] if row["market_type"] == "dex"
-        )
-        self.assertEqual(dex["selection_inputs"]["dex_tvl_usd"], "4")
-        self.assertEqual(dex["selection_inputs"]["dex_24h_usd"], "5")
+        with self.assertRaisesRegex(ValueError, "duplicate|publication"):
+            self.fixture.build()
 
     def test_cex_volume_missing_then_numeric_is_numeric_not_zero_or_error(self):
         path = self.fixture.data_dir / "cex_exchange_volume_daily.csv"
@@ -551,14 +900,14 @@ class ShadowInputBuildTests(unittest.TestCase):
 
     def test_descriptor_or_path_identity_change_during_capture_is_rejected(self):
         target = self.fixture.data_dir / "cex_depth_latest.csv"
-        original = route_shadow_inputs._read_fd_bounded
+        original = route_shadow_inputs._copy_source_descriptor
         changed = {"done": False}
 
         target_identity = (target.stat().st_dev, target.stat().st_ino)
 
-        def read_then_replace(descriptor, maximum_bytes):
-            payload = original(descriptor, maximum_bytes)
-            metadata = os.fstat(descriptor)
+        def copy_then_replace(source_descriptor, capture_descriptor, maximum_bytes):
+            result = original(source_descriptor, capture_descriptor, maximum_bytes)
+            metadata = os.fstat(source_descriptor)
             if not changed["done"] and (
                 metadata.st_dev, metadata.st_ino
             ) == target_identity:
@@ -566,10 +915,10 @@ class ShadowInputBuildTests(unittest.TestCase):
                 replacement.write_bytes(target.read_bytes())
                 os.replace(str(replacement), str(target))
                 changed["done"] = True
-            return payload
+            return result
 
         with patch.object(route_shadow_inputs, "PROJECT_ROOT", self.fixture.project_root), patch.object(
-            route_shadow_inputs, "_read_fd_bounded", side_effect=read_then_replace
+            route_shadow_inputs, "_copy_source_descriptor", side_effect=copy_then_replace
         ):
             with self.assertRaisesRegex(ValueError, "changed|identity"):
                 build_shadow_universe(
@@ -762,6 +1111,100 @@ class RunUniversePublicationTests(unittest.TestCase):
 
         self.assertFalse((self.shadow_root / "runs/run-failed").exists())
         self.assertEqual(list((self.shadow_root / "runs").glob(".stage-*")), [])
+
+    def test_swapped_staging_directory_cannot_be_renamed_as_the_run(self):
+        original = route_shadow_inputs._rename_directory_noreplace_at
+
+        def swap_then_rename(runs_descriptor, source_name, destination_name, *args, **kwargs):
+            stolen_name = source_name + "-stolen"
+            os.rename(
+                source_name,
+                stolen_name,
+                src_dir_fd=runs_descriptor,
+                dst_dir_fd=runs_descriptor,
+            )
+            os.mkdir(source_name, 0o700, dir_fd=runs_descriptor)
+            attacker_fd = os.open(
+                source_name,
+                os.O_RDONLY | os.O_DIRECTORY,
+                dir_fd=runs_descriptor,
+            )
+            try:
+                for member in ("route_universe.json", "baseline_manifest.json"):
+                    descriptor = os.open(
+                        member,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=attacker_fd,
+                    )
+                    try:
+                        os.write(descriptor, b'{"attacker":true}')
+                    finally:
+                        os.close(descriptor)
+            finally:
+                os.close(attacker_fd)
+            return original(
+                runs_descriptor,
+                source_name,
+                destination_name,
+                *args,
+                **kwargs,
+            )
+
+        with patch.object(
+            route_shadow_inputs,
+            "_rename_directory_noreplace_at",
+            side_effect=swap_then_rename,
+        ):
+            with self.assertRaisesRegex(ValueError, "staging|identity|changed"):
+                write_run_universe(
+                    self.shadow_root, "run-swapped-stage", self.universe, self.manifest
+                )
+
+        self.assertFalse((self.shadow_root / "runs/run-swapped-stage").exists())
+
+    def test_owned_run_is_removed_if_post_install_bytes_fail_verification(self):
+        original = route_shadow_inputs._rename_directory_noreplace_at
+
+        def rename_then_mutate(runs_descriptor, source_name, destination_name, *args, **kwargs):
+            result = original(
+                runs_descriptor,
+                source_name,
+                destination_name,
+                *args,
+                **kwargs,
+            )
+            installed_fd = os.open(
+                destination_name,
+                os.O_RDONLY | os.O_DIRECTORY,
+                dir_fd=runs_descriptor,
+            )
+            try:
+                member_fd = os.open(
+                    "route_universe.json",
+                    os.O_WRONLY | os.O_TRUNC,
+                    dir_fd=installed_fd,
+                )
+                try:
+                    os.write(member_fd, b'{"changed":true}')
+                    os.fsync(member_fd)
+                finally:
+                    os.close(member_fd)
+            finally:
+                os.close(installed_fd)
+            return result
+
+        with patch.object(
+            route_shadow_inputs,
+            "_rename_directory_noreplace_at",
+            side_effect=rename_then_mutate,
+        ):
+            with self.assertRaisesRegex(ValueError, "installed|verification|bytes|changed"):
+                write_run_universe(
+                    self.shadow_root, "run-post-install", self.universe, self.manifest
+                )
+
+        self.assertFalse((self.shadow_root / "runs/run-post-install").exists())
 
     def test_racing_writers_have_exactly_one_no_replace_winner(self):
         barrier = threading.Barrier(2)

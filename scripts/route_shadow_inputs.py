@@ -1,8 +1,9 @@
 """Build one source-bound private route universe from captured publications.
 
 The shadow runner must not hash one filesystem generation and parse another.
-Every parser in this module therefore consumes an immutable in-memory capture;
-SQLite is opened only after those exact bytes are copied to a private snapshot.
+Every parser therefore consumes a private, unlinked descriptor-backed capture;
+SQLite is opened through that same descriptor and raw text bytes are released
+one bounded source at a time.
 """
 
 from __future__ import annotations
@@ -30,12 +31,44 @@ try:
     from scripts.cex_instrument_lifecycle import (
         validate_cex_instrument_lifecycle_review,
     )
+    from scripts.execution_cost import (
+        EXECUTION_COST_COLUMNS,
+        validate_execution_snapshot,
+    )
+    from scripts.fetch_cex_depth import (
+        DEPTH_COLUMNS_ALL as CEX_DEPTH_COLUMNS,
+        validate_snapshot as validate_cex_depth_snapshot,
+    )
+    from scripts.fetch_dex_depth import (
+        DEX_DEPTH_COLUMNS,
+        validate_snapshot as validate_dex_depth_snapshot,
+    )
+    from scripts.fetch_tvl import (
+        TVL_COLUMNS,
+        validate_snapshot as validate_tvl_snapshot,
+    )
     from scripts.route_universe import build_route_universe, route_universe_sha256
     from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
     from scripts.token_registry import validate_registry_payload
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from cex_instrument_lifecycle import (  # type: ignore[no-redef]
         validate_cex_instrument_lifecycle_review,
+    )
+    from execution_cost import (  # type: ignore[no-redef]
+        EXECUTION_COST_COLUMNS,
+        validate_execution_snapshot,
+    )
+    from fetch_cex_depth import (  # type: ignore[no-redef]
+        DEPTH_COLUMNS_ALL as CEX_DEPTH_COLUMNS,
+        validate_snapshot as validate_cex_depth_snapshot,
+    )
+    from fetch_dex_depth import (  # type: ignore[no-redef]
+        DEX_DEPTH_COLUMNS,
+        validate_snapshot as validate_dex_depth_snapshot,
+    )
+    from fetch_tvl import (  # type: ignore[no-redef]
+        TVL_COLUMNS,
+        validate_snapshot as validate_tvl_snapshot,
     )
     from route_universe import (  # type: ignore[no-redef]
         build_route_universe,
@@ -49,8 +82,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CALCULATION_VERSION = "route_shadow_inputs/v1"
 BASELINE_MANIFEST_SCHEMA = "route_shadow_baseline_manifest/v1"
 WINDOW_DAYS = 30
-MAX_SOURCE_BYTES = 512 * 1024 * 1024
-MAX_SQLITE_BYTES = 1024 * 1024 * 1024
+MAX_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_SQLITE_BYTES = 192 * 1024 * 1024
+MAX_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_AGGREGATE_SOURCE_BYTES = 256 * 1024 * 1024
 
 _DATA_INPUTS = (
     ("market_facts.sqlite3", "market_facts.sqlite3", MAX_SQLITE_BYTES),
@@ -79,10 +114,16 @@ class SourceFileIdentity:
     sha256: str
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CapturedSource:
     identity: SourceFileIdentity
-    payload: bytes
+    descriptor: int
+
+    def close(self) -> None:
+        descriptor = self.descriptor
+        if descriptor >= 0:
+            self.descriptor = -1
+            os.close(descriptor)
 
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -200,27 +241,71 @@ def _recheck_directory_chain(
         os.close(descriptor)
 
 
-def _read_fd_bounded(descriptor: int, maximum_bytes: int) -> bytes:
-    chunks = []
+def _descriptor_sha256(descriptor: int, maximum_bytes: int) -> Tuple[int, str]:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        block = os.pread(
+            descriptor,
+            min(1024 * 1024, maximum_bytes + 1 - offset),
+            offset,
+        )
+        if not block:
+            break
+        offset += len(block)
+        if offset > maximum_bytes:
+            raise ValueError("source exceeds the bounded input limit")
+        digest.update(block)
+    return offset, digest.hexdigest()
+
+
+def _new_unlinked_capture() -> int:
+    descriptor, path = tempfile.mkstemp(prefix="route-shadow-capture-")
+    try:
+        os.unlink(path)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _copy_source_descriptor(
+    source_descriptor: int,
+    capture_descriptor: int,
+    maximum_bytes: int,
+) -> Tuple[int, str]:
+    digest = hashlib.sha256()
     total = 0
     while True:
-        block = os.read(descriptor, min(1024 * 1024, maximum_bytes + 1 - total))
+        block = os.read(
+            source_descriptor,
+            min(1024 * 1024, maximum_bytes + 1 - total),
+        )
         if not block:
             break
         total += len(block)
         if total > maximum_bytes:
             raise ValueError("source exceeds the bounded input limit")
-        chunks.append(block)
-    return b"".join(chunks)
+        digest.update(block)
+        view = memoryview(block)
+        offset = 0
+        while offset < len(view):
+            written = os.write(capture_descriptor, view[offset:])
+            if written <= 0:
+                raise OSError("captured source write made no progress")
+            offset += written
+    os.fsync(capture_descriptor)
+    return total, digest.hexdigest()
 
 
 def _stable_file_metadata(
     metadata: os.stat_result,
-) -> Tuple[int, int, int, int, int, int]:
+) -> Tuple[int, int, int, int, int, int, int]:
     return (
         metadata.st_dev,
         metadata.st_ino,
         stat.S_IFMT(metadata.st_mode),
+        metadata.st_nlink,
         metadata.st_size,
         getattr(metadata, "st_mtime_ns", int(metadata.st_mtime * 1000000000)),
         getattr(metadata, "st_ctime_ns", int(metadata.st_ctime * 1000000000)),
@@ -239,8 +324,10 @@ def _capture_entry(
         path_before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     except FileNotFoundError:
         raise FileNotFoundError("required source is missing: {}".format(logical_path))
-    if not stat.S_ISREG(path_before.st_mode):
-        raise ValueError("required source must be a regular non-symlink file")
+    if not stat.S_ISREG(path_before.st_mode) or path_before.st_nlink != 1:
+        raise ValueError(
+            "required source must be a single-link regular non-symlink file"
+        )
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -250,6 +337,7 @@ def _capture_entry(
         descriptor = os.open(name, flags, dir_fd=parent_descriptor)
     except OSError as error:
         raise ValueError("required source changed or is a symlink") from error
+    capture_descriptor = -1
     try:
         descriptor_before = os.fstat(descriptor)
         if (
@@ -260,8 +348,17 @@ def _capture_entry(
             raise ValueError("required source path and descriptor identity differ")
         if descriptor_before.st_size > maximum_bytes:
             raise ValueError("source exceeds the bounded input limit")
-        payload = _read_fd_bounded(descriptor, maximum_bytes)
+        capture_descriptor = _new_unlinked_capture()
+        captured_size, captured_sha = _copy_source_descriptor(
+            descriptor,
+            capture_descriptor,
+            maximum_bytes,
+        )
         descriptor_after = os.fstat(descriptor)
+        source_size_after, source_sha_after = _descriptor_sha256(
+            descriptor,
+            maximum_bytes,
+        )
         try:
             path_after = os.stat(
                 name, dir_fd=parent_descriptor, follow_symlinks=False
@@ -272,17 +369,68 @@ def _capture_entry(
         if (
             expected != _stable_file_metadata(descriptor_after)
             or expected != _stable_file_metadata(path_after)
-            or len(payload) != descriptor_after.st_size
+            or captured_size != descriptor_after.st_size
+            or source_size_after != captured_size
+            or source_sha_after != captured_sha
         ):
             raise ValueError("required source changed while it was captured")
+        capture_metadata = os.fstat(capture_descriptor)
+        verified_size, verified_sha = _descriptor_sha256(
+            capture_descriptor,
+            maximum_bytes,
+        )
+        if (
+            not stat.S_ISREG(capture_metadata.st_mode)
+            or capture_metadata.st_nlink != 0
+            or capture_metadata.st_size != captured_size
+            or verified_size != captured_size
+            or verified_sha != captured_sha
+        ):
+            raise ValueError("private source capture identity is invalid")
+    except BaseException:
+        if capture_descriptor >= 0:
+            os.close(capture_descriptor)
+        raise
     finally:
         os.close(descriptor)
     identity = SourceFileIdentity(
         path=logical_path,
-        size=len(payload),
-        sha256=hashlib.sha256(payload).hexdigest(),
+        size=captured_size,
+        sha256=captured_sha,
     )
-    return _CapturedSource(identity=identity, payload=payload)
+    return _CapturedSource(identity=identity, descriptor=capture_descriptor)
+
+
+def _verify_capture(capture: _CapturedSource) -> None:
+    if capture.descriptor < 0:
+        raise ValueError("private source capture is closed")
+    metadata = os.fstat(capture.descriptor)
+    size, digest = _descriptor_sha256(
+        capture.descriptor,
+        capture.identity.size,
+    )
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 0
+        or metadata.st_size != capture.identity.size
+        or size != capture.identity.size
+        or digest != capture.identity.sha256
+    ):
+        raise ValueError("private source capture bytes or identity changed")
+
+
+def _capture_bytes(capture: _CapturedSource) -> bytes:
+    _verify_capture(capture)
+    duplicate = os.dup(capture.descriptor)
+    os.lseek(duplicate, 0, os.SEEK_SET)
+    with os.fdopen(duplicate, "rb") as handle:
+        payload = handle.read(capture.identity.size + 1)
+    if len(payload) != capture.identity.size:
+        raise ValueError("private source capture size changed")
+    if hashlib.sha256(payload).hexdigest() != capture.identity.sha256:
+        raise ValueError("private source capture bytes changed")
+    _verify_capture(capture)
+    return payload
 
 
 def _reject_sqlite_sidecars(data_descriptor: int) -> None:
@@ -325,6 +473,7 @@ def _capture_required_sources(
             raise ValueError("admin source directory is missing or a symlink") from error
         config_descriptor, config_chain = _open_directory_chain(config_path.parent)
         captures = []
+        aggregate_size = 0
         for logical_path, relative_path, maximum_bytes in _DATA_INPUTS:
             if "/" in relative_path:
                 parent_descriptor = admin_descriptor
@@ -332,22 +481,28 @@ def _capture_required_sources(
             else:
                 parent_descriptor = data_descriptor
                 name = relative_path
-            captures.append(
-                _capture_entry(
+            capture = _capture_entry(
                     parent_descriptor,
                     name,
                     logical_path,
                     maximum_bytes,
                 )
-            )
-        captures.append(
-            _capture_entry(
+            aggregate_size += capture.identity.size
+            if aggregate_size > MAX_AGGREGATE_SOURCE_BYTES:
+                capture.close()
+                raise ValueError("aggregate source capture budget exceeded")
+            captures.append(capture)
+        capture = _capture_entry(
                 config_descriptor,
                 config_path.name,
                 _CONFIG_LOGICAL_PATH,
-                MAX_SOURCE_BYTES,
+                MAX_CONFIG_BYTES,
             )
-        )
+        aggregate_size += capture.identity.size
+        if aggregate_size > MAX_AGGREGATE_SOURCE_BYTES:
+            capture.close()
+            raise ValueError("aggregate source capture budget exceeded")
+        captures.append(capture)
         _reject_sqlite_sidecars(data_descriptor)
         data_metadata = os.fstat(data_descriptor)
         if (data_metadata.st_dev, data_metadata.st_ino) != data_chain[-1]:
@@ -365,6 +520,10 @@ def _capture_required_sources(
         _recheck_directory_chain(data_path, data_chain)
         _recheck_directory_chain(config_path.parent, config_chain)
         return tuple(captures)
+    except BaseException:
+        for capture in locals().get("captures", []):
+            capture.close()
+        raise
     finally:
         if config_descriptor >= 0:
             os.close(config_descriptor)
@@ -579,42 +738,32 @@ def _parse_lifecycle(payload: bytes, configured_ids: Sequence[str]) -> set:
     return withheld
 
 
-def _copy_sqlite_capture(payload: bytes, directory: Path) -> Path:
-    path = directory / "market_facts.sqlite3"
-    descriptor = os.open(
-        str(path),
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
-    try:
-        view = memoryview(payload)
-        offset = 0
-        while offset < len(view):
-            written = os.write(descriptor, view[offset:])
-            if written <= 0:
-                raise OSError("short write while copying captured SQLite")
-            offset += written
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    return path
+def _sqlite_capture_uri(capture: _CapturedSource) -> str:
+    if sys.platform == "darwin":
+        descriptor_path = "/dev/fd/{}".format(capture.descriptor)
+    elif sys.platform.startswith("linux"):
+        descriptor_path = "/proc/self/fd/{}".format(capture.descriptor)
+    else:
+        raise ValueError("descriptor-backed SQLite capture is unsupported")
+    return "file:{}?mode=ro&immutable=1".format(descriptor_path)
 
 
 def _parse_sqlite(
-    payload: bytes,
+    capture: _CapturedSource,
     cex_identity: SourceFileIdentity,
     allowed_tokens: set,
     lifecycle_withheld: set,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    with tempfile.TemporaryDirectory(prefix="route-shadow-sqlite-") as directory:
-        os.chmod(directory, 0o700)
-        snapshot_path = _copy_sqlite_capture(payload, Path(directory))
-        uri = "{}?mode=ro&immutable=1".format(snapshot_path.as_uri())
-        try:
-            connection = sqlite3.connect(uri, uri=True)
-        except sqlite3.Error as error:
-            raise ValueError("captured SQLite state is invalid") from error
-        connection.row_factory = sqlite3.Row
+    _verify_capture(capture)
+    uri = _sqlite_capture_uri(capture)
+    _verify_capture(capture)
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as error:
+        raise ValueError("captured SQLite state is invalid") from error
+    connection.row_factory = sqlite3.Row
+    try:
+        _verify_capture(capture)
         try:
             integrity = connection.execute("PRAGMA integrity_check").fetchall()
             if len(integrity) != 1 or integrity[0][0] != "ok":
@@ -693,8 +842,9 @@ def _parse_sqlite(
             ).fetchall()
         except sqlite3.Error as error:
             raise ValueError("captured SQLite state is invalid") from error
-        finally:
-            connection.close()
+    finally:
+        connection.close()
+    _verify_capture(capture)
 
     catalog = []
     seen = set()
@@ -724,34 +874,16 @@ def _parse_sqlite(
     return catalog, imported_at
 
 
-def _latest_rows_by_market(
-    rows: Iterable[Mapping[str, str]], market_id_builder
-) -> List[Tuple[str, Mapping[str, str]]]:
-    latest = {}
-    latest_keys = {}
-    for row in rows:
-        market_id = market_id_builder(row)
-        observed = _timestamp(row.get("observed_at"), "observed_at")
-        response = str(row.get("response_received_at") or observed)
-        if response != observed:
-            _timestamp(response, "response_received_at")
-        key = (
-            exact_rfc3339_epoch_seconds(response),
-            exact_rfc3339_epoch_seconds(observed),
-            response,
-            observed,
-            str(row.get("snapshot_id") or ""),
-        )
-        if (
-            market_id in latest_keys
-            and key == latest_keys[market_id]
-            and dict(row) != dict(latest[market_id])
-        ):
-            raise ValueError("current publication has conflicting market rows")
-        if market_id not in latest_keys or key > latest_keys[market_id]:
-            latest_keys[market_id] = key
-            latest[market_id] = row
-    return [(market_id, latest[market_id]) for market_id in sorted(latest)]
+def _single_publication_snapshot_id(
+    rows: Sequence[Mapping[str, Any]], label: str
+) -> str:
+    snapshot_ids = {
+        _required_text(row.get("snapshot_id"), "{} snapshot_id".format(label))
+        for row in rows
+    }
+    if len(snapshot_ids) != 1:
+        raise ValueError("{} must contain one nonempty snapshot ID".format(label))
+    return next(iter(snapshot_ids))
 
 
 def _parse_cex_volume(
@@ -805,33 +937,41 @@ def _parse_cex_volume(
 
 
 def _parse_depth(
-    payload: bytes, *, market_type: str
-) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    payload: bytes,
+    *,
+    market_type: str,
+    expected_market_ids: set,
+) -> Tuple[List[Dict[str, Any]], str]:
     if market_type == "cex":
         label = "cex_depth_latest.csv"
         builder = _cex_market_id
-        required = {
-            "snapshot_id", "observed_at", "token_symbol", "exchange", "cex_symbol",
-            "bid_depth_100bps_usd", "ask_depth_100bps_usd",
-            "total_depth_100bps_usd", "status",
-        }
+        required = CEX_DEPTH_COLUMNS
     else:
         label = "dex_depth_latest.csv"
         builder = _dex_market_id
-        required = {
-            "snapshot_id", "observed_at", "token_symbol", "chain", "dex",
-            "pool_address", "block_timestamp", "buy_depth_100bps_usd",
-            "sell_depth_100bps_usd", "total_depth_100bps_usd", "status",
-        }
+        required = DEX_DEPTH_COLUMNS
     source_rows = _parse_csv(payload, label, required)
-    latest = _latest_rows_by_market(source_rows, builder)
+    market_ids = [builder(row) for row in source_rows]
+    if len(market_ids) != len(set(market_ids)):
+        raise ValueError("{} contains duplicate market rows".format(label))
+    if set(market_ids) != expected_market_ids:
+        raise ValueError("{} coverage does not match the catalog".format(label))
+    snapshot_id = _single_publication_snapshot_id(source_rows, label)
+    if market_type == "cex":
+        validate_cex_depth_snapshot(
+            source_rows,
+            source_rows,
+            allow_no_observed=True,
+        )
+    else:
+        validate_dex_depth_snapshot(
+            source_rows,
+            source_rows,
+            allow_no_observed=True,
+        )
     projected = []
-    lineage = {}
-    for market_id, row in latest:
-        snapshot_id = _required_text(row.get("snapshot_id"), "snapshot_id")
+    for market_id, row in zip(market_ids, source_rows):
         status_text = _required_text(row.get("status"), "status")
-        if status_text not in {"observed", "partial", "failed", "unsupported"}:
-            raise ValueError("Depth status is invalid")
         if market_type == "cex":
             state_time = _timestamp(row.get("observed_at"), "observed_at")
             directional = {
@@ -858,7 +998,6 @@ def _parse_depth(
                     row.get("sell_depth_100bps_usd"), "sell_depth_100bps_usd"
                 ),
             }
-        lineage[market_id] = snapshot_id
         projected.append({
             "market_id": market_id,
             "snapshot_id": snapshot_id,
@@ -869,26 +1008,34 @@ def _parse_depth(
             ),
             **directional,
         })
-    return projected, lineage
+    return projected, snapshot_id
 
 
 def _parse_execution(
     payload: bytes,
     *,
     market_type: str,
-    depth_lineage: Mapping[str, str]
+    depth_snapshot_id: str,
+    expected_market_ids: set,
 ) -> List[Dict[str, Any]]:
     label = "{}_execution_cost_latest.csv".format(market_type)
     rows = _parse_csv(
         payload,
         label,
-        {
-            "snapshot_id", "source_snapshot_id", "observed_at",
-            "state_observed_at", "market_id", "market_type", "token_symbol",
-            "exchange", "cex_symbol", "chain", "dex", "pool_address",
-            "direction", "requested_notional_usd", "status",
-        },
+        EXECUTION_COST_COLUMNS,
     )
+    validate_execution_snapshot(
+        expected_market_ids,
+        rows,
+        enforce_usd_price_timing=(market_type == "dex"),
+    )
+    _single_publication_snapshot_id(rows, label)
+    source_snapshot_ids = {
+        _required_text(row.get("source_snapshot_id"), "source_snapshot_id")
+        for row in rows
+    }
+    if source_snapshot_ids != {depth_snapshot_id}:
+        raise ValueError("Depth and Execution source snapshot lineage do not match")
     projected = []
     keys = set()
     for row in rows:
@@ -904,8 +1051,6 @@ def _parse_execution(
         source_snapshot = _required_text(
             row.get("source_snapshot_id"), "source_snapshot_id"
         )
-        if depth_lineage.get(expected_id) != source_snapshot:
-            raise ValueError("Depth and Execution snapshot lineage do not match")
         notional = _decimal_text(
             row.get("requested_notional_usd"),
             "requested_notional_usd",
@@ -932,30 +1077,35 @@ def _parse_execution(
 
 def _parse_tvl_and_volume(
     payload: bytes,
+    *,
+    expected_market_ids: set,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     rows = _parse_csv(
         payload,
         "dex_pool_tvl_latest.csv",
-        {
-            "snapshot_id", "observed_at", "token_symbol", "chain", "dex",
-            "pool_address", "pool_name", "tvl_usd", "volume_24h_usd", "status",
-        },
+        TVL_COLUMNS,
     )
-    latest = _latest_rows_by_market(rows, _dex_market_id)
+    market_ids = [_dex_market_id(row) for row in rows]
+    if len(market_ids) != len(set(market_ids)):
+        raise ValueError("dex_pool_tvl_latest.csv contains duplicate market rows")
+    if set(market_ids) != expected_market_ids:
+        raise ValueError("TVL publication coverage does not match the catalog")
+    _single_publication_snapshot_id(rows, "dex_pool_tvl_latest.csv")
+    validate_tvl_snapshot(rows, rows, allow_no_observed=True)
     tvl_rows = []
     volume_rows = []
-    for market_id, row in latest:
+    for market_id, row in zip(market_ids, rows):
         observed_at = _timestamp(row.get("observed_at"), "observed_at")
         status_text = _required_text(row.get("status"), "status")
-        if status_text not in {"observed", "partial", "failed", "unsupported"}:
-            raise ValueError("TVL status is invalid")
         tvl_value = None
         volume_value = None
-        if status_text in {"observed", "partial"}:
+        if status_text == "observed":
             tvl_value = _decimal_text(row.get("tvl_usd"), "tvl_usd")
             volume_value = _decimal_text(
                 row.get("volume_24h_usd"), "volume_24h_usd"
             )
+        elif str(row.get("volume_24h_usd") or "").strip():
+            raise ValueError("non-observed TVL row cannot publish 24h Volume")
         binding = _required_text(row.get("snapshot_id"), "snapshot_id")
         tvl_rows.append({
             "market_id": market_id,
@@ -1008,66 +1158,114 @@ def build_shadow_universe(
     """Build one route universe and its exact immutable source manifest."""
     window = selection_window(now)
     captures = _capture_required_sources(Path(data_dir), Path(static_token_config))
-    by_path = {capture.identity.path: capture for capture in captures}
-    expected_paths = [item[0] for item in _DATA_INPUTS] + [_CONFIG_LOGICAL_PATH]
-    if list(by_path) != expected_paths or len(by_path) != len(captures):
-        raise ValueError("required source capture set is invalid")
-    manifest = _source_manifest(captures, window)
+    try:
+        by_path = {capture.identity.path: capture for capture in captures}
+        expected_paths = [item[0] for item in _DATA_INPUTS] + [_CONFIG_LOGICAL_PATH]
+        if list(by_path) != expected_paths or len(by_path) != len(captures):
+            raise ValueError("required source capture set is invalid")
+        manifest = _source_manifest(captures, window)
+    except BaseException:
+        for capture in captures:
+            capture.close()
+        raise
+    try:
+        payload = _capture_bytes(by_path[_CONFIG_LOGICAL_PATH])
+        static_tokens, static_crypto = _parse_static_tokens(payload)
+        del payload
+        by_path[_CONFIG_LOGICAL_PATH].close()
 
-    static_tokens, static_crypto = _parse_static_tokens(
-        by_path[_CONFIG_LOGICAL_PATH].payload
-    )
-    runtime_tokens, runtime_crypto = _parse_runtime_registry(
-        by_path["admin/token_registry.json"].payload
-    )
-    configured_crypto = tuple(sorted(set(static_crypto) | set(runtime_crypto)))
-    lifecycle_withheld = _parse_lifecycle(
-        by_path["cex_instrument_lifecycle.json"].payload,
-        configured_crypto,
-    )
-    catalog, imported_at = _parse_sqlite(
-        by_path["market_facts.sqlite3"].payload,
-        by_path["cex_exchange_volume_daily.csv"].identity,
-        static_tokens | runtime_tokens,
-        lifecycle_withheld,
-    )
-    cex_volume_rows = _parse_cex_volume(
-        by_path["cex_exchange_volume_daily.csv"].payload,
-        window,
-        imported_at,
-    )
-    cex_depth_rows, cex_depth_lineage = _parse_depth(
-        by_path["cex_depth_latest.csv"].payload,
-        market_type="cex",
-    )
-    dex_depth_rows, dex_depth_lineage = _parse_depth(
-        by_path["dex_depth_latest.csv"].payload,
-        market_type="dex",
-    )
-    cex_execution_rows = _parse_execution(
-        by_path["cex_execution_cost_latest.csv"].payload,
-        market_type="cex",
-        depth_lineage=cex_depth_lineage,
-    )
-    dex_execution_rows = _parse_execution(
-        by_path["dex_execution_cost_latest.csv"].payload,
-        market_type="dex",
-        depth_lineage=dex_depth_lineage,
-    )
-    tvl_rows, dex_volume_rows = _parse_tvl_and_volume(
-        by_path["dex_pool_tvl_latest.csv"].payload
-    )
-    universe = build_route_universe(
-        catalog,
-        cex_depth_rows + dex_depth_rows,
-        cex_execution_rows + dex_execution_rows,
-        cex_volume_rows,
-        dex_volume_rows,
-        tvl_rows,
-        selection_window=window,
-        candidate_source_generation=manifest["candidate_source_generation"],
-    )
-    return universe, manifest
+        payload = _capture_bytes(by_path["admin/token_registry.json"])
+        runtime_tokens, runtime_crypto = _parse_runtime_registry(payload)
+        del payload
+        by_path["admin/token_registry.json"].close()
+
+        configured_crypto = tuple(sorted(set(static_crypto) | set(runtime_crypto)))
+        payload = _capture_bytes(by_path["cex_instrument_lifecycle.json"])
+        lifecycle_withheld = _parse_lifecycle(payload, configured_crypto)
+        del payload
+        by_path["cex_instrument_lifecycle.json"].close()
+
+        catalog, imported_at = _parse_sqlite(
+            by_path["market_facts.sqlite3"],
+            by_path["cex_exchange_volume_daily.csv"].identity,
+            static_tokens | runtime_tokens,
+            lifecycle_withheld,
+        )
+        by_path["market_facts.sqlite3"].close()
+        expected_by_type = {
+            market_type: {
+                row["market_id"]
+                for row in catalog
+                if row["market_type"] == market_type
+            }
+            for market_type in ("cex", "dex")
+        }
+
+        payload = _capture_bytes(by_path["cex_exchange_volume_daily.csv"])
+        cex_volume_rows = _parse_cex_volume(payload, window, imported_at)
+        del payload
+        by_path["cex_exchange_volume_daily.csv"].close()
+
+        payload = _capture_bytes(by_path["cex_depth_latest.csv"])
+        cex_depth_rows, cex_depth_snapshot_id = _parse_depth(
+            payload,
+            market_type="cex",
+            expected_market_ids=expected_by_type["cex"],
+        )
+        del payload
+        by_path["cex_depth_latest.csv"].close()
+
+        payload = _capture_bytes(by_path["dex_depth_latest.csv"])
+        dex_depth_rows, dex_depth_snapshot_id = _parse_depth(
+            payload,
+            market_type="dex",
+            expected_market_ids=expected_by_type["dex"],
+        )
+        del payload
+        by_path["dex_depth_latest.csv"].close()
+
+        payload = _capture_bytes(by_path["cex_execution_cost_latest.csv"])
+        cex_execution_rows = _parse_execution(
+            payload,
+            market_type="cex",
+            depth_snapshot_id=cex_depth_snapshot_id,
+            expected_market_ids=expected_by_type["cex"],
+        )
+        del payload
+        by_path["cex_execution_cost_latest.csv"].close()
+
+        payload = _capture_bytes(by_path["dex_execution_cost_latest.csv"])
+        dex_execution_rows = _parse_execution(
+            payload,
+            market_type="dex",
+            depth_snapshot_id=dex_depth_snapshot_id,
+            expected_market_ids=expected_by_type["dex"],
+        )
+        del payload
+        by_path["dex_execution_cost_latest.csv"].close()
+
+        payload = _capture_bytes(by_path["dex_pool_tvl_latest.csv"])
+        tvl_rows, dex_volume_rows = _parse_tvl_and_volume(
+            payload,
+            expected_market_ids=expected_by_type["dex"],
+        )
+        del payload
+        by_path["dex_pool_tvl_latest.csv"].close()
+
+        universe = build_route_universe(
+            catalog,
+            cex_depth_rows + dex_depth_rows,
+            cex_execution_rows + dex_execution_rows,
+            cex_volume_rows,
+            dex_volume_rows,
+            tvl_rows,
+            selection_window=window,
+            candidate_source_generation=manifest["candidate_source_generation"],
+        )
+        return universe, manifest
+    finally:
+        for capture in captures:
+            capture.close()
 
 
 def _validate_run_id(run_id: str) -> str:
@@ -1190,9 +1388,101 @@ def _write_staged_file(
         os.close(descriptor)
 
 
-def _rename_directory_noreplace_at(
-    directory_descriptor: int, source_name: str, destination_name: str
+def _directory_identity(descriptor: int) -> Tuple[int, int]:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("shadow staging descriptor is not a directory")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _read_member_bytes(descriptor: int, maximum_bytes: int) -> bytes:
+    with os.fdopen(os.dup(descriptor), "rb") as handle:
+        payload = handle.read(maximum_bytes + 1)
+    if len(payload) > maximum_bytes:
+        raise ValueError("shadow run member exceeds expected bytes")
+    return payload
+
+
+def _verify_run_directory(
+    directory_descriptor: int,
+    expected_identity: Tuple[int, int],
+    expected_payloads: Mapping[str, bytes],
 ) -> None:
+    if _directory_identity(directory_descriptor) != expected_identity:
+        raise ValueError("shadow staging directory identity changed")
+    if sorted(os.listdir(directory_descriptor)) != sorted(expected_payloads):
+        raise ValueError("shadow run directory has unexpected members")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError("secure shadow member verification is unavailable")
+    for name, expected_payload in expected_payloads.items():
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+        try:
+            before = os.fstat(descriptor)
+            payload = _read_member_bytes(descriptor, len(expected_payload))
+            after = os.fstat(descriptor)
+            path_metadata = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or _stable_file_metadata(before) != _stable_file_metadata(after)
+                or _stable_file_metadata(before) != _stable_file_metadata(path_metadata)
+                or payload != expected_payload
+            ):
+                raise ValueError("shadow run member bytes or identity changed")
+        finally:
+            os.close(descriptor)
+
+
+def _verify_named_directory(
+    runs_descriptor: int,
+    name: str,
+    expected_identity: Tuple[int, int],
+) -> None:
+    metadata = os.stat(name, dir_fd=runs_descriptor, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != expected_identity
+    ):
+        raise ValueError("shadow staging directory path identity changed")
+
+
+def _rename_directory_noreplace_at(
+    directory_descriptor: int,
+    source_name: str,
+    destination_name: str,
+    *,
+    expected_source_identity: Optional[Tuple[int, int]] = None,
+    expected_payloads: Optional[Mapping[str, bytes]] = None,
+) -> None:
+    if expected_source_identity is not None:
+        _verify_named_directory(
+            directory_descriptor,
+            source_name,
+            expected_source_identity,
+        )
+        source_descriptor = os.open(
+            source_name,
+            _secure_directory_flags(),
+            dir_fd=directory_descriptor,
+        )
+        try:
+            if expected_payloads is not None:
+                _verify_run_directory(
+                    source_descriptor,
+                    expected_source_identity,
+                    expected_payloads,
+                )
+        finally:
+            os.close(source_descriptor)
     library = ctypes.CDLL(None, use_errno=True)
     source = os.fsencode(source_name)
     destination = os.fsencode(destination_name)
@@ -1236,16 +1526,46 @@ def _rename_directory_noreplace_at(
     raise OSError(error_number, os.strerror(error_number))
 
 
-def _cleanup_stage(
-    runs_descriptor: int, stage_descriptor: int, stage_name: str
+def _cleanup_owned_directory(
+    runs_descriptor: int,
+    owned_descriptor: int,
+    owned_identity: Tuple[int, int],
+    expected_members: Iterable[str],
 ) -> None:
-    for member in ("route_universe.json", "baseline_manifest.json"):
+    owned_name = None
+    for candidate in os.listdir(runs_descriptor):
         try:
-            os.unlink(member, dir_fd=stage_descriptor)
+            metadata = os.stat(
+                candidate,
+                dir_fd=runs_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        if (
+            stat.S_ISDIR(metadata.st_mode)
+            and (metadata.st_dev, metadata.st_ino) == owned_identity
+        ):
+            owned_name = candidate
+            break
+    if owned_name is None:
+        return
+    if not owned_name.startswith((".stage-", ".quarantine-")):
+        quarantine_name = ".quarantine-{}".format(uuid.uuid4().hex)
+        os.rename(
+            owned_name,
+            quarantine_name,
+            src_dir_fd=runs_descriptor,
+            dst_dir_fd=runs_descriptor,
+        )
+        owned_name = quarantine_name
+    for member in expected_members:
+        try:
+            os.unlink(member, dir_fd=owned_descriptor)
         except FileNotFoundError:
             pass
     try:
-        os.rmdir(stage_name, dir_fd=runs_descriptor)
+        os.rmdir(owned_name, dir_fd=runs_descriptor)
     except (FileNotFoundError, OSError):
         pass
 
@@ -1284,6 +1604,7 @@ def write_run_universe(
     runs_descriptor, runs_chain = _ensure_directory_chain(runs_path)
     stage_name = ".stage-{}-{}".format(validated_run_id, uuid.uuid4().hex)
     stage_descriptor = -1
+    stage_identity = None
     committed = False
     try:
         try:
@@ -1293,33 +1614,61 @@ def write_run_universe(
         stage_descriptor = os.open(
             stage_name, _secure_directory_flags(), dir_fd=runs_descriptor
         )
+        stage_identity = _directory_identity(stage_descriptor)
+        expected_payloads = {
+            "route_universe.json": universe_payload,
+            "baseline_manifest.json": manifest_payload,
+        }
         _write_staged_file(
             stage_descriptor, "route_universe.json", universe_payload
         )
         _write_staged_file(
             stage_descriptor, "baseline_manifest.json", manifest_payload
         )
-        members = sorted(os.listdir(stage_descriptor))
-        if members != ["baseline_manifest.json", "route_universe.json"]:
-            raise ValueError("shadow staging directory has unexpected members")
-        for member in members:
-            metadata = os.stat(
-                member, dir_fd=stage_descriptor, follow_symlinks=False
-            )
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise ValueError("shadow run member is unsafe or hard-linked")
+        _verify_run_directory(
+            stage_descriptor,
+            stage_identity,
+            expected_payloads,
+        )
         os.fsync(stage_descriptor)
         _recheck_directory_chain(runs_path, runs_chain)
         _rename_directory_noreplace_at(
-            runs_descriptor, stage_name, validated_run_id
+            runs_descriptor,
+            stage_name,
+            validated_run_id,
+            expected_source_identity=stage_identity,
+            expected_payloads=expected_payloads,
         )
-        committed = True
+        installed_descriptor = os.open(
+            validated_run_id,
+            _secure_directory_flags(),
+            dir_fd=runs_descriptor,
+        )
+        try:
+            _verify_named_directory(
+                runs_descriptor,
+                validated_run_id,
+                stage_identity,
+            )
+            _verify_run_directory(
+                installed_descriptor,
+                stage_identity,
+                expected_payloads,
+            )
+        finally:
+            os.close(installed_descriptor)
         os.fsync(runs_descriptor)
         _recheck_directory_chain(runs_path, runs_chain)
+        committed = True
     finally:
         if stage_descriptor >= 0:
-            if not committed:
-                _cleanup_stage(runs_descriptor, stage_descriptor, stage_name)
+            if not committed and stage_identity is not None:
+                _cleanup_owned_directory(
+                    runs_descriptor,
+                    stage_descriptor,
+                    stage_identity,
+                    ("route_universe.json", "baseline_manifest.json"),
+                )
             os.close(stage_descriptor)
         os.close(runs_descriptor)
 
