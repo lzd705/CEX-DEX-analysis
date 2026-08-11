@@ -1462,68 +1462,122 @@ def _rename_directory_noreplace_at(
     *,
     expected_source_identity: Optional[Tuple[int, int]] = None,
     expected_payloads: Optional[Mapping[str, bytes]] = None,
-) -> None:
-    if expected_source_identity is not None:
-        _verify_named_directory(
-            directory_descriptor,
-            source_name,
-            expected_source_identity,
-        )
-        source_descriptor = os.open(
-            source_name,
-            _secure_directory_flags(),
-            dir_fd=directory_descriptor,
-        )
-        try:
+) -> Tuple[int, Tuple[int, int]]:
+    source_descriptor = -1
+    try:
+        if expected_source_identity is not None:
+            _verify_named_directory(
+                directory_descriptor,
+                source_name,
+                expected_source_identity,
+            )
+            source_descriptor = os.open(
+                source_name,
+                _secure_directory_flags(),
+                dir_fd=directory_descriptor,
+            )
             if expected_payloads is not None:
                 _verify_run_directory(
                     source_descriptor,
                     expected_source_identity,
                     expected_payloads,
                 )
-        finally:
+        library = ctypes.CDLL(None, use_errno=True)
+        source = os.fsencode(source_name)
+        destination = os.fsencode(destination_name)
+        if sys.platform == "darwin":
+            try:
+                operation = library.renameatx_np
+            except AttributeError as error:
+                raise ValueError(
+                    "atomic no-replace directory rename is unsupported"
+                ) from error
+            operation.argtypes = [
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            operation.restype = ctypes.c_int
+            arguments = (
+                directory_descriptor, source, directory_descriptor,
+                destination, 0x00000004,
+            )
+        elif sys.platform.startswith("linux"):
+            try:
+                operation = library.renameat2
+            except AttributeError as error:
+                raise ValueError(
+                    "atomic no-replace directory rename is unsupported"
+                ) from error
+            operation.argtypes = [
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            operation.restype = ctypes.c_int
+            arguments = (
+                directory_descriptor, source, directory_descriptor,
+                destination, 1,
+            )
+        else:
+            raise ValueError("atomic no-replace directory rename is unsupported")
+        ctypes.set_errno(0)
+        if operation(*arguments) != 0:
+            error_number = ctypes.get_errno()
+            if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise ValueError("immutable shadow run already exists")
+            if error_number in {errno.ENOSYS, errno.ENOTSUP}:
+                raise ValueError(
+                    "atomic no-replace directory rename is unsupported"
+                )
+            raise OSError(error_number, os.strerror(error_number))
+
+        installed_descriptor = os.open(
+            destination_name,
+            _secure_directory_flags(),
+            dir_fd=directory_descriptor,
+        )
+        try:
+            installed_identity = _directory_identity(installed_descriptor)
+            _verify_named_directory(
+                directory_descriptor,
+                destination_name,
+                installed_identity,
+            )
+        except BaseException:
+            os.close(installed_descriptor)
+            raise
+        return installed_descriptor, installed_identity
+    finally:
+        if source_descriptor >= 0:
             os.close(source_descriptor)
-    library = ctypes.CDLL(None, use_errno=True)
-    source = os.fsencode(source_name)
-    destination = os.fsencode(destination_name)
-    if sys.platform == "darwin":
-        try:
-            operation = library.renameatx_np
-        except AttributeError as error:
-            raise ValueError("atomic no-replace directory rename is unsupported") from error
-        operation.argtypes = [
-            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        operation.restype = ctypes.c_int
-        arguments = (
-            directory_descriptor, source, directory_descriptor, destination,
-            0x00000004,
+
+
+def _named_directory_matches_descriptor(
+    runs_descriptor: int,
+    name: str,
+    owned_descriptor: int,
+    owned_identity: Tuple[int, int],
+) -> bool:
+    if _directory_identity(owned_descriptor) != owned_identity:
+        raise ValueError("owned shadow directory descriptor identity changed")
+    candidate_descriptor = -1
+    try:
+        candidate_descriptor = os.open(
+            name,
+            _secure_directory_flags(),
+            dir_fd=runs_descriptor,
         )
-    elif sys.platform.startswith("linux"):
-        try:
-            operation = library.renameat2
-        except AttributeError as error:
-            raise ValueError("atomic no-replace directory rename is unsupported") from error
-        operation.argtypes = [
-            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        operation.restype = ctypes.c_int
-        arguments = (
-            directory_descriptor, source, directory_descriptor, destination, 1,
+        if _directory_identity(candidate_descriptor) != owned_identity:
+            return False
+        metadata = os.stat(name, dir_fd=runs_descriptor, follow_symlinks=False)
+        return (
+            stat.S_ISDIR(metadata.st_mode)
+            and (metadata.st_dev, metadata.st_ino) == owned_identity
         )
-    else:
-        raise ValueError("atomic no-replace directory rename is unsupported")
-    ctypes.set_errno(0)
-    if operation(*arguments) == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise ValueError("immutable shadow run already exists")
-    if error_number in {errno.ENOSYS, errno.ENOTSUP}:
-        raise ValueError("atomic no-replace directory rename is unsupported")
-    raise OSError(error_number, os.strerror(error_number))
+    except (FileNotFoundError, OSError):
+        return False
+    finally:
+        if candidate_descriptor >= 0:
+            os.close(candidate_descriptor)
 
 
 def _cleanup_owned_directory(
@@ -1552,6 +1606,13 @@ def _cleanup_owned_directory(
         return
     if not owned_name.startswith((".stage-", ".quarantine-")):
         quarantine_name = ".quarantine-{}".format(uuid.uuid4().hex)
+        if not _named_directory_matches_descriptor(
+            runs_descriptor,
+            owned_name,
+            owned_descriptor,
+            owned_identity,
+        ):
+            return
         os.rename(
             owned_name,
             quarantine_name,
@@ -1559,11 +1620,25 @@ def _cleanup_owned_directory(
             dst_dir_fd=runs_descriptor,
         )
         owned_name = quarantine_name
+    if not _named_directory_matches_descriptor(
+        runs_descriptor,
+        owned_name,
+        owned_descriptor,
+        owned_identity,
+    ):
+        return
     for member in expected_members:
         try:
             os.unlink(member, dir_fd=owned_descriptor)
         except FileNotFoundError:
             pass
+    if not _named_directory_matches_descriptor(
+        runs_descriptor,
+        owned_name,
+        owned_descriptor,
+        owned_identity,
+    ):
+        return
     try:
         os.rmdir(owned_name, dir_fd=runs_descriptor)
     except (FileNotFoundError, OSError):
@@ -1605,6 +1680,8 @@ def write_run_universe(
     stage_name = ".stage-{}-{}".format(validated_run_id, uuid.uuid4().hex)
     stage_descriptor = -1
     stage_identity = None
+    installed_descriptor = -1
+    installed_identity = None
     committed = False
     try:
         try:
@@ -1632,35 +1709,38 @@ def write_run_universe(
         )
         os.fsync(stage_descriptor)
         _recheck_directory_chain(runs_path, runs_chain)
-        _rename_directory_noreplace_at(
+        installed_descriptor, installed_identity = _rename_directory_noreplace_at(
             runs_descriptor,
             stage_name,
             validated_run_id,
             expected_source_identity=stage_identity,
             expected_payloads=expected_payloads,
         )
-        installed_descriptor = os.open(
+        if installed_identity != stage_identity:
+            raise ValueError("installed shadow run identity changed")
+        _verify_named_directory(
+            runs_descriptor,
             validated_run_id,
-            _secure_directory_flags(),
-            dir_fd=runs_descriptor,
+            installed_identity,
         )
-        try:
-            _verify_named_directory(
-                runs_descriptor,
-                validated_run_id,
-                stage_identity,
-            )
-            _verify_run_directory(
-                installed_descriptor,
-                stage_identity,
-                expected_payloads,
-            )
-        finally:
-            os.close(installed_descriptor)
+        _verify_run_directory(
+            installed_descriptor,
+            installed_identity,
+            expected_payloads,
+        )
         os.fsync(runs_descriptor)
         _recheck_directory_chain(runs_path, runs_chain)
         committed = True
     finally:
+        if installed_descriptor >= 0:
+            if not committed and installed_identity is not None:
+                _cleanup_owned_directory(
+                    runs_descriptor,
+                    installed_descriptor,
+                    installed_identity,
+                    ("route_universe.json", "baseline_manifest.json"),
+                )
+            os.close(installed_descriptor)
         if stage_descriptor >= 0:
             if not committed and stage_identity is not None:
                 _cleanup_owned_directory(

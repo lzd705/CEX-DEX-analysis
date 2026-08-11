@@ -1112,6 +1112,75 @@ class RunUniversePublicationTests(unittest.TestCase):
         self.assertFalse((self.shadow_root / "runs/run-failed").exists())
         self.assertEqual(list((self.shadow_root / "runs").glob(".stage-*")), [])
 
+    def test_stage_swapped_after_final_check_is_rolled_back_from_run_path(self):
+        real_library = route_shadow_inputs.ctypes.CDLL(None, use_errno=True)
+        operation_name = (
+            "renameatx_np"
+            if route_shadow_inputs.sys.platform == "darwin"
+            else "renameat2"
+        )
+        real_operation = getattr(real_library, operation_name)
+
+        class SwapBeforeRename:
+            argtypes = None
+            restype = None
+
+            def __call__(self, *arguments):
+                runs_descriptor = arguments[0]
+                source_name = os.fsdecode(arguments[1])
+                os.rename(
+                    source_name,
+                    source_name + "-owned",
+                    src_dir_fd=runs_descriptor,
+                    dst_dir_fd=runs_descriptor,
+                )
+                os.mkdir(source_name, 0o700, dir_fd=runs_descriptor)
+                attacker_descriptor = os.open(
+                    source_name,
+                    os.O_RDONLY | os.O_DIRECTORY,
+                    dir_fd=runs_descriptor,
+                )
+                try:
+                    for member in (
+                        "route_universe.json",
+                        "baseline_manifest.json",
+                    ):
+                        descriptor = os.open(
+                            member,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=attacker_descriptor,
+                        )
+                        try:
+                            os.write(descriptor, b'{"attacker":true}')
+                        finally:
+                            os.close(descriptor)
+                finally:
+                    os.close(attacker_descriptor)
+                return real_operation(*arguments)
+
+        class SwapLibrary:
+            pass
+
+        swap_library = SwapLibrary()
+        setattr(swap_library, operation_name, SwapBeforeRename())
+        with patch.object(
+            route_shadow_inputs.ctypes,
+            "CDLL",
+            return_value=swap_library,
+        ):
+            with self.assertRaisesRegex(ValueError, "installed|identity|changed"):
+                write_run_universe(
+                    self.shadow_root,
+                    "run-mid-syscall-swap",
+                    self.universe,
+                    self.manifest,
+                )
+
+        self.assertFalse(
+            (self.shadow_root / "runs/run-mid-syscall-swap").exists()
+        )
+
     def test_swapped_staging_directory_cannot_be_renamed_as_the_run(self):
         original = route_shadow_inputs._rename_directory_noreplace_at
 
