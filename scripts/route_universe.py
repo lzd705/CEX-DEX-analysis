@@ -41,15 +41,29 @@ def _positive_decimal(value: Any) -> Optional[Decimal]:
     return result
 
 
+def _non_negative_decimal(value: Any) -> Optional[Decimal]:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not result.is_finite() or result < 0:
+        return None
+    return result
+
+
 def _decimal_text(value: Optional[Decimal]) -> Optional[str]:
     if value is None:
         return None
+    if value == 0:
+        return "0"
     return format(value, "f")
 
 
 def _canonical_decimal_text(value: Optional[Decimal]) -> Optional[str]:
     if value is None:
         return None
+    if value == 0:
+        return "0"
     text = format(value, "f")
     if "." in text:
         text = text.rstrip("0").rstrip(".")
@@ -148,7 +162,7 @@ def _latest_current_numeric(
         if not isinstance(row, Mapping):
             continue
         market_id = _market_id(row)
-        amount = _positive_decimal(row.get(field))
+        amount = _non_negative_decimal(row.get(field))
         timestamp = row.get("observed_at")
         if market_id is None or amount is None or not _valid_timestamp(timestamp):
             continue
@@ -227,21 +241,23 @@ def _selection_key(row: Mapping[str, Any]) -> Tuple[int, Decimal, Decimal, Decim
     capability = str(inputs["execution_capability"])
     capacity = _positive_decimal(inputs["proved_execution_capacity_usd"]) or Decimal(0)
     depth = _positive_decimal(inputs["observed_100bps_depth_usd"]) or Decimal(0)
-    cex_volume = _positive_decimal(inputs["cex_selected_window_usd"]) or Decimal(0)
-    dex_volume = _positive_decimal(inputs["dex_24h_usd"]) or Decimal(0)
-    dex_tvl = _positive_decimal(inputs["dex_tvl_usd"]) or Decimal(0)
+    cex_volume = _non_negative_decimal(inputs["cex_selected_window_usd"])
+    dex_volume = _non_negative_decimal(inputs["dex_24h_usd"])
+    dex_tvl = _non_negative_decimal(inputs["dex_tvl_usd"])
     liquidity = capacity if capacity > 0 else depth
     return (
-        -_CAPABILITY_ORDER[capability], -liquidity, -cex_volume,
-        -dex_volume, -dex_tvl, str(row["market_id"]),
+        -_CAPABILITY_ORDER[capability], -liquidity,
+        -(cex_volume or Decimal(0)),
+        -(dex_volume or Decimal(0)), -(dex_tvl or Decimal(0)),
+        str(row["market_id"]),
     )
 
 
 def _reference_volume_usd(leg: Mapping[str, Any]) -> Optional[Decimal]:
     inputs = leg["selection_inputs"]
     if leg["market_type"] == "cex":
-        return _positive_decimal(inputs["cex_selected_window_usd"])
-    return _positive_decimal(inputs["dex_24h_usd"])
+        return _non_negative_decimal(inputs["cex_selected_window_usd"])
+    return _non_negative_decimal(inputs["dex_24h_usd"])
 
 
 def select_route_legs(
