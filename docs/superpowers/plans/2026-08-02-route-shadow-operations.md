@@ -236,6 +236,18 @@ by `route_cohort_id`; B remains an orphan and cannot count as a valid shadow.
 Cover hash cross-wiring, symlink/hardlink/directory-swap, run-ID traversal, and
 two concurrent publishers.
 
+For every DEX leg, also require the core's USD-price source snapshot ID,
+observed time, source, endpoint, and raw-response SHA to reproduce the exact
+allowlisted `collector_context` embedded in the selected universe leg. Context
+is source evidence, not a caller hint; a missing/extra field or lineage mismatch
+invalidates the joint publication. For an observed leg, rebuild an unordered
+address-to-price map from context `base_token_id`/`quote_token_id` and exact
+prices, then require the core's `token0_address`/`token1_address` and
+`token0_price_usd`/`token1_price_usd` to reproduce the same map. Copying source
+labels while using different price inputs must fail. Also bind context
+status/reason. Each Token ID must use the pool chain prefix and contain a
+different canonical 20-byte EVM address.
+
 Derive the universe and baseline paths exclusively from the Task 1 run-ID
 validator as `<shadow_root>/runs/<audit.run_id>/route_universe.json` and
 `baseline_manifest.json`; callers cannot supply arbitrary paths. Reject a
@@ -277,11 +289,37 @@ Add a GitHub commit comment with denominator, percentile, and failure-injection 
 - Create: `scripts/run_route_shadow.py`
 - Create: `tests/test_run_route_shadow.py`
 - Modify: `scripts/collect_route_cohort.py`
+- Modify: `scripts/route_shadow_inputs.py`
+- Modify: `scripts/route_universe.py`
+- Modify: `tests/test_route_shadow_inputs.py`
+- Modify: `tests/test_route_universe.py`
 
 **Interfaces:**
 - Produces: `run_shadow_once(data_dir: Path, now: datetime, phase: str, ...) -> dict`.
 - Produces CLI subcommands: `run` and `reconcile`.
 - Consumes Task 1 universe and Task 2 audit/pointer interfaces.
+- Produces Task 1 public helpers
+  `current_source_generation(data_dir, *, static_token_config) -> str` and
+  `load_run_input_binding(shadow_root, run_id) -> dict`.
+  `current_source_generation()` only rehashes the current ten inputs and never
+  rebuilds a universe. `load_run_input_binding()` descriptor-safely rereads and
+  fully validates the installed universe plus baseline and returns their exact
+  hashes/generation; neither helper trusts caller-computed hashes.
+- Every selected DEX leg embeds an exact-schema
+  `route_collector_context/v1` derived only from the same captured TVL row.
+  The context allows exactly `schema`, `snapshot_id`, `request_started_at`,
+  `observed_at`, `response_received_at`, `status`, `reason_code`, `pool_name`,
+  `base_token_id`, `quote_token_id`, `base_token_price_usd`,
+  `quote_token_price_usd`, `tvl_method`, `source`, `source_endpoint`, and
+  `raw_response_sha256`; it excludes `error`, paths, credentials, and unknown
+  fields. Observed context requires complete ordered timestamps, two distinct
+  parseable EVM token addresses with the pool chain prefix, two positive prices,
+  and a 64-hex source hash. Status/reason combinations exactly match the TVL
+  production contract `observed|missing|not_found|failed`; unavailable numeric
+  values serialize as JSON null, never empty string or zero. Non-observed
+  context retains its explicit lineage and can only produce a terminal
+  unavailable leg. Context is serialized inside
+  `route_universe.json` and therefore bound by its SHA.
 - The terminal ledger record owns `lock_acquired`, complete run duration, and
   the exact committed shadow-pointer SHA. It counts a valid joint publication
   only after rereading that pointer by SHA; these values are never inferred
@@ -293,6 +331,24 @@ Hold `collection/collection.lock`, run the real orchestrator with source readers
 that raise if called, and assert exit zero plus one `skipped_locked` ledger
 record and zero source calls. Assert the lock is held across universe build,
 collection, private-core publication, audit, and joint pointer publication.
+Extend `_ForkProcessExecutor`/`collect_route_cohort()` with an exact
+`child_close_fds` contract. Before a fork child invokes any collector it must
+close the inherited collection-lock descriptor. In a real process test, kill
+or close the parent while a child remains blocked and prove a third process can
+immediately acquire the collection lock; the orphan child must not retain it.
+Fix the ledger/lock order: choose and validate run ID, then attempt the
+collection lock nonblocking. A successful owner first closes older unterminal
+entries, then publishes its own `started.json`. A busy invocation atomically
+commits one run directory containing both `started.json` and
+`terminal.json(outcome=skipped_locked)` and never exposes an unterminal skipped
+run. Use barriers to prove two simultaneous invocations cannot mark each other
+unexplained. If `ExecStopPost` knows an invocation ID but no ledger exists, it
+creates bounded synthetic `unexplained` evidence for the killed-after-lock,
+before-started window. Absence cannot prove whether the lock was acquired, so
+synthetic terminal evidence uses `lock_acquired: null` with status
+`not_evaluated`; normal owners write `true`, busy invocations write `false`,
+and null blocks later gates. Test kill-before-lock and
+kill-after-lock-before-start separately without inventing a boolean.
 
 - [ ] **Step 2: Write the no-public-pointer RED test**
 
@@ -310,32 +366,88 @@ Expected: FAIL because the orchestrator does not exist.
 - [ ] **Step 4: Implement canary/full execution bounds**
 
 Canary uses the literal ten-Token allowlist, deadline 60, workers 2, per venue
-1, per chain 1. Full uses every eligible Token, workers 4, per venue/chain 1.
+1, per chain 1: `PEPE,CAKE,SHIB,SUSHI,ZK,SNX,GRT,COMP,ENS,STRK`. Full uses
+every eligible Token, workers 4, per venue/chain 1, with the same 60-second
+deadline. The CLI exposes no deadline/worker bypass. Canary fails if any of the
+ten Tokens has no route; it never silently shrinks the denominator. Scope the
+universe first, then atomically persist it. Reload it exclusively through
+`load_run_input_binding()` and use only that fully reread immutable universe
+for collection and audit; mutating the pre-write Python object must have no
+effect. Canary requires every Token to have at least one candidate route that
+contains a proved, supported constant-product-V2 DEX leg; a CEX-only or
+research-only route cannot satisfy canary coverage. Audit inventory cannot
+describe a wider full candidate set.
+
+Materialize CEX collector identity only through canonical Market ID and require
+the exchange to exist in the live order-book adapter/`REQUESTED_LEVELS` map.
+Materialize DEX identity plus the exact embedded collector context; never call
+legacy `_resolve_inventory_legs()`, `load_pool_inventory()`, or any production
+inventory loader after Task 1 capture. Patch those loaders to raise in an
+integration test and exercise a real DEX collector preflight.
+In the parent scheduler, a non-observed DEX context becomes a terminal leg with
+stable reason `usd_price_context_<status>` and retains snapshot, effective
+observed time, source, endpoint, and raw SHA. Do not submit its chain resolver,
+DEX collector, or RPC work; tests patch both resolver and collector to raise.
+
 Use dependency injection for collectors in tests, but exercise the real input,
-publication, and ledger boundaries. Rehash sources immediately before private
-publication and reject drift.
+publication, and ledger boundaries. Compare
+`current_source_generation()` at collection start, collection completion,
+immediately before private-core publication, and immediately before the joint
+pointer. Every check must equal the immutable binding's original
+`candidate_source_generation`; the first runtime rehash never becomes a new
+baseline. Drift before core rejects the run; drift after core leaves only a core
+orphan and never writes a joint pointer. The private collector executor receives
+the collection-lock FD through `child_close_fds`.
 
 - [ ] **Step 5: Implement durable ledger and reconciliation**
+
+The ledger is descriptor-relative under
+`routes/shadow/ledger/<run_id>/{started,terminal,service}.json`, never an
+append-only JSONL. Install every exact-schema canonical event with
+`O_EXCL|O_NOFOLLOW`, regular/nlink checks, file/directory `fsync`, and no
+overwrite. `started` records explicit run ID, phase, invocation ID, UTC start,
+boot ID, and `monotonic_ns`; `terminal` records exact outcome, lock-acquired,
+duration status/value, cohort ID, and committed joint-pointer SHA; `service`
+records only the normalized systemd result evidence. Runner/reconciler races
+have exactly one terminal winner; identical retries are idempotent and
+conflicting retries fail closed.
 
 Write `started` before source reads and a terminal result after completion.
 `reconcile --run-id ... --service-result ... --exit-code ... --exit-status ...`
 must atomically close a started entry as success, failed, timeout, OOM, or
 unexplained termination. A new run first closes any older unterminal entry as
-unexplained; it never silently drops it. Persist exact started/finished times,
+unexplained only after it successfully acquires the collection lock; a busy
+manual invocation must not close the still-running owner. `run` accepts an
+explicit validated run ID, otherwise uses systemd `INVOCATION_ID`, otherwise
+generates and prints one; Task 6 must pass the same ID to `ExecStopPost`.
+If explicit `--run-id` and `INVOCATION_ID` both exist they must be identical;
+manual runs serialize `invocation_id` as JSON null. Test literal systemd
+normalization: `SERVICE_RESULT=success`, `EXIT_CODE=exited`, `EXIT_STATUS=0`
+is only service-level success; `timeout` maps timeout, `oom-kill` maps OOM,
+nonzero exit/signal/core-dump/watchdog/resources map failed, and empty or
+unknown combinations produce unexplained/fail-closed evidence.
+`SERVICE_RESULT=success` alone never proves success: terminal success requires
+`load_latest_shadow_result()` to return the same run ID and exact committed
+pointer SHA produced by Task 2. Persist exact started/finished times,
 run duration, lock-acquired flag, route cohort ID, and committed shadow-pointer
 SHA when available; a core-only orphan is not a valid joint publication.
+Use monotonic duration within one boot. Reconcile without comparable boot and
+monotonic evidence writes `not_evaluated`, which fails later gates; never derive
+an SLA duration from wall clock. Normalize only literal success, timeout, OOM,
+failed, and unexplained systemd combinations; unknown values fail closed.
 
 - [ ] **Step 6: Verify GREEN and collector regressions**
 
-Run: `python3 -m unittest tests.test_run_route_shadow tests.test_route_collection -v`
+Run: `python3 -m unittest tests.test_run_route_shadow tests.test_route_collection tests.test_route_shadow_inputs tests.test_route_universe tests.test_framework -v`
 
 Expected: PASS, including generation drift, collector terminal rows, deadline,
-and lock contention.
+lock contention, fork-FD release, source-bound DEX context, ledger races, and
+Python 3.8 grammar.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add scripts/run_route_shadow.py scripts/collect_route_cohort.py tests/test_run_route_shadow.py
+git add scripts/run_route_shadow.py scripts/collect_route_cohort.py scripts/route_shadow_inputs.py scripts/route_universe.py tests/test_run_route_shadow.py tests/test_route_shadow_inputs.py tests/test_route_universe.py
 git commit -m "feat(routes): orchestrate bounded shadow cohorts"
 ```
 
