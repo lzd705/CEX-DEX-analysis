@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import http.client
 import json
 import shutil
@@ -8,6 +9,7 @@ import unittest
 from email.utils import formatdate
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from dashboard import server
 from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_SOURCES
@@ -58,6 +60,40 @@ class StaticDeliveryPolicyTest(unittest.TestCase):
 
 
 class StaticRepresentationTest(unittest.TestCase):
+    def test_process_fingerprint_is_derived_from_the_frozen_served_bundle(self):
+        # Re-reading the checkout after representations are frozen can bind
+        # version A to bytes B if a deployment replaces an asset mid-startup.
+        with tempfile.TemporaryDirectory() as directory_name:
+            static_root = Path(directory_name)
+            for served_name, source_name in PUBLIC_STATIC_ASSET_SOURCES:
+                source_path = static_root / source_name
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                source_path.write_bytes(f"frozen:{served_name}".encode("utf-8"))
+
+            with patch.object(server, "STATIC_ROOT", static_root):
+                representations = server._build_static_representations()
+                (static_root / "app.js").write_bytes(b"replacement-during-startup")
+                frozen_sha = server._compute_static_asset_sha(representations)
+                with patch.object(
+                    server, "_STATIC_REPRESENTATIONS", representations
+                ), patch.object(server, "_PROCESS_STATIC_ASSET_SHA", frozen_sha):
+                    actual_health_sha = server.static_asset_sha()
+                    served_raw_by_name = {
+                        served_name: server.static_representation(
+                            f"/{served_name}"
+                        ).raw
+                        for served_name, _source_name in PUBLIC_STATIC_ASSET_SOURCES
+                    }
+
+        digest = hashlib.sha256()
+        for served_name, _source_name in PUBLIC_STATIC_ASSET_SOURCES:
+            digest.update(served_name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(served_raw_by_name[served_name])
+            digest.update(b"\0")
+
+        self.assertEqual(actual_health_sha, digest.hexdigest())
+
     def test_public_representations_are_frozen_and_gzip_round_trips_exactly(self):
         expected_content_types = {
             "actions.css": "text/css; charset=utf-8",

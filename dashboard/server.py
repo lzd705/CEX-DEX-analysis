@@ -320,15 +320,52 @@ def _read_application_release_sha() -> str:
     return "unavailable"
 
 
-def _compute_static_asset_sha() -> str:
-    """Fingerprint the complete asset bundle reachable by a public client."""
+@dataclass(frozen=True)
+class StaticRepresentation:
+    raw: bytes
+    gzip: bytes
+    content_type: str
+    last_modified: str
 
+
+STATIC_CONTENT_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+}
+IMMUTABLE_STATIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
+def _build_static_representations() -> dict[str, StaticRepresentation]:
+    representations = {}
+    for served_name, source_name in PUBLIC_STATIC_ASSET_SOURCES:
+        source_path = STATIC_ROOT / source_name
+        with source_path.open("rb") as source:
+            raw = source.read()
+            source_stat = os.fstat(source.fileno())
+        representations[f"/{served_name}"] = StaticRepresentation(
+            raw=raw,
+            gzip=gzip.compress(raw, compresslevel=5, mtime=0),
+            content_type=STATIC_CONTENT_TYPES[source_path.suffix],
+            last_modified=formatdate(source_stat.st_mtime, usegmt=True),
+        )
+    return representations
+
+
+_STATIC_REPRESENTATIONS = _build_static_representations()
+
+
+def _compute_static_asset_sha(
+    representations: dict[str, StaticRepresentation] | None = None,
+) -> str:
+    """Fingerprint the exact frozen asset bundle served by this process."""
+
+    if representations is None:
+        representations = _build_static_representations()
     digest = hashlib.sha256()
-    for served_name, source_path in PUBLIC_STATIC_ASSET_SOURCES:
-        path = STATIC_ROOT / source_path
+    for served_name, _source_path in PUBLIC_STATIC_ASSET_SOURCES:
         digest.update(served_name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update(representations[f"/{served_name}"].raw)
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -336,7 +373,7 @@ def _compute_static_asset_sha() -> str:
 # Freeze release evidence when this Python process imports the application.
 # A later checkout update must not let an old process claim the new revision.
 _PROCESS_APPLICATION_SHA = _read_application_release_sha()
-_PROCESS_STATIC_ASSET_SHA = _compute_static_asset_sha()
+_PROCESS_STATIC_ASSET_SHA = _compute_static_asset_sha(_STATIC_REPRESENTATIONS)
 
 
 def application_release_sha() -> str:
@@ -361,38 +398,6 @@ def render_versioned_html(path: Path) -> str:
         "__ASSET_VERSION__",
         static_asset_version(),
     )
-
-
-@dataclass(frozen=True)
-class StaticRepresentation:
-    raw: bytes
-    gzip: bytes
-    content_type: str
-    last_modified: str
-
-
-STATIC_CONTENT_TYPES = {
-    ".css": "text/css; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
-}
-IMMUTABLE_STATIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
-
-
-def _build_static_representations() -> dict[str, StaticRepresentation]:
-    representations = {}
-    for served_name, source_name in PUBLIC_STATIC_ASSET_SOURCES:
-        source_path = STATIC_ROOT / source_name
-        raw = source_path.read_bytes()
-        representations[f"/{served_name}"] = StaticRepresentation(
-            raw=raw,
-            gzip=gzip.compress(raw, compresslevel=5, mtime=0),
-            content_type=STATIC_CONTENT_TYPES[source_path.suffix],
-            last_modified=formatdate(source_path.stat().st_mtime, usegmt=True),
-        )
-    return representations
-
-
-_STATIC_REPRESENTATIONS = _build_static_representations()
 
 
 def static_representation(path: str) -> StaticRepresentation | None:

@@ -2094,6 +2094,16 @@ class ReleaseAssetTests(unittest.TestCase):
             "truncated gzip": lambda body, headers: with_actual_content_length(
                 body[:-8], headers
             ),
+            "trailing gzip bytes": (
+                lambda body, headers: with_actual_content_length(
+                    body + b"\0\0", headers
+                )
+            ),
+            "concatenated gzip member": (
+                lambda body, headers: with_actual_content_length(
+                    body + gzip.compress(b"second-member"), headers
+                )
+            ),
             "wrong content length": lambda body, headers: (body, [
                 (key, str(len(body) + 1) if key == "Content-Length" else value)
                 for key, value in headers
@@ -2178,6 +2188,44 @@ class ReleaseAssetTests(unittest.TestCase):
         with patch(
             "scripts.check_dashboard_release.urlopen", side_effect=budget_urlopen
         ), self.assertRaisesRegex(ReleaseCheckError, "gzip bundle.*220000"):
+            fetch_static_asset_bundle(
+                "https://dashboard.test", version, timeout=1.0
+            )
+
+        oversized_name = STATIC_ASSET_FILENAMES[1]
+        oversized_raw = b"z" * (release_checker.MAX_STATIC_ASSET_BYTES + 1)
+
+        def oversized_urlopen(request, timeout):
+            self.assertEqual(timeout, 1.0)
+            name = request.full_url.split(
+                "https://dashboard.test/", 1
+            )[1].split("?", 1)[0]
+            raw = oversized_raw if name == oversized_name else raw_by_name[name]
+            body = gzip.compress(raw)
+            return AssetResponse(
+                body,
+                [
+                    ("Content-Encoding", "gzip"),
+                    ("Content-Length", str(len(body))),
+                    ("Cache-Control", cache_control),
+                    ("Vary", "Accept-Encoding"),
+                ],
+                request.full_url,
+            )
+
+        # The old one-shot decoder allocates the complete expansion before the
+        # limit check. Masking it makes that implementation incorrectly pass;
+        # the bounded streaming path must independently reject the expansion.
+        with patch(
+            "scripts.check_dashboard_release.urlopen",
+            side_effect=oversized_urlopen,
+        ), patch(
+            "scripts.check_dashboard_release.gzip.decompress",
+            return_value=b"tiny",
+        ), self.assertRaisesRegex(
+            ReleaseCheckError,
+            "exceeds the static asset size limit",
+        ):
             fetch_static_asset_bundle(
                 "https://dashboard.test", version, timeout=1.0
             )

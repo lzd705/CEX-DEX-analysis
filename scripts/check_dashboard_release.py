@@ -3746,6 +3746,29 @@ def validate_opportunity_api_release(
     }, metrics
 
 
+def _bounded_static_gzip_decompress(body: bytes, path: str) -> bytes:
+    """Decode one complete gzip member without expanding beyond the asset cap."""
+
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        raw = decoder.decompress(body, MAX_STATIC_ASSET_BYTES + 1)
+    except zlib.error as error:
+        raise ReleaseCheckError(
+            "{} declared invalid gzip".format(path)
+        ) from error
+    require(
+        len(raw) <= MAX_STATIC_ASSET_BYTES,
+        "{} exceeds the static asset size limit".format(path),
+    )
+    require(
+        decoder.eof
+        and not decoder.unconsumed_tail
+        and not decoder.unused_data,
+        "{} declared invalid gzip".format(path),
+    )
+    return raw
+
+
 def fetch_static_asset_bundle(
     base_url: str,
     asset_version: str,
@@ -3819,12 +3842,7 @@ def fetch_static_asset_bundle(
             vary == ["Accept-Encoding"],
             "{} Vary is not exactly Accept-Encoding".format(path),
         )
-        try:
-            raw = gzip.decompress(body) if compressed else body
-        except (gzip.BadGzipFile, EOFError, zlib.error) as error:
-            raise ReleaseCheckError(
-                "{} declared invalid gzip".format(path)
-            ) from error
+        raw = _bounded_static_gzip_decompress(body, path) if compressed else body
         require(
             len(raw) <= MAX_STATIC_ASSET_BYTES,
             "{} exceeds the static asset size limit".format(path),
