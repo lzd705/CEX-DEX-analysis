@@ -30,19 +30,38 @@
 
 **Interfaces:**
 - Produces: `SourceFileIdentity(path: str, size: int, sha256: str)`.
+- Internally captures each required source once as immutable bytes (or an
+  exact private SQLite snapshot) and makes every parser consume that capture;
+  no parser may reopen a source path after its identity was hashed.
 - Produces: `selection_window(now: datetime) -> dict[str, str]`.
-- Produces: `build_shadow_universe(data_dir: Path, now: datetime) -> tuple[dict, dict]`, returning universe and source manifest.
-- Produces: `write_run_universe(shadow_root: Path, run_id: str, universe: Mapping) -> Path`.
+- Produces: `build_shadow_universe(data_dir: Path, now: datetime, *, static_token_config: Path) -> tuple[dict, dict]`, returning universe and source manifest.
+- Produces: `write_run_universe(shadow_root: Path, run_id: str, universe: Mapping, source_manifest: Mapping) -> tuple[Path, Path]`.
 - Writes the same run-scoped source manifest as
   `routes/shadow/runs/<run_id>/baseline_manifest.json`, including calculation
   version, filters, observation bounds, input paths, sizes, and SHA-256s.
+- Requires the canonical published inputs `market_facts.sqlite3`,
+  `cex_instrument_lifecycle.json`, `admin/token_registry.json`,
+  `cex_exchange_volume_daily.csv`, `cex_depth_latest.csv`,
+  `dex_depth_latest.csv`, `cex_execution_cost_latest.csv`,
+  `dex_execution_cost_latest.csv`, and `dex_pool_tvl_latest.csv`, plus the
+  tracked `config/tokens.csv` validation authority. The runtime registry must
+  exist even when empty and use its canonical empty schema. The config
+  argument must resolve exactly to tracked `PROJECT_ROOT/config/tokens.csv`;
+  its manifest path is always the logical `config/tokens.csv`. The other nine
+  manifest paths are fixed POSIX paths relative to `MARKET_DATA_DIR`. Absolute
+  host paths are never serialized.
 
 - [ ] **Step 1: Write failing window and source-identity tests**
 
 Use a fixed `2026-08-02T13:00:00Z` clock and assert the literal window
 `{"start": "2026-07-03", "end": "2026-08-01"}`. Mutating one byte of every
 required source must change the canonical generation; missing, symlinked, or
-non-regular required sources must fail before universe construction.
+non-regular required sources must fail before universe construction. Reject a
+source whose descriptor identity changes while it is read. Changing only mtime
+must not change the byte generation. Cover month/year/leap-day windows and
+reject naive clocks. Mutate or replace every source path immediately after its
+capture and assert the universe still comes only from the captured bytes whose
+SHA is in the manifest; patch any later path reopen to fail the test.
 
 - [ ] **Step 2: Run the focused tests and verify RED**
 
@@ -54,10 +73,34 @@ Expected: FAIL because `scripts.route_shadow_inputs` does not exist.
 
 Read catalog identities from `market_facts.sqlite3` plus current lifecycle and
 runtime registry files; read CEX daily Volume, CEX/DEX Depth, CEX/DEX Execution,
-and DEX TVL/24h Volume from their published files. Aggregate CEX
-`selected_window_usd` over the exact 30-day window and pass literal rows into
-`build_route_universe()`. Hash canonical manifest entries containing relative
-path, byte size, and SHA-256; do not use mtime as identity.
+and DEX TVL/24h Volume from their published files. Verify SQLite integrity,
+schema/current-state uniqueness, and that its committed CEX source name/SHA is
+the exact daily CSV being aggregated; reject unbound WAL/journal sidecars.
+Open every required regular file through a verified descriptor and, in the
+same pass, hash and capture the exact bytes that will be parsed. Parse JSON and
+CSV from those captured bytes. Copy the exact captured SQLite bytes into a
+private bounded snapshot file and open only that copy read-only with immutable
+mode; never hash one path generation and later parse another. Recheck source
+descriptor and parent-directory identities after capture and fail closed on
+change.
+Project the production schemas into canonical adapter rows before calling
+`build_route_universe()`: construct Market IDs for Depth/TVL, map CEX
+`observed_at` and DEX `block_timestamp` to `state_observed_at`, retain the
+single aligned Depth/Execution snapshot lineage, and derive DEX 24h Volume from
+the same TVL snapshot row. Aggregate CEX `selected_window_usd` over the exact
+30 complete UTC days and bind it to the SQLite import timestamp. Volume and
+TVL accept genuine non-negative zero; missing stays null and Depth/execution
+capacity remains strictly positive. Hash canonical manifest entries containing
+relative path, byte size, and SHA-256; do not use mtime as identity or expose
+absolute production paths. Except for the single tracked
+`PROJECT_ROOT/config/tokens.csv` authority, Shadow reads only canonical files
+under `MARKET_DATA_DIR`.
+
+Before implementation, add explicit RED tests for every adapter projection,
+SQLite integrity/current-state and CSV source-SHA mismatch, WAL/journal
+presence, Depth/Execution snapshot-lineage mismatch, DEX TVL/24h Volume
+same-row binding, and the distinction between a real numeric zero and missing
+data. These contract tests must fail against the pre-Task-1 implementation.
 
 - [ ] **Step 4: Add failing atomic run-universe tests**
 
@@ -66,16 +109,22 @@ Assert the destination is exactly
 canonical JSON, and rereads to the same `route_universe_sha256()`. Reject run
 IDs containing separators, dot segments, whitespace, or non-ASCII controls.
 Assert `baseline_manifest.json` binds the same candidate generation and cannot
-be replaced independently.
+be replaced independently. Inject failure after either file write and before
+directory commit; no final run directory may become visible. Race two writers
+for the same run ID and require exactly one no-replace winner.
 
 - [ ] **Step 5: Implement exclusive immutable publication and verify GREEN**
 
-Create the run directory without following symlinks, write with
-`O_CREAT|O_EXCL`, `fsync` the file and directory, and return the final path.
+Create a hidden staging directory beneath the verified `runs` descriptor,
+write both files with `O_CREAT|O_EXCL|O_NOFOLLOW`, `fsync` both files and the
+staging directory, then atomically rename the whole directory into `<run_id>`
+with no-replace semantics and `fsync` `runs`. Never expose a one-file partial
+run. Reject symlink ancestors/members, hard-linked files, and changed directory
+identity. Return both final paths.
 
-Run: `python3 -m unittest tests.test_route_shadow_inputs tests.test_route_universe -v`
+Run: `python3 -m unittest tests.test_route_shadow_inputs tests.test_route_universe tests.test_framework -v`
 
-Expected: PASS.
+Expected: PASS, including the repository's Python 3.8 grammar gate.
 
 - [ ] **Step 6: Commit**
 
@@ -399,7 +448,17 @@ Reject mismatched source/universe/core/audit hashes, stale joint pointer,
 orphan core counted valid, unexplained ledger gaps, invalid phase widening,
 missing cgroup verification, and promotion-ready claims with any incomplete
 strict cost component. Shadow absence remains valid while the feature is not
-enabled.
+enabled. Reject a deployed Web point-file override that would make the
+dashboard read a different publication from Shadow. `MARKET_CEX_DATA` and
+`MARKET_DEX_DATA` must be unset while Shadow is enabled because either switches
+the Web reader away from the SQLite commit point to an independently mutable
+CSV path. Cover `MARKET_DATABASE`, `MARKET_TVL_DATA`,
+`MARKET_CEX_DEPTH_DATA`, `MARKET_DEX_DEPTH_DATA`,
+`MARKET_CEX_EXECUTION_COST_DATA`, and `MARKET_DEX_EXECUTION_COST_DATA`: every
+variable must be unset or resolve exactly to its canonical file beneath the
+same `MARKET_DATA_DIR`. Apply the same rule to
+`MARKET_CEX_INSTRUMENT_LIFECYCLE` and `TOKEN_REGISTRY_PATH`, resolving to
+`cex_instrument_lifecycle.json` and `admin/token_registry.json` respectively.
 
 - [ ] **Step 2: Verify RED**
 
@@ -412,7 +471,9 @@ Expected: FAIL on the new shadow release cases.
 Report exact run/leg/route numerators and denominators, phase, storage, ledger,
 and gate failures. Document canary enable, read-only observation, full-phase
 promotion, manual public promotion, rollback, timer disable, and evidence
-retention commands. Never call a running canary a public opportunity feed.
+retention commands. Validate the Web/Shadow point-file environment equivalence
+before canary enable and in release checking. Never call a running canary a
+public opportunity feed.
 
 - [ ] **Step 4: Run route and full suites**
 
