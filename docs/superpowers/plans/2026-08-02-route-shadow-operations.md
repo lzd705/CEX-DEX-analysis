@@ -144,17 +144,62 @@ Add a GitHub commit comment listing the literal window, mutation cases, and focu
 
 **Interfaces:**
 - Produces: `nearest_rank(values: Iterable[Decimal], percentile: Decimal) -> str | None`.
-- Produces: `build_shadow_audit(cohort: Mapping, *, run: Mapping, phase: str, audit_finished_at: str) -> dict`.
-- Produces: `publish_shadow_result(shadow_root: Path, *, core_pointer: Mapping, universe_path: Path, audit: Mapping) -> dict`.
+- Produces: `build_shadow_audit(cohort: Mapping, *, core_pointer: Mapping, run: Mapping, phase: str, audit_finished_at: str) -> dict`.
+- Produces: `publish_shadow_result(shadow_root: Path, *, core_pointer: Mapping, audit: Mapping) -> dict`.
 - Produces: `load_latest_shadow_result(shadow_root: Path) -> dict`.
+- Uses audit schema `route_shadow_audit/v1`. The audit contains only facts
+  knowable before joint-pointer commit: `run_id`, `phase`,
+  `route_cohort_id`, exact core pointer/manifest hashes, universe/baseline
+  hashes and candidate generation, `audit_finished_at`, leg availability, and
+  route timing/age numerators, denominators, and percentiles. Joint-pointer
+  success rate and complete run duration are later ledger/gate metrics and
+  must not be guessed as `1/1` inside a prepublication audit.
+- The audit permits exactly `schema`, `run_id`, `phase`, `route_cohort_id`,
+  `core_pointer_sha256`, `core_manifest_sha256`,
+  `route_universe_sha256`, `baseline_manifest_sha256`,
+  `candidate_source_generation`, `audit_finished_at`, and `metrics`.
+  `build_shadow_audit()` validates the supplied exact core pointer, extracts
+  its cohort/manifest identity, and hashes its canonical pointer bytes;
+  publication later proves that same pointer was the current private pointer
+  at commit time.
+- `phase` is exactly `canary` or `full`. The `run` mapping accepted by
+  `build_shadow_audit()` has exactly the required `run_id`,
+  `route_universe_sha256`, `baseline_manifest_sha256`, and
+  `candidate_source_generation` bindings; unknown or missing keys fail.
+- The joint pointer schema is exactly `route_shadow_pointer/v1` and permits no
+  keys beyond `schema`, `run_id`, `phase`, `route_cohort_id`,
+  `core_pointer_sha256`, `core_manifest_sha256`, `route_universe_sha256`,
+  `baseline_manifest_sha256`, `candidate_source_generation`, and
+  `audit_sha256`.
+- Hash domains are literal: `route_universe_sha256` is the logical canonical
+  object hash returned by `route_universe_sha256()`; core pointer, core
+  manifest, baseline manifest, and audit hashes are SHA-256 of their exact
+  installed canonical UTF-8 bytes. The returned joint-pointer SHA is SHA-256
+  of the exact canonical bytes installed at `routes/shadow/latest.json`.
+- Audit `metrics` has the exact keys `leg_availability`,
+  `timing_availability`, `conditional_skew_sla`,
+  `passing_skew_seconds_p95`, `passing_skew_seconds_max`,
+  `route_age_seconds_p95`, and `route_age_seconds_max`. Ratio metrics use only
+  `status,numerator,denominator,value`; percentile/max metrics use only
+  `status,sample_count,value`. Metric status is exactly `evaluated` or
+  `not_evaluated`.
 
 - [ ] **Step 1: Write failing literal metric tests**
 
 Cover zero, one, two, and twenty samples. Assert nearest-rank p95 uses
-`ceil(0.95*n)`, valid-core denominator is lock-acquired runs, availability is
-within/all, conditional skew is within/(within+outside), unavailable routes do
-not enter the conditional denominator, and empty denominators serialize as
+`ceil(0.95*n)`, availability is available/all legs, timing availability is
+`within/all routes`, conditional skew is `within/(within+outside)`, unavailable
+routes do not enter the conditional denominator, and empty denominators
+serialize as
 `{"status": "not_evaluated", "numerator": 0, "denominator": 0, "value": null}`.
+For displayed ratios enter an explicit local Decimal context sized for the
+input integers, quantize to 12 fractional places with `ROUND_HALF_EVEN`, strip
+trailing zeros and the trailing dot, and normalize any zero to `"0"`; later
+gates must compare the stored integer numerator/denominator, never the rounded
+display string. An empty percentile/max sample serializes as
+`{"status":"not_evaluated","sample_count":0,"value":null}`. Test `1/3`,
+`1/2`, very large integers, and altered global Decimal contexts. Reject invalid
+percentiles, non-finite values, and negative zero.
 
 - [ ] **Step 2: Verify RED**
 
@@ -164,28 +209,58 @@ Expected: FAIL because the audit module is absent.
 
 - [ ] **Step 3: Implement metrics and strict schema validation**
 
-Derive route age as `audit_finished_at - min(buy_state, sell_state)` only for
-two-leg-available routes. Preserve exact numerator/denominator integers and
-canonical decimal strings. Reject duplicate route IDs, missing leg lineage,
-future state times, unknown statuses, and negative durations.
+Treat an `observed`/`partial` leg as available when `available is not False`;
+do not require an invented literal `true`. Derive route age as
+`audit_finished_at - min(buy_state, sell_state)` for every two-leg-available
+route, including `research_only`. A research-only route may have timing status
+`unavailable`, so it contributes age but not the conditional-skew denominator.
+Only `within_sla` routes enter passing-skew percentiles; `outside_sla` and
+`unavailable` do not. Preserve exact numerator/denominator integers and
+canonical decimal strings. Reject duplicate route/leg IDs, missing lineage,
+future state times, unknown statuses, and negative durations. Derive the
+bounded venue/adapter label only from the canonical exchange or DEX component
+of Market ID; do not trust an undefined row field.
 
 - [ ] **Step 4: Add failing pointer atomicity tests**
 
-The pointer must bind `core_manifest_sha256`, `audit_sha256`,
-`route_universe_sha256`, `phase`, and `run_id`. Inject failures before audit
-write, after core publication, and during pointer replacement. The prior
-pointer must remain readable; an orphan core must not count as valid.
+The pointer must bind every exact field listed above. Assert the core,
+universe, baseline, and audit agree on route inventory, selection window,
+notional grid, candidate generation, and run/cohort identity, rather than
+merely hashing unrelated objects. Inject failures before/during/after audit
+installation, after core publication, during pointer replacement, and after
+replace during fsync/reread. The prior pointer must remain readable whenever
+the commit still owns the replacement; a concurrent third-party pointer must
+never be overwritten during rollback. Publish shadow A, then publish private
+core B without a shadow commit: the loader must still resolve immutable core A
+by `route_cohort_id`; B remains an orphan and cannot count as a valid shadow.
+Cover hash cross-wiring, symlink/hardlink/directory-swap, run-ID traversal, and
+two concurrent publishers.
+
+Derive the universe and baseline paths exclusively from the Task 1 run-ID
+validator as `<shadow_root>/runs/<audit.run_id>/route_universe.json` and
+`baseline_manifest.json`; callers cannot supply arbitrary paths. Reject a
+lexically safe file from another run/root as a cross-run binding attempt.
 
 - [ ] **Step 5: Implement joint publication and verify GREEN**
 
-Write the immutable audit under `routes/shadow/runs/<run_id>/audit.json`, fully
-reread universe/audit/core, then atomically replace only
-`routes/shadow/latest.json`. Reuse route-publication bounded-read and path
-safety rules rather than trusting caller objects.
+Install the immutable audit under
+`routes/shadow/runs/<run_id>/audit.json` through a hidden temporary file,
+`fsync`, and no-replace atomic installation; a killed writer must not leave a
+partial final audit. Fully reread and validate universe/baseline/audit plus the
+immutable `routes/core/bundles/<route_cohort_id>` while holding the core
+directory shared lock, and prove the supplied core pointer is the exact current
+private pointer at commit time. Atomically replace only
+`routes/shadow/latest.json` under the shadow-root exclusive lock. Generalize
+the complete-pointer rollback commit helper so post-replace fsync/reread
+failure restores the owned prior pointer; do not use the non-rollback
+`_atomic_replace_pointer_at`. Return the exact committed shadow-pointer SHA so
+Task 3 can persist it in the ledger. Reuse route-publication bounded-read and
+path-safety rules rather than trusting caller objects; explicitly reject
+hard-linked immutable inputs.
 
-Run: `python3 -m unittest tests.test_route_shadow_audit tests.test_route_publication -v`
+Run: `python3 -m unittest tests.test_route_shadow_audit tests.test_route_publication tests.test_framework -v`
 
-Expected: PASS.
+Expected: PASS, including Python 3.8 grammar and all A/B orphan/rollback cases.
 
 - [ ] **Step 6: Commit**
 
@@ -207,6 +282,10 @@ Add a GitHub commit comment with denominator, percentile, and failure-injection 
 - Produces: `run_shadow_once(data_dir: Path, now: datetime, phase: str, ...) -> dict`.
 - Produces CLI subcommands: `run` and `reconcile`.
 - Consumes Task 1 universe and Task 2 audit/pointer interfaces.
+- The terminal ledger record owns `lock_acquired`, complete run duration, and
+  the exact committed shadow-pointer SHA. It counts a valid joint publication
+  only after rereading that pointer by SHA; these values are never inferred
+  from the prepublication audit.
 
 - [ ] **Step 1: Write the lock-priority RED test**
 
@@ -242,7 +321,9 @@ Write `started` before source reads and a terminal result after completion.
 `reconcile --run-id ... --service-result ... --exit-code ... --exit-status ...`
 must atomically close a started entry as success, failed, timeout, OOM, or
 unexplained termination. A new run first closes any older unterminal entry as
-unexplained; it never silently drops it.
+unexplained; it never silently drops it. Persist exact started/finished times,
+run duration, lock-acquired flag, route cohort ID, and committed shadow-pointer
+SHA when available; a core-only orphan is not a valid joint publication.
 
 - [ ] **Step 6: Verify GREEN and collector regressions**
 
@@ -280,6 +361,16 @@ less than seven days/500 valid full cohorts; valid rate below 99% canary or
 passing route above 60 seconds; duration above 75/90 seconds; any lineage,
 unsafe-path, OOM, orphan, interference, unexplained-ledger, or resource-limit
 verification error; storage pressure; and any `not_evaluated` required metric.
+Compute valid-joint-pointer rate as ledger entries whose committed pointer SHA
+can be reconstructed from that run's immutable audit, universe, baseline, and
+immutable core bundle divided by lock-acquired runs. Historical verification
+never compares an old SHA to the moving `routes/shadow/latest.json`; rebuild
+the exact `route_shadow_pointer/v1` canonical bytes for each run and compare
+their SHA to its ledger entry. Compute complete run-duration percentiles/max
+from every lock-acquired terminal run, including success, failed, timeout, and
+OOM; exclude `skipped_locked`. Do not read either value from a Task 2 audit.
+Compare every ratio by integer cross multiplication, not its rounded display
+text.
 
 - [ ] **Step 2: Verify RED**
 
