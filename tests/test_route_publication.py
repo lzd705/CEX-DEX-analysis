@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import csv
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, localcontext
 import hashlib
 import json
 import os
@@ -18,7 +18,12 @@ from unittest.mock import patch
 
 from scripts.route_publication import (
     build_route_cohort_sqlite,
+    load_active_phase_state,
+    load_historical_phase_state,
     load_latest_route_cohort,
+    load_latest_shadow_result,
+    load_shadow_result,
+    publish_shadow_result,
     publish_route_cohort_bundle,
     validate_route_cohort_bundle,
 )
@@ -36,6 +41,8 @@ from scripts.route_opportunity import (
     usd_projection_evidence,
 )
 from scripts.route_quantity import CommonTarget
+from scripts.route_shadow_inputs import SourceFileIdentity, _candidate_source_generation
+from scripts.route_universe import route_universe_sha256
 from scripts.route_inventory import (
     INVENTORY_PROFILE_COLUMNS,
     classify_route_mode_evidence,
@@ -809,6 +816,13 @@ class RoutePublicationInterfaceTests(unittest.TestCase):
         self.assertTrue(callable(validate_route_cohort_bundle))
         self.assertTrue(callable(publish_route_cohort_bundle))
         self.assertTrue(callable(load_latest_route_cohort))
+
+    def test_task_two_joint_shadow_interfaces_exist(self):
+        self.assertTrue(callable(publish_shadow_result))
+        self.assertTrue(callable(load_shadow_result))
+        self.assertTrue(callable(load_latest_shadow_result))
+        self.assertTrue(callable(load_active_phase_state))
+        self.assertTrue(callable(load_historical_phase_state))
 
     def test_private_tmp_alias_normalization_is_darwin_only(self):
         with patch("scripts.route_publication.sys.platform", "linux"):
@@ -3128,6 +3142,1322 @@ class RoutePublicationFailureTests(TemporaryRouteRootTestCase):
 
         with self.assertRaisesRegex(ValueError, "file inventory"):
             validate_route_cohort_bundle(bundle)
+
+
+def _shadow_json_bytes(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _shadow_pointer_bytes(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+
+
+class JointShadowPublicationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.routes_root = Path(self.temporary.name) / "data/local/routes"
+        self.core_root = self.routes_root / "core"
+        self.shadow_root = self.routes_root / "shadow"
+        self.run_id = "shadow-run-001"
+        logical_paths = (
+            "market_facts.sqlite3",
+            "cex_instrument_lifecycle.json",
+            "admin/token_registry.json",
+            "cex_exchange_volume_daily.csv",
+            "cex_depth_latest.csv",
+            "dex_depth_latest.csv",
+            "cex_execution_cost_latest.csv",
+            "dex_execution_cost_latest.csv",
+            "dex_pool_tvl_latest.csv",
+            "config/tokens.csv",
+        )
+        self.source_identities = [
+            SourceFileIdentity(
+                path,
+                index + 1,
+                hashlib.sha256(path.encode("utf-8")).hexdigest(),
+            )
+            for index, path in enumerate(logical_paths)
+        ]
+        self.generation = _candidate_source_generation(self.source_identities)
+        self.cohort, self.core_pointer = self._publish_core(_cohort())
+        self.audit = self._write_shadow_inputs(self.run_id, self.cohort)
+
+    def _publish_core(self, cohort):
+        value = copy.deepcopy(cohort)
+        value["candidate_source_generation"] = self.generation
+        value["source_state"]["candidate_source_generation"] = self.generation
+        value["selection_window"] = {
+            "start": "2026-07-03",
+            "end": "2026-08-01",
+        }
+        for collection in (value["routes"], value["route_rows"]):
+            for row in collection:
+                row["candidate_source_generation"] = self.generation
+        value = _rehash(value)
+        pointer = publish_route_cohort_bundle(value, core_root=self.core_root)
+        return value, pointer
+
+    def _universe(self, cohort):
+        selected_legs = []
+        for rank, leg in enumerate(cohort["legs"], start=1):
+            selected_leg = {
+                "market_id": leg["market_id"],
+                "market_type": leg["market_type"],
+                "token_symbol": leg["token_symbol"],
+                "candidate_source_generation": self.generation,
+                "selection_window": copy.deepcopy(cohort["selection_window"]),
+                "selection_inputs": {
+                    "execution_capability": "proved",
+                    "proved_execution_capacity_usd": "100000",
+                    "observed_100bps_depth_usd": "100000",
+                    "cex_selected_window_usd": (
+                        ("9000" if rank == 1 else "7000")
+                        if leg["market_type"] == "cex" else None
+                    ),
+                    "dex_24h_usd": (
+                        ("9000" if rank == 1 else "7000")
+                        if leg["market_type"] == "dex" else None
+                    ),
+                    "dex_tvl_usd": (
+                        "10000" if leg["market_type"] == "dex" else None
+                    ),
+                },
+                "selection_rank": rank,
+            }
+            if "collector_context" in leg:
+                selected_leg["collector_context"] = copy.deepcopy(
+                    leg["collector_context"]
+                )
+            selected_legs.append(selected_leg)
+        return {
+            "schema": "route_universe/v1",
+            "candidate_source_generation": self.generation,
+            "selection_window": copy.deepcopy(cohort["selection_window"]),
+            "requested_notionals_usd": [1000, 5000, 10000, 50000, 100000],
+            "selected_legs": selected_legs,
+            "routes": copy.deepcopy(cohort["routes"]),
+        }
+
+    def _write_shadow_inputs(self, run_id, cohort, *, phase="canary"):
+        run_directory = self.shadow_root / "runs" / run_id
+        run_directory.mkdir(parents=True)
+        universe = self._universe(cohort)
+        universe_bytes = _shadow_json_bytes(universe)
+        universe_sha256 = route_universe_sha256(universe)
+        baseline = {
+            "schema": "route_shadow_baseline_manifest/v1",
+            "calculation_version": "route_shadow_inputs/v1",
+            "candidate_source_generation": self.generation,
+            "selection_window": copy.deepcopy(cohort["selection_window"]),
+            "filters": {
+                "window_days": 30,
+                "calendar": "complete_utc_days",
+                "cex_volume_aggregation": "sum_quote_volume_usd",
+                "maximum_legs_per_token_market_type": 3,
+            },
+            "observation_bounds": {
+                "start_inclusive": "2026-07-03T00:00:00Z",
+                "end_exclusive": "2026-08-02T00:00:00Z",
+            },
+            "inputs": [
+                {"path": row.path, "size": row.size, "sha256": row.sha256}
+                for row in self.source_identities
+            ],
+            "route_universe_sha256": universe_sha256,
+        }
+        baseline_bytes = _shadow_json_bytes(baseline)
+
+        def typed_sha(domain, value):
+            return hashlib.sha256(
+                domain + _shadow_json_bytes(value) + b"\n"
+            ).hexdigest()
+
+        adapter_registry = {
+            "schema": "route_cost_adapter_registry/v1",
+            "registry_version": "test-v1",
+            "adapters": [],
+        }
+        adapter_registry_sha256 = hashlib.sha256(
+            _shadow_json_bytes(adapter_registry)
+        ).hexdigest()
+        connector_key_registry = {
+            "schema": "route_cost_connector_key_registry/v1",
+            "registry_version": "test-v1",
+            "keys": [],
+        }
+        connector_key_registry_sha256 = hashlib.sha256(
+            _shadow_json_bytes(connector_key_registry)
+        ).hexdigest()
+        trace_identity = {
+            "schema": "route_cost_trace_profile_identity/v1",
+            "status": "missing",
+            "profile_id": None,
+            "endpoint_id": None,
+        }
+        trace_profile_generation = typed_sha(
+            b"route-cost-trace-profile-identity/v1\n", trace_identity
+        )
+        connector_identity = {
+            "schema": "route_cost_submission_connector_identity/v1",
+            "status": "missing",
+            "profile_id": None,
+            "connector_id": None,
+        }
+        submission_connector_profile_generation = typed_sha(
+            b"route-cost-submission-connector-identity/v1\n",
+            connector_identity,
+        )
+        selected_markets = []
+        for leg in sorted(
+            (
+                row for row in universe["selected_legs"]
+                if row["market_type"] == "dex"
+            ),
+            key=lambda row: row["market_id"],
+        ):
+            route_volumes = [
+                Decimal(route["route_volume_usd"])
+                for route in universe["routes"]
+                if leg["market_id"] in {
+                    route["buy_market_id"], route["sell_market_id"]
+                }
+                and route.get("route_volume_usd") is not None
+            ]
+            selected_markets.append({
+                "market_id": leg["market_id"],
+                "token_rank": 1,
+                "selection_rank": leg["selection_rank"],
+                "best_route_volume_usd": (
+                    format(max(route_volumes), "f") if route_volumes else None
+                ),
+                "dex_24h_usd": leg["selection_inputs"]["dex_24h_usd"],
+                "dex_tvl_usd": leg["selection_inputs"]["dex_tvl_usd"],
+                "adapter_id": "uniswap-v2-router02-ethereum",
+                "structural_support_status": "unsupported",
+                "structural_reason": "strict_cost_adapter_unsupported",
+            })
+        transcripts = [
+            {
+                "market_id": market["market_id"],
+                "direction": direction,
+                "requested_notional_usd": str(notional),
+                "status": "unavailable",
+                "reason_code": "strict_cost_adapter_unsupported",
+            }
+            for market in selected_markets
+            for direction in ("buy", "sell")
+            for notional in universe["requested_notionals_usd"]
+        ]
+        selected_market_set_sha256 = hashlib.sha256(_shadow_json_bytes({
+            "schema": "route_cost_selected_markets/v1",
+            "members": selected_markets,
+        })).hexdigest()
+        empty_member_set_sha256 = typed_sha(
+            b"route-cost-submission-policy-member-set/v1\n", []
+        )
+        submission_policy_snapshot = {
+            "schema": "route_cost_submission_policy_snapshot/v1",
+            "run_id": run_id,
+            "route_cohort_id": cohort["route_cohort_id"],
+            "candidate_source_generation": self.generation,
+            "route_universe_sha256": universe_sha256,
+            "adapter_registry_sha256": adapter_registry_sha256,
+            "selected_market_set_sha256": selected_market_set_sha256,
+            "connector_key_registry_sha256": connector_key_registry_sha256,
+            "trace_profile_generation": trace_profile_generation,
+            "submission_connector_profile_generation": (
+                submission_connector_profile_generation
+            ),
+            "connector_id": None,
+            "member_count": 0,
+            "members": [],
+            "member_set_sha256": empty_member_set_sha256,
+            "status": "not_applicable",
+            "reason_code": "scope_empty",
+            "observed_at": None,
+            "valid_until": None,
+            "issuer_key_id": None,
+            "signature_algorithm": None,
+            "attested_payload_sha256": None,
+            "signature": None,
+        }
+        cost_evidence = {
+            "schema": "route_cost_evidence_manifest/v1",
+            "run_id": run_id,
+            "route_cohort_id": cohort["route_cohort_id"],
+            "phase": phase,
+            "candidate_source_generation": self.generation,
+            "route_universe_sha256": universe_sha256,
+            "adapter_registry": adapter_registry,
+            "adapter_registry_sha256": adapter_registry_sha256,
+            "connector_key_registry": connector_key_registry,
+            "connector_key_registry_sha256": connector_key_registry_sha256,
+            "transcript_count": len(transcripts),
+            "trace_profile_generation": trace_profile_generation,
+            "submission_connector_profile_generation": (
+                submission_connector_profile_generation
+            ),
+            "evaluated_at": "2026-08-01T12:00:03Z",
+            "selected_market_count": len(selected_markets),
+            "selected_markets": selected_markets,
+            "selected_market_set_sha256": selected_market_set_sha256,
+            "native_price_evidence": None,
+            "native_price_evidence_sha256": None,
+            "chain_evidence_count": 0,
+            "chain_evidence": [],
+            "chain_evidence_set_sha256": typed_sha(
+                b"route-cost-chain-evidence-set/v1\n", []
+            ),
+            "market_evidence_count": 0,
+            "market_evidence": [],
+            "market_evidence_set_sha256": typed_sha(
+                b"route-cost-market-evidence-set/v1\n", []
+            ),
+            "transcripts": transcripts,
+            "transcript_set_sha256": typed_sha(
+                b"route-cost-evidence-transcript-set/v1\n", transcripts
+            ),
+            "binding_count": 0,
+            "bindings": [],
+            "binding_set_sha256": typed_sha(
+                b"route-cost-evidence-binding-set/v1\n", []
+            ),
+            "submission_policy_snapshot": submission_policy_snapshot,
+            "submission_policy_snapshot_sha256": typed_sha(
+                b"route-cost-submission-policy-snapshot/v1\n",
+                submission_policy_snapshot,
+            ),
+            "counts": {
+                "transcript_observed": 0,
+                "transcript_unavailable": len(transcripts),
+                "transcript_failed": 0,
+                "binding_observed": 0,
+                "binding_unavailable": 0,
+                "binding_failed": 0,
+            },
+        }
+        cost_bytes = _shadow_json_bytes(cost_evidence)
+        (run_directory / "route_universe.json").write_bytes(universe_bytes)
+        (run_directory / "baseline_manifest.json").write_bytes(baseline_bytes)
+        (run_directory / "route-cost-evidence.json").write_bytes(cost_bytes)
+        core_pointer_sha256 = hashlib.sha256(
+            _shadow_pointer_bytes(self.core_pointer)
+        ).hexdigest()
+        phase_state_sha256 = hashlib.sha256(
+            b"route-shadow-phase/implicit-canary/v1\n"
+        ).hexdigest()
+        return {
+            "schema": "route_shadow_audit/v1",
+            "run_id": run_id,
+            "phase": phase,
+            "route_cohort_id": cohort["route_cohort_id"],
+            "phase_state_sha256": phase_state_sha256,
+            "phase_transition_id": None,
+            "core_pointer_sha256": core_pointer_sha256,
+            "core_manifest_sha256": self.core_pointer["manifest_sha256"],
+            "route_cost_evidence_sha256": hashlib.sha256(cost_bytes).hexdigest(),
+            "route_universe_sha256": universe_sha256,
+            "baseline_manifest_sha256": hashlib.sha256(baseline_bytes).hexdigest(),
+            "candidate_source_generation": self.generation,
+            "audit_finished_at": "2026-08-01T12:00:04Z",
+            "metrics": {
+                "leg_availability": {
+                    "status": "evaluated", "numerator": 2,
+                    "denominator": 2, "value": "1",
+                },
+                "timing_availability": {
+                    "status": "evaluated", "numerator": 2,
+                    "denominator": 2, "value": "1",
+                },
+                "conditional_skew_sla": {
+                    "status": "evaluated", "numerator": 2,
+                    "denominator": 2, "value": "1",
+                },
+                "passing_skew_seconds_p95": {
+                    "status": "evaluated", "sample_count": 2, "value": "1",
+                },
+                "passing_skew_seconds_max": {
+                    "status": "evaluated", "sample_count": 2, "value": "1",
+                },
+                "route_age_seconds_p95": {
+                    "status": "evaluated", "sample_count": 2, "value": "3",
+                },
+                "route_age_seconds_max": {
+                    "status": "evaluated", "sample_count": 2, "value": "3",
+                },
+            },
+        }
+
+    def _publish(self):
+        return publish_shadow_result(
+            self.shadow_root,
+            core_pointer=self.core_pointer,
+            audit=self.audit,
+        )
+
+    def _install_full_phase(self):
+        gates = self.shadow_root / "gates"
+        transitions = self.shadow_root / "transitions"
+        gates.mkdir()
+        transitions.mkdir()
+        gate_bytes = _shadow_json_bytes({
+            "schema": "route_shadow_gate/v1",
+            "phase": "canary",
+            "blocking_reasons": [],
+        })
+        gate_sha256 = hashlib.sha256(gate_bytes).hexdigest()
+        (gates / (gate_sha256 + ".json")).write_bytes(gate_bytes)
+        fields = {
+            "schema": "route_shadow_phase/v1",
+            "prior_phase": "canary",
+            "phase": "full",
+            "evaluated_at": "2026-08-02T00:00:00Z",
+            "gate_evidence_sha256": gate_sha256,
+            "storage_admission_sha256": "1" * 64,
+            "anchored_joint_pointer_sha256": "2" * 64,
+            "primary_schedule_guard_sha256": "3" * 64,
+            "schedule_envelope_sha256": None,
+            "phase_identity_id": "4" * 64,
+        }
+        transition_id = hashlib.sha256(_shadow_json_bytes(fields)).hexdigest()
+        state = {**fields, "transition_id": transition_id}
+        state_bytes = _shadow_json_bytes(state)
+        (transitions / (transition_id + ".json")).write_bytes(state_bytes)
+        (self.shadow_root / "phase.json").write_bytes(state_bytes)
+        return state, state_bytes
+
+    def _dex_context_fixture(self, status="observed"):
+        first = "0x" + "11" * 20
+        second = "0x" + "22" * 20
+        observed = status == "observed"
+        reason_by_status = {
+            "observed": "observed",
+            "missing": "source_no_tvl_observation",
+            "not_found": "source_pool_not_found",
+            "failed": "source_unavailable",
+        }
+        context = {
+            "schema": "route_collector_context/v1",
+            "snapshot_id": "tvl-snapshot-1",
+            "request_started_at": "2026-08-01T11:59:58Z",
+            "observed_at": "2026-08-01T11:59:59Z",
+            "response_received_at": "2026-08-01T12:00:00Z",
+            "status": status,
+            "reason_code": reason_by_status[status],
+            "pool_name": "UNI / USDC",
+            "base_token_id": "eth_" + first if observed else None,
+            "quote_token_id": "eth_" + second if observed else None,
+            "base_token_price_usd": "7" if observed else None,
+            "quote_token_price_usd": "1" if observed else None,
+            "tvl_method": "reserve_value",
+            "source": "geckoterminal",
+            "source_endpoint": "https://api.example.test/pools",
+            "raw_response_sha256": "d" * 64,
+        }
+        universe = {
+            "selected_legs": [{
+                "market_id": "dex:eth:uniswap:0xaaa:UNI",
+                "collector_context": context,
+            }],
+        }
+        core_leg = {
+            "market_id": "dex:eth:uniswap:0xaaa:UNI",
+            "market_type": "dex",
+            "collector_context": copy.deepcopy(context),
+            "available": True if observed else False,
+            "reason_code": None if observed else "usd_price_context_" + status,
+            "usd_price_source_snapshot_id": context["snapshot_id"],
+            "usd_price_observed_at": context["observed_at"],
+            "usd_price_source": context["source"],
+            "usd_price_source_endpoint": context["source_endpoint"],
+            "usd_price_raw_response_sha256": context["raw_response_sha256"],
+            "token0_address": second,
+            "token1_address": first,
+            "token0_price_usd": "1" if observed else None,
+            "token1_price_usd": "7" if observed else None,
+        }
+        return universe, core_leg
+
+    def test_publish_and_all_loaders_return_only_the_exact_joint_view(self):
+        published = self._publish()
+
+        self.assertEqual(set(published), {
+            "pointer", "pointer_sha256", "audit", "audit_sha256",
+            "cohort", "manifest",
+        })
+        self.assertEqual(set(published["pointer"]), {
+            "schema", "run_id", "phase", "route_cohort_id",
+            "phase_state_sha256", "phase_transition_id",
+            "core_pointer_sha256", "core_manifest_sha256",
+            "route_universe_sha256", "route_cost_evidence_sha256",
+            "baseline_manifest_sha256", "candidate_source_generation",
+            "audit_sha256",
+        })
+        pointer_bytes = (self.shadow_root / "latest.json").read_bytes()
+        self.assertEqual(pointer_bytes, _shadow_pointer_bytes(published["pointer"]))
+        self.assertEqual(
+            published["pointer_sha256"], hashlib.sha256(pointer_bytes).hexdigest()
+        )
+        self.assertEqual(
+            load_shadow_result(
+                self.shadow_root,
+                run_id=self.run_id,
+                expected_pointer_sha256=published["pointer_sha256"],
+            ),
+            published,
+        )
+        self.assertEqual(load_latest_shadow_result(self.shadow_root), published)
+
+    def test_historical_canary_remains_readable_after_full_transition(self):
+        published = self._publish()
+        state, state_bytes = self._install_full_phase()
+
+        active = load_active_phase_state(self.shadow_root)
+        self.assertEqual(active, {
+            "phase": "full",
+            "phase_state_sha256": hashlib.sha256(state_bytes).hexdigest(),
+            "phase_transition_id": state["transition_id"],
+            "state": state,
+        })
+        historical = load_historical_phase_state(
+            self.shadow_root,
+            phase="canary",
+            phase_state_sha256=published["pointer"]["phase_state_sha256"],
+            phase_transition_id=None,
+        )
+        self.assertEqual(historical["phase"], "canary")
+        self.assertIsNone(historical["state"])
+        self.assertEqual(load_latest_shadow_result(self.shadow_root), published)
+
+    def test_full_phase_rejects_noncanonical_state_and_mutated_gate(self):
+        state, _state_bytes = self._install_full_phase()
+        (self.shadow_root / "phase.json").write_bytes(
+            json.dumps(state, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        )
+        with self.assertRaisesRegex(ValueError, "canonical|phase-state"):
+            load_active_phase_state(self.shadow_root)
+
+    def test_full_phase_gate_hash_is_replayed_from_immutable_bytes(self):
+        state, state_bytes = self._install_full_phase()
+        gate_path = self.shadow_root / "gates" / (
+            state["gate_evidence_sha256"] + ".json"
+        )
+        gate_path.write_bytes(_shadow_json_bytes({
+            "schema": "route_shadow_gate/v1",
+            "phase": "canary",
+            "blocking_reasons": ["changed"],
+        }))
+
+        with self.assertRaisesRegex(ValueError, "gate.*hash"):
+            load_historical_phase_state(
+                self.shadow_root,
+                phase="full",
+                phase_state_sha256=hashlib.sha256(state_bytes).hexdigest(),
+                phase_transition_id=state["transition_id"],
+            )
+
+    def test_full_phase_transition_replacement_during_gate_read_fails(self):
+        state, state_bytes = self._install_full_phase()
+        transition_path = self.shadow_root / "transitions" / (
+            state["transition_id"] + ".json"
+        )
+        real_read = route_publication._read_canonical_object_at
+        replaced = {"done": False}
+
+        def replace_transition_after_gate(directory_fd, filename, **kwargs):
+            result = real_read(directory_fd, filename, **kwargs)
+            if kwargs.get("label") == "route shadow gate evidence" and not replaced[
+                "done"
+            ]:
+                temporary = transition_path.with_name(".transition-replacement")
+                temporary.write_bytes(state_bytes)
+                os.replace(temporary, transition_path)
+                replaced["done"] = True
+            return result
+
+        with patch.object(
+            route_publication,
+            "_read_canonical_object_at",
+            side_effect=replace_transition_after_gate,
+        ):
+            with self.assertRaisesRegex(ValueError, "transition changed"):
+                load_historical_phase_state(
+                    self.shadow_root,
+                    phase="full",
+                    phase_state_sha256=hashlib.sha256(state_bytes).hexdigest(),
+                    phase_transition_id=state["transition_id"],
+                )
+
+    def test_active_phase_absence_is_rechecked_before_return(self):
+        original = route_publication._optional_regular_snapshot_at
+        calls = {"phase": 0}
+
+        def appear_after_absent(directory_fd, filename, **kwargs):
+            result = original(directory_fd, filename, **kwargs)
+            if filename == "phase.json":
+                calls["phase"] += 1
+                if calls["phase"] == 1 and result is None:
+                    (self.shadow_root / "phase.json").write_bytes(b"{}")
+            return result
+
+        with patch.object(
+            route_publication,
+            "_optional_regular_snapshot_at",
+            side_effect=appear_after_absent,
+        ):
+            with self.assertRaisesRegex(ValueError, "phase changed"):
+                load_active_phase_state(self.shadow_root)
+
+    def test_phase_absence_aba_before_commit_fails_closed(self):
+        real_install = route_publication._install_immutable_audit_at
+
+        def install_then_appear_and_delete(run_fd, run_path, audit_bytes):
+            real_install(run_fd, run_path, audit_bytes)
+            self._install_full_phase()
+            (self.shadow_root / "phase.json").unlink()
+
+        with patch.object(
+            route_publication,
+            "_install_immutable_audit_at",
+            side_effect=install_then_appear_and_delete,
+        ):
+            with self.assertRaisesRegex(ValueError, "phase|shadow root.*changed"):
+                self._publish()
+
+        self.assertFalse((self.shadow_root / "latest.json").exists())
+
+    def test_dex_context_replays_unordered_address_price_map(self):
+        universe, core_leg = self._dex_context_fixture()
+
+        route_publication._validate_dex_collector_contexts(
+            universe, [core_leg]
+        )
+
+        core_leg["token0_price_usd"] = "2"
+        with self.assertRaisesRegex(ValueError, "address-price map"):
+            route_publication._validate_dex_collector_contexts(
+                universe, [core_leg]
+            )
+
+    def test_observed_dex_context_is_bound_through_joint_publication(self):
+        dex_cohort = _dex_cohort()
+        _universe, context_leg = self._dex_context_fixture()
+        for leg in dex_cohort["legs"]:
+            context = copy.deepcopy(context_leg["collector_context"])
+            leg.update({
+                "collector_context": context,
+                "usd_price_source_snapshot_id": context["snapshot_id"],
+                "usd_price_observed_at": context["observed_at"],
+                "usd_price_source": context["source"],
+                "usd_price_source_endpoint": context["source_endpoint"],
+                "usd_price_raw_response_sha256": context[
+                    "raw_response_sha256"
+                ],
+                "token0_address": context_leg["token0_address"],
+                "token1_address": context_leg["token1_address"],
+                "token0_price_usd": context_leg["token0_price_usd"],
+                "token1_price_usd": context_leg["token1_price_usd"],
+            })
+        dex_cohort = _rehash(dex_cohort)
+        self.cohort, self.core_pointer = self._publish_core(dex_cohort)
+        self.run_id = "shadow-run-dex"
+        self.audit = self._write_shadow_inputs(self.run_id, self.cohort)
+
+        published = self._publish()
+
+        self.assertEqual(
+            published["cohort"]["route_cohort_id"],
+            self.cohort["route_cohort_id"],
+        )
+
+    def test_dex_context_exact_schema_token_ids_and_unavailable_matrix(self):
+        for status in ("missing", "not_found", "failed"):
+            with self.subTest(status=status):
+                universe, core_leg = self._dex_context_fixture(status)
+                route_publication._validate_dex_collector_contexts(
+                    universe, [core_leg]
+                )
+                universe["selected_legs"][0]["collector_context"][
+                    "base_token_price_usd"
+                ] = "7"
+                core_leg["collector_context"]["base_token_price_usd"] = "7"
+                with self.assertRaisesRegex(ValueError, "unavailable"):
+                    route_publication._validate_dex_collector_contexts(
+                        universe, [core_leg]
+                    )
+
+        universe, core_leg = self._dex_context_fixture()
+        context = universe["selected_legs"][0]["collector_context"]
+        context["quote_token_id"] = context["base_token_id"]
+        core_leg["collector_context"]["quote_token_id"] = context[
+            "base_token_id"
+        ]
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            route_publication._validate_dex_collector_contexts(
+                universe, [core_leg]
+            )
+
+        universe, core_leg = self._dex_context_fixture()
+        universe["selected_legs"][0]["collector_context"]["extra"] = True
+        core_leg["collector_context"]["extra"] = True
+        with self.assertRaisesRegex(ValueError, "context lineage"):
+            route_publication._validate_dex_collector_contexts(
+                universe, [core_leg]
+            )
+
+        universe, core_leg = self._dex_context_fixture("failed")
+        universe["selected_legs"][0]["collector_context"][
+            "reason_code"
+        ] = "made_up_failure"
+        core_leg["collector_context"]["reason_code"] = "made_up_failure"
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            route_publication._validate_dex_collector_contexts(
+                universe, [core_leg]
+            )
+
+    def test_loader_pins_core_a_when_a_new_private_core_is_orphaned(self):
+        published = self._publish()
+        second = _second_cohort()
+        self._publish_core(second)
+
+        loaded = load_latest_shadow_result(self.shadow_root)
+
+        self.assertEqual(loaded["pointer_sha256"], published["pointer_sha256"])
+        self.assertEqual(loaded["cohort"]["route_cohort_id"], self.cohort["route_cohort_id"])
+
+    def test_publish_rejects_a_supplied_core_pointer_that_is_no_longer_current(self):
+        old_pointer = copy.deepcopy(self.core_pointer)
+        self._publish_core(_second_cohort())
+
+        with self.assertRaisesRegex(ValueError, "core.*current|core.*changed"):
+            publish_shadow_result(
+                self.shadow_root,
+                core_pointer=old_pointer,
+                audit=self.audit,
+            )
+        self.assertFalse((self.shadow_root / "latest.json").exists())
+
+    def test_structurally_valid_but_forged_metrics_are_rebuilt_from_core(self):
+        self.audit["metrics"]["route_age_seconds_p95"]["value"] = "2"
+        self.audit["metrics"]["route_age_seconds_max"]["value"] = "2"
+
+        with self.assertRaisesRegex(ValueError, "audit.*metrics|rebuilt"):
+            self._publish()
+
+        self.assertFalse((self.shadow_root / "latest.json").exists())
+
+    def test_universe_selection_inputs_rank_and_window_are_exact(self):
+        mutations = (
+            ("extra input", lambda value: value["selected_legs"][0][
+                "selection_inputs"
+            ].__setitem__("extra", "1")),
+            ("rank gap", lambda value: value["selected_legs"][1].__setitem__(
+                "selection_rank", 3
+            )),
+            ("wrong market inputs", lambda value: value["selected_legs"][0][
+                "selection_inputs"
+            ].__setitem__("dex_tvl_usd", "1")),
+            ("negative zero", lambda value: value["selected_legs"][0][
+                "selection_inputs"
+            ].__setitem__("cex_selected_window_usd", "-0")),
+            ("extreme exponent", lambda value: value["selected_legs"][0][
+                "selection_inputs"
+            ].__setitem__("cex_selected_window_usd", "1e999999999")),
+            ("rank comparator", lambda value: value["selected_legs"][0][
+                "selection_inputs"
+            ].__setitem__("cex_selected_window_usd", "1")),
+            ("short window", lambda value: value["selection_window"].__setitem__(
+                "start", "2026-07-04"
+            )),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                universe = self._universe(self.cohort)
+                mutate(universe)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "universe.*(input|rank|window|contract|leg|volume|invalid)",
+                ):
+                    route_publication._validate_route_universe_payload(universe)
+
+        universe = self._universe(self.cohort)
+        universe["selected_legs"][0]["collector_context"] = {
+            "password": "secret",
+            "path": "/tmp/outside",
+        }
+        with self.assertRaisesRegex(ValueError, "leg schema"):
+            route_publication._validate_route_universe_payload(universe)
+
+        universe = self._universe(self.cohort)
+        universe["selected_legs"][0]["selection_inputs"][
+            "cex_selected_window_usd"
+        ] = "123456780"
+        universe["selected_legs"][1]["selection_inputs"][
+            "cex_selected_window_usd"
+        ] = "123456789"
+        with localcontext() as context:
+            context.prec = 2
+            with self.assertRaisesRegex(ValueError, "selection ranks"):
+                route_publication._validate_route_universe_payload(universe)
+
+    def test_cost_evidence_rejects_unknown_fields_on_publish_and_load(self):
+        run_directory = self.shadow_root / "runs" / self.run_id
+        cost_path = run_directory / "route-cost-evidence.json"
+        cost = json.loads(cost_path.read_text(encoding="utf-8"))
+        cost["unrelated_routes"] = ["route-from-another-run"]
+        cost_bytes = _shadow_json_bytes(cost)
+        cost_path.write_bytes(cost_bytes)
+        self.audit["route_cost_evidence_sha256"] = hashlib.sha256(
+            cost_bytes
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "route-cost evidence schema"):
+            self._publish()
+
+        self.run_id = "shadow-run-002"
+        self.audit = self._write_shadow_inputs(self.run_id, self.cohort)
+        run_directory = self.shadow_root / "runs" / self.run_id
+        cost_path = run_directory / "route-cost-evidence.json"
+        cost = json.loads(cost_path.read_text(encoding="utf-8"))
+        cost_bytes = _shadow_json_bytes(cost)
+        cost_path.write_bytes(cost_bytes)
+        self.audit["route_cost_evidence_sha256"] = hashlib.sha256(
+            cost_bytes
+        ).hexdigest()
+        published = self._publish()
+
+        cost["unrelated_notionals"] = [999]
+        corrupt_cost_bytes = _shadow_json_bytes(cost)
+        cost_path.write_bytes(corrupt_cost_bytes)
+        audit_path = run_directory / "audit.json"
+        corrupt_audit = copy.deepcopy(published["audit"])
+        corrupt_audit["route_cost_evidence_sha256"] = hashlib.sha256(
+            corrupt_cost_bytes
+        ).hexdigest()
+        corrupt_audit_bytes = _shadow_json_bytes(corrupt_audit)
+        audit_path.write_bytes(corrupt_audit_bytes)
+        corrupt_pointer = copy.deepcopy(published["pointer"])
+        corrupt_pointer["route_cost_evidence_sha256"] = corrupt_audit[
+            "route_cost_evidence_sha256"
+        ]
+        corrupt_pointer["audit_sha256"] = hashlib.sha256(
+            corrupt_audit_bytes
+        ).hexdigest()
+        corrupt_pointer_bytes = _shadow_pointer_bytes(corrupt_pointer)
+        (self.shadow_root / "latest.json").write_bytes(corrupt_pointer_bytes)
+
+        with self.assertRaisesRegex(ValueError, "route-cost evidence schema"):
+            load_shadow_result(
+                self.shadow_root,
+                run_id=self.run_id,
+                expected_pointer_sha256=hashlib.sha256(
+                    corrupt_pointer_bytes
+                ).hexdigest(),
+            )
+
+    def test_cost_evidence_requires_full_v1_shape_counts_and_hashes(self):
+        run_directory = self.shadow_root / "runs" / self.run_id
+        cost = json.loads(
+            (run_directory / "route-cost-evidence.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        universe = self._universe(self.cohort)
+        universe_sha256 = route_universe_sha256(universe)
+
+        def validate(value):
+            route_publication._validate_cost_evidence_outer_lineage(
+                value,
+                run_id=self.run_id,
+                route_cohort_id=self.cohort["route_cohort_id"],
+                phase="canary",
+                candidate_source_generation=self.generation,
+                route_universe_sha256_value=universe_sha256,
+                universe=universe,
+            )
+
+        validate(cost)
+        common_fields = {
+            "schema", "run_id", "route_cohort_id", "phase",
+            "candidate_source_generation", "route_universe_sha256",
+        }
+        mutations = (
+            (
+                "bootstrap six",
+                {key: value for key, value in cost.items() if key in common_fields},
+                "schema",
+            ),
+            (
+                "partial full",
+                {key: value for key, value in cost.items() if key != "counts"},
+                "schema",
+            ),
+            (
+                "set hash",
+                {**cost, "transcript_set_sha256": "f" * 64},
+                "hash mismatch",
+            ),
+            (
+                "count",
+                {**cost, "transcript_count": 1},
+                "count differs|scope",
+            ),
+            (
+                "profile generation",
+                {**cost, "trace_profile_generation": "not-a-sha"},
+                "generation.*invalid",
+            ),
+        )
+        for label, value, message in mutations:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate(value)
+
+    def test_cost_evidence_cannot_shrink_dex_scope_or_forge_empty_bindings(self):
+        dex_cohort = _dex_cohort()
+        run_id = "shadow-run-dex-cost"
+        self._write_shadow_inputs(run_id, dex_cohort)
+        run_directory = self.shadow_root / "runs" / run_id
+        cost = json.loads(
+            (run_directory / "route-cost-evidence.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        universe = self._universe(dex_cohort)
+        universe_sha256 = route_universe_sha256(universe)
+
+        def validate(value):
+            route_publication._validate_cost_evidence_outer_lineage(
+                value,
+                run_id=run_id,
+                route_cohort_id=dex_cohort["route_cohort_id"],
+                phase="canary",
+                candidate_source_generation=self.generation,
+                route_universe_sha256_value=universe_sha256,
+                universe=universe,
+            )
+
+        validate(cost)
+        empty = copy.deepcopy(cost)
+        empty["selected_markets"] = []
+        empty["selected_market_count"] = 0
+        with self.assertRaisesRegex(ValueError, "selected scope"):
+            validate(empty)
+
+        subset = copy.deepcopy(cost)
+        subset["selected_markets"] = subset["selected_markets"][:1]
+        subset["selected_market_count"] = 1
+        with self.assertRaisesRegex(ValueError, "selected scope"):
+            validate(subset)
+
+        def typed_sha(domain, value):
+            return hashlib.sha256(
+                domain + _shadow_json_bytes(value) + b"\n"
+            ).hexdigest()
+
+        fake_binding = copy.deepcopy(cost)
+        fake_binding["binding_count"] = 1
+        fake_binding["bindings"] = [{"status": "observed"}]
+        fake_binding["binding_set_sha256"] = typed_sha(
+            b"route-cost-evidence-binding-set/v1\n",
+            fake_binding["bindings"],
+        )
+        fake_binding["counts"]["binding_observed"] = 1
+        with self.assertRaisesRegex(ValueError, "empty selected scope|empty policy"):
+            validate(fake_binding)
+
+        arbitrary_transcripts = copy.deepcopy(cost)
+        arbitrary_transcripts["transcripts"] = [
+            {"status": "unavailable"}
+            for _row in arbitrary_transcripts["transcripts"]
+        ]
+        arbitrary_transcripts["transcript_set_sha256"] = typed_sha(
+            b"route-cost-evidence-transcript-set/v1\n",
+            arbitrary_transcripts["transcripts"],
+        )
+        with self.assertRaisesRegex(ValueError, "transcript scope"):
+            validate(arbitrary_transcripts)
+
+        observed_unsupported = copy.deepcopy(cost)
+        observed_unsupported["transcripts"][0]["status"] = "observed"
+        observed_unsupported["transcripts"][0]["reason_code"] = None
+        observed_unsupported["transcript_set_sha256"] = typed_sha(
+            b"route-cost-evidence-transcript-set/v1\n",
+            observed_unsupported["transcripts"],
+        )
+        observed_unsupported["counts"]["transcript_unavailable"] -= 1
+        observed_unsupported["counts"]["transcript_observed"] += 1
+        with self.assertRaisesRegex(ValueError, "unsupported-market transcript"):
+            validate(observed_unsupported)
+
+        mixed = copy.deepcopy(cost)
+        mixed["selected_markets"][0]["structural_support_status"] = "supported"
+        mixed["selected_markets"][0]["structural_reason"] = None
+        mixed["selected_market_set_sha256"] = hashlib.sha256(
+            _shadow_json_bytes({
+                "schema": "route_cost_selected_markets/v1",
+                "members": mixed["selected_markets"],
+            })
+        ).hexdigest()
+        mixed["submission_policy_snapshot"][
+            "selected_market_set_sha256"
+        ] = mixed["selected_market_set_sha256"]
+        mixed["submission_policy_snapshot_sha256"] = typed_sha(
+            b"route-cost-submission-policy-snapshot/v1\n",
+            mixed["submission_policy_snapshot"],
+        )
+        unsupported_id = mixed["selected_markets"][1]["market_id"]
+        mixed_transcript = next(
+            row for row in mixed["transcripts"]
+            if row["market_id"] == unsupported_id
+        )
+        mixed_transcript["status"] = "observed"
+        mixed_transcript["reason_code"] = None
+        mixed["transcript_set_sha256"] = typed_sha(
+            b"route-cost-evidence-transcript-set/v1\n",
+            mixed["transcripts"],
+        )
+        mixed["counts"]["transcript_unavailable"] -= 1
+        mixed["counts"]["transcript_observed"] += 1
+        with self.assertRaisesRegex(ValueError, "unsupported-market transcript"):
+            validate(mixed)
+
+    def test_post_replace_failure_rolls_back_only_an_owned_pointer(self):
+        real_fsync = route_publication._fsync_directory
+
+        def fail_after_replace(path, *, directory_fd=None):
+            actual_root = Path(path)
+            if actual_root.name == "shadow" and (
+                actual_root / "latest.json"
+            ).exists():
+                raise OSError("injected shadow fsync failure")
+            return real_fsync(path, directory_fd=directory_fd)
+
+        with patch.object(
+            route_publication, "_fsync_directory", side_effect=fail_after_replace
+        ):
+            with self.assertRaisesRegex(Exception, "fsync|uncertain"):
+                self._publish()
+
+        self.assertFalse((self.shadow_root / "latest.json").exists())
+        self.assertFalse(any(
+            path.name.startswith(".latest.")
+            for path in self.shadow_root.iterdir()
+        ))
+
+    def test_post_replace_failure_restores_the_exact_prior_pointer(self):
+        first = self._publish()
+        prior_bytes = (self.shadow_root / "latest.json").read_bytes()
+        self.run_id = "shadow-run-002"
+        self.audit = self._write_shadow_inputs(self.run_id, self.cohort)
+        real_fsync = route_publication._fsync_directory
+
+        def fail_second_pointer(path, *, directory_fd=None):
+            actual_root = Path(path)
+            if actual_root.name == "shadow" and (
+                actual_root / "latest.json"
+            ).read_bytes() != prior_bytes:
+                raise OSError("injected second shadow fsync failure")
+            return real_fsync(path, directory_fd=directory_fd)
+
+        with patch.object(
+            route_publication,
+            "_fsync_directory",
+            side_effect=fail_second_pointer,
+        ):
+            with self.assertRaisesRegex(Exception, "fsync|uncertain"):
+                self._publish()
+
+        self.assertEqual((self.shadow_root / "latest.json").read_bytes(), prior_bytes)
+        self.assertEqual(load_latest_shadow_result(self.shadow_root), first)
+
+    def test_rollback_never_overwrites_same_bytes_from_a_new_inode(self):
+        observed = {"third_party": None}
+        real_fsync = route_publication._fsync_directory
+
+        def replace_same_bytes_then_fail(path, *, directory_fd=None):
+            actual_root = Path(path)
+            pointer_path = actual_root / "latest.json"
+            if actual_root.name == "shadow" and pointer_path.exists():
+                attempted = pointer_path.read_bytes()
+                replacement = actual_root / ".third-party-latest"
+                replacement.write_bytes(attempted)
+                os.replace(replacement, pointer_path)
+                observed["third_party"] = os.stat(pointer_path).st_ino
+                raise OSError("injected same-byte concurrent shadow writer")
+            return real_fsync(path, directory_fd=directory_fd)
+
+        with patch.object(
+            route_publication,
+            "_fsync_directory",
+            side_effect=replace_same_bytes_then_fail,
+        ):
+            with self.assertRaisesRegex(Exception, "concurrent|uncertain"):
+                self._publish()
+
+        pointer_path = self.shadow_root / "latest.json"
+        self.assertTrue(pointer_path.exists())
+        self.assertEqual(os.stat(pointer_path).st_ino, observed["third_party"])
+        self.assertEqual(
+            json.loads(pointer_path.read_text(encoding="utf-8"))["run_id"],
+            self.run_id,
+        )
+
+    def test_rollback_never_overwrites_a_concurrent_third_party_pointer(self):
+        attacker = b'{"attacker":true}\n'
+        real_fsync = route_publication._fsync_directory
+
+        def replace_then_fail(path, *, directory_fd=None):
+            actual_root = Path(path)
+            if actual_root.name == "shadow" and (
+                actual_root / "latest.json"
+            ).exists():
+                (actual_root / "latest.json").write_bytes(attacker)
+                raise OSError("injected concurrent shadow writer")
+            return real_fsync(path, directory_fd=directory_fd)
+
+        with patch.object(
+            route_publication, "_fsync_directory", side_effect=replace_then_fail
+        ):
+            with self.assertRaisesRegex(Exception, "concurrent|uncertain"):
+                self._publish()
+
+        self.assertEqual((self.shadow_root / "latest.json").read_bytes(), attacker)
+
+    def test_shadow_root_rename_away_and_back_is_detected(self):
+        real_read = route_publication._read_shadow_run_evidence
+        detached = self.shadow_root.with_name("shadow-detached")
+
+        def read_then_swap_back(shadow_root, run_id):
+            result = real_read(shadow_root, run_id)
+            os.rename(self.shadow_root, detached)
+            os.rename(detached, self.shadow_root)
+            return result
+
+        with patch.object(
+            route_publication,
+            "_read_shadow_run_evidence",
+            side_effect=read_then_swap_back,
+        ):
+            with self.assertRaisesRegex(ValueError, "shadow root|phase.*changed"):
+                self._publish()
+
+        self.assertFalse((self.shadow_root / "latest.json").exists())
+
+    def test_run_evidence_replacement_and_in_place_aba_fail_closed(self):
+        published = self._publish()
+        run_directory = self.shadow_root / "runs" / self.run_id
+        real_read = route_publication._read_canonical_object_at
+
+        for mode in ("replace", "in_place"):
+            with self.subTest(mode=mode):
+                changed = {"done": False}
+
+                def mutate_after_later_member(directory_fd, filename, **kwargs):
+                    result = real_read(directory_fd, filename, **kwargs)
+                    if filename == "audit.json" and not changed["done"]:
+                        target = run_directory / "route_universe.json"
+                        original = target.read_bytes()
+                        if mode == "replace":
+                            replacement = run_directory / ".universe-replacement"
+                            replacement.write_bytes(original)
+                            os.replace(replacement, target)
+                        else:
+                            with target.open("r+b") as handle:
+                                handle.seek(0)
+                                handle.write(original)
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                        changed["done"] = True
+                    return result
+
+                with patch.object(
+                    route_publication,
+                    "_read_canonical_object_at",
+                    side_effect=mutate_after_later_member,
+                ):
+                    with self.assertRaisesRegex(ValueError, "changed"):
+                        load_shadow_result(
+                            self.shadow_root,
+                            run_id=self.run_id,
+                            expected_pointer_sha256=published["pointer_sha256"],
+                        )
+
+    def test_cleanup_preserves_primary_failure_and_attempts_both_unlocks(self):
+        real_fsync = route_publication._fsync_directory
+        real_flock = route_publication.fcntl.flock
+        unlocks = []
+
+        def fail_after_replace(path, *, directory_fd=None):
+            actual_root = Path(path)
+            if actual_root.name == "shadow" and (
+                actual_root / "latest.json"
+            ).exists():
+                raise OSError("primary shadow fsync failure")
+            return real_fsync(path, directory_fd=directory_fd)
+
+        def fail_first_unlock(fd, operation):
+            if operation == route_publication.fcntl.LOCK_UN:
+                unlocks.append(fd)
+                if len(unlocks) == 1:
+                    raise OSError("secondary unlock failure")
+            return real_flock(fd, operation)
+
+        with patch.object(
+            route_publication, "_fsync_directory", side_effect=fail_after_replace
+        ), patch.object(
+            route_publication.fcntl, "flock", side_effect=fail_first_unlock
+        ):
+            with self.assertRaisesRegex(OSError, "primary shadow fsync failure"):
+                self._publish()
+
+        self.assertGreaterEqual(len(unlocks), 2)
+
+    def test_shadow_close_failure_does_not_skip_core_cleanup(self):
+        real_flock = route_publication.fcntl.flock
+        real_close = route_publication.os.close
+        descriptors = {"core": None, "shadow": None}
+        close_attempts = []
+        failed = {"shadow": False}
+
+        def remember_locks(fd, operation):
+            if operation == route_publication.fcntl.LOCK_SH:
+                descriptors["core"] = fd
+            elif operation == route_publication.fcntl.LOCK_EX:
+                descriptors["shadow"] = fd
+            return real_flock(fd, operation)
+
+        def fail_shadow_close_once(fd):
+            close_attempts.append(fd)
+            if fd == descriptors["shadow"] and not failed["shadow"]:
+                failed["shadow"] = True
+                raise OSError("injected shadow close failure")
+            return real_close(fd)
+
+        try:
+            with patch.object(
+                route_publication.fcntl, "flock", side_effect=remember_locks
+            ), patch.object(
+                route_publication.os, "close", side_effect=fail_shadow_close_once
+            ):
+                with self.assertRaisesRegex(ValueError, "shadow descriptor close"):
+                    self._publish()
+        finally:
+            if descriptors["shadow"] is not None and failed["shadow"]:
+                try:
+                    real_close(descriptors["shadow"])
+                except OSError:
+                    pass
+
+        self.assertIn(descriptors["core"], close_attempts)
+
+    def test_historical_loader_preserves_lineage_error_over_unlock_error(self):
+        published = self._publish()
+        real_flock = route_publication.fcntl.flock
+
+        def fail_unlock(fd, operation):
+            if operation == route_publication.fcntl.LOCK_UN:
+                raise OSError("secondary historical unlock failure")
+            return real_flock(fd, operation)
+
+        with patch.object(
+            route_publication,
+            "_validate_joint_lineage",
+            side_effect=ValueError("primary historical lineage failure"),
+        ), patch.object(
+            route_publication.fcntl,
+            "flock",
+            side_effect=fail_unlock,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "primary historical lineage failure"
+            ):
+                load_shadow_result(
+                    self.shadow_root,
+                    run_id=self.run_id,
+                    expected_pointer_sha256=published["pointer_sha256"],
+                )
+
+    def test_core_descriptor_is_closed_when_second_root_open_fails(self):
+        real_open = route_publication._open_verified_directory
+        real_release = route_publication._release_route_lock_and_close
+        shadow_opens = {"count": 0}
+        cleanup_labels = []
+
+        def fail_final_shadow_open(path, label):
+            if label == "route shadow root":
+                shadow_opens["count"] += 1
+                if shadow_opens["count"] == 3:
+                    raise OSError("injected final shadow open failure")
+            return real_open(path, label)
+
+        def record_cleanup(descriptor, *, locked, label):
+            cleanup_labels.append(label)
+            return real_release(descriptor, locked=locked, label=label)
+
+        with patch.object(
+            route_publication,
+            "_open_verified_directory",
+            side_effect=fail_final_shadow_open,
+        ), patch.object(
+            route_publication,
+            "_release_route_lock_and_close",
+            side_effect=record_cleanup,
+        ):
+            with self.assertRaisesRegex(OSError, "final shadow open failure"):
+                self._publish()
+
+        self.assertIn("route core", cleanup_labels)
+
+    def test_phase_change_at_pointer_boundary_rolls_back_shadow_latest(self):
+        real_commit = route_publication._commit_shadow_pointer_at_locked
+
+        def transition_then_commit(
+            shadow_fd, shadow_path, pointer_bytes, *, commit_state=None
+        ):
+            self._install_full_phase()
+            return real_commit(
+                shadow_fd,
+                shadow_path,
+                pointer_bytes,
+                commit_state=commit_state,
+            )
+
+        with patch.object(
+            route_publication,
+            "_commit_shadow_pointer_at_locked",
+            side_effect=transition_then_commit,
+        ):
+            with self.assertRaisesRegex(ValueError, "lineage changed|phase"):
+                self._publish()
+
+        self.assertFalse((self.shadow_root / "latest.json").exists())
+
+    def test_hardlinked_run_evidence_and_unsafe_run_ids_fail_closed(self):
+        run_directory = self.shadow_root / "runs" / self.run_id
+        universe = run_directory / "route_universe.json"
+        replacement = run_directory / "universe-hardlink"
+        os.link(universe, replacement)
+        with self.assertRaisesRegex(ValueError, "hard-linked|single-link|unsafe"):
+            self._publish()
+
+        with self.assertRaisesRegex(ValueError, "run ID"):
+            load_shadow_result(
+                self.shadow_root,
+                run_id="../outside",
+                expected_pointer_sha256="a" * 64,
+            )
 
 
 if __name__ == "__main__":
