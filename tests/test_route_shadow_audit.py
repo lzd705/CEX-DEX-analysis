@@ -12,6 +12,7 @@ from scripts.route_shadow_audit import (
     AUDIT_FIELDS,
     IMPLICIT_CANARY_PHASE_SHA256,
     ROUTE_SHADOW_AUDIT_SCHEMA,
+    RouteShadowAuditError,
     _ratio_metric,
     build_shadow_audit,
     nearest_rank,
@@ -406,6 +407,7 @@ class BuildShadowAuditTests(unittest.TestCase):
     def test_partial_leg_without_literal_true_is_available(self):
         cohort = _cohort()
         cohort["legs"][0]["status"] = "partial"
+        cohort["legs"][0]["reason_code"] = "source_level_limit"
         cohort["legs"][0].pop("available")
         cohort = _rehash(cohort)
         audit = build_shadow_audit(
@@ -416,6 +418,23 @@ class BuildShadowAuditTests(unittest.TestCase):
             audit_finished_at="2026-08-01T12:00:10Z",
         )
         self.assertEqual(audit["metrics"]["leg_availability"]["numerator"], 2)
+
+    def test_partial_cex_leg_without_reason_code_fails_closed(self):
+        cohort = _cohort()
+        cohort["legs"][0]["status"] = "partial"
+        cohort["legs"][0].pop("available")
+        cohort = _rehash(cohort)
+        with self.assertRaisesRegex(
+            RouteShadowAuditError,
+            "CEX leg status and reason conflict",
+        ):
+            build_shadow_audit(
+                cohort,
+                core_pointer=_core_pointer(cohort),
+                run=_run(),
+                phase="canary",
+                audit_finished_at="2026-08-01T12:00:10Z",
+            )
 
     def test_empty_conditional_samples_are_not_evaluated(self):
         cohort = _cohort()
