@@ -194,6 +194,166 @@ console.log(JSON.stringify({
         self.assertEqual(result["parsed"]["state"]["start"], "2026-07-01")
         self.assertEqual(result["parsed"]["state"]["window"], "30d")
 
+    def test_single_selection_round_trips_on_every_workspace_page(self):
+        result = run_navigation_javascript(
+            """
+const shared = {
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "",
+  selection: "single",
+  start: "2026-07-01",
+  end: "2026-07-28",
+};
+const pages = {};
+for (const page of navigation.WORKSPACE_PAGES) {
+  const path = navigation.buildWorkspacePath("AAVE", page, shared);
+  const url = new URL(path, "https://example.test");
+  pages[page] = {
+    path,
+    state: navigation.parseRoute(url.pathname, url.search).state,
+  };
+}
+const pairedPath = navigation.buildWorkspacePath("AAVE", "compare", {
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "dex:ethereum:uniswap-v3:0xabc:AAVE",
+  start: "2026-07-01",
+  end: "2026-07-28",
+  window: "30d",
+});
+const pairedUrl = new URL(pairedPath, "https://example.test");
+console.log(JSON.stringify({
+  pages,
+  pairedPath,
+  paired: navigation.parseRoute(pairedUrl.pathname, pairedUrl.search),
+}));
+"""
+        )
+        expected_state = {
+            "marketA": "cex:binance:AAVE/USDT",
+            "selection": "single",
+            "start": "2026-07-01",
+            "end": "2026-07-28",
+        }
+        for page in ("markets", "compare", "liquidity", "events", "quality"):
+            self.assertIn("marketA=cex%3Abinance%3AAAVE%2FUSDT", result["pages"][page]["path"])
+            self.assertIn("selection=single", result["pages"][page]["path"])
+            self.assertNotIn("marketB", result["pages"][page]["path"])
+            self.assertEqual(result["pages"][page]["state"], expected_state)
+        self.assertNotIn("selection", result["pairedPath"])
+        self.assertEqual(result["paired"], {
+            "kind": "workspace",
+            "token": "AAVE",
+            "page": "compare",
+            "state": {
+                "marketA": "cex:binance:AAVE/USDT",
+                "marketB": "dex:ethereum:uniswap-v3:0xabc:AAVE",
+                "start": "2026-07-01",
+                "end": "2026-07-28",
+                "window": "30d",
+            },
+        })
+
+    def test_validate_selection_has_explicit_single_and_pair_cardinality_rules(self):
+        result = run_navigation_javascript(
+            """
+const idA = "cex:binance:AAVE/USDT";
+const idB = "dex:ethereum:uniswap-v3:0xabc:AAVE";
+const markets = [{ market_id: idA }, { market_id: idB }];
+if (typeof navigation.validateSelection !== "function") {
+  console.log(JSON.stringify({ missingApi: true }));
+} else {
+const cases = [
+  ["single", markets, idA, "", "single"],
+  ["missingB", markets, idA, "", ""],
+  ["pair", markets, idA, idB, ""],
+  ["singleWithB", markets, idA, idB, "single"],
+  ["unknownA", markets, "cex:unknown:AAVE/USDT", "", "single"],
+  ["unknownB", markets, idA, "dex:unknown:AAVE", ""],
+  ["same", markets, idA, idA, ""],
+  ["invalidMarker", markets, idA, "", "multi"],
+  ["oneRowSingle", [markets[0]], idA, "", "single"],
+];
+console.log(JSON.stringify(Object.fromEntries(cases.map(
+  ([name, rows, marketA, marketB, selection]) => [
+    name,
+    navigation.validateSelection(rows, marketA, marketB, selection),
+  ],
+))));
+}
+"""
+        )
+        self.assertNotIn("missingApi", result)
+        self.assertEqual((result["single"]["valid"], result["single"]["mode"]), (True, "single"))
+        self.assertEqual(
+            [error["code"] for error in result["missingB"]["errors"]],
+            ["market_b_required"],
+        )
+        self.assertEqual((result["pair"]["valid"], result["pair"]["mode"]), (True, "pair"))
+        self.assertEqual(
+            [error["code"] for error in result["singleWithB"]["errors"]],
+            ["selection_market_b_conflict"],
+        )
+        self.assertEqual(
+            [error["code"] for error in result["unknownA"]["errors"]],
+            ["market_a_not_found"],
+        )
+        self.assertEqual(
+            [error["code"] for error in result["unknownB"]["errors"]],
+            ["market_b_not_found"],
+        )
+        self.assertEqual(
+            [error["code"] for error in result["same"]["errors"]],
+            ["same_market"],
+        )
+        self.assertEqual(
+            [error["code"] for error in result["invalidMarker"]["errors"]],
+            ["selection_invalid", "market_b_required"],
+        )
+        self.assertEqual(
+            (result["oneRowSingle"]["valid"], result["oneRowSingle"]["mode"]),
+            (True, "single"),
+        )
+        self.assertNotIn(
+            "insufficient_markets",
+            [error["code"] for error in result["oneRowSingle"]["errors"]],
+        )
+
+    def test_workspace_builder_rejects_unknown_selection_marker(self):
+        result = run_navigation_javascript(
+            """
+let error = null;
+try {
+  navigation.buildWorkspacePath("AAVE", "markets", {
+    marketA: "cex:binance:AAVE/USDT",
+    selection: "multi",
+  });
+} catch (caught) {
+  error = { name: caught.name, message: caught.message };
+}
+console.log(JSON.stringify(error));
+"""
+        )
+        self.assertEqual(result, {
+            "name": "TypeError",
+            "message": "Unknown market selection marker",
+        })
+
+    def test_validate_pair_keeps_its_legacy_result_keys(self):
+        result = run_navigation_javascript(
+            """
+const markets = [
+  { market_id: "cex:binance:AAVE/USDT" },
+  { market_id: "dex:ethereum:uniswap-v3:0xabc:AAVE" },
+];
+console.log(JSON.stringify(Object.keys(navigation.validatePair(
+  markets,
+  markets[0].market_id,
+  markets[1].market_id,
+)).sort()));
+"""
+        )
+        self.assertEqual(result, ["errors", "marketA", "marketB", "valid"])
+
     def test_page_specific_parameters_do_not_leak_between_workspace_pages(self):
         result = run_navigation_javascript(
             """

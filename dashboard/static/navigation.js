@@ -287,11 +287,13 @@
     const state = {};
     const marketA = firstParam(params, ["marketA", "a"]);
     const marketB = firstParam(params, ["marketB", "b"]);
+    const selection = firstParam(params, ["selection"]);
     const pairMode = firstParam(params, ["pairMode", "pair"]);
     const start = firstParam(params, ["start"]);
     const end = firstParam(params, ["end"]);
     if (marketA !== null) state.marketA = marketA;
     if (marketB !== null) state.marketB = marketB;
+    if (selection !== null) state.selection = selection;
     if (pairMode !== null && PAIR_MODES.has(pairMode)) state.pairMode = pairMode;
     if (isIsoDate(start)) state.start = start;
     if (isIsoDate(end)) state.end = end;
@@ -440,6 +442,12 @@
     const params = new URLSearchParams();
     setString(params, "marketA", state.marketA);
     setString(params, "marketB", state.marketB);
+    if (state.selection !== undefined && state.selection !== "") {
+      if (state.selection !== "single") {
+        throw new TypeError("Unknown market selection marker");
+      }
+      params.set("selection", "single");
+    }
     setEnum(params, "pairMode", state.pairMode, PAIR_MODES);
     setDate(params, "start", state.start);
     setDate(params, "end", state.end);
@@ -485,7 +493,7 @@
     return { code, field, value: value ?? null };
   }
 
-  function validatePair(markets, a, b) {
+  function validateSelection(markets, a, b, selection = "") {
     const rows = Array.isArray(markets) ? markets : [];
     const byId = new Map();
     const duplicateIds = new Set();
@@ -498,42 +506,70 @@
 
     const marketAId = stringValue(a);
     const marketBId = stringValue(b);
+    const marker = stringValue(selection) ?? "";
+    const wantsSingle = marker === "single";
     const errors = [];
+
+    if (marker && !wantsSingle) {
+      errors.push(validationError("selection_invalid", "selection", marker));
+    }
     if (marketAId === null) {
       errors.push(validationError("market_a_required", "marketA", a));
     }
-    if (marketBId === null) {
+    if (wantsSingle && marketBId !== null) {
+      errors.push(validationError(
+        "selection_market_b_conflict",
+        "marketB",
+        marketBId,
+      ));
+    } else if (!wantsSingle && marketBId === null) {
       errors.push(validationError("market_b_required", "marketB", b));
     }
-    if (marketAId !== null && marketBId !== null && marketAId === marketBId) {
+    if (
+      !wantsSingle
+      && marketAId !== null
+      && marketBId !== null
+      && marketAId === marketBId
+    ) {
       errors.push(validationError("same_market", "marketB", marketBId));
     }
     if (marketAId !== null && !byId.has(marketAId)) {
       errors.push(validationError("market_a_not_found", "marketA", marketAId));
     }
-    if (marketBId !== null && !byId.has(marketBId)) {
+    if (!wantsSingle && marketBId !== null && !byId.has(marketBId)) {
       errors.push(validationError("market_b_not_found", "marketB", marketBId));
     }
     if (marketAId !== null && duplicateIds.has(marketAId)) {
       errors.push(validationError("market_a_ambiguous", "marketA", marketAId));
     }
-    if (marketBId !== null && duplicateIds.has(marketBId)) {
+    if (!wantsSingle && marketBId !== null && duplicateIds.has(marketBId)) {
       errors.push(validationError("market_b_ambiguous", "marketB", marketBId));
     }
-    if (rows.length < 2) {
+    if (!wantsSingle && rows.length < 2) {
       errors.push(validationError("insufficient_markets", "markets", rows.length));
     }
 
+    const resolvedA = marketAId !== null && !duplicateIds.has(marketAId)
+      ? byId.get(marketAId) ?? null
+      : null;
+    const resolvedB = !wantsSingle
+      && marketBId !== null
+      && !duplicateIds.has(marketBId)
+      ? byId.get(marketBId) ?? null
+      : null;
+
     return {
       valid: errors.length === 0,
-      marketA: marketAId !== null && !duplicateIds.has(marketAId)
-        ? byId.get(marketAId) ?? null
-        : null,
-      marketB: marketBId !== null && !duplicateIds.has(marketBId)
-        ? byId.get(marketBId) ?? null
-        : null,
+      mode: errors.length ? null : wantsSingle ? "single" : "pair",
+      marketA: resolvedA,
+      marketB: wantsSingle ? null : resolvedB,
       errors,
     };
+  }
+
+  function validatePair(markets, a, b) {
+    const { mode, ...legacyResult } = validateSelection(markets, a, b, "");
+    return legacyResult;
   }
 
   return Object.freeze({
@@ -543,6 +579,7 @@
     buildOpportunitiesPath,
     validateOpportunityFilters,
     buildWorkspacePath,
+    validateSelection,
     validatePair,
   });
 });
