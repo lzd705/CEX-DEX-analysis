@@ -7,8 +7,9 @@ and a Token, then selects required Market A and either an exact Market B or the
 explicit `Market A only — no comparison` option while moving through `Markets`,
 `Compare`, `Liquidity & Execution`, `Events`, and `Data Quality`. Paired A/B
 markets may be CEX/CEX, CEX/DEX, or DEX/DEX. An empty Market B is an incomplete
-draft; it is not the explicit single-market selection and is not a structured
-`N/A` fact. A
+draft only when `selection=single` is absent. A valid single-market selection
+has B blank or omitted together with that explicit marker. Neither state is a
+structured `N/A` fact. A
 separate authenticated administrator page can refresh configured Tokens,
 retry audit-approved missing windows, and onboard a DEX Token from a validated
 smart-contract address when explicitly enabled; the entire administrator

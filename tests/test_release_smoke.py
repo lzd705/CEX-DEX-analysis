@@ -5969,6 +5969,9 @@ class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
             "B statistics": lambda payload: payload.update(
                 market_b_statistics={"observation_count": 2}
             ),
+            "pair union days": lambda payload: payload["metadata"].update(
+                union_observation_days=2
+            ),
             "pair row": lambda payload: payload["observations"][0].update(
                 price_spread=0.01
             ),

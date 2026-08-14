@@ -4193,7 +4193,8 @@ def validate_comparison(
         require(
             "market_b_statistics" not in payload
             and "latest_comparable_observation" not in payload
-            and "comparison_days" not in metadata,
+            and "comparison_days" not in metadata
+            and "union_observation_days" not in metadata,
             "Compare leaked pair-derived fields",
         )
     else:

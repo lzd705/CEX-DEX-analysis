@@ -90,8 +90,9 @@ CSVs and a validated SQLite database back into `data/local/`.
 - Inside one Token workspace, Market A and B may be any two distinct cataloged
   markets for that Token, including CEX/CEX or DEX/DEX.
 - Market A is always required. Market B can be replaced only by the explicit
-  `Market A only — no comparison` option. A blank B remains a draft validation
-  error; it is not single-market mode and is not the same as a structured
+  `Market A only — no comparison` option. A blank or omitted B without
+  `selection=single` remains a draft validation error; with that marker it is
+  the valid single-market selection. Neither is the same as a structured
   unavailable (`N/A`) Fact returned by the server.
 - In single-market mode, Compare shows only Market A price/volume lines and
   table values; Liquidity & Execution shows only A depth and its ten execution
