@@ -5103,6 +5103,168 @@ globalThis.MarketMonitorNavigation = {
             self.assertIn("Exact catalog screening reason.", state["html"])
             self.assertIn("1 warning reason", state["summary"])
 
+    def test_optional_market_b_control_has_exact_accessible_copy(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
+        self.assertIn('<label for="facts-market-b">Market B (optional)</label>', index)
+        self.assertIn('aria-label="Market B (optional)"', index)
+        self.assertIn("Apply selection", index)
+        self.assertNotIn("Apply pair", index)
+
+        result = run_app_javascript(
+            """
+const markets = [{
+  market_id: "cex:binance:AAVE/USDT",
+  market_type: "cex",
+  venue: "binance",
+  instrument: "AAVE/USDT",
+}];
+console.log(JSON.stringify({
+  a: factsOptions(markets, ""),
+  b: factsOptions(markets, "", { emptyLabel: "Market A only — no comparison" }),
+}));
+"""
+        )
+        self.assertTrue(result["a"].startswith('<option value="">Select market</option>'))
+        self.assertTrue(
+            result["b"].startswith(
+                '<option value="">Market A only — no comparison</option>'
+            )
+        )
+
+    def test_saved_selection_schema_is_additive_and_invalid_drafts_do_not_erase_it(self):
+        result = run_app_javascript(
+            """
+const controls = {
+  "facts-token": { value: "AAVE" },
+  "facts-market-a": { value: "cex:binance:AAVE/USDT" },
+  "facts-market-b": { value: "dex:eth:uniswap:AAVE/WETH" },
+};
+const writes = [];
+global.document = { getElementById(id) { return controls[id] || null; } };
+global.window = {
+  sessionStorage: { setItem(_key, value) { writes.push(JSON.parse(value)); } },
+};
+app.payload = { metadata: {}, tokens: [{ token_symbol: "AAVE" }] };
+app.catalog = { markets: [
+  { market_id: "cex:binance:AAVE/USDT", token_symbol: "AAVE" },
+  { market_id: "dex:eth:uniswap:AAVE/WETH", token_symbol: "AAVE" },
+] };
+app.pairSelections = {
+  AAVE: {
+    marketA: "cex:binance:AAVE/USDT",
+    marketB: "dex:eth:uniswap:AAVE/WETH",
+  },
+};
+const legacy = normalizedSavedSelection(app.pairSelections.AAVE);
+controls["facts-market-b"].value = "";
+app.workspaceSelection = "";
+const incomplete = persistSelectedSelection();
+const kept = { ...app.pairSelections.AAVE };
+app.workspaceSelection = "single";
+const single = persistSelectedSelection();
+const savedSingle = { ...app.pairSelections.AAVE };
+controls["facts-market-b"].value = "dex:eth:uniswap:AAVE/WETH";
+app.workspaceSelection = "";
+const pair = persistSelectedSelection();
+console.log(JSON.stringify({ legacy, incomplete, kept, single, savedSingle, pair, final: app.pairSelections.AAVE, writes }));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  validateSelection(markets, a, b, selection = "") {
+    const byId = new Map(markets.map((market) => [market.market_id, market]));
+    const single = selection === "single";
+    const valid = Boolean(byId.has(a) && (single ? !b : byId.has(b) && a !== b));
+    return {
+      valid,
+      mode: valid ? (single ? "single" : "pair") : null,
+      marketA: byId.get(a) || null,
+      marketB: single ? null : byId.get(b) || null,
+      errors: valid ? [] : [{ code: "selection_invalid" }],
+    };
+  },
+};
+""",
+        )
+        pair_record = {
+            "marketA": "cex:binance:AAVE/USDT",
+            "marketB": "dex:eth:uniswap:AAVE/WETH",
+        }
+        self.assertEqual(result["legacy"], {**pair_record, "selection": ""})
+        self.assertFalse(result["incomplete"])
+        self.assertEqual(result["kept"], pair_record)
+        self.assertTrue(result["single"])
+        self.assertEqual(
+            result["savedSingle"],
+            {
+                "marketA": "cex:binance:AAVE/USDT",
+                "marketB": "",
+                "selection": "single",
+            },
+        )
+        self.assertTrue(result["pair"])
+        self.assertEqual(result["final"], pair_record)
+
+    def test_saved_single_and_pair_restore_independently_per_token(self):
+        result = run_app_javascript(
+            """
+const controls = {
+  "facts-token": { value: "AAVE" },
+  "facts-market-a": { value: "cex:binance:AAVE/USDT" },
+  "facts-market-b": { value: "dex:eth:uniswap:AAVE/WETH" },
+  "date-start": { value: "2026-07-01" },
+  "date-end": { value: "2026-07-30" },
+  "workspace-context-notice": { hidden: true, textContent: "", dataset: {} },
+};
+global.document = { getElementById(id) { return controls[id] || null; } };
+global.window = { location: { pathname: "/tokens/AAVE/markets", search: "" } };
+app.payload = {
+  metadata: { start_date: "2026-07-01", end_date: "2026-07-30" },
+  tokens: [{ token_symbol: "AAVE" }, { token_symbol: "BTC" }, { token_symbol: "ETH" }],
+};
+app.route = { kind: "workspace", token: "AAVE", page: "markets", state: {} };
+app.workspaceSelection = "";
+app.pairSelections = {
+  BTC: { marketA: "cex:binance:BTC/USDT", marketB: "", selection: "single" },
+  ETH: { marketA: "cex:binance:ETH/USDT", marketB: "dex:eth:uniswap:ETH/WETH" },
+};
+const paths = [];
+navigateTo = (path) => { paths.push(path); };
+selectWorkspaceToken("BTC");
+selectWorkspaceToken("ETH");
+app.workspaceSelection = "single";
+const empty = workspaceStateWithoutMarkets("markets");
+console.log(JSON.stringify({ paths, empty, stored: app.pairSelections }));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  buildWorkspacePath(token, page, state = {}) {
+    const query = new URLSearchParams();
+    Object.entries(state).forEach(([key, value]) => {
+      if (value !== "" && value !== null && value !== undefined) query.set(key, value);
+    });
+    return `/tokens/${token}/${page}?${query.toString()}`;
+  },
+};
+""",
+        )
+        btc = result["paths"][0]
+        eth = result["paths"][1]
+        self.assertIn("/tokens/BTC/markets?", btc)
+        self.assertIn("marketA=cex%3Abinance%3ABTC%2FUSDT", btc)
+        self.assertIn("selection=single", btc)
+        self.assertNotIn("marketB=", btc)
+        self.assertNotIn("pairMode=", btc)
+        self.assertIn("/tokens/ETH/markets?", eth)
+        self.assertIn("marketA=cex%3Abinance%3AETH%2FUSDT", eth)
+        self.assertIn("marketB=dex%3Aeth%3Auniswap%3AETH%2FWETH", eth)
+        self.assertNotIn("selection=", eth)
+        self.assertNotIn("pairMode=", eth)
+        self.assertNotIn("marketA", result["empty"])
+        self.assertNotIn("marketB", result["empty"])
+        self.assertNotIn("selection", result["empty"])
+        self.assertEqual(result["empty"]["pairMode"], "manual")
+        self.assertEqual(result["stored"]["BTC"]["selection"], "single")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,8 @@ const app = {
   route: { kind: "screener", filters: {} },
   pairSelections: {},
   pairSelectionSource: "",
+  workspaceSelection: "",
+  workspaceSelectionInvalid: false,
   routeReady: false,
   selections: {},
   selectionOverrides: {},
@@ -394,10 +396,46 @@ function writePairSelections() {
   }
 }
 
-function selectedPairState() {
+function normalizedSavedSelection(record) {
+  if (!record || typeof record !== "object") return null;
+  if (record.selection === "single" && record.marketA && !record.marketB) {
+    return { marketA: record.marketA, marketB: "", selection: "single" };
+  }
+  if (!record.selection && record.marketA && record.marketB) {
+    return { marketA: record.marketA, marketB: record.marketB, selection: "" };
+  }
+  return null;
+}
+
+function selectedMarketSelection() {
   return {
     marketA: byId("facts-market-a")?.value || "",
     marketB: byId("facts-market-b")?.value || "",
+    selection: app.workspaceSelection === "single" ? "single" : "",
+  };
+}
+
+function selectedPairState() {
+  const { marketA, marketB } = selectedMarketSelection();
+  return { marketA, marketB };
+}
+
+function validateWorkspaceSelection(markets, marketA, marketB, selection = "") {
+  if (typeof navigation?.validateSelection === "function") {
+    return navigation.validateSelection(markets, marketA, marketB, selection);
+  }
+  const wantsSingle = selection === "single";
+  const valid = Boolean(
+    marketA
+    && (wantsSingle ? !marketB : marketB && marketA !== marketB),
+  );
+  const resolve = (id) => markets.find((market) => market.market_id === id) || { market_id: id };
+  return {
+    valid,
+    mode: valid ? (wantsSingle ? "single" : "pair") : null,
+    marketA: marketA ? resolve(marketA) : null,
+    marketB: !wantsSingle && marketB ? resolve(marketB) : null,
+    errors: valid ? [] : [{ code: "selection_invalid" }],
   };
 }
 
@@ -457,13 +495,16 @@ function currentWorkspaceRouteState(
   page,
   { window = appliedTimeWindow() } = {},
 ) {
-  const state = selectedPairState();
+  const state = selectedMarketSelection();
   if (app.route?.kind === "workspace" && !app.catalog) {
     state.marketA ||= app.route.state?.marketA || "";
     state.marketB ||= app.route.state?.marketB || "";
+    state.selection ||= app.route.state?.selection === "single" ? "single" : "";
   }
   if (app.pairSelectionSource === "transient") state.pairMode = "transient";
-  if (!state.marketA || !state.marketB) state.pairMode = "manual";
+  if (!state.marketA || (!state.marketB && state.selection !== "single")) {
+    state.pairMode = "manual";
+  }
   state.start = window.start || "";
   state.end = window.end || "";
   if (page === "liquidity") {
@@ -575,6 +616,7 @@ function replaceCurrentRoute({
     && Array.isArray(app.route.validationErrors)
     && app.route.validationErrors.length
   ) return;
+  if (app.route?.kind === "workspace" && app.workspaceSelectionInvalid) return;
   let path;
   if (app.route.kind === "workspace") {
     path = currentWorkspacePath(app.route.page, { window });
@@ -608,6 +650,7 @@ function canonicalizeCurrentRoute() {
     && Array.isArray(app.route.validationErrors)
     && app.route.validationErrors.length
   ) return;
+  if (app.route?.kind === "workspace" && app.workspaceSelectionInvalid) return;
   let path;
   if (app.route.kind === "workspace") {
     path = currentWorkspacePath(app.route.page);
@@ -1001,49 +1044,90 @@ function applyWorkspaceRoute(route) {
   app.pairSelectionSource = route.state?.pairMode === "transient"
     ? "transient"
     : "";
+  app.workspaceSelection = route.state?.selection || "";
+  app.workspaceSelectionInvalid = false;
   byId("facts-token").value = exactToken;
   const markets = factsMarketsForToken(exactToken);
-  const routeProvidedPair = Boolean(route.state?.marketA || route.state?.marketB);
+  const routeProvidedSelection = Boolean(
+    route.state?.marketA
+    || route.state?.marketB
+    || route.state?.selection,
+  );
   const manualPair = route.state?.pairMode === "manual";
-  const hadSavedPair = Boolean(app.pairSelections[exactToken]);
-  const validation = navigation.validatePair(
+  const savedSelection = normalizedSavedSelection(app.pairSelections[exactToken]);
+  const validation = validateWorkspaceSelection(
     markets,
     route.state?.marketA,
     route.state?.marketB,
+    route.state?.selection,
   );
-  if (routeProvidedPair || manualPair) {
-    populateFactsMarkets({
-      requestedA: validation.marketA?.market_id || "",
-      requestedB: validation.marketB?.market_id || "",
-      allowDefaults: false,
-      persistSelection: app.pairSelectionSource !== "transient",
-    });
+  if (routeProvidedSelection || manualPair) {
     const invalidReferenceErrors = validation.errors.filter((error) => (
       !["market_a_required", "market_b_required"].includes(error.code)
     ));
-    if (invalidReferenceErrors.length) {
+    app.workspaceSelectionInvalid = invalidReferenceErrors.length > 0;
+    if (app.workspaceSelectionInvalid) {
+      populateFactsMarkets({
+        requestedA: "",
+        requestedB: "",
+        allowDefaults: false,
+        persistSelection: false,
+      });
+      const details = [
+        `marketA=${String(route.state?.marketA || "(empty)")}`,
+        `marketB=${String(route.state?.marketB || "(empty)")}`,
+        `selection=${String(route.state?.selection || "(empty)")}`,
+      ].join(", ");
       const codes = validation.errors.map((error) => error.code).join(", ");
       showStatus(
         byId("workspace-context-notice"),
-        `The shared link contains an invalid market pair (${codes}). Valid selections were kept; no replacement market was chosen.`,
-        "stale",
-      );
-    } else if (!validation.valid) {
-      showStatus(
-        byId("workspace-context-notice"),
-        `Pair selection is in progress for ${exactToken}. Choose two distinct markets; no replacement market was selected.`,
+        `The shared selection is invalid (${codes}). Raw values: ${details}. No replacement market was chosen and no data request was started.`,
         "stale",
       );
     } else {
+      app.workspaceSelection = validation.mode === "single" ? "single" : "";
+      populateFactsMarkets({
+        requestedA: validation.marketA?.market_id || "",
+        requestedB: validation.marketB?.market_id || "",
+        allowDefaults: false,
+        persistSelection: app.pairSelectionSource !== "transient" && validation.valid,
+      });
+    }
+    if (!app.workspaceSelectionInvalid && !validation.valid) {
+      showStatus(
+        byId("workspace-context-notice"),
+        `Market selection is in progress for ${exactToken}. Choose Market A and optionally Market B, then apply the selection.`,
+        "stale",
+      );
+    } else if (!app.workspaceSelectionInvalid) {
       hideStatus(byId("workspace-context-notice"));
     }
   } else {
-    populateFactsMarkets();
+    const savedValidation = savedSelection
+      ? validateWorkspaceSelection(
+        markets,
+        savedSelection.marketA,
+        savedSelection.marketB,
+        savedSelection.selection,
+      )
+      : null;
+    if (savedValidation?.valid) {
+      app.workspaceSelection = savedSelection.selection;
+      populateFactsMarkets({
+        requestedA: savedSelection.marketA,
+        requestedB: savedSelection.marketB,
+        allowDefaults: false,
+        persistSelection: false,
+      });
+    } else {
+      app.workspaceSelection = "";
+      populateFactsMarkets();
+    }
     showStatus(
       byId("workspace-context-notice"),
-      hadSavedPair
-        ? `Restored the saved ${exactToken} market pair.`
-        : `Auto-selected a source-backed ${exactToken} market pair. Review it before comparing.`,
+      savedValidation?.valid
+        ? `Restored the saved ${exactToken} market selection.`
+        : `Prepared source-backed ${exactToken} market defaults. Review them before applying.`,
       "success",
     );
   }
@@ -1077,6 +1161,7 @@ function applyWorkspaceRoute(route) {
   renderQualityFromCatalog();
   updateFactsContract();
   byId("facts-workbench").setAttribute("aria-busy", "false");
+  if (app.workspaceSelectionInvalid) return;
   if (route.page === "compare") loadComparison();
   if (route.page === "liquidity") {
     renderLiquidityCurve();
@@ -3033,14 +3118,15 @@ function snapshotRefreshInlineStatus(button) {
 function snapshotRefreshRouteContext() {
   const route = app.route || { kind: "unknown" };
   const routeState = route.kind === "workspace" ? route.state || {} : route.filters || {};
-  const selectedPair = route.kind === "workspace" ? selectedPairState() : {};
+  const selected = route.kind === "workspace" ? selectedMarketSelection() : {};
   const location = globalThis.window?.location;
   return JSON.stringify({
     kind: route.kind || "unknown",
     page: route.kind === "workspace" ? route.page || "" : "",
     token: route.kind === "workspace" ? String(route.token || "").toUpperCase() : "",
-    marketA: selectedPair.marketA || routeState.marketA || "",
-    marketB: selectedPair.marketB || routeState.marketB || "",
+    marketA: selected.marketA || routeState.marketA || "",
+    marketB: selected.marketB || routeState.marketB || "",
+    selection: selected.selection || routeState.selection || "",
     start: routeState.start || "",
     end: routeState.end || "",
     location: location ? `${location.pathname || ""}${location.search || ""}` : "",
@@ -3341,7 +3427,7 @@ function renderWorkspaceContext() {
       ? `${formatShare(aggregates.aggregateDexShare)} DEX share`
       : "DEX share unavailable";
     byId("workspace-description").textContent = `${aggregateText} · ${shareText}. `
-      + "Market A/B stay shared across the four research pages.";
+      + "Applied market identities stay shared across the four research pages.";
   }
   const pair = selectedPairState();
   const byMarketId = new Map(markets.map((market) => [market.market_id, market]));
@@ -3463,7 +3549,7 @@ function renderWorkspaceMarkets() {
             ${qualityStateMarkup(rowQualityStatus, rowQualityLabel)}
             <span class="metric-note">${flags.length} reason${flags.length === 1 ? "" : "s"}</span>
           </td>
-          <td data-label="Pair selection">
+          <td data-label="Market selection">
             <span class="pair-actions">
               <button
                 type="button"
@@ -4692,11 +4778,14 @@ function factsMarketsForToken(token) {
   return app.catalog.markets.filter((market) => market.token_symbol === token);
 }
 
-function factsOptions(markets, selectedId) {
-  return '<option value="">Select market</option>' + markets.map((market) => (
-    `<option value="${escapeHtml(market.market_id)}" ${market.market_id === selectedId ? "selected" : ""}>`
-      + `${escapeHtml(factsMarketLabel(market))}</option>`
-  )).join("");
+function factsOptions(markets, selectedId, { emptyLabel = "Select market" } = {}) {
+  return [
+    `<option value="">${escapeHtml(emptyLabel)}</option>`,
+    ...markets.map((market) => (
+      `<option value="${escapeHtml(market.market_id)}" ${market.market_id === selectedId ? "selected" : ""}>`
+        + `${escapeHtml(factsMarketLabel(market))}</option>`
+    )),
+  ].join("");
 }
 
 function factsMarketWarningFlags(market) {
@@ -4756,7 +4845,7 @@ function factsMarketWarningMarkup(slotLabel, market, flags, severity) {
     <div class="market-warning-market">${escapeHtml(factsMarketLabel(market))}</div>
     <ul>${items}</ul>
     <a class="warning-quality-link" href="${escapeHtml(qualityPath)}" data-workspace-page="quality">
-      Inspect this pair in Data Quality
+      Inspect this selection in Data Quality
     </a>
   `;
 }
@@ -5700,7 +5789,7 @@ function populateFactsMarkets({
   const token = byId("facts-token").value;
   const markets = factsMarketsForToken(token);
   const tokenSummary = app.payload?.tokens.find((row) => row.token_symbol === token);
-  const saved = app.pairSelections[token] || {};
+  const saved = normalizedSavedSelection(app.pairSelections[token]) || {};
   const previousA = requestedA ?? (preserve ? byId("facts-market-a").value : saved.marketA || "");
   const previousB = requestedB ?? (preserve ? byId("facts-market-b").value : saved.marketB || "");
   const cex = preferredCatalogMarket(markets, "cex", tokenSummary);
@@ -5713,18 +5802,21 @@ function populateFactsMarkets({
     ? dex || markets.find((market) => market.market_id !== marketA?.market_id)
     : null);
   if (marketA && marketB && marketB.market_id === marketA.market_id) {
-    marketB = markets.find((market) => market.market_id !== marketA.market_id);
+    marketB = allowDefaults
+      ? markets.find((market) => market.market_id !== marketA.market_id)
+      : null;
+    app.workspaceSelection = "";
   }
   byId("facts-market-a").innerHTML = factsOptions(markets, marketA?.market_id);
-  byId("facts-market-b").innerHTML = factsOptions(markets, marketB?.market_id);
+  byId("facts-market-b").innerHTML = factsOptions(
+    markets,
+    marketB?.market_id,
+    { emptyLabel: "Market A only — no comparison" },
+  );
   byId("facts-market-a").value = marketA?.market_id || "";
   byId("facts-market-b").value = marketB?.market_id || "";
-  if (marketA && marketB && persistSelection) {
-    app.pairSelections[token] = {
-      marketA: marketA.market_id,
-      marketB: marketB.market_id,
-    };
-    writePairSelections();
+  if (persistSelection) {
+    persistSelectedSelection();
   }
   renderFactsMarketWarnings();
   renderLiquidityCurve();
@@ -6965,20 +7057,32 @@ async function applyWindow(candidate = draftTimeWindow()) {
   return true;
 }
 
-function persistSelectedPair() {
+function persistSelectedSelection() {
   const token = selectedWorkspaceToken();
-  const { marketA, marketB } = selectedPairState();
-  if (token && marketA && marketB && marketA !== marketB) {
+  const selection = selectedMarketSelection();
+  const markets = app.catalog && token ? factsMarketsForToken(token) : [];
+  const validation = validateWorkspaceSelection(
+    markets,
+    selection.marketA,
+    selection.marketB,
+    selection.selection,
+  );
+  if (token && validation?.valid) {
     app.pairSelectionSource = "";
-    app.pairSelections[token] = { marketA, marketB };
+    app.workspaceSelectionInvalid = false;
+    app.pairSelections[token] = {
+      marketA: validation.marketA.market_id,
+      marketB: validation.marketB?.market_id || "",
+      ...(validation.mode === "single" ? { selection: "single" } : {}),
+    };
     writePairSelections();
     return true;
   }
-  if (token && Object.hasOwn(app.pairSelections, token)) {
-    delete app.pairSelections[token];
-    writePairSelections();
-  }
   return false;
+}
+
+function persistSelectedPair() {
+  return persistSelectedSelection();
 }
 
 function clearScreenerQualityDrilldown({ pairComplete = false } = {}) {
@@ -6989,10 +7093,30 @@ function clearScreenerQualityDrilldown({ pairComplete = false } = {}) {
   }
 }
 
-function applySelectedPair() {
-  if (!persistSelectedPair()) {
-    replaceCurrentRoute();
-    refreshWorkspacePageData();
+function applySelectedSelection() {
+  const draft = selectedMarketSelection();
+  if (
+    draft.marketA
+    && !draft.marketB
+    && !app.workspaceSelectionInvalid
+    && ["", "single"].includes(app.workspaceSelection)
+  ) {
+    app.workspaceSelection = "single";
+  }
+  if (!persistSelectedSelection()) {
+    const attempted = selectedMarketSelection();
+    const validation = validateWorkspaceSelection(
+      app.catalog ? factsMarketsForToken(selectedWorkspaceToken()) : [],
+      attempted.marketA,
+      attempted.marketB,
+      app.workspaceSelection,
+    );
+    const codes = validation?.errors?.map((error) => error.code).join(", ") || "selection_invalid";
+    showStatus(
+      byId("workspace-context-notice"),
+      `The market selection is invalid (${codes}). The last valid saved selection was kept.`,
+      "stale",
+    );
     return false;
   }
   navigateTo(currentWorkspacePath("compare"));
@@ -7017,14 +7141,19 @@ function selectWorkspaceMarket(slot, marketIdValue) {
   const otherSlot = slot === "a" ? "b" : "a";
   const other = byId(`facts-market-${otherSlot}`);
   target.value = marketIdValue;
+  app.workspaceSelectionInvalid = false;
+  if (slot === "b") {
+    app.workspaceSelection = marketIdValue ? "" : "single";
+  }
   if (marketIdValue && other.value === marketIdValue) {
     other.value = "";
+    app.workspaceSelection = "";
     showStatus(
       byId("workspace-context-notice"),
       `Market ${otherSlot.toUpperCase()} was cleared because A and B must be different. Choose another market explicitly.`,
       "stale",
     );
-  } else if (persistSelectedPair()) {
+  } else if (persistSelectedSelection()) {
     hideStatus(byId("workspace-context-notice"));
   }
   const pair = selectedPairState();
@@ -7033,7 +7162,7 @@ function selectWorkspaceMarket(slot, marketIdValue) {
       pair.marketA && pair.marketB && pair.marketA !== pair.marketB
     ),
   });
-  persistSelectedPair();
+  persistSelectedSelection();
   replaceCurrentRoute();
   refreshWorkspacePageData();
 }
@@ -7042,19 +7171,28 @@ function selectWorkspaceToken(newToken) {
   const previousToken = app.route?.kind === "workspace" ? app.route.token : "";
   if (!newToken || !navigation) return false;
   clearScreenerQualityDrilldown({ pairComplete: false });
-  delete app.pairSelections[newToken];
-  writePairSelections();
   const page = app.route?.kind === "workspace" ? app.route.page : "markets";
+  const saved = normalizedSavedSelection(app.pairSelections[newToken]);
+  const state = saved
+    ? {
+      ...currentWorkspaceRouteState(page),
+      marketA: saved.marketA,
+      marketB: saved.marketB,
+      selection: saved.selection,
+    }
+    : workspaceStateWithoutMarkets(page);
+  delete state.pairMode;
+  if (!saved) state.pairMode = "manual";
   navigateTo(navigation.buildWorkspacePath(
     newToken,
     page,
-    workspaceStateWithoutMarkets(page),
+    state,
   ));
   showStatus(
     byId("workspace-context-notice"),
     previousToken
-      ? `Token changed from ${previousToken} to ${newToken}. The previous markets were cleared.`
-      : `Choose two ${newToken} markets.`,
+      ? `Token changed from ${previousToken} to ${newToken}. ${saved ? "The saved market selection was restored." : "Choose its markets."}`
+      : `Choose the ${newToken} market selection.`,
     "stale",
   );
   return true;
@@ -7064,6 +7202,7 @@ function workspaceStateWithoutMarkets(page) {
   const state = currentWorkspaceRouteState(page);
   delete state.marketA;
   delete state.marketB;
+  delete state.selection;
   state.pairMode = "manual";
   return state;
 }
@@ -7389,7 +7528,7 @@ function bindEvents() {
     );
     app.comparisonChartResizeObserver.observe(byId("comparison-plot"));
   }
-  byId("compare-markets").addEventListener("click", applySelectedPair);
+  byId("compare-markets").addEventListener("click", applySelectedSelection);
   byId("export-csv").addEventListener("click", exportVisibleCsv);
   document.addEventListener("click", (event) => {
     const refreshButton = event.target.closest?.("[data-refresh-fact]");

@@ -201,11 +201,11 @@
             </div>
           </div>
           <div class="facts-control">
-            <label for="facts-market-b">Market B</label>
+            <label for="facts-market-b">Market B (optional)</label>
             <div class="market-selector-shell">
               <select
                 id="facts-market-b"
-                aria-label="Market B"
+                aria-label="Market B (optional)"
                 aria-describedby="selector-policy facts-market-b-warning-status"
               ></select>
               <div id="facts-market-b-warning" class="market-warning-anchor" hidden>
@@ -237,19 +237,19 @@
             </div>
           </div>
           <button id="compare-markets" class="compare-command" type="button">
-            Apply pair
+            Apply selection
           </button>
         </div>
         <div id="selector-policy" class="module-context selector-policy" aria-label="A and B selection policy">
           <span class="module-chip">Depth-screened defaults</span>
-          <span class="module-chip">Shared A/B identities</span>
+          <span class="module-chip">Shared market identities</span>
           <details class="context-info">
             <summary aria-label="A and B market selection policy details">
               <i data-lucide="info"></i>
             </summary>
             <div class="context-tooltip" role="tooltip">
-              <strong>Pair-selection policy</strong>
-              <p>Initial A/B choices prefer markets with integrity-valid measured depth and no depth-relevant quality flags. The daily comparison uses the same selected market IDs, so its defaults can differ from the quality-weighted primary market.</p>
+              <strong>Market-selection policy</strong>
+              <p>Initial choices prefer markets with integrity-valid measured depth and no depth-relevant quality flags. Market B is optional; when selected, the daily comparison uses the same market IDs.</p>
             </div>
           </details>
         </div>
@@ -268,14 +268,14 @@
               <div class="module-context" aria-label="Market coverage module scope">
                 <span class="module-chip">Full catalog</span>
                 <span class="module-chip">CEX + DEX</span>
-                <span class="module-chip">A/B selectable</span>
+                <span class="module-chip">Markets selectable</span>
                 <details class="context-info">
                   <summary aria-label="Token market coverage details">
                     <i data-lucide="info"></i>
                   </summary>
                   <div class="context-tooltip" role="tooltip">
                     <strong>Market coverage</strong>
-                    <p>Review every cataloged CEX instrument and DEX pool for the selected Token. Set any two distinct markets as A and B before moving to comparison or execution analysis.</p>
+                    <p>Review every cataloged CEX instrument and DEX pool for the selected Token. Set Market A and optionally Market B before opening research views.</p>
                   </div>
                 </details>
               </div>
@@ -299,7 +299,7 @@
                   <th scope="col">±100 bps Depth</th>
                   <th scope="col">Coverage</th>
                   <th scope="col">Status</th>
-                  <th scope="col">Pair Actions</th>
+                  <th scope="col">Market Actions</th>
                 </tr>
               </thead>
               <tbody id="workspace-market-body">

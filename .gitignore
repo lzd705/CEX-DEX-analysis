@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 dashboard/node_modules/
+dashboard/test-results/
+dashboard/playwright-report/
 dashboard/state/*.local.json
 dashboard/state/*.local.jsonl
 .env

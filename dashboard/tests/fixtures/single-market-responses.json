@@ -1,0 +1,153 @@
+{
+  "summary": {
+    "metadata": {
+      "response_scope": "screener_summary",
+      "summary_version": 3,
+      "start_date": "2026-07-01",
+      "end_date": "2026-07-30",
+      "available_start": "2026-05-14",
+      "available_end": "2026-07-30",
+      "default_workspace_token": "AAVE",
+      "data_generation": "single-market-fixture",
+      "sources": [],
+      "tvl_note": "TVL unavailable in browser fixture.",
+      "cex_depth_note": "CEX depth unavailable in browser fixture.",
+      "dex_depth_note": "DEX depth unavailable in browser fixture."
+    },
+    "tokens": [
+      {
+        "token_symbol": "AAVE",
+        "absolute_price_gap": null,
+        "absolute_price_gap_method": "symmetric_midpoint_relative_gap",
+        "aggregate_volume_usd": 1000000,
+        "cex_volume_usd": 900000,
+        "dex_volume_usd": 100000,
+        "dex_share": 0.1,
+        "covered_market_count": 2,
+        "primary_cex": null,
+        "primary_dex": null,
+        "quality_status": "ok",
+        "quality_flags": []
+      }
+    ],
+    "cex_markets": [],
+    "dex_pools": []
+  },
+  "catalog_one": {
+    "token_symbol": "AAVE",
+    "metadata": {
+      "time_grain": "daily UTC",
+      "window_start": "2026-07-01",
+      "window_end": "2026-07-30",
+      "data_generation": "single-market-fixture",
+      "sources": [],
+      "primary_selection": { "weights": {} },
+      "market_quality_thresholds": {}
+    },
+    "markets": [
+      {
+        "market_id": "cex:binance:AAVE/USDT",
+        "market_type": "cex",
+        "token_symbol": "AAVE",
+        "venue": "binance",
+        "instrument": "AAVE/USDT",
+        "window_volume_usd": 900000,
+        "coverage_ratio": 1,
+        "observation_days": 30,
+        "quality_status": "ok",
+        "quality_flags": []
+      }
+    ]
+  },
+  "catalog_pair": {
+    "token_symbol": "AAVE",
+    "metadata": {
+      "time_grain": "daily UTC",
+      "window_start": "2026-07-01",
+      "window_end": "2026-07-30",
+      "data_generation": "single-market-fixture",
+      "sources": [],
+      "primary_selection": { "weights": {} },
+      "market_quality_thresholds": {}
+    },
+    "markets": [
+      {
+        "market_id": "cex:binance:AAVE/USDT",
+        "market_type": "cex",
+        "token_symbol": "AAVE",
+        "venue": "binance",
+        "instrument": "AAVE/USDT",
+        "window_volume_usd": 900000,
+        "coverage_ratio": 1,
+        "observation_days": 30,
+        "quality_status": "ok",
+        "quality_flags": []
+      },
+      {
+        "market_id": "dex:eth:uniswap_v3:AAVE/WETH:0.05%",
+        "market_type": "dex",
+        "token_symbol": "AAVE",
+        "venue": "uniswap_v3",
+        "instrument": "AAVE/WETH 0.05%",
+        "window_volume_usd": 100000,
+        "coverage_ratio": 1,
+        "observation_days": 30,
+        "quality_status": "ok",
+        "quality_flags": []
+      }
+    ]
+  },
+  "compare_single": {
+    "token_symbol": "AAVE",
+    "selection_mode": "single",
+    "market_a": { "market_id": "cex:binance:AAVE/USDT", "market_type": "cex", "venue": "binance", "instrument": "AAVE/USDT" },
+    "market_b": null,
+    "market_a_statistics": { "window_return": 0.01, "daily_volatility": 0.02 },
+    "market_b_statistics": null,
+    "latest_comparable_observation": null,
+    "observations": [{ "date": "2026-07-30", "market_a_close": 300, "market_a_volume_usd": 900000 }],
+    "metadata": { "comparison_days": 0, "union_observation_days": 1 }
+  },
+  "compare_pair": {
+    "token_symbol": "AAVE",
+    "selection_mode": "pair",
+    "market_a": { "market_id": "cex:binance:AAVE/USDT", "market_type": "cex", "venue": "binance", "instrument": "AAVE/USDT" },
+    "market_b": { "market_id": "dex:eth:uniswap_v3:AAVE/WETH:0.05%", "market_type": "dex", "venue": "uniswap_v3", "instrument": "AAVE/WETH 0.05%" },
+    "market_a_statistics": { "window_return": 0.01, "daily_volatility": 0.02 },
+    "market_b_statistics": { "window_return": 0.02, "daily_volatility": 0.03 },
+    "latest_comparable_observation": { "date": "2026-07-30", "absolute_spread_usd": 1, "spread_bps": 33 },
+    "observations": [{ "date": "2026-07-30", "market_a_close": 300, "market_b_close": 301, "market_a_volume_usd": 900000, "market_b_volume_usd": 100000, "absolute_spread_usd": 1, "spread_bps": 33 }],
+    "metadata": { "comparison_days": 1, "union_observation_days": 1 }
+  },
+  "execution_single": {
+    "token_symbol": "AAVE",
+    "selection_mode": "single",
+    "market_a": { "market_id": "cex:binance:AAVE/USDT", "market_type": "cex", "venue": "binance", "instrument": "AAVE/USDT" },
+    "market_b": null,
+    "market_a_result": { "status": "not_cataloged_in_snapshot", "rows": [] },
+    "market_b_result": null,
+    "scenarios": [],
+    "metadata": { "snapshot_skew_seconds": null }
+  },
+  "execution_pair": {
+    "token_symbol": "AAVE",
+    "selection_mode": "pair",
+    "market_a": { "market_id": "cex:binance:AAVE/USDT", "market_type": "cex", "venue": "binance", "instrument": "AAVE/USDT" },
+    "market_b": { "market_id": "dex:eth:uniswap_v3:AAVE/WETH:0.05%", "market_type": "dex", "venue": "uniswap_v3", "instrument": "AAVE/WETH 0.05%" },
+    "market_a_result": { "status": "not_cataloged_in_snapshot", "rows": [] },
+    "market_b_result": { "status": "not_cataloged_in_snapshot", "rows": [] },
+    "scenarios": [],
+    "metadata": { "snapshot_skew_seconds": null }
+  },
+  "quality_selected": {
+    "token_symbol": "AAVE",
+    "metadata": { "scope": "selected", "selected_market_ids": ["cex:binance:AAVE/USDT"], "window_start": "2026-07-01", "window_end": "2026-07-30", "daily_quality_report": { "status": "unavailable" } },
+    "markets": [],
+    "rollups": []
+  },
+  "events": {
+    "query": { "token": "AAVE" },
+    "events": [],
+    "metadata": {}
+  }
+}
