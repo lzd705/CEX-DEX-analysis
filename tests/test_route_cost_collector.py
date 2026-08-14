@@ -1336,10 +1336,11 @@ class BoundedRouteCostWireTests(unittest.TestCase):
             None, None, 302, "Found", {}, "https://example.invalid/new"
         ))
 
-    def test_profile_in_place_mutation_during_read_is_rejected(self):
+    def test_profile_metadata_change_after_read_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory_name:
             profile = Path(directory_name) / "trace.json"
             _canonical_private_json(profile, _trace_profile())
+            initial_metadata = profile.stat()
             original_read = os.read
             mutated = False
 
@@ -1352,6 +1353,30 @@ class BoundedRouteCostWireTests(unittest.TestCase):
                     self.assertEqual(len(replacement), len(data))
                     profile.write_bytes(replacement)
                     profile.chmod(0o600)
+                    os.utime(
+                        str(profile),
+                        ns=(
+                            initial_metadata.st_atime_ns,
+                            initial_metadata.st_mtime_ns + 10_000_000_000,
+                        ),
+                    )
+                    changed_metadata = os.fstat(descriptor)
+                    self.assertEqual(
+                        (
+                            changed_metadata.st_dev,
+                            changed_metadata.st_ino,
+                            changed_metadata.st_size,
+                        ),
+                        (
+                            initial_metadata.st_dev,
+                            initial_metadata.st_ino,
+                            initial_metadata.st_size,
+                        ),
+                    )
+                    self.assertNotEqual(
+                        changed_metadata.st_mtime_ns,
+                        initial_metadata.st_mtime_ns,
+                    )
                 return data
 
             with patch.dict(
