@@ -587,6 +587,63 @@ class ShadowInputBuildTests(unittest.TestCase):
             ):
                 self.fixture.build()
 
+    def test_sqlite_staging_rejects_in_place_mutation_after_read(self):
+        original = route_shadow_inputs._stage_sqlite_capture
+
+        @contextmanager
+        def stage_then_mutate_after_read(capture):
+            with original(capture) as uri:
+                yield uri
+                path = Path(unquote(urlsplit(uri).path))
+                descriptor = os.open(str(path), os.O_RDWR)
+                try:
+                    original_byte = os.pread(descriptor, 1, 0)
+                    os.pwrite(descriptor, b"X" if original_byte != b"X" else b"Y", 0)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+
+        with patch.object(
+            route_shadow_inputs,
+            "_stage_sqlite_capture",
+            stage_then_mutate_after_read,
+        ):
+            with self.assertRaisesRegex(ValueError, "SQLite staging|staging identity"):
+                self.fixture.build()
+
+    def test_sqlite_staging_rejects_same_byte_path_replacement_after_read(self):
+        original = route_shadow_inputs._stage_sqlite_capture
+
+        @contextmanager
+        def stage_then_replace_after_read(capture):
+            with original(capture) as uri:
+                yield uri
+                path = Path(unquote(urlsplit(uri).path))
+                payload = path.read_bytes()
+                replacement = path.parent / "replacement.sqlite3"
+                descriptor = os.open(
+                    str(replacement),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                try:
+                    os.fchmod(descriptor, 0o600)
+                    offset = 0
+                    while offset < len(payload):
+                        offset += os.write(descriptor, payload[offset:])
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                os.replace(str(replacement), str(path))
+
+        with patch.object(
+            route_shadow_inputs,
+            "_stage_sqlite_capture",
+            stage_then_replace_after_read,
+        ):
+            with self.assertRaisesRegex(ValueError, "SQLite staging|staging identity"):
+                self.fixture.build()
+
     def test_minimal_observed_execution_rows_do_not_prove_capacity(self):
         minimal_fields = [
             "snapshot_id", "source_snapshot_id", "observed_at",

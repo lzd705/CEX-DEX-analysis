@@ -1046,6 +1046,35 @@ def _parse_lifecycle(payload: bytes, configured_ids: Sequence[str]) -> set:
     return withheld
 
 
+def _verify_staged_sqlite(
+    descriptor: int, path: Path, identity: SourceFileIdentity
+) -> None:
+    try:
+        metadata = os.fstat(descriptor)
+        path_metadata = os.stat(str(path), follow_symlinks=False)
+        verified_size, verified_sha = _descriptor_sha256(
+            descriptor,
+            identity.size,
+        )
+    except OSError as error:
+        raise ValueError("private SQLite staging identity is invalid") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or metadata.st_nlink != 1
+        or path_metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or stat.S_IMODE(path_metadata.st_mode) != 0o600
+        or (metadata.st_dev, metadata.st_ino)
+        != (path_metadata.st_dev, path_metadata.st_ino)
+        or metadata.st_size != identity.size
+        or path_metadata.st_size != identity.size
+        or verified_size != identity.size
+        or verified_sha != identity.sha256
+    ):
+        raise ValueError("private SQLite staging identity is invalid")
+
+
 @contextmanager
 def _stage_sqlite_capture(capture: _CapturedSource) -> Iterator[str]:
     _verify_capture(capture)
@@ -1094,33 +1123,34 @@ def _stage_sqlite_capture(capture: _CapturedSource) -> Iterator[str]:
                         raise OSError("private SQLite staging write made no progress")
                     offset += written
             os.fsync(descriptor)
-            metadata = os.fstat(descriptor)
-            path_metadata = os.stat(str(path), follow_symlinks=False)
-            verified_size, verified_sha = _descriptor_sha256(
-                descriptor,
-                capture.identity.size,
-            )
             if (
-                not stat.S_ISREG(metadata.st_mode)
-                or not stat.S_ISREG(path_metadata.st_mode)
-                or metadata.st_nlink != 1
-                or path_metadata.st_nlink != 1
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or stat.S_IMODE(path_metadata.st_mode) != 0o600
-                or (metadata.st_dev, metadata.st_ino)
-                != (path_metadata.st_dev, path_metadata.st_ino)
-                or metadata.st_size != capture.identity.size
-                or path_metadata.st_size != capture.identity.size
-                or total != capture.identity.size
+                total != capture.identity.size
                 or digest.hexdigest() != capture.identity.sha256
-                or verified_size != capture.identity.size
-                or verified_sha != capture.identity.sha256
             ):
                 raise ValueError("private SQLite staging identity is invalid")
+            _verify_staged_sqlite(descriptor, path, capture.identity)
+            _verify_capture(capture)
+            body_failed = False
+            try:
+                yield "{}?mode=ro&immutable=1".format(path.as_uri())
+            except BaseException:
+                body_failed = True
+                raise
+            finally:
+                verification_error = None
+                try:
+                    _verify_staged_sqlite(descriptor, path, capture.identity)
+                except Exception as error:
+                    verification_error = error
+                try:
+                    _verify_capture(capture)
+                except Exception as error:
+                    if verification_error is None:
+                        verification_error = error
+                if verification_error is not None and not body_failed:
+                    raise verification_error
         finally:
             os.close(descriptor)
-        _verify_capture(capture)
-        yield "{}?mode=ro&immutable=1".format(path.as_uri())
 
 
 def _parse_sqlite(
