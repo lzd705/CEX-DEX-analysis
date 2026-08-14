@@ -968,7 +968,7 @@ def _project_canary_universe(universe: Mapping[str, Any]) -> Dict[str, Any]:
     return {**dict(universe), "selected_legs": legs, "routes": routes}
 
 
-def _run_shadow_owned(data_dir: Path, *, run_id: str, started_at: datetime, monotonic_ns: int, boot_id: str, expected_phase: Optional[str], lock_fd: int) -> Dict[str, Any]:
+def _run_shadow_owned(data_dir: Path, *, run_id: str, dispatch_id: Optional[str], invocation_id: Optional[str], started_at: datetime, monotonic_ns: int, boot_id: str, expected_phase: Optional[str], lock_fd: int) -> Dict[str, Any]:
     # Lazy imports keep the fixed public wrapper importable while Tasks 1/2/3
     # remain independently testable and avoid module-import cycles.
     try:
@@ -1024,10 +1024,6 @@ def _run_shadow_owned(data_dir: Path, *, run_id: str, started_at: datetime, mono
     core_root = root / "routes/core"
     raw_root = root / "raw/route-cohort"
     static_token_config = PROJECT_ROOT / "config/tokens.csv"
-    dispatch_id = os.environ.get("ROUTE_SHADOW_DISPATCH_ID")
-    invocation_id = os.environ.get("INVOCATION_ID")
-    if invocation_id is None:
-        dispatch_id = None
     run_dir = _ensure_ledger_root(root) / run_id
     phase_view = load_active_phase_state(shadow_root)
     phase_mismatch = (
@@ -1286,12 +1282,21 @@ def _run_shadow_with_capability(data_dir: Path, *, expected_phase: Optional[str]
     invocation = os.environ.get("INVOCATION_ID")
     dispatch = os.environ.get("ROUTE_SHADOW_DISPATCH_ID")
     explicit = os.environ.get("ROUTE_SHADOW_RUN_ID")
-    if explicit and invocation and explicit != invocation:
+    scheduled = dispatch is not None
+    if scheduled and explicit is not None and explicit != invocation:
         raise ValueError("explicit run ID and INVOCATION_ID differ")
-    run_id = _validate_run_id(explicit or invocation or run_id_factory())
-    scheduled = invocation is not None
-    if scheduled and (_HEX32.fullmatch(invocation or "") is None or run_id != invocation or _HEX32.fullmatch(dispatch or "") is None):
+    if scheduled and (
+        _HEX32.fullmatch(dispatch) is None
+        or _HEX32.fullmatch(invocation or "") is None
+    ):
         raise ValueError("scheduled route Shadow identity is invalid")
+    run_id = _validate_run_id(
+        invocation if scheduled else (
+            explicit if explicit is not None else run_id_factory()
+        )
+    )
+    dispatch_id = dispatch if scheduled else None
+    invocation_id = invocation if scheduled else None
     lock_fd = _open_collection_lock(data_dir)
     acquired = False
     owner_nonce = None
@@ -1301,7 +1306,7 @@ def _run_shadow_with_capability(data_dir: Path, *, expected_phase: Optional[str]
             acquired = True
         except BlockingIOError:
             now = clock()
-            terminal = _install_busy_closure(data_dir, run_id=run_id, dispatch_id=dispatch if scheduled else None, invocation_id=invocation if scheduled else None, started_at=_utc_text(now), boot_id=_boot_id(), monotonic_ns=time.monotonic_ns())
+            terminal = _install_busy_closure(data_dir, run_id=run_id, dispatch_id=dispatch_id, invocation_id=invocation_id, started_at=_utc_text(now), boot_id=_boot_id(), monotonic_ns=time.monotonic_ns())
             return {"status": "terminal", **terminal}
         authoritative = _authority_view(
             load_committed_route_shadow_authority(Path(data_dir))
@@ -1323,7 +1328,7 @@ def _run_shadow_with_capability(data_dir: Path, *, expected_phase: Optional[str]
         monotonic_ns = time.monotonic_ns()
         owner_nonce = uuid.uuid4().hex
         write_shadow_lock_owner(lock_fd, run_id=run_id, boot_id=boot_id, nonce=owner_nonce)
-        return _run_shadow_owned(data_dir, run_id=run_id, started_at=now, monotonic_ns=monotonic_ns, boot_id=boot_id, expected_phase=expected_phase, lock_fd=lock_fd)
+        return _run_shadow_owned(data_dir, run_id=run_id, dispatch_id=dispatch_id, invocation_id=invocation_id, started_at=now, monotonic_ns=monotonic_ns, boot_id=boot_id, expected_phase=expected_phase, lock_fd=lock_fd)
     finally:
         if acquired:
             if owner_nonce is not None:

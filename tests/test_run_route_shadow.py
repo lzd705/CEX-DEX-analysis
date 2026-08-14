@@ -84,6 +84,39 @@ class ShadowLockPriorityTests(unittest.TestCase):
         (self.data_dir / "collection").mkdir(parents=True)
         self.lock_path = self.data_dir / "collection/collection.lock"
 
+    @staticmethod
+    def _enabled_authority():
+        return {
+            "schema": "route_shadow_authority_view/v1",
+            "status": "enabled",
+            "transaction_id": "a" * 64,
+            "authority_sha256": "b" * 64,
+            "primary_unit_projection_sha256": "c" * 64,
+            "reason_code": None,
+        }
+
+    def _run_busy_shadow(self, environment, factory):
+        with self.lock_path.open("a+") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                run_route_shadow,
+                "_run_shadow_owned",
+                side_effect=AssertionError("busy run must call zero sources"),
+            ), patch.object(
+                run_route_shadow,
+                "load_committed_route_shadow_authority",
+                return_value=self._enabled_authority(),
+            ), patch.object(
+                run_route_shadow,
+                "_trusted_utc_now",
+                return_value=NOW,
+            ), patch.object(
+                run_route_shadow,
+                "_new_manual_run_id",
+                **factory,
+            ):
+                return run_shadow_once(self.data_dir)
+
     def test_busy_lock_commits_one_started_terminal_closure_and_zero_sources(self):
         with self.lock_path.open("a+") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -122,6 +155,113 @@ class ShadowLockPriorityTests(unittest.TestCase):
         ledger = load_run_ledger(self.data_dir, "manual-busy")
         self.assertFalse(ledger["terminal"]["lock_acquired"])
         self.assertIsNone(ledger["terminal"]["verification_sha256"])
+
+    def test_busy_manual_run_ignores_ambient_invocation_id_without_dispatch_marker(self):
+        result = self._run_busy_shadow(
+            {"INVOCATION_ID": "1" * 32},
+            {"return_value": "manual-ambient"},
+        )
+
+        self.assertEqual(result["run_id"], "manual-ambient")
+        ledger = load_run_ledger(self.data_dir, "manual-ambient")
+        self.assertIsNone(ledger["started"]["dispatch_id"])
+        self.assertIsNone(ledger["started"]["invocation_id"])
+        self.assertIsNone(ledger["terminal"]["dispatch_id"])
+
+    def test_busy_manual_run_uses_explicit_id_without_dispatch_marker(self):
+        result = self._run_busy_shadow(
+            {
+                "INVOCATION_ID": "1" * 32,
+                "ROUTE_SHADOW_RUN_ID": "manual-explicit",
+            },
+            {"side_effect": AssertionError("explicit manual ID must win")},
+        )
+
+        self.assertEqual(result["run_id"], "manual-explicit")
+        ledger = load_run_ledger(self.data_dir, "manual-explicit")
+        self.assertIsNone(ledger["started"]["dispatch_id"])
+        self.assertIsNone(ledger["started"]["invocation_id"])
+
+    def test_scheduled_run_binds_valid_dispatch_and_invocation_ids(self):
+        dispatch = "2" * 32
+        invocation = "3" * 32
+        phase = {
+            "phase": "canary",
+            "phase_state_sha256": hashlib.sha256(
+                b"route-shadow-phase/implicit-canary/v1\n"
+            ).hexdigest(),
+            "phase_transition_id": None,
+            "state": None,
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "ROUTE_SHADOW_DISPATCH_ID": dispatch,
+                "INVOCATION_ID": invocation,
+            },
+            clear=True,
+        ), patch.object(
+            run_route_shadow,
+            "load_committed_route_shadow_authority",
+            side_effect=(self._enabled_authority(), self._enabled_authority()),
+        ), patch(
+            "scripts.route_publication.load_active_phase_state",
+            return_value=phase,
+        ), patch(
+            "scripts.route_shadow_inputs.build_shadow_universe",
+            side_effect=ValueError("fixture source failure"),
+        ), patch.object(
+            run_route_shadow, "_trusted_utc_now", return_value=NOW
+        ):
+            result = run_shadow_once(self.data_dir)
+
+        self.assertEqual(result["status"], "terminal")
+        ledger = load_run_ledger(self.data_dir, invocation)
+        self.assertEqual(ledger["started"]["run_id"], invocation)
+        self.assertEqual(ledger["started"]["dispatch_id"], dispatch)
+        self.assertEqual(ledger["started"]["invocation_id"], invocation)
+        self.assertEqual(ledger["terminal"]["dispatch_id"], dispatch)
+
+    def test_dispatch_marker_rejects_missing_or_invalid_scheduled_identity(self):
+        dispatch = "4" * 32
+        invocation = "5" * 32
+        invalid_environments = (
+            {"ROUTE_SHADOW_DISPATCH_ID": dispatch},
+            {
+                "ROUTE_SHADOW_DISPATCH_ID": dispatch,
+                "INVOCATION_ID": "A" * 32,
+            },
+            {
+                "ROUTE_SHADOW_DISPATCH_ID": "D" * 32,
+                "INVOCATION_ID": invocation,
+            },
+            {
+                "ROUTE_SHADOW_DISPATCH_ID": dispatch,
+                "INVOCATION_ID": invocation,
+                "ROUTE_SHADOW_RUN_ID": "6" * 32,
+            },
+            {
+                "ROUTE_SHADOW_DISPATCH_ID": dispatch,
+                "INVOCATION_ID": invocation,
+                "ROUTE_SHADOW_RUN_ID": "",
+            },
+        )
+        for environment in invalid_environments:
+            with self.subTest(environment=environment), patch.dict(
+                os.environ, environment, clear=True
+            ), patch.object(
+                run_route_shadow,
+                "load_committed_route_shadow_authority",
+                return_value=self._enabled_authority(),
+            ), patch.object(
+                run_route_shadow,
+                "_open_collection_lock",
+                side_effect=AssertionError("invalid identity must not open lock"),
+            ):
+                with self.assertRaises(ValueError):
+                    run_shadow_once(self.data_dir)
+
+        self.assertFalse((self.data_dir / "routes/shadow/ledger").exists())
 
     def test_disabled_authority_makes_zero_source_or_ledger_calls(self):
         with patch.object(
