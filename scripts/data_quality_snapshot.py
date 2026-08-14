@@ -13,6 +13,7 @@ import stat
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
@@ -2074,8 +2075,18 @@ def _execution_market_identity(
     if market_type == "cex":
         exchange = row["exchange"].strip().lower()
         symbol = row["cex_symbol"].strip().upper()
-        if not exchange or not symbol:
-            raise _PublicDataError("required_field_null")
+        symbol_parts = symbol.split("/")
+        base_asset = row["base_asset"].strip().upper()
+        quote_asset = row["source_quote_asset"].strip().upper()
+        if (
+            not exchange
+            or len(symbol_parts) != 2
+            or not all(symbol_parts)
+            or token != symbol_parts[0]
+            or base_asset != symbol_parts[0]
+            or quote_asset != symbol_parts[1]
+        ):
+            raise _PublicDataError("invalid_execution_contract")
         expected_market_id = f"cex:{exchange}:{symbol}"
         identity = (token, exchange, symbol)
     else:
@@ -2091,6 +2102,143 @@ def _execution_market_identity(
     if row["market_id"].strip() != expected_market_id:
         raise _PublicDataError("invalid_market_identity")
     return expected_market_id, identity
+
+
+def _validate_execution_rows_equivalent(
+    rows: Sequence[Mapping[str, str]],
+    *,
+    market_type: str,
+) -> None:
+    from scripts.execution_cost import (
+        DEX_MEASURED_PROVENANCE_COLUMNS,
+        MEASURED_PROVENANCE_COLUMNS,
+        RESULT_NUMERIC_COLUMNS,
+        _assert_base_unit_aligned,
+        _assert_close,
+        _base_unit_decimals,
+        _expected_market_id,
+        execution_fact_row,
+        finite_decimal,
+        optional_decimal,
+        usd_price_timing,
+    )
+
+    for row in rows:
+        if _expected_market_id(dict(row)) != row["market_id"]:
+            raise ValueError("execution market identity mismatch")
+        status = row["status"]
+        if market_type == "cex":
+            if row["fee_status"] != "excluded_unknown_account_tier":
+                raise ValueError("invalid CEX fee status")
+            if row["fee_rate_bps"] or row["fee_amount_usd"]:
+                raise ValueError("uncollected CEX fee facts")
+            if "taker_fee" not in {
+                value.strip()
+                for value in row["excluded_costs"].split(",")
+                if value.strip()
+            }:
+                raise ValueError("missing CEX taker-fee exclusion")
+        if status in {"unsupported", "failed"}:
+            if any(row[field] for field in RESULT_NUMERIC_COLUMNS):
+                raise ValueError("terminal execution row contains numeric facts")
+            continue
+
+        if any(not row[field] for field in MEASURED_PROVENANCE_COLUMNS):
+            raise ValueError("measured execution provenance is incomplete")
+        if not _is_sha256(row["raw_response_sha256"]):
+            raise ValueError("measured execution source hash is invalid")
+        if market_type == "dex":
+            if any(not row[field] for field in DEX_MEASURED_PROVENANCE_COLUMNS):
+                raise ValueError("DEX execution provenance is incomplete")
+            block_number = row["block_number"]
+            if (
+                not block_number.isdigit()
+                or int(block_number) <= 0
+                or row["state_observed_at"] != row["block_timestamp"]
+                or row["source_sequence"] != block_number
+                or not usd_price_timing(
+                    row["state_observed_at"], row["usd_price_observed_at"]
+                )["usable"]
+            ):
+                raise ValueError("DEX execution timing or block lineage is invalid")
+            fee_rate = optional_decimal(row["fee_rate_bps"])
+            if (
+                fee_rate is None
+                or fee_rate != fee_rate.to_integral_value()
+                or fee_rate >= Decimal(10_000)
+            ):
+                raise ValueError("DEX execution fee rate is invalid")
+
+        rebuilt = execution_fact_row(
+            common=dict(row),
+            direction=row["direction"],
+            requested_notional_usd=row["requested_notional_usd"],
+            status=status,
+            status_reason=row["status_reason"],
+            reference_price_quote_per_token=row["reference_price_quote_per_token"],
+            quote_to_usd=row["quote_to_usd"],
+            target_token_quantity=row["target_token_quantity"],
+            filled_token_quantity=row["filled_token_quantity"] or None,
+            quote_amount=row["quote_amount"] or None,
+            levels_or_ticks_consumed=row["levels_or_ticks_consumed"] or None,
+            ending_marginal_price_quote_per_token=(
+                row["ending_marginal_price_quote_per_token"] or None
+            ),
+            fee_amount_usd=row["fee_amount_usd"] or None,
+            error=row["error"],
+        )
+        for field in RESULT_NUMERIC_COLUMNS:
+            expected_value = optional_decimal(rebuilt[field])
+            actual_value = optional_decimal(row[field])
+            if expected_value is None:
+                if actual_value is not None:
+                    raise ValueError("execution formula field must be blank")
+            else:
+                _assert_close(actual_value, expected_value, label=field)
+
+        reference_quote = finite_decimal(
+            row["reference_price_quote_per_token"], positive=True
+        )
+        conversion = finite_decimal(row["quote_to_usd"], positive=True)
+        requested = finite_decimal(row["requested_notional_usd"], positive=True)
+        target = finite_decimal(row["target_token_quantity"], positive=True)
+        target_decimals = _base_unit_decimals(
+            row["target_token_decimals"], label="target_token_decimals"
+        )
+        quote_decimals = _base_unit_decimals(
+            row["quote_token_decimals"], label="quote_token_decimals"
+        )
+        if target_decimals is None:
+            _assert_close(
+                target,
+                requested / (reference_quote * conversion),
+                label="target_token_quantity",
+            )
+        else:
+            _assert_base_unit_aligned(
+                target, target_decimals, label="target_token_quantity"
+            )
+            target_fraction = Fraction(target)
+            theoretical_fraction = Fraction(requested) / (
+                Fraction(reference_quote) * Fraction(conversion)
+            )
+            unit_fraction = Fraction(1, 10**target_decimals)
+            if not (
+                target_fraction
+                <= theoretical_fraction
+                < target_fraction + unit_fraction
+            ):
+                raise ValueError("quantized execution target is not a floor")
+        _assert_base_unit_aligned(
+            optional_decimal(row["filled_token_quantity"]),
+            target_decimals,
+            label="filled_token_quantity",
+        )
+        _assert_base_unit_aligned(
+            optional_decimal(row["quote_amount"]),
+            quote_decimals,
+            label="quote_amount",
+        )
 
 
 def _evaluate_execution(
@@ -2319,6 +2467,7 @@ def _evaluate_execution(
                         for field in RESULT_NUMERIC_COLUMNS
                     ):
                         raise ValueError("invalid terminal execution scenarios")
+        _validate_execution_rows_equivalent(rows, market_type=market_type)
         if observed_count == expected_count and all(
             row["status"] in {"observed", "partial"} for row in rows
         ):
@@ -3796,16 +3945,44 @@ def _evaluate_route_shadow(
     shadow_root = data_dir / Path(pointer_capture["identity"]["logical_path"]).parent
     routes_root = shadow_root.parent
     core_root = routes_root / "core"
+    run_members = (
+        ("route_universe.json", 16 * 1024 * 1024),
+        ("baseline_manifest.json", 16 * 1024 * 1024),
+        ("route-cost-evidence.json", 32 * 1024 * 1024),
+        ("audit.json", 16 * 1024 * 1024),
+    )
+    core_members = (
+        ("manifest.json", 16 * 1024 * 1024),
+        ("route_candidates.csv", 128 * 1024 * 1024),
+        ("route_legs.csv", 128 * 1024 * 1024),
+        ("route_timing.csv", 128 * 1024 * 1024),
+        ("route_cohort.sqlite3", 512 * 1024 * 1024),
+    )
+    initial_run_captures: Dict[str, Dict[str, Any]] = {}
+    initial_core_captures: Dict[str, Dict[str, Any]] = {}
     try:
-        initial_cost_capture = _capture_fixed_tree_file(
-            shadow_root,
-            ("runs", pointer["run_id"], "route-cost-evidence.json"),
-            logical_path="route_shadow_bundle/route-cost-evidence.json",
-            byte_limit=32 * 1024 * 1024,
-        )
+        for filename, byte_limit in run_members:
+            initial_run_captures[filename] = _capture_fixed_tree_file(
+                shadow_root,
+                ("runs", pointer["run_id"], filename),
+                logical_path="route_shadow_bundle/" + filename,
+                byte_limit=byte_limit,
+            )
+            family["source"]["inputs"].append(
+                initial_run_captures[filename]["identity"]
+            )
+        for filename, byte_limit in core_members:
+            initial_core_captures[filename] = _capture_fixed_tree_file(
+                core_root,
+                ("bundles", pointer["route_cohort_id"], filename),
+                logical_path="route_shadow_core/" + filename,
+                byte_limit=byte_limit,
+            )
+            family["source"]["inputs"].append(
+                initial_core_captures[filename]["identity"]
+            )
     except _PublicDataError as error:
         return _set_failed(family, error.reason)
-    family["source"]["inputs"].append(initial_cost_capture["identity"])
     family["source"]["inputs"].sort(key=lambda item: item["logical_path"])
     try:
         from scripts.route_publication import (
@@ -3823,19 +4000,6 @@ def _evaluate_route_shadow(
     if loaded.get("pointer") != pointer:
         return _set_failed(family, "route_pointer_changed")
 
-    run_members = (
-        ("route_universe.json", 16 * 1024 * 1024),
-        ("baseline_manifest.json", 16 * 1024 * 1024),
-        ("route-cost-evidence.json", 32 * 1024 * 1024),
-        ("audit.json", 16 * 1024 * 1024),
-    )
-    core_members = (
-        ("manifest.json", 16 * 1024 * 1024),
-        ("route_candidates.csv", 128 * 1024 * 1024),
-        ("route_legs.csv", 128 * 1024 * 1024),
-        ("route_timing.csv", 128 * 1024 * 1024),
-        ("route_cohort.sqlite3", 512 * 1024 * 1024),
-    )
     run_captures: Dict[str, Dict[str, Any]] = {}
     core_captures: Dict[str, Dict[str, Any]] = {}
     try:
@@ -3874,7 +4038,10 @@ def _evaluate_route_shadow(
         for filename, _limit in run_members
     ):
         return _set_failed(family, "route_artifact_changed")
-    if initial_cost_capture != run_captures["route-cost-evidence.json"]:
+    if (
+        initial_run_captures != run_captures
+        or initial_core_captures != core_captures
+    ):
         return _set_failed(family, "route_artifact_changed")
     run_expected_hashes = {
         "route_universe.json": pointer["route_universe_sha256"],
@@ -3902,16 +4069,6 @@ def _evaluate_route_shadow(
         )
     ):
         return _set_failed(family, "route_artifact_hash_mismatch")
-    family["source"]["inputs"].extend(
-        run_captures[filename]["identity"]
-        for filename, _limit in run_members
-        if filename != "route-cost-evidence.json"
-    )
-    family["source"]["inputs"].extend(
-        core_captures[filename]["identity"] for filename, _limit in core_members
-    )
-    family["source"]["inputs"].sort(key=lambda item: item["logical_path"])
-
     cost = evidence["cost_evidence"]
     audit = evidence["audit"]
     bindings = cost["bindings"]

@@ -1351,10 +1351,61 @@ class DataQualitySnapshotDepthAdapterTests(unittest.TestCase):
 
 
 class DataQualitySnapshotExecutionAdapterTests(unittest.TestCase):
+    def test_incomplete_execution_grid_still_uses_production_row_semantics(self):
+        cases = []
+        bad_formula = _execution_rows("cex")[:-1]
+        bad_formula[0]["fill_ratio"] = "0.123"
+        cases.append(("cex", bad_formula))
+        bad_fee = _execution_rows("cex")[:-1]
+        for row in bad_fee:
+            row["fee_status"] = "invented"
+        cases.append(("cex", bad_fee))
+        stale_price = _execution_rows("dex")[:-1]
+        for row in stale_price:
+            row["usd_price_observed_at"] = "2026-08-13T09:00:00Z"
+        cases.append(("dex", stale_price))
+
+        for market_type, rows in cases:
+            with self.subTest(market_type=market_type):
+                with tempfile.TemporaryDirectory() as directory:
+                    _write_csv(
+                        Path(directory)
+                        / f"{market_type}_execution_cost_latest.csv",
+                        EXECUTION_HEADER,
+                        rows,
+                    )
+
+                    family = _family(
+                        _snapshot(directory), f"{market_type}_execution_cost"
+                    )
+
+                    self.assertEqual(family["state"], "failed")
+                    self.assertEqual(
+                        family["failure_reason"], "invalid_execution_contract"
+                    )
+
     def test_execution_rows_bind_exact_retained_market_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = _execution_rows("cex")
             rows[0]["token_symbol"] = "ETH"
+            _write_csv(
+                Path(directory) / "cex_execution_cost_latest.csv",
+                EXECUTION_HEADER,
+                rows,
+            )
+
+            family = _family(_snapshot(directory), "cex_execution_cost")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(
+                family["failure_reason"], "invalid_execution_contract"
+            )
+
+    def test_cex_execution_quote_asset_matches_exact_symbol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = _execution_rows("cex")
+            for row in rows:
+                row["source_quote_asset"] = "USD"
             _write_csv(
                 Path(directory) / "cex_execution_cost_latest.csv",
                 EXECUTION_HEADER,
@@ -2210,6 +2261,49 @@ class DataQualitySnapshotTrackedRepositoryDataTests(unittest.TestCase):
 
 
 class DataQualitySnapshotRoutePointerTests(unittest.TestCase):
+    def test_failed_shadow_audit_bytes_remain_publication_inputs(self):
+        snapshots = []
+        audit_hashes = []
+        for replacement in (b"{", b"[invalid-audit"):
+            fixture = _publish_route_shadow_fixture()
+            try:
+                data_dir = Path(fixture.temporary.name) / "data"
+                pointer_path = (
+                    data_dir / "local" / "routes" / "shadow" / "latest.json"
+                )
+                pointer = json.loads(pointer_path.read_text())
+                audit_path = (
+                    pointer_path.parent
+                    / "runs"
+                    / pointer["run_id"]
+                    / "audit.json"
+                )
+                audit_path.write_bytes(replacement)
+                audit_hashes.append(hashlib.sha256(replacement).hexdigest())
+
+                snapshot = _snapshot(data_dir)
+                family = _family(
+                    snapshot, "route_shadow_route_cost_evidence"
+                )
+
+                self.assertEqual(family["state"], "failed")
+                self.assertEqual(family["failure_reason"], "route_bundle_invalid")
+                self.assertIn(
+                    audit_hashes[-1],
+                    {item["sha256"] for item in family["source"]["inputs"]},
+                )
+                snapshots.append(snapshot)
+            finally:
+                fixture.doCleanups()
+
+        self.assertNotEqual(
+            snapshots[0]["publication"]["identity"],
+            snapshots[1]["publication"]["identity"],
+        )
+        self.assertNotEqual(
+            snapshots[0]["snapshot_sha256"], snapshots[1]["snapshot_sha256"]
+        )
+
     def test_route_entities_use_uniform_contract_shape(self):
         required_fields = {
             "grain",
