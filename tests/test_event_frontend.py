@@ -17,12 +17,15 @@ def run_app_javascript(source):
     node = shutil.which("node")
     if node is None:
         raise unittest.SkipTest("Node.js is not installed in this runtime")
+    script = APP_PATH.read_text(encoding="utf-8") + "\n" + source
     completed = subprocess.run(
-        [node, "-e", APP_PATH.read_text(encoding="utf-8") + "\n" + source],
+        [node, "-"],
         cwd=PROJECT_ROOT,
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        input=script,
     )
     return json.loads(completed.stdout)
 
@@ -95,11 +98,13 @@ const built = navigation.buildWorkspacePath("STRK", "events", parsed.state);
 console.log(JSON.stringify({{ parsed, built }}));
         """
         completed = subprocess.run(
-            [node, "-e", script],
+            [node, "-"],
             cwd=PROJECT_ROOT,
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            input=script,
         )
         result = json.loads(completed.stdout)
 

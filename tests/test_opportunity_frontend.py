@@ -29,11 +29,13 @@ def run_app_javascript(source: str, *, prelude: str = ""):
         raise unittest.SkipTest("Node.js is not installed in this runtime")
     script = prelude + "\n" + APP_PATH.read_text(encoding="utf-8") + "\n" + source
     completed = subprocess.run(
-        [node, "-e", script],
+        [node, "-"],
         cwd=PROJECT_ROOT,
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        input=script,
     )
     return json.loads(completed.stdout)
 
