@@ -2,8 +2,8 @@
 
 The shadow runner must not hash one filesystem generation and parse another.
 Every parser therefore consumes a private, unlinked descriptor-backed capture;
-SQLite is opened through that same descriptor and raw text bytes are released
-one bounded source at a time.
+SQLite is opened through a private named staging copy of that capture and raw
+text bytes are released one bounded source at a time.
 """
 
 from __future__ import annotations
@@ -21,12 +21,13 @@ import stat
 import sys
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 try:
@@ -1045,14 +1046,81 @@ def _parse_lifecycle(payload: bytes, configured_ids: Sequence[str]) -> set:
     return withheld
 
 
-def _sqlite_capture_uri(capture: _CapturedSource) -> str:
-    if sys.platform == "darwin":
-        descriptor_path = "/dev/fd/{}".format(capture.descriptor)
-    elif sys.platform.startswith("linux"):
-        descriptor_path = "/proc/self/fd/{}".format(capture.descriptor)
-    else:
-        raise ValueError("descriptor-backed SQLite capture is unsupported")
-    return "file:{}?mode=ro&immutable=1".format(descriptor_path)
+@contextmanager
+def _stage_sqlite_capture(capture: _CapturedSource) -> Iterator[str]:
+    _verify_capture(capture)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError("secure SQLite staging is unavailable")
+    with tempfile.TemporaryDirectory(prefix="route-shadow-sqlite-") as directory:
+        os.chmod(directory, 0o700)
+        directory_metadata = os.stat(directory, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
+            raise ValueError("private SQLite staging directory is invalid")
+
+        path = Path(directory) / "market_facts.sqlite3"
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | nofollow
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(str(path), flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                block = os.pread(
+                    capture.descriptor,
+                    min(1024 * 1024, capture.identity.size + 1 - total),
+                    total,
+                )
+                if not block:
+                    break
+                total += len(block)
+                if total > capture.identity.size:
+                    raise ValueError("private SQLite staging size changed")
+                digest.update(block)
+                view = memoryview(block)
+                offset = 0
+                while offset < len(view):
+                    written = os.write(descriptor, view[offset:])
+                    if written <= 0:
+                        raise OSError("private SQLite staging write made no progress")
+                    offset += written
+            os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+            path_metadata = os.stat(str(path), follow_symlinks=False)
+            verified_size, verified_sha = _descriptor_sha256(
+                descriptor,
+                capture.identity.size,
+            )
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or not stat.S_ISREG(path_metadata.st_mode)
+                or metadata.st_nlink != 1
+                or path_metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or stat.S_IMODE(path_metadata.st_mode) != 0o600
+                or (metadata.st_dev, metadata.st_ino)
+                != (path_metadata.st_dev, path_metadata.st_ino)
+                or metadata.st_size != capture.identity.size
+                or path_metadata.st_size != capture.identity.size
+                or total != capture.identity.size
+                or digest.hexdigest() != capture.identity.sha256
+                or verified_size != capture.identity.size
+                or verified_sha != capture.identity.sha256
+            ):
+                raise ValueError("private SQLite staging identity is invalid")
+        finally:
+            os.close(descriptor)
+        _verify_capture(capture)
+        yield "{}?mode=ro&immutable=1".format(path.as_uri())
 
 
 def _parse_sqlite(
@@ -1062,95 +1130,100 @@ def _parse_sqlite(
     lifecycle_withheld: set,
 ) -> Tuple[List[Dict[str, Any]], str]:
     _verify_capture(capture)
-    uri = _sqlite_capture_uri(capture)
-    _verify_capture(capture)
-    try:
-        connection = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error as error:
-        raise ValueError("captured SQLite state is invalid") from error
-    connection.row_factory = sqlite3.Row
-    try:
+    with _stage_sqlite_capture(capture) as uri:
         _verify_capture(capture)
         try:
-            integrity = connection.execute("PRAGMA integrity_check").fetchall()
-            if len(integrity) != 1 or integrity[0][0] != "ok":
-                raise ValueError("captured SQLite integrity check failed")
-            required_tables = {
-                "schema_migrations", "dataset_snapshots", "import_runs",
-                "dataset_state", "tokens", "cex_market_daily",
-                "dex_pool_daily",
-            }
-            actual_tables = {
-                str(row[0]) for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-            if not required_tables <= actual_tables:
-                raise ValueError("captured SQLite schema is incomplete")
-            user_version = connection.execute("PRAGMA user_version").fetchone()[0]
-            migrations = connection.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
-            ).fetchall()
-            if user_version != 1 or [row[0] for row in migrations] != [1]:
-                raise ValueError("captured SQLite schema version is unsupported")
-            current_rows = connection.execute(
-                """
-                SELECT state.singleton_id, state.snapshot_id, state.import_run_id,
-                       snapshot.cex_source_name, snapshot.cex_source_bytes,
-                       snapshot.cex_sha256, snapshot.token_count,
-                       snapshot.cex_row_count, snapshot.dex_row_count,
-                       run.imported_at, run.status, run.snapshot_id AS run_snapshot_id
-                FROM dataset_state state
-                JOIN dataset_snapshots snapshot
-                  ON snapshot.snapshot_id = state.snapshot_id
-                JOIN import_runs run
-                  ON run.run_id = state.import_run_id
-                """
-            ).fetchall()
-            if len(current_rows) != 1:
-                raise ValueError("SQLite dataset current state is not unique")
-            current = current_rows[0]
-            if (
-                current["singleton_id"] != 1
-                or current["status"] != "published"
-                or current["run_snapshot_id"] != current["snapshot_id"]
-            ):
-                raise ValueError("SQLite dataset current state is invalid")
-            imported_at = _timestamp(current["imported_at"], "SQLite import timestamp")
-            if (
-                current["cex_source_name"] != "cex_exchange_volume_daily.csv"
-                or current["cex_source_bytes"] != cex_identity.size
-                or current["cex_sha256"] != cex_identity.sha256
-            ):
-                raise ValueError("SQLite current CEX CSV SHA/source binding is invalid")
-            actual_cex_count = connection.execute(
-                "SELECT COUNT(*) FROM cex_market_daily"
-            ).fetchone()[0]
-            actual_dex_count = connection.execute(
-                "SELECT COUNT(*) FROM dex_pool_daily"
-            ).fetchone()[0]
-            actual_token_count = connection.execute(
-                "SELECT COUNT(*) FROM tokens"
-            ).fetchone()[0]
-            if actual_cex_count != current["cex_row_count"]:
-                raise ValueError("SQLite current CEX row count is invalid")
-            if actual_dex_count != current["dex_row_count"]:
-                raise ValueError("SQLite current DEX row count is invalid")
-            if actual_token_count != current["token_count"]:
-                raise ValueError("SQLite current Token row count is invalid")
-            cex_rows = connection.execute(
-                "SELECT DISTINCT token_symbol, exchange, cex_symbol FROM cex_market_daily"
-            ).fetchall()
-            dex_rows = connection.execute(
-                """
-                SELECT DISTINCT token_symbol, chain, dex, pool_address
-                FROM dex_pool_daily
-                """
-            ).fetchall()
+            connection = sqlite3.connect(uri, uri=True)
         except sqlite3.Error as error:
             raise ValueError("captured SQLite state is invalid") from error
-    finally:
-        connection.close()
+        connection.row_factory = sqlite3.Row
+        try:
+            _verify_capture(capture)
+            try:
+                integrity = connection.execute("PRAGMA integrity_check").fetchall()
+                if len(integrity) != 1 or integrity[0][0] != "ok":
+                    raise ValueError("captured SQLite integrity check failed")
+                required_tables = {
+                    "schema_migrations", "dataset_snapshots", "import_runs",
+                    "dataset_state", "tokens", "cex_market_daily",
+                    "dex_pool_daily",
+                }
+                actual_tables = {
+                    str(row[0]) for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                if not required_tables <= actual_tables:
+                    raise ValueError("captured SQLite schema is incomplete")
+                user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+                migrations = connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                ).fetchall()
+                if user_version != 1 or [row[0] for row in migrations] != [1]:
+                    raise ValueError("captured SQLite schema version is unsupported")
+                current_rows = connection.execute(
+                    """
+                    SELECT state.singleton_id, state.snapshot_id, state.import_run_id,
+                           snapshot.cex_source_name, snapshot.cex_source_bytes,
+                           snapshot.cex_sha256, snapshot.token_count,
+                           snapshot.cex_row_count, snapshot.dex_row_count,
+                           run.imported_at, run.status, run.snapshot_id AS run_snapshot_id
+                    FROM dataset_state state
+                    JOIN dataset_snapshots snapshot
+                      ON snapshot.snapshot_id = state.snapshot_id
+                    JOIN import_runs run
+                      ON run.run_id = state.import_run_id
+                    """
+                ).fetchall()
+                if len(current_rows) != 1:
+                    raise ValueError("SQLite dataset current state is not unique")
+                current = current_rows[0]
+                if (
+                    current["singleton_id"] != 1
+                    or current["status"] != "published"
+                    or current["run_snapshot_id"] != current["snapshot_id"]
+                ):
+                    raise ValueError("SQLite dataset current state is invalid")
+                imported_at = _timestamp(
+                    current["imported_at"], "SQLite import timestamp"
+                )
+                if (
+                    current["cex_source_name"] != "cex_exchange_volume_daily.csv"
+                    or current["cex_source_bytes"] != cex_identity.size
+                    or current["cex_sha256"] != cex_identity.sha256
+                ):
+                    raise ValueError(
+                        "SQLite current CEX CSV SHA/source binding is invalid"
+                    )
+                actual_cex_count = connection.execute(
+                    "SELECT COUNT(*) FROM cex_market_daily"
+                ).fetchone()[0]
+                actual_dex_count = connection.execute(
+                    "SELECT COUNT(*) FROM dex_pool_daily"
+                ).fetchone()[0]
+                actual_token_count = connection.execute(
+                    "SELECT COUNT(*) FROM tokens"
+                ).fetchone()[0]
+                if actual_cex_count != current["cex_row_count"]:
+                    raise ValueError("SQLite current CEX row count is invalid")
+                if actual_dex_count != current["dex_row_count"]:
+                    raise ValueError("SQLite current DEX row count is invalid")
+                if actual_token_count != current["token_count"]:
+                    raise ValueError("SQLite current Token row count is invalid")
+                cex_rows = connection.execute(
+                    "SELECT DISTINCT token_symbol, exchange, cex_symbol "
+                    "FROM cex_market_daily"
+                ).fetchall()
+                dex_rows = connection.execute(
+                    """
+                    SELECT DISTINCT token_symbol, chain, dex, pool_address
+                    FROM dex_pool_daily
+                    """
+                ).fetchall()
+            except sqlite3.Error as error:
+                raise ValueError("captured SQLite state is invalid") from error
+        finally:
+            connection.close()
     _verify_capture(capture)
 
     catalog = []

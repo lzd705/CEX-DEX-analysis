@@ -4,13 +4,16 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import unquote, urlsplit
 
 from scripts import route_shadow_inputs
 from scripts.execution_cost import EXECUTION_COST_COLUMNS
@@ -486,40 +489,97 @@ class ShadowInputBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CEX CSV.*SHA|SHA.*CEX CSV"):
             self.fixture.build()
 
-    def test_sqlite_parser_rejects_a_valid_private_copy_mutated_before_open(self):
-        original = route_shadow_inputs._sqlite_capture_uri
+    def test_sqlite_parser_opens_a_private_named_copy_of_the_capture(self):
+        source = self.fixture.data_dir / "market_facts.sqlite3"
+        expected_size = source.stat().st_size
+        expected_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        real_connect = sqlite3.connect
+        staged_paths = []
 
-        def uri_then_mutate(capture):
-            uri = original(capture)
-            original_bytes = os.pread(capture.descriptor, capture.identity.size, 0)
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "changed.sqlite3"
-                path.write_bytes(original_bytes)
-                connection = sqlite3.connect(str(path))
-                try:
-                    connection.execute(
-                        "UPDATE import_runs SET imported_at = ? WHERE run_id = 'import-1'",
-                        ("2026-08-02T12:00:01+00:00",),
-                    )
-                    connection.commit()
-                finally:
-                    connection.close()
-                changed_bytes = path.read_bytes()
-            os.ftruncate(capture.descriptor, len(changed_bytes))
-            offset = 0
-            while offset < len(changed_bytes):
-                offset += os.pwrite(
-                    capture.descriptor,
-                    changed_bytes[offset:],
-                    offset,
+        def connect_and_assert(database, *args, **kwargs):
+            uri = str(database)
+            parsed = urlsplit(uri)
+            self.assertTrue(kwargs.get("uri"))
+            self.assertEqual(parsed.scheme, "file")
+            self.assertEqual(parsed.query, "mode=ro&immutable=1")
+            staged_path = Path(unquote(parsed.path))
+            self.assertFalse(str(staged_path).startswith("/proc/self/fd/"))
+            self.assertFalse(str(staged_path).startswith("/dev/fd/"))
+            self.assertEqual(staged_path.name, "market_facts.sqlite3")
+
+            metadata = os.stat(str(staged_path), follow_symlinks=False)
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(metadata.st_nlink, 1)
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_size, expected_size)
+            self.assertEqual(
+                hashlib.sha256(staged_path.read_bytes()).hexdigest(),
+                expected_sha,
+            )
+
+            parent_metadata = os.stat(
+                str(staged_path.parent), follow_symlinks=False
+            )
+            self.assertTrue(stat.S_ISDIR(parent_metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(parent_metadata.st_mode), 0o700)
+            staged_paths.append(staged_path)
+            return real_connect(database, *args, **kwargs)
+
+        with patch.object(
+            route_shadow_inputs.sqlite3,
+            "connect",
+            side_effect=connect_and_assert,
+        ):
+            _, manifest = self.fixture.build()
+
+        sqlite_identity = next(
+            item for item in manifest["inputs"]
+            if item["path"] == "market_facts.sqlite3"
+        )
+        self.assertEqual(sqlite_identity["size"], expected_size)
+        self.assertEqual(sqlite_identity["sha256"], expected_sha)
+        self.assertEqual(len(staged_paths), 1)
+        self.assertFalse(staged_paths[0].exists())
+        self.assertFalse(staged_paths[0].parent.exists())
+
+    def test_sqlite_parser_rejects_a_valid_private_copy_mutated_before_open(self):
+        original = route_shadow_inputs._stage_sqlite_capture
+
+        @contextmanager
+        def stage_then_mutate(capture):
+            with original(capture) as uri:
+                original_bytes = os.pread(
+                    capture.descriptor, capture.identity.size, 0
                 )
-            os.fsync(capture.descriptor)
-            return uri
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "changed.sqlite3"
+                    path.write_bytes(original_bytes)
+                    connection = sqlite3.connect(str(path))
+                    try:
+                        connection.execute(
+                            "UPDATE import_runs SET imported_at = ? "
+                            "WHERE run_id = 'import-1'",
+                            ("2026-08-02T12:00:01+00:00",),
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    changed_bytes = path.read_bytes()
+                os.ftruncate(capture.descriptor, len(changed_bytes))
+                offset = 0
+                while offset < len(changed_bytes):
+                    offset += os.pwrite(
+                        capture.descriptor,
+                        changed_bytes[offset:],
+                        offset,
+                    )
+                os.fsync(capture.descriptor)
+                yield uri
 
         with patch.object(
             route_shadow_inputs,
-            "_sqlite_capture_uri",
-            side_effect=uri_then_mutate,
+            "_stage_sqlite_capture",
+            stage_then_mutate,
         ):
             with self.assertRaisesRegex(
                 ValueError,
