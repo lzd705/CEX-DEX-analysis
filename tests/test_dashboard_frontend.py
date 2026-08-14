@@ -5144,6 +5144,77 @@ global.fetch = async (url) => {
         self.assertEqual(result["rendered"], ["AAVE"])
         self.assertIn("contract", result["error"].lower())
 
+    def test_pair_response_accepts_legacy_absent_mode_and_rejects_explicit_modes(self):
+        result = run_app_javascript(
+            r"""
+const selection = {
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "dex:eth:uniswap_v3:AAVE/WETH:0.05%",
+  selection: "",
+};
+const legacy = {
+  token_symbol: "AAVE",
+  market_a: { market_id: selection.marketA },
+  market_b: { market_id: selection.marketB },
+};
+console.log(JSON.stringify({
+  absent: comparisonPayloadMatchesSelection(legacy, "AAVE", selection),
+  nullMode: comparisonPayloadMatchesSelection({ ...legacy, selection_mode: null }, "AAVE", selection),
+  single: comparisonPayloadMatchesSelection({ ...legacy, selection_mode: "single" }, "AAVE", selection),
+  fabricatedPair: comparisonPayloadMatchesSelection({ ...legacy, selection_mode: "pair" }, "AAVE", selection),
+  unexpected: comparisonPayloadMatchesSelection({ ...legacy, selection_mode: "future" }, "AAVE", selection),
+  wrongB: comparisonPayloadMatchesSelection({
+    ...legacy,
+    market_b: { market_id: "dex:wrong:AAVE/USDC" },
+  }, "AAVE", selection),
+}));
+"""
+        )
+
+        self.assertTrue(result["absent"])
+        self.assertTrue(result["nullMode"])
+        self.assertFalse(result["single"])
+        self.assertFalse(result["fabricatedPair"])
+        self.assertFalse(result["unexpected"])
+        self.assertFalse(result["wrongB"])
+
+    def test_single_loading_copy_never_calls_it_two_markets(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    disabled: false, attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map();
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+  querySelectorAll() { return []; },
+};
+app.workspaceSelection = "single";
+let chartMessage = "";
+clearComparisonChart = (message) => { chartMessage = message; };
+setComparisonLoading("Loading AAVE Market A…");
+console.log(JSON.stringify({
+  chartMessage,
+  body: nodes.get("comparison-body").innerHTML,
+  plotLabel: nodes.get("comparison-plot").attributes["aria-label"],
+}));
+"""
+        )
+
+        self.assertEqual(result["chartMessage"], "Loading Market A…")
+        self.assertIn("Loading Market A", result["body"])
+        self.assertNotIn("selected markets", result["chartMessage"])
+        self.assertEqual(result["plotLabel"], "Interactive daily Market A chart")
+
     def test_delayed_single_response_cannot_overwrite_new_pair(self):
         result = run_app_javascript(
             r"""
@@ -5189,7 +5260,7 @@ const singlePayload = {
   market_a: { market_id: "cex:binance:AAVE/USDT" }, market_b: null,
 };
 const pairPayload = {
-  token_symbol: "AAVE", selection_mode: "pair",
+  token_symbol: "AAVE",
   market_a: { market_id: "cex:binance:AAVE/USDT" },
   market_b: { market_id: marketB },
 };
@@ -5209,15 +5280,15 @@ const pairPayload = {
     ok: true, status: 200, json: async () => singlePayload,
   });
   const singleLoaded = await oldSingle;
-  console.log(JSON.stringify({ rendered, pairLoaded, singleLoaded, finalMode: app.comparison?.selection_mode }));
+  console.log(JSON.stringify({ rendered, pairLoaded, singleLoaded, finalMarketB: app.comparison?.market_b?.market_id }));
 })();
 """
         )
 
         self.assertTrue(result["pairLoaded"])
         self.assertFalse(result["singleLoaded"])
-        self.assertEqual(result["rendered"], ["pair"])
-        self.assertEqual(result["finalMode"], "pair")
+        self.assertEqual(result["rendered"], [None])
+        self.assertEqual(result["finalMarketB"], "dex:eth:uniswap_v3:AAVE/WETH:0.05%")
 
     def test_snapshot_refresh_owner_key_includes_single_selection_marker(self):
         result = run_app_javascript(

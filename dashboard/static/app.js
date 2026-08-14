@@ -6545,8 +6545,8 @@ function setComparisonLoading(message) {
   ].forEach((id) => {
     byId(id).textContent = "—";
   });
-  clearComparisonChart("Loading the selected markets…");
   const single = app.workspaceSelection === "single";
+  clearComparisonChart(single ? "Loading Market A…" : "Loading the selected markets…");
   byId("comparison-body").innerHTML = `<tr><td colspan="${single ? 3 : 8}" class="missing">${single ? "Loading Market A…" : "Loading the selected markets…"}</td></tr>`;
 }
 
@@ -6769,7 +6769,7 @@ function comparisonPayloadMatchesSelection(payload, token, selection) {
     return payload.selection_mode === "single" && payload.market_b === null;
   }
   return (
-    payload.selection_mode === "pair"
+    payload.selection_mode == null
     && payload?.market_b?.market_id === selection.marketB
   );
 }

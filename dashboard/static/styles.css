@@ -2424,6 +2424,9 @@ footer {
     max-height: 55vh;
   }
   .comparison-summary { grid-template-columns: 1fr; }
+  .facts-workbench[data-selection-mode="single"] .comparison-summary {
+    grid-template-columns: 1fr;
+  }
   .facts-workbench[data-selection-mode="single"] .comparison-table {
     min-width: 0;
   }

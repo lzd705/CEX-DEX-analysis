@@ -91,6 +91,10 @@ test("single Compare renders only Market A", async ({ page }) => {
     "/tokens/AAVE/compare?marketA=cex%3Abinance%3AAAVE%2FUSDT&selection=single&start=2026-07-01&end=2026-07-30",
   );
   await expect(page.locator("#comparison-status")).toContainText("Market A current");
+  const summaryColumns = await page.locator(".comparison-summary").evaluate((element) => (
+    getComputedStyle(element).gridTemplateColumns.split(" ").filter(Boolean).length
+  ));
+  expect(summaryColumns).toBe(await page.evaluate(() => (window.innerWidth <= 640 ? 1 : 2)));
   await expect(page.locator("#comparison-table-region").getByRole("columnheader"))
     .toHaveText(["Date (UTC)", "binance Price (USD)", "binance Volume (USD)"]);
   await expect(page.locator("#comparison-chart-legend .comparison-legend-item")).toHaveCount(2);
@@ -170,7 +174,9 @@ test("restoring Market B restores the pair contract", async ({ page }) => {
   await marketB.selectOption("dex:eth:uniswap_v3:AAVE/WETH:0.05%");
   await page.getByRole("button", { name: "Apply selection" }).click();
   await expect(page).not.toHaveURL(/selection=single/);
+  await expect(page.locator("#comparison-status")).toContainText("comparison current");
   await expect(page.getByText("Latest comparable date", { exact: true })).toBeVisible();
+  await expect(page.locator("#comparison-chart-legend")).toContainText("B · DEX");
   await page.reload();
   await expect(marketB).toHaveValue("dex:eth:uniswap_v3:AAVE/WETH:0.05%");
   expect(new URL(page.url()).searchParams.get("selection")).toBeNull();

@@ -110,13 +110,12 @@
   },
   "compare_pair": {
     "token_symbol": "AAVE",
-    "selection_mode": "pair",
     "market_a": { "market_id": "cex:binance:AAVE/USDT", "market_type": "cex", "venue": "binance", "instrument": "AAVE/USDT" },
     "market_b": { "market_id": "dex:eth:uniswap_v3:AAVE/WETH:0.05%", "market_type": "dex", "venue": "uniswap_v3", "instrument": "AAVE/WETH 0.05%" },
     "market_a_statistics": { "window_return": 0.01, "daily_volatility": 0.02 },
     "market_b_statistics": { "window_return": 0.02, "daily_volatility": 0.03 },
     "latest_comparable_observation": { "date": "2026-07-30", "absolute_spread_usd": 1, "spread_bps": 33 },
-    "observations": [{ "date": "2026-07-30", "market_a_close": 300, "market_b_close": 301, "market_a_volume_usd": 900000, "market_b_volume_usd": 100000, "absolute_spread_usd": 1, "spread_bps": 33 }],
+    "observations": [{ "date": "2026-07-30", "market_a": { "price_usd": 300, "volume_usd": 900000 }, "market_b": { "price_usd": 301, "volume_usd": 100000 }, "absolute_spread_usd": 1, "spread_bps": 33, "missing_reason": null }],
     "metadata": { "comparison_days": 1, "union_observation_days": 1 }
   },
   "execution_single": {
