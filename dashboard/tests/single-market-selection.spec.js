@@ -12,10 +12,18 @@ async function installApiRoutes(page, {
   calls = [],
   compareSingle = fixture.compare_single,
   events = fixture.events,
+  executionSingle = null,
+  qualitySelected = null,
+  failures = new Set(),
 } = {}) {
   await page.route("**/api/markets/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(`${url.pathname}${url.search}`);
+    const endpoint = url.pathname.split("/").at(-1);
+    if (failures.has(endpoint)) {
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: `${endpoint} unavailable` }) });
+      return;
+    }
     let body;
     if (url.pathname.endsWith("/summary")) body = fixture.summary;
     else if (url.pathname.endsWith("/catalog")) body = catalog;
@@ -25,9 +33,9 @@ async function installApiRoutes(page, {
         : fixture.compare_pair;
     } else if (url.pathname.endsWith("/execution-cost")) {
       body = url.searchParams.get("selection") === "single"
-        ? fixture.execution_single
+        ? executionSingle || singleExecution
         : fixture.execution_pair;
-    } else if (url.pathname.endsWith("/quality")) body = fixture.quality_selected;
+    } else if (url.pathname.endsWith("/quality")) body = qualitySelected || singleQuality;
     else if (url.pathname.endsWith("/events")) body = events;
     else throw new Error(`Unexpected API route: ${url.pathname}`);
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
@@ -78,6 +86,68 @@ const overlayEvents = {
     source: { url: "https://example.test/release" },
   }],
   metadata: {},
+};
+
+const executionRows = [1000, 5000, 10000, 50000, 100000].flatMap((notional) => (
+  ["buy_token", "sell_token"].map((direction) => ({
+    direction,
+    requested_notional_usd: notional,
+    status: "observed",
+    quoted_execution_cost_bps: 2,
+    quoted_execution_cost_usd: 2,
+    fill_ratio: 1,
+    fee_status: "excluded_unknown_account_tier",
+  }))
+));
+
+const singleExecution = {
+  token_symbol: "AAVE",
+  selection_mode: "single",
+  market_a: {
+    market: {
+      market_id: "cex:binance:AAVE/USDT",
+      token_symbol: "AAVE",
+      market_type: "cex",
+      venue: "binance",
+      instrument: "AAVE/USDT",
+    },
+    status: "available",
+    publication_status: "published",
+    rows: executionRows,
+    timing: {
+      status: "not_applicable",
+      state_observed_at: "2026-07-30T00:00:00Z",
+      usd_price_observed_at: null,
+      usd_price_state_skew_seconds: null,
+    },
+  },
+  market_b: null,
+  metadata: {
+    notionals_usd: [1000, 5000, 10000, 50000, 100000],
+    snapshot_skew_seconds: null,
+  },
+};
+
+const singleQuality = {
+  token_symbol: "AAVE",
+  metadata: {
+    scope: "selected",
+    selected_market_ids: ["cex:binance:AAVE/USDT"],
+    window_start: "2026-07-01",
+    window_end: "2026-07-30",
+    daily_quality_report: { status: "unavailable" },
+  },
+  markets: [{
+    market_id: "cex:binance:AAVE/USDT",
+    token_symbol: "AAVE",
+    market_type: "cex",
+    venue: "binance",
+    instrument: "AAVE/USDT",
+    quality_status: "ok",
+    quality_flags: [],
+    facts: {},
+  }],
+  rollups: [],
 };
 
 test("single Compare renders only Market A", async ({ page }) => {
@@ -223,4 +293,124 @@ test("invalid selection marker is not repaired", async ({ page }) => {
     expect(page.url()).toContain(item.search);
   }
   expect(calls.filter((call) => /\/(compare|execution-cost|quality|events)\?/.test(call))).toEqual([]);
+});
+
+test("single selection survives research pages", async ({ page }) => {
+  const calls = [];
+  await installApiRoutes(page, { calls, compareSingle: singleCompare, events: overlayEvents });
+  const start = "/tokens/AAVE/compare?marketA=cex%3Abinance%3AAAVE%2FUSDT&selection=single&start=2026-07-01&end=2026-07-30";
+  await page.goto(start);
+  await expect(page.locator("#comparison-status")).toContainText("Market A current");
+  await page.getByRole("link", { name: "Liquidity & Execution" }).click();
+  await expect(page).toHaveURL(/\/tokens\/AAVE\/liquidity\?.*selection=single/);
+  await expect(page.locator("#execution-status")).toContainText("AAVE");
+  await expect(page.locator("#execution-table-body tr")).toHaveCount(5);
+  await page.getByRole("link", { name: "Events", exact: true }).click();
+  await expect(page).toHaveURL(/\/tokens\/AAVE\/events\?.*selection=single/);
+  await expect(page.locator("#events-status")).toContainText(/event/i);
+  await page.getByRole("link", { name: "Data Quality", exact: true }).click();
+  await expect(page).toHaveURL(/\/tokens\/AAVE\/quality\?.*selection=single/);
+  await expect(page.locator("#quality-status")).toContainText("1 market");
+  await expect(page.locator("#quality-body")).toContainText("cex:binance:AAVE/USDT");
+  await page.reload();
+  await expect(page.locator("#quality-status")).toContainText("1 market");
+  await page.goBack();
+  expect(new URL(page.url()).searchParams.get("selection")).toBe("single");
+  expect(calls.filter((call) => call.includes("/events?")).every((call) => (
+    !call.includes("market_a=") && !call.includes("market_b=") && !call.includes("selection=")
+  ))).toBe(true);
+});
+
+test("single mobile layout has no pair slots", async ({ page, isMobile }) => {
+  const browserErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") browserErrors.push(message.text());
+  });
+  page.on("pageerror", (error) => browserErrors.push(error.message));
+  await installApiRoutes(page, { compareSingle: singleCompare, events: overlayEvents });
+  await page.goto(
+    "/tokens/AAVE/liquidity?marketA=cex%3Abinance%3AAAVE%2FUSDT&selection=single&start=2026-07-01&end=2026-07-30",
+  );
+  await expect(page.locator("#execution-status")).toContainText("AAVE");
+  await expect(page.locator("[data-pair-only]:visible")).toHaveCount(0);
+  await expect(page.locator(".liquidity-table").first().getByRole("columnheader")).toHaveCount(5);
+  await expect(page.locator(".execution-table").getByRole("columnheader")).toHaveCount(4);
+  for (let index = 0; index < 28; index += 1) {
+    await page.keyboard.press("Tab");
+    expect(await page.evaluate(() => Boolean(document.activeElement?.closest?.("[data-pair-only]"))))
+      .toBe(false);
+  }
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  const summaryColumns = await page.locator(".liquidity-summary").evaluate((element) => (
+    getComputedStyle(element).gridTemplateColumns.split(" ").filter(Boolean).length
+  ));
+  expect(summaryColumns).toBe(1);
+  const executionColumns = await page.locator(".execution-summary").evaluate((element) => (
+    getComputedStyle(element).gridTemplateColumns.split(" ").filter(Boolean).length
+  ));
+  expect(executionColumns).toBe(1);
+  expect(browserErrors).toEqual([]);
+});
+
+test("latest selection owns async responses", async ({ page }) => {
+  let releaseOld;
+  const oldGate = new Promise((resolve) => { releaseOld = resolve; });
+  let singleRequestSeen;
+  const singleSeen = new Promise((resolve) => { singleRequestSeen = resolve; });
+  await page.route("**/api/markets/**", async (route) => {
+    const url = new URL(route.request().url());
+    let body = fixture.summary;
+    if (url.pathname.endsWith("/catalog")) body = fixture.catalog_pair;
+    else if (url.pathname.endsWith("/events")) body = overlayEvents;
+    else if (url.pathname.endsWith("/compare")) {
+      if (url.searchParams.get("selection") === "single") {
+        singleRequestSeen();
+        await oldGate;
+        body = singleCompare;
+      } else body = fixture.compare_pair;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+  await page.goto(
+    "/tokens/AAVE/compare?marketA=cex%3Abinance%3AAAVE%2FUSDT&selection=single&start=2026-07-01&end=2026-07-30",
+    { waitUntil: "domcontentloaded" },
+  );
+  await singleSeen;
+  await page.evaluate(() => {
+    const b = document.getElementById("facts-market-b");
+    b.value = "dex:eth:uniswap_v3:AAVE/WETH:0.05%";
+    app.workspaceSelection = "";
+    app.route.state.marketB = b.value;
+    delete app.route.state.selection;
+    void loadComparison();
+  });
+  await expect(page.locator("#comparison-status")).toContainText("comparison current");
+  releaseOld();
+  await page.waitForTimeout(100);
+  await expect(page.locator("#comparison-status")).toContainText("comparison current");
+  await expect(page.locator("#comparison-chart-legend")).toContainText("B · DEX");
+});
+
+test("page failures are isolated", async ({ page }) => {
+  await installApiRoutes(page, {
+    compareSingle: singleCompare,
+    events: overlayEvents,
+    failures: new Set(["execution-cost", "events", "quality"]),
+  });
+  await page.goto(
+    "/tokens/AAVE/liquidity?marketA=cex%3Abinance%3AAAVE%2FUSDT&selection=single&start=2026-07-01&end=2026-07-30",
+  );
+  await expect(page.locator("#execution-error")).toContainText("execution-cost unavailable");
+  await expect(page.locator("#liquidity-status")).not.toContainText("execution-cost unavailable");
+  await expect(page.locator("#global-error")).toBeHidden();
+  await expect(page.locator("#liquidity-a-label")).toContainText("A · binance");
+  await page.getByRole("link", { name: "Events", exact: true }).click();
+  await expect(page.locator("#events-error")).toContainText("events unavailable");
+  await expect(page.locator("#global-error")).toBeHidden();
+  await page.getByRole("link", { name: "Data Quality", exact: true }).click();
+  await expect(page.locator("#quality-error")).toContainText("quality unavailable");
+  await expect(page.locator("#quality-body")).toContainText("cex:binance:AAVE/USDT");
+  await expect(page.locator("#quality-body")).not.toContainText("uniswap_v3");
+  await page.getByRole("link", { name: "Compare", exact: true }).click();
+  await expect(page.locator("#comparison-status")).toContainText("Market A current");
 });

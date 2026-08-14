@@ -1311,6 +1311,14 @@ main { min-width: 0; padding: 14px 18px 30px; }
   font-size: 16px;
 }
 .execution-table { min-width: 980px; }
+.facts-workbench[data-selection-mode="single"] .liquidity-summary,
+.facts-workbench[data-selection-mode="single"] .execution-summary {
+  grid-template-columns: 1fr;
+}
+.facts-workbench[data-selection-mode="single"] .liquidity-table,
+.facts-workbench[data-selection-mode="single"] .execution-table {
+  min-width: 640px;
+}
 .method-note {
   margin: 10px 0 0;
   color: var(--muted);
@@ -2729,6 +2737,13 @@ footer {
   #market-table .depth-grid { grid-template-columns: minmax(0, 1fr) auto; }
   #market-table .metric-note,
   #market-table .spread-date { text-align: right; }
+}
+
+@media (max-width: 640px) {
+  .facts-workbench[data-selection-mode="single"] .liquidity-table,
+  .facts-workbench[data-selection-mode="single"] .execution-table {
+    min-width: 0;
+  }
 }
 
 .custom-window-editor[hidden] { display: none; }

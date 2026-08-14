@@ -28,6 +28,80 @@ def run_app_javascript(source):
 
 
 class EventFrontendTest(unittest.TestCase):
+    def test_single_workspace_keeps_events_token_scoped(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map(Object.entries({
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control(""),
+  "date-start": control("2026-07-01"), "date-end": control("2026-07-30"),
+  "events-body": control(), "events-status": control(), "events-error": control(),
+}));
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+};
+global.window = { location: { pathname: "/tokens/AAVE/events", search: "" } };
+app.catalog = { markets: [] };
+app.payload = { metadata: { start_date: "2026-07-01", end_date: "2026-07-30" } };
+app.route = { kind: "workspace", token: "AAVE", page: "events", state: {
+  marketA: "cex:binance:AAVE/USDT", selection: "single",
+  start: "2026-07-01", end: "2026-07-30",
+} };
+app.workspaceSelection = "single";
+app.eventLifecycle = "scheduled";
+app.eventClockState = "past";
+app.comparison = { sentinel: "market facts stay" };
+const calls = [];
+global.fetch = async (url) => {
+  calls.push(url);
+  return { ok: true, status: 200, json: async () => ({
+    schema: "event_facts_api/v2", clock_as_of_utc: "2026-08-01T00:00:00Z",
+    availability: { status: "available" },
+    query: { token: "AAVE", lifecycle: "scheduled", clock_state: "past" },
+    events: [], metadata: {},
+  }) };
+};
+(async () => {
+  const state = currentWorkspaceRouteState("events");
+  const loaded = await loadEvents();
+  const success = { state, loaded, url: calls[0] };
+  global.fetch = async () => { throw new Error("events unavailable"); };
+  const failed = await loadEvents();
+  console.log(JSON.stringify({ success, failed, comparison: app.comparison,
+    error: nodes.get("events-error").textContent }));
+})();
+"""
+        )
+
+        self.assertEqual(result["success"]["state"]["selection"], "single")
+        self.assertEqual(
+            result["success"]["state"]["marketA"],
+            "cex:binance:AAVE/USDT",
+        )
+        self.assertTrue(result["success"]["loaded"])
+        event_url = result["success"]["url"]
+        self.assertIn("token=AAVE", event_url)
+        self.assertIn("lifecycle=scheduled", event_url)
+        self.assertIn("clock_state=past", event_url)
+        self.assertNotIn("market_a", event_url)
+        self.assertNotIn("market_b", event_url)
+        self.assertNotIn("selection", event_url)
+        self.assertFalse(result["failed"])
+        self.assertEqual(result["comparison"], {"sentinel": "market facts stay"})
+        self.assertIn("events unavailable", result["error"])
+
     def test_single_compare_keeps_market_a_when_event_overlay_fails(self):
         result = run_app_javascript(
             r"""

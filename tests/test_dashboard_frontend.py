@@ -34,6 +34,351 @@ def run_app_javascript(source: str, prelude: str = ""):
 
 
 class DashboardFrontendContractTest(unittest.TestCase):
+    def test_single_liquidity_renders_only_market_a(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map(Object.entries({
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control(""),
+  "liquidity-status": control(),
+  "liquidity-table-body": control(),
+  "liquidity-legend": control(),
+  "liquidity-chart-description": control(),
+}));
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+};
+global.window = {};
+app.workspaceSelection = "single";
+app.catalog = { markets: [{
+  token_symbol: "AAVE", market_id: "cex:binance:AAVE/USDT",
+  market_type: "cex", venue: "binance", instrument: "AAVE/USDT",
+  depth_status: "partial", depth_observed_at: "2026-07-30T00:00:00Z",
+  depth_method: "visible order book", total_depth_10bps_usd: 100,
+  bid_depth_10bps_usd: 40, ask_depth_10bps_usd: 60,
+  depth_10bps_complete: true, total_depth_25bps_usd: 250,
+  bid_depth_25bps_usd: 110, ask_depth_25bps_usd: 140,
+  depth_25bps_complete: true, depth_50bps_usd: 500,
+  total_depth_50bps_usd: 500, bid_depth_50bps_usd: 220,
+  ask_depth_50bps_usd: 280, depth_50bps_complete: true,
+  total_depth_100bps_usd: 1000, bid_depth_100bps_usd: 450,
+  ask_depth_100bps_usd: 550, depth_100bps_complete: false,
+  quality_flags: [],
+}] };
+renderLiquiditySvg = (series) => {
+  app.liquidityEffectiveScale = "linear";
+  app.renderedLiquiditySeries = series;
+  return true;
+};
+hideLiquidityTooltip = () => {};
+renderLiquidityCurve();
+console.log(JSON.stringify({
+  legend: nodes.get("liquidity-legend").innerHTML,
+  table: nodes.get("liquidity-table-body").innerHTML,
+  status: nodes.get("liquidity-status").textContent,
+  description: nodes.get("liquidity-chart-description").textContent,
+  bMeta: nodes.get("liquidity-market-b-meta").innerHTML,
+  seriesSlots: app.renderedLiquiditySeries.map((series) => series.slot),
+}));
+"""
+        )
+
+        self.assertTrue(result["seriesSlots"])
+        self.assertEqual(set(result["seriesSlots"]), {"A"})
+        self.assertIn("A · CEX · binance · AAVE/USDT", result["legend"])
+        self.assertNotIn("B ·", result["legend"])
+        self.assertIn('data-label="A Total"', result["table"])
+        self.assertIn('data-label="A Completeness"', result["table"])
+        self.assertNotIn('data-label="B Total"', result["table"])
+        self.assertNotIn("snapshot skew", result["status"].lower())
+        self.assertNotIn("Market B", result["description"])
+        self.assertEqual(result["bMeta"], "")
+
+    def test_single_execution_uses_exact_market_a_and_preserves_compare_on_failure(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, disabled: false, textContent: "", innerHTML: "",
+    dataset: {}, attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map(Object.entries({
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control(""),
+  "date-start": control("2026-07-01"), "date-end": control("2026-07-30"),
+  "execution-notional": control("10000"),
+  "execution-table-body": control(), "execution-status": control(),
+  "execution-error": control(),
+}));
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+};
+global.window = { location: { pathname: "/tokens/AAVE/liquidity", search: "" } };
+app.catalog = { markets: [] };
+app.payload = { metadata: { start_date: "2026-07-01", end_date: "2026-07-30" } };
+app.route = { kind: "workspace", token: "AAVE", page: "liquidity", state: {
+  marketA: "cex:binance:AAVE/USDT", selection: "single",
+  start: "2026-07-01", end: "2026-07-30",
+} };
+app.workspaceSelection = "single";
+app.comparison = { token_symbol: "AAVE", sentinel: "keep" };
+const rows = [1000, 5000, 10000, 50000, 100000].flatMap((notional) => (
+  ["buy_token", "sell_token"].map((direction) => ({
+    direction, requested_notional_usd: notional, status: "observed",
+    quoted_execution_cost_bps: 2, quoted_execution_cost_usd: 2,
+    fill_ratio: 1, fee_status: "excluded_unknown_account_tier",
+  }))
+));
+const exactResult = {
+  market: { market_id: "cex:binance:AAVE/USDT", token_symbol: "AAVE", market_type: "cex", venue: "binance", instrument: "AAVE/USDT" },
+  status: "available", publication_status: "published", rows,
+  timing: { status: "not_applicable", state_observed_at: "2026-07-30T00:00:00Z" },
+};
+const calls = [];
+global.fetch = async (url, options) => {
+  calls.push({ url, aborted: options.signal.aborted });
+  return { ok: true, status: 200, json: async () => ({
+    token_symbol: "AAVE", selection_mode: "single",
+    market_a: exactResult, market_b: null,
+    metadata: { notionals_usd: [1000, 5000, 10000, 50000, 100000], snapshot_skew_seconds: null },
+  }) };
+};
+(async () => {
+  const loaded = await loadExecutionCost();
+  const first = {
+    loaded, url: calls[0]?.url || "", table: nodes.get("execution-table-body").innerHTML,
+    aCost: nodes.get("execution-a-cost").innerHTML,
+    bCost: nodes.get("execution-b-cost").innerHTML,
+    fee: nodes.get("execution-fee-scope").textContent,
+    status: nodes.get("execution-status").textContent,
+  };
+  global.fetch = async () => ({ ok: true, status: 200, json: async () => ({
+    token_symbol: "AAVE", selection_mode: "single",
+    market_a: { ...exactResult, market: { ...exactResult.market, market_id: "cex:wrong:AAVE/USDT" } },
+    market_b: null, metadata: { snapshot_skew_seconds: null },
+  }) });
+  const wrongLoaded = await loadExecutionCost();
+  console.log(JSON.stringify({ first, wrongLoaded, comparison: app.comparison }));
+})();
+"""
+        )
+
+        self.assertTrue(result["first"]["loaded"])
+        query = result["first"]["url"]
+        self.assertIn("market_a=cex%3Abinance%3AAAVE%2FUSDT", query)
+        self.assertIn("selection=single", query)
+        self.assertNotIn("market_b=", query)
+        self.assertIn("A Cost", result["first"]["table"])
+        self.assertNotIn("B Cost", result["first"]["table"])
+        self.assertNotEqual(result["first"]["aCost"], "")
+        self.assertEqual(result["first"]["bCost"], "")
+        self.assertIn("CEX account fee excluded", result["first"]["fee"])
+        self.assertNotIn("Market B", result["first"]["status"])
+        self.assertFalse(result["wrongLoaded"])
+        self.assertEqual(result["comparison"], {"token_symbol": "AAVE", "sentinel": "keep"})
+
+    def test_single_quality_uses_exact_a_scope(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    attributes: {}, classList: { toggle() {} },
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map(Object.entries({
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control(""),
+  "date-start": control("2026-07-01"), "date-end": control("2026-07-30"),
+  "quality-body": control(), "quality-filter-summary": control(),
+  "quality-error": control(), "quality-status": control(),
+}));
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+  querySelectorAll() { return []; },
+};
+global.window = { location: { pathname: "/tokens/AAVE/quality", search: "" } };
+const exactA = "cex:binance:AAVE/USDT";
+const other = "dex:eth:uniswap_v3:AAVE/WETH:0.05%";
+const market = (id, venue) => ({
+  market_id: id, token_symbol: "AAVE", market_type: id.startsWith("cex") ? "cex" : "dex",
+  venue, instrument: id.startsWith("cex") ? "AAVE/USDT" : "AAVE/WETH",
+  quality_status: "ok", quality_flags: [], facts: {},
+});
+app.catalog = { metadata: { market_quality_thresholds: {} }, markets: [
+  market(exactA, "binance"), market(other, "uniswap_v3"),
+] };
+app.payload = { metadata: { start_date: "2026-07-01", end_date: "2026-07-30" } };
+app.route = { kind: "workspace", token: "AAVE", page: "quality", state: {
+  marketA: exactA, selection: "single", start: "2026-07-01", end: "2026-07-30",
+} };
+app.workspaceSelection = "single";
+app.qualityScope = "all";
+const calls = [];
+global.fetch = async (url) => {
+  calls.push(url);
+  return { ok: true, status: 200, json: async () => ({
+    token_symbol: "AAVE", markets: [market(exactA, "binance")],
+    metadata: { scope: "selected", selected_market_ids: [exactA],
+      window_start: "2026-07-01", window_end: "2026-07-30", daily_quality_report: {} },
+  }) };
+};
+(async () => {
+  const loaded = await loadQuality();
+  const success = { loaded, url: calls[0], html: nodes.get("quality-body").innerHTML,
+    status: nodes.get("quality-status").textContent, scope: app.qualityScope };
+  global.fetch = async () => { throw new Error("quality unavailable"); };
+  const failed = await loadQuality();
+  console.log(JSON.stringify({ success, failed, fallback: nodes.get("quality-body").innerHTML }));
+})();
+"""
+        )
+
+        self.assertTrue(result["success"]["loaded"])
+        self.assertEqual(result["success"]["scope"], "selected")
+        query = result["success"]["url"]
+        self.assertIn("scope=selected", query)
+        self.assertIn("market_a=cex%3Abinance%3AAAVE%2FUSDT", query)
+        self.assertIn("selection=single", query)
+        self.assertNotIn("market_b=", query)
+        self.assertIn("cex:binance:AAVE/USDT", result["success"]["html"])
+        self.assertNotIn("uniswap_v3", result["success"]["html"])
+        self.assertIn("1 market", result["success"]["status"])
+        self.assertFalse(result["failed"])
+        self.assertIn("cex:binance:AAVE/USDT", result["fallback"])
+        self.assertNotIn("uniswap_v3", result["fallback"])
+
+    def test_workspace_requests_reject_stale_selection_generation_and_navigation_owners(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, disabled: false, textContent: "", innerHTML: "",
+    dataset: {}, attributes: {}, classList: { toggle() {} },
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map(Object.entries({
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control(""),
+  "date-start": control("2026-07-01"), "date-end": control("2026-07-30"),
+  "execution-table-body": control(), "execution-status": control(), "execution-error": control(),
+  "quality-body": control(), "quality-status": control(), "quality-error": control(),
+  "quality-filter-summary": control(), "comparison-status": control(), "comparison-error": control(),
+  "facts-workbench": control(), "compare-markets": control(), "time-toolbar": control(),
+  "research-pair-context": control(), "selector-policy": control(),
+}));
+const views = ["compare", "liquidity", "events", "quality"].map((name) => {
+  const node = control(); node.dataset.workspaceView = name; return node;
+});
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+  querySelectorAll(selector) { return selector === "[data-workspace-view]" ? views : []; },
+  querySelector() { return control(); },
+};
+global.window = { location: { pathname: "/tokens/AAVE/liquidity", search: "" } };
+app.catalog = { markets: [] };
+app.payload = { metadata: { start_date: "2026-07-01", end_date: "2026-07-30" } };
+app.route = { kind: "workspace", token: "AAVE", page: "liquidity", state: {
+  marketA: "cex:binance:AAVE/USDT", selection: "single",
+  start: "2026-07-01", end: "2026-07-30",
+} };
+app.workspaceSelection = "single";
+const pending = [];
+global.fetch = (url, options) => new Promise((resolve) => pending.push({ url, options, resolve }));
+setExecutionLoading = () => {};
+clearExecutionResult = () => {};
+const executionCommits = [];
+renderExecution = (payload) => { executionCommits.push(payload.selection_mode || "pair"); app.execution = payload; };
+const resultFor = (id) => ({ market: { market_id: id }, status: "available", rows: [] });
+(async () => {
+  const oldExecution = loadExecutionCost();
+  await Promise.resolve();
+  const oldExecutionSignal = pending[0].options.signal;
+  nodes.get("facts-market-b").value = "dex:eth:uniswap_v3:AAVE/WETH:0.05%";
+  app.workspaceSelection = "";
+  app.route.state = { marketA: "cex:binance:AAVE/USDT", marketB: nodes.get("facts-market-b").value,
+    start: "2026-07-01", end: "2026-07-30" };
+  const newExecution = loadExecutionCost();
+  await Promise.resolve();
+  pending[1].resolve({ ok: true, status: 200, json: async () => ({
+    token_symbol: "AAVE", market_a: resultFor("cex:binance:AAVE/USDT"),
+    market_b: resultFor("dex:eth:uniswap_v3:AAVE/WETH:0.05%"), metadata: {},
+  }) });
+  const pairLoaded = await newExecution;
+  pending[0].resolve({ ok: true, status: 200, json: async () => ({
+    token_symbol: "AAVE", selection_mode: "single",
+    market_a: resultFor("cex:binance:AAVE/USDT"), market_b: null, metadata: {},
+  }) });
+  const staleLoaded = await oldExecution;
+
+  app.route.page = "quality";
+  app.workspaceSelection = "single";
+  nodes.get("facts-market-b").value = "";
+  app.route.state = { marketA: "cex:binance:AAVE/USDT", selection: "single",
+    start: "2026-07-01", end: "2026-07-30" };
+  app.qualityScope = "all";
+  renderQualityFromCatalog = () => {};
+  const qualityCommits = [];
+  renderQualityPayload = (payload) => { qualityCommits.push(payload.token_symbol); app.quality = payload; };
+  const oldQuality = loadQuality();
+  await Promise.resolve();
+  const qualityRequest = pending[2];
+  app.route.page = "events";
+  setActiveWorkspacePage("events");
+  qualityRequest.resolve({ ok: true, status: 200, json: async () => ({
+    token_symbol: "AAVE", markets: [{ market_id: "cex:binance:AAVE/USDT" }],
+    metadata: { scope: "selected", selected_market_ids: ["cex:binance:AAVE/USDT"] },
+  }) });
+  const navigatedLoaded = await oldQuality;
+  console.log(JSON.stringify({
+    pairLoaded, staleLoaded, executionCommits,
+    oldExecutionAborted: oldExecutionSignal.aborted,
+    navigatedLoaded, qualityCommits,
+    qualityAborted: qualityRequest.options.signal.aborted,
+  }));
+})();
+"""
+        )
+
+        self.assertTrue(result["pairLoaded"])
+        self.assertFalse(result["staleLoaded"])
+        self.assertEqual(result["executionCommits"], ["pair"])
+        self.assertTrue(result["oldExecutionAborted"])
+        self.assertFalse(result["navigatedLoaded"])
+        self.assertEqual(result["qualityCommits"], [])
+        self.assertTrue(result["qualityAborted"])
+
     def test_screener_daily_gap_labels_are_explicitly_research_only(self):
         result = run_app_javascript(
             """

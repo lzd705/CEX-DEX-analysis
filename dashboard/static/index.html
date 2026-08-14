@@ -361,15 +361,15 @@
               <span id="liquidity-a-label">Market A at ±100 bps</span>
               <strong id="liquidity-a-100">—</strong>
             </div>
-            <div>
+            <div data-pair-only>
               <span id="liquidity-b-label">Market B at ±100 bps</span>
               <strong id="liquidity-b-100">—</strong>
             </div>
-            <div>
+            <div data-pair-only>
               <span>Snapshot skew</span>
               <strong id="liquidity-skew">—</strong>
             </div>
-            <div>
+            <div data-pair-only>
               <span>Complete paired bands</span>
               <strong id="liquidity-paired-bands">—</strong>
             </div>
@@ -414,7 +414,7 @@
             tabindex="0"
           >
             <table class="liquidity-table">
-              <caption>Exact cumulative USD depth for the selected two markets at each observed price-distance band.</caption>
+              <caption id="liquidity-table-caption">Exact cumulative USD depth for the selected two markets at each observed price-distance band.</caption>
               <thead>
                 <tr>
                   <th scope="col">Band</th>
@@ -422,10 +422,10 @@
                   <th scope="col" id="liquidity-a-sell-heading">A Sell execution</th>
                   <th scope="col" id="liquidity-a-buy-heading">A Buy execution</th>
                   <th scope="col">A Completeness</th>
-                  <th scope="col" id="liquidity-b-total-heading">B Total</th>
-                  <th scope="col" id="liquidity-b-sell-heading">B Sell execution</th>
-                  <th scope="col" id="liquidity-b-buy-heading">B Buy execution</th>
-                  <th scope="col">B Completeness</th>
+                  <th scope="col" id="liquidity-b-total-heading" data-pair-only>B Total</th>
+                  <th scope="col" id="liquidity-b-sell-heading" data-pair-only>B Sell execution</th>
+                  <th scope="col" id="liquidity-b-buy-heading" data-pair-only>B Buy execution</th>
+                  <th scope="col" data-pair-only>B Completeness</th>
                 </tr>
               </thead>
               <tbody id="liquidity-table-body">
@@ -435,7 +435,7 @@
           </div>
 
           <div id="liquidity-market-a-meta" class="liquidity-market-meta"></div>
-          <div id="liquidity-market-b-meta" class="liquidity-market-meta"></div>
+          <div id="liquidity-market-b-meta" class="liquidity-market-meta" data-pair-only></div>
 
           <section class="execution-panel" aria-labelledby="execution-title">
             <div class="page-heading">
@@ -485,12 +485,12 @@
                 <strong id="execution-a-cost">—</strong>
                 <small id="execution-a-fill">—</small>
               </div>
-              <div>
+              <div data-pair-only>
                 <span id="execution-b-label">Market B cost</span>
                 <strong id="execution-b-cost">—</strong>
                 <small id="execution-b-fill">—</small>
               </div>
-              <div>
+              <div data-pair-only>
                 <span>A/B state-time skew</span>
                 <strong id="execution-skew">—</strong>
                 <small>Difference between the two selected market states</small>
@@ -507,7 +507,7 @@
                 <small id="execution-a-price-time">USD price time —</small>
                 <small id="execution-a-price-skew">Price/state skew —</small>
               </div>
-              <div id="execution-b-timing-card">
+              <div id="execution-b-timing-card" data-pair-only>
                 <span>Market B source timing</span>
                 <strong id="execution-b-timing-status">—</strong>
                 <small id="execution-b-state-time">State time —</small>
@@ -517,16 +517,16 @@
             </div>
             <div class="liquidity-table-scroll" role="region" aria-label="Fixed-notional execution cost values" tabindex="0">
               <table class="liquidity-table execution-table">
-                <caption>Execution cost and fill ratio for each collected notional in the selected direction.</caption>
+                <caption id="execution-table-caption">Execution cost and fill ratio for each collected notional in the selected direction.</caption>
                 <thead>
                   <tr>
                     <th scope="col">Requested Notional</th>
                     <th scope="col" id="execution-a-cost-heading">A Cost</th>
                     <th scope="col">A Fill</th>
                     <th scope="col">A Status</th>
-                    <th scope="col" id="execution-b-cost-heading">B Cost</th>
-                    <th scope="col">B Fill</th>
-                    <th scope="col">B Status</th>
+                    <th scope="col" id="execution-b-cost-heading" data-pair-only>B Cost</th>
+                    <th scope="col" data-pair-only>B Fill</th>
+                    <th scope="col" data-pair-only>B Status</th>
                   </tr>
                 </thead>
                 <tbody id="execution-table-body">
@@ -833,7 +833,7 @@
                 </details>
               </div>
             </div>
-            <div class="segmented-control" role="group" aria-label="Data quality scope">
+            <div class="segmented-control" role="group" aria-label="Data quality scope" data-pair-only>
               <button type="button" data-quality-scope="all" class="active" aria-pressed="true">All markets</button>
               <button type="button" data-quality-scope="selected" aria-pressed="false">Selected A &amp; B</button>
             </div>

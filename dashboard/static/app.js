@@ -50,8 +50,11 @@ const app = {
   comparisonController: null,
   comparisonRequestKey: "",
   executionController: null,
+  executionRequestKey: "",
   qualityController: null,
+  qualityRequestKey: "",
   eventController: null,
+  eventRequestKey: "",
   snapshotRefreshController: null,
   opportunityController: null,
   liquidityLayoutMode: null,
@@ -548,7 +551,7 @@ function currentWorkspaceRouteState(
     state.view = app.liquidityView;
     state.scale = app.liquidityScale;
   } else if (page === "quality") {
-    state.scope = app.qualityScope;
+    state.scope = effectiveQualityScope(state);
     if (app.qualitySeverity) state.severity = app.qualitySeverity;
     if (app.qualityOrigin) state.origin = app.qualityOrigin;
   } else if (page === "events") {
@@ -707,6 +710,10 @@ function setActiveAppView(kind) {
 }
 
 function setActiveWorkspacePage(page) {
+  if (page !== "compare") invalidateComparisonRequest();
+  if (page !== "liquidity") invalidateExecutionRequest();
+  if (page !== "quality") invalidateQualityRequest();
+  if (page !== "events") invalidateEventRequest();
   document.querySelectorAll("[data-workspace-view]").forEach((view) => {
     view.hidden = view.dataset.workspaceView !== page;
   });
@@ -3612,8 +3619,9 @@ function catalogQualityPayload() {
   if (!app.catalog) return { token_symbol: "", markets: [] };
   const token = selectedWorkspaceToken();
   const selected = new Set(Object.values(selectedPairState()).filter(Boolean));
+  const scope = effectiveQualityScope();
   const markets = factsMarketsForToken(token)
-    .filter((market) => app.qualityScope === "all" || selected.has(market.market_id))
+    .filter((market) => scope === "all" || selected.has(market.market_id))
     .map((market) => {
       const row = payloadMarketForCatalog(market);
       const dailyCoverage = firstFinite(market.coverage_ratio, row?.coverage_ratio);
@@ -4127,6 +4135,7 @@ function setExecutionLoading(message) {
 function invalidateExecutionRequest() {
   if (app.executionController) app.executionController.abort();
   app.executionController = null;
+  app.executionRequestKey = "";
   app.executionRequestId += 1;
   return app.executionRequestId;
 }
@@ -4162,23 +4171,27 @@ function clearExecutionResult(message = "") {
 
 function renderExecution(payload) {
   app.execution = payload;
+  const single = payload?.selection_mode === "single";
   const notionals = payload.metadata?.notionals_usd || [1000, 5000, 10000, 50000, 100000];
   const resultA = payload.market_a;
-  const resultB = payload.market_b;
+  const resultB = single ? null : payload.market_b;
   renderExecutionTiming("a", resultA);
-  renderExecutionTiming("b", resultB);
+  if (!single) renderExecutionTiming("b", resultB);
   const rowsA = notionals.map((notional) => executionScenario(
     resultA,
     app.executionDirection,
     notional,
   ));
-  const rowsB = notionals.map((notional) => executionScenario(
+  const rowsB = single ? [] : notionals.map((notional) => executionScenario(
     resultB,
     app.executionDirection,
     notional,
   ));
   byId("execution-a-cost-heading").textContent = `${executionMarketName(resultA, "A")} Cost`;
-  byId("execution-b-cost-heading").textContent = `${executionMarketName(resultB, "B")} Cost`;
+  if (!single) byId("execution-b-cost-heading").textContent = `${executionMarketName(resultB, "B")} Cost`;
+  byId("execution-table-caption").textContent = single
+    ? "Execution cost and fill ratio for Market A at each collected notional in the selected direction."
+    : "Execution cost and fill ratio for each collected notional in the selected direction.";
   byId("execution-table-body").innerHTML = notionals.map((notional, index) => {
     const rowA = rowsA[index];
     const rowB = rowsB[index];
@@ -4187,9 +4200,9 @@ function renderExecution(payload) {
       <td data-label="A Cost">${executionCostMarkup(rowA, resultA, notional)}</td>
       <td data-label="A Fill">${executionFillMarkup(rowA, resultA, notional)}</td>
       <td data-label="A Status">${executionStatusMarkup(rowA, resultA)}</td>
-      <td data-label="B Cost">${executionCostMarkup(rowB, resultB, notional)}</td>
+      ${single ? "" : `<td data-label="B Cost">${executionCostMarkup(rowB, resultB, notional)}</td>
       <td data-label="B Fill">${executionFillMarkup(rowB, resultB, notional)}</td>
-      <td data-label="B Status">${executionStatusMarkup(rowB, resultB)}</td>
+      <td data-label="B Status">${executionStatusMarkup(rowB, resultB)}</td>`}
     </tr>`;
   }).join("");
 
@@ -4198,42 +4211,38 @@ function renderExecution(payload) {
     app.executionDirection,
     app.executionNotionalUsd,
   );
-  const selectedB = executionScenario(
+  const selectedB = single ? null : executionScenario(
     resultB,
     app.executionDirection,
     app.executionNotionalUsd,
   );
   byId("execution-a-label").textContent = `${executionMarketName(resultA, "A")} cost`;
-  byId("execution-b-label").textContent = `${executionMarketName(resultB, "B")} cost`;
+  if (!single) byId("execution-b-label").textContent = `${executionMarketName(resultB, "B")} cost`;
   byId("execution-a-cost").innerHTML = executionCostMarkup(
     selectedA,
     resultA,
     app.executionNotionalUsd,
   );
-  byId("execution-b-cost").innerHTML = executionCostMarkup(
-    selectedB,
-    resultB,
-    app.executionNotionalUsd,
+  byId("execution-b-cost").innerHTML = single ? "" : executionCostMarkup(
+    selectedB, resultB, app.executionNotionalUsd,
   );
   byId("execution-a-fill").innerHTML = executionFillMarkup(
     selectedA,
     resultA,
     app.executionNotionalUsd,
   );
-  byId("execution-b-fill").innerHTML = executionFillMarkup(
-    selectedB,
-    resultB,
-    app.executionNotionalUsd,
+  byId("execution-b-fill").innerHTML = single ? "" : executionFillMarkup(
+    selectedB, resultB, app.executionNotionalUsd,
   );
   const snapshotSkew = payload.metadata?.snapshot_skew_seconds;
-  setFactValue(
+  if (!single) setFactValue(
     "execution-skew",
     finite(snapshotSkew),
     formatDurationSeconds(snapshotSkew),
     "Snapshot skew requires valid state timestamps for both selected execution markets.",
     { token: payload.token_symbol, factLabel: "execution snapshot skew" },
   );
-  const feeScope = executionFeeScope([selectedA, selectedB]);
+  const feeScope = executionFeeScope(single ? [selectedA] : [selectedA, selectedB]);
   setFactValue(
     "execution-fee-scope",
     Boolean(feeScope),
@@ -4248,17 +4257,15 @@ function renderExecution(payload) {
 
   const scenarioRows = [...rowsA, ...rowsB].filter(Boolean);
   const statuses = scenarioRows.map((row) => row.status);
-  const unavailableResults = [resultA, resultB].filter((result) => (
+  const unavailableResults = (single ? [resultA] : [resultA, resultB]).filter((result) => (
     !result || result.status !== "available"
   ));
   const failed = statuses.filter((status) => status === "failed").length;
   const partial = statuses.filter((status) => status === "partial").length;
   const unsupported = statuses.filter((status) => status === "unsupported").length;
   const observed = statuses.filter((status) => status === "observed").length;
-  const withheldResults = [
-    ["A", resultA],
-    ["B", resultB],
-  ].filter(([, result]) => result?.publication_status === "withheld");
+  const withheldResults = (single ? [["A", resultA]] : [["A", resultA], ["B", resultB]])
+    .filter(([, result]) => result?.publication_status === "withheld");
   const state = failed
     ? "critical"
     : partial || unsupported || unavailableResults.length
@@ -4281,21 +4288,51 @@ function renderExecution(payload) {
   if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
 
+function executionPayloadMatchesSelection(payload, token, selection) {
+  if (
+    payload?.token_symbol !== token
+    || payload?.market_a?.market?.market_id !== selection.marketA
+  ) return false;
+  if (selection.selection === "single") {
+    return payload.selection_mode === "single" && payload.market_b === null;
+  }
+  return (
+    payload.selection_mode == null
+    && payload?.market_b?.market?.market_id === selection.marketB
+  );
+}
+
+function executionRequestIsCurrent(requestId, requestKey, selection) {
+  return (
+    requestId === app.executionRequestId
+    && requestKey === app.executionRequestKey
+    && app.route?.page === "liquidity"
+    && requestKey === workspaceRequestKey("liquidity", selection)
+  );
+}
+
 async function loadExecutionCost() {
   const requestId = invalidateExecutionRequest();
   const token = selectedWorkspaceToken();
-  const { marketA, marketB } = selectedPairState();
-  if (!app.catalog || !token || !marketA || !marketB || marketA === marketB) {
-    clearExecutionResult("Choose two distinct markets for this Token to inspect execution cost.");
+  const selection = selectedMarketSelection();
+  const { marketA, marketB } = selection;
+  const single = selection.selection === "single";
+  if (!app.catalog || !token || !marketA || (single ? Boolean(marketB) : !marketB || marketA === marketB)) {
+    clearExecutionResult(single
+      ? "Choose Market A and leave Market B empty to inspect execution cost."
+      : "Choose two distinct markets for this Token to inspect execution cost.");
     return false;
   }
+  const requestKey = workspaceRequestKey("liquidity", selection);
+  app.executionRequestKey = requestKey;
   const controller = new AbortController();
   app.executionController = controller;
   const query = new URLSearchParams({
     token,
     market_a: marketA,
-    market_b: marketB,
   });
+  if (single) query.set("selection", "single");
+  else query.set("market_b", marketB);
   setExecutionLoading(`Loading ${token} fixed-notional execution facts…`);
   try {
     const response = await fetch(`/api/markets/execution-cost?${query.toString()}`, {
@@ -4303,21 +4340,25 @@ async function loadExecutionCost() {
     });
     const payload = await responseJson(response);
     if (!response.ok) throw new Error(payload.error || "Execution facts failed to load.");
-    if (requestId !== app.executionRequestId) return false;
+    if (!executionRequestIsCurrent(requestId, requestKey, selection)) return false;
+    if (!executionPayloadMatchesSelection(payload, token, selection)) {
+      throw new Error("The execution response failed its Token, market, or selection contract.");
+    }
     renderExecution(payload);
     return true;
   } catch (error) {
-    if (error.name === "AbortError" || requestId !== app.executionRequestId) return false;
+    if (error.name === "AbortError" || !executionRequestIsCurrent(requestId, requestKey, selection)) return false;
     clearExecutionResult(publicErrorMessage(error, "Execution facts failed to load."));
     return false;
   } finally {
-    if (requestId === app.executionRequestId) app.executionController = null;
+    if (executionRequestIsCurrent(requestId, requestKey, selection)) app.executionController = null;
   }
 }
 
 function invalidateQualityRequest() {
   if (app.qualityController) app.qualityController.abort();
   app.qualityController = null;
+  app.qualityRequestKey = "";
   app.qualityRequestId += 1;
   return app.qualityRequestId;
 }
@@ -4354,33 +4395,78 @@ function qualityStatusTiers(counts) {
   };
 }
 
+function effectiveQualityScope(selection = selectedMarketSelection()) {
+  return selection.selection === "single" ? "selected" : app.qualityScope;
+}
+
+function qualityPayloadMatchesSelection(payload, token, selection, scope) {
+  if (payload?.token_symbol !== token || payload?.metadata?.scope !== scope) return false;
+  const expectedIds = scope === "selected"
+    ? selection.selection === "single"
+      ? [selection.marketA]
+      : [selection.marketA, selection.marketB]
+    : null;
+  if (!expectedIds) return true;
+  const actualIds = payload?.metadata?.selected_market_ids;
+  if (
+    !Array.isArray(actualIds)
+    || actualIds.length !== expectedIds.length
+    || actualIds.some((id, index) => id !== expectedIds[index])
+  ) return false;
+  const rows = Array.isArray(payload?.markets) ? payload.markets : [];
+  return rows.length === expectedIds.length
+    && rows.every((row, index) => (row?.market_id || row?.market?.market_id) === expectedIds[index]);
+}
+
+function qualityRequestIsCurrent(requestId, requestKey, selection, scope) {
+  return (
+    requestId === app.qualityRequestId
+    && requestKey === app.qualityRequestKey
+    && app.route?.page === "quality"
+    && requestKey === workspaceRequestKey("quality", selection, { scope })
+  );
+}
+
 async function loadQuality() {
   const window = appliedTimeWindow();
   const requestId = invalidateQualityRequest();
   const token = selectedWorkspaceToken();
-  const { marketA, marketB } = selectedPairState();
+  const selection = selectedMarketSelection();
+  const { marketA, marketB } = selection;
+  const scope = effectiveQualityScope(selection);
+  if (selection.selection === "single") app.qualityScope = "selected";
   if (!app.catalog || !token) {
     showError(byId("quality-error"), "Market catalog is unavailable.");
     return false;
   }
-  if (app.qualityScope === "selected" && (!marketA || !marketB || marketA === marketB)) {
+  if (scope === "selected" && (
+    !marketA
+    || (selection.selection === "single" ? Boolean(marketB) : !marketB || marketA === marketB)
+  )) {
     renderQualityFromCatalog();
     showStatus(
       byId("quality-status"),
-      "Selected scope needs two distinct markets. The catalog-level fallback remains visible.",
+      selection.selection === "single"
+        ? "Selected scope needs exact Market A. The A-only catalog fallback remains visible."
+        : "Selected scope needs two distinct markets. The catalog-level fallback remains visible.",
       "stale",
     );
-    showError(byId("quality-error"), "Choose distinct Market A and Market B.");
+    showError(byId("quality-error"), selection.selection === "single"
+      ? "Choose exact Market A and leave Market B empty."
+      : "Choose distinct Market A and Market B.");
     return false;
   }
+  const requestKey = workspaceRequestKey("quality", selection, { scope });
+  app.qualityRequestKey = requestKey;
   const controller = new AbortController();
   app.qualityController = controller;
-  const query = new URLSearchParams({ token, scope: app.qualityScope });
+  const query = new URLSearchParams({ token, scope });
   if (window.start) query.set("start", window.start);
   if (window.end) query.set("end", window.end);
-  if (app.qualityScope === "selected") {
+  if (scope === "selected") {
     query.set("market_a", marketA);
-    query.set("market_b", marketB);
+    if (selection.selection === "single") query.set("selection", "single");
+    else query.set("market_b", marketB);
   }
   hideError(byId("quality-error"));
   showStatus(byId("quality-status"), `Loading ${token} fact lineage and quality states…`);
@@ -4390,7 +4476,10 @@ async function loadQuality() {
     });
     const payload = await responseJson(response);
     if (!response.ok) throw new Error(payload.error || "Quality facts failed to load.");
-    if (requestId !== app.qualityRequestId) return false;
+    if (!qualityRequestIsCurrent(requestId, requestKey, selection, scope)) return false;
+    if (!qualityPayloadMatchesSelection(payload, token, selection, scope)) {
+      throw new Error("The quality response failed its Token, market, or selection contract.");
+    }
     renderQualityPayload(payload);
     const counts = qualityStatusCounts(payload);
     const { critical, pending, informational } = qualityStatusTiers(counts);
@@ -4403,7 +4492,7 @@ async function loadQuality() {
       byId("quality-status"),
       `${payload.token_symbol} · ${payload.metadata.scope} scope · `
         + `${payload.metadata.window_start || "—"} → ${payload.metadata.window_end || "—"} · `
-        + `${payload.markets.length} markets · ${counts.observed || 0} observed · `
+        + `${payload.markets.length} market${payload.markets.length === 1 ? "" : "s"} · ${counts.observed || 0} observed · `
         + `${pending} attention/limits · ${critical} failed/invalid · `
         + `${informational} informational/structural · ${counts.partial || 0} partial · `
         + `${dailyAuditText}.`,
@@ -4413,7 +4502,7 @@ async function loadQuality() {
     hideError(byId("quality-error"));
     return true;
   } catch (error) {
-    if (error.name === "AbortError" || requestId !== app.qualityRequestId) return false;
+    if (error.name === "AbortError" || !qualityRequestIsCurrent(requestId, requestKey, selection, scope)) return false;
     renderQualityFromCatalog();
     showStatus(
       byId("quality-status"),
@@ -4426,15 +4515,28 @@ async function loadQuality() {
     );
     return false;
   } finally {
-    if (requestId === app.qualityRequestId) app.qualityController = null;
+    if (qualityRequestIsCurrent(requestId, requestKey, selection, scope)) app.qualityController = null;
   }
 }
 
 function invalidateEventRequest() {
   if (app.eventController) app.eventController.abort();
   app.eventController = null;
+  app.eventRequestKey = "";
   app.eventRequestId += 1;
   return app.eventRequestId;
+}
+
+function eventRequestIsCurrent(requestId, requestKey, selection) {
+  return (
+    requestId === app.eventRequestId
+    && requestKey === app.eventRequestKey
+    && app.route?.page === "events"
+    && requestKey === workspaceRequestKey("events", selection, {
+      lifecycle: app.eventLifecycle,
+      clockState: app.eventClockState,
+    })
+  );
 }
 
 function eventAvailabilityStatus(payload) {
@@ -4678,12 +4780,18 @@ async function fetchEventFacts({
 async function loadEvents() {
   const requestId = invalidateEventRequest();
   const token = selectedWorkspaceToken();
+  const selection = selectedMarketSelection();
   if (!app.catalog || !token) {
     showError(byId("events-error"), "Token catalog is unavailable.");
     return false;
   }
   const controller = new AbortController();
   app.eventController = controller;
+  const requestKey = workspaceRequestKey("events", selection, {
+    lifecycle: app.eventLifecycle,
+    clockState: app.eventClockState,
+  });
+  app.eventRequestKey = requestKey;
   hideError(byId("events-error"));
   showStatus(byId("events-status"), `Loading ${token} verified Event Facts…`);
   try {
@@ -4693,11 +4801,11 @@ async function loadEvents() {
       clockState: app.eventClockState,
       signal: controller.signal,
     });
-    if (requestId !== app.eventRequestId) return false;
+    if (!eventRequestIsCurrent(requestId, requestKey, selection)) return false;
     renderEventFacts(payload);
     return true;
   } catch (error) {
-    if (error.name === "AbortError" || requestId !== app.eventRequestId) return false;
+    if (error.name === "AbortError" || !eventRequestIsCurrent(requestId, requestKey, selection)) return false;
     app.eventFacts = null;
     byId("events-body").innerHTML = (
       '<tr><td colspan="8" class="missing">Verified Event Facts could not be loaded. No zero-event claim is made.</td></tr>'
@@ -4728,7 +4836,7 @@ async function loadEvents() {
     if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
     return false;
   } finally {
-    if (requestId === app.eventRequestId) app.eventController = null;
+    if (eventRequestIsCurrent(requestId, requestKey, selection)) app.eventController = null;
   }
 }
 
@@ -5486,7 +5594,15 @@ function liquidityDepthMarkup(value, complete, market, band, component) {
   });
 }
 
-function renderLiquidityTable(marketA, marketB, dataMarketA, dataMarketB, invalidA, invalidB) {
+function renderLiquidityTable(
+  marketA,
+  marketB,
+  dataMarketA,
+  dataMarketB,
+  invalidA,
+  invalidB,
+  { single = false } = {},
+) {
   const sidesA = liquiditySideDefinition(marketA);
   const sidesB = liquiditySideDefinition(marketB);
   byId("liquidity-a-total-heading").textContent = "A Total";
@@ -5495,6 +5611,9 @@ function renderLiquidityTable(marketA, marketB, dataMarketA, dataMarketB, invali
   byId("liquidity-b-total-heading").textContent = "B Total";
   byId("liquidity-b-sell-heading").textContent = `B ${sidesB.sellLabel}`;
   byId("liquidity-b-buy-heading").textContent = `B ${sidesB.buyLabel}`;
+  byId("liquidity-table-caption").textContent = single
+    ? "Exact cumulative USD depth for Market A at each observed price-distance band."
+    : "Exact cumulative USD depth for the selected two markets at each observed price-distance band.";
   byId("liquidity-table-body").innerHTML = DEPTH_BANDS.map((band) => {
     const completeA = Boolean(dataMarketA?.[`depth_${band}bps_complete`]);
     const completeB = Boolean(dataMarketB?.[`depth_${band}bps_complete`]);
@@ -5504,10 +5623,10 @@ function renderLiquidityTable(marketA, marketB, dataMarketA, dataMarketB, invali
       <td data-label="A Sell execution">${liquidityDepthMarkup(liquidityDepthValue(dataMarketA, band, sidesA.sellField), completeA, marketA, band, sidesA.sellLabel.toLowerCase())}</td>
       <td data-label="A Buy execution">${liquidityDepthMarkup(liquidityDepthValue(dataMarketA, band, sidesA.buyField), completeA, marketA, band, sidesA.buyLabel.toLowerCase())}</td>
       <td data-label="A Completeness">${escapeHtml(liquidityCompletenessLabel(marketA, dataMarketA, band, invalidA))}</td>
-      <td data-label="B Total">${liquidityDepthMarkup(liquidityDepthValue(dataMarketB, band), completeB, marketB, band, "total")}</td>
+      ${single ? "" : `<td data-label="B Total">${liquidityDepthMarkup(liquidityDepthValue(dataMarketB, band), completeB, marketB, band, "total")}</td>
       <td data-label="B Sell execution">${liquidityDepthMarkup(liquidityDepthValue(dataMarketB, band, sidesB.sellField), completeB, marketB, band, sidesB.sellLabel.toLowerCase())}</td>
       <td data-label="B Buy execution">${liquidityDepthMarkup(liquidityDepthValue(dataMarketB, band, sidesB.buyField), completeB, marketB, band, sidesB.buyLabel.toLowerCase())}</td>
-      <td data-label="B Completeness">${escapeHtml(liquidityCompletenessLabel(marketB, dataMarketB, band, invalidB))}</td>
+      <td data-label="B Completeness">${escapeHtml(liquidityCompletenessLabel(marketB, dataMarketB, band, invalidB))}</td>`}
     </tr>`;
   }).join("");
 }
@@ -5602,7 +5721,7 @@ function liquiditySnapshotSkew(marketA, marketB) {
   return `${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m`;
 }
 
-function renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB) {
+function renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB, { single = false } = {}) {
   const completeA = Boolean(dataMarketA?.depth_100bps_complete);
   const completeB = Boolean(dataMarketB?.depth_100bps_complete);
   byId("liquidity-a-label").textContent = marketA
@@ -5632,6 +5751,7 @@ function renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB) {
       bandBps: 100,
     },
   );
+  if (single) return;
   setFactValue(
     "liquidity-b-100",
     validDepth(depthB),
@@ -5670,38 +5790,32 @@ function renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB) {
 
 function renderLiquidityCurve() {
   if (!app.catalog) return;
+  const selection = selectedMarketSelection();
+  const single = selection.selection === "single" && !selection.marketB;
   const { token, marketA, marketB } = selectedLiquidityMarkets();
   const issuesA = liquidityDepthIssues(marketA);
-  const issuesB = liquidityDepthIssues(marketB);
+  const issuesB = single ? [] : liquidityDepthIssues(marketB);
   const dataMarketA = liquidityRenderableMarket(marketA, issuesA);
-  const dataMarketB = liquidityRenderableMarket(marketB, issuesB);
+  const dataMarketB = single ? null : liquidityRenderableMarket(marketB, issuesB);
   const series = [
     ...liquiditySeriesForMarket("A", marketA),
-    ...liquiditySeriesForMarket("B", marketB),
+    ...(single ? [] : liquiditySeriesForMarket("B", marketB)),
   ];
   const plotted = renderLiquiditySvg(series);
   const plottedSlots = new Set(series.map((item) => item.slot));
-  const unavailableSlots = [
-    ["A", marketA],
-    ["B", marketB],
-  ].filter(([slot]) => !plottedSlots.has(slot));
+  const selectedSlots = single ? [["A", marketA]] : [["A", marketA], ["B", marketB]];
+  const unavailableSlots = selectedSlots.filter(([slot]) => !plottedSlots.has(slot));
   const failedSlots = unavailableSlots
     .filter(([, market]) => market?.depth_status === "failed")
     .map(([slot]) => slot);
-  const partialSlots = [
-    ["A", marketA],
-    ["B", marketB],
-  ].filter(([, market]) => market?.depth_status === "partial");
-  const qualityWarningSlots = [
-    ["A", marketA],
-    ["B", marketB],
-  ].map(([slot, market]) => [slot, liquidityRelevantFlags(market)])
+  const partialSlots = selectedSlots.filter(([, market]) => market?.depth_status === "partial");
+  const qualityWarningSlots = selectedSlots.map(([slot, market]) => [slot, liquidityRelevantFlags(market)])
     .filter(([, flags]) => flags.length);
   const hasCriticalQualityFlag = qualityWarningSlots.some(([, flags]) => (
     flags.some((flag) => flag.severity === "critical")
   ));
   renderLiquidityLegend(series);
-  renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB);
+  renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB, { single });
   renderLiquidityTable(
     marketA,
     marketB,
@@ -5709,10 +5823,12 @@ function renderLiquidityCurve() {
     dataMarketB,
     Boolean(marketA && issuesA.length),
     Boolean(marketB && issuesB.length),
+    { single },
   );
   renderLiquidityMarketMeta("A", marketA, issuesA);
-  renderLiquidityMarketMeta("B", marketB, issuesB);
-  const skew = liquiditySnapshotSkew(marketA, marketB);
+  if (single) byId("liquidity-market-b-meta").innerHTML = "";
+  else renderLiquidityMarketMeta("B", marketB, issuesB);
+  const skew = single ? null : liquiditySnapshotSkew(marketA, marketB);
   const status = byId("liquidity-status");
   const integrityIssues = [...issuesA, ...issuesB];
   const scaleStatus = !plotted
@@ -5738,7 +5854,7 @@ function renderLiquidityCurve() {
   status.textContent = integrityIssues.length
     ? `Invalid market series suppressed: ${integrityIssues.join("; ")}.`
     : `${token || "Selected Token"} · ${app.liquidityView} markers · ${scaleStatus}`
-      + `${skew ? ` · snapshot skew ${skew}` : " · snapshot skew unavailable"}`
+      + `${single ? "" : skew ? ` · snapshot skew ${skew}` : " · snapshot skew unavailable"}`
       + `${unavailableSlots.length
         ? ` · ${unavailableSlots.map(([slot, market]) => (
             `Market ${slot} ${market?.depth_status || "unavailable"}`
@@ -5761,10 +5877,10 @@ function renderLiquidityCurve() {
     marketA
       ? `${liquidityMarketLabel("A", marketA)} is ${marketA.depth_status || "unavailable"} at ${formatUtcTimestamp(marketA.depth_observed_at)}.`
       : "Market A is unavailable.",
-    marketB
+    !single && marketB
       ? `${liquidityMarketLabel("B", marketB)} is ${marketB.depth_status || "unavailable"} at ${formatUtcTimestamp(marketB.depth_observed_at)}.`
-      : "Market B is unavailable.",
-    "Only the four labeled thresholds are measured; missing markets are not replaced with zero or TVL.",
+      : !single ? "Market B is unavailable." : "",
+    `Only the four labeled thresholds are measured; missing ${single ? "values are" : "markets are"} not replaced with zero or TVL.`,
   ].join(" ");
   hideLiquidityTooltip();
   if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
