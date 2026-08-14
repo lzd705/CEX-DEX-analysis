@@ -376,9 +376,10 @@ In `tests/test_dashboard.py`, add:
 - `test_compare_requires_explicit_single_marker_when_market_b_missing`;
 - `test_single_selection_cardinality_rejects_conflicting_or_unknown_modes`;
 - `test_public_api_query_items_keeps_selection_in_projection_cache_key`;
-- `test_public_response_cache_separates_pair_and_single_projections`.
+- `test_public_response_cache_separates_pair_and_single_projections`;
+- `DashboardApiTest.test_single_selection_public_queries_fail_closed_before_payload_build`.
 
-Build both a paired and a single normalized query tuple and assert they differ. Adding an unsupported query key must change neither tuple. Exercise `_build_public_api_response_cached` in pair -> single -> pair order and assert the final pair cache hit retains the exact pair payload while the single response retains only A.
+Build both a paired and a single normalized query tuple and assert they differ. Adding an unsupported query key must change neither tuple. For the pre-Compare cache test, stub `_build_public_api_payload()` at the cache boundary to return hand-written pair or single literals based only on the received normalized tuple. Exercise `_build_public_api_response_cached` in pair -> single -> pair order and assert the builder is called once per distinct key, the second pair call is a cache hit, and neither literal crosses modes.
 
 At the public HTTP boundary, add requests proving missing marker, marker+B conflict, and `scope=all&selection=single` return 400. Patch the builders/source readers with poisoned callables and assert none is invoked for those rejected queries.
 
@@ -387,7 +388,12 @@ At the public HTTP boundary, add requests proving missing marker, marker+B confl
 Run:
 
 ```bash
-python3 -m unittest tests.test_dashboard -v
+python3 -m unittest \
+  tests.test_dashboard.MarketMonitorServerTest.test_compare_requires_explicit_single_marker_when_market_b_missing \
+  tests.test_dashboard.MarketMonitorServerTest.test_single_selection_cardinality_rejects_conflicting_or_unknown_modes \
+  tests.test_dashboard.MarketMonitorServerTest.test_public_api_query_items_keeps_selection_in_projection_cache_key \
+  tests.test_dashboard.MarketMonitorServerTest.test_public_response_cache_separates_pair_and_single_projections \
+  tests.test_dashboard.DashboardApiTest.test_single_selection_public_queries_fail_closed_before_payload_build -v
 ```
 
 Expected: FAIL because the explicit marker is not accepted, is absent from the allowlist/cache key, and the HTTP boundary still reaches old validation.
@@ -443,7 +449,7 @@ Forward `selection=query.get("selection")` from `_build_public_api_payload()` in
 
 - [ ] **Step 6: Cardinality/cache cycle — verify GREEN**
 
-Run the focused new cardinality, HTTP-400, normalized-key, and alternating response-cache tests plus existing public API cache tests. Expected: GREEN before any Compare projection code is written; paired keys/responses remain exact.
+Re-run the exact five-test command from Step 4. Expected: GREEN before any Compare projection code is written; paired keys/responses remain exact. Then run `python3 -m unittest tests.test_dashboard.MarketMonitorServerTest.test_public_api_cache_key_ignores_unsupported_query_fields -v` as the existing cache regression.
 
 - [ ] **Step 7: Compare cycle — write and verify failing single-response tests**
 
@@ -460,7 +466,18 @@ self.assertEqual(result["latest_market_a_observation"], result["observations"][-
 self.assertTrue(all(set(row) == {"date", "market_a"} for row in result["observations"]))
 ```
 
-Run the same assertions with a CEX ID and a DEX ID as A. Spy on `selected_market_rows()` and prove only A is requested; do not corrupt the shared catalog source. Add an empty-series case with `observations == []`, `latest_market_a_observation is None`, structured unavailable statistics, and no B placeholder. Run the focused tests and observe a response-contract RED.
+Run the same assertions with a CEX ID and a DEX ID as A. Spy on `selected_market_rows()` and prove only A is requested; do not corrupt the shared catalog source. Add `test_compare_single_empty_series_returns_bounded_na_without_pair_fields` for `observations == []`, `latest_market_a_observation is None`, structured unavailable statistics, and no B placeholder.
+
+Run:
+
+```bash
+python3 -m unittest \
+  tests.test_dashboard.MarketMonitorServerTest.test_compare_single_selection_returns_only_market_a_projection \
+  tests.test_dashboard.MarketMonitorServerTest.test_compare_single_empty_series_returns_bounded_na_without_pair_fields \
+  tests.test_dashboard.MarketMonitorServerTest.test_paired_compare_projection_is_unchanged_when_selection_is_absent -v
+```
+
+Expected: response-contract RED before the Compare branch is implemented.
 
 - [ ] **Step 8: Compare cycle — implement the single branch**
 
@@ -711,11 +728,19 @@ Add behavioral tests for:
 
 - [ ] **Step 3: Write failing invalid-deep-link tests**
 
-For `selection=single&marketA=<exact>&marketB=<exact>`, an unknown A, and `marketA=<exact>&selection=bogus`, assert the raw IDs/marker remain visible in the bounded error, no default is selected, no data request starts, and `history.replaceState` does not produce a repaired valid link. Mirror the bogus-marker case in Playwright so real hydration also proves zero API requests and zero canonicalizing `replaceState` calls.
+For `selection=single&marketA=<exact>&marketB=<exact>`, an unknown A, and `marketA=<exact>&selection=bogus`, assert the raw IDs/marker remain visible in the bounded error, no default is selected, no data request starts, and `history.replaceState` does not produce a repaired valid link. Add Playwright test `invalid selection marker is not repaired` so real hydration also proves zero API requests and zero canonicalizing `replaceState` calls.
 
 - [ ] **Step 4: Verify unit RED**
 
-Run: `python3 -m unittest tests.test_dashboard_frontend -v`
+Run:
+
+```bash
+python3 -m unittest tests.test_dashboard_frontend -v
+node "$NODE_PATH/playwright/cli.js" test \
+  -c dashboard/playwright.config.js \
+  --project=desktop \
+  --grep "invalid selection marker is not repaired"
+```
 
 Expected: FAIL because current session and route code treats every empty B as incomplete and deletes prior records.
 
@@ -810,7 +835,7 @@ python3 -m unittest tests.test_navigation tests.test_dashboard_frontend \
 node "$NODE_PATH/playwright/cli.js" test \
   -c dashboard/playwright.config.js \
   --project=desktop \
-  --grep "can be confirmed when Market B starts empty|restoring Market B restores the pair contract"
+  --grep "can be confirmed when Market B starts empty|restoring Market B restores the pair contract|invalid selection marker is not repaired"
 ```
 
 Expected: PASS, including per-Token restoration and the unchanged pair flow.
@@ -870,7 +895,7 @@ Assert single Compare:
 
 Before implementation, extend `dashboard/tests/single-market-selection.spec.js` with `single Compare renders only Market A`. Run it in both configured projects against the single Compare fixture. Assert the three table headings, one chart identity, centered A marker, hidden pair-only roles absent from the accessibility/focus order, retained Event overlay, no unexpected console/page error, and no horizontal overflow at 390x844.
 
-Add both unit and browser fixtures for a valid single response with `observations: []`, `latest_market_a_observation: null`, and structured unavailable statistics. Assert the page renders a bounded empty/N/A state, does not crash, and never creates a B legend, B placeholder, comparable card, or pair-derived table column.
+Add both unit and browser fixtures plus Playwright test `single Compare handles empty observations` for a valid response with `observations: []`, `latest_market_a_observation: null`, and structured unavailable statistics. Assert the page renders a bounded empty/N/A state, does not crash, and never creates a B legend, B placeholder, comparable card, or pair-derived table column.
 
 - [ ] **Step 3: Verify RED**
 
@@ -883,7 +908,7 @@ python3 -m unittest \
   tests.test_event_frontend -v
 node "$NODE_PATH/playwright/cli.js" test \
   -c dashboard/playwright.config.js \
-  --grep "single Compare renders only Market A"
+  --grep "single Compare renders only Market A|single Compare handles empty observations"
 ```
 
 Expected: FAIL because the current renderer dereferences Market B and always exposes spread/comparable UI.
@@ -979,7 +1004,7 @@ python3 -m unittest \
   tests.test_navigation -v
 node "$NODE_PATH/playwright/cli.js" test \
   -c dashboard/playwright.config.js \
-  --grep "single Compare renders only Market A"
+  --grep "single Compare renders only Market A|single Compare handles empty observations"
 ```
 
 Expected: PASS. Switching single -> pair must restore all existing B/spread/comparable behavior.
@@ -1019,19 +1044,26 @@ Add tests proving that single mode:
 - hides B depth summary/meta, snapshot skew, paired-band count, and every B cell;
 - keeps A completeness, lower-bound, timing, flags, and structured `N/A` reasons.
 
-Run the focused Liquidity renderer tests and observe an assertion RED caused by visible/derived B output, not by a poisoned helper crash.
+Run `python3 -m unittest tests.test_dashboard_frontend.DashboardFrontendContractTest.test_single_liquidity_renders_only_market_a -v` and observe an assertion RED caused by visible/derived B output, not by a poisoned helper crash.
 
 - [ ] **Step 2: Liquidity cycle — implement the A-only branch and verify GREEN**
 
-In `renderLiquidityCurve()`, derive the canonical selection first. In single mode build only A series, summary, table, and metadata; add `data-pair-only` hooks for B/skew/paired DOM and dynamic singular captions. Do not derive paired bands or construct B status arrays. Re-run only the Liquidity-focused tests until GREEN, then run the existing paired Liquidity regressions.
+In `renderLiquidityCurve()`, derive the canonical selection first. In single mode build only A series, summary, table, and metadata; add `data-pair-only` hooks for B/skew/paired DOM and dynamic singular captions. Do not derive paired bands or construct B status arrays. Re-run the exact Step 1 test until GREEN, then run:
+
+```bash
+python3 -m unittest \
+  tests.test_dashboard.MarketMonitorServerTest.test_liquidity_profile_compares_only_discrete_source_backed_depth \
+  tests.test_dashboard.MarketMonitorServerTest.test_liquidity_profile_behavior_preserves_fact_boundaries \
+  tests.test_dashboard_frontend.DashboardFrontendContractTest.test_comparison_and_liquidity_summary_na_values_disclose_exact_reason -v
+```
 
 - [ ] **Step 3: Execution cycle — write and verify failing behavior tests**
 
-Add focused tests proving the request carries A + marker with no B; the response accepts only exact A identity, `market_b=null`, and null skew; the renderer shows only A cost/fill/status/timing and A fee scope; notional and direction controls redraw the owned payload; and an Execution failure never clears Compare. Observe the intended assertion RED.
+Add `test_single_execution_uses_exact_market_a_and_preserves_compare_on_failure`, proving the request carries A + marker with no B; the response accepts only exact A identity, `market_b=null`, and null skew; the renderer shows only A cost/fill/status/timing and A fee scope; notional and direction controls redraw the owned payload; and an Execution failure never clears Compare. Run `python3 -m unittest tests.test_dashboard_frontend.DashboardFrontendContractTest.test_single_execution_uses_exact_market_a_and_preserves_compare_on_failure -v` and observe the intended assertion RED.
 
 - [ ] **Step 4: Execution cycle — implement the A-only loader/renderer and verify GREEN**
 
-Single `renderExecution()` uses only `payload.market_a`, one timing card, A scenarios, and `executionFeeScope([selectedA])`; it never builds B timing/rows. The request-owner key contains only Token/A/B/marker because the response already contains all scenarios. Validate exact owner and identity before render; a current wrong identity produces only an Execution contract error. Re-run focused Execution tests to GREEN before continuing.
+Single `renderExecution()` uses only `payload.market_a`, one timing card, A scenarios, and `executionFeeScope([selectedA])`; it never builds B timing/rows. The request-owner key contains only Token/A/B/marker because the response already contains all scenarios. Validate exact owner and identity before render; a current wrong identity produces only an Execution contract error. Re-run the exact Step 3 test to GREEN before continuing.
 
 - [ ] **Step 5: Quality/Events cycle — write failing behavior tests**
 
@@ -1046,11 +1078,19 @@ Assert that in single mode:
 - `/api/markets/events` requests contain only Token/date/lifecycle/clock filters and never A/B/selection;
 - an Event failure changes only Event status/overlay and leaves other page facts intact.
 
-Run the focused Quality/Event tests and observe assertion REDs for wrong scope/cardinality or leaked market fields; correct fixture/setup errors before implementation.
+Add `DashboardFrontendContractTest.test_single_quality_uses_exact_a_scope` and `EventFrontendTest.test_single_workspace_keeps_events_token_scoped`. Run:
+
+```bash
+python3 -m unittest \
+  tests.test_dashboard_frontend.DashboardFrontendContractTest.test_single_quality_uses_exact_a_scope \
+  tests.test_event_frontend.EventFrontendTest.test_single_workspace_keeps_events_token_scoped -v
+```
+
+Observe assertion REDs for wrong scope/cardinality or leaked market fields; correct fixture/setup errors before implementation.
 
 - [ ] **Step 6: Quality/Events cycle — implement exact A scope and verify GREEN**
 
-Add `effectiveQualityScope(selection)` and use it in route state, visible controls, query construction, and owner keys. Single Quality always requests selected exact A, validates ordered `[A]`, and filters any catalog fallback to A. Events remain Token-only; workspace links retain selection, and Event failure never clears Compare. Re-run the focused Quality/Event tests to GREEN before continuing.
+Add `effectiveQualityScope(selection)` and use it in route state, visible controls, query construction, and owner keys. Single Quality always requests selected exact A, validates ordered `[A]`, and filters any catalog fallback to A. Events remain Token-only; workspace links retain selection, and Event failure never clears Compare. Re-run the exact two-test command from Step 5 to GREEN before continuing.
 
 - [ ] **Step 7: Ownership cycle — write failing race and navigation-away tests**
 
@@ -1058,9 +1098,11 @@ Create deferred Compare, execution, and Quality responses. Start A-only, apply A
 
 Add a navigation-away case for each owned loader: start the request, navigate to another research page before it resolves, then resolve it. The old Compare, execution, or Quality response must not commit application state, DOM, or status after route ownership changed. Mirror the most integration-sensitive case in Playwright with delayed intercepted responses.
 
+Name the Node test `DashboardFrontendContractTest.test_workspace_requests_reject_stale_selection_generation_and_navigation_owners` and run that exact unittest method to observe RED.
+
 - [ ] **Step 8: Ownership cycle — implement owner keys/invalidation and verify GREEN**
 
-Use immutable keys containing page, Token, A, B, marker, and applied window, plus only page controls that change the network response. Invalidate/abort on A/B/Token/window/apply/navigation changes and require request ID plus key before every state/DOM/status commit. Re-run the focused deferred-response tests to GREEN, including the catalog/snapshot generation-refresh marker regression.
+Use immutable keys containing page, Token, A, B, marker, and applied window, plus only page controls that change the network response. Invalidate/abort on A/B/Token/window/apply/navigation changes and require request ID plus key before every state/DOM/status commit. Re-run `python3 -m unittest tests.test_dashboard_frontend.DashboardFrontendContractTest.test_workspace_requests_reject_stale_selection_generation_and_navigation_owners -v` to GREEN, including the catalog/snapshot generation-refresh marker regression.
 
 - [ ] **Step 9: Layout/browser cycle — write and verify failing real-browser tests**
 
