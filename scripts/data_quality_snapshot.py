@@ -314,6 +314,34 @@ _EXECUTION_NOTIONAL_DEFINITION = (
 )
 _EXECUTION_DIRECTIONS = ("sell_token", "buy_token")
 _EXECUTION_STATUSES = {"observed", "partial", "unsupported", "failed"}
+_PUBLIC_EXECUTION_REASONS = frozenset({
+    "target_filled",
+    "full_book_insufficient_liquidity",
+    "source_level_limit",
+    "full_target_quantity_filled",
+    "full_pool_reserve_insufficient",
+    "exact_integer_swap_math_not_implemented",
+    "execution_calculation_failed",
+    "unsupported_protocol_or_chain",
+    "source_range_unavailable",
+    "source_no_two_sided_book",
+    "source_no_order_book",
+    "source_invalid_order_book",
+    "not_listed",
+    "rate_limit",
+    "source_unavailable",
+    "source_rejected_request",
+    "network",
+    "parse",
+    "unsupported_source",
+    "collection_failed",
+    "unsupported_chain",
+    "unsupported_protocol",
+    "unsupported_method",
+    "validation",
+    "depth_usd_price_time_mismatch",
+})
+_OTHER_EXECUTION_REASON = "other_status_reason"
 _EXECUTION_COLUMNS = (
     "snapshot_id",
     "source_snapshot_id",
@@ -1001,7 +1029,7 @@ def _canonical_dex_market(
     token = str(token_symbol).strip().upper()
     normalized_chain = str(chain).strip().lower()
     pool = str(pool_address).strip()
-    if pool.startswith("0x"):
+    if pool[:2].lower() == "0x":
         pool = pool.lower()
     return token, normalized_chain, pool
 
@@ -1769,6 +1797,8 @@ def _evaluate_depth(
         return _set_failed(family, "invalid_utf8")
     except _PublicDataError as error:
         return _set_failed(family, error.reason)
+    if not rows:
+        return _set_failed(family, "empty_inventory")
 
     observed_count = len(rows)
     required_null_count = 0
@@ -1805,12 +1835,35 @@ def _evaluate_depth(
 
             token = row["token_symbol"].strip().upper()
             if market_type == "cex":
+                symbol_parts = row["cex_symbol"].strip().upper().split("/")
+                if (
+                    len(symbol_parts) != 2
+                    or not all(symbol_parts)
+                    or symbol_parts[0] != token
+                    or row["base_asset"].strip().upper() != token
+                    or row["source_quote_asset"].strip().upper()
+                    != symbol_parts[1]
+                ):
+                    raise _PublicDataError("invalid_depth_contract")
                 key = (
                     token,
                     row["exchange"].strip().lower(),
                     row["cex_symbol"].strip().upper(),
                 )
             else:
+                target_position = row["target_token_position"].strip()
+                if target_position not in {"0", "1"}:
+                    raise _PublicDataError("invalid_depth_contract")
+                target_address = row["target_token_address"].strip().lower()
+                positioned_address = row[
+                    f"token{target_position}_address"
+                ].strip().lower()
+                if (
+                    target_address != positioned_address
+                    or row["token0_address"].strip().lower()
+                    == row["token1_address"].strip().lower()
+                ):
+                    raise _PublicDataError("invalid_depth_contract")
                 key = _canonical_dex_market(
                     token,
                     row["chain"],
@@ -1913,6 +1966,17 @@ def _evaluate_depth(
     }
     if duplicate_count:
         return _set_failed(family, "duplicate_primary_key")
+
+    try:
+        if market_type == "cex":
+            from scripts.fetch_cex_depth import validate_snapshot
+        else:
+            from scripts.fetch_dex_depth import validate_snapshot
+        validate_snapshot(rows, rows, allow_no_observed=True)
+    except (ImportError, ModuleNotFoundError):
+        return _set_failed(family, "depth_validator_unavailable")
+    except (KeyError, TypeError, ValueError):
+        return _set_failed(family, "invalid_depth_contract")
 
     family["required_field_null"] = {
         "count": required_null_count,
@@ -2073,6 +2137,8 @@ def _evaluate_execution(
     reason_counts: Dict[str, int] = {}
     observation_times: List[Tuple[datetime, str]] = []
     try:
+        from scripts.execution_cost import _expected_market_id
+
         for row in rows:
             if None in row or any(
                 not isinstance(row.get(field), str) for field in _EXECUTION_COLUMNS
@@ -2107,6 +2173,8 @@ def _evaluate_execution(
                     raise _PublicDataError("future_observation_timestamp")
 
             market_id, identity = _execution_market_identity(row, market_type)
+            if _expected_market_id(row) != market_id:
+                raise _PublicDataError("invalid_execution_contract")
             market_identities[market_id] = identity
             direction = row["direction"].strip()
             if direction not in _EXECUTION_DIRECTIONS:
@@ -2126,8 +2194,12 @@ def _evaluate_execution(
             reason = row["status_reason"].strip()
             if not _is_safe_public_reason(reason):
                 raise _PublicDataError("unsafe_public_value")
+            public_reason = (
+                reason if reason in _PUBLIC_EXECUTION_REASONS
+                else _OTHER_EXECUTION_REASON
+            )
             status_counts[status] = status_counts.get(status, 0) + 1
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            reason_counts[public_reason] = reason_counts.get(public_reason, 0) + 1
 
             parsed_measurements = {}
             for field in _EXECUTION_MEASUREMENT_FIELDS:
@@ -2184,6 +2256,10 @@ def _evaluate_execution(
             observation_times.append((state_time, state_text))
             if all(value is not None for value in parsed_measurements.values()):
                 usable_count += 1
+    except (ImportError, ModuleNotFoundError):
+        return _set_failed(family, "execution_validator_unavailable")
+    except ValueError:
+        return _set_failed(family, "invalid_execution_contract")
     except _PublicDataError as error:
         family["required_field_null"] = {
             "count": required_null_count,
@@ -2210,6 +2286,52 @@ def _evaluate_execution(
     expected_count = market_count * len(_EXECUTION_DIRECTIONS) * len(
         _EXECUTION_NOTIONALS
     )
+    try:
+        from scripts.execution_cost import (
+            MARKET_LINEAGE_COLUMNS,
+            RESULT_NUMERIC_COLUMNS,
+            validate_execution_snapshot,
+        )
+
+        lineage_columns = tuple(
+            field
+            for field in MARKET_LINEAGE_COLUMNS
+            if field not in RESULT_NUMERIC_COLUMNS
+        )
+        for market_id in market_identities:
+            market_rows = [row for row in rows if row["market_id"] == market_id]
+            if len(
+                {
+                    tuple(row.get(field) for field in lineage_columns)
+                    for row in market_rows
+                }
+            ) != 1:
+                raise ValueError("mixed execution lineage")
+            for direction in _EXECUTION_DIRECTIONS:
+                direction_rows = [
+                    row for row in market_rows if row["direction"] == direction
+                ]
+                statuses = {row["status"] for row in direction_rows}
+                if statuses & {"unsupported", "failed"}:
+                    if len(statuses) != 1 or any(
+                        row.get(field) not in (None, "")
+                        for row in direction_rows
+                        for field in RESULT_NUMERIC_COLUMNS
+                    ):
+                        raise ValueError("invalid terminal execution scenarios")
+        if observed_count == expected_count and all(
+            row["status"] in {"observed", "partial"} for row in rows
+        ):
+            validate_execution_snapshot(
+                market_identities,
+                rows,
+                enforce_usd_price_timing=market_type == "dex",
+            )
+    except (ImportError, ModuleNotFoundError):
+        return _set_failed(family, "execution_validator_unavailable")
+    except (KeyError, TypeError, ValueError):
+        return _set_failed(family, "invalid_execution_contract")
+
     family["required_field_null"] = {
         "count": required_null_count,
         "rate_bps": _basis_points(
@@ -2421,6 +2543,7 @@ def _evaluate_event_facts(
     observation_times: List[Tuple[datetime, str]] = []
     evidence_inputs: Dict[Tuple[str, str], Dict[str, Any]] = {}
     evidence_path_hashes: Dict[str, str] = {}
+    evidence_captures: Dict[str, Dict[str, Any]] = {}
     measurement_counts = {
         field: {"null_count": 0, "zero_count": 0}
         for field in _EVENT_MEASUREMENT_FIELDS
@@ -2459,7 +2582,10 @@ def _evaluate_event_facts(
             if row["source_kind"].strip() not in _EVENT_SOURCE_KINDS:
                 raise _PublicDataError("invalid_source_kind")
             source_url = row["source_url"].strip()
-            parsed_source_url = urlsplit(source_url)
+            try:
+                parsed_source_url = urlsplit(source_url)
+            except ValueError:
+                raise _PublicDataError("invalid_source_url")
             if (
                 parsed_source_url.scheme != "https"
                 or not parsed_source_url.netloc
@@ -2483,6 +2609,7 @@ def _evaluate_event_facts(
             record_capture = _capture_event_record(
                 data_dir, row["source_record_file"].strip()
             )
+            evidence_captures[row["source_record_file"].strip()] = record_capture
             record_identity = record_capture["identity"]
             previous_record_hash = evidence_path_hashes.setdefault(
                 record_identity["logical_path"], record_identity["sha256"]
@@ -2494,6 +2621,13 @@ def _evaluate_event_facts(
                 record_identity["sha256"],
             )
             evidence_inputs[evidence_key] = record_identity
+            family["source"]["inputs"] = [
+                capture["identity"],
+                *sorted(
+                    evidence_inputs.values(),
+                    key=lambda item: item["logical_path"],
+                ),
+            ]
             try:
                 record = json.loads(record_capture["payload"].decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -2561,8 +2695,34 @@ def _evaluate_event_facts(
         ):
             return _set_failed(family, "nonmonotonic_revision_time")
 
-    family["source"]["inputs"].extend(evidence_inputs.values())
-    family["source"]["inputs"].sort(key=lambda item: item["logical_path"])
+    try:
+        from scripts.event_facts import (
+            EventFactValidationError,
+            normalize_event_rows,
+        )
+
+        with tempfile.TemporaryDirectory() as validation_directory:
+            validation_root = Path(validation_directory)
+            for relative_text, record_capture in evidence_captures.items():
+                record_path = validation_root / Path(relative_text)
+                record_path.parent.mkdir(parents=True, exist_ok=True)
+                record_path.write_bytes(record_capture["payload"])
+            normalize_event_rows(
+                rows,
+                allowed_tokens={row["token_symbol"].strip().upper() for row in rows},
+                record_root=validation_root,
+            )
+    except (ImportError, ModuleNotFoundError):
+        return _set_failed(family, "event_validator_unavailable")
+    except (EventFactValidationError, OSError, TypeError, ValueError):
+        return _set_failed(family, "invalid_event_contract")
+
+    family["source"]["inputs"] = [
+        capture["identity"],
+        *sorted(
+            evidence_inputs.values(), key=lambda item: item["logical_path"]
+        ),
+    ]
     family["required_field_null"] = {
         "count": required_null_count,
         "rate_bps": _basis_points(
@@ -2725,6 +2885,18 @@ def _evaluate_cex_lifecycle(
         return _set_failed(family, "schema_mismatch")
     except _PublicDataError as error:
         return _set_failed(family, error.reason)
+
+    try:
+        from scripts.cex_instrument_lifecycle import (
+            validate_cex_instrument_lifecycle_review,
+        )
+
+        for review in reviews:
+            validate_cex_instrument_lifecycle_review(review)
+    except (ImportError, ModuleNotFoundError):
+        return _set_failed(family, "cex_lifecycle_validator_unavailable")
+    except (KeyError, TypeError, ValueError):
+        return _set_failed(family, "invalid_market_identity")
 
     duplicate_count = len(keys) - len(set(keys))
     family["duplicate_primary_key"] = {
@@ -3066,6 +3238,47 @@ def _evaluate_market_lifecycle(
         if ordered[-1]["status"] == "disposed":
             active_count += 1
 
+    token_chain_capture = None
+    try:
+        if any(review["market_type"] == "dex" for review in reviews):
+            token_chain_capture = _capture_fixed_tree_file(
+                Path(__file__).resolve().parents[1],
+                ("config", "token_chains.csv"),
+                logical_path="market_lifecycle_contract/token_chains.csv",
+                byte_limit=1024 * 1024,
+            )
+            family["source"]["inputs"].append(token_chain_capture["identity"])
+            family["source"]["inputs"].sort(
+                key=lambda item: item["logical_path"]
+            )
+        from scripts.market_lifecycle_reviews import (
+            LifecycleReviewError,
+            load_lifecycle_reviews,
+        )
+
+        with tempfile.TemporaryDirectory() as validation_directory:
+            validation_root = Path(validation_directory)
+            review_path = validation_root / "market_lifecycle_reviews.json"
+            review_path.write_bytes(capture["payload"])
+            token_chain_path = validation_root / "token_chains.csv"
+            if token_chain_capture is not None:
+                token_chain_path.write_bytes(token_chain_capture["payload"])
+            _active_reviews, validation_metadata = load_lifecycle_reviews(
+                review_path,
+                token_chain_path=token_chain_path,
+            )
+        if (
+            validation_metadata["sha256"] != capture["identity"]["sha256"]
+            or validation_metadata["revision_count"] != declared_count
+        ):
+            raise _PublicDataError("invalid_source_lineage")
+    except (ImportError, ModuleNotFoundError):
+        return _set_failed(family, "market_lifecycle_validator_unavailable")
+    except (LifecycleReviewError, OSError, TypeError, ValueError):
+        return _set_failed(family, "invalid_source_lineage")
+    except _PublicDataError as error:
+        return _set_failed(family, error.reason)
+
     minimum = min(reviewed_times)
     maximum = max(reviewed_times)
     freshness = int((generated_at - maximum[0]).total_seconds())
@@ -3286,6 +3499,36 @@ def _validated_route_pointer(payload: bytes, *, shadow: bool) -> Dict[str, Any]:
     return pointer
 
 
+def _route_entity_quality(
+    *,
+    grain: str,
+    primary_key: Sequence[str],
+    expected: int,
+    observed: int,
+    usable: int,
+    expected_basis: Mapping[str, Any],
+    status_counts: Optional[Mapping[str, int]] = None,
+    reason_counts: Optional[Mapping[str, int]] = None,
+) -> Dict[str, Any]:
+    return {
+        "grain": grain,
+        "primary_key": list(primary_key),
+        "counts": {
+            "expected": expected,
+            "observed": observed,
+            "usable": usable,
+            "expected_basis": dict(expected_basis),
+        },
+        "coverage_bps": _basis_points(usable, expected),
+        "duplicate_primary_key": {
+            "count": 0,
+            "rate_bps": _basis_points(0, observed),
+        },
+        "status_counts": dict(sorted((status_counts or {}).items())),
+        "reason_counts": dict(sorted((reason_counts or {}).items())),
+    }
+
+
 def _evaluate_route_opportunity(
     spec: Mapping[str, Any],
     data_dir: Path,
@@ -3306,20 +3549,6 @@ def _evaluate_route_opportunity(
     except _PublicDataError as error:
         return _set_failed(family, error.reason)
     routes_root = data_dir / Path(pointer_capture["identity"]["logical_path"]).parent
-    try:
-        from scripts.route_publication import (
-            RoutePublicationError,
-            load_latest_complete_route_bundle,
-        )
-
-        loaded = load_latest_complete_route_bundle(routes_root)
-    except (ImportError, ModuleNotFoundError):
-        return _set_failed(family, "route_validator_unavailable")
-    except (RoutePublicationError, OSError, TypeError, ValueError):
-        return _set_failed(family, "route_bundle_invalid")
-    if loaded.get("pointer") != pointer:
-        return _set_failed(family, "route_pointer_changed")
-
     cohort_id = pointer["route_cohort_id"]
     fixed_members = (
         ("manifest.json", 16 * 1024 * 1024),
@@ -3337,6 +3566,46 @@ def _evaluate_route_opportunity(
                 logical_path="route_opportunity_bundle/" + filename,
                 byte_limit=byte_limit,
             )
+    except _PublicDataError as error:
+        return _set_failed(family, error.reason)
+    family["source"]["inputs"].extend(
+        captures[filename]["identity"] for filename, _limit in fixed_members
+    )
+    family["source"]["inputs"].sort(key=lambda item: item["logical_path"])
+    try:
+        from scripts.route_publication import (
+            RoutePublicationError,
+            load_latest_complete_route_bundle,
+        )
+
+        with tempfile.TemporaryDirectory() as validation_directory:
+            validation_root = Path(validation_directory) / "routes"
+            validation_bundle = validation_root / "bundles" / cohort_id
+            validation_bundle.mkdir(parents=True)
+            (validation_root / "latest.json").write_bytes(
+                pointer_capture["payload"]
+            )
+            for filename, _byte_limit in fixed_members:
+                (validation_bundle / filename).write_bytes(
+                    captures[filename]["payload"]
+                )
+            loaded = load_latest_complete_route_bundle(validation_root)
+    except (ImportError, ModuleNotFoundError):
+        return _set_failed(family, "route_validator_unavailable")
+    except (RoutePublicationError, OSError, TypeError, ValueError):
+        return _set_failed(family, "route_bundle_invalid")
+    if loaded.get("pointer") != pointer:
+        return _set_failed(family, "route_pointer_changed")
+
+    captures_after: Dict[str, Dict[str, Any]] = {}
+    try:
+        for filename, byte_limit in fixed_members:
+            captures_after[filename] = _capture_fixed_tree_file(
+                routes_root,
+                ("bundles", cohort_id, filename),
+                logical_path="route_opportunity_bundle/" + filename,
+                byte_limit=byte_limit,
+            )
         pointer_after = _route_pointer_capture(data_dir, shadow=False)
     except _PublicDataError as error:
         return _set_failed(family, error.reason)
@@ -3346,6 +3615,8 @@ def _evaluate_route_opportunity(
         or pointer_after["identity"] != pointer_capture["identity"]
     ):
         return _set_failed(family, "route_pointer_changed")
+    if captures_after != captures:
+        return _set_failed(family, "route_artifact_changed")
 
     manifest = loaded["manifest"]
     declared_files = manifest.get("files", {})
@@ -3361,11 +3632,6 @@ def _evaluate_route_opportunity(
         )
     ):
         return _set_failed(family, "route_artifact_hash_mismatch")
-    family["source"]["inputs"].extend(
-        captures[filename]["identity"] for filename, _limit in fixed_members
-    )
-    family["source"]["inputs"].sort(key=lambda item: item["logical_path"])
-
     counts = manifest["counts"]
     opportunities = loaded["opportunities"]
     routes = loaded["bundle"]["routes"]
@@ -3470,36 +3736,39 @@ def _evaluate_route_opportunity(
                 "freshness_lag_seconds": freshness,
             },
             "entities": {
-                "opportunities": {
-                    "expected": counts["opportunities"],
-                    "observed": observed_count,
-                    "usable": usable_count,
-                },
-                "routes": {
-                    "expected": counts["routes"],
-                    "observed": len(routes),
-                    "usable": usable_routes,
-                },
-                "markets": {
-                    "expected": counts["markets"],
-                    "observed": len(legs),
-                    "usable": usable_legs,
-                },
-                "legs": {
-                    "expected": counts["legs"],
-                    "observed": len(legs),
-                    "usable": usable_legs,
-                    "status_counts": dict(sorted(leg_status_counts.items())),
-                    "reason_counts": dict(sorted(leg_reason_counts.items())),
-                },
-                "cost_components": {
-                    "expected": counts["cost_components"],
-                    "observed": len(cost_components),
-                    "usable": len(cost_components),
-                    "status_counts": dict(
-                        sorted(component_status_counts.items())
-                    ),
-                },
+                "opportunities": _route_entity_quality(
+                    grain="route_x_requested_notional_opportunity",
+                    primary_key=("opportunity_id",),
+                    expected=counts["opportunities"], observed=observed_count,
+                    usable=usable_count,
+                    expected_basis={"kind": "sealed_route_opportunity_manifest", "manifest_sha256": pointer["manifest_sha256"], "count_field": "opportunities"},
+                    status_counts=status_counts, reason_counts=reason_counts,
+                ),
+                "routes": _route_entity_quality(
+                    grain="directed_route", primary_key=("route_id",),
+                    expected=counts["routes"], observed=len(routes), usable=usable_routes,
+                    expected_basis={"kind": "sealed_route_opportunity_manifest", "manifest_sha256": pointer["manifest_sha256"], "count_field": "routes"},
+                ),
+                "markets": _route_entity_quality(
+                    grain="route_leg_market", primary_key=("market_id",),
+                    expected=counts["markets"], observed=len(legs), usable=usable_legs,
+                    expected_basis={"kind": "sealed_route_opportunity_manifest", "manifest_sha256": pointer["manifest_sha256"], "count_field": "markets"},
+                    status_counts=leg_status_counts, reason_counts=leg_reason_counts,
+                ),
+                "legs": _route_entity_quality(
+                    grain="route_leg", primary_key=("leg_id",),
+                    expected=counts["legs"], observed=len(legs), usable=usable_legs,
+                    expected_basis={"kind": "sealed_route_opportunity_manifest", "manifest_sha256": pointer["manifest_sha256"], "count_field": "legs"},
+                    status_counts=leg_status_counts, reason_counts=leg_reason_counts,
+                ),
+                "cost_components": _route_entity_quality(
+                    grain="route_opportunity_cost_component",
+                    primary_key=("opportunity_id", "component_type", "leg"),
+                    expected=counts["cost_components"], observed=len(cost_components),
+                    usable=len(cost_components),
+                    expected_basis={"kind": "sealed_route_opportunity_manifest", "manifest_sha256": pointer["manifest_sha256"], "count_field": "cost_components"},
+                    status_counts=component_status_counts,
+                ),
             },
         }
     )
@@ -3536,6 +3805,8 @@ def _evaluate_route_shadow(
         )
     except _PublicDataError as error:
         return _set_failed(family, error.reason)
+    family["source"]["inputs"].append(initial_cost_capture["identity"])
+    family["source"]["inputs"].sort(key=lambda item: item["logical_path"])
     try:
         from scripts.route_publication import (
             RoutePublicationError,
@@ -3632,7 +3903,9 @@ def _evaluate_route_shadow(
     ):
         return _set_failed(family, "route_artifact_hash_mismatch")
     family["source"]["inputs"].extend(
-        run_captures[filename]["identity"] for filename, _limit in run_members
+        run_captures[filename]["identity"]
+        for filename, _limit in run_members
+        if filename != "route-cost-evidence.json"
     )
     family["source"]["inputs"].extend(
         core_captures[filename]["identity"] for filename, _limit in core_members
@@ -3744,38 +4017,32 @@ def _evaluate_route_shadow(
                 "freshness_lag_seconds": freshness,
             },
             "entities": {
-                "bindings": {
-                    "expected": cost["binding_count"],
-                    "observed": len(bindings),
-                    "usable": usable_bindings,
-                    "status_counts": binding_status_counts,
-                },
-                "runs": {
-                    "expected": 1,
-                    "observed": 1,
-                    "usable": 1,
-                    "status_counts": {pointer["phase"]: 1},
-                },
-                "markets": {
-                    "expected": cost["selected_market_count"],
-                    "observed": len(markets),
-                    "usable": usable_markets,
-                },
-                "transcripts": {
-                    "expected": cost["transcript_count"],
-                    "observed": len(transcripts),
-                    "usable": usable_transcripts,
-                    "status_counts": transcript_status_counts,
-                },
+                "bindings": _route_entity_quality(
+                    grain="route_notional_cost_binding", primary_key=("binding_key",),
+                    expected=cost["binding_count"], observed=len(bindings), usable=usable_bindings,
+                    expected_basis={"kind": "sealed_route_cost_evidence", "route_cost_evidence_sha256": pointer["route_cost_evidence_sha256"], "count_field": "binding_count"},
+                    status_counts=binding_status_counts, reason_counts=binding_reason_counts,
+                ),
+                "runs": _route_entity_quality(
+                    grain="shadow_run", primary_key=("run_id",), expected=1, observed=1, usable=1,
+                    expected_basis={"kind": "sealed_shadow_pointer", "audit_sha256": pointer["audit_sha256"], "declared_count": 1},
+                    status_counts={pointer["phase"]: 1},
+                ),
+                "markets": _route_entity_quality(
+                    grain="selected_market", primary_key=("market_id",),
+                    expected=cost["selected_market_count"], observed=len(markets), usable=usable_markets,
+                    expected_basis={"kind": "sealed_route_cost_evidence", "route_cost_evidence_sha256": pointer["route_cost_evidence_sha256"], "count_field": "selected_market_count"},
+                    status_counts=market_status_counts,
+                ),
+                "transcripts": _route_entity_quality(
+                    grain="route_cost_transcript", primary_key=("transcript_key",),
+                    expected=cost["transcript_count"], observed=len(transcripts), usable=usable_transcripts,
+                    expected_basis={"kind": "sealed_route_cost_evidence", "route_cost_evidence_sha256": pointer["route_cost_evidence_sha256"], "count_field": "transcript_count"},
+                    status_counts=transcript_status_counts, reason_counts=transcript_reason_counts,
+                ),
             },
         }
     )
-    if binding_reason_counts:
-        family["entities"]["bindings"]["reason_counts"] = binding_reason_counts
-    if market_status_counts:
-        family["entities"]["markets"]["status_counts"] = market_status_counts
-    if transcript_reason_counts:
-        family["entities"]["transcripts"]["reason_counts"] = transcript_reason_counts
     return family
 
 
@@ -3807,6 +4074,8 @@ def _evaluate_tvl(
         return _set_failed(family, "invalid_utf8")
     except _PublicDataError as error:
         return _set_failed(family, error.reason)
+    if not raw_rows:
+        return _set_failed(family, "empty_inventory")
 
     observed_count = len(raw_rows)
     required_null_count = 0
@@ -3833,11 +4102,12 @@ def _evaluate_tvl(
             snapshot_id = row["snapshot_id"].strip()
             if not _TVL_GENERATION_ID_RE.fullmatch(snapshot_id):
                 raise _PublicDataError("invalid_snapshot_id")
-            token = row["token_symbol"].strip().upper()
-            chain = row["chain"].strip()
-            pool = row["pool_address"].strip()
             snapshots.add(snapshot_id)
-            keys.append((token, chain, pool))
+            keys.append(
+                _canonical_dex_market(
+                    row["token_symbol"], row["chain"], row["pool_address"]
+                )
+            )
             observed_at, canonical_time = _parse_observation_timestamp(row["observed_at"])
             if observed_at > generated_at:
                 raise _PublicDataError("future_observation_timestamp")
@@ -3915,7 +4185,10 @@ def _evaluate_tvl(
                 "usable": usable_count,
                 "expected_basis": {
                     "kind": "latest_file_inventory",
-                    "snapshot_id": next(iter(snapshots), None),
+                    "snapshot_id_sha256": _opaque_identifier_hash(
+                        "data_quality_snapshot/v1/tvl_snapshot",
+                        next(iter(snapshots)),
+                    ),
                 },
             },
             "coverage_bps": _basis_points(usable_count, observed_count),

@@ -212,7 +212,7 @@ def _cex_depth_row(**overrides):
     row.update(
         {
             "snapshot_id": "cex-depth-001",
-            "observed_at": "2026-08-13T12:00:00Z",
+            "observed_at": "2026-08-13T12:00:00+00:00",
             "request_started_at": "2026-08-13T11:59:58Z",
             "response_received_at": "2026-08-13T12:00:01Z",
             "token_symbol": "BTC",
@@ -254,7 +254,7 @@ def _dex_depth_row(**overrides):
     row.update(
         {
             "snapshot_id": "dex-depth-001",
-            "observed_at": "2026-08-13T12:00:02Z",
+            "observed_at": "2026-08-13T12:00:02+00:00",
             "request_started_at": "2026-08-13T11:59:58Z",
             "response_received_at": "2026-08-13T12:00:02Z",
             "token_symbol": "BTC",
@@ -312,7 +312,7 @@ def _execution_row(market_type, direction, notional, **overrides):
             "source_snapshot_id": f"{market_type}-source-001",
             "contract_version": "1",
             "calculation_method": "fixed_notional_from_observed_state",
-            "observed_at": "2026-08-13T12:00:02Z",
+            "observed_at": "2026-08-13T12:00:02+00:00",
             "state_observed_at": "2026-08-13T12:00:00Z",
             "request_started_at": "2026-08-13T11:59:58Z",
             "response_received_at": "2026-08-13T12:00:02Z",
@@ -461,7 +461,7 @@ def _write_event_fixture(directory, rows, records):
         _write_json(data_dir / "evidence" / "events" / filename, record)
 
 
-def _cex_lifecycle_payload(*, checked_at="2026-08-13T12:00:00Z"):
+def _cex_lifecycle_payload(*, checked_at="2026-08-13T12:00:00+00:00"):
     response_hash = "a" * 64
     configured_hash = "b" * 64
     review = {
@@ -1088,6 +1088,52 @@ class DataQualitySnapshotDexDailyAdapterTests(unittest.TestCase):
 
 
 class DataQualitySnapshotDepthAdapterTests(unittest.TestCase):
+    def test_depth_rows_bind_exact_retained_market_identity(self):
+        cases = (
+            (
+                "cex_depth",
+                "cex_depth_latest.csv",
+                CEX_DEPTH_HEADER,
+                [_cex_depth_row(token_symbol="ETH")],
+            ),
+            (
+                "dex_depth",
+                "dex_depth_latest.csv",
+                DEX_DEPTH_HEADER,
+                [_dex_depth_row(target_token_position="1")],
+            ),
+        )
+        for family_name, filename, header, rows in cases:
+            with self.subTest(family=family_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    _write_csv(Path(directory) / filename, header, rows)
+
+                    family = _family(_snapshot(directory), family_name)
+
+                    self.assertEqual(family["state"], "failed")
+                    self.assertEqual(
+                        family["failure_reason"], "invalid_depth_contract"
+                    )
+
+    def test_header_only_latest_depth_and_tvl_files_fail_empty_inventory(self):
+        cases = (
+            ("tvl", "dex_pool_tvl_latest.csv", TVL_HEADER),
+            ("cex_depth", "cex_depth_latest.csv", CEX_DEPTH_HEADER),
+            ("dex_depth", "dex_depth_latest.csv", DEX_DEPTH_HEADER),
+        )
+        for family_name, filename, header in cases:
+            with self.subTest(family=family_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    _write_csv(Path(directory) / filename, header, [])
+
+                    family = _family(_snapshot(directory), family_name)
+
+                    self.assertEqual(family["state"], "failed")
+                    self.assertEqual(family["failure_reason"], "empty_inventory")
+                    self.assertIsNone(family["counts"]["expected"])
+                    self.assertIsNone(family["counts"]["observed"])
+                    self.assertIsNone(family["counts"]["usable"])
+
     def test_depth_adapters_report_exact_status_reason_clocks_and_measurements(self):
         cases = []
 
@@ -1096,7 +1142,7 @@ class DataQualitySnapshotDepthAdapterTests(unittest.TestCase):
             cex_symbol="ETH/USDT",
             source_instrument="ETHUSDT",
             base_asset="ETH",
-            observed_at="2026-08-13T13:00:00Z",
+            observed_at="2026-08-13T13:00:00+00:00",
             status="failed",
             reason_code="network",
             error="api_key=top-secret /private/operator/cex.json",
@@ -1120,7 +1166,7 @@ class DataQualitySnapshotDepthAdapterTests(unittest.TestCase):
         dex_unsupported = _dex_depth_row(
             token_symbol="ETH",
             pool_address="0x4444444444444444444444444444444444444444",
-            observed_at="2026-08-13T13:00:00Z",
+            observed_at="2026-08-13T13:00:00+00:00",
             block_number="",
             block_timestamp="",
             status="unsupported",
@@ -1263,7 +1309,7 @@ class DataQualitySnapshotDepthAdapterTests(unittest.TestCase):
             _write_csv(
                 Path(directory) / "cex_depth_latest.csv",
                 CEX_DEPTH_HEADER,
-                [_cex_depth_row(observed_at="2026-08-12T00:00:00Z")],
+                [_cex_depth_row(observed_at="2026-08-12T00:00:00+00:00")],
             )
 
             family = _family(_snapshot(directory), "cex_depth")
@@ -1305,6 +1351,23 @@ class DataQualitySnapshotDepthAdapterTests(unittest.TestCase):
 
 
 class DataQualitySnapshotExecutionAdapterTests(unittest.TestCase):
+    def test_execution_rows_bind_exact_retained_market_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = _execution_rows("cex")
+            rows[0]["token_symbol"] = "ETH"
+            _write_csv(
+                Path(directory) / "cex_execution_cost_latest.csv",
+                EXECUTION_HEADER,
+                rows,
+            )
+
+            family = _family(_snapshot(directory), "cex_execution_cost")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(
+                family["failure_reason"], "invalid_execution_contract"
+            )
+
     def test_execution_adapters_require_the_exact_two_by_five_inventory(self):
         cases = [
             (
@@ -1340,9 +1403,10 @@ class DataQualitySnapshotExecutionAdapterTests(unittest.TestCase):
         ) in cases:
             with self.subTest(family=family_name):
                 with tempfile.TemporaryDirectory() as directory:
-                    rows[0]["source_endpoint"] = (
-                        "api_key=top-secret /private/operator/state.json"
-                    )
+                    for row in rows:
+                        row["source_endpoint"] = (
+                            "api_key=top-secret /private/operator/state.json"
+                        )
                     rows[0]["error"] = "cookie=session-secret"
                     _write_csv(Path(directory) / filename, EXECUTION_HEADER, rows)
 
@@ -1457,6 +1521,29 @@ class DataQualitySnapshotExecutionAdapterTests(unittest.TestCase):
                             canonical_snapshot_bytes(snapshot).decode("utf-8"),
                         )
 
+    def test_unknown_execution_reason_is_bucketed_without_disclosure(self):
+        secret = "sk-live-51ABCDEFprivatecredential"
+        with tempfile.TemporaryDirectory() as directory:
+            rows = _execution_rows("cex")
+            rows[0]["status_reason"] = secret
+            _write_csv(
+                Path(directory) / "cex_execution_cost_latest.csv",
+                EXECUTION_HEADER,
+                rows,
+            )
+
+            snapshot = _snapshot(directory)
+            family = _family(snapshot, "cex_execution_cost")
+
+            self.assertEqual(family["state"], "evaluated")
+            self.assertEqual(
+                family["reason_counts"],
+                {"other_status_reason": 1, "target_filled": 9},
+            )
+            self.assertNotIn(
+                secret, canonical_snapshot_bytes(snapshot).decode("utf-8")
+            )
+
     def test_dex_execution_requires_fixed_block_and_usd_lineage(self):
         cases = [
             ("usd_price_source_snapshot_id", "", "required_field_null"),
@@ -1538,6 +1625,65 @@ class DataQualitySnapshotExecutionAdapterTests(unittest.TestCase):
 
 
 class DataQualitySnapshotEventFactsAdapterTests(unittest.TestCase):
+    def test_event_effective_time_and_precision_use_production_contract(self):
+        cases = (
+            {"effective_at": "not-a-time"},
+            {"effective_at_precision": "banana"},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                with tempfile.TemporaryDirectory() as directory:
+                    _write_event_fixture(
+                        directory,
+                        [_event_row(**changes)],
+                        {"btc-release-v1.json": _event_record()},
+                    )
+
+                    family = _family(_snapshot(directory), "event_facts")
+
+                    self.assertEqual(family["state"], "failed")
+                    self.assertEqual(
+                        family["failure_reason"], "invalid_event_contract"
+                    )
+
+    def test_failed_event_evidence_bytes_remain_publication_inputs(self):
+        snapshots = []
+        evidence_hashes = []
+        for malformed_bytes in (b"{", b"[not-json"):
+            with tempfile.TemporaryDirectory() as directory:
+                _write_event_fixture(
+                    directory,
+                    [_event_row()],
+                    {"btc-release-v1.json": _event_record()},
+                )
+                evidence_path = (
+                    Path(directory)
+                    / "evidence"
+                    / "events"
+                    / "btc-release-v1.json"
+                )
+                evidence_path.write_bytes(malformed_bytes)
+                evidence_hashes.append(hashlib.sha256(malformed_bytes).hexdigest())
+
+                snapshot = _snapshot(directory)
+                family = _family(snapshot, "event_facts")
+
+                self.assertEqual(family["state"], "failed")
+                self.assertEqual(family["failure_reason"], "invalid_evidence_record")
+                self.assertIn(
+                    evidence_hashes[-1],
+                    {item["sha256"] for item in family["source"]["inputs"]},
+                )
+                snapshots.append(snapshot)
+
+        self.assertNotEqual(
+            snapshots[0]["publication"]["identity"],
+            snapshots[1]["publication"]["identity"],
+        )
+        self.assertNotEqual(
+            snapshots[0]["snapshot_sha256"], snapshots[1]["snapshot_sha256"]
+        )
+
     def test_event_revisions_bind_evidence_and_count_only_latest_as_usable(self):
         with tempfile.TemporaryDirectory() as directory:
             first = _event_row()
@@ -1675,6 +1821,24 @@ class DataQualitySnapshotEventFactsAdapterTests(unittest.TestCase):
                     self.assertEqual(family["state"], "failed")
                     self.assertEqual(family["failure_reason"], failure_reason)
 
+    def test_malformed_event_url_is_a_family_failure_not_a_build_exception(self):
+        malformed_url = "https://[bad"
+        record = _event_record()
+        record["source_url"] = malformed_url
+        with tempfile.TemporaryDirectory() as directory:
+            _write_event_fixture(
+                directory,
+                [_event_row(source_url=malformed_url)],
+                {"btc-release-v1.json": record},
+            )
+
+            snapshot = _snapshot(directory)
+            family = _family(snapshot, "event_facts")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "invalid_source_url")
+            self.assertNotIn(malformed_url, json.dumps(family, sort_keys=True))
+
     def test_event_evidence_must_be_contained_regular_and_bound(self):
         cases = [
             (
@@ -1739,6 +1903,22 @@ class DataQualitySnapshotEventFactsAdapterTests(unittest.TestCase):
 
 
 class DataQualitySnapshotCexLifecycleAdapterTests(unittest.TestCase):
+    def test_instrument_uses_exact_canonical_base_quote_shape(self):
+        payload = _cex_lifecycle_payload()
+        review = payload["reviews"][0]
+        review["instrument"] = "BTC/USDT/EXTRA"
+        review["market_id"] = "cex:crypto_com:BTC/USDT/EXTRA"
+        with tempfile.TemporaryDirectory() as directory:
+            _write_json(
+                Path(directory) / "curated" / "cex_instrument_lifecycle.json",
+                payload,
+            )
+
+            family = _family(_snapshot(directory), "cex_instrument_lifecycle")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "invalid_market_identity")
+
     def test_complete_manifest_is_evaluated_with_configured_inventory_context(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
@@ -1825,7 +2005,7 @@ class DataQualitySnapshotCexLifecycleAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             _write_json(
                 Path(directory) / "cex_instrument_lifecycle.json",
-                _cex_lifecycle_payload(checked_at="2026-08-12T00:00:00Z"),
+                _cex_lifecycle_payload(checked_at="2026-08-12T00:00:00+00:00"),
             )
             family = _family(_snapshot(directory), "cex_instrument_lifecycle")
             self.assertEqual(family["state"], "evaluated")
@@ -1836,6 +2016,31 @@ class DataQualitySnapshotCexLifecycleAdapterTests(unittest.TestCase):
 
 
 class DataQualitySnapshotMarketLifecycleAdapterTests(unittest.TestCase):
+    def test_cex_evidence_must_bind_the_exact_reviewed_market(self):
+        review = _market_review_revision()
+        review["source_checks"][0]["url"] = (
+            "https://api.upbit.com/v1/ticker?markets=USDT-BTC"
+        )
+        review["source_checks"][0]["observations"] = {
+            "market": "USDT-BTC",
+            "last_trade_date_utc": "2026-08-11",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            _write_json(
+                Path(directory) / "curated" / "market_lifecycle_reviews.json",
+                _market_lifecycle_payload([review]),
+            )
+
+            snapshot = _snapshot(directory)
+            family = _family(snapshot, "market_lifecycle_reviews")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(
+                family["failure_reason"], "invalid_source_lineage"
+            )
+            serialized = canonical_snapshot_bytes(snapshot).decode("utf-8")
+            self.assertNotIn("USDT-BTC", serialized)
+
     def test_revision_inventory_counts_only_latest_as_usable(self):
         with tempfile.TemporaryDirectory() as directory:
             first = _market_review_revision()
@@ -2005,6 +2210,164 @@ class DataQualitySnapshotTrackedRepositoryDataTests(unittest.TestCase):
 
 
 class DataQualitySnapshotRoutePointerTests(unittest.TestCase):
+    def test_route_entities_use_uniform_contract_shape(self):
+        required_fields = {
+            "grain",
+            "primary_key",
+            "counts",
+            "coverage_bps",
+            "duplicate_primary_key",
+            "status_counts",
+            "reason_counts",
+        }
+        cases = []
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "data"
+            _publish_route_opportunity_fixture(data_dir)
+            cases.append(
+                (
+                    _family(_snapshot(data_dir), "route_cohort_opportunity"),
+                    {
+                        "opportunities": (
+                            "route_x_requested_notional_opportunity",
+                            ["opportunity_id"],
+                        ),
+                        "routes": ("directed_route", ["route_id"]),
+                        "markets": ("route_leg_market", ["market_id"]),
+                        "legs": ("route_leg", ["leg_id"]),
+                        "cost_components": (
+                            "route_opportunity_cost_component",
+                            ["opportunity_id", "component_type", "leg"],
+                        ),
+                    },
+                )
+            )
+            for family, contracts in cases:
+                for name, (grain, primary_key) in contracts.items():
+                    with self.subTest(family=family["name"], entity=name):
+                        entity = family["entities"][name]
+                        self.assertEqual(set(entity), required_fields)
+                        self.assertEqual(entity["grain"], grain)
+                        self.assertEqual(entity["primary_key"], primary_key)
+                        self.assertEqual(
+                            set(entity["counts"]),
+                            {"expected", "observed", "usable", "expected_basis"},
+                        )
+                        self.assertEqual(
+                            set(entity["duplicate_primary_key"]),
+                            {"count", "rate_bps"},
+                        )
+
+        fixture = _publish_route_shadow_fixture()
+        try:
+            data_dir = Path(fixture.temporary.name) / "data"
+            family = _family(
+                _snapshot(data_dir), "route_shadow_route_cost_evidence"
+            )
+            contracts = {
+                "bindings": ("route_notional_cost_binding", ["binding_key"]),
+                "runs": ("shadow_run", ["run_id"]),
+                "markets": ("selected_market", ["market_id"]),
+                "transcripts": ("route_cost_transcript", ["transcript_key"]),
+            }
+            for name, (grain, primary_key) in contracts.items():
+                with self.subTest(family=family["name"], entity=name):
+                    entity = family["entities"][name]
+                    self.assertEqual(set(entity), required_fields)
+                    self.assertEqual(entity["grain"], grain)
+                    self.assertEqual(entity["primary_key"], primary_key)
+                    self.assertEqual(
+                        set(entity["counts"]),
+                        {"expected", "observed", "usable", "expected_basis"},
+                    )
+                    self.assertEqual(
+                        set(entity["duplicate_primary_key"]),
+                        {"count", "rate_bps"},
+                    )
+        finally:
+            fixture.doCleanups()
+
+    def test_failed_route_artifact_bytes_remain_publication_inputs(self):
+        snapshots = []
+        artifact_hashes = []
+        for suffix in (b"broken-one", b"broken-two"):
+            with tempfile.TemporaryDirectory() as directory:
+                data_dir = Path(directory) / "data"
+                pointer = _publish_route_opportunity_fixture(data_dir)
+                artifact_path = (
+                    data_dir
+                    / "routes"
+                    / "bundles"
+                    / pointer["route_cohort_id"]
+                    / "route_legs.csv"
+                )
+                artifact_path.write_bytes(artifact_path.read_bytes() + suffix)
+                artifact_hashes.append(
+                    hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+                )
+
+                snapshot = _snapshot(data_dir)
+                family = _family(snapshot, "route_cohort_opportunity")
+
+                self.assertEqual(family["state"], "failed")
+                self.assertEqual(family["failure_reason"], "route_bundle_invalid")
+                self.assertIn(
+                    artifact_hashes[-1],
+                    {item["sha256"] for item in family["source"]["inputs"]},
+                )
+                snapshots.append(snapshot)
+
+        self.assertNotEqual(
+            snapshots[0]["publication"]["identity"],
+            snapshots[1]["publication"]["identity"],
+        )
+        self.assertNotEqual(
+            snapshots[0]["snapshot_sha256"], snapshots[1]["snapshot_sha256"]
+        )
+
+    def test_failed_shadow_sidecar_bytes_remain_publication_inputs(self):
+        snapshots = []
+        sidecar_hashes = []
+        for replacement in (b"{", b"[invalid-shadow"):
+            fixture = _publish_route_shadow_fixture()
+            try:
+                data_dir = Path(fixture.temporary.name) / "data"
+                pointer_path = (
+                    data_dir / "local" / "routes" / "shadow" / "latest.json"
+                )
+                pointer = json.loads(pointer_path.read_text())
+                sidecar_path = (
+                    pointer_path.parent
+                    / "runs"
+                    / pointer["run_id"]
+                    / "route-cost-evidence.json"
+                )
+                sidecar_path.write_bytes(replacement)
+                sidecar_hashes.append(hashlib.sha256(replacement).hexdigest())
+
+                snapshot = _snapshot(data_dir)
+                family = _family(
+                    snapshot, "route_shadow_route_cost_evidence"
+                )
+
+                self.assertEqual(family["state"], "failed")
+                self.assertEqual(family["failure_reason"], "route_bundle_invalid")
+                self.assertIn(
+                    sidecar_hashes[-1],
+                    {item["sha256"] for item in family["source"]["inputs"]},
+                )
+                snapshots.append(snapshot)
+            finally:
+                fixture.doCleanups()
+
+        self.assertNotEqual(
+            snapshots[0]["publication"]["identity"],
+            snapshots[1]["publication"]["identity"],
+        )
+        self.assertNotEqual(
+            snapshots[0]["snapshot_sha256"], snapshots[1]["snapshot_sha256"]
+        )
+
     def test_missing_route_pointers_remain_not_evaluated(self):
         with tempfile.TemporaryDirectory() as directory:
             snapshot = _snapshot(directory)
@@ -2153,31 +2516,21 @@ class DataQualitySnapshotRoutePointerTests(unittest.TestCase):
                 },
             )
             self.assertEqual(
-                family["entities"],
+                {
+                    name: entity["counts"]
+                    for name, entity in family["entities"].items()
+                },
                 {
                     "opportunities": {
                         "expected": 5,
                         "observed": 5,
                         "usable": 5,
+                        "expected_basis": family["entities"]["opportunities"]["counts"]["expected_basis"],
                     },
-                    "routes": {"expected": 1, "observed": 1, "usable": 1},
-                    "markets": {"expected": 2, "observed": 2, "usable": 2},
-                    "legs": {
-                        "expected": 2,
-                        "observed": 2,
-                        "usable": 2,
-                        "status_counts": {"observed": 2},
-                        "reason_counts": {"observed": 2},
-                    },
-                    "cost_components": {
-                        "expected": 15,
-                        "observed": 15,
-                        "usable": 15,
-                        "status_counts": {
-                            "authenticated": 10,
-                            "not_applicable": 5,
-                        },
-                    },
+                    "routes": {"expected": 1, "observed": 1, "usable": 1, "expected_basis": family["entities"]["routes"]["counts"]["expected_basis"]},
+                    "markets": {"expected": 2, "observed": 2, "usable": 2, "expected_basis": family["entities"]["markets"]["counts"]["expected_basis"]},
+                    "legs": {"expected": 2, "observed": 2, "usable": 2, "expected_basis": family["entities"]["legs"]["counts"]["expected_basis"]},
+                    "cost_components": {"expected": 15, "observed": 15, "usable": 15, "expected_basis": family["entities"]["cost_components"]["counts"]["expected_basis"]},
                 },
             )
             self.assertEqual(
@@ -2285,31 +2638,15 @@ class DataQualitySnapshotRoutePointerTests(unittest.TestCase):
                 },
             )
             self.assertEqual(
-                family["entities"],
                 {
-                    "bindings": {
-                        "expected": 0,
-                        "observed": 0,
-                        "usable": 0,
-                        "status_counts": {},
-                    },
-                    "runs": {
-                        "expected": 1,
-                        "observed": 1,
-                        "usable": 1,
-                        "status_counts": {"canary": 1},
-                    },
-                    "markets": {
-                        "expected": 0,
-                        "observed": 0,
-                        "usable": 0,
-                    },
-                    "transcripts": {
-                        "expected": 0,
-                        "observed": 0,
-                        "usable": 0,
-                        "status_counts": {},
-                    },
+                    name: entity["counts"]
+                    for name, entity in family["entities"].items()
+                },
+                {
+                    "bindings": {"expected": 0, "observed": 0, "usable": 0, "expected_basis": family["entities"]["bindings"]["counts"]["expected_basis"]},
+                    "runs": {"expected": 1, "observed": 1, "usable": 1, "expected_basis": family["entities"]["runs"]["counts"]["expected_basis"]},
+                    "markets": {"expected": 0, "observed": 0, "usable": 0, "expected_basis": family["entities"]["markets"]["counts"]["expected_basis"]},
+                    "transcripts": {"expected": 0, "observed": 0, "usable": 0, "expected_basis": family["entities"]["transcripts"]["counts"]["expected_basis"]},
                 },
             )
             self.assertEqual(len(family["source"]["inputs"]), 10)
@@ -2417,6 +2754,28 @@ class DataQualitySnapshotPointInTimeTests(unittest.TestCase):
             self.assertEqual(family["state"], "failed")
             self.assertEqual(family["failure_reason"], "mixed_snapshot_id")
 
+    def test_tvl_case_variant_pool_identity_is_a_duplicate(self):
+        lower_pool = "0x" + "a" * 40
+        upper_pool = "0X" + "A" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            _write_csv(
+                Path(directory) / "dex_pool_tvl_latest.csv",
+                TVL_HEADER,
+                [
+                    _tvl_row(chain="ethereum", pool_address=lower_pool),
+                    _tvl_row(chain="Ethereum", pool_address=upper_pool),
+                ],
+            )
+
+            family = _family(_snapshot(directory), "tvl")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "duplicate_primary_key")
+            self.assertEqual(
+                family["duplicate_primary_key"],
+                {"count": 1, "rate_bps": 5000},
+            )
+
     def test_invalid_tvl_snapshot_id_fails_without_projecting_secret(self):
         with tempfile.TemporaryDirectory() as directory:
             secret = "api_key=top-secret /private/operator/token"
@@ -2432,6 +2791,35 @@ class DataQualitySnapshotPointInTimeTests(unittest.TestCase):
             self.assertEqual(family["state"], "failed")
             self.assertEqual(family["failure_reason"], "invalid_snapshot_id")
             self.assertNotIn(secret, canonical_snapshot_bytes(snapshot).decode("utf-8"))
+
+    def test_valid_tvl_snapshot_id_is_published_only_as_an_opaque_hash(self):
+        snapshot_id = "customer_secret_abcdef"
+        expected_hash = hashlib.sha256(
+            (
+                "data_quality_snapshot/v1/tvl_snapshot\0" + snapshot_id
+            ).encode("utf-8")
+        ).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            _write_csv(
+                Path(directory) / "dex_pool_tvl_latest.csv",
+                TVL_HEADER,
+                [_tvl_row(snapshot_id=snapshot_id)],
+            )
+
+            snapshot = _snapshot(directory)
+            family = _family(snapshot, "tvl")
+
+            self.assertEqual(family["state"], "evaluated")
+            self.assertEqual(
+                family["counts"]["expected_basis"],
+                {
+                    "kind": "latest_file_inventory",
+                    "snapshot_id_sha256": expected_hash,
+                },
+            )
+            self.assertNotIn(
+                snapshot_id, canonical_snapshot_bytes(snapshot).decode("utf-8")
+            )
 
     def test_tvl_extra_trailing_column_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
