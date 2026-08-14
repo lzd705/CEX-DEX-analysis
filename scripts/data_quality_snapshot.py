@@ -19,6 +19,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = "data_quality_snapshot/v1"
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_SQLITE_SNAPSHOT_ID_RE = re.compile(r"^[0-9a-f]{24}$")
+_SQLITE_IMPORT_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_TVL_GENERATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _MAX_CSV_BYTES = 64 * 1024 * 1024
 _MAX_SQLITE_BYTES = 512 * 1024 * 1024
 _CEX_COLUMNS = (
@@ -291,9 +294,21 @@ def _snapshot_hash(snapshot_without_hash: Mapping[str, Any]) -> str:
 
 
 class _PublicDataError(Exception):
-    def __init__(self, reason: str):
+    def __init__(
+        self,
+        reason: str,
+        *,
+        duplicate_count: Optional[int] = None,
+        duplicate_denominator: Optional[int] = None,
+        required_null_count: Optional[int] = None,
+        required_null_denominator: Optional[int] = None,
+    ):
         super().__init__(reason)
         self.reason = reason
+        self.duplicate_count = duplicate_count
+        self.duplicate_denominator = duplicate_denominator
+        self.required_null_count = required_null_count
+        self.required_null_denominator = required_null_denominator
 
 
 def _basis_points(numerator: int, denominator: int) -> Optional[int]:
@@ -390,6 +405,8 @@ def _capture_candidate(
 def _read_cex_inventory(
     database_payload: bytes,
     cex_source: Mapping[str, Any],
+    csv_row_count: int,
+    csv_markets: set[Tuple[str, str, str]],
 ) -> Tuple[List[Tuple[str, str, str]], Dict[str, Any]]:
     temporary_path = None
     try:
@@ -411,9 +428,11 @@ def _read_cex_inventory(
                 """
                 SELECT snapshots.snapshot_id,
                        state.import_run_id,
+                       runs.snapshot_id AS run_snapshot_id,
                        snapshots.cex_source_name,
                        snapshots.cex_source_bytes,
                        snapshots.cex_sha256,
+                       snapshots.cex_row_count,
                        runs.status
                 FROM dataset_state AS state
                 JOIN dataset_snapshots AS snapshots
@@ -425,22 +444,43 @@ def _read_cex_inventory(
             ).fetchone()
             if state is None or state["status"] != "published":
                 raise _PublicDataError("authoritative_inventory_invalid")
+            snapshot_id = state["snapshot_id"]
+            import_run_id = state["import_run_id"]
+            if (
+                not isinstance(snapshot_id, str)
+                or not _SQLITE_SNAPSHOT_ID_RE.fullmatch(snapshot_id)
+                or not isinstance(import_run_id, str)
+                or not _SQLITE_IMPORT_RUN_ID_RE.fullmatch(import_run_id)
+                or state["run_snapshot_id"] != snapshot_id
+            ):
+                raise _PublicDataError("authoritative_inventory_invalid")
             if (
                 state["cex_source_name"] != "cex_exchange_volume_daily.csv"
                 or state["cex_source_bytes"] != cex_source["size_bytes"]
                 or state["cex_sha256"] != cex_source["sha256"]
             ):
                 raise _PublicDataError("authoritative_inventory_source_mismatch")
-            markets = [
-                (str(row[0]).strip().upper(), str(row[1]).strip(), str(row[2]).strip())
-                for row in connection.execute(
+            actual_cex_row_count = connection.execute(
+                "SELECT COUNT(*) FROM cex_market_daily"
+            ).fetchone()[0]
+            if (
+                not isinstance(state["cex_row_count"], int)
+                or state["cex_row_count"] != actual_cex_row_count
+                or state["cex_row_count"] != csv_row_count
+            ):
+                raise _PublicDataError("authoritative_inventory_invalid")
+            markets = sorted(
+                {
+                    (str(row[0]).strip().upper(), str(row[1]).strip(), str(row[2]).strip())
+                    for row in connection.execute(
                     """
                     SELECT DISTINCT token_symbol, exchange, cex_symbol
                     FROM cex_market_daily
                     ORDER BY token_symbol, exchange, cex_symbol
                     """
-                ).fetchall()
-            ]
+                    ).fetchall()
+                }
+            )
         finally:
             connection.close()
     except _PublicDataError:
@@ -455,9 +495,15 @@ def _read_cex_inventory(
                 pass
     if not markets or any(not all(market) for market in markets):
         raise _PublicDataError("authoritative_inventory_invalid")
+    if set(markets) != csv_markets:
+        raise _PublicDataError("authoritative_inventory_market_mismatch")
     generation = {
-        "snapshot_id": str(state["snapshot_id"]),
-        "import_run_id": str(state["import_run_id"]),
+        "snapshot_id_sha256": _opaque_identifier_hash(
+            "data_quality_snapshot/v1/dataset_snapshot", state["snapshot_id"]
+        ),
+        "import_run_id_sha256": _opaque_identifier_hash(
+            "data_quality_snapshot/v1/import_run", state["import_run_id"]
+        ),
     }
     return markets, generation
 
@@ -491,11 +537,77 @@ def _market_hash(market: Sequence[str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _opaque_identifier_hash(domain: str, value: str) -> str:
+    return hashlib.sha256((domain + "\0" + value).encode("utf-8")).hexdigest()
+
+
 def _set_failed(family: Dict[str, Any], reason: str) -> Dict[str, Any]:
     family["state"] = "failed"
     family["not_evaluated_reason"] = None
     family["failure_reason"] = reason
     return family
+
+
+def _read_cex_csv(
+    payload: bytes,
+    window_start: date,
+    window_end: date,
+) -> Tuple[List[Tuple[Mapping[str, str], date, Tuple[str, str, str]]], set[Tuple[str, str, str]]]:
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _PublicDataError("invalid_utf8")
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    if tuple(reader.fieldnames or ()) != _CEX_COLUMNS:
+        raise _PublicDataError("schema_mismatch")
+    raw_rows = list(reader)
+    normalized_rows = []
+    csv_markets = set()
+    keys = []
+    structural_null = False
+    required_null_count = 0
+    window_row_count = 0
+    for row in raw_rows:
+        if None in row:
+            raise _PublicDataError("schema_mismatch")
+        if any(not isinstance(row.get(field), str) for field in _CEX_COLUMNS):
+            raise _PublicDataError("schema_mismatch")
+        if not row["date"].strip():
+            structural_null = True
+            continue
+        day = _parse_canonical_day(row["date"])
+        in_window = window_start <= day <= window_end
+        if in_window:
+            window_row_count += 1
+            required_null_count += sum(
+                1 for field in _CEX_COLUMNS if not row[field].strip()
+            )
+        if any(not row[field].strip() for field in _CEX_IDENTITY_FIELDS):
+            structural_null = True
+            continue
+        market = (
+            row["token_symbol"].strip().upper(),
+            row["exchange"].strip(),
+            row["cex_symbol"].strip(),
+        )
+        key = (day.isoformat(), market[0], market[1], market[2])
+        keys.append(key)
+        csv_markets.add(market)
+        normalized_rows.append((row, day, market))
+    if structural_null:
+        raise _PublicDataError(
+            "required_field_null",
+            required_null_count=required_null_count,
+            required_null_denominator=window_row_count * len(_CEX_COLUMNS),
+        )
+    duplicate_count = len(keys) - len(set(keys))
+    if duplicate_count:
+        raise _PublicDataError(
+            "duplicate_primary_key",
+            duplicate_count=duplicate_count,
+            duplicate_denominator=len(keys),
+        )
+    return normalized_rows, csv_markets
 
 
 def _evaluate_cex_daily(
@@ -531,16 +643,32 @@ def _evaluate_cex_daily(
     family["source"]["inputs"].sort(key=lambda item: item["logical_path"])
 
     try:
-        markets, generation = _read_cex_inventory(
-            database_capture["payload"], csv_capture["identity"]
+        raw_rows, csv_markets = _read_cex_csv(
+            csv_capture["payload"], window_start, window_end
         )
-        text = csv_capture["payload"].decode("utf-8")
-        reader = csv.DictReader(io.StringIO(text, newline=""))
-        if tuple(reader.fieldnames or ()) != _CEX_COLUMNS:
-            raise _PublicDataError("schema_mismatch")
-        raw_rows = list(reader)
-    except UnicodeDecodeError:
-        return _set_failed(family, "invalid_utf8")
+    except _PublicDataError as error:
+        if error.duplicate_count is not None:
+            family["duplicate_primary_key"] = {
+                "count": error.duplicate_count,
+                "rate_bps": _basis_points(
+                    error.duplicate_count, error.duplicate_denominator or 0
+                ),
+            }
+        if error.required_null_count is not None:
+            family["required_field_null"] = {
+                "count": error.required_null_count,
+                "rate_bps": _basis_points(
+                    error.required_null_count, error.required_null_denominator or 0
+                ),
+            }
+        return _set_failed(family, error.reason)
+    try:
+        markets, generation = _read_cex_inventory(
+            database_capture["payload"],
+            csv_capture["identity"],
+            len(raw_rows),
+            csv_markets,
+        )
     except _PublicDataError as error:
         return _set_failed(family, error.reason)
 
@@ -552,8 +680,8 @@ def _evaluate_cex_daily(
     expected_basis = {
         "inventory_source": database_capture["identity"]["logical_path"],
         "inventory_sha256": database_capture["identity"]["sha256"],
-        "snapshot_id": generation["snapshot_id"],
-        "import_run_id": generation["import_run_id"],
+        "snapshot_id_sha256": generation["snapshot_id_sha256"],
+        "import_run_id_sha256": generation["import_run_id_sha256"],
         "market_count": len(markets),
         "market_inventory_sha256": _snapshot_hash(inventory_payload),
     }
@@ -566,8 +694,6 @@ def _evaluate_cex_daily(
         for market in markets
         for day in expected_dates
     }
-    known_markets = set(markets)
-
     observed_rows = []
     keys = []
     required_null_count = 0
@@ -575,29 +701,15 @@ def _evaluate_cex_daily(
         field: {"null_count": 0, "zero_count": 0}
         for field in _CEX_MEASUREMENT_FIELDS
     }
-    structural_null = False
     try:
-        for row in raw_rows:
-            required_null_count += sum(
-                1 for field in _CEX_COLUMNS if (row.get(field) or "").strip() == ""
-            )
-            if any((row.get(field) or "").strip() == "" for field in _CEX_IDENTITY_FIELDS):
-                structural_null = True
+        for row, day, market in raw_rows:
+            if not window_start <= day <= window_end:
                 continue
-            day = _parse_canonical_day(row["date"])
-            token = row["token_symbol"].strip().upper()
-            exchange = row["exchange"].strip()
-            cex_symbol = row["cex_symbol"].strip()
-            if not token or not exchange or not cex_symbol:
-                structural_null = True
-                continue
-            market = (token, exchange, cex_symbol)
-            if window_start <= day <= window_end and market not in known_markets:
-                raise _PublicDataError("market_not_in_authoritative_inventory")
+            required_null_count += sum(1 for field in _CEX_COLUMNS if not row[field].strip())
             measurements = {}
             usable = True
             for field in _CEX_MEASUREMENT_FIELDS:
-                number = _parse_decimal(row.get(field, ""))
+                number = _parse_decimal(row[field])
                 measurements[field] = number
                 if number is None:
                     measurement_fields[field]["null_count"] += 1
@@ -609,10 +721,9 @@ def _evaluate_cex_daily(
                         raise _PublicDataError("invalid_measurement")
                     if field in ("base_volume", "quote_volume_usd") and number < 0:
                         raise _PublicDataError("invalid_measurement")
-            key = (day.isoformat(), token, exchange, cex_symbol)
-            if window_start <= day <= window_end:
-                keys.append(key)
-                observed_rows.append((key, usable))
+            key = (day.isoformat(), market[0], market[1], market[2])
+            keys.append(key)
+            observed_rows.append((key, usable))
     except _PublicDataError as error:
         return _set_failed(family, error.reason)
 
@@ -632,8 +743,6 @@ def _evaluate_cex_daily(
         "zero_count": sum(item["zero_count"] for item in measurement_fields.values()),
         "fields": measurement_fields,
     }
-    if structural_null:
-        return _set_failed(family, "required_field_null")
     if duplicate_count:
         return _set_failed(family, "duplicate_primary_key")
 
@@ -775,6 +884,8 @@ def _evaluate_tvl(
     observation_times: List[Tuple[datetime, str]] = []
     try:
         for row in raw_rows:
+            if None in row:
+                raise _PublicDataError("schema_mismatch")
             nulls = [
                 field for field in _TVL_REQUIRED_FIELDS if not (row.get(field) or "").strip()
             ]
@@ -782,6 +893,8 @@ def _evaluate_tvl(
             if nulls:
                 raise _PublicDataError("required_field_null")
             snapshot_id = row["snapshot_id"].strip()
+            if not _TVL_GENERATION_ID_RE.fullmatch(snapshot_id):
+                raise _PublicDataError("invalid_snapshot_id")
             token = row["token_symbol"].strip().upper()
             chain = row["chain"].strip()
             pool = row["pool_address"].strip()

@@ -193,6 +193,17 @@ def _rebind_cex_source(directory, rows):
         connection.close()
 
 
+def _update_database(directory, statements):
+    connection = sqlite3.connect(Path(directory) / "market_facts.sqlite3")
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        for statement, parameters in statements:
+            connection.execute(statement, parameters)
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _snapshot(directory):
     return build_snapshot(
         Path(directory),
@@ -417,6 +428,155 @@ class DataQualitySnapshotDailyTests(unittest.TestCase):
                 },
             )
 
+    def test_window_external_null_does_not_pollute_window_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_cex_row(day) for day in _window_dates()]
+            rows.append(_cex_row("2026-07-14", quote_volume_usd=""))
+            _build_bound_database(directory, rows)
+
+            family = _family(_snapshot(directory), "cex_daily_ohlcv")
+
+            self.assertEqual(family["state"], "evaluated")
+            self.assertEqual(family["counts"]["observed"], 30)
+            self.assertEqual(family["counts"]["usable"], 30)
+            self.assertEqual(family["measurements"]["null_count"], 0)
+            self.assertEqual(family["required_field_null"], {"count": 0, "rate_bps": 0})
+
+    def test_window_external_duplicate_primary_key_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_cex_row(day) for day in _window_dates()]
+            rows.append(_cex_row("2026-07-14"))
+            _build_bound_database(directory, rows)
+            _rebind_cex_source(directory, rows + [_cex_row("2026-07-14")])
+
+            family = _family(_snapshot(directory), "cex_daily_ohlcv")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "duplicate_primary_key")
+
+    def test_csv_extra_trailing_column_fails_before_database_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_cex_row(day) for day in _window_dates()]
+            _build_bound_database(directory, rows)
+            path = Path(directory) / "cex_exchange_volume_daily.csv"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "2026-07-15,BTC,Binance,BTCUSDT,100,110,90,105,2,200\n",
+                    "2026-07-15,BTC,Binance,BTCUSDT,100,110,90,105,2,200,tail\n",
+                ),
+                encoding="utf-8",
+            )
+
+            family = _family(_snapshot(directory), "cex_daily_ohlcv")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "schema_mismatch")
+
+    def test_database_run_must_bind_to_current_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_cex_row(day) for day in _window_dates()]
+            _build_bound_database(directory, rows)
+            _update_database(
+                directory,
+                [
+                    (
+                        "UPDATE import_runs SET snapshot_id = ? WHERE run_id = "
+                        "(SELECT import_run_id FROM dataset_state WHERE singleton_id = 1)",
+                        ("f" * 24,),
+                    )
+                ],
+            )
+
+            family = _family(_snapshot(directory), "cex_daily_ohlcv")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "authoritative_inventory_invalid")
+
+    def test_database_secret_snapshot_id_is_never_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_cex_row(day) for day in _window_dates()]
+            _build_bound_database(directory, rows)
+            secret = "api_key=top-secret/private/operator"
+            _update_database(
+                directory,
+                [
+                    (
+                        "UPDATE dataset_snapshots SET snapshot_id = ? WHERE snapshot_id = "
+                        "(SELECT snapshot_id FROM dataset_state WHERE singleton_id = 1)",
+                        (secret,),
+                    ),
+                    (
+                        "UPDATE import_runs SET snapshot_id = ? WHERE run_id = "
+                        "(SELECT import_run_id FROM dataset_state WHERE singleton_id = 1)",
+                        (secret,),
+                    ),
+                    ("UPDATE dataset_state SET snapshot_id = ? WHERE singleton_id = 1", (secret,)),
+                ],
+            )
+
+            snapshot = _snapshot(directory)
+            family = _family(snapshot, "cex_daily_ohlcv")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "authoritative_inventory_invalid")
+            self.assertNotIn(secret, canonical_snapshot_bytes(snapshot).decode("utf-8"))
+
+    def test_database_secret_import_run_id_is_never_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_cex_row(day) for day in _window_dates()]
+            _build_bound_database(directory, rows)
+            secret = "api_key=top-secret/private/operator"
+            _update_database(
+                directory,
+                [
+                    (
+                        "UPDATE import_runs SET run_id = ? WHERE run_id = "
+                        "(SELECT import_run_id FROM dataset_state WHERE singleton_id = 1)",
+                        (secret,),
+                    ),
+                    ("UPDATE dataset_state SET import_run_id = ? WHERE singleton_id = 1", (secret,)),
+                ],
+            )
+
+            snapshot = _snapshot(directory)
+            family = _family(snapshot, "cex_daily_ohlcv")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "authoritative_inventory_invalid")
+            self.assertNotIn(secret, canonical_snapshot_bytes(snapshot).decode("utf-8"))
+
+    def test_database_declared_row_count_must_match_csv_and_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_cex_row(day) for day in _window_dates()]
+            _build_bound_database(directory, rows)
+            _update_database(
+                directory,
+                [
+                    (
+                        "UPDATE dataset_snapshots SET cex_row_count = cex_row_count + 1 "
+                        "WHERE snapshot_id = (SELECT snapshot_id FROM dataset_state WHERE singleton_id = 1)",
+                        (),
+                    )
+                ],
+            )
+
+            family = _family(_snapshot(directory), "cex_daily_ohlcv")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "authoritative_inventory_invalid")
+
+    def test_database_market_inventory_must_match_bound_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [_cex_row(day) for day in _window_dates()]
+            _build_bound_database(directory, rows)
+            changed_rows = [dict(row, cex_symbol="BTCUSD") for row in rows]
+            _rebind_cex_source(directory, changed_rows)
+
+            family = _family(_snapshot(directory), "cex_daily_ohlcv")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "authoritative_inventory_market_mismatch")
+
 
 class DataQualitySnapshotPointInTimeTests(unittest.TestCase):
     def test_timezone_naive_timestamp_fails_closed(self):
@@ -458,6 +618,38 @@ class DataQualitySnapshotPointInTimeTests(unittest.TestCase):
             self.assertEqual(family["state"], "failed")
             self.assertEqual(family["failure_reason"], "mixed_snapshot_id")
 
+    def test_invalid_tvl_snapshot_id_fails_without_projecting_secret(self):
+        with tempfile.TemporaryDirectory() as directory:
+            secret = "api_key=top-secret /private/operator/token"
+            _write_csv(
+                Path(directory) / "dex_pool_tvl_latest.csv",
+                TVL_HEADER,
+                [_tvl_row(snapshot_id=secret)],
+            )
+
+            snapshot = _snapshot(directory)
+            family = _family(snapshot, "tvl")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "invalid_snapshot_id")
+            self.assertNotIn(secret, canonical_snapshot_bytes(snapshot).decode("utf-8"))
+
+    def test_tvl_extra_trailing_column_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dex_pool_tvl_latest.csv"
+            _write_csv(path, TVL_HEADER, [_tvl_row()])
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    ",observed,observed,\n", ",observed,observed,,tail\n"
+                ),
+                encoding="utf-8",
+            )
+
+            family = _family(_snapshot(directory), "tvl")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(family["failure_reason"], "schema_mismatch")
+
     def test_stale_partition_remains_evaluated_and_visible(self):
         with tempfile.TemporaryDirectory() as directory:
             _write_csv(
@@ -493,6 +685,31 @@ class DataQualitySnapshotDeterminismTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(canonical_snapshot_bytes(first), canonical_snapshot_bytes(second))
             self.assertEqual(first["snapshot_sha256"], second["snapshot_sha256"])
+            unsigned = dict(first)
+            del unsigned["snapshot_sha256"]
+            expected = hashlib.sha256(
+                (
+                    json.dumps(
+                        unsigned,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(first["snapshot_sha256"], expected)
+
+    def test_publication_identity_changes_with_input_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dex_pool_tvl_latest.csv"
+            _write_csv(path, TVL_HEADER, [_tvl_row(source_endpoint="https://example.invalid/one")])
+            first = _snapshot(directory)
+            _write_csv(path, TVL_HEADER, [_tvl_row(source_endpoint="https://example.invalid/two")])
+            second = _snapshot(directory)
+
+            self.assertNotEqual(first["publication"]["identity"], second["publication"]["identity"])
 
     def test_output_never_projects_private_path_cookie_or_api_key(self):
         with tempfile.TemporaryDirectory() as directory:

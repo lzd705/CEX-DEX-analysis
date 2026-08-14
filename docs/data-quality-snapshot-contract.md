@@ -164,11 +164,15 @@ market identity x every UTC date in the inclusive requested window
 The market inventory comes from the current, integrity-checked
 `market_facts.sqlite3` dataset pointer and its distinct exact CEX or DEX market
 rows. CEX catalog entries with validated `lifecycle_withheld = true` are not
-ranking candidates. `expected_basis` records the SQLite input SHA, current
-snapshot/import identity, market count, and a hash of the canonical market-ID
-inventory. If the SQLite catalog is absent, stale relative to the CSV binding,
-or invalid, the daily family is `not_evaluated` or `failed`; it never falls
-back to the set of markets that happen to have CSV rows.
+ranking candidates. For CEX, the active dataset state, selected import run,
+declared CEX row count, actual SQLite CEX row count, CSV row count, and
+canonical CEX market set must all agree. `expected_basis` records the SQLite
+input SHA, domain-separated hashes of the validated current snapshot/import
+identifiers, market count, and a hash of the canonical market-ID inventory.
+Raw database identifiers are never published. If the SQLite catalog is absent,
+stale relative to the CSV binding, or invalid, the daily family is
+`not_evaluated` or `failed`; it never falls back to the set of markets that
+happen to have CSV rows.
 
 It never substitutes the distance between the minimum and maximum dates for
 this grid. A row with measured volume `0` is observed. A missing row is not
@@ -233,13 +237,19 @@ Every used evidence file is a separately hashed, sorted publication input.
 ## Input validation
 
 - Required headers and fields are explicit per family.
-- Primary keys must be complete and unique after canonical identity
-  normalization.
+- Every CSV is checked across the full file for exact schema, trailing fields,
+  complete primary keys, and uniqueness after canonical identity normalization.
+  These structural failures are reported before any authoritative SQLite
+  binding failure can mask them.
 - Daily dates must be canonical `YYYY-MM-DD` values.
+- Daily observed, usable, required-null, null, and zero metrics use only rows
+  in the requested window; rows outside the window cannot change their
+  denominators or counts, but can still fail full-file structural validation.
 - Point-in-time clocks must be timezone-aware RFC 3339 and must not be later
   than `generated_at_utc`.
 - A latest point-in-time file must contain one `snapshot_id`; multiple snapshot
-  IDs are mixed-grain input and fail closed.
+  IDs are mixed-grain input and fail closed. TVL snapshot IDs are bounded,
+  lower-case path-safe identifiers and invalid IDs are never published.
 - A stale partition remains evaluated but is surfaced through freshness and a
   stable `stale_partition` reason/status count; it is not refreshed or hidden.
 - The fixed execution inventory is five notionals by two directions per
