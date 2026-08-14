@@ -4294,7 +4294,11 @@ function executionPayloadMatchesSelection(payload, token, selection) {
     || payload?.market_a?.market?.market_id !== selection.marketA
   ) return false;
   if (selection.selection === "single") {
-    return payload.selection_mode === "single" && payload.market_b === null;
+    return (
+      payload.selection_mode === "single"
+      && payload.market_b === null
+      && payload?.metadata?.snapshot_skew_seconds === null
+    );
   }
   return (
     payload.selection_mode == null
@@ -5497,7 +5501,9 @@ function liquidityMarkerMarkup(series, point, x, y) {
 function renderLiquiditySvg(series) {
   const svg = byId("liquidity-chart");
   const emptyState = byId("liquidity-empty");
-  emptyState.textContent = "No source-backed depth bands are available for the selected markets.";
+  emptyState.textContent = app.workspaceSelection === "single"
+    ? "No source-backed depth bands are available for Market A."
+    : "No source-backed depth bands are available for the selected markets.";
   const dimensions = liquidityChartDimensions();
   app.liquidityLayoutMode = dimensions.layout;
   svg.setAttribute("viewBox", `0 0 ${dimensions.width} ${dimensions.height}`);

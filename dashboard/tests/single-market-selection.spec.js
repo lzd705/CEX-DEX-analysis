@@ -7,6 +7,45 @@ const fixture = JSON.parse(fs.readFileSync(
   "utf8",
 ));
 
+const assetDiagnostics = new WeakMap();
+
+test.beforeEach(async ({ page }) => {
+  const diagnostics = [];
+  assetDiagnostics.set(page, diagnostics);
+  page.on("requestfailed", (request) => {
+    if (new URL(request.url()).pathname === "/navigation.js") {
+      diagnostics.push({
+        type: "navigation-request-failed",
+        url: request.url(),
+        failure: request.failure(),
+      });
+    }
+  });
+  page.on("response", (response) => {
+    if (new URL(response.url()).pathname === "/navigation.js") {
+      diagnostics.push({
+        type: "navigation-response",
+        url: response.url(),
+        status: response.status(),
+        ok: response.ok(),
+      });
+    }
+  });
+  page.on("pageerror", (error) => {
+    diagnostics.push({ type: "pageerror", message: error.message });
+  });
+});
+
+test.afterEach(async ({ page }, testInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) return;
+  const diagnostics = assetDiagnostics.get(page) || [];
+  await testInfo.attach("asset-diagnostics", {
+    body: JSON.stringify(diagnostics, null, 2),
+    contentType: "application/json",
+  });
+  console.error(`ASSET_DIAGNOSTICS ${testInfo.project.name} ${testInfo.title} ${JSON.stringify(diagnostics)}`);
+});
+
 async function installApiRoutes(page, {
   catalog = fixture.catalog_pair,
   calls = [],

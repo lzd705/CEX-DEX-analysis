@@ -106,6 +106,50 @@ console.log(JSON.stringify({
         self.assertNotIn("Market B", result["description"])
         self.assertEqual(result["bMeta"], "")
 
+    def test_single_liquidity_empty_state_names_market_a(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    clientWidth: 800, attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map(Object.entries({
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control(""),
+}));
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+};
+global.window = { matchMedia() { return { matches: false }; } };
+app.workspaceSelection = "single";
+app.catalog = { markets: [{
+  token_symbol: "AAVE", market_id: "cex:binance:AAVE/USDT",
+  market_type: "cex", venue: "binance", instrument: "AAVE/USDT",
+  depth_status: "unavailable", quality_flags: [],
+}] };
+hideLiquidityTooltip = () => {};
+renderLiquidityCurve();
+console.log(JSON.stringify({
+  empty: nodes.get("liquidity-empty").textContent,
+  emptyHidden: nodes.get("liquidity-empty").hidden,
+  description: nodes.get("liquidity-chart-description").textContent,
+}));
+"""
+        )
+
+        self.assertFalse(result["emptyHidden"])
+        self.assertIn("Market A", result["empty"])
+        self.assertNotIn("selected markets", result["empty"].lower())
+        self.assertNotIn("selected markets", result["description"].lower())
+
     def test_single_execution_uses_exact_market_a_and_preserves_compare_on_failure(self):
         result = run_app_javascript(
             r"""
@@ -173,11 +217,17 @@ global.fetch = async (url, options) => {
   };
   global.fetch = async () => ({ ok: true, status: 200, json: async () => ({
     token_symbol: "AAVE", selection_mode: "single",
+    market_a: exactResult, market_b: null,
+    metadata: { snapshot_skew_seconds: 60 },
+  }) });
+  const skewLoaded = await loadExecutionCost();
+  global.fetch = async () => ({ ok: true, status: 200, json: async () => ({
+    token_symbol: "AAVE", selection_mode: "single",
     market_a: { ...exactResult, market: { ...exactResult.market, market_id: "cex:wrong:AAVE/USDT" } },
     market_b: null, metadata: { snapshot_skew_seconds: null },
   }) });
   const wrongLoaded = await loadExecutionCost();
-  console.log(JSON.stringify({ first, wrongLoaded, comparison: app.comparison }));
+  console.log(JSON.stringify({ first, skewLoaded, wrongLoaded, comparison: app.comparison }));
 })();
 """
         )
@@ -193,6 +243,7 @@ global.fetch = async (url, options) => {
         self.assertEqual(result["first"]["bCost"], "")
         self.assertIn("CEX account fee excluded", result["first"]["fee"])
         self.assertNotIn("Market B", result["first"]["status"])
+        self.assertFalse(result["skewLoaded"])
         self.assertFalse(result["wrongLoaded"])
         self.assertEqual(result["comparison"], {"token_symbol": "AAVE", "sentinel": "keep"})
 
