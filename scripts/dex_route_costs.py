@@ -19,9 +19,25 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 try:
     from scripts.execution_cost_components import cost_component_row
+    from scripts.route_cost_evidence import (
+        build_v2_swap_calldata as build_strict_v2_swap_calldata,
+        decode_v2_swap_calldata as decode_strict_v2_swap_calldata,
+        network_gas_usd as strict_network_gas_usd,
+        next_base_fee_wei as strict_next_base_fee_wei,
+        solidity_allowance_storage_key as strict_allowance_storage_key,
+        solidity_balance_storage_key as strict_balance_storage_key,
+    )
     from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
 except ModuleNotFoundError:
     from execution_cost_components import cost_component_row  # type: ignore
+    from route_cost_evidence import (  # type: ignore
+        build_v2_swap_calldata as build_strict_v2_swap_calldata,
+        decode_v2_swap_calldata as decode_strict_v2_swap_calldata,
+        network_gas_usd as strict_network_gas_usd,
+        next_base_fee_wei as strict_next_base_fee_wei,
+        solidity_allowance_storage_key as strict_allowance_storage_key,
+        solidity_balance_storage_key as strict_balance_storage_key,
+    )
     from timestamp_contract import exact_rfc3339_epoch_seconds  # type: ignore
 
 

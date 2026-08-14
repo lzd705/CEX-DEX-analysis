@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import ssl
 import time
@@ -28,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -155,6 +156,16 @@ except ModuleNotFoundError:
     )
 
 
+# Exchange decimal fields are fixed-point text, not arbitrary Decimal input.
+# These caps are checked lexically before Decimal can allocate or format an
+# attacker-controlled exponent.
+MAX_RULE_DECIMAL_TOKEN_BYTES = 512
+MAX_RULE_DECIMAL_PLACES = 255
+_RULE_DECIMAL_TEXT = re.compile(
+    r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z", flags=re.ASCII
+)
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATABASE = PROJECT_ROOT / "data/local/market_facts.sqlite3"
 DEFAULT_CEX_CSV = PROJECT_ROOT / "data/local/cex_exchange_volume_daily.csv"
@@ -194,6 +205,9 @@ EXACT_COVERAGE_POLICY = {
 DEPTH_BANDS_BPS = (10, 25, 50, 100)
 REQUEST_SLEEP_SECONDS = 0.15
 MAX_RETRIES = 3
+STRICT_CEX_TYPED_RULE_VENUES = frozenset({"binance", "bybit"})
+STRICT_CEX_TYPED_VALIDITY_SECONDS = 60
+MAX_CEX_TYPED_RULE_RESPONSE_BYTES = 256 * 1024
 
 # Public REST limits differ by venue.  A completeness flag prevents a limited
 # response from being represented as the venue's complete depth.
@@ -463,15 +477,394 @@ def query_url(base: str, params: dict[str, Any]) -> str:
     return f"{base}?{urllib.parse.urlencode(params)}"
 
 
+def _canonical_typed_json(value: dict[str, Any]) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _bounded_rule_decimal_text(
+    value: Any, field: str, *, permit_internal_decimal: bool = False
+) -> str:
+    if permit_internal_decimal and isinstance(value, Decimal):
+        value = str(value)
+    if not isinstance(value, str):
+        raise ValueError("{} is not exact fixed-point text".format(field))
+    try:
+        width = len(value.encode("ascii"))
+    except UnicodeEncodeError as error:
+        raise ValueError("{} is not exact fixed-point text".format(field)) from error
+    if (
+        not value
+        or width > MAX_RULE_DECIMAL_TOKEN_BYTES
+        or _RULE_DECIMAL_TEXT.fullmatch(value) is None
+    ):
+        raise ValueError("{} is not exact fixed-point text".format(field))
+    places = len(value.rsplit(".", 1)[1]) if "." in value else 0
+    if places > MAX_RULE_DECIMAL_PLACES:
+        raise ValueError("{} has unsupported precision".format(field))
+    return value
+
+
+def _rule_decimal(
+    value: Any,
+    field: str,
+    *,
+    allow_zero: bool,
+    permit_internal_decimal: bool = False,
+) -> Decimal:
+    text = _bounded_rule_decimal_text(
+        value, field, permit_internal_decimal=permit_internal_decimal
+    )
+    try:
+        number = Decimal(text)
+    except InvalidOperation as error:  # pragma: no cover - grammar is stricter
+        raise ValueError("{} is not exact fixed-point text".format(field)) from error
+    if number < 0 or (not allow_zero and number == 0):
+        qualification = "nonnegative" if allow_zero else "positive"
+        raise ValueError("{} is not an exact {} decimal".format(field, qualification))
+    return number
+
+
+def _positive_rule_decimal(value: Any, field: str) -> Decimal:
+    return _rule_decimal(value, field, allow_zero=False)
+
+
+def _nonnegative_rule_decimal(value: Any, field: str) -> Decimal:
+    return _rule_decimal(value, field, allow_zero=True)
+
+
+def _canonical_rule_decimal(
+    value: Any,
+    field: str,
+    *,
+    allow_zero: bool = False,
+    permit_internal_decimal: bool = False,
+) -> str:
+    number = _rule_decimal(
+        value,
+        field,
+        allow_zero=allow_zero,
+        permit_internal_decimal=permit_internal_decimal,
+    )
+    text = format(number, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _decimal_unit_places(value: Any, field: str) -> int:
+    number = _positive_rule_decimal(value, field).normalize()
+    exponent = int(number.as_tuple().exponent)
+    places = max(0, -exponent)
+    if places > 255:
+        raise ValueError("{} has unsupported precision".format(field))
+    return places
+
+
+def _unit_increment(decimals: int) -> str:
+    if type(decimals) is not int or not 0 <= decimals <= 255:
+        raise ValueError("asset precision is invalid")
+    if decimals == 0:
+        return "1"
+    return "0." + "0" * (decimals - 1) + "1"
+
+
+def _typed_source_window(observed_at: str) -> tuple[str, str]:
+    canonical = canonical_rfc3339_utc(observed_at)
+    observed = datetime.fromisoformat(canonical)
+    valid_until = observed + timedelta(seconds=STRICT_CEX_TYPED_VALIDITY_SECONDS)
+    return canonical, valid_until.isoformat()
+
+
+def binance_market_rules_projection(
+    payload: Any,
+    *,
+    base_asset: str,
+    quote_asset: str,
+    source_instrument: str,
+) -> dict[str, str]:
+    """Replay Binance's exact trading-rule fields without I/O or timestamps."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("symbols"), list):
+        raise ValueError("Binance market-rules response is invalid")
+    matches = [
+        item for item in payload["symbols"]
+        if isinstance(item, dict) and item.get("symbol") == source_instrument
+    ]
+    if len(matches) != 1:
+        raise ValueError("Binance market-rules instrument is not unique")
+    record = matches[0]
+    if (
+        record.get("status") != "TRADING"
+        or record.get("baseAsset") != base_asset
+        or record.get("quoteAsset") != quote_asset
+        or type(record.get("baseAssetPrecision")) is not int
+        or type(record.get("quoteAssetPrecision")) is not int
+        or not 0 <= record["baseAssetPrecision"] <= 255
+        or not 0 <= record["quoteAssetPrecision"] <= 255
+        or not isinstance(record.get("filters"), list)
+    ):
+        raise ValueError("Binance market-rules identity is invalid")
+    filters: dict[str, dict[str, Any]] = {}
+    for item in record["filters"]:
+        if not isinstance(item, dict) or not isinstance(item.get("filterType"), str):
+            raise ValueError("Binance market-rules filter is invalid")
+        filter_type = item["filterType"]
+        if filter_type in filters:
+            raise ValueError("Binance market-rules filter is duplicated")
+        filters[filter_type] = item
+    try:
+        price_filter = filters["PRICE_FILTER"]
+        lot_filter = filters["LOT_SIZE"]
+        notional_filters = [
+            filters[name] for name in ("NOTIONAL", "MIN_NOTIONAL")
+            if name in filters
+        ]
+        if len(notional_filters) != 1:
+            raise ValueError(
+                "Binance notional filter must contain exactly one unambiguous rule"
+            )
+        notional_filter = notional_filters[0]
+        return {
+            "price_tick": _canonical_rule_decimal(
+                price_filter["tickSize"], "Binance PRICE_FILTER.tickSize"
+            ),
+            "quantity_step": _canonical_rule_decimal(
+                lot_filter["stepSize"], "Binance LOT_SIZE.stepSize"
+            ),
+            "min_quantity": _canonical_rule_decimal(
+                lot_filter["minQty"],
+                "Binance LOT_SIZE.minQty",
+                allow_zero=True,
+            ),
+            "min_notional": _canonical_rule_decimal(
+                notional_filter["minNotional"],
+                "Binance notional minimum",
+                allow_zero=True,
+            ),
+        }
+    except (KeyError, TypeError) as error:
+        raise ValueError("Binance market-rules fields are incomplete") from error
+
+
+def _binance_market_rules_source(
+    payload: Any,
+    *,
+    market: dict[str, str],
+    source_instrument: str,
+    observed_at: str,
+) -> dict[str, Any]:
+    base_asset, quote_asset = market["cex_symbol"].upper().split("/", 1)
+    projection = binance_market_rules_projection(
+        payload,
+        base_asset=base_asset,
+        quote_asset=quote_asset,
+        source_instrument=source_instrument,
+    )
+    record = next(
+        item for item in payload["symbols"]
+        if isinstance(item, dict) and item.get("symbol") == source_instrument
+    )
+    exact_observed_at, valid_until = _typed_source_window(observed_at)
+    return {
+        "schema": "route_market_rules_source/v1",
+        "market_id": cex_market_id(market),
+        "base_asset": base_asset,
+        "quote_asset": quote_asset,
+        "base_unit_decimals": record["baseAssetPrecision"],
+        "quote_unit_decimals": record["quoteAssetPrecision"],
+        "base_increment": projection["quantity_step"],
+        "quote_increment": _unit_increment(record["quoteAssetPrecision"]),
+        "min_base_quantity": projection["min_quantity"],
+        "min_quote_notional": projection["min_notional"],
+        "observed_at": exact_observed_at,
+        "valid_until": valid_until,
+    }
+
+
+def _bybit_market_rules_source(
+    payload: Any,
+    *,
+    market: dict[str, str],
+    source_instrument: str,
+    observed_at: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("retCode") != 0
+        or not isinstance(payload.get("result"), dict)
+        or payload["result"].get("category") != "spot"
+        or not isinstance(payload["result"].get("list"), list)
+    ):
+        raise ValueError("Bybit market-rules response is invalid")
+    matches = [
+        item for item in payload["result"]["list"]
+        if isinstance(item, dict) and item.get("symbol") == source_instrument
+    ]
+    if len(matches) != 1:
+        raise ValueError("Bybit market-rules instrument is not unique")
+    record = matches[0]
+    base_asset, quote_asset = market["cex_symbol"].upper().split("/", 1)
+    lot = record.get("lotSizeFilter")
+    price = record.get("priceFilter")
+    if (
+        record.get("status") != "Trading"
+        or record.get("baseCoin") != base_asset
+        or record.get("quoteCoin") != quote_asset
+        or not isinstance(lot, dict)
+        or not isinstance(price, dict)
+    ):
+        raise ValueError("Bybit market-rules identity is invalid")
+    try:
+        base_increment = _canonical_rule_decimal(
+            lot["basePrecision"], "Bybit basePrecision"
+        )
+        quote_increment = _canonical_rule_decimal(
+            lot["quotePrecision"], "Bybit quotePrecision"
+        )
+        # Bybit's spot instrument contract marks minOrderQty deprecated and
+        # says it is no longer enforced; minOrderAmt is the active minimum.
+        # A stale positive minOrderQty therefore cannot become a strict rule.
+        min_base_quantity = "0"
+        min_quote_notional = _canonical_rule_decimal(
+            lot["minOrderAmt"], "Bybit minOrderAmt"
+        )
+        _canonical_rule_decimal(
+            price["tickSize"], "Bybit tickSize"
+        )
+    except (KeyError, TypeError) as error:
+        raise ValueError("Bybit market-rules fields are incomplete") from error
+    exact_observed_at, valid_until = _typed_source_window(observed_at)
+    return {
+        "schema": "route_market_rules_source/v1",
+        "market_id": cex_market_id(market),
+        "base_asset": base_asset,
+        "quote_asset": quote_asset,
+        "base_unit_decimals": _decimal_unit_places(
+            lot["basePrecision"], "Bybit basePrecision"
+        ),
+        "quote_unit_decimals": _decimal_unit_places(
+            lot["quotePrecision"], "Bybit quotePrecision"
+        ),
+        "base_increment": base_increment,
+        "quote_increment": quote_increment,
+        "min_base_quantity": min_base_quantity,
+        "min_quote_notional": min_quote_notional,
+        "observed_at": exact_observed_at,
+        "valid_until": valid_until,
+    }
+
+
+def _validate_typed_market_rules(value: dict[str, Any]) -> dict[str, Any]:
+    payload = _canonical_typed_json(value)
+    MarketRules(
+        market_id=value["market_id"],
+        base_asset=value["base_asset"],
+        quote_asset=value["quote_asset"],
+        base_unit_decimals=value["base_unit_decimals"],
+        quote_unit_decimals=value["quote_unit_decimals"],
+        base_increment=Decimal(value["base_increment"]),
+        quote_increment=Decimal(value["quote_increment"]),
+        min_base_quantity=Decimal(value["min_base_quantity"]),
+        min_quote_notional=Decimal(value["min_quote_notional"]),
+        observed_at=value["observed_at"],
+        valid_until=value["valid_until"],
+        source_record_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    return value
+
+
+def _typed_market_rules_request(exchange: str, source_instrument: str) -> str:
+    if exchange == "binance":
+        return query_url(
+            "https://api.binance.com/api/v3/exchangeInfo",
+            {"symbol": source_instrument},
+        )
+    if exchange == "bybit":
+        return query_url(
+            "https://api.bybit.com/v5/market/instruments-info",
+            {"category": "spot", "symbol": source_instrument},
+        )
+    raise ValueError("CEX typed market-rules adapter is unsupported")
+
+
+def _typed_cex_source_payloads(
+    market: dict[str, str],
+    book: dict[str, Any],
+    *,
+    rules_response: Any,
+    rules_raw: bytes,
+    rules_observed_at: str,
+    conversion_observed_at: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    exchange = market["exchange"].lower()
+    if exchange not in STRICT_CEX_TYPED_RULE_VENUES:
+        raise ValueError("CEX typed market-rules adapter is unsupported")
+    if not isinstance(rules_raw, bytes) or not rules_raw:
+        raise ValueError("CEX market-rules raw response is invalid")
+    if len(rules_raw) > MAX_CEX_TYPED_RULE_RESPONSE_BYTES:
+        raise ValueError("CEX market-rules response exceeds its byte limit")
+    if exchange == "binance":
+        rules = _validate_typed_market_rules(_binance_market_rules_source(
+            rules_response,
+            market=market,
+            source_instrument=book["source_instrument"],
+            observed_at=rules_observed_at,
+        ))
+    else:
+        rules = _validate_typed_market_rules(_bybit_market_rules_source(
+            rules_response,
+            market=market,
+            source_instrument=book["source_instrument"],
+            observed_at=rules_observed_at,
+        ))
+    quote_asset = str(book["source_quote_asset"]).upper()
+    conversion_method = str(book.get("quote_conversion_method") or "")
+    conversion_value = _canonical_rule_decimal(
+        book.get("quote_to_usd"),
+        "CEX quote-to-USD conversion",
+        permit_internal_decimal=True,
+    )
+    if quote_asset == "USD":
+        if conversion_value != "1" or conversion_method != "USD=USD identity":
+            raise ValueError("CEX USD identity conversion is invalid")
+    elif quote_asset == "USDT":
+        if conversion_value != "1" or conversion_method != "USDT=USD proxy":
+            raise ValueError("CEX USDT proxy conversion is invalid")
+    else:
+        raise ValueError("CEX typed USD conversion adapter is unsupported")
+    conversion_observed, conversion_valid_until = _typed_source_window(
+        conversion_observed_at
+    )
+    conversion = {
+        "schema": "route_usd_conversion_source/v1",
+        "quote_asset": quote_asset,
+        "usd_per_quote": conversion_value,
+        "observed_at": conversion_observed,
+        "valid_until": conversion_valid_until,
+        "source": conversion_method,
+    }
+    return rules, conversion
+
+
 def request_json(
     url: str,
     *,
     deadline: CollectionDeadline | None = None,
     timeout_seconds: float = 30,
     max_retries: int = MAX_RETRIES,
+    max_bytes: int | None = None,
 ) -> tuple[Any, bytes]:
     if max_retries < 1:
         raise ValueError("max_retries must be at least 1")
+    if max_bytes is not None and (
+        type(max_bytes) is not int or max_bytes < 1
+    ):
+        raise ValueError("max_bytes must be a positive integer")
     request = urllib.request.Request(
         url,
         headers={
@@ -491,7 +884,13 @@ def request_json(
                 timeout=timeout,
                 context=TLS_CONTEXT,
             ) as response:
-                raw = response.read()
+                raw = (
+                    response.read()
+                    if max_bytes is None
+                    else response.read(max_bytes + 1)
+                )
+                if max_bytes is not None and len(raw) > max_bytes:
+                    raise ValueError("HTTP response exceeds its byte limit")
                 return json.loads(raw.decode("utf-8")), raw
         except urllib.error.HTTPError as error:
             if deadline is not None:
@@ -683,7 +1082,9 @@ def parse_book(
             raise ValueError(f"Bybit returned no order book: {payload}")
         book = payload["result"]
         bids, asks = book.get("b", []), book.get("a", [])
-        instrument = str(book.get("s") or instrument)
+        returned_instrument = str(book.get("s") or "")
+        if returned_instrument and returned_instrument != instrument:
+            raise ValueError("Bybit returned a different order-book instrument")
         sequence = str(book.get("u") or book.get("seq") or "")
         observed_at = timestamp_text(book.get("cts") or book.get("ts"))
     elif exchange == "kucoin":
@@ -1606,6 +2007,7 @@ def collect_cex_market_observation(
     raw_path: Path,
     request: Callable[[str], tuple[Any, bytes]] = request_json,
     deadline: CollectionDeadline | None = None,
+    typed_source_payload_sink: Callable[[dict[str, Any]], Any] | None = None,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Collect one CEX market without owning orchestration or publication."""
     if deadline is not None:
@@ -1633,6 +2035,55 @@ def collect_cex_market_observation(
             request_started_at=request_started_at,
             response_received_at=response_received_at,
         )
+        if (
+            typed_source_payload_sink is not None
+            and market["exchange"].lower() in STRICT_CEX_TYPED_RULE_VENUES
+        ):
+            try:
+                if deadline is not None:
+                    deadline.require_remaining()
+                conversion_observed_at = (
+                    book.get("source_observed_at") or response_received_at
+                )
+
+                def rules_request(url: str) -> tuple[Any, bytes]:
+                    if request is request_json:
+                        return request_json(
+                            url,
+                            deadline=deadline,
+                            max_bytes=MAX_CEX_TYPED_RULE_RESPONSE_BYTES,
+                        )
+                    return effective_request(url)
+
+                rules_response, rules_raw = rules_request(
+                    _typed_market_rules_request(
+                        market["exchange"].lower(), book["source_instrument"]
+                    )
+                )
+                if deadline is not None:
+                    deadline.require_remaining()
+                rules_observed_at = utc_now_text()
+                rules, conversion = _typed_cex_source_payloads(
+                    market,
+                    book,
+                    rules_response=rules_response,
+                    rules_raw=rules_raw,
+                    rules_observed_at=rules_observed_at,
+                    conversion_observed_at=conversion_observed_at,
+                )
+            except CollectionDeadlineExceeded:
+                raise
+            except Exception:
+                pass
+            else:
+                typed_source_payload_sink({
+                    "role": "cex_market_rules",
+                    "payload": _canonical_typed_json(rules),
+                })
+                typed_source_payload_sink({
+                    "role": "quote_usd_conversion",
+                    "payload": _canonical_typed_json(conversion),
+                })
         try:
             market_execution_rows = execution_rows_for_book(
                 market,

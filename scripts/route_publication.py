@@ -42,9 +42,14 @@ try:
         validate_cost_components,
     )
     from scripts.fetch_cex_depth import (
+        CEX_DEPTH_REASON_CODES,
         parse_book,
         route_quantity_quote_for_book,
         source_request,
+    )
+    from scripts.fetch_dex_depth import (
+        DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES,
+        DEX_DEPTH_UNSUPPORTED_REASON_CODES,
     )
     from scripts.route_cohort import (
         canonical_route_id,
@@ -56,6 +61,10 @@ try:
         inventory_capacity_for_route,
         load_validated_inventory_profile,
     )
+    from scripts.route_cost_evidence import (
+        RouteCostEvidenceError,
+        validate_route_cost_evidence_manifest_for_publication,
+    )
     from scripts.route_opportunity import (
         OPPORTUNITY_FIELDS,
         _issue_publication_attestation,
@@ -64,7 +73,30 @@ try:
         route_opportunity_id,
     )
     from scripts.route_quantity import FeeSemantics, MarketRules, QuantityQuote
-    from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
+    from scripts.route_shadow_inputs import (
+        TYPED_SOURCE_MANIFEST_FIELDS,
+        TYPED_SOURCE_MANIFEST_MEMBER_FIELDS,
+        TYPED_SOURCE_MANIFEST_SCHEMA,
+        TYPED_SOURCE_ROLE_CONTRACTS,
+        _validate_run_id as _validate_shadow_run_id,
+        _validated_publication_manifest as _validate_shadow_baseline_manifest,
+        typed_source_lineage_observed_members,
+        validate_typed_source_lineage,
+    )
+    from scripts.route_universe import (
+        ROUTE_UNIVERSE_SCHEMA,
+        _selection_key as _route_universe_selection_key,
+        route_universe_sha256,
+    )
+    from scripts.timestamp_contract import (
+        exact_rfc3339_epoch_seconds,
+        parse_rfc3339_utc,
+    )
+    from scripts.token_registry import (
+        TokenRegistryError,
+        normalize_chain,
+        normalize_contract_address,
+    )
 except ModuleNotFoundError:
     from cex_fee_facts import (  # type: ignore[no-redef]
         collect_cex_fee_snapshot,
@@ -75,9 +107,14 @@ except ModuleNotFoundError:
         validate_cost_components,
     )
     from fetch_cex_depth import (  # type: ignore[no-redef]
+        CEX_DEPTH_REASON_CODES,
         parse_book,
         route_quantity_quote_for_book,
         source_request,
+    )
+    from fetch_dex_depth import (  # type: ignore[no-redef]
+        DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES,
+        DEX_DEPTH_UNSUPPORTED_REASON_CODES,
     )
     from route_cohort import (  # type: ignore[no-redef]
         canonical_route_id,
@@ -88,6 +125,10 @@ except ModuleNotFoundError:
         classify_route_mode_evidence,
         inventory_capacity_for_route,
         load_validated_inventory_profile,
+    )
+    from route_cost_evidence import (  # type: ignore[no-redef]
+        RouteCostEvidenceError,
+        validate_route_cost_evidence_manifest_for_publication,
     )
     from route_opportunity import (  # type: ignore[no-redef]
         OPPORTUNITY_FIELDS,
@@ -101,8 +142,29 @@ except ModuleNotFoundError:
         MarketRules,
         QuantityQuote,
     )
+    from route_shadow_inputs import (  # type: ignore[no-redef]
+        TYPED_SOURCE_MANIFEST_FIELDS,
+        TYPED_SOURCE_MANIFEST_MEMBER_FIELDS,
+        TYPED_SOURCE_MANIFEST_SCHEMA,
+        TYPED_SOURCE_ROLE_CONTRACTS,
+        _validate_run_id as _validate_shadow_run_id,
+        _validated_publication_manifest as _validate_shadow_baseline_manifest,
+        typed_source_lineage_observed_members,
+        validate_typed_source_lineage,
+    )
+    from route_universe import (  # type: ignore[no-redef]
+        ROUTE_UNIVERSE_SCHEMA,
+        _selection_key as _route_universe_selection_key,
+        route_universe_sha256,
+    )
     from timestamp_contract import (  # type: ignore[no-redef]
         exact_rfc3339_epoch_seconds,
+        parse_rfc3339_utc,
+    )
+    from token_registry import (  # type: ignore[no-redef]
+        TokenRegistryError,
+        normalize_chain,
+        normalize_contract_address,
     )
 
 
@@ -118,6 +180,95 @@ ROUTE_CANDIDATE_CSV_SCHEMA = "route_candidates/v1"
 ROUTE_LEG_CSV_SCHEMA = "route_legs/v1"
 ROUTE_TIMING_CSV_SCHEMA = "route_timing/v1"
 ROUTE_SQLITE_LOGICAL_SCHEMA = "route_cohort_sqlite/v1"
+
+ROUTE_SHADOW_POINTER_SCHEMA = "route_shadow_pointer/v1"
+ROUTE_SHADOW_PHASE_SCHEMA = "route_shadow_phase/v1"
+ROUTE_SHADOW_AUDIT_FILENAME = "audit.json"
+ROUTE_SHADOW_COST_EVIDENCE_FILENAME = "route-cost-evidence.json"
+ROUTE_SHADOW_LATEST_FILENAME = "latest.json"
+ROUTE_SHADOW_PHASE_FILENAME = "phase.json"
+ROUTE_SHADOW_IMPLICIT_CANARY_BYTES = b"route-shadow-phase/implicit-canary/v1\n"
+ROUTE_SHADOW_IMPLICIT_CANARY_SHA256 = hashlib.sha256(
+    ROUTE_SHADOW_IMPLICIT_CANARY_BYTES
+).hexdigest()
+
+_ROUTE_SHADOW_POINTER_FIELDS = frozenset({
+    "schema",
+    "run_id",
+    "phase",
+    "route_cohort_id",
+    "phase_state_sha256",
+    "phase_transition_id",
+    "core_pointer_sha256",
+    "core_manifest_sha256",
+    "route_universe_sha256",
+    "route_cost_evidence_sha256",
+    "baseline_manifest_sha256",
+    "candidate_source_generation",
+    "audit_sha256",
+})
+_ROUTE_SHADOW_PHASE_FIELDS = frozenset({
+    "schema",
+    "transition_id",
+    "prior_phase",
+    "phase",
+    "evaluated_at",
+    "gate_evidence_sha256",
+    "storage_admission_sha256",
+    "anchored_joint_pointer_sha256",
+    "primary_schedule_guard_sha256",
+    "schedule_envelope_sha256",
+    "phase_identity_id",
+})
+_ROUTE_UNIVERSE_FIELDS = frozenset({
+    "schema",
+    "candidate_source_generation",
+    "selection_window",
+    "requested_notionals_usd",
+    "selected_legs",
+    "routes",
+})
+_ROUTE_UNIVERSE_LEG_FIELDS = frozenset({
+    "market_id",
+    "market_type",
+    "token_symbol",
+    "candidate_source_generation",
+    "selection_window",
+    "selection_inputs",
+    "selection_rank",
+})
+_ROUTE_UNIVERSE_DEX_IDENTITY_FIELDS = frozenset({
+    "collector_context",
+    "target_token_address",
+    "target_token_side",
+})
+_ROUTE_UNIVERSE_SELECTION_INPUT_FIELDS = frozenset({
+    "execution_capability",
+    "proved_execution_capacity_usd",
+    "observed_100bps_depth_usd",
+    "cex_selected_window_usd",
+    "dex_24h_usd",
+    "dex_tvl_usd",
+})
+_ROUTE_COLLECTOR_CONTEXT_FIELDS = frozenset({
+    "schema",
+    "snapshot_id",
+    "request_started_at",
+    "observed_at",
+    "response_received_at",
+    "status",
+    "reason_code",
+    "pool_name",
+    "base_token_id",
+    "quote_token_id",
+    "base_token_price_usd",
+    "quote_token_price_usd",
+    "tvl_method",
+    "source",
+    "source_endpoint",
+    "raw_response_sha256",
+})
+_MAX_ROUTE_COST_EVIDENCE_BYTES = 32 * 1024 * 1024
 
 ROUTE_CANDIDATES_FILENAME = "route_candidates.csv"
 ROUTE_LEGS_FILENAME = "route_legs.csv"
@@ -179,6 +330,10 @@ _CANONICAL_UTC_TIMESTAMP = re.compile(
     r"(?:\.[0-9]+)?Z\Z"
 )
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+_SHADOW_DECIMAL_TEXT = re.compile(
+    r"(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?\Z",
+    flags=re.ASCII,
+)
 
 _ROUTE_MODES = frozenset({
     "prepositioned_inventory",
@@ -225,7 +380,37 @@ _LEG_REASONS = frozenset({
     "raw_evidence_hash_mismatch",
     "raw_evidence_path_unsafe",
     "route_deadline_exceeded",
+    "usd_price_context_missing",
+    "usd_price_context_not_found",
+    "usd_price_context_failed",
+    "measurement_limit",
+}) | DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES | DEX_DEPTH_UNSUPPORTED_REASON_CODES
+
+# These failures are created by the bounded cohort orchestrator after (or
+# instead of) the venue-specific DEX collector.  They are distinct from the
+# collector's own closed failure vocabulary, but they still describe a failed
+# DEX leg and must survive exact publication/replay.
+_DEX_ORCHESTRATION_FAILURE_REASONS = frozenset({
+    "fixed_block_unavailable",
+    "fixed_block_lineage_mismatch",
+    "collector_identity_mismatch",
+    "raw_evidence_missing",
+    "raw_evidence_hash_mismatch",
+    "raw_evidence_path_unsafe",
+    "usd_price_context_missing",
+    "usd_price_context_not_found",
+    "usd_price_context_failed",
 })
+_CEX_ORCHESTRATION_FAILURE_REASONS = frozenset({
+    "collector_identity_mismatch",
+    "raw_evidence_missing",
+    "raw_evidence_hash_mismatch",
+    "raw_evidence_path_unsafe",
+})
+_CEX_COLLECTOR_FAILURE_REASONS = frozenset(CEX_DEPTH_REASON_CODES) - {
+    "observed",
+    "source_level_limit",
+}
 
 _TOP_LEVEL_FIELDS = frozenset({
     "schema",
@@ -405,6 +590,28 @@ def _validate_timestamp(value: Any, field: str) -> str:
     return text
 
 
+def _validate_collector_timestamp(value: Any, field: str) -> str:
+    """Validate the exact UTC representation emitted by fact collectors.
+
+    Shadow runtime evidence is normalized to ``Z``.  The TVL fact contract is
+    older and deliberately preserves ``datetime.isoformat()`` bytes using
+    ``+00:00``.  Collector context is source evidence copied unchanged, so it
+    must be checked against that producer contract instead of normalized here.
+    """
+    text = _nonempty_text(value, field)
+    try:
+        parsed = parse_rfc3339_utc(text)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("{} is invalid".format(field)) from error
+    if parsed.isoformat() != text:
+        raise RoutePublicationError(
+            "{} must use the collector's canonical UTC representation".format(
+                field
+            )
+        )
+    return text
+
+
 def _clone_json(value: Any) -> Any:
     """Detach caller-owned state while rejecting NaN and non-JSON values."""
     return json.loads(_canonical_json_text(value))
@@ -436,6 +643,139 @@ def _safe_network_endpoint(value: Any) -> bool:
     return urlunsplit(
         (parsed.scheme, safe_host, parsed.path, "", "")
     ) == value
+
+
+def _canonical_shadow_decimal(
+    raw: Any, *, positive: bool, label: str
+) -> str:
+    if (
+        not isinstance(raw, str)
+        or len(raw) > 256
+        or _SHADOW_DECIMAL_TEXT.fullmatch(raw) is None
+    ):
+        raise RoutePublicationError("{} is invalid".format(label))
+    try:
+        amount = Decimal(raw)
+    except (InvalidOperation, ValueError) as error:
+        raise RoutePublicationError("{} is invalid".format(label)) from error
+    canonical = format(amount, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    if (
+        not amount.is_finite()
+        or amount < 0
+        or (positive and amount <= 0)
+        or raw != canonical
+    ):
+        raise RoutePublicationError("{} is invalid".format(label))
+    return raw
+
+
+def _collector_token_address(value: Any, *, chain: str, label: str) -> str:
+    text = _nonempty_text(value, label)
+    prefix, separator, address = text.partition("_")
+    if not separator or prefix != chain or not address:
+        raise RoutePublicationError("{} is invalid".format(label))
+    try:
+        normalized = normalize_contract_address(chain, address)
+    except (TokenRegistryError, ValueError) as error:
+        raise RoutePublicationError("{} is invalid".format(label)) from error
+    if normalized != address:
+        raise RoutePublicationError("{} is invalid".format(label))
+    return address
+
+
+def _validate_route_collector_context(
+    context: Any, *, market_id: str
+) -> Dict[str, Any]:
+    """Validate the complete immutable TVL/USD collector projection."""
+    if (
+        not isinstance(context, dict)
+        or set(context) != _ROUTE_COLLECTOR_CONTEXT_FIELDS
+        or context.get("schema") != "route_collector_context/v1"
+    ):
+        raise RoutePublicationError("DEX collector context schema is invalid")
+    match = _DEX_MARKET_ID.fullmatch(market_id)
+    if match is None:
+        raise RoutePublicationError("DEX collector context market is invalid")
+    raw_chain = match.group(1)
+    try:
+        chain = normalize_chain(raw_chain)
+    except (TokenRegistryError, ValueError) as error:
+        raise RoutePublicationError("DEX collector context chain is invalid") from error
+    if chain != raw_chain:
+        raise RoutePublicationError("DEX collector context chain is invalid")
+    for field in ("snapshot_id", "pool_name", "tvl_method", "source"):
+        _nonempty_text(context.get(field), "DEX collector context " + field)
+    if not _safe_network_endpoint(context.get("source_endpoint")):
+        raise RoutePublicationError("DEX collector source endpoint is unsafe")
+    if (
+        not isinstance(context.get("raw_response_sha256"), str)
+        or _HEX_SHA256.fullmatch(context["raw_response_sha256"]) is None
+    ):
+        raise RoutePublicationError("DEX collector raw-response hash is invalid")
+    request_started_at = _validate_collector_timestamp(
+        context.get("request_started_at"), "DEX collector request_started_at"
+    )
+    observed_at = _validate_collector_timestamp(
+        context.get("observed_at"), "DEX collector observed_at"
+    )
+    response_received_at = _validate_collector_timestamp(
+        context.get("response_received_at"),
+        "DEX collector response_received_at",
+    )
+    if not (
+        exact_rfc3339_epoch_seconds(request_started_at)
+        <= exact_rfc3339_epoch_seconds(observed_at)
+        <= exact_rfc3339_epoch_seconds(response_received_at)
+    ):
+        raise RoutePublicationError("DEX collector timestamps are unordered")
+
+    status = context.get("status")
+    reason = context.get("reason_code")
+    address_prices: Dict[str, str] = {}
+    if status == "observed":
+        if reason != "observed":
+            raise RoutePublicationError("observed DEX collector context is invalid")
+        for token_field, price_field in (
+            ("base_token_id", "base_token_price_usd"),
+            ("quote_token_id", "quote_token_price_usd"),
+        ):
+            address = _collector_token_address(
+                context.get(token_field), chain=chain,
+                label="DEX collector " + token_field,
+            )
+            price = _canonical_shadow_decimal(
+                context.get(price_field), positive=True,
+                label="DEX collector " + price_field,
+            )
+            if address in address_prices:
+                raise RoutePublicationError(
+                    "DEX collector Token IDs must be distinct"
+                )
+            address_prices[address] = price
+    elif status in {"missing", "not_found", "failed"}:
+        allowed_reasons = {
+            "missing": {"source_no_tvl_observation"},
+            "not_found": {"source_pool_not_found"},
+            "failed": {
+                "network", "rate_limit", "source_unavailable", "parse",
+                "validation", "collection_failed",
+            },
+        }
+        if reason not in allowed_reasons[status] or any(
+            context.get(field) is not None
+            for field in (
+                "base_token_id", "quote_token_id",
+                "base_token_price_usd", "quote_token_price_usd",
+            )
+        ):
+            raise RoutePublicationError(
+                "unavailable DEX collector context is invalid"
+            )
+    else:
+        raise RoutePublicationError("DEX collector context status is invalid")
+    return {"context": context, "chain": chain, "address_prices": address_prices}
 
 
 def _unsafe_evidence_string(value: str) -> bool:
@@ -699,6 +1039,15 @@ def _validate_leg_rows(
             raise RoutePublicationError("route leg market type is invalid")
         if row.get("market_type") not in (None, "", inferred_type):
             raise RoutePublicationError("route leg market type is invalid")
+        if "typed_source_lineage" in row:
+            try:
+                validate_typed_source_lineage(
+                    row["typed_source_lineage"], market_type=inferred_type
+                )
+            except (TypeError, ValueError) as error:
+                raise RoutePublicationError(
+                    "route leg typed-source lineage is invalid"
+                ) from error
         status_value = row.get("status")
         status_text = "" if status_value is None else status_value
         if status_text not in _LEG_STATUSES:
@@ -713,6 +1062,32 @@ def _validate_leg_rows(
         reason = row.get("reason_code")
         if reason not in _LEG_REASONS | {None, ""}:
             raise RoutePublicationError("route leg reason enum is invalid")
+        if inferred_type == "dex":
+            allowed_dex_reasons = {
+                "observed": {None, "", "observed"},
+                "partial": {"measurement_limit"},
+                "unsupported": set(DEX_DEPTH_UNSUPPORTED_REASON_CODES),
+                "failed": set(DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES)
+                | set(_DEX_ORCHESTRATION_FAILURE_REASONS),
+                "deadline_exceeded": {"route_deadline_exceeded"},
+            }[status_text]
+            if reason not in allowed_dex_reasons:
+                raise RoutePublicationError(
+                    "DEX leg status and reason conflict"
+                )
+        else:
+            allowed_cex_reasons = {
+                "observed": {None, "", "observed"},
+                "partial": {"source_level_limit"},
+                "unsupported": set(),
+                "failed": set(_CEX_COLLECTOR_FAILURE_REASONS)
+                | set(_CEX_ORCHESTRATION_FAILURE_REASONS),
+                "deadline_exceeded": {"route_deadline_exceeded"},
+            }[status_text]
+            if reason not in allowed_cex_reasons:
+                raise RoutePublicationError(
+                    "CEX leg status and reason conflict"
+                )
         snapshot_id = row.get("snapshot_id")
         if snapshot_id not in (None, "", raw_evidence_run_id):
             raise RoutePublicationError("route leg snapshot lineage conflict")
@@ -1327,6 +1702,29 @@ def _verify_directory_entry(
         )
 
 
+def _verify_directory_entry_snapshot(
+    parent_fd: int,
+    name: str,
+    opened: os.stat_result,
+    label: str,
+) -> os.stat_result:
+    """Require an opened child directory to keep its exact generation."""
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise RoutePublicationError(
+            "{} changed during validation".format(label)
+        ) from error
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or _stable_file_metadata(current) != _stable_file_metadata(opened)
+    ):
+        raise RoutePublicationError(
+            "{} changed during validation".format(label)
+        )
+    return current
+
+
 def _verify_open_path_identity(
     path: Path,
     opened: os.stat_result,
@@ -1347,6 +1745,28 @@ def _verify_open_path_identity(
         )
 
 
+def _verify_open_path_snapshot(
+    path: Path,
+    opened: os.stat_result,
+    label: str,
+) -> os.stat_result:
+    """Require both pathname identity and the opened directory generation."""
+    try:
+        current = os.stat(str(path), follow_symlinks=False)
+    except OSError as error:
+        raise RoutePublicationError(
+            "{} changed during validation".format(label)
+        ) from error
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or _stable_file_metadata(current) != _stable_file_metadata(opened)
+    ):
+        raise RoutePublicationError(
+            "{} changed during validation".format(label)
+        )
+    return current
+
+
 def _open_regular_file_at(
     directory_fd: int,
     filename: str,
@@ -1361,15 +1781,20 @@ def _open_regular_file_at(
         flags |= os.O_CLOEXEC
     try:
         fd = os.open(filename, flags, dir_fd=directory_fd)
+    except FileNotFoundError as error:
+        # Absence of an expected immutable member is a lineage failure.  Keep
+        # it distinct from a present symlink or other unsafe file type so the
+        # run ledger does not misclassify ordinary evidence loss as an attack.
+        raise RoutePublicationError("{} is missing".format(label)) from error
     except OSError as error:
         raise RoutePublicationError(
             "{} must be a regular non-symlink file".format(label)
         ) from error
     before = os.fstat(fd)
-    if not stat.S_ISREG(before.st_mode):
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         os.close(fd)
         raise RoutePublicationError(
-            "{} must be a regular non-symlink file".format(label)
+            "{} must be a regular non-symlink single-link file".format(label)
         )
     return fd, before
 
@@ -5454,3 +5879,1875 @@ def load_latest_complete_route_bundle(
         if bundles_fd is not None:
             os.close(bundles_fd)
         os.close(routes_fd)
+
+
+def _strict_validate_shadow_audit(audit: Mapping[str, Any]) -> Dict[str, Any]:
+    """Validate an audit through the Task 2 audit module without a fallback.
+
+    Keeping this import lazy avoids a module cycle while still failing closed
+    when the independently versioned audit validator is not installed.
+    """
+    try:
+        from scripts.route_shadow_audit import (
+            AUDIT_FIELDS,
+            ROUTE_SHADOW_AUDIT_SCHEMA,
+            validate_shadow_audit,
+        )
+    except ModuleNotFoundError:
+        try:
+            from route_shadow_audit import (  # type: ignore[no-redef]
+                AUDIT_FIELDS,
+                ROUTE_SHADOW_AUDIT_SCHEMA,
+                validate_shadow_audit,
+            )
+        except (ImportError, ModuleNotFoundError) as error:
+            raise RoutePublicationError(
+                "route shadow audit validator is unavailable"
+            ) from error
+    try:
+        normalized = validate_shadow_audit(audit)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("route shadow audit is invalid") from error
+    if (
+        not isinstance(normalized, dict)
+        or set(normalized) != set(AUDIT_FIELDS)
+        or normalized.get("schema") != ROUTE_SHADOW_AUDIT_SCHEMA
+    ):
+        raise RoutePublicationError("route shadow audit schema is invalid")
+    return _clone_json(normalized)
+
+
+def _read_canonical_object_at(
+    directory_fd: int,
+    filename: str,
+    *,
+    limit: int,
+    label: str,
+) -> Tuple[Dict[str, Any], bytes, str, os.stat_result]:
+    value, physical_sha256, details = _read_bounded_bytes_at(
+        directory_fd,
+        filename,
+        limit=limit,
+        label=label,
+    )
+    payload = _decode_json_object_bytes(value, label=label)
+    if value != _canonical_json_bytes(payload):
+        raise RoutePublicationError("{} is not canonical JSON".format(label))
+    try:
+        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise RoutePublicationError("{} changed during validation".format(label)) from error
+    if _stable_file_metadata(current) != _stable_file_metadata(details):
+        raise RoutePublicationError("{} changed during validation".format(label))
+    return payload, value, physical_sha256, details
+
+
+def _optional_regular_snapshot_at(
+    directory_fd: int,
+    filename: str,
+    *,
+    limit: int,
+    label: str,
+) -> Optional[Tuple[bytes, os.stat_result]]:
+    try:
+        details = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RoutePublicationError("{} is not readable".format(label)) from error
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_nlink != 1
+    ):
+        raise RoutePublicationError(
+            "{} must be a regular non-symlink single-link file".format(label)
+        )
+    value, _sha256, read_details = _read_bounded_bytes_at(
+        directory_fd,
+        filename,
+        limit=limit,
+        label=label,
+    )
+    return value, read_details
+
+
+def _install_immutable_audit_at(
+    run_fd: int,
+    run_path: Path,
+    audit_bytes: bytes,
+) -> None:
+    temporary_name = ".audit.{}.tmp".format(secrets.token_hex(12))
+    installed = False
+    _write_new_bytes_at(run_fd, temporary_name, audit_bytes)
+    try:
+        _rename_directory_noreplace_at(
+            run_fd,
+            temporary_name,
+            run_fd,
+            ROUTE_SHADOW_AUDIT_FILENAME,
+            destination_display=run_path / ROUTE_SHADOW_AUDIT_FILENAME,
+        )
+        installed = True
+        _fsync_directory(run_path, directory_fd=run_fd)
+        _payload, installed_bytes, _sha256, _details = _read_canonical_object_at(
+            run_fd,
+            ROUTE_SHADOW_AUDIT_FILENAME,
+            limit=_MAX_JSON_BYTES,
+            label="route shadow audit",
+        )
+        if installed_bytes != audit_bytes:
+            raise RoutePublicationError("installed route shadow audit changed")
+    finally:
+        if not installed:
+            try:
+                os.unlink(temporary_name, dir_fd=run_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def _validate_shadow_pointer(pointer: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(pointer, Mapping) or set(pointer) != _ROUTE_SHADOW_POINTER_FIELDS:
+        raise RoutePublicationError("route shadow pointer schema is invalid")
+    value = _clone_json(dict(pointer))
+    if value.get("schema") != ROUTE_SHADOW_POINTER_SCHEMA:
+        raise RoutePublicationError("route shadow pointer schema is unsupported")
+    try:
+        _validate_shadow_run_id(value.get("run_id"))
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("route shadow pointer run ID is invalid") from error
+    if value.get("phase") not in {"canary", "full"}:
+        raise RoutePublicationError("route shadow pointer phase is invalid")
+    if (
+        not isinstance(value.get("route_cohort_id"), str)
+        or _COHORT_ID.fullmatch(value["route_cohort_id"]) is None
+    ):
+        raise RoutePublicationError("route shadow pointer cohort ID is invalid")
+    for field in (
+        "phase_state_sha256",
+        "core_pointer_sha256",
+        "core_manifest_sha256",
+        "route_universe_sha256",
+        "route_cost_evidence_sha256",
+        "baseline_manifest_sha256",
+        "candidate_source_generation",
+        "audit_sha256",
+    ):
+        if (
+            not isinstance(value.get(field), str)
+            or _HEX_SHA256.fullmatch(value[field]) is None
+        ):
+            raise RoutePublicationError(
+                "route shadow pointer {} is invalid".format(field)
+            )
+    transition_id = value.get("phase_transition_id")
+    if value["phase"] == "canary":
+        if transition_id is not None or (
+            value["phase_state_sha256"] != ROUTE_SHADOW_IMPLICIT_CANARY_SHA256
+        ):
+            raise RoutePublicationError("route shadow canary phase binding is invalid")
+    elif (
+        not isinstance(transition_id, str)
+        or _HEX_SHA256.fullmatch(transition_id) is None
+    ):
+        raise RoutePublicationError("route shadow full transition ID is invalid")
+    return value
+
+
+def _validate_core_pointer_mapping(pointer: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(pointer, Mapping) or set(pointer) != {
+        "schema", "bundle_stage", "route_cohort_id", "manifest_sha256"
+    }:
+        raise RoutePublicationError("supplied route core pointer schema is invalid")
+    value = _clone_json(dict(pointer))
+    if (
+        value.get("schema") != ROUTE_CORE_POINTER_SCHEMA
+        or value.get("bundle_stage") != ROUTE_CORE_BUNDLE_STAGE
+        or not isinstance(value.get("route_cohort_id"), str)
+        or _COHORT_ID.fullmatch(value["route_cohort_id"]) is None
+        or not isinstance(value.get("manifest_sha256"), str)
+        or _HEX_SHA256.fullmatch(value["manifest_sha256"]) is None
+    ):
+        raise RoutePublicationError("supplied route core pointer is invalid")
+    return value
+
+
+def _validate_phase_state_payload(
+    state: Mapping[str, Any],
+    state_bytes: bytes,
+) -> Dict[str, Any]:
+    if set(state) != _ROUTE_SHADOW_PHASE_FIELDS:
+        raise RoutePublicationError("route shadow phase schema is invalid")
+    value = _clone_json(dict(state))
+    if (
+        value.get("schema") != ROUTE_SHADOW_PHASE_SCHEMA
+        or value.get("prior_phase") != "canary"
+        or value.get("phase") != "full"
+    ):
+        raise RoutePublicationError("route shadow phase transition is invalid")
+    if state_bytes != _canonical_json_bytes(value):
+        raise RoutePublicationError("route shadow phase is not canonical JSON")
+    try:
+        exact_rfc3339_epoch_seconds(value.get("evaluated_at"))
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("route shadow phase time is invalid") from error
+    for field in (
+        "transition_id",
+        "gate_evidence_sha256",
+        "storage_admission_sha256",
+        "anchored_joint_pointer_sha256",
+        "phase_identity_id",
+    ):
+        if (
+            not isinstance(value.get(field), str)
+            or _HEX_SHA256.fullmatch(value[field]) is None
+        ):
+            raise RoutePublicationError(
+                "route shadow phase {} is invalid".format(field)
+            )
+    guard_sha = value.get("primary_schedule_guard_sha256")
+    envelope_sha = value.get("schedule_envelope_sha256")
+    if (guard_sha is None) == (envelope_sha is None):
+        raise RoutePublicationError("route shadow phase ownership binding is invalid")
+    for field_value in (guard_sha, envelope_sha):
+        if field_value is not None and (
+            not isinstance(field_value, str)
+            or _HEX_SHA256.fullmatch(field_value) is None
+        ):
+            raise RoutePublicationError("route shadow phase ownership hash is invalid")
+    identity = dict(value)
+    transition_id = identity.pop("transition_id")
+    if _sha256_bytes(_canonical_json_bytes(identity)) != transition_id:
+        raise RoutePublicationError("route shadow transition ID is invalid")
+    return value
+
+
+def _load_full_phase_state(
+    shadow_root: Path,
+    *,
+    phase_state_sha256: str,
+    phase_transition_id: str,
+) -> Dict[str, Any]:
+    shadow, shadow_fd, shadow_details = _open_verified_directory(
+        Path(shadow_root), "route shadow root"
+    )
+    transitions_fd: Optional[int] = None
+    gates_fd: Optional[int] = None
+    try:
+        transitions_fd, transitions_details = _open_directory_at(
+            shadow_fd, "transitions", "route shadow transitions root"
+        )
+        transition_name = phase_transition_id + ".json"
+        state, state_bytes, actual_sha256, state_details = _read_canonical_object_at(
+            transitions_fd,
+            transition_name,
+            limit=_MAX_JSON_BYTES,
+            label="route shadow phase transition",
+        )
+        if actual_sha256 != phase_state_sha256:
+            raise RoutePublicationError("route shadow phase-state hash mismatch")
+        value = _validate_phase_state_payload(state, state_bytes)
+        if value["transition_id"] != phase_transition_id:
+            raise RoutePublicationError("route shadow transition path mismatch")
+        gates_fd, gates_details = _open_directory_at(
+            shadow_fd, "gates", "route shadow gates root"
+        )
+        gate_name = value["gate_evidence_sha256"] + ".json"
+        _gate, gate_bytes, gate_sha256, gate_details = _read_canonical_object_at(
+            gates_fd,
+            gate_name,
+            limit=_MAX_JSON_BYTES,
+            label="route shadow gate evidence",
+        )
+        if gate_sha256 != value["gate_evidence_sha256"]:
+            raise RoutePublicationError("route shadow gate evidence hash mismatch")
+        if not _pointer_snapshot_is_owned(
+            _optional_regular_snapshot_at(
+                transitions_fd,
+                transition_name,
+                limit=_MAX_JSON_BYTES,
+                label="route shadow phase transition",
+            ),
+            (state_bytes, state_details),
+        ):
+            raise RoutePublicationError("route shadow phase transition changed")
+        if not _pointer_snapshot_is_owned(
+            _optional_regular_snapshot_at(
+                gates_fd,
+                gate_name,
+                limit=_MAX_JSON_BYTES,
+                label="route shadow gate evidence",
+            ),
+            (gate_bytes, gate_details),
+        ):
+            raise RoutePublicationError("route shadow gate evidence changed")
+        _verify_directory_entry_snapshot(
+            shadow_fd, "transitions", transitions_details,
+            "route shadow transitions root",
+        )
+        _verify_directory_entry_snapshot(
+            shadow_fd, "gates", gates_details, "route shadow gates root"
+        )
+        _verify_open_path_snapshot(shadow, shadow_details, "route shadow root")
+        return {
+            "phase": "full",
+            "phase_state_sha256": phase_state_sha256,
+            "phase_transition_id": phase_transition_id,
+            "state": value,
+        }
+    finally:
+        _close_route_descriptor_group((
+            (gates_fd, "route shadow gates root"),
+            (transitions_fd, "route shadow transitions root"),
+            (shadow_fd, "route shadow root"),
+        ))
+
+
+def load_historical_phase_state(
+    shadow_root: Path,
+    *,
+    phase: str,
+    phase_state_sha256: str,
+    phase_transition_id: Optional[str],
+) -> Dict[str, Any]:
+    """Reconstruct one pointer's immutable phase without consulting active state."""
+    if phase == "canary":
+        if (
+            phase_state_sha256 != ROUTE_SHADOW_IMPLICIT_CANARY_SHA256
+            or phase_transition_id is not None
+        ):
+            raise RoutePublicationError("historical canary phase binding is invalid")
+        return {
+            "phase": "canary",
+            "phase_state_sha256": ROUTE_SHADOW_IMPLICIT_CANARY_SHA256,
+            "phase_transition_id": None,
+            "state": None,
+        }
+    if (
+        phase != "full"
+        or not isinstance(phase_state_sha256, str)
+        or _HEX_SHA256.fullmatch(phase_state_sha256) is None
+        or not isinstance(phase_transition_id, str)
+        or _HEX_SHA256.fullmatch(phase_transition_id) is None
+    ):
+        raise RoutePublicationError("historical route shadow phase is invalid")
+    return _load_full_phase_state(
+        Path(shadow_root),
+        phase_state_sha256=phase_state_sha256,
+        phase_transition_id=phase_transition_id,
+    )
+
+
+def _load_active_phase_state_with_snapshot(
+    shadow_root: Path,
+) -> Tuple[
+    Dict[str, Any],
+    Optional[Tuple[bytes, os.stat_result]],
+    os.stat_result,
+]:
+    shadow, shadow_fd, shadow_details = _open_verified_directory(
+        Path(shadow_root), "route shadow root"
+    )
+    try:
+        snapshot = _optional_regular_snapshot_at(
+            shadow_fd,
+            ROUTE_SHADOW_PHASE_FILENAME,
+            limit=_MAX_JSON_BYTES,
+            label="route shadow phase",
+        )
+        if snapshot is None:
+            view = {
+                "phase": "canary",
+                "phase_state_sha256": ROUTE_SHADOW_IMPLICIT_CANARY_SHA256,
+                "phase_transition_id": None,
+                "state": None,
+            }
+            if _optional_regular_snapshot_at(
+                shadow_fd,
+                ROUTE_SHADOW_PHASE_FILENAME,
+                limit=_MAX_JSON_BYTES,
+                label="route shadow phase",
+            ) is not None:
+                raise RoutePublicationError("active route shadow phase changed")
+        else:
+            state_bytes = snapshot[0]
+            state = _decode_json_object_bytes(state_bytes, label="route shadow phase")
+            value = _validate_phase_state_payload(state, state_bytes)
+            view = load_historical_phase_state(
+                shadow,
+                phase="full",
+                phase_state_sha256=_sha256_bytes(state_bytes),
+                phase_transition_id=value["transition_id"],
+            )
+            if view["state"] != value:
+                raise RoutePublicationError("active route shadow phase changed")
+            current = _optional_regular_snapshot_at(
+                shadow_fd,
+                ROUTE_SHADOW_PHASE_FILENAME,
+                limit=_MAX_JSON_BYTES,
+                label="route shadow phase",
+            )
+            if not _pointer_snapshot_is_owned(current, snapshot):
+                raise RoutePublicationError("active route shadow phase changed")
+        current_shadow_details = _verify_open_path_snapshot(
+            shadow, shadow_details, "route shadow root"
+        )
+        return view, snapshot, current_shadow_details
+    finally:
+        _close_route_descriptor_group(((shadow_fd, "route shadow root"),))
+
+
+def load_active_phase_state(shadow_root: Path) -> Dict[str, Any]:
+    """Load the sole active phase authority; absence is implicit canary."""
+    view, _snapshot, _root_snapshot = _load_active_phase_state_with_snapshot(
+        Path(shadow_root)
+    )
+    return view
+
+
+def _validate_route_universe_payload(universe: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(universe, Mapping) or set(universe) != _ROUTE_UNIVERSE_FIELDS:
+        raise RoutePublicationError("route universe schema is invalid")
+    value = _clone_json(dict(universe))
+    window = value.get("selection_window")
+    if (
+        value.get("schema") != ROUTE_UNIVERSE_SCHEMA
+        or not isinstance(value.get("candidate_source_generation"), str)
+        or _HEX_SHA256.fullmatch(value["candidate_source_generation"]) is None
+        or not isinstance(window, dict)
+        or set(window) != {"start", "end"}
+        or not _matches_requested_notional_grid(value.get("requested_notionals_usd"))
+        or not isinstance(value.get("selected_legs"), list)
+        or not isinstance(value.get("routes"), list)
+    ):
+        raise RoutePublicationError("route universe contract is invalid")
+    try:
+        window_start = date.fromisoformat(window["start"])
+        window_end = date.fromisoformat(window["end"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RoutePublicationError("route universe selection window is invalid") from error
+    if (
+        not isinstance(window["start"], str)
+        or _ISO_DATE.fullmatch(window["start"]) is None
+        or not isinstance(window["end"], str)
+        or _ISO_DATE.fullmatch(window["end"]) is None
+        or (window_end - window_start).days != 29
+    ):
+        raise RoutePublicationError("route universe selection window is invalid")
+
+    def canonical_decimal(
+        raw: Any,
+        *,
+        positive: bool,
+        nullable: bool,
+        label: str,
+    ) -> Optional[str]:
+        if raw is None and nullable:
+            return None
+        if (
+            not isinstance(raw, str)
+            or len(raw) > 256
+            or _SHADOW_DECIMAL_TEXT.fullmatch(raw) is None
+        ):
+            raise RoutePublicationError("{} is invalid".format(label))
+        try:
+            amount = Decimal(raw)
+        except (InvalidOperation, ValueError) as error:
+            raise RoutePublicationError("{} is invalid".format(label)) from error
+        canonical = format(amount, "f")
+        if "." in canonical:
+            canonical = canonical.rstrip("0").rstrip(".")
+        if (
+            not amount.is_finite()
+            or amount < 0
+            or (amount.is_zero() and amount.is_signed())
+            or (positive and amount <= 0)
+            or raw != canonical
+        ):
+            raise RoutePublicationError("{} is invalid".format(label))
+        return raw
+
+    market_ids = []
+    ranked_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for leg in value["selected_legs"]:
+        if not isinstance(leg, dict):
+            raise RoutePublicationError("route universe leg schema is invalid")
+        market_type = leg.get("market_type")
+        expected_leg_fields = (
+            _ROUTE_UNIVERSE_LEG_FIELDS | _ROUTE_UNIVERSE_DEX_IDENTITY_FIELDS
+            if market_type == "dex"
+            else _ROUTE_UNIVERSE_LEG_FIELDS
+        )
+        if set(leg) != expected_leg_fields:
+            raise RoutePublicationError("route universe leg schema is invalid")
+        market_id = leg.get("market_id")
+        if (
+            not isinstance(market_id, str)
+            or not market_id
+            or market_type not in {"cex", "dex"}
+            or not market_id.startswith(str(market_type) + ":")
+            or leg.get("candidate_source_generation")
+            != value["candidate_source_generation"]
+            or leg.get("selection_window") != value["selection_window"]
+            or not isinstance(leg.get("selection_inputs"), dict)
+            or set(leg["selection_inputs"])
+            != _ROUTE_UNIVERSE_SELECTION_INPUT_FIELDS
+            or isinstance(leg.get("selection_rank"), bool)
+            or not isinstance(leg.get("selection_rank"), int)
+            or leg["selection_rank"] < 1
+        ):
+            raise RoutePublicationError("route universe leg is invalid")
+        if _canonical_market_token(market_id) != leg.get("token_symbol"):
+            raise RoutePublicationError("route universe leg token is invalid")
+        inputs = leg["selection_inputs"]
+        capability = inputs.get("execution_capability")
+        if capability not in {"supported", "proved"}:
+            raise RoutePublicationError("route universe capability is invalid")
+        capacity = canonical_decimal(
+            inputs.get("proved_execution_capacity_usd"),
+            positive=True,
+            nullable=True,
+            label="route universe proved capacity",
+        )
+        if (capability == "proved") != (capacity is not None):
+            raise RoutePublicationError("route universe capability lineage is invalid")
+        canonical_decimal(
+            inputs.get("observed_100bps_depth_usd"),
+            positive=True,
+            nullable=False,
+            label="route universe observed depth",
+        )
+        if market_type == "cex":
+            canonical_decimal(
+                inputs.get("cex_selected_window_usd"),
+                positive=False,
+                nullable=True,
+                label="route universe CEX volume",
+            )
+            if inputs.get("dex_24h_usd") is not None or inputs.get("dex_tvl_usd") is not None:
+                raise RoutePublicationError("route universe market-type inputs conflict")
+        else:
+            target_address = leg.get("target_token_address")
+            target_side = leg.get("target_token_side")
+            market_match = _DEX_MARKET_ID.fullmatch(market_id)
+            if market_match is None:
+                raise RoutePublicationError(
+                    "route universe DEX target identity is invalid"
+                )
+            raw_chain = market_match.group(1)
+            try:
+                chain = normalize_chain(raw_chain)
+                normalized_target = normalize_contract_address(
+                    chain, target_address
+                )
+            except (TokenRegistryError, ValueError) as error:
+                raise RoutePublicationError(
+                    "route universe DEX target identity is invalid"
+                ) from error
+            context_result = _validate_route_collector_context(
+                leg.get("collector_context"), market_id=market_id
+            )
+            context = context_result["context"]
+            if (
+                not isinstance(target_address, str)
+                or normalized_target != target_address
+                or context_result["chain"] != chain
+                or target_side not in {"base", "quote", None}
+                or (context.get("status") == "observed")
+                != (target_side is not None)
+                or (
+                    target_side is not None
+                    and context.get(target_side + "_token_id")
+                    != "{}_{}".format(chain, target_address)
+                )
+            ):
+                raise RoutePublicationError(
+                    "route universe DEX target identity is invalid"
+                )
+            if inputs.get("cex_selected_window_usd") is not None:
+                raise RoutePublicationError("route universe market-type inputs conflict")
+            canonical_decimal(
+                inputs.get("dex_24h_usd"),
+                positive=False,
+                nullable=True,
+                label="route universe DEX volume",
+            )
+            canonical_decimal(
+                inputs.get("dex_tvl_usd"),
+                positive=False,
+                nullable=True,
+                label="route universe DEX TVL",
+            )
+        market_ids.append(market_id)
+        group = (leg["token_symbol"], market_type)
+        ranked_groups.setdefault(group, []).append(leg)
+    if len(market_ids) != len(set(market_ids)):
+        raise RoutePublicationError("route universe contains duplicate markets")
+    def exact_selection_key(
+        row: Mapping[str, Any],
+    ) -> Tuple[int, Decimal, Decimal, Decimal, Decimal, str]:
+        inputs = row["selection_inputs"]
+        capacity = Decimal(inputs["proved_execution_capacity_usd"] or "0")
+        depth = Decimal(inputs["observed_100bps_depth_usd"])
+        liquidity = capacity if capacity > 0 else depth
+
+        def descending(field: str) -> Decimal:
+            return Decimal(inputs[field] or "0").copy_negate()
+
+        return (
+            -({"supported": 0, "proved": 1}[inputs["execution_capability"]]),
+            liquidity.copy_negate(),
+            descending("cex_selected_window_usd"),
+            descending("dex_24h_usd"),
+            descending("dex_tvl_usd"),
+            str(row["market_id"]),
+        )
+
+    for group_rows in ranked_groups.values():
+        ranks = [row["selection_rank"] for row in group_rows]
+        if (
+            ranks != list(range(1, len(ranks) + 1))
+            or len(ranks) > 3
+            or group_rows != sorted(
+                group_rows, key=exact_selection_key
+            )
+        ):
+            raise RoutePublicationError("route universe selection ranks are invalid")
+    if value["selected_legs"] != sorted(
+        value["selected_legs"],
+        key=lambda row: (
+            row["token_symbol"],
+            row["market_type"],
+            row["selection_rank"],
+            row["market_id"],
+        ),
+    ):
+        raise RoutePublicationError("route universe legs are not canonically ordered")
+    route_ids = []
+    selected_by_market = {
+        row["market_id"]: row for row in value["selected_legs"]
+    }
+    for route in value["routes"]:
+        if not isinstance(route, dict):
+            raise RoutePublicationError("route universe route is invalid")
+        route_id = route.get("route_id")
+        if (
+            not isinstance(route_id, str)
+            or not route_id
+            or route.get("candidate_source_generation")
+            != value["candidate_source_generation"]
+            or route.get("requested_notionals_usd")
+            != value["requested_notionals_usd"]
+        ):
+            raise RoutePublicationError("route universe route lineage is invalid")
+        try:
+            buy_leg = selected_by_market[route["buy_market_id"]]
+            sell_leg = selected_by_market[route["sell_market_id"]]
+        except (KeyError, TypeError) as error:
+            raise RoutePublicationError(
+                "route universe route leg is missing"
+            ) from error
+
+        def reference_volume(leg: Mapping[str, Any]) -> Optional[str]:
+            inputs = leg["selection_inputs"]
+            return (
+                inputs["cex_selected_window_usd"]
+                if leg["market_type"] == "cex"
+                else inputs["dex_24h_usd"]
+            )
+
+        if (
+            route.get("buy_reference_volume_usd") != reference_volume(buy_leg)
+            or route.get("sell_reference_volume_usd")
+            != reference_volume(sell_leg)
+        ):
+            raise RoutePublicationError(
+                "route universe reference-volume lineage is invalid"
+            )
+        route_ids.append(route_id)
+    if len(route_ids) != len(set(route_ids)):
+        raise RoutePublicationError("route universe contains duplicate routes")
+    if route_ids != sorted(route_ids):
+        raise RoutePublicationError("route universe routes are not canonically ordered")
+    return value
+
+
+def _validate_cost_evidence_outer_lineage(
+    cost_evidence: Mapping[str, Any],
+    *,
+    run_id: str,
+    route_cohort_id: str,
+    phase: str,
+    candidate_source_generation: str,
+    route_universe_sha256_value: str,
+    universe: Mapping[str, Any],
+    retained_typed_pool_state_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
+) -> None:
+    try:
+        validated = validate_route_cost_evidence_manifest_for_publication(
+            cost_evidence,
+            universe=universe,
+            expected_run_id=run_id,
+            expected_route_cohort_id=route_cohort_id,
+            expected_phase=phase,
+            expected_candidate_source_generation=candidate_source_generation,
+            expected_route_universe_sha256=route_universe_sha256_value,
+            retained_typed_pool_state_members=(
+                retained_typed_pool_state_members
+            ),
+        )
+    except RouteCostEvidenceError as error:
+        raise RoutePublicationError(
+            "route-cost evidence replay failed: {}".format(error)
+        ) from error
+    if validated != cost_evidence:
+        raise RoutePublicationError("route-cost evidence is not canonical")
+
+
+def _load_retained_typed_source_members(
+    shadow_root: Path,
+    core: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Descriptor-reread the exact raw typed inventory bound by core legs."""
+    cohort = core.get("cohort")
+    legs = core.get("legs")
+    if not isinstance(cohort, Mapping) or not isinstance(legs, list):
+        raise RoutePublicationError("typed-source core evidence is invalid")
+    raw_run_id = cohort.get("raw_evidence_run_id")
+    try:
+        validated_raw_run_id = _validate_shadow_run_id(raw_run_id)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError(
+            "typed-source raw evidence run ID is invalid"
+        ) from error
+
+    expected_members: List[Dict[str, Any]] = []
+    for leg in legs:
+        if not isinstance(leg, Mapping):
+            raise RoutePublicationError("typed-source core leg is invalid")
+        market_id = leg.get("market_id")
+        market_type = leg.get("market_type")
+        lineage = leg.get("typed_source_lineage")
+        if not isinstance(market_id, str) or market_type not in {"cex", "dex"}:
+            raise RoutePublicationError("typed-source core leg identity is invalid")
+        try:
+            observed = typed_source_lineage_observed_members(
+                lineage, market_type=market_type
+            )
+        except (TypeError, ValueError) as error:
+            raise RoutePublicationError(
+                "typed-source core lineage is invalid"
+            ) from error
+        expected_members.extend(
+            {"market_id": market_id, **member} for member in observed
+        )
+    expected_members.sort(key=lambda row: (row["market_id"], row["role"]))
+    expected_keys = [
+        (row["market_id"], row["role"]) for row in expected_members
+    ]
+    expected_filenames = [row["filename"] for row in expected_members]
+    if (
+        len(expected_keys) != len(set(expected_keys))
+        or len(expected_filenames) != len(set(expected_filenames))
+    ):
+        raise RoutePublicationError("typed-source core inventory is invalid")
+
+    shadow = _absolute_without_symlink_resolution(Path(shadow_root))
+    raw_root_path = shadow.parent.parent / "raw" / "route-cohort"
+    raw_root, raw_root_fd, raw_root_details = _open_verified_directory(
+        raw_root_path, "typed-source raw root"
+    )
+    run_fd: Optional[int] = None
+    typed_fd: Optional[int] = None
+    try:
+        run_fd, run_details = _open_directory_at(
+            raw_root_fd,
+            validated_raw_run_id,
+            "typed-source raw run",
+        )
+        manifest, manifest_bytes, _manifest_sha, manifest_details = (
+            _read_canonical_object_at(
+                run_fd,
+                "typed-manifest.json",
+                limit=_MAX_JSON_BYTES,
+                label="typed-source manifest",
+            )
+        )
+        if (
+            set(manifest) != TYPED_SOURCE_MANIFEST_FIELDS
+            or manifest.get("schema") != TYPED_SOURCE_MANIFEST_SCHEMA
+            or manifest.get("raw_evidence_run_id") != validated_raw_run_id
+            or isinstance(manifest.get("member_count"), bool)
+            or not isinstance(manifest.get("member_count"), int)
+            or not isinstance(manifest.get("members"), list)
+            or manifest["member_count"] != len(manifest["members"])
+            or any(
+                not isinstance(member, Mapping)
+                or set(member) != TYPED_SOURCE_MANIFEST_MEMBER_FIELDS
+                for member in manifest["members"]
+            )
+            or manifest["members"] != expected_members
+        ):
+            raise RoutePublicationError(
+                "typed-source manifest/core inventory differs"
+            )
+
+        typed_fd, typed_details = _open_directory_at(
+            run_fd, "typed", "typed-source member root"
+        )
+        try:
+            actual_filenames = sorted(os.listdir(typed_fd))
+        except OSError as error:
+            raise RoutePublicationError(
+                "typed-source member inventory is unreadable"
+            ) from error
+        if actual_filenames != sorted(expected_filenames):
+            raise RoutePublicationError(
+                "typed-source member directory inventory differs"
+            )
+
+        retained: Dict[str, Dict[str, Any]] = {}
+        member_snapshots: List[Tuple[str, bytes, os.stat_result, int]] = []
+        for descriptor in expected_members:
+            contract = TYPED_SOURCE_ROLE_CONTRACTS.get(descriptor["role"])
+            if contract is None:
+                raise RoutePublicationError("typed-source role is invalid")
+            payload, physical_sha256, member_details = _read_bounded_bytes_at(
+                typed_fd,
+                descriptor["filename"],
+                limit=contract["max_bytes"],
+                label="typed-source member",
+            )
+            if (
+                len(payload) != descriptor["size"]
+                or physical_sha256 != descriptor["sha256"]
+            ):
+                raise RoutePublicationError(
+                    "typed-source member bytes differ from lineage"
+                )
+            member_snapshots.append((
+                descriptor["filename"],
+                payload,
+                member_details,
+                contract["max_bytes"],
+            ))
+            if descriptor["role"] == "dex_pool_state":
+                retained[descriptor["market_id"]] = {
+                    "descriptor": _clone_json(descriptor),
+                    "payload": payload,
+                }
+
+        for filename, payload, details, limit in member_snapshots:
+            if not _pointer_snapshot_is_owned(
+                _optional_regular_snapshot_at(
+                    typed_fd,
+                    filename,
+                    limit=limit,
+                    label="typed-source member",
+                ),
+                (payload, details),
+            ):
+                raise RoutePublicationError(
+                    "typed-source member changed during validation"
+                )
+        if not _pointer_snapshot_is_owned(
+            _optional_regular_snapshot_at(
+                run_fd,
+                "typed-manifest.json",
+                limit=_MAX_JSON_BYTES,
+                label="typed-source manifest",
+            ),
+            (manifest_bytes, manifest_details),
+        ):
+            raise RoutePublicationError(
+                "typed-source manifest changed during validation"
+            )
+        _verify_directory_entry_snapshot(
+            run_fd, "typed", typed_details, "typed-source member root"
+        )
+        _verify_directory_entry_snapshot(
+            raw_root_fd,
+            validated_raw_run_id,
+            run_details,
+            "typed-source raw run",
+        )
+        _verify_open_path_snapshot(
+            raw_root, raw_root_details, "typed-source raw root"
+        )
+        return retained
+    finally:
+        _close_route_descriptor_group((
+            (typed_fd, "typed-source member root"),
+            (run_fd, "typed-source raw run"),
+            (raw_root_fd, "typed-source raw root"),
+        ))
+
+
+def _open_shadow_run_directory(
+    shadow_root: Path,
+    run_id: str,
+) -> Tuple[
+    Path,
+    int,
+    os.stat_result,
+    int,
+    os.stat_result,
+    Path,
+    int,
+    os.stat_result,
+]:
+    try:
+        validated_run_id = _validate_shadow_run_id(run_id)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("route shadow run ID is invalid") from error
+    shadow, shadow_fd, shadow_details = _open_verified_directory(
+        Path(shadow_root), "route shadow root"
+    )
+    runs_fd: Optional[int] = None
+    run_fd: Optional[int] = None
+    try:
+        runs_fd, runs_details = _open_directory_at(
+            shadow_fd, "runs", "route shadow runs root"
+        )
+        run_fd, run_details = _open_directory_at(
+            runs_fd, validated_run_id, "route shadow run"
+        )
+        return (
+            shadow,
+            shadow_fd,
+            shadow_details,
+            runs_fd,
+            runs_details,
+            shadow / "runs" / validated_run_id,
+            run_fd,
+            run_details,
+        )
+    except BaseException:
+        _close_route_descriptor_group((
+            (run_fd, "route shadow run"),
+            (runs_fd, "route shadow runs root"),
+            (shadow_fd, "route shadow root"),
+        ))
+        raise
+
+
+def _read_shadow_run_evidence(
+    shadow_root: Path,
+    run_id: str,
+) -> Dict[str, Any]:
+    (
+        shadow,
+        shadow_fd,
+        shadow_details,
+        runs_fd,
+        runs_details,
+        run_path,
+        run_fd,
+        run_details,
+    ) = _open_shadow_run_directory(Path(shadow_root), run_id)
+    try:
+        universe, universe_bytes, _universe_physical_sha, universe_details = (
+            _read_canonical_object_at(
+                run_fd,
+                "route_universe.json",
+                limit=_MAX_JSON_BYTES,
+                label="route shadow universe",
+            )
+        )
+        universe = _validate_route_universe_payload(universe)
+        universe_logical_sha256 = route_universe_sha256(universe)
+        baseline, baseline_bytes, baseline_sha256, baseline_details = (
+            _read_canonical_object_at(
+                run_fd,
+                "baseline_manifest.json",
+                limit=_MAX_JSON_BYTES,
+                label="route shadow baseline manifest",
+            )
+        )
+        try:
+            normalized_baseline = _validate_shadow_baseline_manifest(
+                universe, baseline
+            )
+        except (TypeError, ValueError) as error:
+            raise RoutePublicationError(
+                "route shadow baseline manifest is invalid"
+            ) from error
+        if normalized_baseline != baseline or (
+            baseline.get("route_universe_sha256") != universe_logical_sha256
+        ):
+            raise RoutePublicationError("route shadow baseline lineage mismatch")
+        selected_end = date.fromisoformat(universe["selection_window"]["end"])
+        expected_end_exclusive = date.fromordinal(
+            selected_end.toordinal() + 1
+        ).isoformat()
+        if baseline.get("filters") != {
+            "window_days": 30,
+            "calendar": "complete_utc_days",
+            "cex_volume_aggregation": "sum_quote_volume_usd",
+            "maximum_legs_per_token_market_type": 3,
+        } or baseline.get("observation_bounds") != {
+            "start_inclusive": universe["selection_window"]["start"]
+            + "T00:00:00Z",
+            "end_exclusive": expected_end_exclusive + "T00:00:00Z",
+        }:
+            raise RoutePublicationError(
+                "route shadow baseline window contract is invalid"
+            )
+        cost, cost_bytes, cost_sha256, cost_details = _read_canonical_object_at(
+            run_fd,
+            ROUTE_SHADOW_COST_EVIDENCE_FILENAME,
+            limit=_MAX_ROUTE_COST_EVIDENCE_BYTES,
+            label="route-cost evidence",
+        )
+        audit_payload, audit_bytes, audit_sha256, audit_details = (
+            _read_canonical_object_at(
+                run_fd,
+                ROUTE_SHADOW_AUDIT_FILENAME,
+                limit=_MAX_JSON_BYTES,
+                label="route shadow audit",
+            )
+        )
+        audit = _strict_validate_shadow_audit(audit_payload)
+        if audit != audit_payload or _canonical_json_bytes(audit) != audit_bytes:
+            raise RoutePublicationError("route shadow audit normalization changed bytes")
+        if (
+            audit["run_id"] != run_id
+            or audit["route_universe_sha256"] != universe_logical_sha256
+            or audit["baseline_manifest_sha256"] != baseline_sha256
+            or audit["route_cost_evidence_sha256"] != cost_sha256
+            or audit["candidate_source_generation"]
+            != universe["candidate_source_generation"]
+            or baseline["candidate_source_generation"]
+            != universe["candidate_source_generation"]
+            or baseline["selection_window"] != universe["selection_window"]
+        ):
+            raise RoutePublicationError("route shadow run lineage mismatch")
+        immutable_members = (
+            (
+                "route_universe.json",
+                universe_bytes,
+                universe_details,
+                _MAX_JSON_BYTES,
+                "route shadow universe",
+            ),
+            (
+                "baseline_manifest.json",
+                baseline_bytes,
+                baseline_details,
+                _MAX_JSON_BYTES,
+                "route shadow baseline manifest",
+            ),
+            (
+                ROUTE_SHADOW_COST_EVIDENCE_FILENAME,
+                cost_bytes,
+                cost_details,
+                _MAX_ROUTE_COST_EVIDENCE_BYTES,
+                "route-cost evidence",
+            ),
+            (
+                ROUTE_SHADOW_AUDIT_FILENAME,
+                audit_bytes,
+                audit_details,
+                _MAX_JSON_BYTES,
+                "route shadow audit",
+            ),
+        )
+        for filename, member_bytes, member_details, limit, label in immutable_members:
+            if not _pointer_snapshot_is_owned(
+                _optional_regular_snapshot_at(
+                    run_fd,
+                    filename,
+                    limit=limit,
+                    label=label,
+                ),
+                (member_bytes, member_details),
+            ):
+                raise RoutePublicationError("{} changed during validation".format(label))
+        _verify_directory_entry_snapshot(
+            runs_fd, run_id, run_details, "route shadow run"
+        )
+        _verify_directory_entry_snapshot(
+            shadow_fd, "runs", runs_details, "route shadow runs root"
+        )
+        _verify_open_path_snapshot(shadow, shadow_details, "route shadow root")
+        return {
+            "audit": audit,
+            "audit_bytes": audit_bytes,
+            "audit_sha256": audit_sha256,
+            "universe": universe,
+            "universe_bytes": universe_bytes,
+            "route_universe_sha256": universe_logical_sha256,
+            "baseline": normalized_baseline,
+            "baseline_bytes": baseline_bytes,
+            "baseline_manifest_sha256": baseline_sha256,
+            "cost_evidence": cost,
+            "cost_evidence_bytes": cost_bytes,
+            "route_cost_evidence_sha256": cost_sha256,
+        }
+    finally:
+        _close_route_descriptor_group((
+            (run_fd, "route shadow run"),
+            (runs_fd, "route shadow runs root"),
+            (shadow_fd, "route shadow root"),
+        ))
+
+
+def _validate_dex_collector_contexts(
+    universe: Mapping[str, Any],
+    core_legs: Sequence[Mapping[str, Any]],
+) -> None:
+    try:
+        try:
+            from scripts.quality_outcomes import tvl_reason_code
+        except ModuleNotFoundError:
+            from quality_outcomes import tvl_reason_code  # type: ignore[no-redef]
+    except (ImportError, ModuleNotFoundError) as error:
+        raise RoutePublicationError("TVL reason validator is unavailable") from error
+    universe_by_market = {
+        row["market_id"]: row for row in universe["selected_legs"]
+    }
+    for core_leg in core_legs:
+        if core_leg.get("market_type") != "dex":
+            continue
+        market_id = str(core_leg.get("market_id") or "")
+        universe_leg = universe_by_market.get(market_id)
+        if universe_leg is None:
+            raise RoutePublicationError("DEX collector context market is absent")
+        context = universe_leg.get("collector_context")
+        if (
+            core_leg.get("collector_context") != context
+        ):
+            raise RoutePublicationError("DEX collector context lineage mismatch")
+        context_result = _validate_route_collector_context(
+            context, market_id=market_id
+        )
+        context = context_result["context"]
+        redundant = {
+            "snapshot_id": "usd_price_source_snapshot_id",
+            "observed_at": "usd_price_observed_at",
+            "source": "usd_price_source",
+            "source_endpoint": "usd_price_source_endpoint",
+            "raw_response_sha256": "usd_price_raw_response_sha256",
+        }
+        for context_field, core_field in redundant.items():
+            if core_leg.get(core_field) != context.get(context_field):
+                raise RoutePublicationError("DEX USD-price lineage mismatch")
+        status_value = context.get("status")
+        if status_value == "observed":
+            if (
+                context.get("reason_code") != "observed"
+                or tvl_reason_code(context.get("reason_code")) != "observed"
+            ):
+                raise RoutePublicationError("observed DEX price context is unavailable")
+            price_by_address = context_result["address_prices"]
+            core_status = core_leg.get("status")
+            if core_status in {"unsupported", "failed", "deadline_exceeded"}:
+                if (
+                    core_leg.get("available") is True
+                    or any(
+                        core_leg.get(field) is not None
+                        for field in (
+                            "token0_address", "token1_address",
+                            "token0_price_usd", "token1_price_usd",
+                        )
+                    )
+                ):
+                    raise RoutePublicationError(
+                        "terminal DEX leg cannot publish pool price evidence"
+                    )
+                continue
+            if core_leg.get("available") is False:
+                raise RoutePublicationError(
+                    "observed DEX price context is unavailable"
+                )
+            core_price_by_address: Dict[str, str] = {}
+            for address_field, price_field in (
+                ("token0_address", "token0_price_usd"),
+                ("token1_address", "token1_price_usd"),
+            ):
+                address = core_leg.get(address_field)
+                price = core_leg.get(price_field)
+                if (
+                    not isinstance(address, str)
+                    or re.fullmatch(r"0x[0-9a-f]{40}", address) is None
+                    or not isinstance(price, str)
+                ):
+                    raise RoutePublicationError(
+                        "DEX core address-price evidence is invalid"
+                    )
+                core_price_by_address[address] = price
+            if core_price_by_address != price_by_address:
+                raise RoutePublicationError("DEX address-price map mismatch")
+        elif status_value in {"missing", "not_found", "failed"}:
+            reason_code = context.get("reason_code")
+            allowed_reasons = {
+                "missing": {"source_no_tvl_observation"},
+                "not_found": {"source_pool_not_found"},
+                "failed": {
+                    "network",
+                    "rate_limit",
+                    "source_unavailable",
+                    "parse",
+                    "validation",
+                    "collection_failed",
+                },
+            }
+            if (
+                core_leg.get("available") is not False
+                or core_leg.get("reason_code")
+                != "usd_price_context_{}".format(status_value)
+                or reason_code not in allowed_reasons[status_value]
+                or tvl_reason_code(reason_code) != reason_code
+                or any(
+                    context.get(field) is not None
+                    for field in (
+                        "base_token_id",
+                        "quote_token_id",
+                        "base_token_price_usd",
+                        "quote_token_price_usd",
+                    )
+                )
+                or core_leg.get("token0_price_usd") is not None
+                or core_leg.get("token1_price_usd") is not None
+            ):
+                raise RoutePublicationError("unavailable DEX price context is invalid")
+        else:
+            raise RoutePublicationError("DEX collector context status is invalid")
+
+
+def _validate_joint_lineage(
+    shadow_root: Path,
+    evidence: Mapping[str, Any],
+    core: Mapping[str, Any],
+    phase_view: Mapping[str, Any],
+) -> None:
+    audit = evidence["audit"]
+    universe = evidence["universe"]
+    cohort = core["cohort"]
+    if (
+        audit["route_cohort_id"] != cohort["route_cohort_id"]
+        or audit["core_manifest_sha256"] != core["manifest_sha256"]
+        or audit["candidate_source_generation"]
+        != cohort["candidate_source_generation"]
+        or universe["candidate_source_generation"]
+        != cohort["candidate_source_generation"]
+        or universe["selection_window"] != cohort["selection_window"]
+        or universe["requested_notionals_usd"]
+        != cohort["requested_notionals_usd"]
+        or universe["routes"] != core["candidates"]
+        or audit["phase"] != phase_view["phase"]
+        or audit["phase_state_sha256"] != phase_view["phase_state_sha256"]
+        or audit["phase_transition_id"] != phase_view["phase_transition_id"]
+    ):
+        raise RoutePublicationError("joint route shadow lineage mismatch")
+    core_leg_identity = sorted(
+        (
+            row.get("market_id"),
+            row.get("market_type"),
+            row.get("token_symbol"),
+        )
+        for row in core["legs"]
+    )
+    universe_leg_identity = sorted(
+        (
+            row.get("market_id"),
+            row.get("market_type"),
+            row.get("token_symbol"),
+        )
+        for row in universe["selected_legs"]
+    )
+    if core_leg_identity != universe_leg_identity:
+        raise RoutePublicationError("joint route shadow leg inventory mismatch")
+    for leg in core["legs"]:
+        lineage = leg.get("typed_source_lineage")
+        if lineage is None:
+            raise RoutePublicationError(
+                "joint route shadow leg typed-source lineage is missing"
+            )
+        try:
+            validate_typed_source_lineage(
+                lineage, market_type=str(leg.get("market_type"))
+            )
+        except (TypeError, ValueError) as error:
+            raise RoutePublicationError(
+                "joint route shadow leg typed-source lineage is invalid"
+            ) from error
+    retained_pool_states = _load_retained_typed_source_members(
+        Path(shadow_root), core
+    )
+    _validate_cost_evidence_outer_lineage(
+        evidence["cost_evidence"],
+        run_id=audit["run_id"],
+        route_cohort_id=audit["route_cohort_id"],
+        phase=audit["phase"],
+        candidate_source_generation=audit["candidate_source_generation"],
+        route_universe_sha256_value=evidence["route_universe_sha256"],
+        universe=universe,
+        retained_typed_pool_state_members=retained_pool_states,
+    )
+    _validate_dex_collector_contexts(universe, core["legs"])
+    try:
+        try:
+            from scripts.route_shadow_audit import build_shadow_audit
+        except ModuleNotFoundError:
+            from route_shadow_audit import (  # type: ignore[no-redef]
+                build_shadow_audit,
+            )
+        rebuilt_audit = build_shadow_audit(
+            cohort,
+            core_pointer={
+                "schema": ROUTE_CORE_POINTER_SCHEMA,
+                "bundle_stage": ROUTE_CORE_BUNDLE_STAGE,
+                "route_cohort_id": cohort["route_cohort_id"],
+                "manifest_sha256": core["manifest_sha256"],
+            },
+            run={
+                "run_id": audit["run_id"],
+                "phase_state_sha256": audit["phase_state_sha256"],
+                "phase_transition_id": audit["phase_transition_id"],
+                "route_universe_sha256": audit["route_universe_sha256"],
+                "baseline_manifest_sha256": audit["baseline_manifest_sha256"],
+                "candidate_source_generation": audit[
+                    "candidate_source_generation"
+                ],
+                "route_cost_evidence_sha256": audit[
+                    "route_cost_evidence_sha256"
+                ],
+            },
+            phase=audit["phase"],
+            audit_finished_at=audit["audit_finished_at"],
+        )
+    except (ImportError, ModuleNotFoundError, TypeError, ValueError) as error:
+        raise RoutePublicationError(
+            "route shadow audit cannot be rebuilt from immutable facts"
+        ) from error
+    if rebuilt_audit != audit:
+        raise RoutePublicationError(
+            "route shadow audit metrics differ from immutable cohort facts"
+        )
+
+
+def _load_core_bundle_at_root(
+    core: Path,
+    core_fd: int,
+    *,
+    route_cohort_id: str,
+    core_manifest_sha256: str,
+) -> Dict[str, Any]:
+    bundles_fd: Optional[int] = None
+    try:
+        bundles_fd, bundles_details = _open_directory_at(
+            core_fd, "bundles", "route core bundles root"
+        )
+        validated = _validate_route_cohort_bundle(
+            core / "bundles" / route_cohort_id,
+            expected_route_cohort_id=route_cohort_id,
+            expected_manifest_sha256=core_manifest_sha256,
+            require_directory_identity=True,
+            parent_fd=bundles_fd,
+        )
+        _verify_directory_entry(
+            core_fd, "bundles", bundles_details, "route core bundles root"
+        )
+        return validated
+    finally:
+        _close_route_descriptor_group((
+            (bundles_fd, "route core bundles root"),
+        ))
+
+
+def _pointer_from_shadow_evidence(evidence: Mapping[str, Any]) -> Dict[str, Any]:
+    audit = evidence["audit"]
+    return _validate_shadow_pointer({
+        "schema": ROUTE_SHADOW_POINTER_SCHEMA,
+        "run_id": audit["run_id"],
+        "phase": audit["phase"],
+        "route_cohort_id": audit["route_cohort_id"],
+        "phase_state_sha256": audit["phase_state_sha256"],
+        "phase_transition_id": audit["phase_transition_id"],
+        "core_pointer_sha256": audit["core_pointer_sha256"],
+        "core_manifest_sha256": audit["core_manifest_sha256"],
+        "route_universe_sha256": audit["route_universe_sha256"],
+        "route_cost_evidence_sha256": audit["route_cost_evidence_sha256"],
+        "baseline_manifest_sha256": audit["baseline_manifest_sha256"],
+        "candidate_source_generation": audit["candidate_source_generation"],
+        "audit_sha256": evidence["audit_sha256"],
+    })
+
+
+def _joint_shadow_view(
+    pointer: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    core: Mapping[str, Any],
+) -> Dict[str, Any]:
+    pointer_value = _clone_json(dict(pointer))
+    pointer_bytes = _pointer_payload_bytes(pointer_value)
+    return {
+        "pointer": pointer_value,
+        "pointer_sha256": _sha256_bytes(pointer_bytes),
+        "audit": _clone_json(evidence["audit"]),
+        "audit_sha256": evidence["audit_sha256"],
+        "cohort": _clone_json(core["cohort"]),
+        "manifest": _clone_json(core["manifest"]),
+    }
+
+
+def _load_shadow_result_evidence(
+    shadow_root: Path,
+    *,
+    run_id: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    evidence = _read_shadow_run_evidence(Path(shadow_root), run_id)
+    pointer = _pointer_from_shadow_evidence(evidence)
+    phase_view = load_historical_phase_state(
+        Path(shadow_root),
+        phase=pointer["phase"],
+        phase_state_sha256=pointer["phase_state_sha256"],
+        phase_transition_id=pointer["phase_transition_id"],
+    )
+    core_root = _absolute_without_symlink_resolution(Path(shadow_root)).parent / "core"
+    core, core_fd, core_details = _open_verified_directory(
+        core_root, "route core root"
+    )
+    locked = False
+    result: Optional[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = None
+    operation_error: Optional[BaseException] = None
+    operation_traceback = None
+    try:
+        try:
+            fcntl.flock(core_fd, fcntl.LOCK_SH)
+            locked = True
+        except Exception as error:
+            raise RoutePublicationError("route core lock acquisition failed") from error
+        loaded_core = _load_core_bundle_at_root(
+            core,
+            core_fd,
+            route_cohort_id=pointer["route_cohort_id"],
+            core_manifest_sha256=pointer["core_manifest_sha256"],
+        )
+        if (
+            _canonical_core_pointer_sha256(
+                pointer["route_cohort_id"], pointer["core_manifest_sha256"]
+            ) != pointer["core_pointer_sha256"]
+        ):
+            raise RoutePublicationError("historical core pointer hash is invalid")
+        _validate_joint_lineage(
+            Path(shadow_root), evidence, loaded_core, phase_view
+        )
+        _verify_open_path_identity(core, core_details, "route core root")
+        result = (pointer, evidence, loaded_core)
+    except BaseException as error:
+        operation_error = error
+        operation_traceback = error.__traceback__
+    cleanup_error = _release_route_lock_and_close(
+        core_fd,
+        locked=locked,
+        label="route core",
+    )
+    if operation_error is not None:
+        raise operation_error.with_traceback(operation_traceback)
+    if cleanup_error is not None:
+        raise cleanup_error
+    if result is None:
+        raise RoutePublicationError("historical route shadow load returned no result")
+    return result
+
+
+def load_shadow_result(
+    shadow_root: Path,
+    *,
+    run_id: str,
+    expected_pointer_sha256: str,
+) -> Dict[str, Any]:
+    """Load one immutable historical Shadow result without following latest."""
+    try:
+        validated_run_id = _validate_shadow_run_id(run_id)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("route shadow run ID is invalid") from error
+    if (
+        not isinstance(expected_pointer_sha256, str)
+        or _HEX_SHA256.fullmatch(expected_pointer_sha256) is None
+    ):
+        raise RoutePublicationError("expected route shadow pointer hash is invalid")
+    pointer, evidence, core = _load_shadow_result_evidence(
+        Path(shadow_root), run_id=validated_run_id
+    )
+    view = _joint_shadow_view(pointer, evidence, core)
+    if view["pointer_sha256"] != expected_pointer_sha256:
+        raise RoutePublicationError("route shadow pointer hash mismatch")
+    return view
+
+
+def _same_optional_snapshot(
+    first: Optional[Tuple[bytes, os.stat_result]],
+    second: Optional[Tuple[bytes, os.stat_result]],
+) -> bool:
+    if first is None or second is None:
+        return first is None and second is None
+    return _pointer_snapshot_is_owned(second, first)
+
+
+def _restore_shadow_pointer_after_failure(
+    shadow_fd: int,
+    shadow_path: Path,
+    old_pointer: Optional[Tuple[bytes, os.stat_result]],
+    committed_pointer: Optional[Tuple[bytes, os.stat_result]],
+) -> None:
+    """Rollback only the exact pointer inode installed by this transaction."""
+    current = _optional_pointer_snapshot_at(shadow_fd)
+    if old_pointer is None:
+        if current is None:
+            return
+    elif _pointer_snapshot_is_owned(current, old_pointer):
+        return
+    if (
+        committed_pointer is None
+        or not _pointer_snapshot_is_owned(current, committed_pointer)
+    ):
+        raise RoutePublicationError(
+            "route shadow pointer commit is uncertain due to a concurrent writer"
+        )
+    if old_pointer is None:
+        os.unlink(ROUTE_SHADOW_LATEST_FILENAME, dir_fd=shadow_fd)
+        _fsync_directory(shadow_path, directory_fd=shadow_fd)
+        if _optional_pointer_snapshot_at(shadow_fd) is not None:
+            raise RoutePublicationError("route shadow pointer rollback failed")
+        return
+    _replace_pointer_bytes_at(shadow_fd, old_pointer[0])
+    restored = _optional_pointer_snapshot_at(shadow_fd)
+    if restored is None or restored[0] != old_pointer[0]:
+        raise RoutePublicationError("route shadow pointer rollback failed")
+    _fsync_directory(shadow_path, directory_fd=shadow_fd)
+    if not _pointer_snapshot_is_owned(
+        _optional_pointer_snapshot_at(shadow_fd), restored
+    ):
+        raise RoutePublicationError("route shadow pointer rollback failed")
+
+
+def _commit_shadow_pointer_at_locked(
+    shadow_fd: int,
+    shadow_path: Path,
+    pointer_bytes: bytes,
+    *,
+    commit_state: Optional[Dict[str, Any]] = None,
+) -> Tuple[bytes, os.stat_result]:
+    _replace_pointer_bytes_at(shadow_fd, pointer_bytes)
+    committed = _optional_pointer_snapshot_at(shadow_fd)
+    if committed is None or committed[0] != pointer_bytes:
+        raise RoutePublicationError("route shadow pointer commit is uncertain")
+    if commit_state is not None:
+        commit_state["pointer_snapshot"] = committed
+    _fsync_directory(shadow_path, directory_fd=shadow_fd)
+    if not _pointer_snapshot_is_owned(
+        _optional_pointer_snapshot_at(shadow_fd), committed
+    ):
+        raise RoutePublicationError("route shadow pointer commit is uncertain")
+    directory_snapshot = os.fstat(shadow_fd)
+    if commit_state is not None:
+        commit_state["directory_snapshot"] = directory_snapshot
+    return committed
+
+
+def _release_route_lock_and_close(
+    descriptor: int,
+    *,
+    locked: bool,
+    label: str,
+) -> Optional[RoutePublicationError]:
+    """Attempt both cleanup steps and return the first cleanup failure."""
+    first_error: Optional[RoutePublicationError] = None
+    if locked:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except BaseException as error:
+            first_error = RoutePublicationError(
+                "{} lock release failed".format(label)
+            )
+            first_error.__cause__ = error
+    try:
+        os.close(descriptor)
+    except BaseException as error:
+        if first_error is None:
+            first_error = RoutePublicationError(
+                "{} descriptor close failed".format(label)
+            )
+            first_error.__cause__ = error
+    return first_error
+
+
+def _close_route_descriptor_group(
+    descriptors: Sequence[Tuple[Optional[int], str]],
+) -> None:
+    """Close every descriptor without masking an already-active exception."""
+    primary_error_active = sys.exc_info()[0] is not None
+    first_error: Optional[RoutePublicationError] = None
+    for descriptor, label in descriptors:
+        if descriptor is None:
+            continue
+        cleanup_error = _release_route_lock_and_close(
+            descriptor,
+            locked=False,
+            label=label,
+        )
+        if first_error is None:
+            first_error = cleanup_error
+    if first_error is not None and not primary_error_active:
+        raise first_error
+
+
+def publish_shadow_result(
+    shadow_root: Path,
+    *,
+    core_pointer: Mapping[str, Any],
+    audit: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Install an audit and atomically commit one fully bound Shadow pointer."""
+    normalized_audit = _strict_validate_shadow_audit(audit)
+    validated_core_pointer = _validate_core_pointer_mapping(core_pointer)
+    audit_bytes = _canonical_json_bytes(normalized_audit)
+    core_pointer_bytes = _pointer_payload_bytes(validated_core_pointer)
+    if (
+        normalized_audit["core_pointer_sha256"]
+        != _sha256_bytes(core_pointer_bytes)
+        or normalized_audit["core_manifest_sha256"]
+        != validated_core_pointer["manifest_sha256"]
+        or normalized_audit["route_cohort_id"]
+        != validated_core_pointer["route_cohort_id"]
+    ):
+        raise RoutePublicationError("audit and supplied core pointer differ")
+    try:
+        run_id = _validate_shadow_run_id(normalized_audit["run_id"])
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("route shadow audit run ID is invalid") from error
+    (
+        initial_phase,
+        initial_phase_snapshot,
+        initial_phase_root_snapshot,
+    ) = _load_active_phase_state_with_snapshot(Path(shadow_root))
+    if (
+        normalized_audit["phase"] != initial_phase["phase"]
+        or normalized_audit["phase_state_sha256"]
+        != initial_phase["phase_state_sha256"]
+        or normalized_audit["phase_transition_id"]
+        != initial_phase["phase_transition_id"]
+    ):
+        raise RoutePublicationError("audit phase does not match active phase")
+
+    (
+        shadow,
+        shadow_install_fd,
+        shadow_install_details,
+        runs_fd,
+        runs_details,
+        run_path,
+        run_fd,
+        run_details,
+    ) = _open_shadow_run_directory(Path(shadow_root), run_id)
+    try:
+        _install_immutable_audit_at(run_fd, run_path, audit_bytes)
+        _verify_directory_entry(runs_fd, run_id, run_details, "route shadow run")
+        _verify_directory_entry(
+            shadow_install_fd, "runs", runs_details, "route shadow runs root"
+        )
+        _verify_open_path_snapshot(
+            shadow, shadow_install_details, "route shadow root"
+        )
+    finally:
+        primary_error_active = sys.exc_info()[0] is not None
+        install_cleanup_error: Optional[RoutePublicationError] = None
+        for descriptor, label in (
+            (run_fd, "route shadow run"),
+            (runs_fd, "route shadow runs root"),
+            (shadow_install_fd, "route shadow install root"),
+        ):
+            current_cleanup_error = _release_route_lock_and_close(
+                descriptor,
+                locked=False,
+                label=label,
+            )
+            if install_cleanup_error is None:
+                install_cleanup_error = current_cleanup_error
+        if install_cleanup_error is not None and not primary_error_active:
+            raise install_cleanup_error
+
+    core_root = _absolute_without_symlink_resolution(Path(shadow_root)).parent / "core"
+    core, core_fd, core_details = _open_verified_directory(
+        core_root, "route core root"
+    )
+    try:
+        shadow, shadow_fd, shadow_details = _open_verified_directory(
+            Path(shadow_root), "route shadow root"
+        )
+    except BaseException:
+        _release_route_lock_and_close(
+            core_fd,
+            locked=False,
+            label="route core",
+        )
+        raise
+    core_locked = False
+    shadow_locked = False
+    old_pointer: Optional[Tuple[bytes, os.stat_result]] = None
+    pointer_bytes = b""
+    result: Optional[Dict[str, Any]] = None
+    operation_error: Optional[BaseException] = None
+    operation_traceback = None
+    try:
+        if (
+            _stable_file_metadata(shadow_details)
+            != _stable_file_metadata(initial_phase_root_snapshot)
+        ):
+            raise RoutePublicationError("active route shadow phase changed")
+        try:
+            fcntl.flock(core_fd, fcntl.LOCK_SH)
+            core_locked = True
+        except Exception as error:
+            raise RoutePublicationError("route core lock acquisition failed") from error
+        core_snapshot = _optional_pointer_snapshot_at(core_fd)
+        if core_snapshot is None or core_snapshot[0] != core_pointer_bytes:
+            raise RoutePublicationError("supplied route core pointer is not current")
+        try:
+            fcntl.flock(shadow_fd, fcntl.LOCK_EX)
+            shadow_locked = True
+        except Exception as error:
+            raise RoutePublicationError("route shadow lock acquisition failed") from error
+        old_pointer = _optional_pointer_snapshot_at(shadow_fd)
+        evidence = _read_shadow_run_evidence(shadow, run_id)
+        if evidence["audit"] != normalized_audit:
+            raise RoutePublicationError("installed route shadow audit differs")
+        loaded_core = _load_core_bundle_at_root(
+            core,
+            core_fd,
+            route_cohort_id=validated_core_pointer["route_cohort_id"],
+            core_manifest_sha256=validated_core_pointer["manifest_sha256"],
+        )
+        (
+            final_phase,
+            final_phase_snapshot,
+            final_phase_root_snapshot,
+        ) = _load_active_phase_state_with_snapshot(shadow)
+        if (
+            final_phase != initial_phase
+            or not _same_optional_snapshot(
+                initial_phase_snapshot, final_phase_snapshot
+            )
+            or _stable_file_metadata(final_phase_root_snapshot)
+            != _stable_file_metadata(initial_phase_root_snapshot)
+        ):
+            raise RoutePublicationError("active route shadow phase changed")
+        _validate_joint_lineage(shadow, evidence, loaded_core, final_phase)
+        pointer = _pointer_from_shadow_evidence(evidence)
+        pointer_bytes = _pointer_payload_bytes(pointer)
+        _verify_open_path_identity(core, core_details, "route core root")
+        _verify_open_path_snapshot(shadow, shadow_details, "route shadow root")
+        if not _pointer_snapshot_is_owned(
+            _optional_pointer_snapshot_at(core_fd), core_snapshot
+        ):
+            raise RoutePublicationError("route core changed before shadow commit")
+        commit_state: Dict[str, Any] = {}
+        try:
+            _commit_shadow_pointer_at_locked(
+                shadow_fd,
+                shadow,
+                pointer_bytes,
+                commit_state=commit_state,
+            )
+            (
+                post_phase,
+                post_phase_snapshot,
+                post_phase_root_snapshot,
+            ) = _load_active_phase_state_with_snapshot(shadow)
+            if (
+                post_phase != final_phase
+                or not _same_optional_snapshot(final_phase_snapshot, post_phase_snapshot)
+                or _stable_file_metadata(post_phase_root_snapshot)
+                != _stable_file_metadata(commit_state["directory_snapshot"])
+                or not _pointer_snapshot_is_owned(
+                    _optional_pointer_snapshot_at(core_fd), core_snapshot
+                )
+            ):
+                raise RoutePublicationError(
+                    "joint route shadow lineage changed during pointer commit"
+                )
+        except BaseException:
+            _restore_shadow_pointer_after_failure(
+                shadow_fd,
+                shadow,
+                old_pointer,
+                commit_state.get("pointer_snapshot"),
+            )
+            raise
+        result = _joint_shadow_view(pointer, evidence, loaded_core)
+    except BaseException as error:
+        operation_error = error
+        operation_traceback = error.__traceback__
+
+    cleanup_error = _release_route_lock_and_close(
+        shadow_fd,
+        locked=shadow_locked,
+        label="route shadow",
+    )
+    core_cleanup_error = _release_route_lock_and_close(
+        core_fd,
+        locked=core_locked,
+        label="route core",
+    )
+    if cleanup_error is None:
+        cleanup_error = core_cleanup_error
+    if operation_error is not None:
+        raise operation_error.with_traceback(operation_traceback)
+    if cleanup_error is not None:
+        raise cleanup_error
+    if result is None:
+        raise RoutePublicationError("route shadow publication returned no result")
+    return result
+
+
+def load_latest_shadow_result(shadow_root: Path) -> Dict[str, Any]:
+    """Snapshot latest, resolve it through the historical path, then recheck."""
+    shadow, shadow_fd, shadow_details = _open_verified_directory(
+        Path(shadow_root), "route shadow root"
+    )
+    result: Optional[Dict[str, Any]] = None
+    operation_error: Optional[BaseException] = None
+    operation_traceback = None
+    try:
+        snapshot = _optional_pointer_snapshot_at(shadow_fd)
+        if snapshot is None:
+            raise RoutePublicationError("route shadow pointer is missing")
+        pointer_bytes = snapshot[0]
+        pointer = _validate_shadow_pointer(
+            _decode_json_object_bytes(pointer_bytes, label="route shadow pointer")
+        )
+        if pointer_bytes != _pointer_payload_bytes(pointer):
+            raise RoutePublicationError("route shadow pointer is not canonical")
+        loaded = load_shadow_result(
+            shadow,
+            run_id=pointer["run_id"],
+            expected_pointer_sha256=_sha256_bytes(pointer_bytes),
+        )
+        if loaded["pointer"] != pointer or not _pointer_snapshot_is_owned(
+            _optional_pointer_snapshot_at(shadow_fd), snapshot
+        ):
+            raise RoutePublicationError("route shadow pointer changed during validation")
+        _verify_open_path_snapshot(shadow, shadow_details, "route shadow root")
+        result = loaded
+    except BaseException as error:
+        operation_error = error
+        operation_traceback = error.__traceback__
+    cleanup_error = _release_route_lock_and_close(
+        shadow_fd,
+        locked=False,
+        label="route shadow",
+    )
+    if operation_error is not None:
+        raise operation_error.with_traceback(operation_traceback)
+    if cleanup_error is not None:
+        raise cleanup_error
+    if result is None:
+        raise RoutePublicationError("latest route shadow load returned no result")
+    return result

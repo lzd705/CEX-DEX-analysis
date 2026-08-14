@@ -28,7 +28,11 @@ from scripts.fetch_tvl import TVL_COLUMNS, base_row as tvl_base_row
 from scripts.route_shadow_inputs import (
     SourceFileIdentity,
     build_shadow_universe,
+    current_source_generation,
+    load_run_input_binding,
     selection_window,
+    typed_source_lineage_observed_members,
+    validate_typed_source_lineage,
     write_run_universe,
 )
 from scripts.route_universe import route_universe_sha256
@@ -79,6 +83,7 @@ class ProductionInputFixture:
         self.data_dir = self.root / "market-data"
         self.project_root = self.root / "project"
         self.config_path = self.project_root / "config/tokens.csv"
+        self.chain_config_path = self.project_root / "config/token_chains.csv"
         self.data_dir.mkdir()
         (self.data_dir / "admin").mkdir()
         self.config_path.parent.mkdir(parents=True)
@@ -103,6 +108,18 @@ class ProductionInputFixture:
                 "dex_source": "geckoterminal",
                 "primary_dex": "uniswap_v2",
                 "pool_address": "",
+                "notes": "fixture",
+            }],
+        )
+        write_csv(
+            self.chain_config_path,
+            ("token_symbol", "chain", "contract_address", "notes"),
+            [{
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "contract_address": (
+                    "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+                ),
                 "notes": "fixture",
             }],
         )
@@ -217,6 +234,12 @@ class ProductionInputFixture:
             source_endpoint="https://api.example.test/pools",
         )
         tvl.update({
+            "base_token_id": (
+                "eth_0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+            ),
+            "quote_token_id": "eth_0x" + "2" * 40,
+            "base_token_price_usd": "100",
+            "quote_token_price_usd": "1",
             "tvl_usd": "0",
             "volume_24h_usd": "",
             "raw_response_sha256": "e" * 64,
@@ -280,7 +303,9 @@ class ProductionInputFixture:
             "block_number": "123",
             "block_timestamp": BLOCK_TIME,
             "protocol_model": "constant_product_v2",
-            "target_token_address": "0x" + "1" * 40,
+            "target_token_address": (
+                "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+            ),
             "target_token_decimals": "18",
             "quote_token_address": "0x" + "2" * 40,
             "quote_token_decimals": "6",
@@ -408,6 +433,14 @@ class ShadowInputBuildTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.fixture = ProductionInputFixture(self.temporary.name)
 
+    def test_lifecycle_response_hash_requires_a_string(self):
+        path = self.fixture.data_dir / "cex_instrument_lifecycle.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["response_sha256"] = int("1" * 64)
+        path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "lifecycle response SHA"):
+            self.fixture.build()
+
     def test_build_projects_canonical_lineage_and_preserves_zero_vs_missing(self):
         universe, manifest = self.fixture.build()
 
@@ -425,12 +458,18 @@ class ShadowInputBuildTests(unittest.TestCase):
         self.assertEqual(dex["selection_inputs"]["observed_100bps_depth_usd"], "140")
         self.assertEqual(cex["selection_inputs"]["proved_execution_capacity_usd"], "100000")
         self.assertEqual(dex["selection_inputs"]["proved_execution_capacity_usd"], "100000")
+        self.assertEqual(
+            dex["target_token_address"],
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+        )
+        self.assertEqual(dex["target_token_side"], "base")
         self.assertEqual(universe["candidate_source_generation"], manifest[
             "candidate_source_generation"
         ])
         self.assertEqual(
             [entry["path"] for entry in manifest["inputs"]],
-            list(REQUIRED_DATA_PATHS) + ["config/tokens.csv"],
+            list(REQUIRED_DATA_PATHS)
+            + ["config/tokens.csv", "config/token_chains.csv"],
         )
         self.assertFalse(any(
             str(self.fixture.root) in entry["path"] for entry in manifest["inputs"]
@@ -661,6 +700,10 @@ class ShadowInputBuildTests(unittest.TestCase):
                 "reason_code": reason,
                 "tvl_usd": "",
                 "volume_24h_usd": "",
+                "base_token_id": "",
+                "quote_token_id": "",
+                "base_token_price_usd": "",
+                "quote_token_price_usd": "",
                 "error": "fixture {}".format(status),
             })
             write_csv(path, fields, [row])
@@ -672,6 +715,299 @@ class ShadowInputBuildTests(unittest.TestCase):
                 )
                 self.assertIsNone(dex["selection_inputs"]["dex_tvl_usd"])
                 self.assertIsNone(dex["selection_inputs"]["dex_24h_usd"])
+                self.assertEqual(
+                    dex["collector_context"]["status"], status
+                )
+                self.assertEqual(
+                    dex["collector_context"]["reason_code"], reason
+                )
+                self.assertEqual(
+                    dex["target_token_address"],
+                    "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+                )
+                self.assertIsNone(dex["target_token_side"])
+
+    def test_quote_side_target_is_derived_from_captured_token_identity(self):
+        path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            rows = list(reader)
+        rows[0]["base_token_id"] = "eth_0x" + "2" * 40
+        rows[0]["quote_token_id"] = (
+            "eth_0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+        )
+        write_csv(path, fields, rows)
+
+        universe, _manifest = self.fixture.build()
+
+        dex = next(
+            item for item in universe["selected_legs"]
+            if item["market_type"] == "dex"
+        )
+        self.assertEqual(dex["target_token_side"], "quote")
+
+    def test_cross_chain_target_uses_captured_chain_config_identity(self):
+        write_csv(
+            self.fixture.chain_config_path,
+            ("token_symbol", "chain", "contract_address", "notes"),
+            [
+                {
+                    "token_symbol": "UNI",
+                    "chain": "eth",
+                    "contract_address": (
+                        "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+                    ),
+                    "notes": "ethereum canonical",
+                },
+                {
+                    "token_symbol": "UNI",
+                    "chain": "arbitrum",
+                    "contract_address": (
+                        "0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0"
+                    ),
+                    "notes": "arbitrum bridged",
+                },
+            ],
+        )
+        with self.fixture.data_dir.joinpath(
+            "dex_pool_tvl_latest.csv"
+        ).open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            tvl = list(reader)[0]
+        tvl.update({
+            "chain": "arbitrum",
+            "base_token_id": (
+                "arbitrum_0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0"
+            ),
+            "quote_token_id": "arbitrum_0x" + "2" * 40,
+        })
+        write_csv(
+            self.fixture.data_dir / "dex_pool_tvl_latest.csv", fields, [tvl]
+        )
+        with self.fixture.data_dir.joinpath(
+            "dex_depth_latest.csv"
+        ).open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            depth = list(reader)[0]
+        depth.update({"chain": "arbitrum"})
+        write_csv(
+            self.fixture.data_dir / "dex_depth_latest.csv", fields, [depth]
+        )
+        with self.fixture.data_dir.joinpath(
+            "dex_execution_cost_latest.csv"
+        ).open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            execution = list(reader)
+        for row in execution:
+            row.update({
+                "chain": "arbitrum",
+                "market_id": "dex:arbitrum:uniswap_v2:{}:UNI".format(POOL),
+                "target_token_address": (
+                    "0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0"
+                ),
+            })
+        write_csv(
+            self.fixture.data_dir / "dex_execution_cost_latest.csv",
+            fields,
+            execution,
+        )
+        database = self.fixture.data_dir / "market_facts.sqlite3"
+        connection = sqlite3.connect(str(database))
+        try:
+            connection.execute(
+                "UPDATE dex_pool_daily SET chain = 'arbitrum'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        universe, manifest = self.fixture.build()
+
+        dex = next(
+            row for row in universe["selected_legs"]
+            if row["market_type"] == "dex"
+        )
+        self.assertEqual(
+            dex["target_token_address"],
+            "0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0",
+        )
+        self.assertEqual(dex["target_token_side"], "base")
+        self.assertIn(
+            "config/token_chains.csv",
+            [entry["path"] for entry in manifest["inputs"]],
+        )
+
+    def test_observed_context_requires_two_chain_native_ids_and_prices(self):
+        path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            baseline = list(reader)[0]
+        for field, value in (
+            ("base_token_price_usd", ""),
+            ("quote_token_id", baseline["base_token_id"]),
+            ("base_token_id", "solana_" + "1" * 32),
+        ):
+            row = {**baseline, field: value}
+            write_csv(path, fields, [row])
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    ValueError, "collector|Token|price|identity|observed"
+                ):
+                    self.fixture.build()
+
+    def test_nonobserved_context_rejects_stale_token_or_price_fields(self):
+        path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            baseline = list(reader)[0]
+        row = {
+            **baseline,
+            "status": "missing",
+            "reason_code": "source_no_tvl_observation",
+            "tvl_usd": "",
+            "volume_24h_usd": "",
+        }
+        for field in (
+            "base_token_id", "quote_token_id",
+            "base_token_price_usd", "quote_token_price_usd",
+        ):
+            forged = dict(row)
+            forged[field] = baseline[field]
+            for other in (
+                "base_token_id", "quote_token_id",
+                "base_token_price_usd", "quote_token_price_usd",
+            ):
+                if other != field:
+                    forged[other] = ""
+            write_csv(path, fields, [forged])
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    ValueError, "non-observed|collector|Token|price"
+                ):
+                    self.fixture.build()
+
+    def test_collector_context_rejects_unsafe_or_noncanonical_endpoint(self):
+        path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            baseline = list(reader)[0]
+        for endpoint in (
+            "https://user:secret@api.example.test/pools",
+            "https://api.example.test/pools?token=secret",
+            "file:///tmp/pool.json",
+            "HTTPS://api.example.test/pools",
+        ):
+            write_csv(
+                path, fields, [{**baseline, "source_endpoint": endpoint}]
+            )
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaisesRegex(ValueError, "endpoint|unsafe"):
+                    self.fixture.build()
+
+    def test_chain_config_rejects_duplicate_or_conflicting_identity(self):
+        rows = [
+            {
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "contract_address": (
+                    "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+                ),
+                "notes": "canonical",
+            },
+            {
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "contract_address": "0x" + "9" * 40,
+                "notes": "conflict",
+            },
+        ]
+        write_csv(
+            self.fixture.chain_config_path,
+            ("token_symbol", "chain", "contract_address", "notes"),
+            rows,
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate|conflict|identity"):
+            self.fixture.build()
+
+    def test_active_runtime_identity_must_not_conflict_with_captured_chain_config(self):
+        registry = {
+            "schema_version": 1,
+            "tokens": {
+                "eth:0x{}".format("9" * 40): {
+                    "token_symbol": "UNI",
+                    "token_name": "UNI Token",
+                    "chain": "eth",
+                    "contract_address": "0x" + "9" * 40,
+                    "decimals": 18,
+                    "coingecko_id": None,
+                    "source": "geckoterminal",
+                    "source_token_id": "eth_0x" + "9" * 40,
+                    "status": "active",
+                    "cex_mapping": {
+                        "status": "requires_manual_review",
+                        "cex_symbol": None,
+                        "exchanges": [],
+                    },
+                    "created_at": OBSERVED_AT,
+                    "created_by": "fixture",
+                    "activated_at": OBSERVED_AT,
+                    "last_job_id": None,
+                },
+            },
+        }
+        (self.fixture.data_dir / "admin/token_registry.json").write_text(
+            json.dumps(registry, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValueError, "conflict|collision|identity"):
+            self.fixture.build()
+
+    def test_pending_runtime_identity_does_not_override_captured_chain_config(self):
+        registry = {
+            "schema_version": 1,
+            "tokens": {
+                "eth:0x{}".format("9" * 40): {
+                    "token_symbol": "UNI",
+                    "token_name": "UNI Token",
+                    "chain": "eth",
+                    "contract_address": "0x" + "9" * 40,
+                    "decimals": 18,
+                    "coingecko_id": None,
+                    "source": "geckoterminal",
+                    "source_token_id": "eth_0x" + "9" * 40,
+                    "status": "pending",
+                    "cex_mapping": {
+                        "status": "requires_manual_review",
+                        "cex_symbol": None,
+                        "exchanges": [],
+                    },
+                    "created_at": OBSERVED_AT,
+                    "created_by": "fixture",
+                    "activated_at": None,
+                    "last_job_id": None,
+                },
+            },
+        }
+        (self.fixture.data_dir / "admin/token_registry.json").write_text(
+            json.dumps(registry, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        universe, _manifest = self.fixture.build()
+
+        dex = next(
+            row for row in universe["selected_legs"]
+            if row["market_type"] == "dex"
+        )
+        self.assertEqual(
+            dex["target_token_address"],
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+        )
 
     def test_tvl_status_value_contract_rejects_negative_or_nonobserved_values(self):
         path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
@@ -698,7 +1034,13 @@ class ShadowInputBuildTests(unittest.TestCase):
         total = sum(
             (self.fixture.data_dir / relative).stat().st_size
             for relative in REQUIRED_DATA_PATHS
-        ) + self.fixture.config_path.stat().st_size
+        ) + sum(
+            path.stat().st_size
+            for path in (
+                self.fixture.config_path,
+                self.fixture.chain_config_path,
+            )
+        )
         with patch.object(
             route_shadow_inputs,
             "MAX_AGGREGATE_SOURCE_BYTES",
@@ -883,6 +1225,10 @@ class ShadowInputBuildTests(unittest.TestCase):
             replacement = Path(static_token_config).with_name("tokens.replacement")
             replacement.write_bytes(b"later config generation")
             os.replace(str(replacement), str(static_token_config))
+            chain_config = Path(static_token_config).with_name("token_chains.csv")
+            replacement = chain_config.with_name("token_chains.replacement")
+            replacement.write_bytes(b"later chain config generation")
+            os.replace(str(replacement), str(chain_config))
             return captures
 
         with patch.object(route_shadow_inputs, "PROJECT_ROOT", self.fixture.project_root), patch.object(
@@ -896,7 +1242,7 @@ class ShadowInputBuildTests(unittest.TestCase):
             )
 
         self.assertEqual(len(universe["selected_legs"]), 2)
-        self.assertEqual(len(manifest["inputs"]), 10)
+        self.assertEqual(len(manifest["inputs"]), 11)
 
     def test_descriptor_or_path_identity_change_during_capture_is_rejected(self):
         target = self.fixture.data_dir / "cex_depth_latest.csv"
@@ -957,6 +1303,11 @@ class ShadowInputBuildTests(unittest.TestCase):
             self.fixture.config_path,
             (stat_result.st_atime + 100, stat_result.st_mtime + 100),
         )
+        stat_result = self.fixture.chain_config_path.stat()
+        os.utime(
+            self.fixture.chain_config_path,
+            (stat_result.st_atime + 100, stat_result.st_mtime + 100),
+        )
         _universe, after = self.fixture.build()
 
         self.assertEqual(
@@ -967,7 +1318,10 @@ class ShadowInputBuildTests(unittest.TestCase):
     def test_mutating_each_source_identity_changes_generation(self):
         identities = [
             SourceFileIdentity(path, index + 1, hashlib.sha256(path.encode()).hexdigest())
-            for index, path in enumerate(list(REQUIRED_DATA_PATHS) + ["config/tokens.csv"])
+            for index, path in enumerate(
+                list(REQUIRED_DATA_PATHS)
+                + ["config/tokens.csv", "config/token_chains.csv"]
+            )
         ]
         baseline = route_shadow_inputs._candidate_source_generation(identities)
 
@@ -991,7 +1345,10 @@ class RunUniversePublicationTests(unittest.TestCase):
         self.shadow_root = Path(self.temporary.name) / "routes/shadow"
         identities = [
             SourceFileIdentity(path, index + 1, hashlib.sha256(path.encode()).hexdigest())
-            for index, path in enumerate(list(REQUIRED_DATA_PATHS) + ["config/tokens.csv"])
+            for index, path in enumerate(
+                list(REQUIRED_DATA_PATHS)
+                + ["config/tokens.csv", "config/token_chains.csv"]
+            )
         ]
         generation = route_shadow_inputs._candidate_source_generation(identities)
         self.universe = {
@@ -1304,6 +1661,262 @@ class RunUniversePublicationTests(unittest.TestCase):
             sorted(path.name for path in run_directory.iterdir()),
             ["baseline_manifest.json", "route_universe.json"],
         )
+
+    def test_run_input_binding_descriptor_rereads_exact_published_bytes(self):
+        write_run_universe(
+            self.shadow_root, "run-binding", self.universe, self.manifest
+        )
+
+        binding = load_run_input_binding(self.shadow_root, "run-binding")
+
+        self.assertEqual(binding["run_id"], "run-binding")
+        self.assertEqual(binding["universe"], self.universe)
+        self.assertEqual(
+            binding["candidate_source_generation"],
+            self.universe["candidate_source_generation"],
+        )
+        self.assertEqual(
+            binding["route_universe_sha256"],
+            route_universe_sha256(self.universe),
+        )
+        self.assertEqual(
+            binding["baseline_manifest_sha256"],
+            hashlib.sha256(
+                canonical_bytes(
+                    {
+                        **self.manifest,
+                        "route_universe_sha256": route_universe_sha256(
+                            self.universe
+                        ),
+                    }
+                )
+            ).hexdigest(),
+        )
+
+    def test_run_input_binding_rejects_hardlinked_member(self):
+        write_run_universe(
+            self.shadow_root, "run-hardlink", self.universe, self.manifest
+        )
+        run_dir = self.shadow_root / "runs/run-hardlink"
+        os.link(
+            run_dir / "route_universe.json",
+            Path(self.temporary.name) / "route-universe-hardlink.json",
+        )
+
+        with self.assertRaisesRegex(ValueError, "hard|link|unsafe"):
+            load_run_input_binding(self.shadow_root, "run-hardlink")
+
+
+class CurrentSourceGenerationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.fixture = ProductionInputFixture(self.temporary.name)
+
+    def test_current_generation_rehashes_the_exact_eleven_inputs_without_building(self):
+        _universe, manifest = self.fixture.build()
+        with patch.object(
+            route_shadow_inputs,
+            "build_shadow_universe",
+            side_effect=AssertionError("must not rebuild universe"),
+        ), patch.object(
+            route_shadow_inputs, "PROJECT_ROOT", self.fixture.project_root
+        ):
+            actual = current_source_generation(
+                self.fixture.data_dir,
+                static_token_config=self.fixture.config_path,
+            )
+        self.assertEqual(actual, manifest["candidate_source_generation"])
+
+        path = self.fixture.data_dir / "cex_depth_latest.csv"
+        path.write_bytes(path.read_bytes() + b"\n")
+        with patch.object(
+            route_shadow_inputs, "PROJECT_ROOT", self.fixture.project_root
+        ):
+            self.assertNotEqual(
+                current_source_generation(
+                    self.fixture.data_dir,
+                    static_token_config=self.fixture.config_path,
+                ),
+                actual,
+            )
+
+
+class TypedSourceLineageTests(unittest.TestCase):
+    def _cex_lineage(self):
+        return {
+            "schema": "route_leg_typed_source_lineage/v1",
+            "members": sorted([
+                self.observed_member(
+                    "cex_raw_book_response",
+                    "fetch_cex_depth/parse_book/v1",
+                    "route_bytes/v1",
+                    "book.json",
+                ),
+                self.observed_member(
+                    "cex_market_rules",
+                    "route_quantity_quote_for_book/v1",
+                    "route_market_rules_source/v1",
+                    "rules.json",
+                ),
+                self.observed_member(
+                    "quote_usd_conversion",
+                    "route_usd_conversion_source/v1",
+                    "route_usd_conversion_source/v1",
+                    "usd.json",
+                ),
+            ], key=lambda row: row["role"]),
+        }
+
+    def test_hash_fields_require_lowercase_hex_strings_not_string_coercion(self):
+        for field in ("sha256", "logical_generation"):
+            for invalid in (int("1" * 64), b"1" * 64):
+                with self.subTest(field=field, invalid_type=type(invalid).__name__):
+                    lineage = self._cex_lineage()
+                    lineage["members"][0][field] = invalid
+                    with self.assertRaisesRegex(ValueError, "typed-source"):
+                        validate_typed_source_lineage(
+                            lineage, market_type="cex"
+                        )
+
+    def observed_member(self, role, adapter_id, content_schema, filename):
+        return {
+            "role": role,
+            "status": "observed",
+            "reason_code": None,
+            "filename": filename,
+            "sha256": "a" * 64,
+            "size": 17,
+            "logical_generation": "b" * 64,
+            "adapter_id": adapter_id,
+            "content_schema": content_schema,
+        }
+
+    def test_exact_cex_lineage_and_observed_projection_are_canonical(self):
+        members = [
+            self.observed_member(
+                "quote_usd_conversion",
+                "route_usd_conversion_source/v1",
+                "route_usd_conversion_source/v1",
+                "usd.json",
+            ),
+            self.observed_member(
+                "cex_raw_book_response",
+                "fetch_cex_depth/parse_book/v1",
+                "route_bytes/v1",
+                "book.json",
+            ),
+            self.observed_member(
+                "cex_market_rules",
+                "route_quantity_quote_for_book/v1",
+                "route_market_rules_source/v1",
+                "rules.json",
+            ),
+        ]
+        lineage = {
+            "schema": "route_leg_typed_source_lineage/v1",
+            "members": sorted(members, key=lambda row: row["role"]),
+        }
+
+        validated = validate_typed_source_lineage(
+            lineage, market_type="cex"
+        )
+        self.assertEqual(validated, lineage)
+        self.assertIsNot(validated, lineage)
+        self.assertEqual(
+            typed_source_lineage_observed_members(
+                validated, market_type="cex"
+            ),
+            [
+                {
+                    field: member[field]
+                    for field in (
+                        "role", "filename", "sha256", "size",
+                        "logical_generation", "adapter_id", "content_schema",
+                    )
+                }
+                for member in lineage["members"]
+            ],
+        )
+
+    def test_unavailable_member_has_exact_null_and_reason_matrix(self):
+        lineage = {
+            "schema": "route_leg_typed_source_lineage/v1",
+            "members": [
+                {
+                    "role": "dex_pool_state",
+                    "status": "unavailable",
+                    "reason_code": "typed_source_failed",
+                    "filename": None,
+                    "sha256": None,
+                    "size": None,
+                    "logical_generation": None,
+                    "adapter_id": "route_quantity_quote_for_v2_pool/v1",
+                    "content_schema": "route_v2_pool_state/v1",
+                },
+                {
+                    "role": "dex_usd_price_context",
+                    "status": "unavailable",
+                    "reason_code": "typed_source_missing",
+                    "filename": None,
+                    "sha256": None,
+                    "size": None,
+                    "logical_generation": None,
+                    "adapter_id": "route_dex_usd_price_context/v1",
+                    "content_schema": "route_dex_usd_price_context/v1",
+                },
+            ],
+        }
+        self.assertEqual(
+            validate_typed_source_lineage(lineage, market_type="dex"),
+            lineage,
+        )
+        self.assertEqual(
+            typed_source_lineage_observed_members(
+                lineage, market_type="dex"
+            ),
+            [],
+        )
+
+    def test_cross_market_role_unsafe_name_and_wrong_contract_fail(self):
+        base_members = [
+            self.observed_member(
+                "cex_raw_book_response",
+                "fetch_cex_depth/parse_book/v1",
+                "route_bytes/v1",
+                "book.json",
+            ),
+            self.observed_member(
+                "cex_market_rules",
+                "route_quantity_quote_for_book/v1",
+                "route_market_rules_source/v1",
+                "rules.json",
+            ),
+            self.observed_member(
+                "quote_usd_conversion",
+                "route_usd_conversion_source/v1",
+                "route_usd_conversion_source/v1",
+                "usd.json",
+            ),
+        ]
+        cases = (
+            ({**base_members[0], "role": "dex_pool_state"}, "role|market"),
+            ({**base_members[0], "filename": "../book.json"}, "filename|basename"),
+            ({**base_members[0], "adapter_id": "caller/adapter/v1"}, "adapter|contract"),
+            ({**base_members[0], "size": 8 * 1024 * 1024 + 1}, "size|bytes"),
+        )
+        for member, message in cases:
+            with self.subTest(member=member):
+                mutated = [member] + base_members[1:]
+                mutated.sort(key=lambda row: row["role"])
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_typed_source_lineage(
+                        {
+                            "schema": "route_leg_typed_source_lineage/v1",
+                            "members": mutated,
+                        },
+                        market_type="cex",
+                    )
 
 
 if __name__ == "__main__":

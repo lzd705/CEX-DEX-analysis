@@ -342,6 +342,27 @@ def _route_mode(buy_leg: Mapping[str, Any], sell_leg: Mapping[str, Any]) -> Tupl
     return "prepositioned_inventory", "candidate", None
 
 
+def strict_cost_route_classification(
+    leg: Mapping[str, Any],
+    *,
+    selected_market_ids: Iterable[str],
+    structurally_supported_market_ids: Iterable[str],
+) -> Tuple[str, Optional[str]]:
+    """Classify a DEX leg from frozen structural scope, never live outcomes."""
+    if not isinstance(leg, Mapping):
+        raise ValueError("strict-cost leg is invalid")
+    market_id = leg.get("market_id")
+    if not isinstance(market_id, str) or leg.get("market_type") != "dex":
+        raise ValueError("strict-cost DEX leg identity is invalid")
+    selected = set(selected_market_ids)
+    supported = set(structurally_supported_market_ids)
+    if market_id in selected and market_id in supported:
+        return "candidate", None
+    if market_id in supported:
+        return "research_only", "cost_adapter_cohort_capacity"
+    return "research_only", "strict_cost_adapter_unsupported"
+
+
 def build_route_universe(
     catalog: Iterable[Mapping[str, Any]],
     depth_rows: Iterable[Mapping[str, Any]],

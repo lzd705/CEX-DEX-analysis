@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import errno
 import hashlib
+import inspect
 import json
 import math
 import multiprocessing
@@ -35,6 +36,7 @@ try:
         publish_route_cohort_bundle,
     )
     from scripts.fetch_cex_depth import (
+        STRICT_CEX_TYPED_RULE_VENUES,
         cex_market_id,
         collect_cex_market_observation,
         load_cataloged_markets,
@@ -42,11 +44,24 @@ try:
     from scripts.fetch_dex_depth import (
         RpcClient,
         block_timestamp_text,
+        canonical_route_fixed_block_header,
         collect_dex_pool_observation,
+        freeze_v2_pool_state,
+        is_canonical_rpc_quantity,
         rpc_url_for_chain,
         dex_market_id,
         load_pool_inventory,
     )
+    from scripts.route_shadow_inputs import (
+        TYPED_SOURCE_LINEAGE_SCHEMA,
+        TYPED_SOURCE_MANIFEST_FIELDS,
+        TYPED_SOURCE_MANIFEST_MEMBER_FIELDS,
+        TYPED_SOURCE_MANIFEST_SCHEMA,
+        TYPED_SOURCE_ROLE_CONTRACTS,
+        typed_source_lineage_observed_members,
+        validate_typed_source_lineage,
+    )
+    from scripts.route_quantity import MarketRules
 except ModuleNotFoundError:
     from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
     from route_cohort import canonical_route_id, classify_route_timing
@@ -55,6 +70,7 @@ except ModuleNotFoundError:
         publish_route_cohort_bundle,
     )
     from fetch_cex_depth import (
+        STRICT_CEX_TYPED_RULE_VENUES,
         cex_market_id,
         collect_cex_market_observation,
         load_cataloged_markets,
@@ -62,11 +78,24 @@ except ModuleNotFoundError:
     from fetch_dex_depth import (
         RpcClient,
         block_timestamp_text,
+        canonical_route_fixed_block_header,
         collect_dex_pool_observation,
+        freeze_v2_pool_state,
+        is_canonical_rpc_quantity,
         rpc_url_for_chain,
         dex_market_id,
         load_pool_inventory,
     )
+    from route_shadow_inputs import (  # type: ignore[no-redef]
+        TYPED_SOURCE_LINEAGE_SCHEMA,
+        TYPED_SOURCE_MANIFEST_FIELDS,
+        TYPED_SOURCE_MANIFEST_MEMBER_FIELDS,
+        TYPED_SOURCE_MANIFEST_SCHEMA,
+        TYPED_SOURCE_ROLE_CONTRACTS,
+        typed_source_lineage_observed_members,
+        validate_typed_source_lineage,
+    )
+    from route_quantity import MarketRules
 
 
 class _DaemonFutureExecutor:
@@ -120,13 +149,46 @@ class _DaemonFutureExecutor:
                 thread.join()
 
 
+class _RouteCollectionResult(dict):
+    """A normal JSON mapping plus one process-local sealed typed capability."""
+
+    __slots__ = ("_typed_source_payloads",)
+
+    def __init__(
+        self,
+        value: Mapping[str, Any],
+        typed_source_payloads: Mapping[str, Tuple[Mapping[str, Any], ...]],
+    ) -> None:
+        super().__init__(value)
+        self._typed_source_payloads = {
+            market_id: tuple(dict(item) for item in members)
+            for market_id, members in typed_source_payloads.items()
+        }
+
+
+_CANONICAL_CHAIN_IDS = {
+    "eth": "0x1",
+    "optimism": "0xa",
+    "bsc": "0x38",
+    "zksync": "0x144",
+    "base": "0x2105",
+    "arbitrum": "0xa4b1",
+}
+
+
 def _run_process_call(
     connection: Any,
     function: Callable[..., Any],
     args: Tuple[Any, ...],
+    child_close_fds: Tuple[int, ...],
 ) -> None:
     """Run one inherited callable and return only a value or a generic failure."""
     try:
+        for descriptor in child_close_fds:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             payload = ("result", function(*args))
         except BaseException:
@@ -164,16 +226,34 @@ class _ForkProcessExecutor:
     in-process state inject ``ThreadPoolExecutor`` explicitly.
     """
 
-    def __init__(self, max_workers: int) -> None:
+    def __init__(
+        self,
+        max_workers: int,
+        *,
+        child_close_fds: Iterable[int] = (),
+    ) -> None:
         _require_single_threaded_fork()
         if type(max_workers) is not int or max_workers < 1:
             raise ValueError("max_workers must be positive")
+        try:
+            close_fds = tuple(child_close_fds)
+        except TypeError as error:
+            raise ValueError("child_close_fds must be an iterable of descriptors") from error
+        if (
+            any(type(descriptor) is not int or descriptor < 0 for descriptor in close_fds)
+            or len(close_fds) != len(set(close_fds))
+        ):
+            raise ValueError("child_close_fds must contain unique nonnegative integers")
         self._context = multiprocessing.get_context("fork")
         self._max_workers = max_workers
+        self._child_close_fds = close_fds
         self._closed = False
         self._lock = Lock()
         self._records: Dict[Future, Dict[str, Any]] = {}
         self._sequence = 0
+        self._started_count = 0
+        self._reaped_count = 0
+        self._orphan_count = 0
 
     def submit(self, function: Callable[..., Any], *args: Any) -> Future:
         with self._lock:
@@ -192,7 +272,7 @@ class _ForkProcessExecutor:
             receive, send = self._context.Pipe(duplex=False)
             process = self._context.Process(
                 target=_run_process_call,
-                args=(send, function, tuple(args)),
+                args=(send, function, tuple(args), self._child_close_fds),
                 name="route-cohort-process-{}".format(self._sequence + 1),
             )
             process.daemon = True
@@ -207,9 +287,11 @@ class _ForkProcessExecutor:
                 return future
             send.close()
             self._sequence += 1
+            self._started_count += 1
             record: Dict[str, Any] = {
                 "process": process,
                 "connection": receive,
+                "reaped": False,
             }
             self._records[future] = record
             return future
@@ -233,6 +315,7 @@ class _ForkProcessExecutor:
             except (EOFError, OSError, ValueError):
                 kind, value = "error", "route collection worker terminated"
             self._reap_process(process)
+            self._mark_reaped(record)
             if future.done():
                 return
             if kind == "result":
@@ -244,6 +327,22 @@ class _ForkProcessExecutor:
                 connection.close()
             except OSError:
                 pass
+
+    def _mark_reaped(self, record: Mapping[str, Any]) -> None:
+        if record["process"].is_alive():
+            return
+        if not record.get("reaped"):
+            record["reaped"] = True
+            self._reaped_count += 1
+
+    def process_evidence(self) -> Dict[str, int]:
+        """Return observed child lifecycle counts without inferring success."""
+        with self._lock:
+            return {
+                "collector_process_started_count": self._started_count,
+                "collector_process_reaped_count": self._reaped_count,
+                "orphan_process_count": self._orphan_count,
+            }
 
     def wait_for_any(
         self,
@@ -282,12 +381,14 @@ class _ForkProcessExecutor:
                 process.terminate()
         for record in records:
             record["process"].join(timeout=0.25)
+            self._mark_reaped(record)
         for record in records:
             process = record["process"]
             if process.is_alive():
                 process.kill()
         for record in records:
             record["process"].join(timeout=0.25)
+            self._mark_reaped(record)
         for record in records:
             try:
                 record["connection"].close()
@@ -306,6 +407,7 @@ class _ForkProcessExecutor:
             for record in records
             if record["process"].is_alive()
         ]
+        self._orphan_count = len(survivors)
         if survivors:
             raise RuntimeError("route collection process cleanup failed")
         with self._lock:
@@ -472,6 +574,337 @@ def _canonical_fingerprint(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def publish_typed_source_manifest(
+    raw_run_root: Path,
+    *,
+    raw_evidence_run_id: str,
+    members: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Atomically retain exact observed typed members and their manifest."""
+    if not isinstance(raw_evidence_run_id, str) or not _SNAPSHOT_ID.fullmatch(
+        raw_evidence_run_id
+    ):
+        raise ValueError("typed-source raw run ID is invalid")
+    root = _canonical_raw_path(Path(raw_run_root))
+    _reject_symlink_ancestry(root)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stage = root / ".typed-stage-{}".format(uuid.uuid4().hex)
+    stage.mkdir(mode=0o700)
+    typed_stage = stage / "typed"
+    typed_stage.mkdir(mode=0o700)
+    records = []
+    seen = set()
+    try:
+        normalized = []
+        for raw in members:
+            if not isinstance(raw, Mapping) or set(raw) != {
+                "market_id", "role", "payload", "logical_generation",
+                "adapter_id", "content_schema",
+            }:
+                raise ValueError("typed-source producer member schema is invalid")
+            market_id = raw.get("market_id")
+            role = raw.get("role")
+            contract = TYPED_SOURCE_ROLE_CONTRACTS.get(role)
+            payload = raw.get("payload")
+            key = (market_id, role)
+            if key in seen:
+                raise ValueError("typed-source market/role must be unique")
+            seen.add(key)
+            if (
+                not isinstance(market_id, str)
+                or not market_id.startswith(("cex:", "dex:"))
+                or contract is None
+                or raw.get("adapter_id") != contract["adapter_id"]
+                or raw.get("content_schema") != contract["content_schema"]
+                or not isinstance(payload, bytes)
+                or not 0 < len(payload) <= contract["max_bytes"]
+                or not isinstance(raw.get("logical_generation"), str)
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    raw["logical_generation"],
+                    flags=re.ASCII,
+                ) is None
+            ):
+                raise ValueError("typed-source producer member is invalid")
+            normalized.append(dict(raw))
+        normalized.sort(key=lambda row: (row["market_id"], row["role"]))
+        for index, raw in enumerate(normalized):
+            filename = "{:04d}-{}.json".format(index, raw["role"])
+            payload = raw["payload"]
+            target = typed_stage / filename
+            descriptor = os.open(
+                str(target),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                offset = 0
+                while offset < len(payload):
+                    written = os.write(descriptor, payload[offset:])
+                    if written <= 0:
+                        raise OSError("short typed-source member write")
+                    offset += written
+                os.fsync(descriptor)
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ValueError("typed-source member is unsafe")
+            finally:
+                os.close(descriptor)
+            record = {
+                "market_id": raw["market_id"],
+                "role": raw["role"],
+                "filename": filename,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+                "logical_generation": raw["logical_generation"],
+                "adapter_id": raw["adapter_id"],
+                "content_schema": raw["content_schema"],
+            }
+            if set(record) != TYPED_SOURCE_MANIFEST_MEMBER_FIELDS:
+                raise AssertionError("typed-source manifest member schema drifted")
+            records.append(record)
+        manifest = {
+            "schema": TYPED_SOURCE_MANIFEST_SCHEMA,
+            "raw_evidence_run_id": raw_evidence_run_id,
+            "member_count": len(records),
+            "members": records,
+        }
+        if set(manifest) != TYPED_SOURCE_MANIFEST_FIELDS:
+            raise AssertionError("typed-source manifest schema drifted")
+        manifest_bytes = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        manifest_path = stage / "typed-manifest.json"
+        manifest_path.write_bytes(manifest_bytes)
+        with manifest_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        stage_fd = os.open(str(stage), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(stage_fd)
+        finally:
+            os.close(stage_fd)
+        final_typed = root / "typed"
+        final_manifest = root / "typed-manifest.json"
+        if final_typed.exists() or final_manifest.exists():
+            raise ValueError("immutable typed-source inventory already exists")
+        os.rename(typed_stage, final_typed)
+        os.rename(manifest_path, final_manifest)
+        root_fd = os.open(str(root), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+        for record in records:
+            payload = (final_typed / record["filename"]).read_bytes()
+            if len(payload) != record["size"] or hashlib.sha256(payload).hexdigest() != record["sha256"]:
+                raise ValueError("typed-source member changed after publication")
+        if final_manifest.read_bytes() != manifest_bytes:
+            raise ValueError("typed-source manifest changed after publication")
+        return {
+            "manifest": manifest,
+            "typed_source_manifest_sha256": hashlib.sha256(
+                manifest_bytes
+            ).hexdigest(),
+            "typed_root": str(final_typed),
+            "manifest_path": str(final_manifest),
+        }
+    finally:
+        if stage.exists():
+            if typed_stage.exists():
+                for path in typed_stage.iterdir():
+                    path.unlink()
+                typed_stage.rmdir()
+            manifest_path = stage / "typed-manifest.json"
+            if manifest_path.exists():
+                manifest_path.unlink()
+            stage.rmdir()
+
+
+def _typed_json_bytes(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        value, allow_nan=False, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _typed_unavailable(role: str, reason: str) -> Dict[str, Any]:
+    contract = TYPED_SOURCE_ROLE_CONTRACTS[role]
+    return {
+        "role": role,
+        "status": "unavailable",
+        "reason_code": reason,
+        "filename": None,
+        "sha256": None,
+        "size": None,
+        "logical_generation": None,
+        "adapter_id": contract["adapter_id"],
+        "content_schema": contract["content_schema"],
+    }
+
+
+def _typed_member_spec(
+    market_id: str, role: str, payload: bytes, logical_generation: str
+) -> Dict[str, Any]:
+    contract = TYPED_SOURCE_ROLE_CONTRACTS[role]
+    return {
+        "market_id": market_id,
+        "role": role,
+        "payload": payload,
+        "logical_generation": logical_generation,
+        "adapter_id": contract["adapter_id"],
+        "content_schema": contract["content_schema"],
+    }
+
+
+def attach_typed_source_lineage(
+    cohort: Mapping[str, Any], *, raw_root: Path
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Install retained typed members and bind every leg to the manifest."""
+    if not isinstance(cohort, Mapping):
+        raise ValueError("typed-source cohort is invalid")
+    run_id = cohort.get("raw_evidence_run_id")
+    if not isinstance(run_id, str) or _SNAPSHOT_ID.fullmatch(run_id) is None:
+        raise ValueError("typed-source raw run ID is invalid")
+    raw_run_root = _canonical_raw_path(Path(raw_root)) / run_id
+    legs = cohort.get("legs")
+    if not isinstance(legs, list):
+        raise ValueError("typed-source cohort legs are invalid")
+    specs: List[Dict[str, Any]] = []
+    has_sealed_capability = hasattr(cohort, "_typed_source_payloads")
+    sealed_payloads = getattr(cohort, "_typed_source_payloads", {})
+    if not isinstance(sealed_payloads, Mapping):
+        raise ValueError("typed-source payload capability is invalid")
+    eligible_market_ids = {
+        leg.get("market_id")
+        for leg in legs
+        if isinstance(leg, Mapping)
+        and leg.get("status") in {"observed", "partial"}
+    }
+    if (
+        any(not isinstance(value, str) for value in eligible_market_ids)
+        or any(not isinstance(value, str) for value in sealed_payloads)
+        or set(sealed_payloads) - eligible_market_ids
+        or (
+            has_sealed_capability
+            and set(sealed_payloads) != eligible_market_ids
+        )
+    ):
+        raise ValueError("typed-source payload capability is invalid")
+    pending: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for leg in legs:
+        if not isinstance(leg, Mapping):
+            raise ValueError("typed-source leg is invalid")
+        market_id = leg.get("market_id")
+        market_type = leg.get("market_type")
+        if not isinstance(market_id, str) or market_type not in {"cex", "dex"}:
+            raise ValueError("typed-source leg identity is invalid")
+        contracts = {
+            role: contract
+            for role, contract in TYPED_SOURCE_ROLE_CONTRACTS.items()
+            if contract["market_type"] == market_type
+        }
+        members = {
+            role: _typed_unavailable(role, "typed_source_missing")
+            for role in contracts
+        }
+        available = leg.get("status") in {"observed", "partial"}
+        if market_type == "cex":
+            venue = market_id.split(":", 2)[1]
+            if venue not in STRICT_CEX_TYPED_RULE_VENUES:
+                members["cex_market_rules"] = _typed_unavailable(
+                    "cex_market_rules", "typed_source_adapter_unsupported"
+                )
+                members["quote_usd_conversion"] = _typed_unavailable(
+                    "quote_usd_conversion", "typed_source_adapter_unsupported"
+                )
+        if market_type == "cex" and available:
+            if venue in STRICT_CEX_TYPED_RULE_VENUES:
+                members["cex_market_rules"] = _typed_unavailable(
+                    "cex_market_rules", "typed_source_failed"
+                )
+                members["quote_usd_conversion"] = _typed_unavailable(
+                    "quote_usd_conversion", "typed_source_failed"
+                )
+            response_path = (
+                raw_run_root / "accepted"
+                / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
+                / "response.json"
+            )
+            response, _identity = _read_regular_file(response_path)
+            raw_sha = hashlib.sha256(response).hexdigest()
+            if raw_sha != leg.get("raw_response_sha256"):
+                raise ValueError("typed-source CEX raw response lineage differs")
+            specs.append(_typed_member_spec(
+                market_id, "cex_raw_book_response", response, raw_sha
+            ))
+        elif market_type == "dex":
+            context = leg.get("collector_context")
+            if isinstance(context, Mapping):
+                context_payload = _typed_json_bytes(context)
+                specs.append(_typed_member_spec(
+                    market_id, "dex_usd_price_context", context_payload,
+                    hashlib.sha256(context_payload).hexdigest(),
+                ))
+        for sealed in sealed_payloads.get(market_id, ()):
+            if (
+                not isinstance(sealed, Mapping)
+                or set(sealed) != {
+                    "market_id", "role", "payload", "logical_generation",
+                    "adapter_id", "content_schema",
+                }
+                or sealed.get("market_id") != market_id
+            ):
+                raise ValueError("typed-source payload capability is invalid")
+            specs.append(dict(sealed))
+        pending[market_id] = members
+
+    publication = publish_typed_source_manifest(
+        raw_run_root, raw_evidence_run_id=run_id, members=specs
+    )
+    for record in publication["manifest"]["members"]:
+        member = {
+            "role": record["role"],
+            "status": "observed",
+            "reason_code": None,
+            "filename": record["filename"],
+            "sha256": record["sha256"],
+            "size": record["size"],
+            "logical_generation": record["logical_generation"],
+            "adapter_id": record["adapter_id"],
+            "content_schema": record["content_schema"],
+        }
+        pending[record["market_id"]][record["role"]] = member
+    normalized_legs = []
+    observed_inventory = []
+    for leg in legs:
+        market_id = leg["market_id"]
+        market_type = leg["market_type"]
+        lineage = validate_typed_source_lineage({
+            "schema": TYPED_SOURCE_LINEAGE_SCHEMA,
+            "members": sorted(
+                pending[market_id].values(), key=lambda row: row["role"]
+            ),
+        }, market_type=market_type)
+        normalized_legs.append({**dict(leg), "typed_source_lineage": lineage})
+        for item in typed_source_lineage_observed_members(
+            lineage, market_type=market_type
+        ):
+            observed_inventory.append({"market_id": market_id, **item})
+    if observed_inventory != publication["manifest"]["members"]:
+        raise ValueError("typed-source manifest/core inventory differs")
+    normalized = dict(cohort)
+    normalized["legs"] = normalized_legs
+    normalized.pop("route_cohort_id", None)
+    normalized.pop("fingerprint", None)
+    without_hashes = dict(normalized)
+    normalized["route_cohort_id"] = "cohort:" + _canonical_fingerprint(
+        without_hashes
+    )
+    normalized["fingerprint"] = _canonical_fingerprint(normalized)
+    return normalized, publication
+
+
 _CEX_MARKET_ID = re.compile(
     r"cex:([a-z0-9][a-z0-9._-]{0,63}):"
     r"([A-Z0-9][A-Z0-9._-]{0,63})/"
@@ -625,6 +1058,195 @@ def _row_from_collector(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("route leg collector returned an invalid row")
     return value
+
+
+def _collector_accepts_typed_sink(collector: Callable[..., Any]) -> bool:
+    """Do not pass a new keyword to legacy/custom collectors by accident."""
+    try:
+        parameters = inspect.signature(collector).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        item.name == "typed_source_payload_sink"
+        for item in parameters
+    )
+
+
+def _validated_typed_payload_inventory(
+    market_id: str,
+    market_type: str,
+    values: Iterable[Any],
+) -> Tuple[Mapping[str, Any], ...]:
+    members = []
+    seen = set()
+    aggregate = 0
+    for raw in values:
+        if not isinstance(raw, Mapping) or set(raw) != {"role", "payload"}:
+            raise ValueError("typed-source worker inventory is invalid")
+        role = raw.get("role")
+        payload = raw.get("payload")
+        contract = TYPED_SOURCE_ROLE_CONTRACTS.get(role)
+        if (
+            role in seen
+            or contract is None
+            or contract["market_type"] != market_type
+            or not isinstance(payload, bytes)
+            or not 0 < len(payload) <= contract["max_bytes"]
+        ):
+            raise ValueError("typed-source worker inventory is invalid")
+        if market_type == "cex" and role in {
+            "cex_market_rules", "quote_usd_conversion"
+        }:
+            try:
+                prefix, venue, _instrument = market_id.split(":", 2)
+            except ValueError as error:
+                raise ValueError(
+                    "typed-source worker inventory is invalid"
+                ) from error
+            if prefix != "cex" or venue not in STRICT_CEX_TYPED_RULE_VENUES:
+                raise ValueError("typed-source worker inventory is invalid")
+        seen.add(role)
+        aggregate += len(payload)
+        if aggregate > 24 * 1024 * 1024:
+            raise ValueError("typed-source worker inventory is invalid")
+        if role == "dex_pool_state":
+            try:
+                parsed = json.loads(payload.decode("utf-8"))
+                if (
+                    not isinstance(parsed, Mapping)
+                    or parsed.get("schema") != contract["content_schema"]
+                    or parsed.get("state_id")
+                    != freeze_v2_pool_state({
+                        **dict(parsed),
+                        **{
+                            field: int(parsed[field])
+                            for field in (
+                                "chain_id", "token0_decimals", "token1_decimals",
+                                "reserve0_raw", "reserve1_raw",
+                                "reserve_timestamp_last_raw", "fee_bps",
+                                "fee_numerator", "fee_denominator", "block_number",
+                            )
+                        },
+                    }).state_id
+                    or payload != _typed_json_bytes(parsed)
+                ):
+                    raise ValueError("invalid state")
+                logical_generation = parsed["state_id"].split(":", 1)[1]
+            except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("typed-source worker inventory is invalid") from error
+        elif role in {"cex_market_rules", "quote_usd_conversion"}:
+            try:
+                parsed = json.loads(payload.decode("utf-8"))
+                if not isinstance(parsed, Mapping) or payload != _typed_json_bytes(parsed):
+                    raise ValueError("invalid typed JSON")
+                if role == "cex_market_rules":
+                    expected_fields = {
+                        "schema", "market_id", "base_asset", "quote_asset",
+                        "base_unit_decimals", "quote_unit_decimals",
+                        "base_increment", "quote_increment",
+                        "min_base_quantity", "min_quote_notional",
+                        "observed_at", "valid_until",
+                    }
+                    _prefix, _venue, instrument = market_id.split(":", 2)
+                    base_asset, quote_asset = instrument.split("/", 1)
+                    decimal_fields = (
+                        "base_increment", "quote_increment",
+                        "min_base_quantity", "min_quote_notional",
+                    )
+                    if (
+                        set(parsed) != expected_fields
+                        or parsed.get("schema") != contract["content_schema"]
+                        or parsed.get("market_id") != market_id
+                        or parsed.get("base_asset") != base_asset
+                        or parsed.get("quote_asset") != quote_asset
+                        or any(
+                            type(parsed.get(field)) is not int
+                            or not 0 <= parsed[field] <= 255
+                            for field in (
+                                "base_unit_decimals", "quote_unit_decimals"
+                            )
+                        )
+                    ):
+                        raise ValueError("invalid CEX market rules")
+                else:
+                    expected_fields = {
+                        "schema", "quote_asset", "usd_per_quote",
+                        "observed_at", "valid_until", "source",
+                    }
+                    decimal_fields = ("usd_per_quote",)
+                    _prefix, _venue, instrument = market_id.split(":", 2)
+                    quote_asset = instrument.split("/", 1)[1]
+                    if (
+                        set(parsed) != expected_fields
+                        or parsed.get("schema") != contract["content_schema"]
+                        or parsed.get("quote_asset") != quote_asset
+                        or not isinstance(parsed.get("source"), str)
+                        or not parsed["source"]
+                        or parsed["source"] != parsed["source"].strip()
+                    ):
+                        raise ValueError("invalid CEX USD conversion")
+                for field in decimal_fields:
+                    value = parsed.get(field)
+                    if not isinstance(value, str) or not value or value != value.strip():
+                        raise ValueError("invalid typed decimal")
+                    number = Decimal(value)
+                    canonical = format(number, "f")
+                    if "." in canonical:
+                        canonical = canonical.rstrip("0").rstrip(".")
+                    if (
+                        not number.is_finite()
+                        or number < 0
+                        or (number.is_zero() and number.is_signed())
+                        or (
+                            number == 0
+                            and field not in {
+                                "min_base_quantity", "min_quote_notional"
+                            }
+                        )
+                        or canonical != value
+                    ):
+                        raise ValueError("invalid typed decimal")
+                observed = _utc_datetime(
+                    parsed.get("observed_at"), field="typed observed_at"
+                )
+                valid_until = _utc_datetime(
+                    parsed.get("valid_until"), field="typed valid_until"
+                )
+                if valid_until <= observed:
+                    raise ValueError("invalid typed validity window")
+                if role == "cex_market_rules":
+                    MarketRules(
+                        market_id=parsed["market_id"],
+                        base_asset=parsed["base_asset"],
+                        quote_asset=parsed["quote_asset"],
+                        base_unit_decimals=parsed["base_unit_decimals"],
+                        quote_unit_decimals=parsed["quote_unit_decimals"],
+                        base_increment=Decimal(parsed["base_increment"]),
+                        quote_increment=Decimal(parsed["quote_increment"]),
+                        min_base_quantity=Decimal(parsed["min_base_quantity"]),
+                        min_quote_notional=Decimal(parsed["min_quote_notional"]),
+                        observed_at=parsed["observed_at"],
+                        valid_until=parsed["valid_until"],
+                        source_record_sha256=hashlib.sha256(payload).hexdigest(),
+                    )
+                logical_generation = hashlib.sha256(payload).hexdigest()
+            except (
+                KeyError, TypeError, ValueError, InvalidOperation,
+                UnicodeDecodeError, json.JSONDecodeError,
+            ) as error:
+                raise ValueError("typed-source worker inventory is invalid") from error
+        else:
+            logical_generation = hashlib.sha256(payload).hexdigest()
+        members.append({
+            "market_id": market_id,
+            "role": role,
+            "payload": payload,
+            "logical_generation": logical_generation,
+            "adapter_id": contract["adapter_id"],
+            "content_schema": contract["content_schema"],
+        })
+    members.sort(key=lambda item: item["role"])
+    return tuple(members)
 
 
 def _collector_identity_matches(
@@ -1543,6 +2165,7 @@ def _clear_unsafe_accepted_alias(
 def _validated_fixed_block(
     resolved: Any,
     *,
+    chain: str,
     latest_allowed: datetime,
 ) -> Dict[str, Any]:
     if not isinstance(resolved, Mapping):
@@ -1557,9 +2180,35 @@ def _validated_fixed_block(
     parsed = _utc_datetime(normalized, field="fixed block timestamp")
     if parsed > latest_allowed.astimezone(timezone.utc):
         raise ValueError("invalid fixed block")
+    chain_id = resolved.get("chain_id")
+    if chain_id is not None:
+        expected_chain_id = _CANONICAL_CHAIN_IDS.get(chain)
+        if (
+            not is_canonical_rpc_quantity(chain_id)
+            or expected_chain_id is None
+            or chain_id != expected_chain_id
+        ):
+            raise ValueError("invalid fixed block chain ID")
+    header = None
+    raw_header = resolved.get("block_header")
+    if raw_header is not None:
+        try:
+            candidate = canonical_route_fixed_block_header(raw_header)
+            if (
+                int(candidate["number"], 16) == number
+                and _utc_datetime(
+                    block_timestamp_text(candidate),
+                    field="fixed block header timestamp",
+                ) == parsed
+            ):
+                header = candidate
+        except (TypeError, ValueError):
+            header = None
     return {
         "block_number": number,
         "block_timestamp": normalized,
+        "chain_id": chain_id,
+        "block_header": header,
     }
 
 
@@ -1580,6 +2229,8 @@ def collect_route_cohort(
     raw_root: Optional[Path] = None,
     snapshot_id: Optional[str] = None,
     executor_factory: Callable[..., Any] = _ForkProcessExecutor,
+    child_close_fds: Iterable[int] = (),
+    process_evidence_sink: Optional[Dict[str, int]] = None,
     wall_clock: Callable[[], datetime] = _utc_now,
 ) -> Dict[str, Any]:
     """Collect one fair, bounded cohort; late or incomplete legs stay terminal."""
@@ -1614,7 +2265,14 @@ def collect_route_cohort(
         raise ValueError("route references an unselected leg")
     if _has_route_volume_lineage(routes, legs_by_market):
         _validate_route_volume_lineage(routes, legs_by_market)
-    has_dex = any(_market_type(legs_by_market[item]) == "dex" for item in market_ids)
+    has_dex = any(
+        _market_type(legs_by_market[item]) == "dex"
+        and (
+            not isinstance(legs_by_market[item].get("collector_context"), Mapping)
+            or legs_by_market[item]["collector_context"].get("status") == "observed"
+        )
+        for item in market_ids
+    )
     if has_dex and dex_block_resolver is None:
         raise ValueError("DEX fixed block resolver is required")
     if raw_root is None:
@@ -1667,8 +2325,15 @@ def collect_route_cohort(
     fixed_blocks: Dict[str, Mapping[str, Any]] = {}
     dex_by_chain: Dict[str, List[str]] = {}
     for market_id in market_ids:
-        if _market_type(legs_by_market[market_id]) == "dex":
-            dex_by_chain.setdefault(_source_key(legs_by_market[market_id])[1], []).append(market_id)
+        leg = legs_by_market[market_id]
+        if _market_type(leg) == "dex":
+            context = leg.get("collector_context")
+            if isinstance(context, Mapping) and context.get("status") != "observed":
+                terminal_reasons[market_id] = "usd_price_context_{}".format(
+                    context.get("status")
+                )
+            else:
+                dex_by_chain.setdefault(_source_key(leg)[1], []).append(market_id)
     pending_by_source: Dict[Tuple[str, str], List[str]] = {}
     for market_id in market_ids:
         if _market_type(legs_by_market[market_id]) == "cex":
@@ -1695,6 +2360,9 @@ def collect_route_cohort(
     source_index = 0
     active_by_source: Dict[Tuple[str, str], int] = {}
     completed: Dict[str, Mapping[str, Any]] = {}
+    completed_typed_payloads: Dict[
+        str, Tuple[Mapping[str, Any], ...]
+    ] = {}
     completed_stage_dirs: Dict[
         str, Tuple[Path, Tuple[int, int]]
     ] = {}
@@ -1725,6 +2393,7 @@ def collect_route_cohort(
         Optional[str],
         Optional[Path],
         Optional[Tuple[int, int]],
+        Tuple[Mapping[str, Any], ...],
     ]:
         leg = legs_by_market[market_id]
         kind, source = _source_key(leg)
@@ -1733,10 +2402,19 @@ def collect_route_cohort(
         try:
             raw_path, stage_dir, stage_identity = raw_paths(market_id)
             active_deadline.require_remaining()
+            typed_payloads: List[Mapping[str, Any]] = []
+            typed_keyword = (
+                {"typed_source_payload_sink": typed_payloads.append}
+                if _collector_accepts_typed_sink(
+                    cex_collector if kind == "cex" else dex_collector
+                )
+                else {}
+            )
             if kind == "cex":
                 row = _row_from_collector(cex_collector(
                     dict(leg), snapshot_id=run_id, raw_path=raw_path,
                     deadline=active_deadline,
+                    **typed_keyword,
                 ))
             else:
                 block = fixed_blocks[source]
@@ -1744,7 +2422,10 @@ def collect_route_cohort(
                     dict(leg), snapshot_id=run_id, raw_path=raw_path,
                     fixed_block_number=block["block_number"],
                     fixed_block_timestamp=block.get("block_timestamp", ""),
+                    fixed_chain_id=block.get("chain_id"),
+                    fixed_block_header=block.get("block_header"),
                     deadline=active_deadline,
+                    **typed_keyword,
                 ))
                 if (str(row.get("block_number")) != str(block["block_number"])
                         or str(row.get("block_timestamp") or "") != str(block.get("block_timestamp") or "")):
@@ -1754,6 +2435,7 @@ def collect_route_cohort(
                         "fixed_block_lineage_mismatch",
                         stage_dir,
                         stage_identity,
+                        (),
                     )
                 row = {
                     **dict(row),
@@ -1767,9 +2449,15 @@ def collect_route_cohort(
                     "collector_identity_mismatch",
                     stage_dir,
                     stage_identity,
+                    (),
                 )
             active_deadline.require_remaining()
-            return market_id, row, None, stage_dir, stage_identity
+            inventory = _validated_typed_payload_inventory(
+                market_id, kind, typed_payloads
+            )
+            return (
+                market_id, row, None, stage_dir, stage_identity, inventory
+            )
         except _UnsafeRawEvidence:
             return (
                 market_id,
@@ -1777,6 +2465,7 @@ def collect_route_cohort(
                 "raw_evidence_path_unsafe",
                 stage_dir,
                 stage_identity,
+                (),
             )
         except CollectionDeadlineExceeded:
             return (
@@ -1785,6 +2474,7 @@ def collect_route_cohort(
                 "route_deadline_exceeded",
                 stage_dir,
                 stage_identity,
+                (),
             )
         except Exception:
             return (
@@ -1793,6 +2483,7 @@ def collect_route_cohort(
                 "collection_failed",
                 stage_dir,
                 stage_identity,
+                (),
             )
 
     def resolve_one(
@@ -1803,6 +2494,7 @@ def collect_route_cohort(
             resolved = dex_block_resolver(chain, deadline=active_deadline)
             normalized = _validated_fixed_block(
                 resolved,
+                chain=chain,
                 latest_allowed=wall_deadline_utc,
             )
             active_deadline.require_remaining()
@@ -1812,7 +2504,22 @@ def collect_route_cohort(
         except Exception:
             return chain, None, "fixed_block_unavailable"
 
-    executor = executor_factory(max_workers=max_workers)
+    close_fds = tuple(child_close_fds)
+    if (
+        any(type(descriptor) is not int or descriptor < 0 for descriptor in close_fds)
+        or len(close_fds) != len(set(close_fds))
+    ):
+        raise ValueError("child_close_fds must contain unique nonnegative integers")
+    if executor_factory is _ForkProcessExecutor:
+        executor = executor_factory(
+            max_workers=max_workers, child_close_fds=close_fds
+        )
+    else:
+        if close_fds:
+            raise ValueError(
+                "child_close_fds are supported only by the process executor"
+            )
+        executor = executor_factory(max_workers=max_workers)
 
     def source_limit(key: Tuple[str, str]) -> int:
         if key[0] == "cex":
@@ -1909,6 +2616,7 @@ def collect_route_cohort(
                         reason,
                         stage_dir,
                         stage_identity,
+                        typed_payloads,
                     ) = future.result()
                     if reason == "route_deadline_exceeded":
                         expired.add(returned_id)
@@ -1916,6 +2624,7 @@ def collect_route_cohort(
                         terminal_reasons[returned_id] = reason
                     elif row is not None:
                         completed[returned_id] = row
+                        completed_typed_payloads[returned_id] = typed_payloads
                         if stage_dir is not None and stage_identity is not None:
                             completed_stage_dirs[returned_id] = (
                                 stage_dir,
@@ -1936,6 +2645,17 @@ def collect_route_cohort(
             else:
                 expired.update(items)
         executor.shutdown(wait=False)
+        evidence = getattr(executor, "process_evidence", None)
+        observed_processes = (
+            evidence() if callable(evidence) else {
+                "collector_process_started_count": 0,
+                "collector_process_reaped_count": 0,
+                "orphan_process_count": 0,
+            }
+        )
+        if process_evidence_sink is not None:
+            process_evidence_sink.clear()
+            process_evidence_sink.update(observed_processes)
 
     if source_generation_reader() != expected_source_generation:
         raise ValueError("collection input generation changed")
@@ -1961,6 +2681,7 @@ def collect_route_cohort(
             )
             for market_id in dex_by_chain[chain]:
                 completed.pop(market_id, None)
+                completed_typed_payloads.pop(market_id, None)
                 completed_stage_dirs.pop(market_id, None)
             fixed_blocks.pop(chain, None)
     try:
@@ -1974,6 +2695,7 @@ def collect_route_cohort(
         for market_id in completed_stage_dirs:
             terminal_reasons[market_id] = "raw_evidence_path_unsafe"
             completed.pop(market_id, None)
+            completed_typed_payloads.pop(market_id, None)
     if raw_run_descriptors is not None:
         try:
             for market_id in sorted(completed_stage_dirs):
@@ -1999,6 +2721,7 @@ def collect_route_cohort(
                         )
                     terminal_reasons[market_id] = raw_failure
                     completed.pop(market_id, None)
+                    completed_typed_payloads.pop(market_id, None)
                     continue
                 if actual_sha256 is None or response_identity is None:
                     continue
@@ -2031,6 +2754,7 @@ def collect_route_cohort(
                     )
                     terminal_reasons[market_id] = "raw_evidence_path_unsafe"
                     completed.pop(market_id, None)
+                    completed_typed_payloads.pop(market_id, None)
                     if entry_descriptor is not None:
                         os.close(entry_descriptor)
                     continue
@@ -2082,6 +2806,7 @@ def collect_route_cohort(
                             ) from rollback_error
                         terminal_reasons[market_id] = post_failure
                         completed.pop(market_id, None)
+                        completed_typed_payloads.pop(market_id, None)
                 finally:
                     os.close(entry_descriptor)
         finally:
@@ -2106,14 +2831,47 @@ def collect_route_cohort(
     legs = [
         _safe_leg_projection({
             **row,
+            "market_type": _market_type(legs_by_market[row["market_id"]]),
             **{
                 key: legs_by_market[row["market_id"]][key]
                 for key in ("execution_adapter_supported", "execution_adapter_status")
                 if key in legs_by_market[row["market_id"]]
             },
+            **(
+                {
+                    "collector_context": legs_by_market[row["market_id"]]["collector_context"],
+                    "usd_price_source_snapshot_id": legs_by_market[row["market_id"]]["collector_context"]["snapshot_id"],
+                    "usd_price_observed_at": legs_by_market[row["market_id"]]["collector_context"]["observed_at"],
+                    "usd_price_source": legs_by_market[row["market_id"]]["collector_context"]["source"],
+                    "usd_price_source_endpoint": legs_by_market[row["market_id"]]["collector_context"]["source_endpoint"],
+                    "usd_price_raw_response_sha256": legs_by_market[row["market_id"]]["collector_context"]["raw_response_sha256"],
+                    **(
+                        {}
+                        if legs_by_market[row["market_id"]]["collector_context"].get("status") == "observed"
+                        else {
+                            "available": False,
+                            "token0_price_usd": None,
+                            "token1_price_usd": None,
+                        }
+                    ),
+                }
+                if _market_type(legs_by_market[row["market_id"]]) == "dex"
+                and isinstance(legs_by_market[row["market_id"]].get("collector_context"), Mapping)
+                else {}
+            ),
         })
         for row in legs
     ]
+    eligible_market_ids = {
+        row["market_id"]
+        for row in legs
+        if row.get("status") in {"observed", "partial"}
+    }
+    for market_id in list(completed_typed_payloads):
+        if market_id not in eligible_market_ids:
+            completed_typed_payloads.pop(market_id, None)
+    if set(completed_typed_payloads) != eligible_market_ids:
+        raise ValueError("typed-source payload capability differs from final legs")
     rows_by_market = {row["market_id"]: row for row in legs}
     route_rows = []
     for route in routes:
@@ -2159,7 +2917,7 @@ def collect_route_cohort(
     }
     result["route_cohort_id"] = "cohort:" + _canonical_fingerprint(result)
     result["fingerprint"] = _canonical_fingerprint(result)
-    return result
+    return _RouteCollectionResult(result, completed_typed_payloads)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -2362,10 +3120,17 @@ def _default_dex_block_resolver(chain: str, *, deadline: CollectionDeadline) -> 
     if not url:
         raise ValueError("missing RPC endpoint")
     client = RpcClient(chain, url, deadline=deadline)
+    chain_id = client.chain_id()
+    expected_chain_id = _CANONICAL_CHAIN_IDS.get(chain)
+    if expected_chain_id is None or chain_id != expected_chain_id:
+        raise ValueError("fixed block chain ID is invalid")
     number = client.block_number()
+    block = client.block(hex(number))
     return {
         "block_number": number,
-        "block_timestamp": block_timestamp_text(client.block(hex(number))),
+        "block_timestamp": block_timestamp_text(block),
+        "chain_id": chain_id,
+        "block_header": canonical_route_fixed_block_header(block),
     }
 
 

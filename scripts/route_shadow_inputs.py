@@ -25,7 +25,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     from scripts.cex_instrument_lifecycle import (
@@ -49,7 +51,12 @@ try:
     )
     from scripts.route_universe import build_route_universe, route_universe_sha256
     from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
-    from scripts.token_registry import validate_registry_payload
+    from scripts.token_registry import (
+        TokenRegistryError,
+        normalize_contract_address,
+        normalize_chain,
+        validate_registry_payload,
+    )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from cex_instrument_lifecycle import (  # type: ignore[no-redef]
         validate_cex_instrument_lifecycle_review,
@@ -75,7 +82,12 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
         route_universe_sha256,
     )
     from timestamp_contract import exact_rfc3339_epoch_seconds  # type: ignore
-    from token_registry import validate_registry_payload  # type: ignore
+    from token_registry import (  # type: ignore[no-redef]
+        TokenRegistryError,
+        normalize_contract_address,
+        normalize_chain,
+        validate_registry_payload,
+    )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +98,76 @@ MAX_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_SQLITE_BYTES = 192 * 1024 * 1024
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
 MAX_AGGREGATE_SOURCE_BYTES = 256 * 1024 * 1024
+
+TYPED_SOURCE_LINEAGE_SCHEMA = "route_leg_typed_source_lineage/v1"
+TYPED_SOURCE_MANIFEST_SCHEMA = "route_typed_source_manifest/v1"
+TYPED_SOURCE_LINEAGE_FIELDS = frozenset({"schema", "members"})
+TYPED_SOURCE_MEMBER_FIELDS = frozenset({
+    "role", "status", "reason_code", "filename", "sha256", "size",
+    "logical_generation", "adapter_id", "content_schema",
+})
+TYPED_SOURCE_MANIFEST_FIELDS = frozenset({
+    "schema", "raw_evidence_run_id", "member_count", "members",
+})
+TYPED_SOURCE_MANIFEST_MEMBER_FIELDS = frozenset({
+    "market_id", "role", "filename", "sha256", "size",
+    "logical_generation", "adapter_id", "content_schema",
+})
+TYPED_SOURCE_UNAVAILABLE_REASONS = frozenset({
+    "typed_source_missing",
+    "typed_source_not_found",
+    "typed_source_failed",
+    "typed_source_adapter_unsupported",
+    "typed_source_validation_failed",
+})
+MAX_TYPED_SOURCE_AGGREGATE_BYTES = 24 * 1024 * 1024
+
+# The values are deliberately immutable and literal.  Task 4 consumes these
+# contracts through the exported validator rather than reflecting over the
+# collector implementation.
+TYPED_SOURCE_ROLE_CONTRACTS = MappingProxyType({
+    "cex_raw_book_response": MappingProxyType({
+        "market_type": "cex",
+        "adapter_id": "fetch_cex_depth/parse_book/v1",
+        "content_schema": "route_bytes/v1",
+        "max_bytes": 8 * 1024 * 1024,
+    }),
+    "cex_market_rules": MappingProxyType({
+        "market_type": "cex",
+        "adapter_id": "route_quantity_quote_for_book/v1",
+        "content_schema": "route_market_rules_source/v1",
+        "max_bytes": 256 * 1024,
+    }),
+    "quote_usd_conversion": MappingProxyType({
+        "market_type": "cex",
+        "adapter_id": "route_usd_conversion_source/v1",
+        "content_schema": "route_usd_conversion_source/v1",
+        "max_bytes": 256 * 1024,
+    }),
+    "dex_pool_state": MappingProxyType({
+        "market_type": "dex",
+        "adapter_id": "route_quantity_quote_for_v2_pool/v1",
+        "content_schema": "route_v2_pool_state/v1",
+        "max_bytes": 1024 * 1024,
+    }),
+    "dex_usd_price_context": MappingProxyType({
+        "market_type": "dex",
+        "adapter_id": "route_dex_usd_price_context/v1",
+        "content_schema": "route_dex_usd_price_context/v1",
+        "max_bytes": 1024 * 1024,
+    }),
+})
+
+_TYPED_ROLES_BY_MARKET_TYPE = MappingProxyType({
+    market_type: tuple(sorted(
+        role for role, contract in TYPED_SOURCE_ROLE_CONTRACTS.items()
+        if contract["market_type"] == market_type
+    ))
+    for market_type in ("cex", "dex")
+})
+_TYPED_BASENAME = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", flags=re.ASCII
+)
 
 _DATA_INPUTS = (
     ("market_facts.sqlite3", "market_facts.sqlite3", MAX_SQLITE_BYTES),
@@ -99,6 +181,7 @@ _DATA_INPUTS = (
     ("dex_pool_tvl_latest.csv", "dex_pool_tvl_latest.csv", MAX_SOURCE_BYTES),
 )
 _CONFIG_LOGICAL_PATH = "config/tokens.csv"
+_CHAIN_CONFIG_LOGICAL_PATH = "config/token_chains.csv"
 _HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z", flags=re.ASCII)
 _RUN_ID_PATTERN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", flags=re.ASCII
@@ -133,6 +216,117 @@ def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def validate_typed_source_lineage(
+    value: Mapping[str, Any], *, market_type: str
+) -> Dict[str, Any]:
+    """Validate and return a detached canonical typed-source lineage object."""
+    if market_type not in _TYPED_ROLES_BY_MARKET_TYPE:
+        raise ValueError("typed-source market type is invalid")
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != TYPED_SOURCE_LINEAGE_FIELDS
+        or value.get("schema") != TYPED_SOURCE_LINEAGE_SCHEMA
+        or not isinstance(value.get("members"), list)
+    ):
+        raise ValueError("typed-source lineage schema is invalid")
+    expected_roles = _TYPED_ROLES_BY_MARKET_TYPE[market_type]
+    raw_members = value["members"]
+    if len(raw_members) > 5:
+        raise ValueError("typed-source member count is invalid")
+    roles = [
+        member.get("role") if isinstance(member, Mapping) else None
+        for member in raw_members
+    ]
+    if tuple(roles) != expected_roles:
+        raise ValueError("typed-source roles are invalid for market type")
+
+    aggregate_size = 0
+    members: List[Dict[str, Any]] = []
+    for raw in raw_members:
+        if not isinstance(raw, Mapping) or set(raw) != TYPED_SOURCE_MEMBER_FIELDS:
+            raise ValueError("typed-source member schema is invalid")
+        role = raw.get("role")
+        contract = TYPED_SOURCE_ROLE_CONTRACTS.get(role)
+        if contract is None or contract["market_type"] != market_type:
+            raise ValueError("typed-source role conflicts with market type")
+        if (
+            raw.get("adapter_id") != contract["adapter_id"]
+            or raw.get("content_schema") != contract["content_schema"]
+        ):
+            raise ValueError("typed-source adapter contract is invalid")
+        status = raw.get("status")
+        if status == "observed":
+            filename = raw.get("filename")
+            size = raw.get("size")
+            if (
+                raw.get("reason_code") is not None
+                or not isinstance(filename, str)
+                or _TYPED_BASENAME.fullmatch(filename) is None
+                or filename in {".", ".."}
+                or len(filename.encode("ascii")) > 128
+                or not isinstance(raw.get("sha256"), str)
+                or _HASH_PATTERN.fullmatch(raw["sha256"]) is None
+                or not isinstance(raw.get("logical_generation"), str)
+                or _HASH_PATTERN.fullmatch(raw["logical_generation"]) is None
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size <= 0
+                or size > contract["max_bytes"]
+            ):
+                raise ValueError("typed-source observed filename, hash, or size is invalid")
+            aggregate_size += size
+        elif status == "unavailable":
+            if (
+                raw.get("reason_code") not in TYPED_SOURCE_UNAVAILABLE_REASONS
+                or any(
+                    raw.get(field) is not None
+                    for field in (
+                        "filename", "sha256", "size", "logical_generation"
+                    )
+                )
+            ):
+                raise ValueError("typed-source unavailable null/reason matrix is invalid")
+        else:
+            raise ValueError("typed-source status is invalid")
+        members.append({field: raw[field] for field in (
+            "role", "status", "reason_code", "filename", "sha256", "size",
+            "logical_generation", "adapter_id", "content_schema",
+        )})
+    if aggregate_size > MAX_TYPED_SOURCE_AGGREGATE_BYTES:
+        raise ValueError("typed-source aggregate bytes exceed the bound")
+    return {"schema": TYPED_SOURCE_LINEAGE_SCHEMA, "members": members}
+
+
+def typed_source_lineage_observed_members(
+    value: Mapping[str, Any], *, market_type: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Return detached observed members in the exact manifest projection."""
+    if market_type is None:
+        if not isinstance(value, Mapping) or not isinstance(value.get("members"), list):
+            raise ValueError("typed-source lineage is invalid")
+        roles = {
+            member.get("role")
+            for member in value["members"]
+            if isinstance(member, Mapping)
+        }
+        candidates = [
+            kind for kind, expected in _TYPED_ROLES_BY_MARKET_TYPE.items()
+            if roles == set(expected)
+        ]
+        if len(candidates) != 1:
+            raise ValueError("typed-source market type cannot be inferred")
+        market_type = candidates[0]
+    lineage = validate_typed_source_lineage(value, market_type=market_type)
+    return [
+        {field: member[field] for field in (
+            "role", "filename", "sha256", "size", "logical_generation",
+            "adapter_id", "content_schema",
+        )}
+        for member in lineage["members"]
+        if member["status"] == "observed"
+    ]
 
 
 def selection_window(now: datetime) -> Dict[str, str]:
@@ -492,17 +686,21 @@ def _capture_required_sources(
                 capture.close()
                 raise ValueError("aggregate source capture budget exceeded")
             captures.append(capture)
-        capture = _capture_entry(
+        for name, logical_path in (
+            (config_path.name, _CONFIG_LOGICAL_PATH),
+            ("token_chains.csv", _CHAIN_CONFIG_LOGICAL_PATH),
+        ):
+            capture = _capture_entry(
                 config_descriptor,
-                config_path.name,
-                _CONFIG_LOGICAL_PATH,
+                name,
+                logical_path,
                 MAX_CONFIG_BYTES,
             )
-        aggregate_size += capture.identity.size
-        if aggregate_size > MAX_AGGREGATE_SOURCE_BYTES:
-            capture.close()
-            raise ValueError("aggregate source capture budget exceeded")
-        captures.append(capture)
+            aggregate_size += capture.identity.size
+            if aggregate_size > MAX_AGGREGATE_SOURCE_BYTES:
+                capture.close()
+                raise ValueError("aggregate source capture budget exceeded")
+            captures.append(capture)
         _reject_sqlite_sidecars(data_descriptor)
         data_metadata = os.fstat(data_descriptor)
         if (data_metadata.st_dev, data_metadata.st_ino) != data_chain[-1]:
@@ -605,6 +803,60 @@ def _decimal_text(
     return text or "0"
 
 
+def _chain_native_token_id(value: Any, *, chain: str, field: str) -> str:
+    """Return the canonical address bound to one collector Token ID.
+
+    GeckoTerminal identifiers are serialized as ``<chain>_<address>``.  The
+    address grammar is chain-specific: applying an EVM-only regular expression
+    here would silently drop valid Starknet and Solana research legs, while
+    accepting a 20-byte EVM address under a non-EVM prefix would create a false
+    identity.  Reuse the captured Token-registry normalizer and require the
+    source bytes to already be canonical.
+    """
+    text = _required_text(value, field)
+    try:
+        canonical_chain = normalize_chain(chain)
+    except (TokenRegistryError, ValueError) as error:
+        raise ValueError("collector Token chain is invalid") from error
+    prefix, separator, address = text.partition("_")
+    if not separator or prefix != canonical_chain or not address:
+        raise ValueError("collector Token identity is invalid")
+    try:
+        canonical_address = normalize_contract_address(canonical_chain, address)
+    except (TokenRegistryError, ValueError) as error:
+        raise ValueError("collector Token identity is invalid") from error
+    if canonical_address != address:
+        raise ValueError("collector Token identity is non-canonical")
+    return canonical_address
+
+
+def _safe_source_endpoint(value: Any) -> str:
+    text = _required_text(value, "source_endpoint")
+    if len(text.encode("utf-8")) > 4096:
+        raise ValueError("source_endpoint exceeds its byte limit")
+    try:
+        parsed = urlsplit(text)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("source_endpoint is unsafe") from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("source_endpoint is unsafe")
+    safe_host = "[{}]".format(hostname) if ":" in hostname else hostname
+    if port is not None:
+        safe_host = "{}:{}".format(safe_host, port)
+    if urlunsplit((parsed.scheme, safe_host, parsed.path, "", "")) != text:
+        raise ValueError("source_endpoint is non-canonical")
+    return text
+
+
 def _cex_market_id(row: Mapping[str, Any]) -> str:
     token = _required_text(row.get("token_symbol"), "token_symbol")
     exchange = _required_text(row.get("exchange"), "exchange")
@@ -644,7 +896,9 @@ def _dex_market_id(row: Mapping[str, Any]) -> str:
     return "dex:{}:{}:{}:{}".format(chain, dex, pool, token)
 
 
-def _parse_static_tokens(payload: bytes) -> Tuple[set, Tuple[str, ...]]:
+def _parse_static_tokens(
+    payload: bytes,
+) -> Tuple[set, Tuple[str, ...], Dict[Tuple[str, str], str]]:
     rows = _parse_csv(
         payload,
         _CONFIG_LOGICAL_PATH,
@@ -654,6 +908,7 @@ def _parse_static_tokens(payload: bytes) -> Tuple[set, Tuple[str, ...]]:
         raise ValueError("tracked Token config is empty")
     symbols = set()
     crypto_markets = []
+    identities: Dict[Tuple[str, str], str] = {}
     for row in rows:
         token = _required_text(row.get("token_symbol"), "token_symbol")
         if token != token.upper() or _CEX_PART.fullmatch(token) is None:
@@ -661,25 +916,74 @@ def _parse_static_tokens(payload: bytes) -> Tuple[set, Tuple[str, ...]]:
         if token in symbols:
             raise ValueError("tracked Token config contains duplicate symbols")
         symbols.add(token)
+        chain = _required_text(row.get("chain"), "chain")
+        address = _required_text(row.get("contract_address"), "contract_address")
+        try:
+            normalized_chain = normalize_chain(chain)
+            normalized_address = normalize_contract_address(
+                normalized_chain, address
+            )
+        except (TokenRegistryError, ValueError) as error:
+            raise ValueError("tracked Token identity is invalid") from error
+        identities[(token, normalized_chain)] = normalized_address
         crypto_markets.append(_cex_market_id({
             "token_symbol": token,
             "exchange": "crypto_com",
             "cex_symbol": row.get("cex_symbol"),
         }))
-    return symbols, tuple(sorted(crypto_markets))
+    return symbols, tuple(sorted(crypto_markets)), identities
 
 
-def _parse_runtime_registry(payload: bytes) -> Tuple[set, Tuple[str, ...]]:
+def _parse_token_chain_identities(
+    payload: bytes, *, configured_tokens: set
+) -> Dict[Tuple[str, str], str]:
+    rows = _parse_csv(
+        payload,
+        _CHAIN_CONFIG_LOGICAL_PATH,
+        {"token_symbol", "chain", "contract_address", "notes"},
+    )
+    if not rows:
+        raise ValueError("tracked Token-chain config is empty")
+    identities: Dict[Tuple[str, str], str] = {}
+    for row in rows:
+        token = _required_text(row.get("token_symbol"), "token_symbol")
+        if (
+            token != token.upper()
+            or _CEX_PART.fullmatch(token) is None
+            or token not in configured_tokens
+        ):
+            raise ValueError("tracked Token-chain symbol is invalid")
+        try:
+            chain = normalize_chain(row.get("chain"))
+            address = normalize_contract_address(
+                chain, row.get("contract_address")
+            )
+        except (TokenRegistryError, ValueError) as error:
+            raise ValueError("tracked Token-chain identity is invalid") from error
+        key = (token, chain)
+        if key in identities:
+            raise ValueError(
+                "tracked Token-chain config contains duplicate identities"
+            )
+        identities[key] = address
+    return identities
+
+
+def _parse_runtime_registry(
+    payload: bytes,
+) -> Tuple[set, Tuple[str, ...], Dict[Tuple[str, str], str]]:
     normalized = validate_registry_payload(
         _parse_json(payload, "admin/token_registry.json")
     )
     symbols = set()
     crypto_markets = []
+    identities: Dict[Tuple[str, str], str] = {}
     for record in normalized["tokens"].values():
         if record.get("status") != "active":
             continue
         token = str(record["token_symbol"])
         symbols.add(token)
+        identities[(token, str(record["chain"]))] = str(record["contract_address"])
         mapping = record.get("cex_mapping") or {}
         if (
             mapping.get("status") == "approved"
@@ -690,7 +994,7 @@ def _parse_runtime_registry(payload: bytes) -> Tuple[set, Tuple[str, ...]]:
                 "exchange": "crypto_com",
                 "cex_symbol": mapping.get("cex_symbol"),
             }))
-    return symbols, tuple(sorted(crypto_markets))
+    return symbols, tuple(sorted(crypto_markets)), identities
 
 
 def _market_ids_sha256(values: Sequence[str]) -> str:
@@ -713,7 +1017,10 @@ def _parse_lifecycle(payload: bytes, configured_ids: Sequence[str]) -> set:
         raise ValueError("CEX lifecycle schema is invalid")
     _timestamp(value["generated_at_utc"], "lifecycle generated_at_utc")
     _timestamp(value["checked_at_utc"], "lifecycle checked_at_utc")
-    if _HASH_PATTERN.fullmatch(str(value["response_sha256"])) is None:
+    if (
+        not isinstance(value["response_sha256"], str)
+        or _HASH_PATTERN.fullmatch(value["response_sha256"]) is None
+    ):
         raise ValueError("CEX lifecycle response SHA is invalid")
     reviews = value["reviews"]
     if not isinstance(reviews, list):
@@ -1079,7 +1386,7 @@ def _parse_tvl_and_volume(
     payload: bytes,
     *,
     expected_market_ids: set,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     rows = _parse_csv(
         payload,
         "dex_pool_tvl_latest.csv",
@@ -1094,8 +1401,28 @@ def _parse_tvl_and_volume(
     validate_tvl_snapshot(rows, rows, allow_no_observed=True)
     tvl_rows = []
     volume_rows = []
+    collector_contexts = {}
     for market_id, row in zip(market_ids, rows):
+        chain = _required_text(row.get("chain"), "chain")
+        try:
+            canonical_chain = normalize_chain(chain)
+        except (TokenRegistryError, ValueError) as error:
+            raise ValueError("collector Token chain is invalid") from error
+        if canonical_chain != chain or market_id.split(":", 4)[1] != chain:
+            raise ValueError("collector Token chain is non-canonical")
+        request_started_at = _timestamp(
+            row.get("request_started_at"), "request_started_at"
+        )
         observed_at = _timestamp(row.get("observed_at"), "observed_at")
+        response_received_at = _timestamp(
+            row.get("response_received_at"), "response_received_at"
+        )
+        if not (
+            exact_rfc3339_epoch_seconds(request_started_at)
+            <= exact_rfc3339_epoch_seconds(observed_at)
+            <= exact_rfc3339_epoch_seconds(response_received_at)
+        ):
+            raise ValueError("collector context timestamps are unordered")
         status_text = _required_text(row.get("status"), "status")
         tvl_value = None
         volume_value = None
@@ -1107,6 +1434,74 @@ def _parse_tvl_and_volume(
         elif str(row.get("volume_24h_usd") or "").strip():
             raise ValueError("non-observed TVL row cannot publish 24h Volume")
         binding = _required_text(row.get("snapshot_id"), "snapshot_id")
+        observed = status_text == "observed"
+        context_fields = (
+            "base_token_id", "quote_token_id",
+            "base_token_price_usd", "quote_token_price_usd",
+        )
+        if not observed and any(
+            str(row.get(field) or "").strip() for field in context_fields
+        ):
+            raise ValueError(
+                "non-observed collector context cannot retain Token or price fields"
+            )
+        base_token_id = None
+        quote_token_id = None
+        base_token_price = None
+        quote_token_price = None
+        if observed:
+            base_token_id = _required_text(
+                row.get("base_token_id"), "base_token_id"
+            )
+            quote_token_id = _required_text(
+                row.get("quote_token_id"), "quote_token_id"
+            )
+            base_address = _chain_native_token_id(
+                base_token_id, chain=chain, field="base_token_id"
+            )
+            quote_address = _chain_native_token_id(
+                quote_token_id, chain=chain, field="quote_token_id"
+            )
+            if base_address == quote_address:
+                raise ValueError("collector Token identities must be distinct")
+            base_token_price = _decimal_text(
+                row.get("base_token_price_usd"),
+                "base_token_price_usd",
+                positive=True,
+            )
+            quote_token_price = _decimal_text(
+                row.get("quote_token_price_usd"),
+                "quote_token_price_usd",
+                positive=True,
+            )
+            if base_token_price is None or quote_token_price is None:
+                raise ValueError("observed collector prices must be positive")
+        raw_response_sha256 = _required_text(
+            row.get("raw_response_sha256"), "raw_response_sha256"
+        )
+        if _HASH_PATTERN.fullmatch(raw_response_sha256) is None:
+            raise ValueError("collector raw response SHA is invalid")
+        context = {
+            "schema": "route_collector_context/v1",
+            "snapshot_id": binding,
+            "request_started_at": request_started_at,
+            "observed_at": observed_at,
+            "response_received_at": response_received_at,
+            "status": status_text,
+            "reason_code": _required_text(row.get("reason_code"), "reason_code"),
+            "pool_name": _required_text(row.get("pool_name"), "pool_name"),
+            "base_token_id": base_token_id,
+            "quote_token_id": quote_token_id,
+            "base_token_price_usd": base_token_price,
+            "quote_token_price_usd": quote_token_price,
+            "tvl_method": _required_text(row.get("tvl_method"), "tvl_method"),
+            "source": _required_text(row.get("source"), "source"),
+            "source_endpoint": _safe_source_endpoint(
+                row.get("source_endpoint")
+            ),
+            "raw_response_sha256": raw_response_sha256,
+        }
+        collector_contexts[market_id] = context
         tvl_rows.append({
             "market_id": market_id,
             "tvl_usd": tvl_value,
@@ -1119,7 +1514,7 @@ def _parse_tvl_and_volume(
             "observed_at": observed_at,
             "source_snapshot_id": binding,
         })
-    return tvl_rows, volume_rows
+    return tvl_rows, volume_rows, collector_contexts
 
 
 def _source_manifest(
@@ -1160,7 +1555,9 @@ def build_shadow_universe(
     captures = _capture_required_sources(Path(data_dir), Path(static_token_config))
     try:
         by_path = {capture.identity.path: capture for capture in captures}
-        expected_paths = [item[0] for item in _DATA_INPUTS] + [_CONFIG_LOGICAL_PATH]
+        expected_paths = [item[0] for item in _DATA_INPUTS] + [
+            _CONFIG_LOGICAL_PATH, _CHAIN_CONFIG_LOGICAL_PATH,
+        ]
         if list(by_path) != expected_paths or len(by_path) != len(captures):
             raise ValueError("required source capture set is invalid")
         manifest = _source_manifest(captures, window)
@@ -1170,12 +1567,28 @@ def build_shadow_universe(
         raise
     try:
         payload = _capture_bytes(by_path[_CONFIG_LOGICAL_PATH])
-        static_tokens, static_crypto = _parse_static_tokens(payload)
+        static_tokens, static_crypto, static_identities = _parse_static_tokens(
+            payload
+        )
         del payload
         by_path[_CONFIG_LOGICAL_PATH].close()
 
+        payload = _capture_bytes(by_path[_CHAIN_CONFIG_LOGICAL_PATH])
+        chain_identities = _parse_token_chain_identities(
+            payload, configured_tokens=static_tokens
+        )
+        del payload
+        by_path[_CHAIN_CONFIG_LOGICAL_PATH].close()
+        for key, address in chain_identities.items():
+            prior = static_identities.get(key)
+            if prior is not None and prior != address:
+                raise ValueError("captured Token identities conflict")
+            static_identities[key] = address
+
         payload = _capture_bytes(by_path["admin/token_registry.json"])
-        runtime_tokens, runtime_crypto = _parse_runtime_registry(payload)
+        runtime_tokens, runtime_crypto, runtime_identities = (
+            _parse_runtime_registry(payload)
+        )
         del payload
         by_path["admin/token_registry.json"].close()
 
@@ -1245,7 +1658,7 @@ def build_shadow_universe(
         by_path["dex_execution_cost_latest.csv"].close()
 
         payload = _capture_bytes(by_path["dex_pool_tvl_latest.csv"])
-        tvl_rows, dex_volume_rows = _parse_tvl_and_volume(
+        tvl_rows, dex_volume_rows, collector_contexts = _parse_tvl_and_volume(
             payload,
             expected_market_ids=expected_by_type["dex"],
         )
@@ -1262,7 +1675,61 @@ def build_shadow_universe(
             selection_window=window,
             candidate_source_generation=manifest["candidate_source_generation"],
         )
+        universe = dict(universe)
+        token_identities = dict(static_identities)
+        for key, address in runtime_identities.items():
+            prior = token_identities.get(key)
+            if prior is not None and prior != address:
+                raise ValueError("captured Token identities conflict")
+            token_identities[key] = address
+        selected_legs = []
+        for leg in universe["selected_legs"]:
+            projected = dict(leg)
+            if leg["market_type"] == "dex":
+                context = collector_contexts[leg["market_id"]]
+                chain = leg["market_id"].split(":", 4)[1]
+                target_address = token_identities.get(
+                    (leg["token_symbol"], chain)
+                )
+                if target_address is None:
+                    raise ValueError("selected DEX target Token identity is absent")
+                target_side = None
+                if context["status"] == "observed":
+                    target_id = "{}_{}".format(chain, target_address)
+                    matches = [
+                        side
+                        for side in ("base", "quote")
+                        if context[side + "_token_id"] == target_id
+                    ]
+                    if len(matches) != 1:
+                        raise ValueError(
+                            "selected DEX target Token side is ambiguous"
+                        )
+                    target_side = matches[0]
+                projected.update({
+                    "collector_context": context,
+                    "target_token_address": target_address,
+                    "target_token_side": target_side,
+                })
+            selected_legs.append(projected)
+        universe["selected_legs"] = selected_legs
         return universe, manifest
+    finally:
+        for capture in captures:
+            capture.close()
+
+
+def current_source_generation(
+    data_dir: Path, *, static_token_config: Path
+) -> str:
+    """Rehash the exact eleven current source inputs without parsing a universe."""
+    captures = _capture_required_sources(
+        Path(data_dir), Path(static_token_config)
+    )
+    try:
+        return _candidate_source_generation(
+            capture.identity for capture in captures
+        )
     finally:
         for capture in captures:
             capture.close()
@@ -1274,6 +1741,152 @@ def _validate_run_id(run_id: str) -> str:
     if run_id in {".", ".."}:
         raise ValueError("run ID contains a dot segment")
     return run_id
+
+
+def _read_run_binding_member(
+    directory_descriptor: int,
+    name: str,
+    *,
+    maximum_bytes: int,
+) -> Tuple[bytes, Tuple[Any, ...]]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError("secure shadow member read is unavailable")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+    except OSError as error:
+        raise ValueError("shadow run input member is missing or unsafe") from error
+    try:
+        before = os.fstat(descriptor)
+        payload = _read_member_bytes(descriptor, maximum_bytes + 1)
+        after = os.fstat(descriptor)
+        path_metadata = os.stat(
+            name, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+        if (
+            len(payload) > maximum_bytes
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or _stable_file_metadata(before) != _stable_file_metadata(after)
+            or _stable_file_metadata(before)
+            != _stable_file_metadata(path_metadata)
+        ):
+            raise ValueError("shadow run input member is changed, unsafe, or hard-linked")
+        return payload, _stable_file_metadata(before)
+    finally:
+        os.close(descriptor)
+
+
+def load_run_input_binding(shadow_root: Path, run_id: str) -> Dict[str, Any]:
+    """Descriptor-reread and fully validate one immutable universe binding."""
+    validated_run_id = _validate_run_id(run_id)
+    runs_path = _absolute_path(Path(shadow_root)) / "runs"
+    runs_descriptor, runs_chain = _open_directory_chain(runs_path)
+    run_descriptor = -1
+    try:
+        try:
+            run_descriptor = os.open(
+                validated_run_id,
+                _secure_directory_flags(),
+                dir_fd=runs_descriptor,
+            )
+        except OSError as error:
+            raise ValueError("shadow run input directory is missing or unsafe") from error
+        run_before = os.fstat(run_descriptor)
+        path_before = os.stat(
+            validated_run_id,
+            dir_fd=runs_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(run_before.st_mode)
+            or (run_before.st_dev, run_before.st_ino)
+            != (path_before.st_dev, path_before.st_ino)
+        ):
+            raise ValueError("shadow run input directory identity is invalid")
+        universe_bytes, universe_metadata = _read_run_binding_member(
+            run_descriptor,
+            "route_universe.json",
+            maximum_bytes=MAX_SOURCE_BYTES,
+        )
+        baseline_bytes, baseline_metadata = _read_run_binding_member(
+            run_descriptor,
+            "baseline_manifest.json",
+            maximum_bytes=MAX_SOURCE_BYTES,
+        )
+        try:
+            universe_raw = json.loads(universe_bytes.decode("utf-8"))
+            baseline_raw = json.loads(baseline_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("shadow run input JSON is invalid") from error
+        if (
+            not isinstance(universe_raw, dict)
+            or not isinstance(baseline_raw, dict)
+            or _canonical_json_bytes(universe_raw) != universe_bytes
+            or _canonical_json_bytes(baseline_raw) != baseline_bytes
+        ):
+            raise ValueError("shadow run input JSON is not canonical")
+        try:
+            # Task 2 owns the complete route-universe contract.  Import lazily
+            # to avoid a module-import cycle while sharing its strict reader.
+            from scripts.route_publication import _validate_route_universe_payload
+            universe = _validate_route_universe_payload(universe_raw)
+        except (ImportError, TypeError, ValueError) as error:
+            raise ValueError("shadow route universe is invalid") from error
+        try:
+            baseline = _validated_publication_manifest(universe, baseline_raw)
+        except (TypeError, ValueError) as error:
+            raise ValueError("shadow baseline manifest is invalid") from error
+        universe_sha256 = route_universe_sha256(universe)
+        if (
+            baseline != baseline_raw
+            or baseline.get("route_universe_sha256") != universe_sha256
+            or baseline.get("candidate_source_generation")
+            != universe.get("candidate_source_generation")
+        ):
+            raise ValueError("shadow run input lineage is invalid")
+        for name, expected_bytes, expected_metadata in (
+            ("route_universe.json", universe_bytes, universe_metadata),
+            ("baseline_manifest.json", baseline_bytes, baseline_metadata),
+        ):
+            current_bytes, current_metadata = _read_run_binding_member(
+                run_descriptor, name, maximum_bytes=MAX_SOURCE_BYTES
+            )
+            if current_bytes != expected_bytes or current_metadata != expected_metadata:
+                raise ValueError("shadow run input changed during validation")
+        run_after = os.fstat(run_descriptor)
+        path_after = os.stat(
+            validated_run_id,
+            dir_fd=runs_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _stable_file_metadata(run_before) != _stable_file_metadata(run_after)
+            or (run_after.st_dev, run_after.st_ino)
+            != (path_after.st_dev, path_after.st_ino)
+        ):
+            raise ValueError("shadow run input directory changed during validation")
+        _recheck_directory_chain(runs_path, runs_chain)
+        return {
+            "run_id": validated_run_id,
+            "universe": universe,
+            "baseline_manifest": baseline,
+            "route_universe_sha256": universe_sha256,
+            "baseline_manifest_sha256": hashlib.sha256(
+                baseline_bytes
+            ).hexdigest(),
+            "candidate_source_generation": universe[
+                "candidate_source_generation"
+            ],
+        }
+    finally:
+        if run_descriptor >= 0:
+            os.close(run_descriptor)
+        os.close(runs_descriptor)
 
 
 def _validated_publication_manifest(
@@ -1312,7 +1925,9 @@ def _validated_publication_manifest(
         )
         _identity_record(identity)
         identities.append(identity)
-    expected_paths = [item[0] for item in _DATA_INPUTS] + [_CONFIG_LOGICAL_PATH]
+    expected_paths = [item[0] for item in _DATA_INPUTS] + [
+        _CONFIG_LOGICAL_PATH, _CHAIN_CONFIG_LOGICAL_PATH,
+    ]
     if [identity.path for identity in identities] != expected_paths:
         raise ValueError("baseline source manifest paths are invalid")
     generation = _candidate_source_generation(identities)
