@@ -384,58 +384,67 @@ class RouteShadowAuthorityTests(unittest.TestCase):
             self.assertIsNone(result["authority_sha256"])
             self.assertEqual(result["reason_code"], "authority_evidence_invalid")
 
-    def test_authority_file_rename_aba_before_open_is_unsafe(self):
+    def test_authority_file_rename_aba_during_open_is_unsafe(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
             authority = _write_authority(data_dir, _FALSE_AUTHORITY_BYTES)
             parked = authority.parent / "parked.json"
             interloper = authority.parent / "interloper.json"
-            interloper.write_bytes(_TRUE_AUTHORITY_BYTES)
+            interloper.write_bytes(_FALSE_AUTHORITY_BYTES)
             real_open = route_shadow_authority.os.open
             did_aba = []
 
-            def open_after_aba(path, flags, *args, **kwargs):
+            def open_during_aba(path, flags, *args, **kwargs):
                 if path == "enabled.json" and not did_aba:
                     authority.rename(parked)
                     interloper.rename(authority)
+                    descriptor = real_open(path, flags, *args, **kwargs)
                     authority.rename(interloper)
                     parked.rename(authority)
                     did_aba.append(True)
+                    return descriptor
                 return real_open(path, flags, *args, **kwargs)
 
             with patch.object(
-                route_shadow_authority.os, "open", side_effect=open_after_aba
+                route_shadow_authority.os, "open", side_effect=open_during_aba
             ):
                 result = load_committed_route_shadow_authority(data_dir)
 
+            self.assertEqual(did_aba, [True])
             self.assertEqual(result["status"], "invalid")
             self.assertIsNone(result["authority_sha256"])
             self.assertEqual(result["reason_code"], "authority_evidence_invalid")
 
-    def test_data_dir_rename_away_and_back_during_read_is_unsafe(self):
+    def test_data_dir_rename_aba_during_open_is_unsafe(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data_dir = root / "data"
             _write_authority(data_dir, _FALSE_AUTHORITY_BYTES)
             detached = root / "data-detached"
-            real_pread = route_shadow_authority.os.pread
+            foreign_data = root / "foreign-data"
+            _write_authority(foreign_data, _FALSE_AUTHORITY_BYTES)
+            real_open = route_shadow_authority.os.open
             did_aba = []
 
-            def read_then_rename_aba(descriptor, size, offset):
-                block = real_pread(descriptor, size, offset)
-                if not did_aba:
+            def open_foreign_data_then_restore(path, flags, *args, **kwargs):
+                if path == "data" and not did_aba:
                     data_dir.rename(detached)
+                    foreign_data.rename(data_dir)
+                    descriptor = real_open(path, flags, *args, **kwargs)
+                    data_dir.rename(foreign_data)
                     detached.rename(data_dir)
                     did_aba.append(True)
-                return block
+                    return descriptor
+                return real_open(path, flags, *args, **kwargs)
 
             with patch.object(
                 route_shadow_authority.os,
-                "pread",
-                side_effect=read_then_rename_aba,
+                "open",
+                side_effect=open_foreign_data_then_restore,
             ):
                 result = load_committed_route_shadow_authority(data_dir)
 
+            self.assertEqual(did_aba, [True])
             self.assertEqual(result["status"], "invalid")
             self.assertIsNone(result["authority_sha256"])
             self.assertEqual(result["reason_code"], "authority_evidence_invalid")
