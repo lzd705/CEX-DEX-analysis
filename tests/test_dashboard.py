@@ -3113,6 +3113,10 @@ class MarketMonitorServerTest(unittest.TestCase):
 
     def test_summary_producer_satisfies_structured_na_release_contract(self):
         checked_at = "2026-08-01T06:00:00+00:00"
+        freshness_bucket = int(
+            datetime.fromisoformat(checked_at).timestamp()
+            // server.API_FRESHNESS_CACHE_SECONDS
+        )
         daily = {
             "status": "current",
             "available_start": "2026-07-01",
@@ -3152,6 +3156,10 @@ class MarketMonitorServerTest(unittest.TestCase):
             server,
             "build_source_freshness",
             return_value=current_freshness,
+        ), patch.object(
+            server,
+            "api_freshness_bucket",
+            return_value=freshness_bucket,
         ):
             summary = server.build_market_summary()
 
