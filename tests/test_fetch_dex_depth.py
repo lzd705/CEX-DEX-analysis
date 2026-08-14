@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import tempfile
 import unittest
@@ -50,6 +51,7 @@ from scripts.fetch_dex_depth import (
     publish_snapshot,
     freeze_v2_pool_state,
     route_quantity_quote_for_v2_pool,
+    strict_route_cost_pool_state_anchor,
     terminal_execution_rows,
     unsupported_row,
     validate_snapshot as validate_depth_snapshot,
@@ -308,6 +310,55 @@ class ActualV2Transport:
 
 
 class DexDepthMathTest(unittest.TestCase):
+    def test_strict_route_cost_anchor_is_exactly_the_frozen_v2_state(self):
+        stable = {
+            "chain": "eth",
+            "chain_id": 1,
+            "dex": "uniswap_v2",
+            "pool_address": "0x3333333333333333333333333333333333333333",
+            "token0_address": "0x1111111111111111111111111111111111111111",
+            "token1_address": "0x2222222222222222222222222222222222222222",
+            "token0_decimals": 18,
+            "token1_decimals": 6,
+            "reserve0_raw": 100 * 10**18,
+            "reserve1_raw": 10_000_000_000,
+            "reserve_timestamp_last_raw": 1_704_067_200,
+            "fee_bps": 30,
+            "fee_numerator": 9_970,
+            "fee_denominator": 10_000,
+            "fee_formula": (
+                "amount_in_with_fee=amount_in*fee_numerator;"
+                "denominator=reserve_in*fee_denominator+amount_in_with_fee"
+            ),
+            "fee_proof_sha256": "c" * 64,
+            "block_number": 123,
+            "block_hash": "0x" + "d" * 64,
+            "block_header_sha256": "e" * 64,
+            "observed_at": "2026-08-01T12:00:00Z",
+            "raw_response_sha256": "f" * 64,
+        }
+        frozen = freeze_v2_pool_state(stable)
+        anchor = strict_route_cost_pool_state_anchor(stable)
+        self.assertEqual(
+            anchor,
+            {
+                "schema": "route_cost_core_pool_state_anchor/v1",
+                "state_id": frozen.state_id,
+                "chain": "eth",
+                "chain_id": 1,
+                "dex": "uniswap_v2",
+                "pool_address": stable["pool_address"],
+                "token0_address": stable["token0_address"],
+                "token1_address": stable["token1_address"],
+                "fee_bps": "30",
+                "block_number": "0x7b",
+                "block_hash": stable["block_hash"],
+                "block_header_sha256": "e" * 64,
+                "observed_at": stable["observed_at"],
+                "raw_response_sha256": "f" * 64,
+            },
+        )
+
     def test_v2_quantity_adapter_freezes_mutable_state_once_for_hash_and_quote(self):
         pool_address = "0x3333333333333333333333333333333333333333"
         target_address = "0x1111111111111111111111111111111111111111"
@@ -746,6 +797,189 @@ class DexDepthCollectionTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    @staticmethod
+    def _fixed_block_header(number="0x7b"):
+        return {
+            "number": number,
+            "hash": "0x" + "a" * 64,
+            "parent_hash": "0x" + "b" * 64,
+            "timestamp": "0x65920080",
+            "base_fee_per_gas": "0x3b9aca00",
+            "gas_used": "0xe4e1c0",
+            "gas_limit": "0x1c9c380",
+        }
+
+    def test_production_v2_typed_sink_binds_full_header_raw_bytes_and_third_word(self):
+        from scripts.fetch_dex_depth import (
+            ROUTE_V2_FEE_IDENTITY,
+            ROUTE_V2_FEE_PROOF_SHA256,
+            collect_dex_pool_observation,
+        )
+
+        class TimestampedV2Rpc(FakeV2Rpc):
+            def eth_calls(self, to, data_values, block_tag):
+                values = super().eth_calls(to, data_values, block_tag)
+                if data_values == [
+                    SELECTOR_TOKEN0,
+                    SELECTOR_TOKEN1,
+                    SELECTOR_GET_RESERVES,
+                ]:
+                    values[2] = uint_result(
+                        100 * 10**18,
+                        10_000 * 10**6,
+                        1_704_067_200,
+                    )
+                return values
+
+        raw_path = self.root / "typed-v2.json"
+        members = []
+        row, execution_rows = collect_dex_pool_observation(
+            self.pool,
+            snapshot_id="typed-v2",
+            raw_path=raw_path,
+            rpc_factory=TimestampedV2Rpc,
+            fixed_block_number=123,
+            fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+            fixed_chain_id="0x1",
+            fixed_block_header=self._fixed_block_header(),
+            typed_source_payload_sink=members.append,
+        )
+
+        self.assertEqual(row["status"], "observed")
+        self.assertEqual(len(execution_rows), 10)
+        self.assertEqual(len(members), 1)
+        self.assertEqual(set(members[0]), {"role", "payload"})
+        self.assertEqual(members[0]["role"], "dex_pool_state")
+        payload_bytes = members[0]["payload"]
+        self.assertIsInstance(payload_bytes, bytes)
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        self.assertEqual(
+            set(payload),
+            {
+                "schema", "chain", "chain_id", "dex", "pool_address",
+                "token0_address", "token1_address", "token0_decimals",
+                "token1_decimals", "reserve0_raw", "reserve1_raw",
+                "reserve_timestamp_last_raw", "fee_bps", "fee_numerator",
+                "fee_denominator", "fee_formula", "fee_proof_sha256",
+                "block_number", "block_hash", "block_header_sha256",
+                "observed_at", "raw_response_sha256", "state_id",
+            },
+        )
+        self.assertEqual(payload["reserve_timestamp_last_raw"], "1704067200")
+        self.assertEqual(payload["block_number"], "123")
+        self.assertEqual(payload["block_hash"], "0x" + "a" * 64)
+        self.assertEqual(
+            payload["raw_response_sha256"],
+            hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            payload["block_header_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    self._fixed_block_header(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            payload["state_id"],
+            freeze_v2_pool_state({
+                **payload,
+                **{
+                    field: int(payload[field])
+                    for field in (
+                        "chain_id", "token0_decimals", "token1_decimals",
+                        "reserve0_raw", "reserve1_raw",
+                        "reserve_timestamp_last_raw", "fee_bps",
+                        "fee_numerator", "fee_denominator", "block_number",
+                    )
+                },
+            }).state_id,
+        )
+        self.assertEqual(payload["fee_proof_sha256"], ROUTE_V2_FEE_PROOF_SHA256)
+        self.assertEqual(
+            ROUTE_V2_FEE_PROOF_SHA256,
+            hashlib.sha256(
+                json.dumps(
+                    ROUTE_V2_FEE_IDENTITY,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+
+    def test_missing_chain_or_cross_block_header_only_disables_typed_pool_state(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        cases = (
+            (None, self._fixed_block_header()),
+            ("0x38", self._fixed_block_header()),
+            ("0x1", None),
+            (
+                "0x1",
+                {
+                    key: value
+                    for key, value in self._fixed_block_header().items()
+                    if key != "gas_limit"
+                },
+            ),
+            ("0x1", self._fixed_block_header(number="0x7c")),
+        )
+        for index, (chain_id, header) in enumerate(cases):
+            with self.subTest(index=index, chain_id=chain_id):
+                members = []
+                row, execution_rows = collect_dex_pool_observation(
+                    self.pool,
+                    snapshot_id="typed-header-{}".format(index),
+                    raw_path=self.root / "typed-header-{}.json".format(index),
+                    rpc_factory=FakeV2Rpc,
+                    fixed_block_number=123,
+                    fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+                    fixed_chain_id=chain_id,
+                    fixed_block_header=header,
+                    typed_source_payload_sink=members.append,
+                )
+                self.assertEqual(row["status"], "observed")
+                self.assertEqual(len(execution_rows), 10)
+                self.assertEqual(members, [])
+
+    def test_get_reserves_third_word_must_be_a_uint32_for_typed_and_depth(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        class OversizedTimestampV2Rpc(FakeV2Rpc):
+            def eth_calls(self, to, data_values, block_tag):
+                values = super().eth_calls(to, data_values, block_tag)
+                if data_values == [
+                    SELECTOR_TOKEN0,
+                    SELECTOR_TOKEN1,
+                    SELECTOR_GET_RESERVES,
+                ]:
+                    values[2] = uint_result(
+                        100 * 10**18,
+                        10_000 * 10**6,
+                        1 << 32,
+                    )
+                return values
+
+        members = []
+        row, execution_rows = collect_dex_pool_observation(
+            self.pool,
+            snapshot_id="typed-uint32-overflow",
+            raw_path=self.root / "typed-uint32-overflow.json",
+            rpc_factory=OversizedTimestampV2Rpc,
+            fixed_block_number=123,
+            fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+            fixed_chain_id="0x1",
+            fixed_block_header=self._fixed_block_header(),
+            typed_source_payload_sink=members.append,
+        )
+        self.assertEqual(row["status"], "failed")
+        self.assertTrue(all(item["status"] == "failed" for item in execution_rows))
+        self.assertEqual(members, [])
 
     def test_inventory_keeps_latest_unique_token_pool_row(self):
         path = self.root / "tvl.csv"

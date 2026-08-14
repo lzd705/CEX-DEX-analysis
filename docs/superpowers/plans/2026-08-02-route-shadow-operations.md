@@ -50,16 +50,19 @@ active execution resumes at Task 2 from HEAD `2c41d9c`.
   `cex_exchange_volume_daily.csv`, `cex_depth_latest.csv`,
   `dex_depth_latest.csv`, `cex_execution_cost_latest.csv`,
   `dex_execution_cost_latest.csv`, and `dex_pool_tvl_latest.csv`, plus the
-  tracked `config/tokens.csv` validation authority. The runtime registry must
-  exist even when empty and use its canonical empty schema. The config
-  argument must resolve exactly to tracked `PROJECT_ROOT/config/tokens.csv`;
-  its manifest path is always the logical `config/tokens.csv`. The other eight
-  manifest paths are fixed POSIX paths relative to `MARKET_DATA_DIR`. Absolute
-  host paths are never serialized.
+  tracked `config/tokens.csv` and `config/token_chains.csv` validation
+  authorities. The latter supplies the exact chain-native target identity for
+  cross-chain DEX legs; it is captured rather than inferred from a pool name or
+  a mutable current file. The runtime registry must exist even when empty and
+  use its canonical empty schema. The config argument must resolve exactly to
+  tracked `PROJECT_ROOT/config/tokens.csv`; the two manifest paths are always
+  the logical `config/tokens.csv` and `config/token_chains.csv`. The other
+  eight manifest paths are fixed POSIX paths relative to `MARKET_DATA_DIR`.
+  Absolute host paths are never serialized.
 - Freeze source-read limits exported by Task 1:
   `MAX_SQLITE_BYTES=192*1024**2`, `MAX_SOURCE_BYTES=32*1024**2` for each of the
-  other eight data-dir inputs, `MAX_CONFIG_BYTES=4*1024**2` for tracked
-  `config/tokens.csv`, and `MAX_AGGREGATE_SOURCE_BYTES=256*1024**2` across all
+  other eight data-dir inputs, `MAX_CONFIG_BYTES=4*1024**2` for each tracked
+  config, and `MAX_AGGREGATE_SOURCE_BYTES=256*1024**2` across all
   captured inputs. Every descriptor reader stops after at most its limit plus
   one sentinel byte; aggregate accounting occurs before parsing/materializing.
   Exact-limit fixtures pass, every +1-byte fixture fails without reading the
@@ -107,9 +110,9 @@ the same TVL snapshot row. Aggregate CEX `selected_window_usd` over the exact
 TVL accept genuine non-negative zero; missing stays null and Depth/execution
 capacity remains strictly positive. Hash canonical manifest entries containing
 relative path, byte size, and SHA-256; do not use mtime as identity or expose
-absolute production paths. Except for the single tracked
-`PROJECT_ROOT/config/tokens.csv` authority, Shadow reads only canonical files
-under `MARKET_DATA_DIR`.
+absolute production paths. Except for the two tracked
+`PROJECT_ROOT/config/tokens.csv` and `PROJECT_ROOT/config/token_chains.csv`
+authorities, Shadow reads only canonical files under `MARKET_DATA_DIR`.
 
 Before implementation, add explicit RED tests for every adapter projection,
 SQLite integrity/current-state and CSV source-SHA mismatch, WAL/journal
@@ -463,7 +466,7 @@ Add a GitHub commit comment with denominator, percentile, and failure-injection 
 - Produces Task 1 public helpers
   `current_source_generation(data_dir, *, static_token_config) -> str` and
   `load_run_input_binding(shadow_root, run_id) -> dict`.
-  `current_source_generation()` only rehashes the current ten inputs and never
+  `current_source_generation()` only rehashes the current eleven inputs and never
   rebuilds a universe. `load_run_input_binding()` descriptor-safely rereads and
   fully validates the installed universe plus baseline and returns their exact
   hashes/generation; neither helper trusts caller-computed hashes.
@@ -475,10 +478,12 @@ Add a GitHub commit comment with denominator, percentile, and failure-injection 
   `quote_token_price_usd`, `tvl_method`, `source`, `source_endpoint`, and
   `raw_response_sha256`; it excludes `error`, paths, credentials, and unknown
   fields. Observed context requires complete ordered timestamps, two distinct
-  parseable EVM token addresses with the pool chain prefix, two positive prices,
+  parseable chain-native token addresses with the pool chain prefix, two
+  positive prices,
   and a 64-hex source hash. Status/reason combinations exactly match the TVL
-  production contract `observed|missing|not_found|failed`; unavailable numeric
-  values serialize as JSON null, never empty string or zero. Non-observed
+  production contract `observed|missing|not_found|failed`; unavailable Token
+  IDs and numeric values serialize as JSON null, never stale identity, empty
+  string, or zero. Non-observed
   context retains its explicit lineage and can only produce a terminal
   unavailable leg. Context is serialized inside
   `route_universe.json` and therefore bound by its SHA.
@@ -905,7 +910,8 @@ checks, file/parent fsync, and exact reread. It uses exact schema
 `schema,run_id,route_cohort_id,phase,candidate_source_generation,
 route_universe_sha256,adapter_registry,adapter_registry_sha256,
 connector_key_registry,connector_key_registry_sha256,transcript_count,
-trace_profile_generation,submission_connector_profile_generation,
+trace_profile_identity,trace_profile_generation,
+submission_connector_profile_identity,submission_connector_profile_generation,
 evaluated_at,
 selected_market_count,selected_markets,selected_market_set_sha256,
 native_price_evidence,native_price_evidence_sha256,
@@ -920,14 +926,35 @@ classification. Exact `route_cost_adapter_registry/v1` permits only
 has only `adapter_id,chain_id,protocol_family,router_address,factory_address,
 router_runtime_code_sha256,factory_runtime_code_sha256,pair_fee_bps,
 gas_fee_model,allowed_selectors,supports_native,supports_multihop,
-supports_fee_on_transfer,trace_method,connector_family,token_funding_descriptors,native_symbol,
+supports_fee_on_transfer,trace_method,connector_family,pair_descriptors,
+token_funding_descriptors,native_symbol,
 wrapped_native_address,simulation_sender_address,native_price_reference_market_id,
 native_price_reference_adapter_id`. `gas_fee_model` is exactly
 `eip1559_fee_history_v1`; the wrapped-native address is the canonical Ethereum
 WETH address used only as the deterministic retained USD-price lookup key, and
 the simulation sender is one checked-in public 20-byte address used with fixed
 state overrides rather than a private operator address.
-`trace_method` is literal `debug_traceCall_state_override_v1`. Funding
+`trace_method` is literal `debug_traceCall_state_override_v1`. Pair descriptors
+are sorted by pair address and each has only
+`pair_address,token0_address,token1_address,pair_runtime_code_sha256,
+source_metadata_sha256`. `source_metadata_sha256` is the physical SHA-256 of
+the authority record retained by the registry maintainer. A pair descriptor
+freezes the factory-created pair address, ordered `token0`/`token1`, and the
+whole-runtime bytecode identity. Static support requires exactly one matching
+pair descriptor, the route target inside its ordered token pair, and funding
+descriptors for both tokens; observed collector context only cross-checks this
+identity and missing/failed context cannot expand or shrink support. The
+tracked production registry contains the fixed-block-20,000,000 UNI/WETH
+Uniswap V2 pair descriptor and nonproxy UNI/WETH funding descriptors. Each
+descriptor's `source_metadata_sha256` is the physical canonical-LF JSON hash of
+its checked-in record under `config/route_cost_authority/`. The production
+loader descriptor-rereads every referenced record, validates its exact closed
+schema and block/source/runtime/storage identity, and requires that physical
+hash and all descriptor projection fields match. Unsafe ancestry, symlinks,
+multiple links, replacement during read, malformed/noncanonical bytes, hash
+drift, or descriptor drift fails closed before collection. The submission
+connector-key registry remains empty, so observed submission remains blocked.
+Funding
 descriptors are sorted by token address and each has only
 `token_address,runtime_code_sha256,proxy_implementation_address,
 proxy_implementation_code_sha256,storage_layout,balance_mapping_slot,
@@ -985,8 +1012,9 @@ fragment, userinfo, or non-root path; the fixed client alone appends
 `/v1/health` and `/v1/submission-policy-snapshots`. It has the same HTTPS/
 explicit-loopback rule, redirects are forbidden, and authorization has the same
 bounded control-free rule. Profile paths, URLs, authorization, and raw
-bytes are never persisted or logged; only canonical profile generations and
-nonsecret endpoint/connector IDs enter the sidecar. Structural classification
+bytes are never persisted or logged; only the exact secret-free profile
+identity objects, their canonical generations, and their nonsecret
+endpoint/connector IDs enter the sidecar. Structural classification
 depends only on the frozen adapter/key registry and deterministic eight-market
 cohort, never on mutable profile presence. An unset trace profile emits the
 full expected transcript inventory as unavailable `trace_profile_missing`; an
@@ -1014,6 +1042,20 @@ does not leak or hash credential/URL; a changed public ID changes generation.
 Unsafe/invalid configured bytes produce no generation or successful sidecar.
 Tests freeze available/missing canonical bytes and hashes, secret/URL privacy,
 ID rotation, null matrix, and cross-profile transplant.
+The two exact identity objects themselves are persisted in the outer sidecar
+beside their generations. Offline replay recomputes both generations from
+those embedded objects, requires every chain `rpc_source_id` to equal the
+available trace identity `endpoint_id`, and requires the policy snapshot
+`connector_id` to equal the available submission identity `connector_id`.
+A missing identity requires the corresponding downstream public ID JSON null;
+an opaque caller-supplied generation alone is never authoritative.
+For nonempty supported scope, a missing trace identity derives every supported
+terminal transcript reason exactly `trace_profile_missing`; it cannot be
+rehash-renamed to a later RPC/router/pair outcome. Likewise a missing connector
+identity derives snapshot and every member exactly
+`unavailable/submission_connector_missing`; remote-unavailable or invalid
+reasons require an available matching connector identity and an attempted
+bounded interaction.
 
 Select the adapter-coverage target before external reads; do not filter out an
 unsupported high-priority market first. The eligible pool is every frozen-
@@ -1060,11 +1102,38 @@ canonical SHAs rather than copying/re-fetching those bytes. Each transcript is e
 `schema,run_id,route_cohort_id,candidate_source_generation,
 route_universe_sha256,adapter_registry_sha256,selected_market_set_sha256,trace_profile_generation,
 submission_connector_profile_generation,market_id,direction,
-requested_notional_usd,adapter_id,core_pool_state_id,
+requested_notional_usd,adapter_id,
+simulation_target_token_address,simulation_target_unit_decimals,
+simulation_target_raw_quantity,simulation_target_lattice_raw,
+simulation_target_sha256,core_pool_state_id,
 core_pool_state_sha256,chain_evidence_sha256,
 market_evidence_sha256,status,completed_stage,reason_code,
 block_evidence,call_evidence,gas_evidence,router_fee_evidence,
 transfer_tax_evidence,raw_transcript`.
+
+The five `simulation_target_*` fields are either all JSON null or the exact
+projection of one cohort-global DEX target for the route token and requested
+notional. The hashed inner value is exact `route_cost_simulation_target/v1`
+with only `schema,token_address,unit_decimals,raw_quantity,lattice_raw`, and
+`simulation_target_sha256` is
+`SHA256(b"route-cost-simulation-target/v1\n" + canonical_json(inner) + b"\n")`.
+For every `(target_token_address,notional)` group, validate the target address
+against the static pair descriptor and retained token0/token1, validate the
+captured `base|quote` side by address rather than pool ordering, and use the
+other token's captured USD price. For each complete pool compute the marginal
+target USD price exactly as
+`(reserve_other / 10**other_decimals) / (reserve_target /
+10**target_decimals) * other_token_price_usd`; the retained pool state and USD
+observation may differ by at most two hours. Take the maximum exact rational
+price across every selected supported pool for the same target, then compute
+`raw_quantity=floor(notional_usd / max_price_usd * 10**target_decimals)`.
+It must be at least one and the initial DEX lattice is exactly `1`. Every
+market transcript for that same token/notional repeats the identical target
+projection. Missing/stale context or retained state suppresses only that
+target-token group and produces terminal transcript rows; it cannot poison an
+unrelated token group or shrink either denominator. The calldata decoder and
+retained-state V2 quote replay bind both quoted raw amounts to this target, so
+renaming a transcript notional and rehashing the graph is rejected.
 
 `route_cost_chain_evidence/v1` permits only
 `schema,run_id,route_cohort_id,candidate_source_generation,
@@ -1082,18 +1151,49 @@ permits only
 route_universe_sha256,adapter_registry_sha256,selected_market_set_sha256,market_id,adapter_id,
 chain_evidence_sha256,core_pool_state_id,core_pool_state_sha256,
 router_address,router_runtime_code,factory_address,factory_runtime_code,
+factory_get_pair_request,factory_get_pair_response,
 pair_address,pair_runtime_code,pair_token0,pair_token1,
+token_runtime_code_evidence,
 captured_started_at,captured_finished_at`. Runtime code fields retain the full
 lowercase even-length bytes used to recompute the pinned whole-runtime SHA,
-never a slice; each code field is at most 128 KiB and a whole market object is
-at most 400 KiB, leaving 16 KiB for the canonical JSON envelope and all other
-fixed fields when all three code fields reach their individual limits. At most
-eight objects therefore remain within the 32 MiB sidecar cap. A simultaneous
-three-code-field exact-limit fixture must pass, while one additional byte in
-any code field or in the 400-KiB whole object must fail before publication.
+never a slice; every router, factory, pair, and token runtime result is
+individually at most 128 KiB and the aggregate canonical market object is at
+most 400 KiB. The aggregate cap deliberately prevents five simultaneous
+individual-limit results while retaining the complete bytes actually used.
+At most eight objects therefore remain within the 32 MiB sidecar cap. Exact
+individual and aggregate boundary fixtures must pass at the limit and reject
+one additional byte before publication.
 Their set hashes use literal domains
 `route-cost-chain-evidence-set/v1\n` and
 `route-cost-market-evidence-set/v1\n` over canonical ordered arrays.
+
+The exact `factory_get_pair_request` is
+`route_cost_factory_get_pair_request/v1` with only
+`schema,jsonrpc,id,method,params`; `jsonrpc="2.0"`, the request ID is one fixed
+bounded integer, `method="eth_call"`, and params are exactly one call object
+plus the fixed block tag. The call object has only `to,data`, names the
+captured adapter factory, and its calldata is the `getPair(address,address)`
+selector followed by the two retained ordered pool-token addresses as ABI
+words. The exact `factory_get_pair_response` is
+`route_cost_factory_get_pair_response/v1` with only
+`schema,jsonrpc,id,result`; its ID matches the request and the decoded result
+is the retained and statically described pair address. No latest-block,
+caller-supplied pair, or self-consistent replacement factory/pair is accepted.
+
+`token_runtime_code_evidence` is the canonical address-sorted two-member
+inventory for the statically described pair tokens. Each exact member is
+`route_cost_token_runtime_code_evidence/v1` with only
+`schema,token_address,request,response`. Its request is exact
+`route_cost_token_runtime_code_request/v1` with only
+`schema,jsonrpc,id,method,params`, method `eth_getCode`, and params exactly the
+member token address plus the same fixed block tag. Its response is exact
+`route_cost_token_runtime_code_response/v1` with only
+`schema,jsonrpc,id,result`; the ID matches and result retains the full
+lowercase even-length runtime bytes. The full result SHA-256 must equal that
+token's captured funding descriptor `runtime_code_sha256` before estimate or
+trace. Missing or drifted code yields terminal
+`token_funding_code_mismatch`; it never changes the static selected-market
+denominator.
 
 Bindings are sorted uniquely by route ID and numeric requested notional; there
 is one for each structural candidate route-notional that contains a selected
@@ -1252,6 +1352,66 @@ binding bytes.
 Exact per-reason fixtures freeze every null
 position and reject floats, `-0`, NaN/Infinity, malformed hex, reversed time,
 unknown reason/status, and extra keys.
+
+The exported pure assembler
+`build_route_cost_evidence_manifest_from_captured(...)` accepts only the
+already captured registries, the two secret-free profile identities, shared
+chain/market/native projections, transcript inventory, and policy snapshot.
+It accepts no URL, path, credential, verifier, clock, adapter override, or
+network/filesystem capability. It recomputes the deterministic selected set,
+all outer counts and set hashes, policy member-set/attestation hashes, and the
+complete binding inventory/status/reason from the frozen universe and captured
+rows. It does not authenticate SSHSIG or bless retained bytes: production must
+pass its output to the sealed publication validator, which alone invokes the
+fixed SSHSIG verifier and binds descriptor-reread typed V2 members. This
+separates bounded capture I/O from exact offline graph composition without a
+caller-forgeable verification result.
+
+The specialized pure terminal builder
+`build_trace_profile_missing_route_cost_evidence_manifest(...)` covers the
+first production profile failure boundary. It requires the captured supported
+adapter/key registries and an exact retained typed V2 member for every selected
+supported market, emits exactly ten `unavailable/none/trace_profile_missing`
+transcripts per market, retains each core state ID/physical SHA and its
+cohort-global simulation target, and emits no chain/market/nested RPC evidence.
+It derives the full missing-connector policy-member and binding inventories.
+The publication validator descriptor-replays the retained mapping; when the
+trace identity is missing, that self-contained retained block/header identity
+is legal without inventing a cost-side RPC header. Any available trace identity
+still requires exactly one matching fixed chain anchor.
+
+Task 3's bounded first producer package exports the pure helpers
+`build_terminal_transcript_inventory(...)`,
+`build_submission_policy_scope(...)`,
+`build_terminal_submission_policy_snapshot(...)`,
+`build_submission_policy_request(...)`, and
+`validate_captured_submission_policy_response(...)`. The generalized terminal
+inventory accepts only the frozen universe, secret-free embedded profile
+identities, captured adapter registry, retained typed pool-state members, and a
+closed per-supported-market terminal reason. It derives status, completed
+stage, core-state and simulation-target presence, every nested null, and every
+unsupported-market row; callers cannot supply those derived fields or any
+expected count. This first package deliberately covers the no-shared-evidence
+terminal reasons through the fixed-block boundary and does not construct live
+chain, market, or observed transcript projections.
+
+The policy-scope helper returns only exact sorted
+`route_id,requested_notional_usd` request members. The terminal snapshot helper
+derives `scope_empty`, missing, remote-unavailable, or invalid matrices from the
+actual embedded connector identity and recomputes both profile generations and
+all lineage hashes. The request helper refuses empty scope or a missing
+connector, emits the exact request schema, and computes `request_id` over the
+same object without that field. The captured-response validator binds exact
+ordered response membership, lineage, connector, key-registry identity,
+member-set and attestation structure to that request but performs no I/O and
+does not verify or inject signature success; sealed publication remains the
+only SSHSIG authentication boundary. None of these public helpers accepts a
+filesystem path, network client, URL, credential, verifier, clock, or expected
+count. The compatibility wrappers
+`build_unavailable_route_cost_evidence_manifest(...)` and
+`build_trace_profile_missing_route_cost_evidence_manifest(...)` compose these
+helpers before final manifest replay.
+
 `transcript_set_sha256` hashes the canonical ordered `transcripts` array under
 literal domain `route-cost-evidence-transcript-set/v1\n`;
 `binding_set_sha256` does the same for `bindings` under
@@ -1385,7 +1545,19 @@ field; failed retains only bounded canonically parsed identity fields and uses
 `native_price_invalid`. These envelopes make incomplete/failed chain evidence
 replayable without pretending absent observations were measured.
 Every raw-transcript key is always present; fields not yet captured under the
-completed-stage matrix are JSON null, never empty placeholders. Exact object,
+completed-stage and request-issuance matrix are JSON null, never empty
+placeholders. A nonnull estimate or trace request means the sealed collector
+actually issued that exact request. A nonnull response means a successful
+exact response was captured and validated. Timeout, transport failure,
+rate-limit/server error, or a sanitized JSON-RPC error retains the issued
+request and leaves its response JSON null; malformed/wrong-ID/invalid results
+do the same under the corresponding failed reason. A response can never exist
+without its request, a trace request requires a successful estimate response,
+`simulation_method` is nonnull exactly when the trace request is nonnull, and
+trace balance deltas are nonnull exactly when the successful trace response is
+nonnull. Thus `completed_stage` records the last completed logical evidence
+stage and is not a shortcut for pretending every attempted RPC returned.
+Exact object,
 array, scalar, byte, and aggregate caps are exported constants and one-byte/
 one-member overflow tests fail before sidecar publication.
 
@@ -1400,6 +1572,7 @@ rate with exact Decimal arithmetic. Persist one top-level exact
 `schema,run_id,route_cohort_id,candidate_source_generation,source_market_id,
 source_adapter_id,source_endpoint_id,book_projection,market_rules_projection,
 usd_conversion_projection,raw_response_base64,raw_response_sha256,
+market_rules_raw_response_base64,market_rules_raw_response_sha256,
 observed_at,valid_until,source_record_sha256`, at most 4 MiB.
 `route_cost_native_price_book/v1` has only
 `schema,market_id,adapter_id,best_ask_price,best_ask_quantity,observed_at,
@@ -1413,6 +1586,12 @@ every timestamp/source identity is recomputed through the existing sealed CEX
 adapter. `raw_response_base64` is canonical padded RFC 4648 with no whitespace;
 its decoded bytes are at most 2 MiB and hash exactly to both
 `raw_response_sha256` and the book projection's identical field.
+`market_rules_raw_response_base64` is independently canonical padded RFC 4648;
+its decoded Binance `exchangeInfo` bytes are at most 256 KiB and hash exactly
+to `market_rules_raw_response_sha256`. The fixed sealed Binance rules parser
+must uniquely reproduce the ETH/USDT market-rules projection from those bytes;
+a caller-carried projection, arbitrary source hash, another USDT market's
+rules, or cross-run/cross-market response is never accepted.
 `source_record_sha256` is exactly
 `SHA256(b"route-cost-native-price-source/v1\n" + canonical_json({"book":book_projection,"market_rules":market_rules_projection,"usd_conversion":usd_conversion_projection}) + b"\n")`.
 The outer `native_price_evidence_sha256` is exactly
@@ -1426,8 +1605,13 @@ hashes must reproduce these closed projections and their underlying sealed CEX
 collector contracts; unknown nested keys are rejected. Observed time
 is the later input time and validity is the earlier input validity; it must cover
 every cost scenario and run terminal, with no hard-coded extension. The fixed
-auxiliary capture consumes at most one extra CEX request, 2 MiB response bytes,
-and one per-venue task inside the existing 60-second/worker limits; it does not
+auxiliary capture is one per-venue Phase-A task which issues exactly two
+no-retry CEX requests: one canonical Binance ETH/USDT depth request and one
+canonical Binance ETH/USDT `exchangeInfo` request. The two sequential requests
+share one aggregate five-second subdeadline; they do not receive five seconds
+each. The existing strict USDT/USD conversion is a local sealed projection and
+causes no third network request. The task retains at most 2 MiB book bytes plus
+256 KiB rules bytes inside the existing 60-second/worker limits; it does not
 enter the route universe or create a public opportunity. If unavailable/stale,
 every otherwise complete DEX scenario ends `native_price_unavailable` and
 remains in intended scope. Malformed/transplanted evidence fails the run. The
@@ -1684,10 +1868,11 @@ snapshot. The only zero-member snapshot is the local
 `not_applicable/scope_empty` row above; it is never sent to the connector.
 Unknown, duplicate, omitted, or extra members invalidate the whole sidecar.
 
-Bound live collection independently of route count. One chain snapshot uses at
-most four RPC calls, each selected market identity uses at most eight calls,
+Bound live collection independently of route count. One chain snapshot uses
+exactly three RPC calls (`eth_chainId`, the fixed block header, and the fixed
+one-block fee history), each selected market identity uses at most eight calls,
 and each of the at most 80 scenario transcripts uses exactly one gas estimate
-and one fixed-tracer simulation: at most 228 RPC calls total. Requests are issued
+and one fixed-tracer simulation: at most 227 RPC calls total. Requests are issued
 in at most six sequential batches of at most 40 calls, with only one in-flight
 batch per chain. The submission connector receives one bounded canonical batch
 containing at most 4096 unsigned policy members and returns one signed snapshot
@@ -1695,8 +1880,8 @@ in one round trip; it may not require a network call or signature per binding.
 The worker launches exactly one `ssh-keygen` verification process for that
 snapshot. The 60-second collector critical path is exact and bounded by three
 joined phases. Phase A starts at most two top-level tasks: one captures chain/
-market identity within 10 seconds; the other starts the independent single
-native-price CEX request and single policy batch concurrently (5 seconds each),
+market identity within 10 seconds; the other starts the independent two-request
+native-price CEX task and single policy batch concurrently (5 seconds each task),
 then performs the policy's one SSHSIG verification (2 seconds), for a 7-second
 maximum. The policy inventory
 is already frozen from the structural route/notional scope, and its verified
@@ -1707,15 +1892,17 @@ validates and serializes everything in 10 seconds. The critical path is
 headroom. At most two top-level tasks exist in Phase A and one in Phase B; each
 owns disjoint immutable result buffers, and only the parent joins, sorts,
 validates, and serializes them. There is still only one in-flight trace-RPC
-batch, one native-price request, and one connector request at a time.
+batch, one in-flight request inside the native-price task, and one connector
+request at a time.
 There are no automatic retries: every
 logical call is issued at most once, so the hard maxima remain six batches and
-228 calls. Timeout/failure
+227 calls. Timeout/failure
 keeps structural candidates incomplete. Fake slow/batch-overflow fixtures and
-the real 228-call/80-transcript/4096-binding/one-signature maximum prove completion or deterministic
+the real 227-call/80-transcript/4096-binding/one-signature maximum prove completion or deterministic
 timeout before the worker's 90-second service limit. The same maximum fixture
-also performs the one auxiliary CEX native-price request (2 MiB response and
-4 MiB canonical evidence), one connector batch round trip, and one SSHSIG
+also performs the two-request auxiliary CEX native-price task (2 MiB book plus
+256 KiB rules responses and 4 MiB canonical evidence), one connector batch
+round trip, and one SSHSIG
 verification; those operations use the exact concurrent/included subdeadlines
 above rather than being silently added after the 55-second critical path.
 Maximum-corpus tests assert the two-task ceiling, join ordering, and completion
@@ -1727,19 +1914,21 @@ non-trace JSON-RPC response is at most 256 KiB, every fixed-tracer response at
 most 2 MiB, each HTTP batch response at most 8 MiB, all trace-RPC response bytes
 combined at most 48 MiB, and the connector request/response at most 8 MiB each.
 Each outgoing RPC batch body is at most 4 MiB and all six combined are at most
-24 MiB; the one connector request is at most 8 MiB and the one native-price CEX
-request at most 64 KiB. Request headers use the same 32-KiB aggregate cap as
+24 MiB; the one connector request is at most 8 MiB and each of the two
+native-price CEX requests is at most 64 KiB. Request headers use the same
+32-KiB aggregate cap as
 responses. The complete collector working-set proof counts at most 48 MiB
 compressed/decompressed RPC wire bytes, 128 MiB bounded parsed/sanitized RPC
-objects, 8 MiB connector request plus 8 MiB response, 2 MiB native-price wire
+objects, 8 MiB connector request plus 8 MiB response, 2.25 MiB native-price wire
 plus 4 MiB canonical native evidence, 32 MiB final sidecar, 64 MiB build/copy
-overlap, and 128 MiB Python/container overhead; total 422 MiB, leaving more
+overlap, and 128 MiB Python/container overhead; total at most 423 MiB, leaving more
 than 300 MiB below the rendered 768 MiB
 `MemoryMax`. `Content-Length` is only an early rejection hint. The fixed client
 streams through a decompression counter, stops after `limit+1`, and never parses,
 retries, logs, or persists an oversized success/error body. Chunked, absent-
 length, compressed-expansion, oversized-error, exact-limit, and one-byte-over
-fixtures plus the maximum 228-RPC/one-CEX/one-connector corpus prove both the 60/90-second and memory
+fixtures plus the maximum 227-RPC/two-CEX-request/one-connector corpus prove
+both the 60/90-second and memory
 boundaries. Each HTTP response permits at most 64 headers, 128 bytes per name,
 8 KiB per value, and 32 KiB total header bytes. Before materialization, the
 streaming JSON limiter permits at most 1,048,576 nodes, 4 KiB per ordinary

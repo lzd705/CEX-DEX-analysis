@@ -42,9 +42,14 @@ try:
         validate_cost_components,
     )
     from scripts.fetch_cex_depth import (
+        CEX_DEPTH_REASON_CODES,
         parse_book,
         route_quantity_quote_for_book,
         source_request,
+    )
+    from scripts.fetch_dex_depth import (
+        DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES,
+        DEX_DEPTH_UNSUPPORTED_REASON_CODES,
     )
     from scripts.route_cohort import (
         canonical_route_id,
@@ -56,6 +61,10 @@ try:
         inventory_capacity_for_route,
         load_validated_inventory_profile,
     )
+    from scripts.route_cost_evidence import (
+        RouteCostEvidenceError,
+        validate_route_cost_evidence_manifest_for_publication,
+    )
     from scripts.route_opportunity import (
         OPPORTUNITY_FIELDS,
         _issue_publication_attestation,
@@ -65,15 +74,29 @@ try:
     )
     from scripts.route_quantity import FeeSemantics, MarketRules, QuantityQuote
     from scripts.route_shadow_inputs import (
+        TYPED_SOURCE_MANIFEST_FIELDS,
+        TYPED_SOURCE_MANIFEST_MEMBER_FIELDS,
+        TYPED_SOURCE_MANIFEST_SCHEMA,
+        TYPED_SOURCE_ROLE_CONTRACTS,
         _validate_run_id as _validate_shadow_run_id,
         _validated_publication_manifest as _validate_shadow_baseline_manifest,
+        typed_source_lineage_observed_members,
+        validate_typed_source_lineage,
     )
     from scripts.route_universe import (
         ROUTE_UNIVERSE_SCHEMA,
         _selection_key as _route_universe_selection_key,
         route_universe_sha256,
     )
-    from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
+    from scripts.timestamp_contract import (
+        exact_rfc3339_epoch_seconds,
+        parse_rfc3339_utc,
+    )
+    from scripts.token_registry import (
+        TokenRegistryError,
+        normalize_chain,
+        normalize_contract_address,
+    )
 except ModuleNotFoundError:
     from cex_fee_facts import (  # type: ignore[no-redef]
         collect_cex_fee_snapshot,
@@ -84,9 +107,14 @@ except ModuleNotFoundError:
         validate_cost_components,
     )
     from fetch_cex_depth import (  # type: ignore[no-redef]
+        CEX_DEPTH_REASON_CODES,
         parse_book,
         route_quantity_quote_for_book,
         source_request,
+    )
+    from fetch_dex_depth import (  # type: ignore[no-redef]
+        DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES,
+        DEX_DEPTH_UNSUPPORTED_REASON_CODES,
     )
     from route_cohort import (  # type: ignore[no-redef]
         canonical_route_id,
@@ -97,6 +125,10 @@ except ModuleNotFoundError:
         classify_route_mode_evidence,
         inventory_capacity_for_route,
         load_validated_inventory_profile,
+    )
+    from route_cost_evidence import (  # type: ignore[no-redef]
+        RouteCostEvidenceError,
+        validate_route_cost_evidence_manifest_for_publication,
     )
     from route_opportunity import (  # type: ignore[no-redef]
         OPPORTUNITY_FIELDS,
@@ -111,8 +143,14 @@ except ModuleNotFoundError:
         QuantityQuote,
     )
     from route_shadow_inputs import (  # type: ignore[no-redef]
+        TYPED_SOURCE_MANIFEST_FIELDS,
+        TYPED_SOURCE_MANIFEST_MEMBER_FIELDS,
+        TYPED_SOURCE_MANIFEST_SCHEMA,
+        TYPED_SOURCE_ROLE_CONTRACTS,
         _validate_run_id as _validate_shadow_run_id,
         _validated_publication_manifest as _validate_shadow_baseline_manifest,
+        typed_source_lineage_observed_members,
+        validate_typed_source_lineage,
     )
     from route_universe import (  # type: ignore[no-redef]
         ROUTE_UNIVERSE_SCHEMA,
@@ -121,6 +159,12 @@ except ModuleNotFoundError:
     )
     from timestamp_contract import (  # type: ignore[no-redef]
         exact_rfc3339_epoch_seconds,
+        parse_rfc3339_utc,
+    )
+    from token_registry import (  # type: ignore[no-redef]
+        TokenRegistryError,
+        normalize_chain,
+        normalize_contract_address,
     )
 
 
@@ -139,7 +183,6 @@ ROUTE_SQLITE_LOGICAL_SCHEMA = "route_cohort_sqlite/v1"
 
 ROUTE_SHADOW_POINTER_SCHEMA = "route_shadow_pointer/v1"
 ROUTE_SHADOW_PHASE_SCHEMA = "route_shadow_phase/v1"
-ROUTE_COST_EVIDENCE_MANIFEST_SCHEMA = "route_cost_evidence_manifest/v1"
 ROUTE_SHADOW_AUDIT_FILENAME = "audit.json"
 ROUTE_SHADOW_COST_EVIDENCE_FILENAME = "route-cost-evidence.json"
 ROUTE_SHADOW_LATEST_FILENAME = "latest.json"
@@ -177,84 +220,6 @@ _ROUTE_SHADOW_PHASE_FIELDS = frozenset({
     "schedule_envelope_sha256",
     "phase_identity_id",
 })
-_ROUTE_COST_EVIDENCE_FIELDS = frozenset({
-    "schema",
-    "run_id",
-    "route_cohort_id",
-    "phase",
-    "candidate_source_generation",
-    "route_universe_sha256",
-    "adapter_registry",
-    "adapter_registry_sha256",
-    "connector_key_registry",
-    "connector_key_registry_sha256",
-    "transcript_count",
-    "trace_profile_generation",
-    "submission_connector_profile_generation",
-    "evaluated_at",
-    "selected_market_count",
-    "selected_markets",
-    "selected_market_set_sha256",
-    "native_price_evidence",
-    "native_price_evidence_sha256",
-    "chain_evidence_count",
-    "chain_evidence",
-    "chain_evidence_set_sha256",
-    "market_evidence_count",
-    "market_evidence",
-    "market_evidence_set_sha256",
-    "transcripts",
-    "transcript_set_sha256",
-    "binding_count",
-    "bindings",
-    "binding_set_sha256",
-    "submission_policy_snapshot",
-    "submission_policy_snapshot_sha256",
-    "counts",
-})
-_ROUTE_COST_COUNT_FIELDS = frozenset({
-    "transcript_observed",
-    "transcript_unavailable",
-    "transcript_failed",
-    "binding_observed",
-    "binding_unavailable",
-    "binding_failed",
-})
-_ROUTE_COST_SELECTED_MARKET_FIELDS = frozenset({
-    "market_id",
-    "token_rank",
-    "selection_rank",
-    "best_route_volume_usd",
-    "dex_24h_usd",
-    "dex_tvl_usd",
-    "adapter_id",
-    "structural_support_status",
-    "structural_reason",
-})
-_ROUTE_COST_POLICY_SNAPSHOT_FIELDS = frozenset({
-    "schema",
-    "run_id",
-    "route_cohort_id",
-    "candidate_source_generation",
-    "route_universe_sha256",
-    "adapter_registry_sha256",
-    "selected_market_set_sha256",
-    "connector_key_registry_sha256",
-    "trace_profile_generation",
-    "submission_connector_profile_generation",
-    "connector_id",
-    "member_count",
-    "members",
-    "member_set_sha256",
-    "status",
-    "reason_code",
-    "observed_at",
-    "valid_until",
-    "issuer_key_id",
-    "signature_algorithm",
-    "attested_payload_sha256",
-    "signature",
-})
 _ROUTE_UNIVERSE_FIELDS = frozenset({
     "schema",
     "candidate_source_generation",
@@ -271,6 +236,11 @@ _ROUTE_UNIVERSE_LEG_FIELDS = frozenset({
     "selection_window",
     "selection_inputs",
     "selection_rank",
+})
+_ROUTE_UNIVERSE_DEX_IDENTITY_FIELDS = frozenset({
+    "collector_context",
+    "target_token_address",
+    "target_token_side",
 })
 _ROUTE_UNIVERSE_SELECTION_INPUT_FIELDS = frozenset({
     "execution_capability",
@@ -413,7 +383,34 @@ _LEG_REASONS = frozenset({
     "usd_price_context_missing",
     "usd_price_context_not_found",
     "usd_price_context_failed",
+    "measurement_limit",
+}) | DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES | DEX_DEPTH_UNSUPPORTED_REASON_CODES
+
+# These failures are created by the bounded cohort orchestrator after (or
+# instead of) the venue-specific DEX collector.  They are distinct from the
+# collector's own closed failure vocabulary, but they still describe a failed
+# DEX leg and must survive exact publication/replay.
+_DEX_ORCHESTRATION_FAILURE_REASONS = frozenset({
+    "fixed_block_unavailable",
+    "fixed_block_lineage_mismatch",
+    "collector_identity_mismatch",
+    "raw_evidence_missing",
+    "raw_evidence_hash_mismatch",
+    "raw_evidence_path_unsafe",
+    "usd_price_context_missing",
+    "usd_price_context_not_found",
+    "usd_price_context_failed",
 })
+_CEX_ORCHESTRATION_FAILURE_REASONS = frozenset({
+    "collector_identity_mismatch",
+    "raw_evidence_missing",
+    "raw_evidence_hash_mismatch",
+    "raw_evidence_path_unsafe",
+})
+_CEX_COLLECTOR_FAILURE_REASONS = frozenset(CEX_DEPTH_REASON_CODES) - {
+    "observed",
+    "source_level_limit",
+}
 
 _TOP_LEVEL_FIELDS = frozenset({
     "schema",
@@ -593,6 +590,28 @@ def _validate_timestamp(value: Any, field: str) -> str:
     return text
 
 
+def _validate_collector_timestamp(value: Any, field: str) -> str:
+    """Validate the exact UTC representation emitted by fact collectors.
+
+    Shadow runtime evidence is normalized to ``Z``.  The TVL fact contract is
+    older and deliberately preserves ``datetime.isoformat()`` bytes using
+    ``+00:00``.  Collector context is source evidence copied unchanged, so it
+    must be checked against that producer contract instead of normalized here.
+    """
+    text = _nonempty_text(value, field)
+    try:
+        parsed = parse_rfc3339_utc(text)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError("{} is invalid".format(field)) from error
+    if parsed.isoformat() != text:
+        raise RoutePublicationError(
+            "{} must use the collector's canonical UTC representation".format(
+                field
+            )
+        )
+    return text
+
+
 def _clone_json(value: Any) -> Any:
     """Detach caller-owned state while rejecting NaN and non-JSON values."""
     return json.loads(_canonical_json_text(value))
@@ -624,6 +643,139 @@ def _safe_network_endpoint(value: Any) -> bool:
     return urlunsplit(
         (parsed.scheme, safe_host, parsed.path, "", "")
     ) == value
+
+
+def _canonical_shadow_decimal(
+    raw: Any, *, positive: bool, label: str
+) -> str:
+    if (
+        not isinstance(raw, str)
+        or len(raw) > 256
+        or _SHADOW_DECIMAL_TEXT.fullmatch(raw) is None
+    ):
+        raise RoutePublicationError("{} is invalid".format(label))
+    try:
+        amount = Decimal(raw)
+    except (InvalidOperation, ValueError) as error:
+        raise RoutePublicationError("{} is invalid".format(label)) from error
+    canonical = format(amount, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    if (
+        not amount.is_finite()
+        or amount < 0
+        or (positive and amount <= 0)
+        or raw != canonical
+    ):
+        raise RoutePublicationError("{} is invalid".format(label))
+    return raw
+
+
+def _collector_token_address(value: Any, *, chain: str, label: str) -> str:
+    text = _nonempty_text(value, label)
+    prefix, separator, address = text.partition("_")
+    if not separator or prefix != chain or not address:
+        raise RoutePublicationError("{} is invalid".format(label))
+    try:
+        normalized = normalize_contract_address(chain, address)
+    except (TokenRegistryError, ValueError) as error:
+        raise RoutePublicationError("{} is invalid".format(label)) from error
+    if normalized != address:
+        raise RoutePublicationError("{} is invalid".format(label))
+    return address
+
+
+def _validate_route_collector_context(
+    context: Any, *, market_id: str
+) -> Dict[str, Any]:
+    """Validate the complete immutable TVL/USD collector projection."""
+    if (
+        not isinstance(context, dict)
+        or set(context) != _ROUTE_COLLECTOR_CONTEXT_FIELDS
+        or context.get("schema") != "route_collector_context/v1"
+    ):
+        raise RoutePublicationError("DEX collector context schema is invalid")
+    match = _DEX_MARKET_ID.fullmatch(market_id)
+    if match is None:
+        raise RoutePublicationError("DEX collector context market is invalid")
+    raw_chain = match.group(1)
+    try:
+        chain = normalize_chain(raw_chain)
+    except (TokenRegistryError, ValueError) as error:
+        raise RoutePublicationError("DEX collector context chain is invalid") from error
+    if chain != raw_chain:
+        raise RoutePublicationError("DEX collector context chain is invalid")
+    for field in ("snapshot_id", "pool_name", "tvl_method", "source"):
+        _nonempty_text(context.get(field), "DEX collector context " + field)
+    if not _safe_network_endpoint(context.get("source_endpoint")):
+        raise RoutePublicationError("DEX collector source endpoint is unsafe")
+    if (
+        not isinstance(context.get("raw_response_sha256"), str)
+        or _HEX_SHA256.fullmatch(context["raw_response_sha256"]) is None
+    ):
+        raise RoutePublicationError("DEX collector raw-response hash is invalid")
+    request_started_at = _validate_collector_timestamp(
+        context.get("request_started_at"), "DEX collector request_started_at"
+    )
+    observed_at = _validate_collector_timestamp(
+        context.get("observed_at"), "DEX collector observed_at"
+    )
+    response_received_at = _validate_collector_timestamp(
+        context.get("response_received_at"),
+        "DEX collector response_received_at",
+    )
+    if not (
+        exact_rfc3339_epoch_seconds(request_started_at)
+        <= exact_rfc3339_epoch_seconds(observed_at)
+        <= exact_rfc3339_epoch_seconds(response_received_at)
+    ):
+        raise RoutePublicationError("DEX collector timestamps are unordered")
+
+    status = context.get("status")
+    reason = context.get("reason_code")
+    address_prices: Dict[str, str] = {}
+    if status == "observed":
+        if reason != "observed":
+            raise RoutePublicationError("observed DEX collector context is invalid")
+        for token_field, price_field in (
+            ("base_token_id", "base_token_price_usd"),
+            ("quote_token_id", "quote_token_price_usd"),
+        ):
+            address = _collector_token_address(
+                context.get(token_field), chain=chain,
+                label="DEX collector " + token_field,
+            )
+            price = _canonical_shadow_decimal(
+                context.get(price_field), positive=True,
+                label="DEX collector " + price_field,
+            )
+            if address in address_prices:
+                raise RoutePublicationError(
+                    "DEX collector Token IDs must be distinct"
+                )
+            address_prices[address] = price
+    elif status in {"missing", "not_found", "failed"}:
+        allowed_reasons = {
+            "missing": {"source_no_tvl_observation"},
+            "not_found": {"source_pool_not_found"},
+            "failed": {
+                "network", "rate_limit", "source_unavailable", "parse",
+                "validation", "collection_failed",
+            },
+        }
+        if reason not in allowed_reasons[status] or any(
+            context.get(field) is not None
+            for field in (
+                "base_token_id", "quote_token_id",
+                "base_token_price_usd", "quote_token_price_usd",
+            )
+        ):
+            raise RoutePublicationError(
+                "unavailable DEX collector context is invalid"
+            )
+    else:
+        raise RoutePublicationError("DEX collector context status is invalid")
+    return {"context": context, "chain": chain, "address_prices": address_prices}
 
 
 def _unsafe_evidence_string(value: str) -> bool:
@@ -887,6 +1039,15 @@ def _validate_leg_rows(
             raise RoutePublicationError("route leg market type is invalid")
         if row.get("market_type") not in (None, "", inferred_type):
             raise RoutePublicationError("route leg market type is invalid")
+        if "typed_source_lineage" in row:
+            try:
+                validate_typed_source_lineage(
+                    row["typed_source_lineage"], market_type=inferred_type
+                )
+            except (TypeError, ValueError) as error:
+                raise RoutePublicationError(
+                    "route leg typed-source lineage is invalid"
+                ) from error
         status_value = row.get("status")
         status_text = "" if status_value is None else status_value
         if status_text not in _LEG_STATUSES:
@@ -901,6 +1062,32 @@ def _validate_leg_rows(
         reason = row.get("reason_code")
         if reason not in _LEG_REASONS | {None, ""}:
             raise RoutePublicationError("route leg reason enum is invalid")
+        if inferred_type == "dex":
+            allowed_dex_reasons = {
+                "observed": {None, "", "observed"},
+                "partial": {"measurement_limit"},
+                "unsupported": set(DEX_DEPTH_UNSUPPORTED_REASON_CODES),
+                "failed": set(DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES)
+                | set(_DEX_ORCHESTRATION_FAILURE_REASONS),
+                "deadline_exceeded": {"route_deadline_exceeded"},
+            }[status_text]
+            if reason not in allowed_dex_reasons:
+                raise RoutePublicationError(
+                    "DEX leg status and reason conflict"
+                )
+        else:
+            allowed_cex_reasons = {
+                "observed": {None, "", "observed"},
+                "partial": {"source_level_limit"},
+                "unsupported": set(),
+                "failed": set(_CEX_COLLECTOR_FAILURE_REASONS)
+                | set(_CEX_ORCHESTRATION_FAILURE_REASONS),
+                "deadline_exceeded": {"route_deadline_exceeded"},
+            }[status_text]
+            if reason not in allowed_cex_reasons:
+                raise RoutePublicationError(
+                    "CEX leg status and reason conflict"
+                )
         snapshot_id = row.get("snapshot_id")
         if snapshot_id not in (None, "", raw_evidence_run_id):
             raise RoutePublicationError("route leg snapshot lineage conflict")
@@ -1594,6 +1781,11 @@ def _open_regular_file_at(
         flags |= os.O_CLOEXEC
     try:
         fd = os.open(filename, flags, dir_fd=directory_fd)
+    except FileNotFoundError as error:
+        # Absence of an expected immutable member is a lineage failure.  Keep
+        # it distinct from a present symlink or other unsafe file type so the
+        # run ledger does not misclassify ordinary evidence loss as an attack.
+        raise RoutePublicationError("{} is missing".format(label)) from error
     except OSError as error:
         raise RoutePublicationError(
             "{} must be a regular non-symlink file".format(label)
@@ -5828,7 +6020,10 @@ def _validate_shadow_pointer(pointer: Mapping[str, Any]) -> Dict[str, Any]:
         raise RoutePublicationError("route shadow pointer run ID is invalid") from error
     if value.get("phase") not in {"canary", "full"}:
         raise RoutePublicationError("route shadow pointer phase is invalid")
-    if _COHORT_ID.fullmatch(str(value.get("route_cohort_id") or "")) is None:
+    if (
+        not isinstance(value.get("route_cohort_id"), str)
+        or _COHORT_ID.fullmatch(value["route_cohort_id"]) is None
+    ):
         raise RoutePublicationError("route shadow pointer cohort ID is invalid")
     for field in (
         "phase_state_sha256",
@@ -5840,7 +6035,10 @@ def _validate_shadow_pointer(pointer: Mapping[str, Any]) -> Dict[str, Any]:
         "candidate_source_generation",
         "audit_sha256",
     ):
-        if _HEX_SHA256.fullmatch(str(value.get(field) or "")) is None:
+        if (
+            not isinstance(value.get(field), str)
+            or _HEX_SHA256.fullmatch(value[field]) is None
+        ):
             raise RoutePublicationError(
                 "route shadow pointer {} is invalid".format(field)
             )
@@ -5850,7 +6048,10 @@ def _validate_shadow_pointer(pointer: Mapping[str, Any]) -> Dict[str, Any]:
             value["phase_state_sha256"] != ROUTE_SHADOW_IMPLICIT_CANARY_SHA256
         ):
             raise RoutePublicationError("route shadow canary phase binding is invalid")
-    elif _HEX_SHA256.fullmatch(str(transition_id or "")) is None:
+    elif (
+        not isinstance(transition_id, str)
+        or _HEX_SHA256.fullmatch(transition_id) is None
+    ):
         raise RoutePublicationError("route shadow full transition ID is invalid")
     return value
 
@@ -5864,8 +6065,10 @@ def _validate_core_pointer_mapping(pointer: Mapping[str, Any]) -> Dict[str, Any]
     if (
         value.get("schema") != ROUTE_CORE_POINTER_SCHEMA
         or value.get("bundle_stage") != ROUTE_CORE_BUNDLE_STAGE
-        or _COHORT_ID.fullmatch(str(value.get("route_cohort_id") or "")) is None
-        or _HEX_SHA256.fullmatch(str(value.get("manifest_sha256") or "")) is None
+        or not isinstance(value.get("route_cohort_id"), str)
+        or _COHORT_ID.fullmatch(value["route_cohort_id"]) is None
+        or not isinstance(value.get("manifest_sha256"), str)
+        or _HEX_SHA256.fullmatch(value["manifest_sha256"]) is None
     ):
         raise RoutePublicationError("supplied route core pointer is invalid")
     return value
@@ -5897,7 +6100,10 @@ def _validate_phase_state_payload(
         "anchored_joint_pointer_sha256",
         "phase_identity_id",
     ):
-        if _HEX_SHA256.fullmatch(str(value.get(field) or "")) is None:
+        if (
+            not isinstance(value.get(field), str)
+            or _HEX_SHA256.fullmatch(value[field]) is None
+        ):
             raise RoutePublicationError(
                 "route shadow phase {} is invalid".format(field)
             )
@@ -5906,7 +6112,10 @@ def _validate_phase_state_payload(
     if (guard_sha is None) == (envelope_sha is None):
         raise RoutePublicationError("route shadow phase ownership binding is invalid")
     for field_value in (guard_sha, envelope_sha):
-        if field_value is not None and _HEX_SHA256.fullmatch(str(field_value)) is None:
+        if field_value is not None and (
+            not isinstance(field_value, str)
+            or _HEX_SHA256.fullmatch(field_value) is None
+        ):
             raise RoutePublicationError("route shadow phase ownership hash is invalid")
     identity = dict(value)
     transition_id = identity.pop("transition_id")
@@ -6018,14 +6227,16 @@ def load_historical_phase_state(
         }
     if (
         phase != "full"
-        or _HEX_SHA256.fullmatch(str(phase_state_sha256 or "")) is None
-        or _HEX_SHA256.fullmatch(str(phase_transition_id or "")) is None
+        or not isinstance(phase_state_sha256, str)
+        or _HEX_SHA256.fullmatch(phase_state_sha256) is None
+        or not isinstance(phase_transition_id, str)
+        or _HEX_SHA256.fullmatch(phase_transition_id) is None
     ):
         raise RoutePublicationError("historical route shadow phase is invalid")
     return _load_full_phase_state(
         Path(shadow_root),
         phase_state_sha256=phase_state_sha256,
-        phase_transition_id=str(phase_transition_id),
+        phase_transition_id=phase_transition_id,
     )
 
 
@@ -6103,9 +6314,8 @@ def _validate_route_universe_payload(universe: Mapping[str, Any]) -> Dict[str, A
     window = value.get("selection_window")
     if (
         value.get("schema") != ROUTE_UNIVERSE_SCHEMA
-        or _HEX_SHA256.fullmatch(
-            str(value.get("candidate_source_generation") or "")
-        ) is None
+        or not isinstance(value.get("candidate_source_generation"), str)
+        or _HEX_SHA256.fullmatch(value["candidate_source_generation"]) is None
         or not isinstance(window, dict)
         or set(window) != {"start", "end"}
         or not _matches_requested_notional_grid(value.get("requested_notionals_usd"))
@@ -6119,8 +6329,10 @@ def _validate_route_universe_payload(universe: Mapping[str, Any]) -> Dict[str, A
     except (KeyError, TypeError, ValueError) as error:
         raise RoutePublicationError("route universe selection window is invalid") from error
     if (
-        _ISO_DATE.fullmatch(str(window["start"])) is None
-        or _ISO_DATE.fullmatch(str(window["end"])) is None
+        not isinstance(window["start"], str)
+        or _ISO_DATE.fullmatch(window["start"]) is None
+        or not isinstance(window["end"], str)
+        or _ISO_DATE.fullmatch(window["end"]) is None
         or (window_end - window_start).days != 29
     ):
         raise RoutePublicationError("route universe selection window is invalid")
@@ -6164,7 +6376,7 @@ def _validate_route_universe_payload(universe: Mapping[str, Any]) -> Dict[str, A
             raise RoutePublicationError("route universe leg schema is invalid")
         market_type = leg.get("market_type")
         expected_leg_fields = (
-            _ROUTE_UNIVERSE_LEG_FIELDS | {"collector_context"}
+            _ROUTE_UNIVERSE_LEG_FIELDS | _ROUTE_UNIVERSE_DEX_IDENTITY_FIELDS
             if market_type == "dex"
             else _ROUTE_UNIVERSE_LEG_FIELDS
         )
@@ -6217,6 +6429,43 @@ def _validate_route_universe_payload(universe: Mapping[str, Any]) -> Dict[str, A
             if inputs.get("dex_24h_usd") is not None or inputs.get("dex_tvl_usd") is not None:
                 raise RoutePublicationError("route universe market-type inputs conflict")
         else:
+            target_address = leg.get("target_token_address")
+            target_side = leg.get("target_token_side")
+            market_match = _DEX_MARKET_ID.fullmatch(market_id)
+            if market_match is None:
+                raise RoutePublicationError(
+                    "route universe DEX target identity is invalid"
+                )
+            raw_chain = market_match.group(1)
+            try:
+                chain = normalize_chain(raw_chain)
+                normalized_target = normalize_contract_address(
+                    chain, target_address
+                )
+            except (TokenRegistryError, ValueError) as error:
+                raise RoutePublicationError(
+                    "route universe DEX target identity is invalid"
+                ) from error
+            context_result = _validate_route_collector_context(
+                leg.get("collector_context"), market_id=market_id
+            )
+            context = context_result["context"]
+            if (
+                not isinstance(target_address, str)
+                or normalized_target != target_address
+                or context_result["chain"] != chain
+                or target_side not in {"base", "quote", None}
+                or (context.get("status") == "observed")
+                != (target_side is not None)
+                or (
+                    target_side is not None
+                    and context.get(target_side + "_token_id")
+                    != "{}_{}".format(chain, target_address)
+                )
+            ):
+                raise RoutePublicationError(
+                    "route universe DEX target identity is invalid"
+                )
             if inputs.get("cex_selected_window_usd") is not None:
                 raise RoutePublicationError("route universe market-type inputs conflict")
             canonical_decimal(
@@ -6334,347 +6583,208 @@ def _validate_cost_evidence_outer_lineage(
     candidate_source_generation: str,
     route_universe_sha256_value: str,
     universe: Mapping[str, Any],
+    retained_typed_pool_state_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
 ) -> None:
-    if (
-        not isinstance(cost_evidence, Mapping)
-        or set(cost_evidence) != _ROUTE_COST_EVIDENCE_FIELDS
-    ):
-        raise RoutePublicationError("route-cost evidence schema is invalid")
-    required = {
-        "schema": ROUTE_COST_EVIDENCE_MANIFEST_SCHEMA,
-        "run_id": run_id,
-        "route_cohort_id": route_cohort_id,
-        "phase": phase,
-        "candidate_source_generation": candidate_source_generation,
-        "route_universe_sha256": route_universe_sha256_value,
-    }
-    if any(cost_evidence.get(key) != expected for key, expected in required.items()):
-        raise RoutePublicationError("route-cost evidence outer lineage mismatch")
+    try:
+        validated = validate_route_cost_evidence_manifest_for_publication(
+            cost_evidence,
+            universe=universe,
+            expected_run_id=run_id,
+            expected_route_cohort_id=route_cohort_id,
+            expected_phase=phase,
+            expected_candidate_source_generation=candidate_source_generation,
+            expected_route_universe_sha256=route_universe_sha256_value,
+            retained_typed_pool_state_members=(
+                retained_typed_pool_state_members
+            ),
+        )
+    except RouteCostEvidenceError as error:
+        raise RoutePublicationError(
+            "route-cost evidence replay failed: {}".format(error)
+        ) from error
+    if validated != cost_evidence:
+        raise RoutePublicationError("route-cost evidence is not canonical")
 
-    def exact_count(value: Any, label: str, maximum: int) -> int:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value < 0
-            or value > maximum
-        ):
-            raise RoutePublicationError("{} is invalid".format(label))
-        return value
 
-    def canonical_physical_sha(value: Any) -> str:
-        return _sha256_bytes(_canonical_json_bytes(value))
+def _load_retained_typed_source_members(
+    shadow_root: Path,
+    core: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Descriptor-reread the exact raw typed inventory bound by core legs."""
+    cohort = core.get("cohort")
+    legs = core.get("legs")
+    if not isinstance(cohort, Mapping) or not isinstance(legs, list):
+        raise RoutePublicationError("typed-source core evidence is invalid")
+    raw_run_id = cohort.get("raw_evidence_run_id")
+    try:
+        validated_raw_run_id = _validate_shadow_run_id(raw_run_id)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError(
+            "typed-source raw evidence run ID is invalid"
+        ) from error
 
-    def typed_sha(domain: bytes, value: Any) -> str:
-        return _sha256_bytes(domain + _canonical_json_bytes(value) + b"\n")
-
-    for field in (
-        "adapter_registry_sha256",
-        "connector_key_registry_sha256",
-        "trace_profile_generation",
-        "submission_connector_profile_generation",
-        "selected_market_set_sha256",
-        "chain_evidence_set_sha256",
-        "market_evidence_set_sha256",
-        "transcript_set_sha256",
-        "binding_set_sha256",
-        "submission_policy_snapshot_sha256",
-    ):
-        if _HEX_SHA256.fullmatch(str(cost_evidence.get(field) or "")) is None:
+    expected_members: List[Dict[str, Any]] = []
+    for leg in legs:
+        if not isinstance(leg, Mapping):
+            raise RoutePublicationError("typed-source core leg is invalid")
+        market_id = leg.get("market_id")
+        market_type = leg.get("market_type")
+        lineage = leg.get("typed_source_lineage")
+        if not isinstance(market_id, str) or market_type not in {"cex", "dex"}:
+            raise RoutePublicationError("typed-source core leg identity is invalid")
+        try:
+            observed = typed_source_lineage_observed_members(
+                lineage, market_type=market_type
+            )
+        except (TypeError, ValueError) as error:
             raise RoutePublicationError(
-                "route-cost evidence {} is invalid".format(field)
-            )
-    _validate_timestamp(cost_evidence.get("evaluated_at"), "route-cost evaluated_at")
-
-    adapter_registry = cost_evidence.get("adapter_registry")
-    if (
-        not isinstance(adapter_registry, dict)
-        or set(adapter_registry) != {"schema", "registry_version", "adapters"}
-        or adapter_registry.get("schema") != "route_cost_adapter_registry/v1"
-        or not isinstance(adapter_registry.get("registry_version"), str)
-        or not adapter_registry["registry_version"]
-        or not isinstance(adapter_registry.get("adapters"), list)
-        or canonical_physical_sha(adapter_registry)
-        != cost_evidence["adapter_registry_sha256"]
-    ):
-        raise RoutePublicationError("route-cost adapter registry is invalid")
-    connector_registry = cost_evidence.get("connector_key_registry")
-    if (
-        not isinstance(connector_registry, dict)
-        or set(connector_registry) != {"schema", "registry_version", "keys"}
-        or connector_registry.get("schema")
-        != "route_cost_connector_key_registry/v1"
-        or not isinstance(connector_registry.get("registry_version"), str)
-        or not connector_registry["registry_version"]
-        or not isinstance(connector_registry.get("keys"), list)
-        or canonical_physical_sha(connector_registry)
-        != cost_evidence["connector_key_registry_sha256"]
-    ):
-        raise RoutePublicationError("route-cost connector registry is invalid")
-
-    arrays_and_counts = (
-        ("selected_markets", "selected_market_count", 8),
-        ("chain_evidence", "chain_evidence_count", 64),
-        ("market_evidence", "market_evidence_count", 8),
-        ("transcripts", "transcript_count", 80),
-        ("bindings", "binding_count", 4096),
-    )
-    for array_field, count_field, maximum in arrays_and_counts:
-        rows = cost_evidence.get(array_field)
-        count = exact_count(cost_evidence.get(count_field), count_field, maximum)
-        if not isinstance(rows, list) or len(rows) != count:
-            raise RoutePublicationError(
-                "route-cost evidence {} count differs".format(array_field)
-            )
-
-    selected_markets = cost_evidence["selected_markets"]
-    selected_ids: List[str] = []
-    universe_dex_ids = {
-        str(row["market_id"])
-        for row in universe["selected_legs"]
-        if row["market_type"] == "dex"
-    }
-    for row in selected_markets:
-        if (
-            not isinstance(row, dict)
-            or set(row) != _ROUTE_COST_SELECTED_MARKET_FIELDS
-            or not isinstance(row.get("market_id"), str)
-            or row["market_id"] not in universe_dex_ids
-            or isinstance(row.get("token_rank"), bool)
-            or not isinstance(row.get("token_rank"), int)
-            or row["token_rank"] < 1
-            or isinstance(row.get("selection_rank"), bool)
-            or not isinstance(row.get("selection_rank"), int)
-            or row["selection_rank"] < 1
-            or not isinstance(row.get("adapter_id"), str)
-            or not row["adapter_id"]
-            or row.get("structural_support_status")
-            not in {"supported", "unsupported"}
-            or (
-                row["structural_support_status"] == "supported"
-                and row.get("structural_reason") is not None
-            )
-            or (
-                row["structural_support_status"] == "unsupported"
-                and row.get("structural_reason")
-                != "strict_cost_adapter_unsupported"
-            )
-        ):
-            raise RoutePublicationError("route-cost selected market is invalid")
-        selected_ids.append(row["market_id"])
-    if selected_ids != sorted(set(selected_ids)):
-        raise RoutePublicationError("route-cost selected markets are not canonical")
-    # Task 2 has no production adapter selector yet, so its safe staging
-    # contract supports at most eight DEX legs and refuses any denominator
-    # reduction.  Task 3's strict validator replaces this with the frozen
-    # Ethereum-V2/top-eight selector when the adapter registry becomes live.
-    expected_selected_ids = sorted(universe_dex_ids)
-    if len(expected_selected_ids) > 8:
-        raise RoutePublicationError("route-cost selected scope exceeds Task 2 limit")
-    if selected_ids != expected_selected_ids:
-        raise RoutePublicationError("route-cost selected scope is inconsistent")
-    binding_scope_empty = not selected_markets or all(
-        row["structural_support_status"] == "unsupported"
-        for row in selected_markets
-    )
-    selected_projection = {
-        "schema": "route_cost_selected_markets/v1",
-        "members": selected_markets,
-    }
-    if canonical_physical_sha(selected_projection) != cost_evidence[
-        "selected_market_set_sha256"
-    ]:
-        raise RoutePublicationError("route-cost selected-market hash mismatch")
-    if cost_evidence["transcript_count"] != len(selected_markets) * 10:
-        raise RoutePublicationError("route-cost transcript scope is incomplete")
-    expected_transcript_scope = [
-        (market_id, direction, str(notional))
-        for market_id in selected_ids
-        for direction in ("buy", "sell")
-        for notional in universe["requested_notionals_usd"]
+                "typed-source core lineage is invalid"
+            ) from error
+        expected_members.extend(
+            {"market_id": market_id, **member} for member in observed
+        )
+    expected_members.sort(key=lambda row: (row["market_id"], row["role"]))
+    expected_keys = [
+        (row["market_id"], row["role"]) for row in expected_members
     ]
-    actual_transcript_scope = []
-    unsupported_market_ids = {
-        row["market_id"]
-        for row in selected_markets
-        if row["structural_support_status"] == "unsupported"
-    }
-    for row in cost_evidence["transcripts"]:
-        if not isinstance(row, dict):
-            raise RoutePublicationError("route-cost transcript is invalid")
-        scope = (
-            row.get("market_id"),
-            row.get("direction"),
-            row.get("requested_notional_usd"),
-        )
-        if (
-            not isinstance(scope[0], str)
-            or scope[1] not in {"buy", "sell"}
-            or not isinstance(scope[2], str)
-        ):
-            raise RoutePublicationError("route-cost transcript scope is invalid")
-        if scope[0] in unsupported_market_ids and (
-            row.get("status") != "unavailable"
-            or row.get("reason_code") != "strict_cost_adapter_unsupported"
-        ):
-            raise RoutePublicationError(
-                "route-cost unsupported-market transcript is invalid"
-            )
-        actual_transcript_scope.append(scope)
-    if actual_transcript_scope != expected_transcript_scope:
-        raise RoutePublicationError("route-cost transcript scope is invalid")
-    if binding_scope_empty and any(
-        cost_evidence[field] != expected
-        for field, expected in (
-            ("chain_evidence_count", 0),
-            ("market_evidence_count", 0),
-            ("binding_count", 0),
-            ("chain_evidence", []),
-            ("market_evidence", []),
-            ("bindings", []),
-            ("native_price_evidence", None),
-            ("native_price_evidence_sha256", None),
-        )
+    expected_filenames = [row["filename"] for row in expected_members]
+    if (
+        len(expected_keys) != len(set(expected_keys))
+        or len(expected_filenames) != len(set(expected_filenames))
     ):
-        raise RoutePublicationError("route-cost empty selected scope is inconsistent")
+        raise RoutePublicationError("typed-source core inventory is invalid")
 
-    set_hashes = (
-        (
-            "chain_evidence",
-            "chain_evidence_set_sha256",
-            b"route-cost-chain-evidence-set/v1\n",
-        ),
-        (
-            "market_evidence",
-            "market_evidence_set_sha256",
-            b"route-cost-market-evidence-set/v1\n",
-        ),
-        (
-            "transcripts",
-            "transcript_set_sha256",
-            b"route-cost-evidence-transcript-set/v1\n",
-        ),
-        (
-            "bindings",
-            "binding_set_sha256",
-            b"route-cost-evidence-binding-set/v1\n",
-        ),
+    shadow = _absolute_without_symlink_resolution(Path(shadow_root))
+    raw_root_path = shadow.parent.parent / "raw" / "route-cohort"
+    raw_root, raw_root_fd, raw_root_details = _open_verified_directory(
+        raw_root_path, "typed-source raw root"
     )
-    for rows_field, hash_field, domain in set_hashes:
-        if typed_sha(domain, cost_evidence[rows_field]) != cost_evidence[hash_field]:
-            raise RoutePublicationError(
-                "route-cost evidence {} hash mismatch".format(rows_field)
+    run_fd: Optional[int] = None
+    typed_fd: Optional[int] = None
+    try:
+        run_fd, run_details = _open_directory_at(
+            raw_root_fd,
+            validated_raw_run_id,
+            "typed-source raw run",
+        )
+        manifest, manifest_bytes, _manifest_sha, manifest_details = (
+            _read_canonical_object_at(
+                run_fd,
+                "typed-manifest.json",
+                limit=_MAX_JSON_BYTES,
+                label="typed-source manifest",
             )
-
-    native_evidence = cost_evidence.get("native_price_evidence")
-    native_sha = cost_evidence.get("native_price_evidence_sha256")
-    if native_evidence is None:
-        if native_sha is not None:
-            raise RoutePublicationError("route-cost native-price null matrix is invalid")
-    elif (
-        not isinstance(native_evidence, dict)
-        or _HEX_SHA256.fullmatch(str(native_sha or "")) is None
-        or typed_sha(
-            b"route-cost-native-price-evidence/v1\n", native_evidence
-        )
-        != native_sha
-    ):
-        raise RoutePublicationError("route-cost native-price evidence is invalid")
-
-    counts = cost_evidence.get("counts")
-    if not isinstance(counts, dict) or set(counts) != _ROUTE_COST_COUNT_FIELDS:
-        raise RoutePublicationError("route-cost evidence counts schema is invalid")
-    statuses = ("observed", "unavailable", "failed")
-    for prefix, rows in (
-        ("transcript", cost_evidence["transcripts"]),
-        ("binding", cost_evidence["bindings"]),
-    ):
-        actual = Counter()
-        for row in rows:
-            if not isinstance(row, dict) or row.get("status") not in statuses:
-                raise RoutePublicationError(
-                    "route-cost {} status is invalid".format(prefix)
-                )
-            actual[row["status"]] += 1
-        for status_value in statuses:
-            expected_count = exact_count(
-                counts.get("{}_{}".format(prefix, status_value)),
-                "route-cost {} {} count".format(prefix, status_value),
-                4096,
-            )
-            if expected_count != actual[status_value]:
-                raise RoutePublicationError("route-cost evidence counts differ")
-
-    snapshot = cost_evidence.get("submission_policy_snapshot")
-    if (
-        not isinstance(snapshot, dict)
-        or set(snapshot) != _ROUTE_COST_POLICY_SNAPSHOT_FIELDS
-    ):
-        raise RoutePublicationError("route-cost policy snapshot schema is invalid")
-    snapshot_links = {
-        "run_id": run_id,
-        "route_cohort_id": route_cohort_id,
-        "candidate_source_generation": candidate_source_generation,
-        "route_universe_sha256": route_universe_sha256_value,
-        "adapter_registry_sha256": cost_evidence["adapter_registry_sha256"],
-        "selected_market_set_sha256": cost_evidence[
-            "selected_market_set_sha256"
-        ],
-        "connector_key_registry_sha256": cost_evidence[
-            "connector_key_registry_sha256"
-        ],
-        "trace_profile_generation": cost_evidence["trace_profile_generation"],
-        "submission_connector_profile_generation": cost_evidence[
-            "submission_connector_profile_generation"
-        ],
-    }
-    if (
-        snapshot.get("schema")
-        != "route_cost_submission_policy_snapshot/v1"
-        or any(snapshot.get(key) != value for key, value in snapshot_links.items())
-        or not isinstance(snapshot.get("members"), list)
-        or exact_count(snapshot.get("member_count"), "policy member_count", 4096)
-        != len(snapshot["members"])
-        or typed_sha(
-            b"route-cost-submission-policy-member-set/v1\n",
-            snapshot["members"],
-        )
-        != snapshot.get("member_set_sha256")
-        or typed_sha(
-            b"route-cost-submission-policy-snapshot/v1\n", snapshot
-        )
-        != cost_evidence["submission_policy_snapshot_sha256"]
-    ):
-        raise RoutePublicationError("route-cost policy snapshot is invalid")
-    if binding_scope_empty:
-        nullable_fields = (
-            "observed_at",
-            "valid_until",
-            "issuer_key_id",
-            "signature_algorithm",
-            "attested_payload_sha256",
-            "signature",
         )
         if (
-            cost_evidence["binding_count"] != 0
-            or cost_evidence["bindings"] != []
-            or snapshot["member_count"] != 0
-            or snapshot["members"] != []
-            or snapshot.get("status") != "not_applicable"
-            or snapshot.get("reason_code") != "scope_empty"
-            or any(snapshot.get(field) is not None for field in nullable_fields)
-            or snapshot.get("connector_id") is not None
-            and (
-                not isinstance(snapshot["connector_id"], str)
-                or not snapshot["connector_id"]
+            set(manifest) != TYPED_SOURCE_MANIFEST_FIELDS
+            or manifest.get("schema") != TYPED_SOURCE_MANIFEST_SCHEMA
+            or manifest.get("raw_evidence_run_id") != validated_raw_run_id
+            or isinstance(manifest.get("member_count"), bool)
+            or not isinstance(manifest.get("member_count"), int)
+            or not isinstance(manifest.get("members"), list)
+            or manifest["member_count"] != len(manifest["members"])
+            or any(
+                not isinstance(member, Mapping)
+                or set(member) != TYPED_SOURCE_MANIFEST_MEMBER_FIELDS
+                for member in manifest["members"]
             )
+            or manifest["members"] != expected_members
         ):
-            raise RoutePublicationError("route-cost empty policy snapshot is invalid")
-    elif (
-        cost_evidence["binding_count"] == 0
-        or snapshot.get("status") == "not_applicable"
-        or snapshot.get("reason_code") == "scope_empty"
-    ):
-        raise RoutePublicationError("route-cost nonempty policy scope is invalid")
+            raise RoutePublicationError(
+                "typed-source manifest/core inventory differs"
+            )
+
+        typed_fd, typed_details = _open_directory_at(
+            run_fd, "typed", "typed-source member root"
+        )
+        try:
+            actual_filenames = sorted(os.listdir(typed_fd))
+        except OSError as error:
+            raise RoutePublicationError(
+                "typed-source member inventory is unreadable"
+            ) from error
+        if actual_filenames != sorted(expected_filenames):
+            raise RoutePublicationError(
+                "typed-source member directory inventory differs"
+            )
+
+        retained: Dict[str, Dict[str, Any]] = {}
+        member_snapshots: List[Tuple[str, bytes, os.stat_result, int]] = []
+        for descriptor in expected_members:
+            contract = TYPED_SOURCE_ROLE_CONTRACTS.get(descriptor["role"])
+            if contract is None:
+                raise RoutePublicationError("typed-source role is invalid")
+            payload, physical_sha256, member_details = _read_bounded_bytes_at(
+                typed_fd,
+                descriptor["filename"],
+                limit=contract["max_bytes"],
+                label="typed-source member",
+            )
+            if (
+                len(payload) != descriptor["size"]
+                or physical_sha256 != descriptor["sha256"]
+            ):
+                raise RoutePublicationError(
+                    "typed-source member bytes differ from lineage"
+                )
+            member_snapshots.append((
+                descriptor["filename"],
+                payload,
+                member_details,
+                contract["max_bytes"],
+            ))
+            if descriptor["role"] == "dex_pool_state":
+                retained[descriptor["market_id"]] = {
+                    "descriptor": _clone_json(descriptor),
+                    "payload": payload,
+                }
+
+        for filename, payload, details, limit in member_snapshots:
+            if not _pointer_snapshot_is_owned(
+                _optional_regular_snapshot_at(
+                    typed_fd,
+                    filename,
+                    limit=limit,
+                    label="typed-source member",
+                ),
+                (payload, details),
+            ):
+                raise RoutePublicationError(
+                    "typed-source member changed during validation"
+                )
+        if not _pointer_snapshot_is_owned(
+            _optional_regular_snapshot_at(
+                run_fd,
+                "typed-manifest.json",
+                limit=_MAX_JSON_BYTES,
+                label="typed-source manifest",
+            ),
+            (manifest_bytes, manifest_details),
+        ):
+            raise RoutePublicationError(
+                "typed-source manifest changed during validation"
+            )
+        _verify_directory_entry_snapshot(
+            run_fd, "typed", typed_details, "typed-source member root"
+        )
+        _verify_directory_entry_snapshot(
+            raw_root_fd,
+            validated_raw_run_id,
+            run_details,
+            "typed-source raw run",
+        )
+        _verify_open_path_snapshot(
+            raw_root, raw_root_details, "typed-source raw root"
+        )
+        return retained
+    finally:
+        _close_route_descriptor_group((
+            (typed_fd, "typed-source member root"),
+            (run_fd, "typed-source raw run"),
+            (raw_root_fd, "typed-source raw root"),
+        ))
 
 
 def _open_shadow_run_directory(
@@ -6804,15 +6914,6 @@ def _read_shadow_run_evidence(
         audit = _strict_validate_shadow_audit(audit_payload)
         if audit != audit_payload or _canonical_json_bytes(audit) != audit_bytes:
             raise RoutePublicationError("route shadow audit normalization changed bytes")
-        _validate_cost_evidence_outer_lineage(
-            cost,
-            run_id=run_id,
-            route_cohort_id=audit["route_cohort_id"],
-            phase=audit["phase"],
-            candidate_source_generation=audit["candidate_source_generation"],
-            route_universe_sha256_value=universe_logical_sha256,
-            universe=universe,
-        )
         if (
             audit["run_id"] != run_id
             or audit["route_universe_sha256"] != universe_logical_sha256
@@ -6918,35 +7019,13 @@ def _validate_dex_collector_contexts(
             raise RoutePublicationError("DEX collector context market is absent")
         context = universe_leg.get("collector_context")
         if (
-            not isinstance(context, dict)
-            or set(context) != _ROUTE_COLLECTOR_CONTEXT_FIELDS
-            or context.get("schema") != "route_collector_context/v1"
-            or core_leg.get("collector_context") != context
+            core_leg.get("collector_context") != context
         ):
             raise RoutePublicationError("DEX collector context lineage mismatch")
-        for field in ("snapshot_id", "pool_name", "tvl_method", "source"):
-            _nonempty_text(context.get(field), "DEX collector context " + field)
-        if not _safe_network_endpoint(context.get("source_endpoint")):
-            raise RoutePublicationError("DEX collector source endpoint is unsafe")
-        if _HEX_SHA256.fullmatch(str(context.get("raw_response_sha256") or "")) is None:
-            raise RoutePublicationError("DEX collector raw-response hash is invalid")
-        request_started_at = _validate_timestamp(
-            context.get("request_started_at"),
-            "DEX collector request_started_at",
+        context_result = _validate_route_collector_context(
+            context, market_id=market_id
         )
-        observed_at = _validate_timestamp(
-            context.get("observed_at"), "DEX collector observed_at"
-        )
-        response_received_at = _validate_timestamp(
-            context.get("response_received_at"),
-            "DEX collector response_received_at",
-        )
-        if not (
-            exact_rfc3339_epoch_seconds(request_started_at)
-            <= exact_rfc3339_epoch_seconds(observed_at)
-            <= exact_rfc3339_epoch_seconds(response_received_at)
-        ):
-            raise RoutePublicationError("DEX collector timestamps are unordered")
+        context = context_result["context"]
         redundant = {
             "snapshot_id": "usd_price_source_snapshot_id",
             "observed_at": "usd_price_observed_at",
@@ -6962,55 +7041,29 @@ def _validate_dex_collector_contexts(
             if (
                 context.get("reason_code") != "observed"
                 or tvl_reason_code(context.get("reason_code")) != "observed"
-                or core_leg.get("available") is False
             ):
                 raise RoutePublicationError("observed DEX price context is unavailable")
-            chain = market_id.split(":", 3)[1]
-            token_pattern = re.compile(
-                re.escape(chain) + r"_(0x[0-9a-f]{40})\Z",
-                flags=re.ASCII,
-            )
-            price_by_address: Dict[str, str] = {}
-            for token_field, price_field in (
-                ("base_token_id", "base_token_price_usd"),
-                ("quote_token_id", "quote_token_price_usd"),
-            ):
-                token_match = token_pattern.fullmatch(
-                    str(context.get(token_field) or "")
+            price_by_address = context_result["address_prices"]
+            core_status = core_leg.get("status")
+            if core_status in {"unsupported", "failed", "deadline_exceeded"}:
+                if (
+                    core_leg.get("available") is True
+                    or any(
+                        core_leg.get(field) is not None
+                        for field in (
+                            "token0_address", "token1_address",
+                            "token0_price_usd", "token1_price_usd",
+                        )
+                    )
+                ):
+                    raise RoutePublicationError(
+                        "terminal DEX leg cannot publish pool price evidence"
+                    )
+                continue
+            if core_leg.get("available") is False:
+                raise RoutePublicationError(
+                    "observed DEX price context is unavailable"
                 )
-                price = context.get(price_field)
-                if (
-                    token_match is None
-                    or not isinstance(price, str)
-                    or len(price) > 256
-                    or _SHADOW_DECIMAL_TEXT.fullmatch(price) is None
-                ):
-                    raise RoutePublicationError(
-                        "DEX collector address-price evidence is invalid"
-                    )
-                try:
-                    amount = Decimal(price)
-                except (InvalidOperation, ValueError) as error:
-                    raise RoutePublicationError(
-                        "DEX collector USD price is invalid"
-                    ) from error
-                canonical = format(amount, "f")
-                if "." in canonical:
-                    canonical = canonical.rstrip("0").rstrip(".")
-                if (
-                    not amount.is_finite()
-                    or amount <= 0
-                    or price != canonical
-                ):
-                    raise RoutePublicationError(
-                        "DEX collector USD price is invalid"
-                    )
-                address = token_match.group(1)
-                if address in price_by_address:
-                    raise RoutePublicationError(
-                        "DEX collector Token IDs must be distinct"
-                    )
-                price_by_address[address] = price
             core_price_by_address: Dict[str, str] = {}
             for address_field, price_field in (
                 ("token0_address", "token0_price_usd"),
@@ -7067,6 +7120,7 @@ def _validate_dex_collector_contexts(
 
 
 def _validate_joint_lineage(
+    shadow_root: Path,
     evidence: Mapping[str, Any],
     core: Mapping[str, Any],
     phase_view: Mapping[str, Any],
@@ -7108,6 +7162,33 @@ def _validate_joint_lineage(
     )
     if core_leg_identity != universe_leg_identity:
         raise RoutePublicationError("joint route shadow leg inventory mismatch")
+    for leg in core["legs"]:
+        lineage = leg.get("typed_source_lineage")
+        if lineage is None:
+            raise RoutePublicationError(
+                "joint route shadow leg typed-source lineage is missing"
+            )
+        try:
+            validate_typed_source_lineage(
+                lineage, market_type=str(leg.get("market_type"))
+            )
+        except (TypeError, ValueError) as error:
+            raise RoutePublicationError(
+                "joint route shadow leg typed-source lineage is invalid"
+            ) from error
+    retained_pool_states = _load_retained_typed_source_members(
+        Path(shadow_root), core
+    )
+    _validate_cost_evidence_outer_lineage(
+        evidence["cost_evidence"],
+        run_id=audit["run_id"],
+        route_cohort_id=audit["route_cohort_id"],
+        phase=audit["phase"],
+        candidate_source_generation=audit["candidate_source_generation"],
+        route_universe_sha256_value=evidence["route_universe_sha256"],
+        universe=universe,
+        retained_typed_pool_state_members=retained_pool_states,
+    )
     _validate_dex_collector_contexts(universe, core["legs"])
     try:
         try:
@@ -7254,7 +7335,9 @@ def _load_shadow_result_evidence(
             ) != pointer["core_pointer_sha256"]
         ):
             raise RoutePublicationError("historical core pointer hash is invalid")
-        _validate_joint_lineage(evidence, loaded_core, phase_view)
+        _validate_joint_lineage(
+            Path(shadow_root), evidence, loaded_core, phase_view
+        )
         _verify_open_path_identity(core, core_details, "route core root")
         result = (pointer, evidence, loaded_core)
     except BaseException as error:
@@ -7285,7 +7368,10 @@ def load_shadow_result(
         validated_run_id = _validate_shadow_run_id(run_id)
     except (TypeError, ValueError) as error:
         raise RoutePublicationError("route shadow run ID is invalid") from error
-    if _HEX_SHA256.fullmatch(str(expected_pointer_sha256 or "")) is None:
+    if (
+        not isinstance(expected_pointer_sha256, str)
+        or _HEX_SHA256.fullmatch(expected_pointer_sha256) is None
+    ):
         raise RoutePublicationError("expected route shadow pointer hash is invalid")
     pointer, evidence, core = _load_shadow_result_evidence(
         Path(shadow_root), run_id=validated_run_id
@@ -7553,7 +7639,7 @@ def publish_shadow_result(
             != _stable_file_metadata(initial_phase_root_snapshot)
         ):
             raise RoutePublicationError("active route shadow phase changed")
-        _validate_joint_lineage(evidence, loaded_core, final_phase)
+        _validate_joint_lineage(shadow, evidence, loaded_core, final_phase)
         pointer = _pointer_from_shadow_evidence(evidence)
         pointer_bytes = _pointer_payload_bytes(pointer)
         _verify_open_path_identity(core, core_details, "route core root")

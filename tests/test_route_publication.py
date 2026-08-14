@@ -42,12 +42,16 @@ from scripts.route_opportunity import (
 )
 from scripts.route_quantity import CommonTarget
 from scripts.route_shadow_inputs import SourceFileIdentity, _candidate_source_generation
+from scripts.token_registry import normalize_contract_address
 from scripts.route_universe import route_universe_sha256
 from scripts.route_inventory import (
     INVENTORY_PROFILE_COLUMNS,
     classify_route_mode_evidence,
     inventory_capacity_for_route,
     load_validated_inventory_profile,
+)
+from scripts.route_cost_evidence import (
+    build_unavailable_route_cost_evidence_manifest,
 )
 from tests.test_route_opportunity import cex_leg, route_and_mode
 import scripts.route_publication as route_publication
@@ -168,6 +172,77 @@ def _cohort():
     cohort["route_cohort_id"] = "cohort:" + _canonical_sha256(cohort)
     cohort["fingerprint"] = _canonical_sha256(cohort)
     return cohort
+
+
+def _cex_typed_source_lineage(prefix):
+    return {
+        "schema": "route_leg_typed_source_lineage/v1",
+        "members": [
+            {
+                "role": "cex_market_rules",
+                "status": "observed",
+                "reason_code": None,
+                "filename": prefix + "-market-rules.json",
+                "sha256": "c" * 64,
+                "size": 1024,
+                "logical_generation": "d" * 64,
+                "adapter_id": "route_quantity_quote_for_book/v1",
+                "content_schema": "route_market_rules_source/v1",
+            },
+            {
+                "role": "cex_raw_book_response",
+                "status": "observed",
+                "reason_code": None,
+                "filename": prefix + "-raw-book.json",
+                "sha256": "a" * 64,
+                "size": 2048,
+                "logical_generation": "b" * 64,
+                "adapter_id": "fetch_cex_depth/parse_book/v1",
+                "content_schema": "route_bytes/v1",
+            },
+            {
+                "role": "quote_usd_conversion",
+                "status": "observed",
+                "reason_code": None,
+                "filename": prefix + "-usd-conversion.json",
+                "sha256": "e" * 64,
+                "size": 512,
+                "logical_generation": "f" * 64,
+                "adapter_id": "route_usd_conversion_source/v1",
+                "content_schema": "route_usd_conversion_source/v1",
+            },
+        ],
+    }
+
+
+def _dex_typed_source_lineage(prefix):
+    return {
+        "schema": "route_leg_typed_source_lineage/v1",
+        "members": [
+            {
+                "role": "dex_pool_state",
+                "status": "unavailable",
+                "reason_code": "typed_source_adapter_unsupported",
+                "filename": None,
+                "sha256": None,
+                "size": None,
+                "logical_generation": None,
+                "adapter_id": "route_quantity_quote_for_v2_pool/v1",
+                "content_schema": "route_v2_pool_state/v1",
+            },
+            {
+                "role": "dex_usd_price_context",
+                "status": "unavailable",
+                "reason_code": "typed_source_adapter_unsupported",
+                "filename": None,
+                "sha256": None,
+                "size": None,
+                "logical_generation": None,
+                "adapter_id": "route_dex_usd_price_context/v1",
+                "content_schema": "route_dex_usd_price_context/v1",
+            },
+        ],
+    }
 
 
 def _rehash(cohort):
@@ -733,8 +808,8 @@ def _rewrite_route_timing_without_foreign_key(bundle):
 
 def _dex_cohort(block_numbers=("100", "100")):
     cohort = _cohort()
-    first = "dex:eth:uniswap:0xaaa:UNI"
-    second = "dex:eth:uniswap:0xbbb:UNI"
+    first = "dex:eth:uniswap_v2:0x{}:UNI".format("a" * 40)
+    second = "dex:eth:uniswap_v2:0x{}:UNI".format("b" * 40)
 
     def route(buy, sell):
         identity = {
@@ -1807,6 +1882,90 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
 
 
 class DeterministicRoutePublicationTests(TemporaryRouteRootTestCase):
+    def test_typed_source_lineage_round_trips_csv_sqlite_and_loader(self):
+        cohort = _cohort()
+        expected_by_market = {}
+        for index, leg in enumerate(cohort["legs"], start=1):
+            lineage = _cex_typed_source_lineage("leg{}".format(index))
+            leg["typed_source_lineage"] = lineage
+            expected_by_market[leg["market_id"]] = lineage
+        cohort = _rehash(cohort)
+
+        publish_route_cohort_bundle(cohort, core_root=self.root)
+        loaded = load_latest_route_cohort(self.root)
+        bundle = self.root / "bundles" / cohort["route_cohort_id"]
+
+        self.assertEqual(
+            {
+                row["market_id"]: row["typed_source_lineage"]
+                for row in loaded["legs"]
+            },
+            expected_by_market,
+        )
+        with (bundle / "route_legs.csv").open(
+            newline="", encoding="utf-8"
+        ) as handle:
+            csv_lineages = {
+                row["market_id"]: json.loads(row["row_json"])[
+                    "typed_source_lineage"
+                ]
+                for row in csv.DictReader(handle)
+            }
+        self.assertEqual(csv_lineages, expected_by_market)
+        connection = sqlite3.connect(str(bundle / "route_cohort.sqlite3"))
+        try:
+            sqlite_lineages = {
+                market_id: json.loads(row_json)["typed_source_lineage"]
+                for market_id, row_json in connection.execute(
+                    "SELECT market_id, row_json FROM route_legs ORDER BY market_id"
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual(sqlite_lineages, expected_by_market)
+
+    def test_typed_source_lineage_exact_contract_fails_closed(self):
+        cases = []
+
+        extra_key = _cex_typed_source_lineage("extra")
+        extra_key["members"][0]["extra"] = True
+        cases.append(("extra", extra_key))
+
+        wrong_market_role = _cex_typed_source_lineage("wrong-role")
+        wrong_market_role["members"][0].update({
+            "role": "dex_pool_state",
+            "adapter_id": "route_quantity_quote_for_v2_pool/v1",
+            "content_schema": "route_v2_pool_state/v1",
+        })
+        cases.append(("role", wrong_market_role))
+
+        duplicate_role = _cex_typed_source_lineage("duplicate")
+        duplicate_role["members"][1]["role"] = "cex_market_rules"
+        cases.append(("role", duplicate_role))
+
+        unavailable_with_bytes = _cex_typed_source_lineage("unavailable")
+        unavailable_with_bytes["members"][0].update({
+            "status": "unavailable",
+            "reason_code": "typed_source_missing",
+        })
+        cases.append(("unavailable", unavailable_with_bytes))
+
+        oversized = _cex_typed_source_lineage("oversized")
+        oversized["members"][0]["size"] = 256 * 1024 + 1
+        cases.append(("size", oversized))
+
+        unsorted = _cex_typed_source_lineage("unsorted")
+        unsorted["members"] = list(reversed(unsorted["members"]))
+        cases.append(("order", unsorted))
+
+        for label, lineage in cases:
+            with self.subTest(label=label):
+                cohort = _cohort()
+                cohort["legs"][0]["typed_source_lineage"] = lineage
+                cohort = _rehash(cohort)
+                with self.assertRaisesRegex(ValueError, "typed-source"):
+                    publish_route_cohort_bundle(cohort, core_root=self.root)
+
     def test_route_volume_lineage_round_trips_candidate_csv_and_sqlite(self):
         cohort = _cohort()
 
@@ -2031,6 +2190,153 @@ class DeterministicRoutePublicationTests(TemporaryRouteRootTestCase):
 
 
 class RoutePublicationFailureTests(TemporaryRouteRootTestCase):
+    def test_cex_collector_and_orchestrator_reason_inventory_is_publishable(self):
+        terminal_reasons = {
+            "observed": "observed",
+            "source_level_limit": "partial",
+            "source_no_two_sided_book": "failed",
+            "source_no_order_book": "failed",
+            "source_invalid_order_book": "failed",
+            "not_listed": "failed",
+            "rate_limit": "failed",
+            "source_unavailable": "failed",
+            "source_rejected_request": "failed",
+            "network": "failed",
+            "parse": "failed",
+            "unsupported_source": "failed",
+            "collection_failed": "failed",
+            "collector_identity_mismatch": "failed",
+            "raw_evidence_missing": "failed",
+            "raw_evidence_hash_mismatch": "failed",
+            "raw_evidence_path_unsafe": "failed",
+            "route_deadline_exceeded": "deadline_exceeded",
+        }
+        for reason_code, status in terminal_reasons.items():
+            with self.subTest(reason_code=reason_code):
+                market_id = "cex:binance:UNI/USDT"
+                leg = {
+                    "leg_id": market_id,
+                    "market_id": market_id,
+                    "market_type": "cex",
+                    "token_symbol": "UNI",
+                    "status": status,
+                    "available": status in {"observed", "partial"},
+                    "reason_code": reason_code,
+                }
+                if status in {"observed", "partial"}:
+                    leg.update({
+                        "state_observed_at": "2026-08-01T12:00:01Z",
+                        "snapshot_id": "snapshot-a",
+                        "raw_response_sha256": "a" * 64,
+                    })
+                rows = route_publication._validate_leg_rows(
+                    [leg],
+                    raw_evidence_run_id="snapshot-a",
+                    collection_completed_at="2026-08-01T12:00:03Z",
+                    collection_deadline_at="2026-08-01T12:01:00Z",
+                )
+                self.assertEqual(rows[market_id]["reason_code"], reason_code)
+
+    def test_cex_leg_status_and_reason_must_match_collector_contract(self):
+        forged_pairs = (
+            ("observed", "network"),
+            ("partial", "observed"),
+            ("failed", "observed"),
+            ("unsupported", "unsupported_source"),
+            ("deadline_exceeded", "network"),
+        )
+        for status, reason_code in forged_pairs:
+            with self.subTest(status=status, reason_code=reason_code):
+                cohort = _cohort()
+                leg = cohort["legs"][0]
+                leg["status"] = status
+                leg["available"] = status in {"observed", "partial"}
+                leg["reason_code"] = reason_code
+                cohort = _rehash(cohort)
+                with self.assertRaisesRegex(
+                    ValueError, "CEX leg status and reason conflict"
+                ):
+                    publish_route_cohort_bundle(cohort, core_root=self.root)
+
+    def test_dex_collector_terminal_reason_inventory_is_publishable(self):
+        terminal_reasons = {
+            "measurement_limit": "partial",
+            "source_range_unavailable": "unsupported",
+            "unsupported_chain": "unsupported",
+            "unsupported_protocol": "unsupported",
+            "unsupported_method": "unsupported",
+            "unsupported_source": "unsupported",
+            "unsupported_protocol_or_chain": "unsupported",
+            "network": "failed",
+            "rate_limit": "failed",
+            "source_unavailable": "failed",
+            "parse": "failed",
+            "validation": "failed",
+            "collection_failed": "failed",
+            "depth_usd_price_time_mismatch": "failed",
+            "fixed_block_unavailable": "failed",
+            "fixed_block_lineage_mismatch": "failed",
+            "collector_identity_mismatch": "failed",
+            "raw_evidence_missing": "failed",
+            "raw_evidence_hash_mismatch": "failed",
+            "raw_evidence_path_unsafe": "failed",
+            "usd_price_context_missing": "failed",
+            "usd_price_context_not_found": "failed",
+            "usd_price_context_failed": "failed",
+        }
+        for reason_code, status in terminal_reasons.items():
+            with self.subTest(reason_code=reason_code):
+                market_id = (
+                    "dex:eth:uniswap_v2:0x{}:UNI".format("a" * 40)
+                    if status == "partial"
+                    else "dex:solana:orca:pool-{}:UNI".format(reason_code)
+                )
+                leg = {
+                    "leg_id": market_id,
+                    "market_id": market_id,
+                    "market_type": "dex",
+                    "token_symbol": "UNI",
+                    "status": status,
+                    "available": status == "partial",
+                    "reason_code": reason_code,
+                }
+                if status == "partial":
+                    leg.update({
+                        "state_observed_at": "2026-08-01T12:00:01Z",
+                        "snapshot_id": "snapshot-a",
+                        "raw_response_sha256": "a" * 64,
+                        "fixed_block_number": "100",
+                        "fixed_block_timestamp": "2026-08-01T11:59:59Z",
+                    })
+                rows = route_publication._validate_leg_rows(
+                    [leg],
+                    raw_evidence_run_id="snapshot-a",
+                    collection_completed_at="2026-08-01T12:00:03Z",
+                    collection_deadline_at="2026-08-01T12:01:00Z",
+                )
+                self.assertEqual(rows[market_id]["reason_code"], reason_code)
+
+    def test_dex_leg_status_and_reason_must_match_collector_contract(self):
+        forged_pairs = (
+            ("observed", "unsupported_chain"),
+            ("observed", "validation"),
+            ("partial", "depth_usd_price_time_mismatch"),
+            ("unsupported", "network"),
+            ("failed", "unsupported_protocol"),
+        )
+        for status, reason_code in forged_pairs:
+            with self.subTest(status=status, reason_code=reason_code):
+                cohort = _dex_cohort()
+                leg = cohort["legs"][0]
+                leg["status"] = status
+                leg["available"] = status in {"observed", "partial"}
+                leg["reason_code"] = reason_code
+                cohort = _rehash(cohort)
+                with self.assertRaisesRegex(
+                    ValueError, "DEX leg status and reason conflict"
+                ):
+                    publish_route_cohort_bundle(cohort, core_root=self.root)
+
     def test_duplicate_route_identity_fails_closed(self):
         cohort = _cohort()
         cohort["routes"].append(copy.deepcopy(cohort["routes"][0]))
@@ -2330,8 +2636,8 @@ class RoutePublicationFailureTests(TemporaryRouteRootTestCase):
 
     def test_dex_pool_identity_rejects_path_like_components(self):
         cohort = _dex_cohort()
-        original = "dex:eth:uniswap:0xaaa:UNI"
-        malformed = "dex:eth:uniswap:../x:UNI"
+        original = "dex:eth:uniswap_v2:0x{}:UNI".format("a" * 40)
+        malformed = "dex:eth:uniswap_v2:../x:UNI"
         for leg in cohort["legs"]:
             if leg["market_id"] == original:
                 leg["market_id"] = malformed
@@ -3181,6 +3487,7 @@ class JointShadowPublicationTests(unittest.TestCase):
             "dex_execution_cost_latest.csv",
             "dex_pool_tvl_latest.csv",
             "config/tokens.csv",
+            "config/token_chains.csv",
         )
         self.source_identities = [
             SourceFileIdentity(
@@ -3194,7 +3501,7 @@ class JointShadowPublicationTests(unittest.TestCase):
         self.cohort, self.core_pointer = self._publish_core(_cohort())
         self.audit = self._write_shadow_inputs(self.run_id, self.cohort)
 
-    def _publish_core(self, cohort):
+    def _publish_core(self, cohort, *, typed_lineage=True):
         value = copy.deepcopy(cohort)
         value["candidate_source_generation"] = self.generation
         value["source_state"]["candidate_source_generation"] = self.generation
@@ -3205,8 +3512,62 @@ class JointShadowPublicationTests(unittest.TestCase):
         for collection in (value["routes"], value["route_rows"]):
             for row in collection:
                 row["candidate_source_generation"] = self.generation
+        if typed_lineage:
+            manifest_members = []
+            typed_payloads = {}
+            for index, leg in enumerate(value["legs"], start=1):
+                prefix = "shadow-leg{}".format(index)
+                leg["typed_source_lineage"] = (
+                    _cex_typed_source_lineage(prefix)
+                    if leg["market_type"] == "cex"
+                    else _dex_typed_source_lineage(prefix)
+                )
+                for member in leg["typed_source_lineage"]["members"]:
+                    if member["status"] != "observed":
+                        continue
+                    payload = _shadow_json_bytes({
+                        "fixture": "joint-shadow-typed-source/v1",
+                        "market_id": leg["market_id"],
+                        "role": member["role"],
+                    })
+                    member["sha256"] = hashlib.sha256(payload).hexdigest()
+                    member["size"] = len(payload)
+                    typed_payloads[member["filename"]] = payload
+                    manifest_members.append({
+                        "market_id": leg["market_id"],
+                        **{
+                            field: member[field]
+                            for field in (
+                                "role", "filename", "sha256", "size",
+                                "logical_generation", "adapter_id",
+                                "content_schema",
+                            )
+                        },
+                    })
+            manifest_members.sort(
+                key=lambda row: (row["market_id"], row["role"])
+            )
         value = _rehash(value)
         pointer = publish_route_cohort_bundle(value, core_root=self.core_root)
+        if typed_lineage:
+            raw_run = (
+                self.routes_root.parent
+                / "raw/route-cohort"
+                / value["raw_evidence_run_id"]
+            )
+            typed_root = raw_run / "typed"
+            typed_root.mkdir(parents=True)
+            for filename, payload in typed_payloads.items():
+                (typed_root / filename).write_bytes(payload)
+            manifest = {
+                "schema": "route_typed_source_manifest/v1",
+                "raw_evidence_run_id": value["raw_evidence_run_id"],
+                "member_count": len(manifest_members),
+                "members": manifest_members,
+            }
+            (raw_run / "typed-manifest.json").write_bytes(
+                _shadow_json_bytes(manifest)
+            )
         return value, pointer
 
     def _universe(self, cohort):
@@ -3237,9 +3598,18 @@ class JointShadowPublicationTests(unittest.TestCase):
                 "selection_rank": rank,
             }
             if "collector_context" in leg:
-                selected_leg["collector_context"] = copy.deepcopy(
-                    leg["collector_context"]
-                )
+                context = copy.deepcopy(leg["collector_context"])
+                selected_leg.update({
+                    "collector_context": context,
+                    "target_token_address": (
+                        context["base_token_id"].split("_", 1)[1]
+                        if context["status"] == "observed"
+                        else "0x" + "1" * 40
+                    ),
+                    "target_token_side": (
+                        "base" if context["status"] == "observed" else None
+                    ),
+                })
             selected_legs.append(selected_leg)
         return {
             "schema": "route_universe/v1",
@@ -3250,7 +3620,180 @@ class JointShadowPublicationTests(unittest.TestCase):
             "routes": copy.deepcopy(cohort["routes"]),
         }
 
-    def _write_shadow_inputs(self, run_id, cohort, *, phase="canary"):
+    def test_route_universe_accepts_chain_native_dex_target_identities(self):
+        cases = (
+            (
+                "starknet",
+                "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+                "0x" + "2" * 64,
+            ),
+            (
+                "solana",
+                "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+                "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+            ),
+        )
+        for chain, target, other in cases:
+            target = normalize_contract_address(chain, target)
+            other = normalize_contract_address(chain, other)
+            context = {
+                "schema": "route_collector_context/v1",
+                "snapshot_id": "tvl-snapshot-1",
+                "request_started_at": "2026-08-01T11:59:58+00:00",
+                "observed_at": "2026-08-01T11:59:59+00:00",
+                "response_received_at": "2026-08-01T12:00:00+00:00",
+                "status": "observed",
+                "reason_code": "observed",
+                "pool_name": "TOKEN / USD",
+                "base_token_id": chain + "_" + target,
+                "quote_token_id": chain + "_" + other,
+                "base_token_price_usd": "7",
+                "quote_token_price_usd": "1",
+                "tvl_method": "reserve_value",
+                "source": "geckoterminal",
+                "source_endpoint": "https://api.example.test/pools",
+                "raw_response_sha256": "d" * 64,
+            }
+            candidate = {
+                "schema": "route_universe/v1",
+                "candidate_source_generation": self.generation,
+                "selection_window": {
+                    "start": "2026-07-03", "end": "2026-08-01",
+                },
+                "requested_notionals_usd": [
+                    1000, 5000, 10000, 50000, 100000,
+                ],
+                "selected_legs": [{
+                    "market_id": "dex:{}:unsupported:pool:UNI".format(chain),
+                    "market_type": "dex",
+                    "token_symbol": "UNI",
+                    "candidate_source_generation": self.generation,
+                    "selection_window": {
+                        "start": "2026-07-03", "end": "2026-08-01",
+                    },
+                    "selection_inputs": {
+                        "execution_capability": "proved",
+                        "proved_execution_capacity_usd": "100000",
+                        "observed_100bps_depth_usd": "100000",
+                        "cex_selected_window_usd": None,
+                        "dex_24h_usd": "9000",
+                        "dex_tvl_usd": "10000",
+                    },
+                    "selection_rank": 1,
+                    "collector_context": context,
+                    "target_token_address": target,
+                    "target_token_side": "base",
+                }],
+                "routes": [],
+            }
+            with self.subTest(chain=chain):
+                validated = route_publication._validate_route_universe_payload(
+                    candidate
+                )
+                self.assertEqual(
+                    next(
+                        item for item in validated["selected_legs"]
+                        if item["market_type"] == "dex"
+                    )["target_token_address"],
+                    normalize_contract_address(chain, target),
+                )
+
+    def test_route_universe_rejects_wrong_chain_address_or_context_matrix(self):
+        context = {
+            "schema": "route_collector_context/v1",
+            "snapshot_id": "tvl-snapshot-1",
+            "request_started_at": "2026-08-01T11:59:58+00:00",
+            "observed_at": "2026-08-01T11:59:59+00:00",
+            "response_received_at": "2026-08-01T12:00:00+00:00",
+            "status": "observed",
+            "reason_code": "observed",
+            "pool_name": "UNI / USDC",
+            "base_token_id": "eth_0x" + "1" * 40,
+            "quote_token_id": "eth_0x" + "2" * 40,
+            "base_token_price_usd": "7",
+            "quote_token_price_usd": "1",
+            "tvl_method": "reserve_value",
+            "source": "geckoterminal",
+            "source_endpoint": "https://api.example.test/pools",
+            "raw_response_sha256": "d" * 64,
+        }
+        universe = {
+            "schema": "route_universe/v1",
+            "candidate_source_generation": self.generation,
+            "selection_window": {
+                "start": "2026-07-03", "end": "2026-08-01",
+            },
+            "requested_notionals_usd": [
+                1000, 5000, 10000, 50000, 100000,
+            ],
+            "selected_legs": [{
+                "market_id": "dex:eth:uniswap_v2:pool:UNI",
+                "market_type": "dex",
+                "token_symbol": "UNI",
+                "candidate_source_generation": self.generation,
+                "selection_window": {
+                    "start": "2026-07-03", "end": "2026-08-01",
+                },
+                "selection_inputs": {
+                    "execution_capability": "proved",
+                    "proved_execution_capacity_usd": "100000",
+                    "observed_100bps_depth_usd": "100000",
+                    "cex_selected_window_usd": None,
+                    "dex_24h_usd": "9000",
+                    "dex_tvl_usd": "10000",
+                },
+                "selection_rank": 1,
+                "collector_context": context,
+                "target_token_address": "0x" + "1" * 40,
+                "target_token_side": "base",
+            }],
+            "routes": [],
+        }
+        cases = []
+        wrong_chain = copy.deepcopy(universe)
+        wrong = next(
+            row for row in wrong_chain["selected_legs"]
+            if row["market_type"] == "dex"
+        )
+        wrong_id = wrong["market_id"]
+        wrong["market_id"] = wrong_id.replace("dex:eth:", "dex:solana:", 1)
+        wrong["collector_context"]["base_token_id"] = (
+            "solana_" + wrong["target_token_address"]
+        )
+        wrong["collector_context"]["quote_token_id"] = "solana_" + "1" * 32
+        cases.append(("wrong-chain-address", wrong_chain))
+        stale_nonobserved = copy.deepcopy(universe)
+        stale = next(
+            row for row in stale_nonobserved["selected_legs"]
+            if row["market_type"] == "dex"
+        )
+        stale["collector_context"].update({
+            "status": "missing",
+            "reason_code": "source_no_tvl_observation",
+            "quote_token_id": None,
+            "base_token_price_usd": None,
+            "quote_token_price_usd": None,
+        })
+        stale["target_token_side"] = None
+        cases.append(("stale-nonobserved-id", stale_nonobserved))
+        missing_price = copy.deepcopy(universe)
+        observed = next(
+            row for row in missing_price["selected_legs"]
+            if row["market_type"] == "dex"
+        )
+        observed["collector_context"]["base_token_price_usd"] = None
+        cases.append(("observed-price-null", missing_price))
+        for label, candidate in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    route_publication.RoutePublicationError,
+                    "DEX target identity|collector|context|Token|price",
+                ):
+                    route_publication._validate_route_universe_payload(candidate)
+
+    def _write_shadow_inputs(
+        self, run_id, cohort, *, phase="canary", core_pointer=None
+    ):
         run_directory = self.shadow_root / "runs" / run_id
         run_directory.mkdir(parents=True)
         universe = self._universe(cohort)
@@ -3448,12 +3991,22 @@ class JointShadowPublicationTests(unittest.TestCase):
                 "binding_failed": 0,
             },
         }
+        cost_evidence = build_unavailable_route_cost_evidence_manifest(
+            universe=universe,
+            run_id=run_id,
+            route_cohort_id=cohort["route_cohort_id"],
+            phase=phase,
+            candidate_source_generation=self.generation,
+            route_universe_sha256=universe_sha256,
+            evaluated_at="2026-08-01T12:00:03Z",
+        )
         cost_bytes = _shadow_json_bytes(cost_evidence)
         (run_directory / "route_universe.json").write_bytes(universe_bytes)
         (run_directory / "baseline_manifest.json").write_bytes(baseline_bytes)
         (run_directory / "route-cost-evidence.json").write_bytes(cost_bytes)
+        bound_core_pointer = self.core_pointer if core_pointer is None else core_pointer
         core_pointer_sha256 = hashlib.sha256(
-            _shadow_pointer_bytes(self.core_pointer)
+            _shadow_pointer_bytes(bound_core_pointer)
         ).hexdigest()
         phase_state_sha256 = hashlib.sha256(
             b"route-shadow-phase/implicit-canary/v1\n"
@@ -3466,7 +4019,7 @@ class JointShadowPublicationTests(unittest.TestCase):
             "phase_state_sha256": phase_state_sha256,
             "phase_transition_id": None,
             "core_pointer_sha256": core_pointer_sha256,
-            "core_manifest_sha256": self.core_pointer["manifest_sha256"],
+            "core_manifest_sha256": bound_core_pointer["manifest_sha256"],
             "route_cost_evidence_sha256": hashlib.sha256(cost_bytes).hexdigest(),
             "route_universe_sha256": universe_sha256,
             "baseline_manifest_sha256": hashlib.sha256(baseline_bytes).hexdigest(),
@@ -3506,6 +4059,92 @@ class JointShadowPublicationTests(unittest.TestCase):
             core_pointer=self.core_pointer,
             audit=self.audit,
         )
+
+    def test_legacy_core_is_readable_but_cannot_become_shadow_candidate_ready(self):
+        legacy, legacy_pointer = self._publish_core(
+            _second_cohort(), typed_lineage=False
+        )
+        loaded = load_latest_route_cohort(self.core_root)
+        self.assertEqual(
+            loaded["cohort"]["route_cohort_id"], legacy["route_cohort_id"]
+        )
+        self.assertTrue(all(
+            "typed_source_lineage" not in leg for leg in loaded["legs"]
+        ))
+        legacy_audit = self._write_shadow_inputs(
+            "legacy-shadow", legacy, core_pointer=legacy_pointer
+        )
+        with self.assertRaisesRegex(ValueError, "typed-source lineage is missing"):
+            publish_shadow_result(
+                self.shadow_root,
+                core_pointer=legacy_pointer,
+                audit=legacy_audit,
+            )
+        self.assertFalse((self.shadow_root / "latest.json").exists())
+
+    def test_typed_source_byte_cap_is_per_leg_not_global_cohort(self):
+        raw_run_id = "snapshot-per-leg-cap"
+        raw_run = (
+            self.routes_root.parent / "raw/route-cohort" / raw_run_id
+        )
+        typed_root = raw_run / "typed"
+        typed_root.mkdir(parents=True)
+        payload = b"x" * (8 * 1024 * 1024)
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        manifest_members = []
+        legs = []
+        for index in range(4):
+            market_id = "cex:venue{}:UNI/USDT".format(index)
+            filename = "leg{}-raw-book.json".format(index)
+            (typed_root / filename).write_bytes(payload)
+            lineage = _cex_typed_source_lineage("leg{}".format(index))
+            for member in lineage["members"]:
+                if member["role"] == "cex_raw_book_response":
+                    member.update({
+                        "filename": filename,
+                        "sha256": payload_sha256,
+                        "size": len(payload),
+                    })
+                else:
+                    member.update({
+                        "status": "unavailable",
+                        "reason_code": "typed_source_missing",
+                        "filename": None,
+                        "sha256": None,
+                        "size": None,
+                        "logical_generation": None,
+                    })
+                if member["status"] == "observed":
+                    manifest_members.append({
+                        "market_id": market_id,
+                        **{
+                            field: member[field]
+                            for field in (
+                                "role", "filename", "sha256", "size",
+                                "logical_generation", "adapter_id",
+                                "content_schema",
+                            )
+                        },
+                    })
+            legs.append({
+                "market_id": market_id,
+                "market_type": "cex",
+                "typed_source_lineage": lineage,
+            })
+        manifest_members.sort(key=lambda row: (row["market_id"], row["role"]))
+        (raw_run / "typed-manifest.json").write_bytes(_shadow_json_bytes({
+            "schema": "route_typed_source_manifest/v1",
+            "raw_evidence_run_id": raw_run_id,
+            "member_count": len(manifest_members),
+            "members": manifest_members,
+        }))
+
+        retained = route_publication._load_retained_typed_source_members(
+            self.shadow_root,
+            {"cohort": {"raw_evidence_run_id": raw_run_id}, "legs": legs},
+        )
+
+        self.assertEqual(retained, {})
 
     def _install_full_phase(self):
         gates = self.shadow_root / "gates"
@@ -3551,9 +4190,9 @@ class JointShadowPublicationTests(unittest.TestCase):
         context = {
             "schema": "route_collector_context/v1",
             "snapshot_id": "tvl-snapshot-1",
-            "request_started_at": "2026-08-01T11:59:58Z",
-            "observed_at": "2026-08-01T11:59:59Z",
-            "response_received_at": "2026-08-01T12:00:00Z",
+            "request_started_at": "2026-08-01T11:59:58+00:00",
+            "observed_at": "2026-08-01T11:59:59+00:00",
+            "response_received_at": "2026-08-01T12:00:00+00:00",
             "status": status,
             "reason_code": reason_by_status[status],
             "pool_name": "UNI / USDC",
@@ -3568,12 +4207,12 @@ class JointShadowPublicationTests(unittest.TestCase):
         }
         universe = {
             "selected_legs": [{
-                "market_id": "dex:eth:uniswap:0xaaa:UNI",
+                "market_id": "dex:eth:uniswap_v2:0x{}:UNI".format("a" * 40),
                 "collector_context": context,
             }],
         }
         core_leg = {
-            "market_id": "dex:eth:uniswap:0xaaa:UNI",
+            "market_id": "dex:eth:uniswap_v2:0x{}:UNI".format("a" * 40),
             "market_type": "dex",
             "collector_context": copy.deepcopy(context),
             "available": True if observed else False,
@@ -3619,6 +4258,99 @@ class JointShadowPublicationTests(unittest.TestCase):
             published,
         )
         self.assertEqual(load_latest_shadow_result(self.shadow_root), published)
+
+    def _assert_raw_typed_failure_preserves_public_latest(self):
+        public_pointer = self.routes_root / "latest.json"
+        public_pointer.write_bytes(b"public-route-sentinel\n")
+
+        with self.assertRaisesRegex(ValueError, "typed-source|typed source"):
+            self._publish()
+
+        self.assertEqual(
+            public_pointer.read_bytes(), b"public-route-sentinel\n"
+        )
+        self.assertFalse((self.shadow_root / "latest.json").exists())
+
+    def test_publish_requires_raw_typed_run_root(self):
+        raw_run = (
+            self.routes_root.parent
+            / "raw/route-cohort"
+            / self.cohort["raw_evidence_run_id"]
+        )
+        shutil.rmtree(raw_run)
+        self._assert_raw_typed_failure_preserves_public_latest()
+
+    def test_publish_requires_raw_typed_manifest(self):
+        manifest = (
+            self.routes_root.parent
+            / "raw/route-cohort"
+            / self.cohort["raw_evidence_run_id"]
+            / "typed-manifest.json"
+        )
+        manifest.unlink()
+        self._assert_raw_typed_failure_preserves_public_latest()
+
+    def test_publish_requires_every_raw_typed_payload(self):
+        typed_root = (
+            self.routes_root.parent
+            / "raw/route-cohort"
+            / self.cohort["raw_evidence_run_id"]
+            / "typed"
+        )
+        next(typed_root.iterdir()).unlink()
+        self._assert_raw_typed_failure_preserves_public_latest()
+
+    def test_historical_load_replays_raw_typed_manifest_and_payloads(self):
+        published = self._publish()
+        raw_run = (
+            self.routes_root.parent
+            / "raw/route-cohort"
+            / self.cohort["raw_evidence_run_id"]
+        )
+        (raw_run / "typed-manifest.json").unlink()
+        with self.assertRaisesRegex(ValueError, "typed-source|typed source"):
+            load_shadow_result(
+                self.shadow_root,
+                run_id=self.run_id,
+                expected_pointer_sha256=published["pointer_sha256"],
+            )
+        with self.assertRaisesRegex(ValueError, "typed-source|typed source"):
+            load_latest_shadow_result(self.shadow_root)
+
+        manifest = {
+            "schema": "route_typed_source_manifest/v1",
+            "raw_evidence_run_id": self.cohort["raw_evidence_run_id"],
+            "member_count": 0,
+            "members": [],
+        }
+        (raw_run / "typed-manifest.json").write_bytes(
+            _shadow_json_bytes(manifest)
+        )
+        with self.assertRaisesRegex(ValueError, "typed-source|typed source"):
+            load_latest_shadow_result(self.shadow_root)
+
+    def test_shadow_hash_and_cohort_fields_reject_string_coercion(self):
+        pointer = copy.deepcopy(self._publish()["pointer"])
+        for field in (
+            "phase_state_sha256",
+            "core_pointer_sha256",
+            "core_manifest_sha256",
+            "route_universe_sha256",
+            "route_cost_evidence_sha256",
+            "baseline_manifest_sha256",
+            "candidate_source_generation",
+            "audit_sha256",
+        ):
+            with self.subTest(field=field):
+                invalid = copy.deepcopy(pointer)
+                invalid[field] = int("1" * 64)
+                with self.assertRaisesRegex(ValueError, field):
+                    route_publication._validate_shadow_pointer(invalid)
+
+        core_pointer = copy.deepcopy(self.core_pointer)
+        core_pointer["manifest_sha256"] = int("1" * 64)
+        with self.assertRaisesRegex(ValueError, "core pointer"):
+            route_publication._validate_core_pointer_mapping(core_pointer)
 
     def test_historical_canary_remains_readable_after_full_transition(self):
         published = self._publish()
@@ -3751,8 +4483,26 @@ class JointShadowPublicationTests(unittest.TestCase):
                 universe, [core_leg]
             )
 
+    def test_dex_context_preserves_the_fact_collectors_utc_representation(self):
+        universe, core_leg = self._dex_context_fixture()
+        universe["selected_legs"][0]["collector_context"][
+            "request_started_at"
+        ] = "2026-08-01T11:59:58Z"
+        core_leg["collector_context"][
+            "request_started_at"
+        ] = "2026-08-01T11:59:58Z"
+
+        with self.assertRaisesRegex(ValueError, "collector.*canonical UTC"):
+            route_publication._validate_dex_collector_contexts(
+                universe, [core_leg]
+            )
+
     def test_observed_dex_context_is_bound_through_joint_publication(self):
         dex_cohort = _dex_cohort()
+        dex_cohort["raw_evidence_run_id"] = "snapshot-dex"
+        for leg in dex_cohort["legs"]:
+            leg["snapshot_id"] = "snapshot-dex"
+        dex_cohort = _rehash(dex_cohort)
         _universe, context_leg = self._dex_context_fixture()
         for leg in dex_cohort["legs"]:
             context = copy.deepcopy(context_leg["collector_context"])
@@ -3812,7 +4562,7 @@ class JointShadowPublicationTests(unittest.TestCase):
         universe, core_leg = self._dex_context_fixture()
         universe["selected_legs"][0]["collector_context"]["extra"] = True
         core_leg["collector_context"]["extra"] = True
-        with self.assertRaisesRegex(ValueError, "context lineage"):
+        with self.assertRaisesRegex(ValueError, "context (?:lineage|schema)"):
             route_publication._validate_dex_collector_contexts(
                 universe, [core_leg]
             )
@@ -3825,6 +4575,68 @@ class JointShadowPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unavailable"):
             route_publication._validate_dex_collector_contexts(
                 universe, [core_leg]
+            )
+
+    def test_observed_non_evm_price_context_allows_terminal_research_leg(self):
+        market_id = (
+            "dex:solana:orca:"
+            "9WwG7yYCr7HiGJLnoD2joxJdFWFzrY1h7i5AdbWwtuCR:UNI"
+        )
+        target = normalize_contract_address(
+            "solana", "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+        )
+        other = normalize_contract_address(
+            "solana", "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
+        )
+        context = {
+            "schema": "route_collector_context/v1",
+            "snapshot_id": "tvl-snapshot-1",
+            "request_started_at": "2026-08-01T11:59:58+00:00",
+            "observed_at": "2026-08-01T11:59:59+00:00",
+            "response_received_at": "2026-08-01T12:00:00+00:00",
+            "status": "observed",
+            "reason_code": "observed",
+            "pool_name": "UNI / USDC",
+            "base_token_id": "solana_" + target,
+            "quote_token_id": "solana_" + other,
+            "base_token_price_usd": "7",
+            "quote_token_price_usd": "1",
+            "tvl_method": "reserve_value",
+            "source": "geckoterminal",
+            "source_endpoint": "https://api.example.test/pools",
+            "raw_response_sha256": "d" * 64,
+        }
+        universe = {"selected_legs": [{
+            "market_id": market_id,
+            "collector_context": context,
+        }]}
+        core_leg = {
+            "market_id": market_id,
+            "market_type": "dex",
+            "status": "unsupported",
+            "available": False,
+            "reason_code": "unsupported_chain",
+            "collector_context": copy.deepcopy(context),
+            "usd_price_source_snapshot_id": context["snapshot_id"],
+            "usd_price_observed_at": context["observed_at"],
+            "usd_price_source": context["source"],
+            "usd_price_source_endpoint": context["source_endpoint"],
+            "usd_price_raw_response_sha256": context["raw_response_sha256"],
+            "token0_address": None,
+            "token1_address": None,
+            "token0_price_usd": None,
+            "token1_price_usd": None,
+        }
+
+        route_publication._validate_dex_collector_contexts(
+            universe, [core_leg]
+        )
+
+        forged = copy.deepcopy(core_leg)
+        forged["token0_price_usd"] = "7"
+        with self.assertRaisesRegex(ValueError, "terminal|price"):
+            route_publication._validate_dex_collector_contexts(
+                universe, [forged]
             )
 
     def test_loader_pins_core_a_when_a_new_private_core_is_orphaned(self):
@@ -4006,7 +4818,7 @@ class JointShadowPublicationTests(unittest.TestCase):
             (
                 "set hash",
                 {**cost, "transcript_set_sha256": "f" * 64},
-                "hash mismatch",
+                "hash (?:mismatch|differs)",
             ),
             (
                 "count",
@@ -4016,7 +4828,7 @@ class JointShadowPublicationTests(unittest.TestCase):
             (
                 "profile generation",
                 {**cost, "trace_profile_generation": "not-a-sha"},
-                "generation.*invalid",
+                "trace profile generation differs",
             ),
         )
         for label, value, message in mutations:
@@ -4052,13 +4864,13 @@ class JointShadowPublicationTests(unittest.TestCase):
         empty = copy.deepcopy(cost)
         empty["selected_markets"] = []
         empty["selected_market_count"] = 0
-        with self.assertRaisesRegex(ValueError, "selected scope"):
+        with self.assertRaisesRegex(ValueError, "selected.*(?:scope|replay)"):
             validate(empty)
 
         subset = copy.deepcopy(cost)
         subset["selected_markets"] = subset["selected_markets"][:1]
         subset["selected_market_count"] = 1
-        with self.assertRaisesRegex(ValueError, "selected scope"):
+        with self.assertRaisesRegex(ValueError, "selected.*(?:scope|replay)"):
             validate(subset)
 
         def typed_sha(domain, value):
@@ -4074,7 +4886,9 @@ class JointShadowPublicationTests(unittest.TestCase):
             fake_binding["bindings"],
         )
         fake_binding["counts"]["binding_observed"] = 1
-        with self.assertRaisesRegex(ValueError, "empty selected scope|empty policy"):
+        with self.assertRaisesRegex(
+            ValueError, "binding schema|empty selected scope|empty policy"
+        ):
             validate(fake_binding)
 
         arbitrary_transcripts = copy.deepcopy(cost)
@@ -4086,7 +4900,7 @@ class JointShadowPublicationTests(unittest.TestCase):
             b"route-cost-evidence-transcript-set/v1\n",
             arbitrary_transcripts["transcripts"],
         )
-        with self.assertRaisesRegex(ValueError, "transcript scope"):
+        with self.assertRaisesRegex(ValueError, "transcript (?:schema|scope)"):
             validate(arbitrary_transcripts)
 
         observed_unsupported = copy.deepcopy(cost)
@@ -4098,7 +4912,9 @@ class JointShadowPublicationTests(unittest.TestCase):
         )
         observed_unsupported["counts"]["transcript_unavailable"] -= 1
         observed_unsupported["counts"]["transcript_observed"] += 1
-        with self.assertRaisesRegex(ValueError, "unsupported-market transcript"):
+        with self.assertRaisesRegex(
+            ValueError, "observed transcript presence|unsupported-market transcript"
+        ):
             validate(observed_unsupported)
 
         mixed = copy.deepcopy(cost)
@@ -4130,7 +4946,9 @@ class JointShadowPublicationTests(unittest.TestCase):
         )
         mixed["counts"]["transcript_unavailable"] -= 1
         mixed["counts"]["transcript_observed"] += 1
-        with self.assertRaisesRegex(ValueError, "unsupported-market transcript"):
+        with self.assertRaisesRegex(
+            ValueError, "selected market replay|unsupported-market transcript"
+        ):
             validate(mixed)
 
     def test_post_replace_failure_rolls_back_only_an_owned_pointer(self):

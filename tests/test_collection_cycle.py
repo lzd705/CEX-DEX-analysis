@@ -1,13 +1,30 @@
 import csv
 import fcntl
+import hashlib
 import json
+import multiprocessing
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from scripts.collection_lock_evidence import (
+    PRIMARY_CONTENTION_CAP_BYTES,
+    PRIMARY_RUN_DATA_BYTES,
+    PRIMARY_RUN_CAP_BYTES,
+    build_primary_collection_manifest_projection,
+    clear_shadow_lock_owner,
+    read_shadow_lock_owner,
+    validate_primary_contention_receipt,
+    validate_primary_run_receipt,
+    write_primary_contention_receipt,
+    write_primary_run_receipt,
+    write_shadow_lock_owner,
+)
 from scripts.run_collection_cycle import (
+    PROFILE_STEPS,
     build_collection_status,
     build_step_commands,
     configured_data_dir,
@@ -23,6 +40,557 @@ from scripts.timestamp_contract import validate_observation_bounds
 
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
+
+
+def _canonical_json_bytes(value):
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _write_primary_run_concurrently(root, receipt, queue):
+    try:
+        queue.put(("ok", write_primary_run_receipt(Path(root), receipt)))
+    except BaseException as error:
+        queue.put(("error", type(error).__name__, str(error)))
+
+
+class CollectionLockEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.lock_path = self.root / "collection/collection.lock"
+        self.lock_path.parent.mkdir(parents=True)
+        self.lock_fd = os.open(
+            str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o600
+        )
+        self.addCleanup(os.close, self.lock_fd)
+
+    def test_shadow_owner_bytes_are_nonce_owned_bounded_and_fsynced(self):
+        owner = write_shadow_lock_owner(
+            self.lock_fd,
+            run_id="manual-run-1",
+            boot_id="a" * 32,
+            nonce="b" * 32,
+        )
+        self.assertEqual(read_shadow_lock_owner(self.lock_fd), owner)
+        with self.assertRaisesRegex(ValueError, "nonce|owner"):
+            clear_shadow_lock_owner(self.lock_fd, nonce="c" * 32)
+        self.assertEqual(read_shadow_lock_owner(self.lock_fd), owner)
+        clear_shadow_lock_owner(self.lock_fd, nonce="b" * 32)
+        self.assertIsNone(read_shadow_lock_owner(self.lock_fd))
+
+    def test_contention_receipt_is_exact_idempotent_and_binds_lock_identity(self):
+        owner = write_shadow_lock_owner(
+            self.lock_fd,
+            run_id="manual-run-1",
+            boot_id="a" * 32,
+            nonce="b" * 32,
+        )
+        receipt = write_primary_contention_receipt(
+            self.root,
+            lock_fd=self.lock_fd,
+            primary_profile="daily",
+            primary_invocation_id="1" * 32,
+            observed_at="2026-08-02T12:00:00Z",
+        )
+        self.assertEqual(receipt["attribution_status"], "shadow")
+        self.assertEqual(receipt["holder_run_id"], owner["run_id"])
+        self.assertEqual(
+            validate_primary_contention_receipt(receipt), receipt
+        )
+        self.assertEqual(
+            write_primary_contention_receipt(
+                self.root,
+                lock_fd=self.lock_fd,
+                primary_profile="daily",
+                primary_invocation_id="1" * 32,
+                observed_at="2026-08-02T12:00:00Z",
+            ),
+            receipt,
+        )
+        with self.assertRaisesRegex(ValueError, "conflict|immutable"):
+            write_primary_contention_receipt(
+                self.root,
+                lock_fd=self.lock_fd,
+                primary_profile="depth",
+                primary_invocation_id="1" * 32,
+                observed_at="2026-08-02T12:00:00Z",
+            )
+
+    def test_unattributed_contention_and_path_unsafe_invocation_fail_closed(self):
+        receipt = write_primary_contention_receipt(
+            self.root,
+            lock_fd=self.lock_fd,
+            primary_profile="depth",
+            primary_invocation_id="2" * 32,
+            observed_at="2026-08-02T12:00:00Z",
+        )
+        self.assertEqual(receipt["attribution_status"], "unattributed")
+        self.assertIsNone(receipt["holder_run_id"])
+        for invalid in ("../x", "A" * 32, "1" * 31, "1" * 33):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "invocation"):
+                    write_primary_contention_receipt(
+                        self.root,
+                        lock_fd=self.lock_fd,
+                        primary_profile="depth",
+                        primary_invocation_id=invalid,
+                        observed_at="2026-08-02T12:00:00Z",
+                    )
+
+    def _contention_receipt(self):
+        return {
+            "schema": "route_shadow_primary_contention/v1",
+            "attribution_status": "unattributed",
+            "holder_run_id": None,
+            "holder_boot_id": None,
+            "holder_nonce": None,
+            "primary_profile": "depth",
+            "primary_invocation_id": "3" * 32,
+            "observed_at": "2026-08-02T12:00:00Z",
+            "lock_identity": "123:456",
+        }
+
+    def test_contention_validator_rejects_noncanonical_utc_and_lock_identity(self):
+        valid = self._contention_receipt()
+        self.assertEqual(validate_primary_contention_receipt(valid), valid)
+        for observed_at in (
+            "2026-02-30T12:00:00Z",
+            "2026-08-02T12:00:00+00:00",
+            "2026-08-02T12:00:00.0Z",
+            "2026-08-02T12:00:00.000001Z",
+        ):
+            with self.subTest(observed_at=observed_at):
+                forged = dict(valid, observed_at=observed_at)
+                with self.assertRaisesRegex(ValueError, "contention|timestamp"):
+                    validate_primary_contention_receipt(forged)
+        for lock_identity in ("", "1", "a:2", "1:-2", "01:2", "1:02", "0:2"):
+            with self.subTest(lock_identity=lock_identity):
+                forged = dict(valid, lock_identity=lock_identity)
+                with self.assertRaisesRegex(ValueError, "contention|lock"):
+                    validate_primary_contention_receipt(forged)
+
+    def test_contention_retry_scans_unknown_members_before_idempotent_return(self):
+        receipt = write_primary_contention_receipt(
+            self.root,
+            lock_fd=self.lock_fd,
+            primary_profile="depth",
+            primary_invocation_id="4" * 32,
+            observed_at="2026-08-02T12:00:00Z",
+        )
+        evidence_root = self.root / "routes/shadow/primary-contention"
+        (evidence_root / "foreign").write_bytes(b"interference")
+        with self.assertRaisesRegex(ValueError, "unknown member"):
+            write_primary_contention_receipt(
+                self.root,
+                lock_fd=self.lock_fd,
+                primary_profile="depth",
+                primary_invocation_id="4" * 32,
+                observed_at="2026-08-02T12:00:00Z",
+            )
+        self.assertEqual(
+            json.loads((evidence_root / ("4" * 32 + ".json")).read_text()),
+            receipt,
+        )
+
+    def test_contention_rejects_unsafe_cap_lock_and_receipt_members(self):
+        evidence_root = self.root / "routes/shadow/primary-contention"
+        evidence_root.mkdir(parents=True)
+        cap_lock = evidence_root / ".cap.lock"
+        cap_lock.write_bytes(b"")
+        os.link(cap_lock, evidence_root / "cap-hardlink")
+        with self.assertRaisesRegex(ValueError, "cap lock|unknown member"):
+            write_primary_contention_receipt(
+                self.root,
+                lock_fd=self.lock_fd,
+                primary_profile="daily",
+                primary_invocation_id="5" * 32,
+                observed_at="2026-08-02T12:00:00Z",
+            )
+
+    def _source_collection_manifest(self, profile="depth"):
+        names = list(PROFILE_STEPS[profile])
+        return {
+            "schema_version": 1,
+            "run_id": "20260802T120000Z-1a2b3c4d",
+            "profile": profile,
+            "status": "succeeded",
+            "publish_local": True,
+            "started_at": "2026-08-02T12:00:00+00:00",
+            "finished_at": "2026-08-02T12:00:30+00:00",
+            "atomicity": "bounded source field deliberately excluded",
+            "steps": [
+                {"name": name, "status": "succeeded", "irrelevant": index}
+                for index, name in enumerate(names)
+            ],
+            "facts": {"irrelevant": True},
+            "dependency_files": {},
+        }
+
+    def _projection_and_sha(self, profile="depth"):
+        manifest = self._source_collection_manifest(profile)
+        source_bytes = (
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+        projection = build_primary_collection_manifest_projection(
+            source_bytes, primary_profile=profile
+        )
+        return projection, hashlib.sha256(
+            _canonical_json_bytes(projection)
+        ).hexdigest()
+
+    def _primary_run_receipt(self, *, status="succeeded", profile="depth"):
+        projection, projection_sha = self._projection_and_sha(profile)
+        receipt = {
+            "schema": "route_shadow_primary_run/v1",
+            "primary_profile": profile,
+            "primary_invocation_id": "6" * 32,
+            "trigger_status": "scheduled",
+            "scheduled_for": "2026-08-02T12:05:00Z" if profile == "depth" else "2026-08-02T00:30:00Z",
+            "started_at": "2026-08-02T12:05:20Z" if profile == "depth" else "2026-08-02T00:30:20Z",
+            "intent_requested_at": "2026-08-02T12:05:20Z" if profile == "depth" else "2026-08-02T00:30:20Z",
+            "intent_acquired_at": "2026-08-02T12:05:20.125Z" if profile == "depth" else "2026-08-02T00:30:20.125Z",
+            "intent_released_at": "2026-08-02T12:05:51Z" if profile == "depth" else "2026-08-02T00:30:51Z",
+            "intent_wait_milliseconds": 125,
+            "lock_acquired_at": "2026-08-02T12:05:21Z" if profile == "depth" else "2026-08-02T00:30:21Z",
+            "lock_released_at": "2026-08-02T12:05:50.250Z" if profile == "depth" else "2026-08-02T00:30:50.250Z",
+            "finished_at": "2026-08-02T12:05:51Z" if profile == "depth" else "2026-08-02T00:30:51Z",
+            "status": status,
+            "lock_hold_milliseconds": 29250,
+            "collection_manifest_projection": projection,
+            "collection_manifest_projection_sha256": projection_sha,
+            "contention_receipt_sha256": None,
+            "reason_code": None,
+        }
+        if status != "succeeded":
+            receipt["collection_manifest_projection"] = None
+            receipt["collection_manifest_projection_sha256"] = None
+            receipt["reason_code"] = (
+                "collection_failed" if status == "failed" else "collection_run_unexplained"
+            )
+        return receipt
+
+    def test_primary_collection_projection_is_exact_and_binds_physical_source(self):
+        manifest = self._source_collection_manifest()
+        source_bytes = (
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+        projection = build_primary_collection_manifest_projection(
+            source_bytes, primary_profile="depth"
+        )
+        self.assertEqual(
+            projection,
+            {
+                "schema": "route_primary_collection_manifest_projection/v1",
+                "primary_profile": "depth",
+                "source_run_id": "20260802T120000Z-1a2b3c4d",
+                "source_manifest_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                "source_schema_version": 1,
+                "source_profile": "depth",
+                "source_status": "succeeded",
+                "source_publish_local": True,
+                "source_started_at": "2026-08-02T12:00:00+00:00",
+                "source_finished_at": "2026-08-02T12:00:30+00:00",
+                "source_step_names": ["depth", "dex_price", "dex_depth"],
+                "source_step_statuses": ["succeeded", "succeeded", "succeeded"],
+            },
+        )
+        mutated = source_bytes + b" "
+        with self.assertRaisesRegex(ValueError, "canonical|source manifest"):
+            build_primary_collection_manifest_projection(
+                mutated, primary_profile="depth"
+            )
+        for mutation in (
+            dict(manifest, status="failed"),
+            dict(manifest, profile="daily"),
+            dict(manifest, publish_local=False),
+            dict(manifest, run_id="manual-not-production"),
+            dict(manifest, finished_at="2026-08-02T11:59:59+00:00"),
+            dict(manifest, extra="forbidden"),
+        ):
+            with self.subTest(mutation=mutation):
+                payload = (
+                    json.dumps(mutation, ensure_ascii=False, indent=2) + "\n"
+                ).encode("utf-8")
+                with self.assertRaises(ValueError):
+                    build_primary_collection_manifest_projection(
+                        payload, primary_profile="depth"
+                    )
+
+    def test_primary_run_validator_replays_exact_schema_hashes_times_and_grid(self):
+        receipt = self._primary_run_receipt()
+        self.assertEqual(validate_primary_run_receipt(receipt), receipt)
+        mutations = []
+        for field in tuple(receipt):
+            mutated = dict(receipt)
+            del mutated[field]
+            mutations.append(("missing-" + field, mutated))
+        mutations.extend((
+            ("extra", dict(receipt, extra=True)),
+            ("wrong-wait", dict(receipt, intent_wait_milliseconds=124)),
+            ("wrong-hold", dict(receipt, lock_hold_milliseconds=29249)),
+            ("late-schedule", dict(receipt, started_at="2026-08-02T12:06:00.001Z", intent_requested_at="2026-08-02T12:06:00.001Z", intent_acquired_at="2026-08-02T12:06:00.126Z")),
+            ("wrong-grid", dict(receipt, scheduled_for="2026-08-02T12:06:00Z")),
+            ("bad-projection-sha", dict(receipt, collection_manifest_projection_sha256="f" * 64)),
+        ))
+        for label, mutated in mutations:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "primary run|projection|timestamp|millisecond|schedule"):
+                    validate_primary_run_receipt(mutated)
+
+    def test_primary_run_validator_freezes_manual_and_invalid_trigger_matrix(self):
+        succeeded = self._primary_run_receipt()
+        manual = dict(succeeded, trigger_status="manual", scheduled_for=None)
+        self.assertEqual(validate_primary_run_receipt(manual), manual)
+        failed = self._primary_run_receipt(status="failed")
+        manual_failed = dict(failed, trigger_status="manual", scheduled_for=None)
+        self.assertEqual(validate_primary_run_receipt(manual_failed), manual_failed)
+        unexplained = dict(
+            failed,
+            trigger_status="invalid",
+            scheduled_for=None,
+            status="unexplained",
+            lock_acquired_at=None,
+            lock_released_at=None,
+            lock_hold_milliseconds=None,
+            reason_code="collection_run_unexplained",
+        )
+        self.assertEqual(validate_primary_run_receipt(unexplained), unexplained)
+        with self.assertRaisesRegex(ValueError, "invalid primary trigger"):
+            validate_primary_run_receipt(
+                dict(manual_failed, trigger_status="invalid")
+            )
+
+    def test_primary_run_status_null_presence_matrix(self):
+        succeeded = self._primary_run_receipt()
+        failed = self._primary_run_receipt(status="failed")
+        self.assertEqual(validate_primary_run_receipt(failed), failed)
+        skipped = dict(
+            failed,
+            status="skipped_locked",
+            lock_acquired_at=None,
+            lock_released_at=None,
+            lock_hold_milliseconds=None,
+            contention_receipt_sha256="a" * 64,
+            reason_code="collection_lock_busy",
+        )
+        self.assertEqual(validate_primary_run_receipt(skipped), skipped)
+        unexplained = dict(
+            skipped,
+            trigger_status="invalid",
+            scheduled_for=None,
+            status="unexplained",
+            contention_receipt_sha256=None,
+            reason_code="collection_run_unexplained",
+        )
+        self.assertEqual(validate_primary_run_receipt(unexplained), unexplained)
+        for label, forged in (
+            ("succeeded-reason", dict(succeeded, reason_code="collection_failed")),
+            ("failed-projection", dict(failed, collection_manifest_projection=succeeded["collection_manifest_projection"], collection_manifest_projection_sha256=succeeded["collection_manifest_projection_sha256"])),
+            ("skipped-lock", dict(skipped, lock_acquired_at=succeeded["lock_acquired_at"])),
+            ("skipped-no-contention", dict(skipped, contention_receipt_sha256=None)),
+            ("unexplained-contention", dict(unexplained, contention_receipt_sha256="b" * 64)),
+            ("invalid-succeeded", dict(succeeded, trigger_status="invalid", scheduled_for=None)),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    validate_primary_run_receipt(forged)
+
+    def test_primary_run_writer_binds_skipped_receipt_to_exact_contention_bytes(self):
+        failed = self._primary_run_receipt(status="failed")
+        skipped = dict(
+            failed,
+            status="skipped_locked",
+            lock_acquired_at=None,
+            lock_released_at=None,
+            lock_hold_milliseconds=None,
+            contention_receipt_sha256="a" * 64,
+            reason_code="collection_lock_busy",
+        )
+        with self.assertRaisesRegex(ValueError, "contention"):
+            write_primary_run_receipt(self.root, skipped)
+        contention = write_primary_contention_receipt(
+            self.root,
+            lock_fd=self.lock_fd,
+            primary_profile="depth",
+            primary_invocation_id=skipped["primary_invocation_id"],
+            observed_at="2026-08-02T12:05:51Z",
+        )
+        contention_bytes = _canonical_json_bytes(contention)
+        skipped["contention_receipt_sha256"] = hashlib.sha256(
+            contention_bytes
+        ).hexdigest()
+        self.assertEqual(write_primary_run_receipt(self.root, skipped), skipped)
+        tampered = self.root / "routes/shadow/primary-contention" / (
+            skipped["primary_invocation_id"] + ".json"
+        )
+        tampered.write_bytes(contention_bytes + b" ")
+        other = dict(skipped, primary_invocation_id="a" * 32)
+        with self.assertRaisesRegex(ValueError, "contention"):
+            write_primary_run_receipt(self.root, other)
+
+    def test_primary_run_writer_is_no_replace_and_scans_before_retry(self):
+        receipt = self._primary_run_receipt()
+        self.assertEqual(write_primary_run_receipt(self.root, receipt), receipt)
+        self.assertEqual(write_primary_run_receipt(self.root, receipt), receipt)
+        conflict = dict(receipt, reason_code="unexpected")
+        with self.assertRaisesRegex(ValueError, "conflict|immutable"):
+            payload = _canonical_json_bytes(conflict)
+            (self.root / "routes/shadow/primary-runs" / ("6" * 32 + ".json")).write_bytes(payload)
+            write_primary_run_receipt(self.root, receipt)
+        evidence_root = self.root / "routes/shadow/primary-runs"
+        (evidence_root / "foreign").write_bytes(b"interference")
+        with self.assertRaisesRegex(ValueError, "unknown member"):
+            write_primary_run_receipt(self.root, receipt)
+
+    def test_primary_run_retry_rejects_tampered_or_partial_named_member(self):
+        receipt = self._primary_run_receipt()
+        evidence_root = self.root / "routes/shadow/primary-runs"
+        evidence_root.mkdir(parents=True)
+        target = evidence_root / (receipt["primary_invocation_id"] + ".json")
+        for payload in (
+            b"{",
+            _canonical_json_bytes(dict(receipt, reason_code="forged")),
+        ):
+            with self.subTest(payload=payload[:20]):
+                target.write_bytes(payload)
+                with self.assertRaisesRegex(ValueError, "invalid|conflict|immutable|canonical"):
+                    write_primary_run_receipt(self.root, receipt)
+
+    def test_primary_run_scan_rejects_named_oversize_and_unsafe_member(self):
+        receipt = self._primary_run_receipt()
+        for unsafe in ("oversize", "hardlink", "symlink"):
+            with self.subTest(unsafe=unsafe):
+                root = self.root / unsafe
+                evidence_root = root / "routes/shadow/primary-runs"
+                evidence_root.mkdir(parents=True)
+                target = evidence_root / ("9" * 32 + ".json")
+                if unsafe == "oversize":
+                    target.write_bytes(b"x" * 4097)
+                else:
+                    foreign = evidence_root / "foreign"
+                    foreign.write_bytes(b"x")
+                    if unsafe == "hardlink":
+                        os.link(foreign, target)
+                    else:
+                        target.symlink_to(foreign)
+                with self.assertRaisesRegex(ValueError, "unsafe|hard-linked|bound|invalid|unknown"):
+                    write_primary_run_receipt(root, receipt)
+
+    def test_primary_run_cap_installs_one_permanent_overflow_marker(self):
+        receipt = self._primary_run_receipt()
+        evidence_root = self.root / "routes/shadow/primary-runs"
+        evidence_root.mkdir(parents=True)
+        candidate_size = len(_canonical_json_bytes(receipt))
+        target_bytes = PRIMARY_RUN_DATA_BYTES - candidate_size + 1
+        full_members, remainder = divmod(target_bytes, 4096)
+        for index in range(full_members):
+            (evidence_root / ("{:032x}.json".format(index + 1))).write_bytes(b"x" * 4096)
+        if remainder:
+            (evidence_root / ("{:032x}.json".format(full_members + 1))).write_bytes(b"x" * remainder)
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            write_primary_run_receipt(self.root, receipt)
+        marker_path = evidence_root / "overflow.json"
+        marker = json.loads(marker_path.read_text())
+        self.assertEqual(
+            marker,
+            {
+                "schema": "route_shadow_primary_run_overflow/v1",
+                "first_rejected_invocation_id": "6" * 32,
+                "observed_at": receipt["finished_at"],
+                "cap_bytes": 1048576,
+                "observed_receipt_bytes": PRIMARY_RUN_DATA_BYTES - candidate_size + 1,
+                "reason_code": "primary_run_receipt_capacity_exhausted",
+            },
+        )
+        marker_bytes = marker_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            write_primary_run_receipt(self.root, dict(receipt, primary_invocation_id="8" * 32))
+        self.assertEqual(marker_path.read_bytes(), marker_bytes)
+        total = sum(
+            path.stat().st_size for path in evidence_root.iterdir() if path.is_file()
+        )
+        self.assertLessEqual(total, 1048576)
+
+    def test_full_caps_reject_without_adding_overflow_marker(self):
+        cases = (
+            (
+                "primary run",
+                self.root / "routes/shadow/primary-runs",
+                PRIMARY_RUN_CAP_BYTES,
+                lambda: write_primary_run_receipt(
+                    self.root, self._primary_run_receipt()
+                ),
+            ),
+            (
+                "primary contention",
+                self.root / "routes/shadow/primary-contention",
+                PRIMARY_CONTENTION_CAP_BYTES,
+                lambda: write_primary_contention_receipt(
+                    self.root,
+                    lock_fd=self.lock_fd,
+                    primary_profile="depth",
+                    primary_invocation_id="d" * 32,
+                    observed_at="2026-08-02T12:00:00Z",
+                ),
+            ),
+        )
+        for label, evidence_root, cap_bytes, writer in cases:
+            with self.subTest(label=label):
+                evidence_root.mkdir(parents=True)
+                # Both receipt roots admit canonical members no larger than
+                # 2 KiB; use that common maximum so the preloaded inventory is
+                # individually valid while exactly consuming the total cap.
+                member_size = 2048
+                member_count, remainder = divmod(cap_bytes, member_size)
+                for index in range(member_count):
+                    (evidence_root / ("{:032x}.json".format(index + 1))).write_bytes(
+                        b"x" * member_size
+                    )
+                self.assertEqual(remainder, 0)
+                before = sum(
+                    path.stat().st_size
+                    for path in evidence_root.iterdir()
+                    if path.is_file()
+                )
+                self.assertEqual(before, cap_bytes)
+                with self.assertRaisesRegex(ValueError, "capacity"):
+                    writer()
+                after = sum(
+                    path.stat().st_size
+                    for path in evidence_root.iterdir()
+                    if path.is_file()
+                )
+                self.assertEqual(after, before)
+                self.assertFalse((evidence_root / "overflow.json").exists())
+
+    def test_primary_run_concurrent_same_id_has_one_no_replace_result(self):
+        receipt = self._primary_run_receipt()
+        context = multiprocessing.get_context("spawn")
+        queue = context.Queue()
+        workers = [
+            context.Process(
+                target=_write_primary_run_concurrently,
+                args=(str(self.root), receipt, queue),
+            )
+            for _index in range(4)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(10)
+            self.assertEqual(worker.exitcode, 0)
+        results = [queue.get(timeout=2) for _index in workers]
+        self.assertTrue(all(item[0] == "ok" for item in results), results)
+        evidence_root = self.root / "routes/shadow/primary-runs"
+        receipts = [
+            path for path in evidence_root.iterdir()
+            if path.name not in {".cap.lock", "overflow.json"}
+        ]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0].read_bytes(), _canonical_json_bytes(receipt))
 
 
 def write_csv(path, fieldnames, rows):
@@ -982,6 +1550,144 @@ class CollectionCycleTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "skipped_locked")
         self.assertFalse(run_root.exists())
+
+    def test_daily_and_depth_take_primary_intent_before_collection_lock(self):
+        for profile in ("daily", "depth"):
+            with self.subTest(profile=profile):
+                lock_path = self.root / (profile + "-collection.lock")
+                intent_path = lock_path.with_name("primary-intent.lock")
+                observations = []
+
+                def runner(_command, log_path):
+                    contender_intent = os.open(str(intent_path), os.O_RDWR)
+                    contender_collection = os.open(str(lock_path), os.O_RDWR)
+                    try:
+                        for label, descriptor in (
+                            ("intent", contender_intent),
+                            ("collection", contender_collection),
+                        ):
+                            try:
+                                fcntl.flock(
+                                    descriptor,
+                                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                                )
+                            except BlockingIOError:
+                                observations.append((label, "busy"))
+                            else:
+                                observations.append((label, "free"))
+                                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    finally:
+                        os.close(contender_collection)
+                        os.close(contender_intent)
+                    log_path.write_text("fixture\n", encoding="utf-8")
+                    return 2
+
+                result = run_collection_cycle(
+                    profile,
+                    publish_local=False,
+                    data_dir=self.data_dir,
+                    run_root=self.root / (profile + "-intent-runs"),
+                    latest_status_path=self.root / (profile + "-intent-latest.json"),
+                    lock_path=lock_path,
+                    now=NOW,
+                    fail_fast=True,
+                    step_runner=runner,
+                )
+
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(observations, [("intent", "busy"), ("collection", "busy")])
+                self.assertTrue(intent_path.is_file())
+
+    def test_daily_intent_busy_returns_original_feature_off_shape_without_collecting(self):
+        lock_path = self.root / "intent-busy/collection.lock"
+        intent_path = lock_path.with_name("primary-intent.lock")
+        intent_path.parent.mkdir(parents=True)
+        intent_fd = os.open(str(intent_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(intent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = run_collection_cycle(
+                "daily",
+                publish_local=True,
+                data_dir=self.data_dir,
+                run_root=self.root / "intent-busy-runs",
+                latest_status_path=self.root / "intent-busy-latest.json",
+                lock_path=lock_path,
+                now=NOW,
+                step_runner=lambda _command, _log_path: self.fail(
+                    "intent-busy primary must not run a collector"
+                ),
+            )
+        finally:
+            fcntl.flock(intent_fd, fcntl.LOCK_UN)
+            os.close(intent_fd)
+
+        self.assertEqual(
+            result,
+            {
+                "run_id": result["run_id"],
+                "profile": "daily",
+                "status": "skipped_locked",
+                "publish_local": True,
+            },
+        )
+        self.assertFalse((self.root / "intent-busy-runs").exists())
+        self.assertFalse(lock_path.exists())
+        self.assertFalse((self.root / "intent-busy-latest.json").exists())
+
+    def test_nonproduction_profile_does_not_join_primary_intent_domain(self):
+        lock_path = self.root / "manual/collection.lock"
+        intent_path = lock_path.with_name("primary-intent.lock")
+        intent_path.parent.mkdir(parents=True)
+        intent_fd = os.open(str(intent_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(intent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def runner(_command, log_path):
+                log_path.write_text("fixture\n", encoding="utf-8")
+                return 2
+
+            result = run_collection_cycle(
+                "tvl",
+                publish_local=False,
+                data_dir=self.data_dir,
+                run_root=self.root / "manual-runs",
+                latest_status_path=self.root / "manual-latest.json",
+                lock_path=lock_path,
+                now=NOW,
+                step_runner=runner,
+            )
+        finally:
+            fcntl.flock(intent_fd, fcntl.LOCK_UN)
+            os.close(intent_fd)
+        self.assertEqual(result["status"], "failed")
+
+    def test_primary_intent_path_rejects_symlink_and_hardlink(self):
+        for unsafe in ("symlink", "hardlink"):
+            with self.subTest(unsafe=unsafe):
+                parent = self.root / unsafe
+                parent.mkdir()
+                lock_path = parent / "collection.lock"
+                intent_path = parent / "primary-intent.lock"
+                target = parent / "foreign"
+                target.write_bytes(b"")
+                if unsafe == "symlink":
+                    intent_path.symlink_to(target)
+                else:
+                    os.link(target, intent_path)
+                with self.assertRaisesRegex(ValueError, "intent|unsafe|hard-linked"):
+                    run_collection_cycle(
+                        "depth",
+                        publish_local=False,
+                        data_dir=self.data_dir,
+                        run_root=parent / "runs",
+                        latest_status_path=parent / "latest.json",
+                        lock_path=lock_path,
+                        now=NOW,
+                        step_runner=lambda _command, _log_path: self.fail(
+                            "unsafe intent path must fail before collectors"
+                        ),
+                    )
+                self.assertFalse(lock_path.exists())
 
     def test_cycle_manifest_keeps_structured_publication_gate_evidence(self):
         gate = {

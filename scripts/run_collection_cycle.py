@@ -26,6 +26,7 @@ import subprocess
 import sys
 import uuid
 from collections import Counter
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -38,6 +39,10 @@ from dashboard.freshness import build_source_freshness
 from scripts.publication_gate import COVERAGE_GATE_LOG_MARKER
 from scripts.cex_instrument_lifecycle import (
     load_cex_instrument_lifecycle_manifest,
+)
+from scripts.collection_lock_evidence import (
+    open_verified_directory_chain,
+    open_verified_regular_at,
 )
 from scripts.timestamp_contract import (
     parse_rfc3339_utc,
@@ -84,6 +89,51 @@ ROUTE_TIMING_STATUS_REASONS = {
         "route_mode_not_executable",
     },
 }
+
+
+@contextmanager
+def _collection_lock_domain(lock_path: Path, *, primary_intent: bool):
+    """Acquire primary-intent -> collection using one descriptor-safe parent."""
+    parent_fd = -1
+    intent_fd = -1
+    collection_fd = -1
+    intent_acquired = False
+    collection_acquired = False
+    try:
+        parent_fd, _ancestry = open_verified_directory_chain(
+            Path(lock_path).parent, create=True
+        )
+        if primary_intent:
+            intent_fd = open_verified_regular_at(
+                parent_fd, "primary-intent.lock", create=True, mode=0o600
+            )
+            try:
+                fcntl.flock(intent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            intent_acquired = True
+        collection_fd = open_verified_regular_at(
+            parent_fd, Path(lock_path).name, create=True, mode=0o600
+        )
+        try:
+            fcntl.flock(collection_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        collection_acquired = True
+        yield True
+    finally:
+        if collection_fd >= 0:
+            if collection_acquired:
+                fcntl.flock(collection_fd, fcntl.LOCK_UN)
+            os.close(collection_fd)
+        if intent_fd >= 0:
+            if intent_acquired:
+                fcntl.flock(intent_fd, fcntl.LOCK_UN)
+            os.close(intent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def utc_now() -> datetime:
@@ -828,18 +878,16 @@ def run_collection_cycle(
             ],
         }
 
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_handle:
-        try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with _collection_lock_domain(
+        Path(lock_path), primary_intent=profile in {"daily", "depth"}
+    ) as acquired:
+        if not acquired:
             return {
                 "run_id": run_id,
                 "profile": profile,
                 "status": "skipped_locked",
                 "publish_local": publish_local,
             }
-
         run_dir = run_root / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
         step_results = []

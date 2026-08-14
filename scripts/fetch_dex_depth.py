@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import ssl
 import time
 import urllib.error
@@ -39,7 +40,7 @@ from decimal import (
     localcontext,
 )
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 try:
     import certifi
@@ -83,6 +84,7 @@ try:
         CommonTarget,
         MarketRules,
         QuantityQuote,
+        V2_FEE_FORMULA,
         V2PoolState,
         quote_v2_pool_quantity,
         validate_v2_quantity_quote_against_state,
@@ -122,6 +124,7 @@ except ModuleNotFoundError:
         CommonTarget,
         MarketRules,
         QuantityQuote,
+        V2_FEE_FORMULA,
         V2PoolState,
         quote_v2_pool_quantity,
         validate_v2_quantity_quote_against_state,
@@ -232,6 +235,66 @@ V2_FEE_BPS = {
     "pancakeswap_v2": Decimal("25"),
     "pancakeswap-v2-zksync": Decimal("25"),
 }
+
+# The initial strict adapter's fee proof is a hash of this checked-in,
+# canonical projection.  A collector cannot replace it with an opaque hash.
+ROUTE_V2_FEE_IDENTITY = {
+    "schema": "route_v2_fee_identity/v1",
+    "adapter_id": "uniswap-v2-router02-ethereum",
+    "chain": "eth",
+    "chain_id": "1",
+    "dex": "uniswap_v2",
+    "protocol_family": "uniswap_v2_router02",
+    "pair_fee_bps": "30",
+    "fee_numerator": "9970",
+    "fee_denominator": "10000",
+    "fee_formula": V2_FEE_FORMULA,
+    "registry_version": "2026-08-12-fixed-block-20000000",
+}
+ROUTE_V2_FEE_PROOF_SHA256 = hashlib.sha256(
+    json.dumps(
+        ROUTE_V2_FEE_IDENTITY,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+ROUTE_FIXED_BLOCK_HEADER_FIELDS = (
+    "number",
+    "hash",
+    "parent_hash",
+    "timestamp",
+    "base_fee_per_gas",
+    "gas_used",
+    "gas_limit",
+)
+ROUTE_V2_POOL_STATE_FIELDS = (
+    "schema",
+    "chain",
+    "chain_id",
+    "dex",
+    "pool_address",
+    "token0_address",
+    "token1_address",
+    "token0_decimals",
+    "token1_decimals",
+    "reserve0_raw",
+    "reserve1_raw",
+    "reserve_timestamp_last_raw",
+    "fee_bps",
+    "fee_numerator",
+    "fee_denominator",
+    "fee_formula",
+    "fee_proof_sha256",
+    "block_number",
+    "block_hash",
+    "block_header_sha256",
+    "observed_at",
+    "raw_response_sha256",
+    "state_id",
+)
+_ROUTE_BLOCK_HASH = re.compile(r"0x[0-9a-f]{64}\Z", flags=re.ASCII)
 V3_DEXES = {
     "aerodrome-slipstream",
     "uniswap_v3",
@@ -1141,6 +1204,29 @@ def freeze_v2_pool_state(source: Any) -> V2PoolState:
     return V2PoolState(**frozen)
 
 
+def strict_route_cost_pool_state_anchor(source: Any) -> dict[str, Any]:
+    """Project the exact retained V2 state fields used by strict cost replay."""
+    state = freeze_v2_pool_state(source)
+    if state.chain != "eth" or state.dex != "uniswap_v2":
+        raise ValueError("strict route-cost pool state is not Ethereum Uniswap V2")
+    return {
+        "schema": "route_cost_core_pool_state_anchor/v1",
+        "state_id": state.state_id,
+        "chain": state.chain,
+        "chain_id": state.chain_id,
+        "dex": state.dex,
+        "pool_address": state.pool_address,
+        "token0_address": state.token0_address,
+        "token1_address": state.token1_address,
+        "fee_bps": str(state.fee_bps),
+        "block_number": hex(state.block_number),
+        "block_hash": state.block_hash,
+        "block_header_sha256": state.block_header_sha256,
+        "observed_at": state.observed_at,
+        "raw_response_sha256": state.raw_response_sha256,
+    }
+
+
 def route_quantity_quote_for_v2_pool(
     source: Any,
     *,
@@ -1536,6 +1622,135 @@ def block_timestamp_text(block: dict[str, Any]) -> str:
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
 
 
+def canonical_route_fixed_block_header(value: Any) -> dict[str, str]:
+    """Project one complete Ethereum header into the strict cost contract."""
+    if not isinstance(value, Mapping):
+        raise ValueError("fixed block header is unavailable")
+    aliases = {
+        "number": "number",
+        "hash": "hash",
+        "parent_hash": "parentHash" if "parent_hash" not in value else "parent_hash",
+        "timestamp": "timestamp",
+        "base_fee_per_gas": (
+            "baseFeePerGas" if "base_fee_per_gas" not in value else "base_fee_per_gas"
+        ),
+        "gas_used": "gasUsed" if "gas_used" not in value else "gas_used",
+        "gas_limit": "gasLimit" if "gas_limit" not in value else "gas_limit",
+    }
+    header = {field: value.get(source) for field, source in aliases.items()}
+    for field in ("number", "timestamp", "base_fee_per_gas", "gas_used", "gas_limit"):
+        if not is_canonical_rpc_quantity(header[field]):
+            raise ValueError("fixed block header is unavailable")
+    for field in ("hash", "parent_hash"):
+        if not isinstance(header[field], str) or _ROUTE_BLOCK_HASH.fullmatch(
+            header[field]
+        ) is None:
+            raise ValueError("fixed block header is unavailable")
+    return header
+
+
+def _route_typed_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _route_v2_pool_state_payload(
+    pool: dict[str, str],
+    row: dict[str, str],
+    *,
+    reserve_timestamp_last_raw: int,
+    fixed_chain_id: Any,
+    fixed_block_header: Any,
+) -> bytes | None:
+    """Return one canonical retained V2 state, or fail closed to unavailable."""
+    if pool.get("chain", "").lower() != "eth" or pool.get("dex", "").lower() != "uniswap_v2":
+        return None
+    try:
+        if (
+            not is_canonical_rpc_quantity(fixed_chain_id)
+            or fixed_chain_id != "0x1"
+            or int(fixed_chain_id, 16)
+            != int(ROUTE_V2_FEE_IDENTITY["chain_id"])
+        ):
+            return None
+        header = canonical_route_fixed_block_header(fixed_block_header)
+        from datetime import datetime
+
+        observed_epoch = int(
+            datetime.fromisoformat(
+                row["block_timestamp"].replace("Z", "+00:00")
+            ).timestamp()
+        )
+        if (
+            int(header["number"], 16) != int(row["block_number"])
+            or int(header["timestamp"], 16) != observed_epoch
+        ):
+            return None
+        fee_bps = int(Decimal(row["fee_bps"]))
+        if fee_bps != int(ROUTE_V2_FEE_IDENTITY["pair_fee_bps"]):
+            return None
+        state = V2PoolState(
+            chain="eth",
+            chain_id=int(fixed_chain_id, 16),
+            dex="uniswap_v2",
+            pool_address=pool["pool_address"].lower(),
+            token0_address=row["token0_address"],
+            token1_address=row["token1_address"],
+            token0_decimals=int(row["token0_decimals"]),
+            token1_decimals=int(row["token1_decimals"]),
+            reserve0_raw=int(row["_route_reserve0_raw"]),
+            reserve1_raw=int(row["_route_reserve1_raw"]),
+            reserve_timestamp_last_raw=reserve_timestamp_last_raw,
+            fee_bps=fee_bps,
+            fee_numerator=int(ROUTE_V2_FEE_IDENTITY["fee_numerator"]),
+            fee_denominator=int(ROUTE_V2_FEE_IDENTITY["fee_denominator"]),
+            fee_formula=V2_FEE_FORMULA,
+            fee_proof_sha256=ROUTE_V2_FEE_PROOF_SHA256,
+            block_number=int(header["number"], 16),
+            block_hash=header["hash"],
+            block_header_sha256=hashlib.sha256(
+                _route_typed_json_bytes(header)
+            ).hexdigest(),
+            observed_at=row["block_timestamp"],
+            raw_response_sha256=row["raw_response_sha256"],
+        )
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        return None
+    payload = {
+        "schema": "route_v2_pool_state/v1",
+        "chain": state.chain,
+        "chain_id": str(state.chain_id),
+        "dex": state.dex,
+        "pool_address": state.pool_address,
+        "token0_address": state.token0_address,
+        "token1_address": state.token1_address,
+        "token0_decimals": str(state.token0_decimals),
+        "token1_decimals": str(state.token1_decimals),
+        "reserve0_raw": str(state.reserve0_raw),
+        "reserve1_raw": str(state.reserve1_raw),
+        "reserve_timestamp_last_raw": str(state.reserve_timestamp_last_raw),
+        "fee_bps": str(state.fee_bps),
+        "fee_numerator": str(state.fee_numerator),
+        "fee_denominator": str(state.fee_denominator),
+        "fee_formula": state.fee_formula,
+        "fee_proof_sha256": state.fee_proof_sha256,
+        "block_number": str(state.block_number),
+        "block_hash": state.block_hash,
+        "block_header_sha256": state.block_header_sha256,
+        "observed_at": state.observed_at,
+        "raw_response_sha256": state.raw_response_sha256,
+        "state_id": state.state_id,
+    }
+    if tuple(payload) != ROUTE_V2_POOL_STATE_FIELDS:
+        raise AssertionError("route V2 pool-state schema drifted")
+    return _route_typed_json_bytes(payload)
+
+
 def _execution_common(
     pool: dict[str, str],
     *,
@@ -1894,7 +2109,7 @@ def observed_pool_row(
     request_started_at: str,
     raw_response_sha256: str,
     protocol: str,
-) -> tuple[dict[str, str], list[dict[str, str]]]:
+) -> tuple[dict[str, str], list[dict[str, str]], int | None]:
     block_tag = hex(block_number)
     pool_address = pool["pool_address"].lower()
     price_timing = require_usable_pool_usd_price(
@@ -1915,6 +2130,9 @@ def observed_pool_row(
         token1 = decode_address(token1_result)
         reserve0 = Decimal(decode_uint(reserves_result, 0))
         reserve1 = Decimal(decode_uint(reserves_result, 1))
+        reserve_timestamp_last_raw = decode_uint(reserves_result, 2)
+        if reserve_timestamp_last_raw > (1 << 32) - 1:
+            raise ValueError("getReserves timestamp does not fit uint32")
         fee_bps = V2_FEE_BPS[pool["dex"].lower()]
         sqrt_price_x96 = None
         current_tick = None
@@ -1958,6 +2176,7 @@ def observed_pool_row(
             tick_spacing,
         )
         reserve0 = reserve1 = Decimal(0)
+        reserve_timestamp_last_raw = None
 
     (token0_symbol, token0_decimals), (token1_symbol, token1_decimals) = token_metadata(
         client,
@@ -2093,6 +2312,9 @@ def observed_pool_row(
             "raw_response_sha256": raw_response_sha256,
         }
     )
+    if protocol == "constant_product_v2":
+        row["_route_reserve0_raw"] = str(int(reserve0))
+        row["_route_reserve1_raw"] = str(int(reserve1))
     row.update(
         depth_fields(
             target_position_index=target_index,
@@ -2130,7 +2352,7 @@ def observed_pool_row(
             block_timestamp=block_timestamp,
             source_endpoint=client.endpoint,
             raw_response_sha256=raw_response_sha256,
-        )
+        ), reserve_timestamp_last_raw
 
     target_token = token0 if target_index == 0 else token1
     quote_token = token1 if target_index == 0 else token0
@@ -2183,7 +2405,7 @@ def observed_pool_row(
             source_endpoint=client.endpoint,
             raw_response_sha256=raw_response_sha256,
         )
-    return row, execution_rows
+    return row, execution_rows, reserve_timestamp_last_raw
 
 
 def raw_transcript_bytes(
@@ -2222,6 +2444,9 @@ def collect_dex_pool_observation(
     client: RpcClient | None = None,
     fixed_block_number: int | None = None,
     fixed_block_timestamp: str = "",
+    fixed_chain_id: str | None = None,
+    fixed_block_header: Mapping[str, Any] | None = None,
+    typed_source_payload_sink: Callable[[Mapping[str, Any]], None] | None = None,
     deadline: CollectionDeadline | None = None,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Collect one DEX pool with isolated client state unless one is supplied."""
@@ -2302,7 +2527,7 @@ def collect_dex_pool_observation(
                 if normalized_number != block_number:
                     raise ValueError("fixed block response number does not match")
             block_timestamp = block_timestamp_text(block)
-        row, pool_execution_rows = observed_pool_row(
+        row, pool_execution_rows, reserve_timestamp_last_raw = observed_pool_row(
             pool,
             snapshot_id=snapshot_id,
             block_number=block_number,
@@ -2323,6 +2548,25 @@ def collect_dex_pool_observation(
         row["raw_response_sha256"] = raw_hash
         for execution_row in pool_execution_rows:
             execution_row["raw_response_sha256"] = raw_hash
+        if typed_source_payload_sink is not None:
+            payload = (
+                _route_v2_pool_state_payload(
+                    pool,
+                    row,
+                    reserve_timestamp_last_raw=reserve_timestamp_last_raw,
+                    fixed_chain_id=fixed_chain_id,
+                    fixed_block_header=fixed_block_header,
+                )
+                if reserve_timestamp_last_raw is not None
+                else None
+            )
+            if payload is not None:
+                typed_source_payload_sink({
+                    "role": "dex_pool_state",
+                    "payload": payload,
+                })
+        row.pop("_route_reserve0_raw", None)
+        row.pop("_route_reserve1_raw", None)
     except CollectionDeadlineExceeded:
         raise
     except Exception as error:

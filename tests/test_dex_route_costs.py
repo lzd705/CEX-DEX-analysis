@@ -16,6 +16,10 @@ from scripts.dex_route_costs import (
     transfer_tax_component,
 )
 from scripts.fetch_dex_depth import RpcClient, sanitize_endpoint
+from scripts.route_cost_evidence import (
+    ETHEREUM_V2_BUY_SELECTOR,
+    ETHEREUM_V2_SELL_SELECTOR,
+)
 
 
 COHORT = "cohort-1"
@@ -62,6 +66,64 @@ SENTINELS = (
     "RPC_SECRET_SENTINEL",
     "/private/rpc/credentials.json",
 )
+
+
+class StrictV2PrimitiveFacadeTests(unittest.TestCase):
+    def test_dex_cost_module_exposes_only_the_fixed_v2_selector_semantics(self):
+        buy = dex_route_costs.build_strict_v2_swap_calldata(
+            direction="buy",
+            quoted_amount_in_raw=10001,
+            quoted_amount_out_raw=5000,
+            submission_loss_bound_bps=100,
+            path_token_in=QUOTE_TOKEN,
+            path_token_out=MARKET_TOKEN,
+            recipient=SENDER,
+            deadline=12345,
+        )
+        sell = dex_route_costs.build_strict_v2_swap_calldata(
+            direction="sell",
+            quoted_amount_in_raw=5000,
+            quoted_amount_out_raw=10001,
+            submission_loss_bound_bps=100,
+            path_token_in=MARKET_TOKEN,
+            path_token_out=QUOTE_TOKEN,
+            recipient=SENDER,
+            deadline=12345,
+        )
+        self.assertTrue(buy.startswith(ETHEREUM_V2_BUY_SELECTOR))
+        self.assertTrue(sell.startswith(ETHEREUM_V2_SELL_SELECTOR))
+        self.assertEqual(
+            dex_route_costs.decode_strict_v2_swap_calldata(buy)["direction"],
+            "buy",
+        )
+        self.assertEqual(
+            dex_route_costs.decode_strict_v2_swap_calldata(sell)["direction"],
+            "sell",
+        )
+
+    def test_dex_cost_module_exposes_exact_eip1559_and_storage_key_primitives(self):
+        self.assertEqual(
+            dex_route_costs.strict_next_base_fee_wei(
+                base_fee_per_gas=100, gas_used=750, gas_limit=1000
+            ),
+            106,
+        )
+        self.assertEqual(
+            dex_route_costs.strict_network_gas_usd(
+                gas_units=21000,
+                max_fee_per_gas_wei_value=100_000_000_000,
+                native_price_usd="3000",
+            ),
+            "6.3",
+        )
+        self.assertRegex(
+            dex_route_costs.strict_balance_storage_key(SENDER, 3),
+            r"^0x[0-9a-f]{64}$",
+        )
+        self.assertRegex(
+            dex_route_costs.strict_allowance_storage_key(SENDER, ROUTER, 4),
+            r"^0x[0-9a-f]{64}$",
+        )
 
 
 def canonical_sha256(value):

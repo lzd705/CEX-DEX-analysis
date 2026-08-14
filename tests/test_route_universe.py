@@ -7,6 +7,7 @@ from scripts.route_universe import (
     build_route_universe,
     execution_capability_by_market,
     route_universe_sha256,
+    strict_cost_route_classification,
     select_route_legs,
 )
 
@@ -95,6 +96,41 @@ def tvl(market_id, value, **overrides):
 
 
 class RouteUniverseSelectionTests(unittest.TestCase):
+    def test_strict_cost_classification_is_structural_and_never_uses_rpc_outcome(self):
+        supported = strict_cost_route_classification(
+            {
+                "market_id": "dex:eth:uniswap_v2:0x1111111111111111111111111111111111111111:UNI",
+                "market_type": "dex",
+            },
+            selected_market_ids={
+                "dex:eth:uniswap_v2:0x1111111111111111111111111111111111111111:UNI"
+            },
+            structurally_supported_market_ids={
+                "dex:eth:uniswap_v2:0x1111111111111111111111111111111111111111:UNI"
+            },
+        )
+        unsupported = strict_cost_route_classification(
+            {
+                "market_id": "dex:eth:uniswap_v3:0x2222222222222222222222222222222222222222:UNI",
+                "market_type": "dex",
+            },
+            selected_market_ids=set(),
+            structurally_supported_market_ids=set(),
+        )
+        capacity = strict_cost_route_classification(
+            {
+                "market_id": "dex:eth:uniswap_v2:0x3333333333333333333333333333333333333333:UNI",
+                "market_type": "dex",
+            },
+            selected_market_ids=set(),
+            structurally_supported_market_ids={
+                "dex:eth:uniswap_v2:0x3333333333333333333333333333333333333333:UNI"
+            },
+        )
+        self.assertEqual(supported, ("candidate", None))
+        self.assertEqual(unsupported, ("research_only", "strict_cost_adapter_unsupported"))
+        self.assertEqual(capacity, ("research_only", "cost_adapter_cohort_capacity"))
+
     def test_selection_is_bounded_excludes_unusable_rows_and_retains_priority_inputs(self):
         cex_ids = ["cex:venue:{}".format(letter) for letter in "ABCDEFG"]
         dex_ids = ["dex:eth:swap:0x{}:UNI".format(letter.lower()) for letter in "ABCDEFG"]

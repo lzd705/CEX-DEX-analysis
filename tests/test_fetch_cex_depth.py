@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+import scripts.fetch_cex_depth as fetch_cex_depth
 from scripts.fetch_cex_depth import (
     CURRENT_FILENAME,
     DEPTH_BANDS_BPS,
@@ -17,6 +18,7 @@ from scripts.fetch_cex_depth import (
     LATEST_FILENAME,
     collect_depth,
     collect_depth_with_execution,
+    collect_cex_market_observation,
     depth_failure_reason_code,
     depth_metrics,
     ensure_full_publish_scope,
@@ -38,6 +40,7 @@ from scripts.fetch_cex_depth import (
     timestamp_text,
     upbit_book,
     validate_snapshot,
+    binance_market_rules_projection,
 )
 from scripts.publication_gate import CoverageRegressionError
 from scripts.execution_cost import (
@@ -88,6 +91,850 @@ def write_snapshot_rows(path, rows):
 
 
 class FetchCexDepthTest(unittest.TestCase):
+    def test_shared_binance_rules_projection_preserves_exact_filters(self):
+        payload = {
+            "symbols": [{
+                "symbol": "ETHUSDT",
+                "status": "TRADING",
+                "baseAsset": "ETH",
+                "quoteAsset": "USDT",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01000000"},
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.00010000",
+                        "stepSize": "0.00010000",
+                    },
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5.00000000"},
+                ],
+            }],
+        }
+        self.assertEqual(
+            binance_market_rules_projection(
+                payload,
+                base_asset="ETH",
+                quote_asset="USDT",
+                source_instrument="ETHUSDT",
+            ),
+            {
+                "price_tick": "0.01",
+                "quantity_step": "0.0001",
+                "min_quantity": "0.0001",
+                "min_notional": "5",
+            },
+        )
+
+    def test_shared_binance_rules_projection_rejects_duplicate_filters(self):
+        payload = {
+            "symbols": [{
+                "symbol": "ETHUSDT",
+                "status": "TRADING",
+                "baseAsset": "ETH",
+                "quoteAsset": "USDT",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.02"},
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.0001",
+                        "stepSize": "0.0001",
+                    },
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+                ],
+            }],
+        }
+        with self.assertRaisesRegex(ValueError, "duplicated"):
+            binance_market_rules_projection(
+                payload,
+                base_asset="ETH",
+                quote_asset="USDT",
+                source_instrument="ETHUSDT",
+            )
+
+    def test_shared_rules_decimal_contract_is_bounded_fixed_point_text(self):
+        payload = {
+            "symbols": [{
+                "symbol": "ETHUSDT",
+                "status": "TRADING",
+                "baseAsset": "ETH",
+                "quoteAsset": "USDT",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.0001",
+                        "stepSize": "0.0001",
+                    },
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+                ],
+            }],
+        }
+
+        def projection(value):
+            mutated = json.loads(json.dumps(payload))
+            mutated["symbols"][0]["filters"][0]["tickSize"] = value
+            return binance_market_rules_projection(
+                mutated,
+                base_asset="ETH",
+                quote_asset="USDT",
+                source_instrument="ETHUSDT",
+            )
+
+        exact_token = "1" * fetch_cex_depth.MAX_RULE_DECIMAL_TOKEN_BYTES
+        self.assertEqual(projection(exact_token)["price_tick"], exact_token)
+        exact_places = "0." + "0" * (
+            fetch_cex_depth.MAX_RULE_DECIMAL_PLACES - 1
+        ) + "1"
+        self.assertEqual(projection(exact_places)["price_tick"], exact_places)
+        for value in (
+            "1" * (fetch_cex_depth.MAX_RULE_DECIMAL_TOKEN_BYTES + 1),
+            "0." + "0" * fetch_cex_depth.MAX_RULE_DECIMAL_PLACES + "1",
+            "1e-1000000",
+            "-0",
+            1,
+        ):
+            with self.subTest(value_type=type(value).__name__, width=len(str(value))):
+                with self.assertRaises(ValueError):
+                    projection(value)
+
+    def test_shared_binance_rules_rejects_ambiguous_notional_filters(self):
+        payload = {
+            "symbols": [{
+                "symbol": "ETHUSDT",
+                "status": "TRADING",
+                "baseAsset": "ETH",
+                "quoteAsset": "USDT",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.0001",
+                        "stepSize": "0.0001",
+                    },
+                    {"filterType": "NOTIONAL", "minNotional": "5"},
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+                ],
+            }],
+        }
+        with self.assertRaisesRegex(ValueError, "notional.*ambiguous|exactly one"):
+            binance_market_rules_projection(
+                payload,
+                base_asset="ETH",
+                quote_asset="USDT",
+                source_instrument="ETHUSDT",
+            )
+
+    def test_binance_collector_emits_authoritative_typed_rules_and_conversion(self):
+        book_raw = (
+            b'{"bids":[["99.99","2"]],"asks":[["100.01","3"]],'
+            b'"lastUpdateId":123}'
+        )
+        rules_raw = json.dumps({
+            "symbols": [{
+                "symbol": "UNIUSDT",
+                "status": "TRADING",
+                "baseAsset": "UNI",
+                "quoteAsset": "USDT",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 4,
+                "filters": [
+                    {
+                        "filterType": "PRICE_FILTER",
+                        "tickSize": "0.01000000",
+                    },
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.10000000",
+                        "stepSize": "0.01000000",
+                    },
+                    {
+                        "filterType": "MIN_NOTIONAL",
+                        "minNotional": "5.00000000",
+                    },
+                ],
+            }],
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        requests = []
+
+        def fake_request(url):
+            requests.append(url)
+            if "/api/v3/depth" in url:
+                return json.loads(book_raw), book_raw
+            if "/api/v3/exchangeInfo" in url:
+                return json.loads(rules_raw), rules_raw
+            raise AssertionError("unexpected CEX source request: {}".format(url))
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name, patch(
+            "scripts.fetch_cex_depth.utc_now_text",
+            return_value="2026-08-01T12:00:00+00:00",
+        ):
+            row, _execution = collect_cex_market_observation(
+                market(),
+                snapshot_id="typed-binance",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        self.assertIn(row["status"], {"observed", "partial"})
+        self.assertEqual(
+            requests,
+            [
+                "https://data-api.binance.vision/api/v3/depth?symbol=UNIUSDT&limit=100",
+                "https://api.binance.com/api/v3/exchangeInfo?symbol=UNIUSDT",
+            ],
+        )
+        self.assertEqual(
+            [member["role"] for member in typed],
+            ["cex_market_rules", "quote_usd_conversion"],
+        )
+        rules = json.loads(typed[0]["payload"].decode("utf-8"))
+        self.assertEqual(rules, {
+            "base_asset": "UNI",
+            "base_increment": "0.01",
+            "base_unit_decimals": 8,
+            "market_id": "cex:binance:UNI/USDT",
+            "min_base_quantity": "0.1",
+            "min_quote_notional": "5",
+            "observed_at": "2026-08-01T12:00:00+00:00",
+            "quote_asset": "USDT",
+            "quote_increment": "0.0001",
+            "quote_unit_decimals": 4,
+            "schema": "route_market_rules_source/v1",
+            "valid_until": "2026-08-01T12:01:00+00:00",
+        })
+        conversion = json.loads(typed[1]["payload"].decode("utf-8"))
+        self.assertEqual(conversion["quote_asset"], "USDT")
+        self.assertEqual(conversion["usd_per_quote"], "1")
+        self.assertEqual(conversion["observed_at"], rules["observed_at"])
+        self.assertEqual(conversion["valid_until"], rules["valid_until"])
+        self.assertNotEqual(
+            conversion["valid_until"], conversion["observed_at"]
+        )
+
+    def test_bybit_typed_rules_use_instrument_precision_and_lot_filters(self):
+        book_raw = json.dumps({
+            "retCode": 0,
+            "result": {
+                "s": "UNIUSDT",
+                "b": [["99.99", "2"]],
+                "a": [["100.01", "3"]],
+            },
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        rules_raw = json.dumps({
+            "retCode": 0,
+            "result": {
+                "category": "spot",
+                "list": [{
+                    "symbol": "UNIUSDT",
+                    "status": "Trading",
+                    "baseCoin": "UNI",
+                    "quoteCoin": "USDT",
+                    "lotSizeFilter": {
+                        "basePrecision": "0.001",
+                        "quotePrecision": "0.0001",
+                        "minOrderQty": "0.01",
+                        "minOrderAmt": "1",
+                    },
+                    "priceFilter": {"tickSize": "0.01"},
+                }],
+            },
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        def fake_request(url):
+            if "/v5/market/orderbook" in url:
+                return json.loads(book_raw), book_raw
+            if "/v5/market/instruments-info" in url:
+                return json.loads(rules_raw), rules_raw
+            raise AssertionError("unexpected CEX source request: {}".format(url))
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name, patch(
+            "scripts.fetch_cex_depth.utc_now_text",
+            return_value="2026-08-01T12:00:00+00:00",
+        ):
+            row, _execution = collect_cex_market_observation(
+                market(exchange="bybit"),
+                snapshot_id="typed-bybit",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        self.assertIn(row["status"], {"observed", "partial"})
+        rules = json.loads(typed[0]["payload"].decode("utf-8"))
+        self.assertEqual(rules["base_unit_decimals"], 3)
+        self.assertEqual(rules["quote_unit_decimals"], 4)
+        self.assertEqual(rules["base_increment"], "0.001")
+        self.assertEqual(rules["quote_increment"], "0.0001")
+        self.assertEqual(rules["min_base_quantity"], "0")
+        self.assertEqual(rules["min_quote_notional"], "1")
+
+    def test_bybit_deprecated_min_order_quantity_is_not_required(self):
+        book_raw = (
+            b'{"retCode":0,"result":{"s":"UNIUSDT",'
+            b'"b":[["99.99","2"]],"a":[["100.01","3"]]}}'
+        )
+        rules = {
+            "retCode": 0,
+            "result": {
+                "category": "spot",
+                "list": [{
+                    "symbol": "UNIUSDT",
+                    "status": "Trading",
+                    "baseCoin": "UNI",
+                    "quoteCoin": "USDT",
+                    "lotSizeFilter": {
+                        "basePrecision": "0.001",
+                        "quotePrecision": "0.0001",
+                        "minOrderAmt": "1",
+                    },
+                    "priceFilter": {"tickSize": "0.01"},
+                }],
+            },
+        }
+        rules_raw = json.dumps(
+            rules, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+
+        def fake_request(url):
+            raw = book_raw if "/v5/market/orderbook" in url else rules_raw
+            return json.loads(raw), raw
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            row, _execution = collect_cex_market_observation(
+                market(exchange="bybit"),
+                snapshot_id="typed-bybit-no-deprecated-minimum",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        self.assertIn(row["status"], {"observed", "partial"})
+        rules_payload = json.loads(typed[0]["payload"].decode("utf-8"))
+        self.assertEqual(rules_payload["min_base_quantity"], "0")
+        self.assertEqual(rules_payload["min_quote_notional"], "1")
+
+    def test_bybit_requires_positive_min_order_amount(self):
+        book_raw = (
+            b'{"retCode":0,"result":{"s":"UNIUSDT",'
+            b'"b":[["99.99","2"]],"a":[["100.01","3"]]}}'
+        )
+        base_record = {
+            "symbol": "UNIUSDT",
+            "status": "Trading",
+            "baseCoin": "UNI",
+            "quoteCoin": "USDT",
+            "lotSizeFilter": {
+                "basePrecision": "0.001",
+                "quotePrecision": "0.0001",
+            },
+            "priceFilter": {"tickSize": "0.01"},
+        }
+        for name, min_order_amount in (("missing", None), ("zero", "0")):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory_name:
+                record = json.loads(json.dumps(base_record))
+                if min_order_amount is not None:
+                    record["lotSizeFilter"]["minOrderAmt"] = min_order_amount
+                rules_raw = json.dumps({
+                    "retCode": 0,
+                    "result": {"category": "spot", "list": [record]},
+                }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+                def fake_request(url):
+                    raw = book_raw if "/v5/market/orderbook" in url else rules_raw
+                    return json.loads(raw), raw
+
+                typed = []
+                row, _execution = collect_cex_market_observation(
+                    market(exchange="bybit"),
+                    snapshot_id="typed-bybit-min-amount-" + name,
+                    raw_path=Path(directory_name) / "book.json",
+                    request=fake_request,
+                    typed_source_payload_sink=typed.append,
+                )
+
+                self.assertIn(row["status"], {"observed", "partial"})
+                self.assertEqual(typed, [])
+
+    def test_suspended_instrument_never_emits_typed_rules_or_conversion(self):
+        book_raw = b'{"bids":[["99","2"]],"asks":[["101","3"]]}'
+        rules_raw = json.dumps({
+            "symbols": [{
+                "symbol": "UNIUSDT",
+                "status": "BREAK",
+                "baseAsset": "UNI",
+                "quoteAsset": "USDT",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 4,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.1",
+                        "stepSize": "0.01",
+                    },
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+                ],
+            }],
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        def fake_request(url):
+            if "/api/v3/depth" in url:
+                return json.loads(book_raw), book_raw
+            return json.loads(rules_raw), rules_raw
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            row, _execution = collect_cex_market_observation(
+                market(),
+                snapshot_id="typed-suspended",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        self.assertIn(row["status"], {"observed", "partial"})
+        self.assertEqual(typed, [])
+
+    def test_bybit_nontrading_instrument_never_emits_typed_payloads(self):
+        book_raw = (
+            b'{"retCode":0,"result":{"s":"UNIUSDT",'
+            b'"b":[["99","2"]],"a":[["101","3"]]}}'
+        )
+        rules_raw = json.dumps({
+            "retCode": 0,
+            "result": {
+                "category": "spot",
+                "list": [{
+                    "symbol": "UNIUSDT",
+                    "status": "PreLaunch",
+                    "baseCoin": "UNI",
+                    "quoteCoin": "USDT",
+                    "lotSizeFilter": {
+                        "basePrecision": "0.001",
+                        "quotePrecision": "0.0001",
+                        "minOrderQty": "0.01",
+                        "minOrderAmt": "1",
+                    },
+                    "priceFilter": {"tickSize": "0.01"},
+                }],
+            },
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        def fake_request(url):
+            raw = book_raw if "/v5/market/orderbook" in url else rules_raw
+            return json.loads(raw), raw
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            row, _execution = collect_cex_market_observation(
+                market(exchange="bybit"),
+                snapshot_id="typed-bybit-nontrading",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        self.assertIn(row["status"], {"observed", "partial"})
+        self.assertEqual(typed, [])
+
+    def test_rules_observed_time_is_sampled_after_rules_response(self):
+        book_raw = b'{"bids":[["99","2"]],"asks":[["101","3"]]}'
+        rules_raw = json.dumps({
+            "symbols": [{
+                "symbol": "UNIUSDT",
+                "status": "TRADING",
+                "baseAsset": "UNI",
+                "quoteAsset": "USDT",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 4,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.1",
+                        "stepSize": "0.01",
+                    },
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+                ],
+            }],
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        def fake_request(url):
+            if "/api/v3/depth" in url:
+                return json.loads(book_raw), book_raw
+            return json.loads(rules_raw), rules_raw
+
+        clock = iter([
+            "2026-08-01T12:00:00+00:00",
+            "2026-08-01T12:00:01+00:00",
+            "2026-08-01T12:00:02+00:00",
+        ])
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name, patch(
+            "scripts.fetch_cex_depth.utc_now_text", side_effect=lambda: next(clock)
+        ):
+            collect_cex_market_observation(
+                market(),
+                snapshot_id="typed-times",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        rules = json.loads(typed[0]["payload"].decode("utf-8"))
+        conversion = json.loads(typed[1]["payload"].decode("utf-8"))
+        self.assertEqual(rules["observed_at"], "2026-08-01T12:00:02+00:00")
+        self.assertEqual(
+            conversion["observed_at"], "2026-08-01T12:00:01+00:00"
+        )
+        self.assertLess(conversion["observed_at"], rules["observed_at"])
+        cohort_now = "2026-08-01T12:00:30+00:00"
+        self.assertLessEqual(rules["observed_at"], cohort_now)
+        self.assertLess(cohort_now, rules["valid_until"])
+        self.assertLessEqual(conversion["observed_at"], cohort_now)
+        self.assertLess(cohort_now, conversion["valid_until"])
+
+    def test_rules_that_cannot_construct_market_rules_emit_nothing(self):
+        book_raw = b'{"bids":[["99","2"]],"asks":[["101","3"]]}'
+        rules_raw = json.dumps({
+            "symbols": [{
+                "symbol": "UNIUSDT",
+                "status": "TRADING",
+                "baseAsset": "UNI",
+                "quoteAsset": "USDT",
+                "baseAssetPrecision": 2,
+                "quoteAssetPrecision": 4,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.1",
+                        "stepSize": "0.001",
+                    },
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+                ],
+            }],
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        def fake_request(url):
+            raw = book_raw if "/api/v3/depth" in url else rules_raw
+            return json.loads(raw), raw
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            row, _execution = collect_cex_market_observation(
+                market(),
+                snapshot_id="typed-invalid-rule-lattice",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        self.assertIn(row["status"], {"observed", "partial"})
+        self.assertEqual(typed, [])
+
+    def test_binance_minima_allow_plain_zero_but_reject_signed_zero(self):
+        book_raw = b'{"bids":[["99","2"]],"asks":[["101","3"]]}'
+        base_rules = {
+            "symbols": [{
+                "symbol": "UNIUSDT",
+                "status": "TRADING",
+                "baseAsset": "UNI",
+                "quoteAsset": "USDT",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 4,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0",
+                        "stepSize": "0.01",
+                    },
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "0"},
+                ],
+            }],
+        }
+        cases = (
+            ("plain-zero", "0", "0", True),
+            ("signed-zero-base", "-0", "0", False),
+            ("signed-zero-notional", "0", "-0", False),
+        )
+        for name, min_quantity, min_notional, should_emit in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory_name:
+                rules = json.loads(json.dumps(base_rules))
+                rules["symbols"][0]["filters"][1]["minQty"] = min_quantity
+                rules["symbols"][0]["filters"][2]["minNotional"] = min_notional
+                rules_raw = json.dumps(
+                    rules, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+
+                def fake_request(url):
+                    raw = book_raw if "/api/v3/depth" in url else rules_raw
+                    return json.loads(raw), raw
+
+                typed = []
+                row, _execution = collect_cex_market_observation(
+                    market(),
+                    snapshot_id="typed-binance-" + name,
+                    raw_path=Path(directory_name) / "book.json",
+                    request=fake_request,
+                    typed_source_payload_sink=typed.append,
+                )
+
+                self.assertIn(row["status"], {"observed", "partial"})
+                if should_emit:
+                    self.assertEqual(
+                        [member["role"] for member in typed],
+                        ["cex_market_rules", "quote_usd_conversion"],
+                    )
+                    payload = json.loads(typed[0]["payload"].decode("utf-8"))
+                    self.assertEqual(payload["min_base_quantity"], "0")
+                    self.assertEqual(payload["min_quote_notional"], "0")
+                else:
+                    self.assertEqual(typed, [])
+
+    def test_conversion_uses_the_book_source_time_when_venue_supplies_one(self):
+        book_raw = json.dumps({
+            "retCode": 0,
+            "result": {
+                "s": "UNIUSDT",
+                "b": [["99", "2"]],
+                "a": [["101", "3"]],
+                "ts": 1785585600000,
+            },
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        rules_raw = json.dumps({
+            "retCode": 0,
+            "result": {
+                "category": "spot",
+                "list": [{
+                    "symbol": "UNIUSDT",
+                    "status": "Trading",
+                    "baseCoin": "UNI",
+                    "quoteCoin": "USDT",
+                    "lotSizeFilter": {
+                        "basePrecision": "0.001",
+                        "quotePrecision": "0.0001",
+                        "minOrderQty": "0.01",
+                        "minOrderAmt": "1",
+                    },
+                    "priceFilter": {"tickSize": "0.01"},
+                }],
+            },
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        def fake_request(url):
+            raw = book_raw if "/v5/market/orderbook" in url else rules_raw
+            return json.loads(raw), raw
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name, patch(
+            "scripts.fetch_cex_depth.utc_now_text",
+            side_effect=[
+                "2026-08-01T12:00:00+00:00",
+                "2026-08-01T12:00:01+00:00",
+                "2026-08-01T12:00:02+00:00",
+            ],
+        ):
+            collect_cex_market_observation(
+                market(exchange="bybit"),
+                snapshot_id="typed-book-source-time",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        conversion = json.loads(typed[1]["payload"].decode("utf-8"))
+        self.assertEqual(
+            conversion["observed_at"], "2026-08-01T12:00:00+00:00"
+        )
+
+    def test_rules_http_body_is_read_with_an_explicit_bound(self):
+        from scripts.fetch_cex_depth import (
+            MAX_CEX_TYPED_RULE_RESPONSE_BYTES,
+            request_json,
+        )
+
+        class BoundedResponse:
+            def __init__(self):
+                self.read_sizes = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, size=-1):
+                self.read_sizes.append(size)
+                return b"{}"
+
+        response = BoundedResponse()
+        with patch("urllib.request.urlopen", return_value=response):
+            payload, raw = request_json(
+                "https://api.binance.com/api/v3/exchangeInfo?symbol=UNIUSDT",
+                max_bytes=MAX_CEX_TYPED_RULE_RESPONSE_BYTES,
+                max_retries=1,
+            )
+
+        self.assertEqual((payload, raw), ({}, b"{}"))
+        self.assertEqual(
+            response.read_sizes, [MAX_CEX_TYPED_RULE_RESPONSE_BYTES + 1]
+        )
+
+    def test_rules_http_body_one_byte_over_bound_is_rejected(self):
+        from scripts.fetch_cex_depth import (
+            MAX_CEX_TYPED_RULE_RESPONSE_BYTES,
+            request_json,
+        )
+
+        class OversizedResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, size=-1):
+                return b"{" + b" " * (size - 1)
+
+        with patch("urllib.request.urlopen", return_value=OversizedResponse()):
+            with self.assertRaisesRegex(ValueError, "response exceeds"):
+                request_json(
+                    "https://api.binance.com/api/v3/exchangeInfo?symbol=UNIUSDT",
+                    max_bytes=MAX_CEX_TYPED_RULE_RESPONSE_BYTES,
+                    max_retries=1,
+                )
+
+    def test_unsupported_venue_does_not_emit_typed_payloads_or_fetch_rules(self):
+        book_raw = b'{"code":"0","data":[{"bids":[["99","2"]],"asks":[["101","3"]]}]}'
+        requests = []
+
+        def fake_request(url):
+            requests.append(url)
+            return json.loads(book_raw), book_raw
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            row, _execution = collect_cex_market_observation(
+                market(exchange="okx"),
+                snapshot_id="typed-unsupported",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        self.assertEqual(row["status"], "observed")
+        self.assertEqual(typed, [])
+        self.assertEqual(len(requests), 1)
+
+    def test_malformed_authoritative_rules_fail_without_leaking_partial_typed_payloads(self):
+        book_raw = b'{"bids":[["99","2"]],"asks":[["101","3"]]}'
+        malformed_rules_raw = b'{"symbols":[{"symbol":"UNIUSDT","filters":[]}]}'
+
+        def fake_request(url):
+            if "/api/v3/depth" in url:
+                return json.loads(book_raw), book_raw
+            if "/api/v3/exchangeInfo" in url:
+                return json.loads(malformed_rules_raw), malformed_rules_raw
+            raise AssertionError("unexpected CEX source request: {}".format(url))
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            row, _execution = collect_cex_market_observation(
+                market(),
+                snapshot_id="typed-invalid-rules",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        self.assertIn(row["status"], {"observed", "partial"})
+        self.assertEqual(typed, [])
+
+    def test_typed_rules_request_honors_the_shared_collection_deadline(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = Clock()
+        deadline = CollectionDeadline.for_duration(1, clock=clock.monotonic)
+        book_raw = b'{"bids":[["99","2"]],"asks":[["101","3"]]}'
+
+        def expiring_request(url, *, deadline):
+            if "/api/v3/depth" in url:
+                clock.now = 0.5
+                return json.loads(book_raw), book_raw
+            clock.now = 2.0
+            deadline.require_remaining()
+
+        retained_raw = None
+        with tempfile.TemporaryDirectory() as directory_name:
+            raw_path = Path(directory_name) / "book.json"
+            with self.assertRaisesRegex(
+                CollectionDeadlineExceeded,
+                "^collection deadline exceeded$",
+            ):
+                collect_cex_market_observation(
+                    market(),
+                    snapshot_id="typed-expired-rules",
+                    raw_path=raw_path,
+                    request=expiring_request,
+                    deadline=deadline,
+                    typed_source_payload_sink=lambda _value: None,
+                )
+            retained_raw = raw_path.read_bytes()
+
+        self.assertEqual(retained_raw, book_raw)
+
+    def test_bybit_returned_instrument_cannot_retarget_typed_rules(self):
+        book_raw = json.dumps({
+            "retCode": 0,
+            "result": {
+                "s": "AAVEUSDT",
+                "b": [["99", "2"]],
+                "a": [["101", "3"]],
+            },
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        requests = []
+
+        def fake_request(url):
+            requests.append(url)
+            return json.loads(book_raw), book_raw
+
+        typed = []
+        with tempfile.TemporaryDirectory() as directory_name:
+            row, _execution = collect_cex_market_observation(
+                market(exchange="bybit"),
+                snapshot_id="typed-wrong-instrument",
+                raw_path=Path(directory_name) / "book.json",
+                request=fake_request,
+                typed_source_payload_sink=typed.append,
+            )
+
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(typed, [])
+        self.assertEqual(len(requests), 1)
+
     def test_coinbase_nanosecond_timestamp_is_canonicalized(self):
         self.assertEqual(
             timestamp_text("2026-07-31T23:05:47.660676312Z"),
