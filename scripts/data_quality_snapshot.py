@@ -1752,7 +1752,25 @@ def _parse_observation_timestamp(value: str) -> Tuple[datetime, str]:
     if not isinstance(value, str) or not value.strip():
         raise _PublicDataError("required_field_null")
     text = value.strip()
-    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    # Python 3.8 rejects nanosecond RFC3339 fractions while newer runtimes
+    # truncate them to datetime's microsecond precision.
+    parse_text = text
+    fractional = re.fullmatch(
+        r"(?P<prefix>.*T\d{2}:\d{2}:\d{2}\.)(?P<fraction>\d+)"
+        r"(?P<offset>Z|[+-]\d{2}:\d{2})",
+        text,
+    )
+    if fractional is not None and len(fractional.group("fraction")) > 6:
+        parse_text = (
+            fractional.group("prefix")
+            + fractional.group("fraction")[:6]
+            + fractional.group("offset")
+        )
+    candidate = (
+        parse_text[:-1] + "+00:00"
+        if parse_text.endswith("Z")
+        else parse_text
+    )
     try:
         parsed = datetime.fromisoformat(candidate)
     except ValueError:
