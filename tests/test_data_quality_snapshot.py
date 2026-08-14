@@ -3106,6 +3106,71 @@ class DataQualitySnapshotDeterminismTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), expected)
             self.assertNotIn(str(data_dir), output.read_text(encoding="utf-8"))
 
+    def test_cli_evaluates_tracked_repository_families_from_clean_cwd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "latest.json"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/build_data_quality_snapshot.py",
+                    "--data-dir",
+                    "data",
+                    "--generated-at-utc",
+                    "2026-08-14T00:00:00Z",
+                    "--window-end",
+                    "2026-08-13",
+                    "--window-days",
+                    "30",
+                    "--application-sha",
+                    "a" * 40,
+                    "--output",
+                    str(output),
+                ],
+                cwd=PROJECT_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            snapshot = json.loads(output.read_text(encoding="utf-8"))
+            states = {
+                family["name"]: family["state"]
+                for family in snapshot["families"]
+            }
+            self.assertEqual(
+                {name for name, state in states.items() if state == "evaluated"},
+                {
+                    "event_facts",
+                    "cex_instrument_lifecycle",
+                    "market_lifecycle_reviews",
+                },
+            )
+            self.assertEqual(
+                {name for name, state in states.items() if state == "not_evaluated"},
+                set(FAMILY_NAMES)
+                - {
+                    "event_facts",
+                    "cex_instrument_lifecycle",
+                    "market_lifecycle_reviews",
+                },
+            )
+            self.assertEqual(
+                snapshot["summary"],
+                {
+                    "evaluated_family_count": 3,
+                    "failed_family_count": 0,
+                    "not_evaluated_family_count": 9,
+                    "total_family_count": 12,
+                },
+            )
+            self.assertEqual(output.read_bytes(), canonical_snapshot_bytes(snapshot))
+            self.assertNotIn(
+                str(PROJECT_ROOT), output.read_text(encoding="utf-8")
+            )
+            self.assertNotIn(directory, output.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

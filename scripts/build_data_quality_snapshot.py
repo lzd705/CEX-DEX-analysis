@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import date
 from pathlib import Path
 
-try:
-    from scripts.data_quality_snapshot import build_snapshot, write_snapshot
-except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
-    from data_quality_snapshot import build_snapshot, write_snapshot
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.data_quality_snapshot import build_snapshot, write_snapshot
 
 
 def _canonical_date(value: str) -> date:
