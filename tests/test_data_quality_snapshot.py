@@ -3019,6 +3019,95 @@ class DataQualitySnapshotPointInTimeTests(unittest.TestCase):
 
 
 class DataQualitySnapshotDeterminismTests(unittest.TestCase):
+    def test_checked_in_public_snapshot_matches_tracked_repository_inputs(self):
+        snapshot = build_snapshot(
+            PROJECT_ROOT / "data",
+            generated_at_utc="2026-08-14T00:00:00Z",
+            window_end=date(2026, 8, 13),
+            window_days=30,
+            application_sha="e702377993a044ce009248e25c44aa035aa0202a",
+        )
+        artifact_path = (
+            PROJECT_ROOT / "data" / "public" / "quality" / "latest.json"
+        )
+
+        self.assertEqual(
+            artifact_path.read_bytes(),
+            canonical_snapshot_bytes(snapshot),
+        )
+        self.assertEqual(
+            snapshot["summary"],
+            {
+                "evaluated_family_count": 3,
+                "failed_family_count": 0,
+                "not_evaluated_family_count": 9,
+                "total_family_count": 12,
+            },
+        )
+        states = {
+            family["name"]: family["state"] for family in snapshot["families"]
+        }
+        evaluated = {
+            "event_facts",
+            "cex_instrument_lifecycle",
+            "market_lifecycle_reviews",
+        }
+        self.assertEqual(
+            {name for name, state in states.items() if state == "evaluated"},
+            evaluated,
+        )
+        self.assertEqual(
+            {name for name, state in states.items() if state == "not_evaluated"},
+            set(FAMILY_NAMES) - evaluated,
+        )
+        self.assertEqual(
+            {
+                family["name"]: (
+                    family["counts"]["expected"],
+                    family["counts"]["observed"],
+                    family["counts"]["usable"],
+                )
+                for family in snapshot["families"]
+                if family["state"] == "evaluated"
+            },
+            {
+                "cex_instrument_lifecycle": (7, 7, 7),
+                "event_facts": (45, 45, 44),
+                "market_lifecycle_reviews": (3, 3, 2),
+            },
+        )
+        self.assertEqual(
+            {
+                family["name"]: family["not_evaluated_reason"]
+                for family in snapshot["families"]
+                if family["state"] == "not_evaluated"
+            },
+            {
+                "cex_daily_ohlcv": "source_file_missing",
+                "cex_depth": "source_file_missing",
+                "cex_execution_cost": "source_file_missing",
+                "dex_daily_ohlcv": "source_file_missing",
+                "dex_depth": "source_file_missing",
+                "dex_execution_cost": "source_file_missing",
+                "route_cohort_opportunity": "route_pointer_missing",
+                "route_shadow_route_cost_evidence": "route_pointer_missing",
+                "tvl": "source_file_missing",
+            },
+        )
+        for family in snapshot["families"]:
+            if family["state"] != "not_evaluated":
+                continue
+            self.assertIsNone(family["counts"]["expected"])
+            self.assertIsNone(family["counts"]["observed"])
+            self.assertIsNone(family["counts"]["usable"])
+            self.assertIsNone(family["coverage_bps"])
+            self.assertIsNone(family["duplicate_primary_key"]["count"])
+            self.assertIsNone(family["duplicate_primary_key"]["rate_bps"])
+            self.assertIsNone(family["required_field_null"]["count"])
+            self.assertIsNone(family["required_field_null"]["rate_bps"])
+            self.assertIsNone(family["measurements"]["null_count"])
+            self.assertIsNone(family["measurements"]["zero_count"])
+
     def test_identical_inputs_produce_identical_canonical_content_and_hash(self):
         with tempfile.TemporaryDirectory() as directory:
             first = _snapshot(directory)

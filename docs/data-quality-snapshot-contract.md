@@ -270,6 +270,37 @@ execution, route, or SQLite runtime facts. A snapshot produced from a clean
 checkout therefore evaluates only the tracked Event and lifecycle families;
 all other families are explicitly `not_evaluated`.
 
+The checked-in `data/public/quality/latest.json` is the canonical result for
+application build `e702377993a044ce009248e25c44aa035aa0202a`, generated at
+`2026-08-14T00:00:00Z` for the inclusive 30-day UTC window
+`2026-07-15` through `2026-08-13`. It contains 12 registered families, with
+three evaluated, nine not evaluated, and none failed:
+
+- `event_facts`: 45 observed revisions and 44 usable latest revisions;
+- `cex_instrument_lifecycle`: 7 observed and 7 usable absence reviews;
+- `market_lifecycle_reviews`: 3 observed revisions and 2 usable latest
+  dispositions;
+- `cex_daily_ohlcv`, `dex_daily_ohlcv`, `tvl`, `cex_depth`, `dex_depth`,
+  `cex_execution_cost`, and `dex_execution_cost`: `not_evaluated` because the
+  corresponding source file is not versioned;
+- `route_cohort_opportunity` and `route_shadow_route_cost_evidence`:
+  `not_evaluated` because the corresponding route pointer is not versioned.
+
+All count and rate fields for the nine not-evaluated families remain null.
+They do not claim zero observations, zero coverage, or successful evaluation.
+The tracked evidence is also not current as of the generation time. Event
+evidence was last recorded on `2026-07-29`; market-lifecycle review evidence
+was last reviewed on `2026-07-31`; and the CEX lifecycle manifest was both
+generated and checked on `2026-08-01T05:01:40.620697Z`. Each evaluated family
+therefore reports `stale_partition`. In particular, repository changes after
+the 2026-08-01 lifecycle check do not constitute refreshed lifecycle evidence.
+
+No production data source, server, authenticated connector, or uncommitted
+`data/local` directory was accessed to produce this checked-in baseline. It is
+only an observed baseline for files available from a clean checkout.
+
 This task does not add authenticated or unauthenticated connectors, expand the
-canary, or implement USDT/USD conversion evidence. Those remain separate
-blockers. No production deployment or `main` merge is part of this contract.
+canary, or implement USDT/USD conversion evidence. Those remain explicitly
+deferred blockers. Funding Rate remains excluded rather than deferred within
+this snapshot scope. No production deployment or `main` merge is part of this
+contract.
