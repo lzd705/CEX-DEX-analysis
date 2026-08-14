@@ -12,6 +12,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = PROJECT_ROOT / "dashboard" / "static" / "index.html"
 STYLES_PATH = PROJECT_ROOT / "dashboard" / "static" / "styles.css"
 APP_PATH = PROJECT_ROOT / "dashboard" / "static" / "app.js"
+NAVIGATION_PATH = PROJECT_ROOT / "dashboard" / "static" / "navigation.js"
+
+
+def navigation_prelude():
+    return (
+        "globalThis.MarketMonitorNavigation = require(\n"
+        f"  {json.dumps(str(NAVIGATION_PATH))}\n"
+        ");\n"
+    )
 
 
 def run_app_javascript(source: str, *, prelude: str = ""):
@@ -349,11 +358,7 @@ opportunityElements["opportunity-filter-form"].listeners.submit({
 });
 console.log(JSON.stringify({ invalidState, navigations }));
 """,
-            prelude="""
-globalThis.MarketMonitorNavigation = require(
-  '/private/tmp/CEX-DEX-analysis-critical-round/dashboard/static/navigation.js'
-);
-""",
+            prelude=navigation_prelude(),
         )
 
         self.assertTrue(result["invalidState"]["prevented"])
@@ -387,11 +392,7 @@ Promise.resolve(applyOpportunitiesRoute(route)).then((loaded) => {
   }));
 });
 """,
-            prelude="""
-globalThis.MarketMonitorNavigation = require(
-  '/private/tmp/CEX-DEX-analysis-critical-round/dashboard/static/navigation.js'
-);
-""",
+            prelude=navigation_prelude(),
         )
 
         self.assertFalse(result["loaded"])
@@ -437,11 +438,7 @@ Promise.resolve(applyRouteFromLocation()).then(
   })),
 );
 """,
-            prelude="""
-globalThis.MarketMonitorNavigation = require(
-  '/private/tmp/CEX-DEX-analysis-critical-round/dashboard/static/navigation.js'
-);
-""",
+            prelude=navigation_prelude(),
         )
 
         self.assertFalse(result["threw"])
@@ -679,11 +676,7 @@ console.log(JSON.stringify({
   comparePath,
 }));
 """,
-            prelude="""
-globalThis.MarketMonitorNavigation = require(
-  '/private/tmp/CEX-DEX-analysis-critical-round/dashboard/static/navigation.js'
-);
-""",
+            prelude=navigation_prelude(),
         )
 
         expected_saved = {
@@ -892,11 +885,7 @@ function payloadFor(token, routeId) {
   }));
 })();
 """,
-            prelude="""
-globalThis.MarketMonitorNavigation = require(
-  '/private/tmp/CEX-DEX-analysis-critical-round/dashboard/static/navigation.js'
-);
-""",
+            prelude=navigation_prelude(),
         )
         self.assertIn("token=AAVE", result["urls"][0])
         self.assertIn("venue=alpha", result["urls"][0])
@@ -972,11 +961,7 @@ function clonePayload() {
   }));
 })();
 """,
-            prelude="""
-globalThis.MarketMonitorNavigation = require(
-  '/private/tmp/CEX-DEX-analysis-critical-round/dashboard/static/navigation.js'
-);
-""",
+            prelude=navigation_prelude(),
         )
         self.assertFalse(result["filterResult"])
         self.assertFalse(result["scopeResult"])
@@ -1108,11 +1093,7 @@ global.fetch = async (url) => {
   }));
 })();
 """,
-            prelude="""
-globalThis.MarketMonitorNavigation = require(
-  '/private/tmp/CEX-DEX-analysis-critical-round/dashboard/static/navigation.js'
-);
-""",
+            prelude=navigation_prelude(),
         )
         self.assertTrue(result["loaded"])
         self.assertFalse(result["failed"])
