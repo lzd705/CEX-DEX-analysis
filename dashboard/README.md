@@ -89,6 +89,18 @@ CSVs and a validated SQLite database back into `data/local/`.
   common UTC date. It is independent of the workspace A/B pair.
 - Inside one Token workspace, Market A and B may be any two distinct cataloged
   markets for that Token, including CEX/CEX or DEX/DEX.
+- Market A is always required. Market B can be replaced only by the explicit
+  `Market A only — no comparison` option. A blank B remains a draft validation
+  error; it is not single-market mode and is not the same as a structured
+  unavailable (`N/A`) Fact returned by the server.
+- In single-market mode, Compare shows only Market A price/volume lines and
+  table values; Liquidity & Execution shows only A depth and its ten execution
+  scenarios; Data Quality shows only A's selected Fact inventory. Pair-only
+  spread, B cards, B chart series, skew, and pair warnings are hidden. Events
+  remains the same Token-scoped timeline and does not acquire a market filter.
+- The explicit single/paired selection is restored per Token for the browser
+  session. Draft controls do not become applied URL state until Apply succeeds,
+  and only the latest request owned by the current page may commit a response.
 - The Token workspace has five pages: Markets, Compare, Liquidity & Execution,
   Events, and Data Quality. The selected daily window is shared across the
   daily-fact pages. Liquidity/depth/execution values remain independently
@@ -107,9 +119,9 @@ CSVs and a validated SQLite database back into `data/local/`.
   10/25/50/100 bps. TVL is never converted into depth.
 - DEX protocols without a protocol-specific, project-validated adapter display `N/A`, not a TVL-based
   estimate.
-- The comparison workbench selects one Token and any two cataloged markets,
-  then displays both the latest point-in-time depth profile and the independent
-  unfilled daily price/volume series.
+- The comparison workbench selects one Token, required Market A, and optional
+  explicit Market B, then displays the applicable point-in-time depth profile
+  and independent unfilled daily price/volume series.
 - Compare provides selectable Price, Spread, and Volume line charts. Price and
   Volume show both markets; Spread is the derived absolute A/B price difference
   divided by the A/B midpoint in basis points. Missing or invalid values and
@@ -196,7 +208,9 @@ builders, so backend query-level partitioning remains a separate optimization.
 Funding rates, numeric account-specific CEX fees, gas costs, DEX V3
 fixed-notional execution, and event-study impact/return estimates are not
 supported by this dashboard. They remain null or explicitly `unsupported`
-rather than being inferred.
+rather than being inferred. Price and volume remain line charts in this
+release; candlesticks/Kline, multi-market selection, and Benchmark comparison
+are deferred.
 
 ## Production boundary
 

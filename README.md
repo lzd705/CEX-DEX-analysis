@@ -3,9 +3,12 @@
 ## Product boundary
 
 The first product is a fact-only Market Monitor. A user selects a time window
-and a Token, then keeps two exact cataloged markets as Market A and Market B
-while moving through `Markets`, `Compare`, `Liquidity & Execution`, `Events`,
-and `Data Quality`. The A/B markets may be CEX/CEX, CEX/DEX, or DEX/DEX. A
+and a Token, then selects required Market A and either an exact Market B or the
+explicit `Market A only — no comparison` option while moving through `Markets`,
+`Compare`, `Liquidity & Execution`, `Events`, and `Data Quality`. Paired A/B
+markets may be CEX/CEX, CEX/DEX, or DEX/DEX. An empty Market B is an incomplete
+draft; it is not the explicit single-market selection and is not a structured
+`N/A` fact. A
 separate authenticated administrator page can refresh configured Tokens,
 retry audit-approved missing windows, and onboard a DEX Token from a validated
 smart-contract address when explicitly enabled; the entire administrator
@@ -32,9 +35,9 @@ or public data-edit controls.
 7. Preserve missing values as null. Never replace unavailable facts with zero.
 8. Keep administrator authentication and refresh APIs separate from the public
    Market Monitor.
-9. Publish an auditable market catalog and a two-venue daily comparison that
-   exposes raw closes, daily USD volume, absolute price spread, and
-   midpoint-relative bps.
+9. Publish an auditable market catalog, preserve the existing two-market daily
+   comparison, and provide an explicit Market-A-only projection without
+   pair-derived spread or Market B facts.
 10. Plot the A/B daily comparison as selectable Price, Spread, and Volume
     lines. Missing, invalid, and nonconsecutive UTC dates break a line instead
     of being interpolated. Market A and B remain distinguishable by marker
@@ -155,4 +158,5 @@ adapters, anomaly rules, historical TVL backfills, historical depth
 reconstruction, and automatic CEX mapping for runtime Tokens require separate
 data contracts and acceptance tests. Unsupported facts remain null or
 explicitly `unsupported`; the dashboard does not estimate them from adjacent
-facts.
+facts. The current charts remain daily line charts. Candlesticks/Kline,
+multi-market selection, and Benchmark-versus-many comparison are deferred.

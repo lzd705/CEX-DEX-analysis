@@ -336,3 +336,12 @@ fields are exact base-10 JSON strings (or `null`) so quantities above IEEE-754's
 safe integer range remain auditable. Consumers may parse strings for plotting,
 but must retain the strings for formula and base-unit verification. Execution
 rows are not embedded wholesale into the market catalog.
+
+With explicit `selection=single`, the same endpoint accepts required Market A
+without Market B. Its top level declares `selection_mode="single"`, returns
+`market_b=null`, and keeps A's exact ten-row direction/notional grid. Snapshot
+skew is null because no cross-market timing difference exists. Snapshot and
+cohort-lineage maps contain only A's CEX or DEX family; an unselected source
+family is neither loaded nor projected. Omitting B without the marker remains
+an invalid request, not an unavailable execution result. Paired requests and
+their response shape are unchanged.

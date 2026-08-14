@@ -267,9 +267,21 @@ cex-dex-dashboard.service` or `systemctl --user restart
 cex-dex-dashboard.service`, matching the active supervisor, then rerun the full
 check set. Do not delete the previous release or data snapshot until the new
 version has passed `/health`, the Screener summary, one single-Token catalog,
-the full audit catalog, compare, quality, execution-cost, and browser smoke
-tests. The summary and Token catalog checks must also confirm a matching
+the full audit catalog, paired and single Compare, paired and one-ID selected
+Quality, paired and single execution-cost, and browser smoke tests. The single
+release smoke makes three additional requests with `selection=single`, omits
+Market B, binds all three to Summary's generation and exact Market A, and
+reports `single_market_smoke.endpoint_count=3`. The summary and Token catalog
+checks must also confirm a matching
 non-empty `data_generation`.
+
+Passing code tests and committing a branch is code completion, not production
+deployment. A production claim additionally requires the prospective-release
+Python 3.8.10 compile/import preflight, exact server SHA and asset SHA, service
+restart, executable release checks, rollback information, and a public-browser
+reproduction against the deployed host. Record those deployment facts in the
+deployment evidence for that release; do not rewrite historical evidence to
+make a code-only change appear deployed.
 
 ## CEX depth raw-response retention
 

@@ -8,10 +8,12 @@
    reads or changes Token Research Market A/B and does not use the daily date
    toolbar.
 3. `Markets` is the Token-level market catalog and the only page that edits
-   Market A/B. `Token Research` then contains four peer pages: `Compare`,
+   required Market A plus optional Market B. `Token Research` then contains four peer pages: `Compare`,
    `Liquidity & Execution`, `Events`, and `Data Quality`.
-4. Market A and Market B are exact market IDs for the selected Token and remain
-   in the URL while the user moves between the four research pages.
+4. Market A is an exact market ID for the selected Token. Market B is either a
+   second distinct exact ID or is absent together with `selection=single`.
+   These applied identities remain in the URL while the user moves between the
+   four research pages. B omitted without the marker is invalid draft state.
 5. Shared definitions, source lineage, and snapshot timing live in the
    `Data Quality` page as a compact disclosure; there is no separate
    Methodology page.
@@ -49,6 +51,27 @@ collection cadence.
   warnings, recovery eligibility, and lineage for the current Token and A/B
   pair. Capability limits and observed market conditions are kept separate
   from collection or validation failures.
+
+## Single-market interaction
+
+`Market A only — no comparison` is an option inside the existing Market B
+control, not a second dashboard mode switch. Apply commits `selection=single`
+and omits `market_b`; selecting a real B removes the marker and restores the
+unchanged paired URL. An empty B before Apply means the selection is incomplete.
+It must not be repaired into single-market mode, and it is distinct from a
+server-returned structured `N/A` Fact.
+
+Compare retains daily Price and Volume line charts for A and hides B series,
+spread controls, pair statistics, and pair warnings. Liquidity & Execution
+hides B depth, B scenarios, and snapshot skew. Data Quality publishes only A's
+selected facts and report rollup. Events is unchanged because it is scoped to
+the Token rather than the selected market pair. The browser restores the last
+explicit selection per Token for the current session. Draft selector state is
+separate from applied URL state, and stale asynchronous responses cannot commit
+after a newer page-owned request.
+
+This release does not introduce candlesticks/Kline. Multi-market selection and
+a Benchmark-versus-many view remain deferred product work.
 
 ## Daily Price Gap placement
 

@@ -3610,6 +3610,7 @@ class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
             "count": 0,
             "tail_generation": None,
             "tail_freshness_stale": False,
+            "single_compare_mutation": None,
         }
 
         def fake_fetch(_base_url, path, *, timeout):
@@ -3668,6 +3669,59 @@ class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
             elif "scope=all" in path and path.startswith("/api/markets/quality?"):
                 token = "AAVE" if "token=AAVE" in path else "UNI"
                 payload = quality_by_token[token]
+            elif path.startswith("/api/markets/compare?"):
+                query = {
+                    key: values[-1]
+                    for key, values in parse_qs(urlsplit(path).query).items()
+                }
+                single = query.get("selection") == "single"
+                selected_a = query["market_a"]
+                generation = "generation-1"
+                if single and summary_state["single_compare_mutation"] == "wrong_a":
+                    selected_a = "cex:crypto_com:UNI/USDT"
+                if (
+                    single
+                    and summary_state["single_compare_mutation"]
+                    == "wrong_generation"
+                ):
+                    generation = "generation-2"
+                payload = {
+                    "token_symbol": query["token"],
+                    "market_a": {"market_id": selected_a},
+                    "market_b": (
+                        None
+                        if single
+                        else {"market_id": query["market_b"]}
+                    ),
+                    "metadata": {
+                        "data_generation": generation,
+                        "comparison_generation": generation,
+                        "start_date": query["start"],
+                        "end_date": query["end"],
+                        **({} if single else {"comparison_days": 1}),
+                    },
+                    "observations": (
+                        [{"date": query["start"], "market_a": 100.0}]
+                        if single
+                        else [{"date": query["start"]}]
+                    ),
+                    **(
+                        {
+                            "selection_mode": "single",
+                            "market_a_statistics": {"observation_count": 1},
+                            "latest_market_a_observation": {
+                                "date": query["start"],
+                                "market_a": 100.0,
+                            },
+                        }
+                        if single
+                        else {
+                            "latest_comparable_observation": {
+                                "date": query["start"]
+                            }
+                        }
+                    ),
+                }
             else:
                 payload = {}
             return payload, self.metrics(path)
@@ -3723,17 +3777,21 @@ class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
                     return_value=[event],
                 ))
                 comparison_validator = stack.enter_context(patch(
-                    "scripts.check_dashboard_release.validate_comparison"
+                    "scripts.check_dashboard_release.validate_comparison",
+                    side_effect=validate_comparison,
                 ))
-                stack.enter_context(patch(
+                quality_validator = stack.enter_context(patch(
                     "scripts.check_dashboard_release.validate_quality"
                 ))
                 execution_validator = stack.enter_context(patch(
                     "scripts.check_dashboard_release.validate_execution"
                 ))
                 result = release_check(args)
-                validator_calls["comparison"] = comparison_validator.call_args
-                validator_calls["execution"] = execution_validator.call_args
+                validator_calls["comparison"] = (
+                    comparison_validator.call_args_list
+                )
+                validator_calls["quality"] = quality_validator.call_args_list
+                validator_calls["execution"] = execution_validator.call_args_list
                 return result
 
         result = run_release()
@@ -3748,17 +3806,86 @@ class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
             },
         )
         self.assertEqual(
-            validator_calls["comparison"].kwargs[
+            validator_calls["comparison"][0].kwargs[
                 "expected_comparison_generation"
             ],
             "generation-1",
         )
         self.assertEqual(
-            validator_calls["execution"].kwargs[
+            validator_calls["execution"][0].kwargs[
                 "expected_execution_generation"
             ],
             "generation-1",
         )
+        expert_paths = [
+            path
+            for path in fetched_paths
+            if path.startswith(
+                (
+                    "/api/markets/compare?",
+                    "/api/markets/quality?",
+                    "/api/markets/execution-cost?",
+                )
+            )
+            and "scope=all" not in path
+        ]
+        self.assertEqual(len(expert_paths), 6)
+        single_paths = [
+            path for path in expert_paths if "selection=single" in path
+        ]
+        self.assertEqual(len(single_paths), 3)
+        pair_paths = [path for path in expert_paths if path not in single_paths]
+        self.assertEqual(len(pair_paths), 3)
+        for path in pair_paths:
+            query = parse_qs(urlsplit(path).query)
+            self.assertIn("market_b", query)
+            self.assertNotIn("selection", query)
+        for path in single_paths:
+            query = parse_qs(urlsplit(path).query)
+            self.assertNotIn("market_b", query)
+            self.assertEqual(query["selection"], ["single"])
+            if path.startswith("/api/markets/quality?"):
+                self.assertEqual(query["scope"], ["selected"])
+        self.assertEqual(
+            result["single_market_smoke"],
+            {
+                "market_a": "cex:crypto_com:AAVE/USDT",
+                "endpoint_count": 3,
+            },
+        )
+        for validator_name in ("comparison", "quality", "execution"):
+            self.assertEqual(len(validator_calls[validator_name]), 2)
+            self.assertEqual(
+                validator_calls[validator_name][1].kwargs["expected_mode"],
+                "single",
+            )
+            self.assertEqual(
+                validator_calls[validator_name][1].kwargs[
+                    "expected_generation"
+                ],
+                "generation-1",
+            )
+        self.assertEqual(
+            validator_calls["comparison"][1].kwargs[
+                "expected_comparison_generation"
+            ],
+            "generation-1",
+        )
+        self.assertEqual(
+            validator_calls["execution"][1].kwargs[
+                "expected_execution_generation"
+            ],
+            "generation-1",
+        )
+
+        successful_release_paths = list(fetched_paths)
+        for mutation in ("wrong_a", "wrong_generation"):
+            with self.subTest(single_compare_mutation=mutation):
+                summary_state["single_compare_mutation"] = mutation
+                with self.assertRaises(ReleaseCheckError):
+                    run_release()
+                summary_state["single_compare_mutation"] = None
+        fetched_paths[:] = successful_release_paths
 
         baseline_summary = copy.deepcopy(summary)
         baseline_quality_by_token = copy.deepcopy(quality_by_token)
@@ -5797,6 +5924,242 @@ class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
                 expected_generation="generation-1",
                 catalog_metadata=catalog_metadata,
             )
+
+    def test_single_expert_validators_accept_only_bounded_market_a_projections(self):
+        market_a = "cex:crypto_com:AAVE/USDT"
+        comparison = {
+            "selection_mode": "single",
+            "token_symbol": "AAVE",
+            "market_a": {"market_id": market_a},
+            "market_b": None,
+            "metadata": {
+                "data_generation": "generation-1",
+                "comparison_generation": "generation-1",
+                "start_date": "2026-01-01",
+                "end_date": "2026-01-31",
+            },
+            "market_a_statistics": {"observation_count": 2},
+            "observations": [
+                {"date": "2026-01-15", "market_a": 100.0},
+                {"date": "2026-01-16", "market_a": 101.0},
+            ],
+            "latest_market_a_observation": {
+                "date": "2026-01-16",
+                "market_a": 101.0,
+            },
+        }
+        validate_comparison(
+            comparison,
+            token="AAVE",
+            market_a=market_a,
+            market_b=None,
+            start="2026-01-01",
+            end="2026-01-31",
+            expected_generation="generation-1",
+            expected_comparison_generation="generation-1",
+            expected_mode="single",
+        )
+
+        comparison_mutations = {
+            "missing mode": lambda payload: payload.pop("selection_mode"),
+            "wrong mode": lambda payload: payload.update(selection_mode="pair"),
+            "non-null B": lambda payload: payload.update(
+                market_b={"market_id": "dex:eth:uniswap_v3:pool:AAVE"}
+            ),
+            "B statistics": lambda payload: payload.update(
+                market_b_statistics={"observation_count": 2}
+            ),
+            "pair row": lambda payload: payload["observations"][0].update(
+                price_spread=0.01
+            ),
+            "stale latest A": lambda payload: payload.update(
+                latest_market_a_observation=payload["observations"][0]
+            ),
+            "wrong Token": lambda payload: payload.update(token_symbol="UNI"),
+            "wrong A": lambda payload: payload["market_a"].update(
+                market_id="cex:crypto_com:UNI/USDT"
+            ),
+            "wrong generation": lambda payload: payload["metadata"].update(
+                data_generation="generation-2"
+            ),
+        }
+        for label, mutate in comparison_mutations.items():
+            with self.subTest(endpoint="compare", case=label):
+                invalid = copy.deepcopy(comparison)
+                mutate(invalid)
+                with self.assertRaises(ReleaseCheckError):
+                    validate_comparison(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=None,
+                        start="2026-01-01",
+                        end="2026-01-31",
+                        expected_generation="generation-1",
+                        expected_comparison_generation="generation-1",
+                        expected_mode="single",
+                    )
+
+        quality = self.screening_quality()
+        quality["metadata"]["scope"] = "selected"
+        quality["metadata"]["selected_market_ids"] = [market_a]
+        quality["markets"] = quality["markets"][:1]
+        quality["metadata"]["daily_quality_report"][
+            "market_issue_rollups"
+        ] = quality["metadata"]["daily_quality_report"][
+            "market_issue_rollups"
+        ][:1]
+        validate_quality(
+            quality,
+            token="AAVE",
+            market_a=market_a,
+            market_b=None,
+            expected_generation="generation-1",
+            expected_mode="single",
+        )
+        quality_mutations = {
+            "wrong selected A": lambda payload: payload["metadata"].update(
+                selected_market_ids=["cex:crypto_com:UNI/USDT"]
+            ),
+            "extra market": lambda payload: payload["markets"].append(
+                copy.deepcopy(self.screening_quality()["markets"][1])
+            ),
+            "extra rollup": lambda payload: payload["metadata"][
+                "daily_quality_report"
+            ]["market_issue_rollups"].append(
+                copy.deepcopy(
+                    self.screening_quality()["metadata"][
+                        "daily_quality_report"
+                    ]["market_issue_rollups"][1]
+                )
+            ),
+            "wrong Token": lambda payload: payload.update(token_symbol="UNI"),
+            "wrong generation": lambda payload: payload["metadata"].update(
+                data_generation="generation-2"
+            ),
+        }
+        for label, mutate in quality_mutations.items():
+            with self.subTest(endpoint="quality", case=label):
+                invalid = copy.deepcopy(quality)
+                mutate(invalid)
+                with self.assertRaises(ReleaseCheckError):
+                    validate_quality(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=None,
+                        expected_generation="generation-1",
+                        expected_mode="single",
+                    )
+
+        cohort_id = "cex-cohort-1"
+        rows = [
+            {
+                "market_id": market_a,
+                "token_symbol": "AAVE",
+                "observed_at": "2026-01-02T00:00:07+00:00",
+                "direction": direction,
+                "requested_notional_usd": notional,
+                "status": "observed",
+                "snapshot_id": cohort_id,
+                "source_snapshot_id": cohort_id,
+            }
+            for direction in ("sell_token", "buy_token")
+            for notional in (1_000, 5_000, 10_000, 50_000, 100_000)
+        ]
+        execution = {
+            "selection_mode": "single",
+            "token_symbol": "AAVE",
+            "market_a": {
+                "market": {"market_id": market_a, "market_type": "cex"},
+                "status": "available",
+                "rows": rows,
+            },
+            "market_b": None,
+            "metadata": {
+                "data_generation": "generation-1",
+                "execution_generation": "generation-1",
+                "cohort_observation_model": "bounded_sequential_observations",
+                "snapshot_skew_seconds": None,
+                "snapshots": {
+                    "cex": {
+                        "snapshot_ids": [cohort_id],
+                        "source_snapshot_ids": [cohort_id],
+                        "observed_at": "2026-01-02T00:00:05+00:00",
+                        "observed_at_min": "2026-01-02T00:00:05+00:00",
+                        "observed_at_max": "2026-01-02T00:00:09+00:00",
+                        "observation_span_seconds": 4,
+                        "market_count": 1,
+                    }
+                },
+                "cohort_lineage": {
+                    "cex": {
+                        "market_type": "cex",
+                        "depth_snapshot_id": cohort_id,
+                        "execution_snapshot_id": cohort_id,
+                        "execution_source_snapshot_id": cohort_id,
+                        "depth_market_count": 1,
+                        "execution_market_count": 1,
+                    }
+                },
+            },
+        }
+        catalog_metadata = {
+            "cex_depth_snapshot": {
+                "snapshot_ids": [cohort_id],
+                "observed_at": "2026-01-02T00:00:00+00:00",
+                "observed_at_min": "2026-01-02T00:00:00+00:00",
+                "observed_at_max": "2026-01-02T00:00:04+00:00",
+                "observation_span_seconds": 4,
+                "market_rows": 1,
+            }
+        }
+        validate_execution(
+            execution,
+            token="AAVE",
+            market_a=market_a,
+            market_b=None,
+            expected_generation="generation-1",
+            expected_execution_generation="generation-1",
+            catalog_metadata=catalog_metadata,
+            expected_mode="single",
+        )
+        execution_mutations = {
+            "missing mode": lambda payload: payload.pop("selection_mode"),
+            "wrong mode": lambda payload: payload.update(selection_mode="pair"),
+            "non-null B": lambda payload: payload.update(market_b={}),
+            "non-null skew": lambda payload: payload["metadata"].update(
+                snapshot_skew_seconds=0
+            ),
+            "unselected snapshot": lambda payload: payload["metadata"][
+                "snapshots"
+            ].update(dex=copy.deepcopy(payload["metadata"]["snapshots"]["cex"])),
+            "unselected lineage": lambda payload: payload["metadata"][
+                "cohort_lineage"
+            ].update(dex=copy.deepcopy(payload["metadata"]["cohort_lineage"]["cex"])),
+            "wrong Token": lambda payload: payload.update(token_symbol="UNI"),
+            "wrong A": lambda payload: payload["market_a"]["market"].update(
+                market_id="cex:crypto_com:UNI/USDT"
+            ),
+            "wrong generation": lambda payload: payload["metadata"].update(
+                data_generation="generation-2"
+            ),
+        }
+        for label, mutate in execution_mutations.items():
+            with self.subTest(endpoint="execution", case=label):
+                invalid = copy.deepcopy(execution)
+                mutate(invalid)
+                with self.assertRaises(ReleaseCheckError):
+                    validate_execution(
+                        invalid,
+                        token="AAVE",
+                        market_a=market_a,
+                        market_b=None,
+                        expected_generation="generation-1",
+                        expected_execution_generation="generation-1",
+                        catalog_metadata=catalog_metadata,
+                        expected_mode="single",
+                    )
 
     def test_release_execution_cohort_lineage_counterexamples_fail_closed(self):
         market_a = "cex:binance:AAVE/USDT"

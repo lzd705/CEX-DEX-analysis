@@ -1,4 +1,4 @@
-# Market summary, catalog, and two-market comparison contract
+# Market summary, catalog, paired comparison, and single-market contract
 
 ## Public endpoints
 
@@ -14,6 +14,8 @@
   catalog for backward compatibility. The website does not load this response.
 - `GET /api/markets/compare?token=...&market_a=...&market_b=...&start=...&end=...`
   returns the union of the two selected markets' daily UTC observations.
+- `GET /api/markets/compare?token=...&market_a=...&selection=single&start=...&end=...`
+  returns only Market A daily UTC observations.
 - `GET /api/markets/execution-cost?token=...&market_a=...&market_b=...`
   returns independent point-in-time $1k/$5k/$10k/$50k/$100k quoted execution
   facts for the same exact market identities.
@@ -32,6 +34,33 @@
 
 `market_a` and `market_b` are exact `market_id` values returned by the catalog.
 They must be different and both must belong to the requested Token.
+Market A is always required. Market B is optional only when the request carries
+the exact `selection=single` marker; a missing B without that marker is invalid,
+and a marker plus B is also invalid. This transport state is separate from a
+structured unavailable Fact whose value is JSON `null` and whose status/reason
+explains `N/A`. Existing paired URLs and response shapes are unchanged.
+
+## Explicit single-market projections
+
+Single Compare has top-level `selection_mode="single"`, the exact
+`token_symbol` and `market_a`, and `market_b=null`. It returns
+`market_a_statistics`, `observations`, and `latest_market_a_observation`.
+Every observation has exactly `{date, market_a}`, and the latest A observation
+is the final row (or null when the bounded series is empty). It does not return
+`market_b_statistics`, `latest_comparable_observation`, pair comparison-day
+metadata, comparable fields, or spread fields.
+
+Single execution-cost has top-level `selection_mode="single"`, exact Token and
+Market A, and `market_b=null`. Market A retains the complete ten-scenario grid:
+two directions times the five configured notionals. Metadata has
+`snapshot_skew_seconds=null`; `snapshots` and `cohort_lineage` contain only A's
+CEX or DEX source family. No unselected execution source is loaded or exposed.
+
+Selected Quality stays contract v4 and does not gain a synthetic top-level
+mode field. For single selection, `metadata.selected_market_ids` is exactly
+`[market_a]`, `markets` contains exactly A, and a matched
+`daily_quality_report.market_issue_rollups` contains exactly A's rollup. Its
+existing Fact/evidence reconciliation is otherwise unchanged.
 
 ## Transfer and cache boundaries
 
@@ -86,9 +115,10 @@ totals must equal the audited Quality totals and the full catalog; the full
 catalog must contain the same Token set, valid per-market Token identities, and
 unique nonempty market IDs. The audited and full-catalog
 `(token_symbol, market_id)` sets must be identical, and one bare Market ID
-cannot be reused across Tokens. Selected quality accepts exactly two distinct
-selected IDs, real integer report counts, and sorted unique canonical
-`YYYY-MM-DD` affected dates.
+cannot be reused across Tokens. Selected quality accepts either the exact
+paired two-ID inventory or, only for an explicit single request, the exact
+one-ID `[market_a]` inventory. It also requires real integer report counts and
+sorted unique canonical `YYYY-MM-DD` affected dates.
 
 Depth/execution snapshot lineage is a separate fail-closed gate from
 `data_generation`. For each loaded CEX or DEX family, readers require exactly
@@ -323,6 +353,8 @@ gas, MEV, and post-block state changes.
 Funding Rate is fully outside this contract and release: there is no
 derivatives Market catalog, funding collector, funding Fact, placeholder
 field, quality projection, or dashboard control in this round.
+The daily visual contract remains line-chart based. Candlesticks/Kline,
+multi-market selection, and Benchmark-versus-many projections are deferred.
 
 ## Known-answer fixtures
 

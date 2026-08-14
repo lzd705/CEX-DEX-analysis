@@ -4162,23 +4162,45 @@ def validate_comparison(
     *,
     token: str,
     market_a: str,
-    market_b: str,
+    market_b: str | None,
     start: str,
     end: str,
     expected_generation: str,
     expected_comparison_generation: str | None = None,
+    expected_mode: str = "pair",
 ) -> None:
     metadata = payload.get("metadata") or {}
     observations = payload.get("observations")
+    require(
+        expected_mode in {"pair", "single"},
+        "Compare validator mode is invalid",
+    )
     require(payload.get("token_symbol") == token, "Compare returned wrong Token")
     require(
         (payload.get("market_a") or {}).get("market_id") == market_a,
         "Compare returned wrong Market A",
     )
-    require(
-        (payload.get("market_b") or {}).get("market_id") == market_b,
-        "Compare returned wrong Market B",
-    )
+    if expected_mode == "single":
+        require(
+            payload.get("selection_mode") == "single",
+            "Compare mode is wrong",
+        )
+        require(payload.get("market_b") is None, "Compare leaked Market B")
+        require(
+            isinstance(payload.get("market_a_statistics"), dict),
+            "Compare Market A statistics are missing",
+        )
+        require(
+            "market_b_statistics" not in payload
+            and "latest_comparable_observation" not in payload
+            and "comparison_days" not in metadata,
+            "Compare leaked pair-derived fields",
+        )
+    else:
+        require(
+            (payload.get("market_b") or {}).get("market_id") == market_b,
+            "Compare returned wrong Market B",
+        )
     require(metadata.get("start_date") == start, "Compare returned wrong start window")
     require(metadata.get("end_date") == end, "Compare returned wrong end window")
     require(
@@ -4204,6 +4226,16 @@ def validate_comparison(
         ),
         "Compare returned an invalid or out-of-window observation",
     )
+    if expected_mode == "single":
+        require(
+            all(set(row) == {"date", "market_a"} for row in observations),
+            "Compare leaked pair-derived observation fields",
+        )
+        require(
+            payload.get("latest_market_a_observation") == observations[-1],
+            "Compare latest Market A observation differs from its final row",
+        )
+        return
     require(
         isinstance(metadata.get("comparison_days"), int)
         and metadata["comparison_days"] > 0,
@@ -4763,12 +4795,19 @@ def validate_quality(
     *,
     token: str,
     market_a: str,
-    market_b: str,
+    market_b: str | None,
     expected_generation: str | None = None,
+    expected_mode: str = "pair",
 ) -> None:
     metadata = payload.get("metadata") or {}
     markets = payload.get("markets")
-    expected_ids = {market_a, market_b}
+    require(
+        expected_mode in {"pair", "single"},
+        "Quality validator mode is invalid",
+    )
+    expected_ids = (
+        {market_a} if expected_mode == "single" else {market_a, market_b}
+    )
     daily_report = _validate_daily_quality_report(
         metadata.get("daily_quality_report"),
         expected_market_ids=expected_ids,
@@ -4787,18 +4826,28 @@ def validate_quality(
             "Summary and selected Quality generations differ",
         )
     selected_market_ids = metadata.get("selected_market_ids")
-    require(
-        isinstance(selected_market_ids, list)
-        and len(selected_market_ids) == 2
-        and all(isinstance(market_id, str) for market_id in selected_market_ids)
-        and len(set(selected_market_ids)) == 2
-        and set(selected_market_ids) == expected_ids,
-        "Quality metadata returned the wrong selected markets",
-    )
-    require(
-        isinstance(markets, list) and len(markets) == 2,
-        "Quality did not return both selected markets",
-    )
+    if expected_mode == "single":
+        require(
+            selected_market_ids == [market_a],
+            "Quality metadata returned the wrong selected markets",
+        )
+        require(
+            isinstance(markets, list) and len(markets) == 1,
+            "Quality did not return exactly selected Market A",
+        )
+    else:
+        require(
+            isinstance(selected_market_ids, list)
+            and len(selected_market_ids) == 2
+            and all(isinstance(market_id, str) for market_id in selected_market_ids)
+            and len(set(selected_market_ids)) == 2
+            and set(selected_market_ids) == expected_ids,
+            "Quality metadata returned the wrong selected markets",
+        )
+        require(
+            isinstance(markets, list) and len(markets) == 2,
+            "Quality did not return both selected markets",
+        )
     require(
         {row.get("market_id") for row in markets if isinstance(row, dict)}
         == expected_ids,
@@ -5774,12 +5823,17 @@ def validate_execution(
     *,
     token: str,
     market_a: str,
-    market_b: str,
+    market_b: str | None,
     expected_generation: str,
     catalog_metadata: dict[str, Any],
     expected_execution_generation: str | None = None,
+    expected_mode: str = "pair",
 ) -> None:
     metadata = payload.get("metadata") or {}
+    require(
+        expected_mode in {"pair", "single"},
+        "Execution validator mode is invalid",
+    )
     require(
         metadata.get("data_generation") == expected_generation,
         "Summary and Execution generations differ",
@@ -5796,6 +5850,16 @@ def validate_execution(
         "Execution cohort observation model is invalid",
     )
     require(payload.get("token_symbol") == token, "Execution returned wrong Token")
+    if expected_mode == "single":
+        require(
+            payload.get("selection_mode") == "single",
+            "Execution mode is wrong",
+        )
+        require(payload.get("market_b") is None, "Execution leaked Market B")
+        require(
+            metadata.get("snapshot_skew_seconds") is None,
+            "Execution single-market snapshot skew is not null",
+        )
     expected_scenarios = {
         (direction, notional)
         for direction in EXECUTION_DIRECTIONS
@@ -5803,10 +5867,10 @@ def validate_execution(
     }
     selected_market_types: dict[str, list[dict[str, Any]]] = {}
     has_measured_rows = False
-    for label, expected_market in (
-        ("market_a", market_a),
-        ("market_b", market_b),
-    ):
+    expected_legs = [("market_a", market_a)]
+    if expected_mode == "pair":
+        expected_legs.append(("market_b", market_b))
+    for label, expected_market in expected_legs:
         leg = payload.get(label)
         require(isinstance(leg, dict), f"Execution omitted {label}")
         require(leg.get("status") == "available", f"Execution {label} is unavailable")
@@ -6781,6 +6845,71 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         catalog_metadata=full_catalog.get("metadata") or {},
     )
 
+    single_query = {
+        "token": token,
+        "market_a": market_a,
+        "selection": "single",
+    }
+    single_comparison_path = "/api/markets/compare?" + urlencode(
+        {**single_query, "start": start, "end": end}
+    )
+    single_quality_path = "/api/markets/quality?" + urlencode(
+        {**single_query, "scope": "selected"}
+    )
+    single_execution_path = "/api/markets/execution-cost?" + urlencode(
+        single_query
+    )
+
+    single_comparison, single_comparison_metrics = fetch_json(
+        args.base_url,
+        single_comparison_path,
+        timeout=args.timeout,
+    )
+    metrics.append(single_comparison_metrics)
+    validate_comparison(
+        single_comparison,
+        token=token,
+        market_a=market_a,
+        market_b=None,
+        start=start,
+        end=end,
+        expected_generation=generation,
+        expected_comparison_generation=generation,
+        expected_mode="single",
+    )
+
+    single_quality, single_quality_metrics = fetch_json(
+        args.base_url,
+        single_quality_path,
+        timeout=args.timeout,
+    )
+    metrics.append(single_quality_metrics)
+    validate_quality(
+        single_quality,
+        token=token,
+        market_a=market_a,
+        market_b=None,
+        expected_generation=generation,
+        expected_mode="single",
+    )
+
+    single_execution, single_execution_metrics = fetch_json(
+        args.base_url,
+        single_execution_path,
+        timeout=args.timeout,
+    )
+    metrics.append(single_execution_metrics)
+    validate_execution(
+        single_execution,
+        token=token,
+        market_a=market_a,
+        market_b=None,
+        expected_generation=generation,
+        expected_execution_generation=generation,
+        catalog_metadata=full_catalog.get("metadata") or {},
+        expected_mode="single",
+    )
+
     final_health, final_health_metrics = fetch_json(
         args.base_url,
         "/health",
@@ -6857,6 +6986,10 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "event_count": len(event_rows),
         "event_covered_token_count": event_coverage["covered_token_count"],
         "event_bundle_id": all_events["bundle_id"],
+        "single_market_smoke": {
+            "market_a": market_a,
+            "endpoint_count": 3,
+        },
         "route_opportunities": {
             key: value
             for key, value in route_opportunity_validation.items()
