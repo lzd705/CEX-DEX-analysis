@@ -339,6 +339,33 @@ def selection_window(now: datetime) -> Dict[str, str]:
     return {"start": start.isoformat(), "end": end.isoformat()}
 
 
+def _expected_utc_dates(window: Mapping[str, str]) -> Tuple[str, ...]:
+    """Return the canonical inclusive UTC dates declared by the window."""
+    if not isinstance(window, Mapping) or set(window) != {"start", "end"}:
+        raise ValueError("selection window fields are invalid")
+    parsed_dates = {}
+    for field in ("start", "end"):
+        value = window.get(field)
+        if not isinstance(value, str):
+            raise ValueError("selection window date is invalid")
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        except ValueError as error:
+            raise ValueError("selection window date is invalid") from error
+        if parsed.isoformat() != value:
+            raise ValueError("selection window date is non-canonical")
+        parsed_dates[field] = parsed
+    start = parsed_dates["start"]
+    end = parsed_dates["end"]
+    inclusive_days = (end - start).days + 1
+    if inclusive_days != WINDOW_DAYS:
+        raise ValueError("selection window must contain exactly 30 UTC dates")
+    return tuple(
+        (start + timedelta(days=offset)).isoformat()
+        for offset in range(inclusive_days)
+    )
+
+
 def _identity_record(identity: SourceFileIdentity) -> Dict[str, Any]:
     if (
         not isinstance(identity.path, str)
@@ -1197,14 +1224,44 @@ def _parse_cex_volume(
     payload: bytes,
     window: Mapping[str, str],
     imported_at: str,
+    expected_market_ids: set,
+    *,
+    catalog_market_ids: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
+    expected_dates = _expected_utc_dates(window)
+    if (
+        isinstance(expected_market_ids, (str, bytes))
+        or isinstance(catalog_market_ids, (str, bytes))
+    ):
+        raise ValueError("CEX volume expected market inventory is invalid")
+    expected_markets = set(expected_market_ids)
+    catalog_markets = (
+        set(catalog_market_ids)
+        if catalog_market_ids is not None
+        else set(expected_markets)
+    )
+    if (
+        not expected_markets <= catalog_markets
+        or any(
+            not isinstance(market_id, str)
+            for market_id in catalog_markets
+        )
+    ):
+        raise ValueError("CEX volume expected market inventory is invalid")
     rows = _parse_csv(
         payload,
         "cex_exchange_volume_daily.csv",
         {"date", "token_symbol", "exchange", "cex_symbol", "quote_volume_usd"},
     )
-    totals = {}
-    observed = set()
+    totals = {market_id: Decimal(0) for market_id in expected_markets}
+    expected_date_set = set(expected_dates)
+    expected_keys = {
+        (market_id, date_text)
+        for market_id in expected_markets
+        for date_text in expected_dates
+    }
+    observed_keys = set()
+    seen_keys = set()
     for row in rows:
         market_id = _cex_market_id(row)
         date_text = _required_text(row.get("date"), "date")
@@ -1214,29 +1271,40 @@ def _parse_cex_volume(
             raise ValueError("CEX volume date is invalid") from error
         if parsed != date_text:
             raise ValueError("CEX volume date is non-canonical")
-        key = (date_text, market_id)
-        if key in observed:
+        key = (market_id, date_text)
+        if key in seen_keys:
             raise ValueError("CEX volume contains duplicate market-date rows")
-        observed.add(key)
-        if window["start"] <= date_text <= window["end"]:
+        seen_keys.add(key)
+        if market_id not in catalog_markets:
+            raise ValueError("CEX volume market is absent from the captured catalog")
+        if market_id not in expected_markets:
+            continue
+        if date_text in expected_date_set:
             amount = _decimal_text(
                 row.get("quote_volume_usd"), "quote_volume_usd"
             )
-            if amount is not None:
-                previous = totals.get(market_id)
-                totals[market_id] = (
-                    previous if previous is not None else Decimal(0)
-                ) + Decimal(amount)
-            elif market_id not in totals:
-                totals[market_id] = None
+            if amount is None:
+                raise ValueError(
+                    "CEX volume window is incomplete: quote_volume_usd is "
+                    "missing for {} on {}".format(market_id, date_text)
+                )
+            totals[market_id] += Decimal(amount)
+            observed_keys.add(key)
+    missing = sorted(expected_keys - observed_keys)
+    if missing:
+        first_market, first_date = missing[0]
+        raise ValueError(
+            "CEX volume window is incomplete: {} market-date cells are missing; "
+            "first missing {} on {}".format(
+                len(missing), first_market, first_date
+            )
+        )
     result = []
     for market_id in sorted(totals):
-        amount = totals[market_id]
         result.append({
             "market_id": market_id,
-            "selected_window_usd": (
-                _decimal_text(amount, "selected_window_usd")
-                if amount is not None else None
+            "selected_window_usd": _decimal_text(
+                totals[market_id], "selected_window_usd"
             ),
             "observed_at": imported_at,
         })
@@ -1613,9 +1681,23 @@ def build_shadow_universe(
             }
             for market_type in ("cex", "dex")
         }
+        expected_cex_volume_market_ids = {
+            row["market_id"]
+            for row in catalog
+            if (
+                row["market_type"] == "cex"
+                and row["lifecycle_withheld"] is False
+            )
+        }
 
         payload = _capture_bytes(by_path["cex_exchange_volume_daily.csv"])
-        cex_volume_rows = _parse_cex_volume(payload, window, imported_at)
+        cex_volume_rows = _parse_cex_volume(
+            payload,
+            window,
+            imported_at,
+            expected_cex_volume_market_ids,
+            catalog_market_ids=expected_by_type["cex"],
+        )
         del payload
         by_path["cex_exchange_volume_daily.csv"].close()
 
