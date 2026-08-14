@@ -1410,6 +1410,41 @@ class DataQualitySnapshotExecutionAdapterTests(unittest.TestCase):
                 family["failure_reason"], "invalid_execution_contract"
             )
 
+    def test_incomplete_partial_row_rejects_orphan_dependent_zeroes(self):
+        for market_type in ("cex", "dex"):
+            with self.subTest(market_type=market_type):
+                with tempfile.TemporaryDirectory() as directory:
+                    rows = _execution_rows(market_type)[:-1]
+                    rows[0].update(
+                        {
+                            "status": "partial",
+                            "status_reason": "source_level_limit",
+                            "filled_token_quantity": "",
+                            "quote_amount": "",
+                            "fill_ratio": "0",
+                            "quote_amount_usd": "0",
+                            "filled_vwap_quote_per_token": "",
+                            "filled_vwap_usd_per_token": "",
+                            "quoted_execution_cost_usd": "",
+                            "quoted_execution_cost_bps": "",
+                        }
+                    )
+                    _write_csv(
+                        Path(directory)
+                        / f"{market_type}_execution_cost_latest.csv",
+                        EXECUTION_HEADER,
+                        rows,
+                    )
+
+                    family = _family(
+                        _snapshot(directory), f"{market_type}_execution_cost"
+                    )
+
+                    self.assertEqual(family["state"], "failed")
+                    self.assertEqual(
+                        family["failure_reason"], "invalid_execution_contract"
+                    )
+
     def test_execution_rows_bind_exact_retained_market_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = _execution_rows("cex")

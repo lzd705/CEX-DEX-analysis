@@ -2142,6 +2142,14 @@ def _validate_execution_rows_equivalent(
             if any(row[field] for field in RESULT_NUMERIC_COLUMNS):
                 raise ValueError("terminal execution row contains numeric facts")
             continue
+        filled_present = bool(row["filled_token_quantity"])
+        quote_present = bool(row["quote_amount"])
+        if filled_present != quote_present:
+            raise ValueError("execution fill and quote facts must be paired")
+        if not filled_present and (
+            row["fill_ratio"] or row["quote_amount_usd"]
+        ):
+            raise ValueError("execution row contains orphan dependent facts")
         if status == "partial" and any(
             row[field]
             for field in (
