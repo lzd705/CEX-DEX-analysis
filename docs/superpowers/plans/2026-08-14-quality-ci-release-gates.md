@@ -70,7 +70,10 @@ Trigger on pushes and pull requests, grant only `contents: read`, use a bounded 
 
 - [ ] **Step 2: Exercise both supported runtime edges**
 
-Use a matrix containing Python `3.8` and `3.13`. Install a maintained Node LTS release in each job and install the locked dashboard dependency set from `dashboard/package-lock.json`.
+Use a matrix containing Python `3.8` and `3.14`. Use the current official
+`actions/checkout@v7`, `actions/setup-python@v7`, and `actions/setup-node@v7`
+major releases. Install Node `24` in each job and install the locked dashboard
+dependency set from `dashboard/package-lock.json`.
 
 - [ ] **Step 3: Run the repository's actual gates**
 
@@ -132,4 +135,3 @@ Push `codex/quality-ci-release-gates` to `origin`; do not merge it.
 - [ ] **Step 3: Verify the exact remote SHA and Actions result**
 
 Compare local HEAD with `origin/codex/quality-ci-release-gates`. Wait for both Python matrix jobs and report their actual status. If GitHub Actions is unavailable or fails, report that honestly rather than treating the local suite as remote CI proof.
-
