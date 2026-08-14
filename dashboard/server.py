@@ -4359,10 +4359,10 @@ def build_execution_cost_comparison(
     selection: str | None = None,
     source_signature: SourceSignature | None = None,
 ) -> dict[str, Any]:
-    """Return source-backed fixed-notional facts for two exact catalog markets."""
+    """Return source-backed fixed-notional facts for exact catalog markets."""
     if not token_symbol:
         raise PublicClientRequestError("token is required")
-    validate_market_selection_cardinality(
+    selection_mode = validate_market_selection_cardinality(
         market_a_id,
         market_b_id,
         selection,
@@ -4375,15 +4375,21 @@ def build_execution_cost_comparison(
         if market["token_symbol"] == token
     }
     market_a = markets.get(market_a_id)
-    market_b = markets.get(market_b_id)
-    if market_a is None or market_b is None:
+    market_b = markets.get(market_b_id) if selection_mode == "pair" else None
+    if market_a is None or (
+        selection_mode == "pair" and market_b is None
+    ):
         raise PublicClientRequestError(
             "Selected market is not cataloged for the requested token"
         )
 
+    selected_markets = (
+        [market_a]
+        if selection_mode == "single"
+        else [market_a, market_b]
+    )
     selected_market_types = {
-        market_a["market_type"],
-        market_b["market_type"],
+        market["market_type"] for market in selected_markets
     }
     snapshot_paths = {
         "cex": resolve_cex_execution_cost_path,
@@ -4465,26 +4471,13 @@ def build_execution_cost_comparison(
             ),
         }
 
-    result_a = market_result(market_a)
-    result_b = market_result(market_b)
-    times = []
-    for result in (result_a, result_b):
-        if not result["rows"]:
-            times.append(None)
-            continue
-        values = {
-            row.get("state_observed_at")
-            for row in result["rows"]
-            if row.get("state_observed_at")
-        }
-        times.append(_timestamp_seconds(max(values)) if values else None)
-    skew = (
-        abs(times[0] - times[1])
-        if times[0] is not None and times[1] is not None
-        else None
-    )
-    return {
-        "metadata": {
+    def execution_metadata(
+        *,
+        snapshot_skew_seconds: float | None,
+        cohort_lineage: dict[str, Any],
+        snapshots: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
             "contract_version": EXECUTION_COST_CONTRACT_VERSION,
             "data_generation": catalog["metadata"]["data_generation"],
             "execution_generation": catalog["metadata"]["data_generation"],
@@ -4535,14 +4528,56 @@ def build_execution_cost_comparison(
                 "withheld as N/A, never zero. USD and USDT identity/proxy "
                 "conversions have no independent price timestamp."
             ),
-            "snapshot_skew_seconds": skew,
+            "snapshot_skew_seconds": snapshot_skew_seconds,
             "cohort_observation_model": "bounded_sequential_observations",
             "cohort_lineage": cohort_lineage,
             "snapshots": {
                 market_type: _execution_snapshot_metadata(snapshot)
                 for market_type, snapshot in snapshots.items()
             },
-        },
+        }
+
+    result_a = market_result(market_a)
+    if selection_mode == "single":
+        return {
+            "selection_mode": "single",
+            "metadata": execution_metadata(
+                snapshot_skew_seconds=None,
+                cohort_lineage=cohort_lineage,
+                snapshots=snapshots,
+            ),
+            "token_symbol": token,
+            "market_a": result_a,
+            "market_b": None,
+        }
+
+    if market_b is None:  # pragma: no cover - guarded before A is loaded.
+        raise PublicClientRequestError(
+            "Selected market is not cataloged for the requested token"
+        )
+    result_b = market_result(market_b)
+    times = []
+    for result in (result_a, result_b):
+        if not result["rows"]:
+            times.append(None)
+            continue
+        values = {
+            row.get("state_observed_at")
+            for row in result["rows"]
+            if row.get("state_observed_at")
+        }
+        times.append(_timestamp_seconds(max(values)) if values else None)
+    skew = (
+        abs(times[0] - times[1])
+        if times[0] is not None and times[1] is not None
+        else None
+    )
+    return {
+        "metadata": execution_metadata(
+            snapshot_skew_seconds=skew,
+            cohort_lineage=cohort_lineage,
+            snapshots=snapshots,
+        ),
         "token_symbol": token,
         "market_a": result_a,
         "market_b": result_b,
@@ -6000,13 +6035,14 @@ def build_market_quality(
     normalized_scope = (scope or "all").strip().lower()
     if normalized_scope not in {"all", "selected"}:
         raise PublicClientRequestError("scope must be all or selected")
+    selection_mode = None
     if normalized_scope == "all":
         if selection not in (None, ""):
             raise PublicClientRequestError(
                 "selection is not supported when scope=all"
             )
     else:
-        validate_market_selection_cardinality(
+        selection_mode = validate_market_selection_cardinality(
             market_a_id,
             market_b_id,
             selection,
@@ -6028,11 +6064,17 @@ def build_market_quality(
     by_id = {market["market_id"]: market for market in token_markets}
     selected_ids: list[str] = []
     if normalized_scope == "selected":
-        if market_a_id not in by_id or market_b_id not in by_id:
+        if market_a_id not in by_id or (
+            selection_mode == "pair" and market_b_id not in by_id
+        ):
             raise PublicClientRequestError(
                 "Selected market is not cataloged for the requested token"
             )
-        selected_ids = [market_a_id, market_b_id]
+        selected_ids = (
+            [market_a_id]
+            if selection_mode == "single"
+            else [market_a_id, market_b_id]
+        )
         token_markets = [by_id[market_id] for market_id in selected_ids]
 
     quality_report_state, report_issues = _daily_quality_report_state(

@@ -4910,6 +4910,11 @@ class MarketMonitorServerTest(unittest.TestCase):
 
         self.assertFalse(compressed)
         self.assertEqual(json.loads(encoded)["token_symbol"], "BTC")
+        self.assertEqual(
+            set(payload),
+            {"metadata", "token_symbol", "market_a", "market_b"},
+        )
+        self.assertNotIn("selection_mode", payload)
         self.assertEqual(payload["market_a"]["status"], "available")
         self.assertEqual(payload["market_b"]["status"], "available")
         self.assertEqual(len(payload["market_a"]["rows"]), 10)
@@ -4935,6 +4940,107 @@ class MarketMonitorServerTest(unittest.TestCase):
             payload["market_a"]["rows"][0]["quoted_execution_cost_bps"],
             "1",
         )
+
+    def test_execution_cost_single_selection_loads_only_market_a_and_has_no_snapshot_skew(self):
+        cex_id = "cex:binance:BTC/USDT"
+        dex_id = "dex:eth:uniswap:0xpool:BTC"
+        self.write_cex_depth_cohort([{"exchange": "binance"}])
+        self.write_dex_depth_cohort(
+            [
+                {
+                    "chain": "eth",
+                    "dex": "uniswap",
+                    "pool_address": "0xpool",
+                }
+            ]
+        )
+        environment = {
+            **self.environment,
+            "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
+            "MARKET_DEX_DEPTH_DATA": str(self.dex_depth_path),
+            "MARKET_CEX_EXECUTION_COST_DATA": str(self.cex_execution_path),
+            "MARKET_DEX_EXECUTION_COST_DATA": str(self.dex_execution_path),
+        }
+        cases = (
+            ("cex", cex_id, self.cex_execution_path, self.dex_execution_path),
+            ("dex", dex_id, self.dex_execution_path, self.cex_execution_path),
+        )
+        for market_type, market_id, selected_path, unselected_path in cases:
+            with self.subTest(market_type=market_type):
+                write_csv(
+                    selected_path,
+                    EXECUTION_COST_COLUMNS,
+                    self.execution_rows(
+                        market_id,
+                        market_type,
+                        state_observed_at="2026-01-02T00:00:00+00:00",
+                    ),
+                )
+                unselected_path.write_text(
+                    "malformed,unselected,execution,source\n",
+                    encoding="utf-8",
+                )
+                server.clear_runtime_caches()
+                try:
+                    with patch.dict(server.os.environ, environment, clear=True):
+                        payload = server.build_execution_cost_comparison(
+                            "BTC",
+                            market_id,
+                            None,
+                            selection="single",
+                        )
+                finally:
+                    server.clear_runtime_caches()
+
+                self.assertEqual(payload["selection_mode"], "single")
+                self.assertEqual(
+                    payload["market_a"]["market"]["market_id"],
+                    market_id,
+                )
+                self.assertIsNone(payload["market_b"])
+                self.assertIsNone(
+                    payload["metadata"]["snapshot_skew_seconds"]
+                )
+                self.assertEqual(
+                    set(payload["metadata"]["snapshots"]),
+                    {market_type},
+                )
+                self.assertEqual(
+                    set(payload["metadata"]["cohort_lineage"]),
+                    {market_type},
+                )
+                self.assertEqual(len(payload["market_a"]["rows"]), 10)
+
+    def test_execution_cost_single_selection_rejects_invalid_cardinality_and_identity(self):
+        cex_id = "cex:binance:BTC/USDT"
+        dex_id = "dex:eth:uniswap:0xpool:BTC"
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            with self.assertRaisesRegex(
+                ValueError,
+                "market_b is required unless selection=single",
+            ):
+                server.build_execution_cost_comparison(
+                    "BTC",
+                    cex_id,
+                    None,
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "market_b must be omitted when selection=single",
+            ):
+                server.build_execution_cost_comparison(
+                    "BTC",
+                    cex_id,
+                    dex_id,
+                    selection="single",
+                )
+            with self.assertRaisesRegex(ValueError, "requested token"):
+                server.build_execution_cost_comparison(
+                    "BTC",
+                    "cex:binance:ETH/USDT",
+                    None,
+                    selection="single",
+                )
 
     def test_stale_dex_price_time_withholds_public_execution_and_flags_quality(self):
         cex_id = "cex:binance:BTC/USDT"
@@ -5334,6 +5440,45 @@ class MarketMonitorServerTest(unittest.TestCase):
             selected["metadata"]["selected_market_ids"],
             [cex_id, dex_id],
         )
+
+    def test_quality_single_selection_rejects_invalid_scope_cardinality_and_identity(self):
+        cex_id = "cex:binance:BTC/USDT"
+        dex_id = "dex:eth:uniswap:0xpool:BTC"
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "scope=all"):
+                server.build_market_quality(
+                    "BTC",
+                    selection="single",
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "market_b is required unless selection=single",
+            ):
+                server.build_market_quality(
+                    "BTC",
+                    "selected",
+                    cex_id,
+                    None,
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "market_b must be omitted when selection=single",
+            ):
+                server.build_market_quality(
+                    "BTC",
+                    "selected",
+                    cex_id,
+                    dex_id,
+                    selection="single",
+                )
+            with self.assertRaisesRegex(ValueError, "requested token"):
+                server.build_market_quality(
+                    "BTC",
+                    "selected",
+                    "cex:binance:ETH/USDT",
+                    None,
+                    selection="single",
+                )
 
     def test_quality_api_distinguishes_execution_states_and_preserves_zero(self):
         binance_id = "cex:binance:BTC/USDT"

@@ -232,6 +232,96 @@ class PublicDailyQualityOverlayTest(unittest.TestCase):
         self.assertNotIn("screening_quality_source", serialized)
         self.assertNotIn(str(self.data_dir), serialized)
 
+    def test_quality_selected_single_returns_exact_market_a_identity_inventory(self):
+        self.write_report(
+            [
+                self.issue(
+                    "2026-01-02",
+                    "network",
+                    "collection_failed",
+                    True,
+                )
+            ]
+        )
+        cex_id = "cex:binance:BTC/USDT"
+        dex_id = "dex:eth:uniswap:0xpool:BTC"
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            paired = server.build_market_quality(
+                "BTC",
+                scope="selected",
+                market_a_id=cex_id,
+                market_b_id=dex_id,
+                start="2026-01-02",
+                end="2026-01-02",
+            )
+            for market_a_id in (cex_id, dex_id):
+                with self.subTest(market_a_id=market_a_id):
+                    payload = server.build_market_quality(
+                        "BTC",
+                        scope="selected",
+                        market_a_id=market_a_id,
+                        market_b_id=None,
+                        start="2026-01-02",
+                        end="2026-01-02",
+                        selection="single",
+                    )
+
+                    self.assertEqual(
+                        payload["metadata"]["contract_version"],
+                        4,
+                    )
+                    self.assertNotIn("selection_mode", payload)
+                    self.assertNotIn("market_a", payload)
+                    self.assertNotIn("market_b", payload)
+                    self.assertEqual(payload["metadata"]["scope"], "selected")
+                    self.assertEqual(
+                        payload["metadata"]["selected_market_ids"],
+                        [market_a_id],
+                    )
+                    self.assertEqual(
+                        [row["market_id"] for row in payload["markets"]],
+                        [market_a_id],
+                    )
+                    self.assertEqual(
+                        [
+                            row["market_id"]
+                            for row in payload["metadata"]
+                            ["daily_quality_report"]
+                            ["market_issue_rollups"]
+                        ],
+                        [market_a_id],
+                    )
+                    paired_market = next(
+                        row
+                        for row in paired["markets"]
+                        if row["market_id"] == market_a_id
+                    )
+                    self.assertEqual(payload["markets"][0], paired_market)
+                    single_freshness = copy.deepcopy(
+                        payload["metadata"]["freshness"]
+                    )
+                    paired_freshness = copy.deepcopy(
+                        paired["metadata"]["freshness"]
+                    )
+                    single_freshness.pop("checked_at")
+                    paired_freshness.pop("checked_at")
+                    self.assertEqual(single_freshness, paired_freshness)
+                    for fact in payload["markets"][0]["facts"].values():
+                        self.assertIn("status", fact)
+                        self.assertIn("reason_code", fact)
+                        self.assertIn("retryable", fact)
+                        self.assertIn("action", fact)
+                        self.assertIn("quality_flags", fact)
+                        for lineage_field in (
+                            "source",
+                            "source_endpoint",
+                            "method",
+                            "snapshot_id",
+                            "dataset_sha256",
+                            "raw_response_sha256",
+                        ):
+                            self.assertIn(lineage_field, fact)
+
     def test_reason_mapping_date_filter_and_mixed_status_priority(self):
         issues = [
             self.issue("2026-01-02", "network", "collection_failed", True),
