@@ -9,7 +9,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -126,26 +126,26 @@ class ProductionInputFixture:
                 "notes": "fixture",
             }],
         )
-        self.cex_rows = [
-            {
-                "date": "2026-07-02", "token_symbol": "UNI",
-                "exchange": "binance", "cex_symbol": "UNI/USDT",
-                "open": "7", "high": "8", "low": "6", "close": "7",
-                "base_volume": "10", "quote_volume_usd": "999",
-            },
-            {
-                "date": "2026-07-03", "token_symbol": "UNI",
-                "exchange": "binance", "cex_symbol": "UNI/USDT",
-                "open": "7", "high": "8", "low": "6", "close": "7",
-                "base_volume": "0", "quote_volume_usd": "0",
-            },
-            {
-                "date": "2026-08-01", "token_symbol": "UNI",
-                "exchange": "binance", "cex_symbol": "UNI/USDT",
-                "open": "7", "high": "8", "low": "6", "close": "7",
-                "base_volume": "0", "quote_volume_usd": "0",
-            },
-        ]
+        window_start = datetime.strptime("2026-07-03", "%Y-%m-%d").date()
+        window_end = datetime.strptime("2026-08-01", "%Y-%m-%d").date()
+        self.cex_rows = [{
+            "date": "2026-07-02", "token_symbol": "UNI",
+            "exchange": "binance", "cex_symbol": "UNI/USDT",
+            "open": "7", "high": "8", "low": "6", "close": "7",
+            "base_volume": "10", "quote_volume_usd": "999",
+        }]
+        self.cex_rows.extend({
+            "date": (window_start + timedelta(days=offset)).isoformat(),
+            "token_symbol": "UNI",
+            "exchange": "binance",
+            "cex_symbol": "UNI/USDT",
+            "open": "7",
+            "high": "8",
+            "low": "6",
+            "close": "7",
+            "base_volume": "0",
+            "quote_volume_usd": "0",
+        } for offset in range((window_end - window_start).days + 1))
         cex_fields = [
             "date", "token_symbol", "exchange", "cex_symbol", "open", "high",
             "low", "close", "base_volume", "quote_volume_usd",
@@ -402,6 +402,33 @@ class ProductionInputFixture:
         finally:
             connection.close()
 
+    def write_cex_rows(self, rows):
+        write_csv(
+            self.data_dir / "cex_exchange_volume_daily.csv",
+            list(self.cex_rows[0]),
+            rows,
+        )
+        self.rebind_database_cex_source()
+
+    def add_cex_catalog_market(self, exchange):
+        connection = sqlite3.connect(str(self.data_dir / "market_facts.sqlite3"))
+        try:
+            connection.execute(
+                "INSERT INTO cex_market_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "2026-08-01", "UNI", exchange, "UNI/USDT",
+                    "7", "8", "6", "7", "0", "0",
+                ),
+            )
+            connection.execute(
+                "UPDATE dataset_snapshots SET cex_row_count = "
+                "(SELECT COUNT(*) FROM cex_market_daily) "
+                "WHERE snapshot_id = 'snapshot-1'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     def build(self):
         with patch.object(route_shadow_inputs, "PROJECT_ROOT", self.project_root):
             return build_shadow_universe(
@@ -428,6 +455,37 @@ class SelectionWindowTests(unittest.TestCase):
     def test_naive_clock_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "timezone-aware"):
             selection_window(datetime(2026, 8, 2, 13))
+
+    def test_expected_utc_dates_are_the_exact_inclusive_window(self):
+        expected = (
+            "2026-07-03", "2026-07-04", "2026-07-05", "2026-07-06",
+            "2026-07-07", "2026-07-08", "2026-07-09", "2026-07-10",
+            "2026-07-11", "2026-07-12", "2026-07-13", "2026-07-14",
+            "2026-07-15", "2026-07-16", "2026-07-17", "2026-07-18",
+            "2026-07-19", "2026-07-20", "2026-07-21", "2026-07-22",
+            "2026-07-23", "2026-07-24", "2026-07-25", "2026-07-26",
+            "2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30",
+            "2026-07-31", "2026-08-01",
+        )
+
+        self.assertEqual(
+            route_shadow_inputs._expected_utc_dates({
+                "start": "2026-07-03",
+                "end": "2026-08-01",
+            }),
+            expected,
+        )
+
+    def test_expected_utc_dates_reject_noncanonical_or_non_thirty_day_windows(self):
+        cases = (
+            {"start": "2026-7-03", "end": "2026-08-01"},
+            {"start": "2026-07-03", "end": "2026-07-31"},
+            {"start": "2026-08-01", "end": "2026-07-03"},
+        )
+        for window in cases:
+            with self.subTest(window=window):
+                with self.assertRaisesRegex(ValueError, "window|date|canonical|30"):
+                    route_shadow_inputs._expected_utc_dates(window)
 
 
 class ShadowInputBuildTests(unittest.TestCase):
@@ -481,6 +539,142 @@ class ShadowInputBuildTests(unittest.TestCase):
             "start_inclusive": "2026-07-03T00:00:00Z",
             "end_exclusive": "2026-08-02T00:00:00Z",
         })
+
+    def test_cex_volume_window_rejects_missing_interior_date(self):
+        rows = [
+            row for row in self.fixture.cex_rows
+            if row["date"] != "2026-07-17"
+        ]
+        self.fixture.write_cex_rows(rows)
+
+        with self.assertRaisesRegex(ValueError, "CEX volume window is incomplete"):
+            self.fixture.build()
+
+    def test_cex_volume_window_rejects_one_day_only(self):
+        rows = [
+            row for row in self.fixture.cex_rows
+            if row["date"] in {"2026-07-02", "2026-07-03"}
+        ]
+        self.fixture.write_cex_rows(rows)
+
+        with self.assertRaisesRegex(ValueError, "CEX volume window is incomplete"):
+            self.fixture.build()
+
+    def test_cex_volume_window_requires_every_active_market_date(self):
+        self.fixture.add_cex_catalog_market("okx")
+        second_market_rows = [
+            {**row, "exchange": "okx"}
+            for row in self.fixture.cex_rows
+            if (
+                "2026-07-03" <= row["date"] <= "2026-08-01"
+                and row["date"] != "2026-07-17"
+            )
+        ]
+        self.fixture.write_cex_rows(self.fixture.cex_rows + second_market_rows)
+
+        with self.assertRaisesRegex(ValueError, "CEX volume window is incomplete"):
+            self.fixture.build()
+
+    def test_cex_volume_all_thirty_zero_days_sum_to_zero(self):
+        universe, _manifest = self.fixture.build()
+
+        cex = next(
+            row for row in universe["selected_legs"]
+            if row["market_id"] == "cex:binance:UNI/USDT"
+        )
+        self.assertEqual(cex["selection_inputs"]["cex_selected_window_usd"], "0")
+
+    def test_cex_volume_rejects_market_absent_from_captured_catalog(self):
+        unknown_rows = [
+            {**row, "exchange": "okx"}
+            for row in self.fixture.cex_rows
+            if "2026-07-03" <= row["date"] <= "2026-08-01"
+        ]
+        self.fixture.write_cex_rows(self.fixture.cex_rows + unknown_rows)
+
+        with self.assertRaisesRegex(ValueError, "catalog|unknown"):
+            self.fixture.build()
+
+    def test_lifecycle_withheld_cex_market_is_exempt_from_volume_grid(self):
+        withheld_market = {
+            "token_symbol": "UNI",
+            "exchange": "crypto_com",
+            "cex_symbol": "UNI/USDT",
+        }
+        self.fixture.add_cex_catalog_market("crypto_com")
+        withheld_volume_row = {
+            **next(
+                row for row in self.fixture.cex_rows
+                if row["date"] == "2026-07-03"
+            ),
+            "exchange": "crypto_com",
+        }
+        self.fixture.write_cex_rows(
+            self.fixture.cex_rows + [withheld_volume_row]
+        )
+
+        lifecycle_path = self.fixture.data_dir / "cex_instrument_lifecycle.json"
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        lifecycle["review_count"] = 1
+        lifecycle["reviews"] = [{
+            "market_id": "cex:crypto_com:UNI/USDT",
+            "market_type": "cex",
+            "token_symbol": "UNI",
+            "exchange": "crypto_com",
+            "instrument": "UNI/USDT",
+            "current_listing_status": "absent_from_official_current_catalog",
+            "reason_code": "instrument_absent_from_current_catalog",
+            "checked_at_utc": OBSERVED_AT,
+            "source_url": (
+                "https://api.crypto.com/exchange/v1/public/get-instruments"
+            ),
+            "http_status": 200,
+            "response_sha256": "a" * 64,
+            "inventory_count": 1,
+            "instrument_present": False,
+        }]
+        lifecycle_path.write_text(
+            json.dumps(lifecycle, sort_keys=True), encoding="utf-8"
+        )
+
+        depth_path = self.fixture.data_dir / "cex_depth_latest.csv"
+        with depth_path.open(newline="", encoding="utf-8") as handle:
+            depth_rows = list(csv.DictReader(handle))
+        depth_rows.append(observed_cex_depth_row(
+            withheld_market,
+            self.fixture._cex_book(),
+            snapshot_id="cex-depth-1",
+            request_started_at="2026-08-02T11:59:59+00:00",
+            response_received_at=OBSERVED_AT,
+        ))
+        write_csv(depth_path, CEX_DEPTH_COLUMNS, depth_rows)
+
+        execution_path = self.fixture.data_dir / "cex_execution_cost_latest.csv"
+        with execution_path.open(newline="", encoding="utf-8") as handle:
+            execution_rows = list(csv.DictReader(handle))
+        execution_rows.extend(execution_rows_for_book(
+            withheld_market,
+            self.fixture._cex_book(),
+            snapshot_id="cex-depth-1",
+            request_started_at="2026-08-02T11:59:59+00:00",
+            response_received_at=OBSERVED_AT,
+        ))
+        write_csv(execution_path, EXECUTION_COST_COLUMNS, execution_rows)
+
+        try:
+            universe, _manifest = self.fixture.build()
+        except ValueError as error:
+            self.fail(
+                "lifecycle-withheld market was incorrectly required: {}".format(
+                    error
+                )
+            )
+
+        cex_market_ids = {
+            row["market_id"] for row in universe["selected_legs"]
+            if row["market_type"] == "cex"
+        }
+        self.assertEqual(cex_market_ids, {"cex:binance:UNI/USDT"})
 
     def test_database_cex_source_sha_must_match_exact_captured_csv(self):
         path = self.fixture.data_dir / "cex_exchange_volume_daily.csv"
@@ -1284,20 +1478,25 @@ class ShadowInputBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate|publication"):
             self.fixture.build()
 
-    def test_cex_volume_missing_then_numeric_is_numeric_not_zero_or_error(self):
-        path = self.fixture.data_dir / "cex_exchange_volume_daily.csv"
+    def test_cex_volume_missing_value_is_not_treated_as_zero(self):
         rows = list(self.fixture.cex_rows)
         rows[1] = {**rows[1], "quote_volume_usd": ""}
         rows[2] = {**rows[2], "quote_volume_usd": "5"}
-        write_csv(path, list(rows[0]), rows)
-        self.fixture.rebind_database_cex_source()
+        self.fixture.write_cex_rows(rows)
 
-        universe, _manifest = self.fixture.build()
+        with self.assertRaisesRegex(ValueError, "incomplete|quote_volume_usd"):
+            self.fixture.build()
 
-        cex = next(
-            row for row in universe["selected_legs"] if row["market_type"] == "cex"
-        )
-        self.assertEqual(cex["selection_inputs"]["cex_selected_window_usd"], "5")
+    def test_cex_volume_rejects_nonfinite_or_negative_amounts(self):
+        for amount in ("NaN", "Infinity", "-1"):
+            rows = list(self.fixture.cex_rows)
+            rows[1] = {**rows[1], "quote_volume_usd": amount}
+            self.fixture.write_cex_rows(rows)
+            with self.subTest(amount=amount):
+                with self.assertRaisesRegex(
+                    ValueError, "quote_volume_usd|finite|sign|magnitude"
+                ):
+                    self.fixture.build()
 
     def test_signed_zero_is_published_as_canonical_zero(self):
         tvl_path = self.fixture.data_dir / "dex_pool_tvl_latest.csv"
