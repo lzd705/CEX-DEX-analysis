@@ -386,23 +386,37 @@ class RouteShadowAuthorityTests(unittest.TestCase):
 
     def test_authority_file_rename_aba_during_open_is_unsafe(self):
         with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory)
+            same_named_ancestor = Path(directory) / "enabled.json"
+            data_dir = same_named_ancestor / "dataset"
             authority = _write_authority(data_dir, _FALSE_AUTHORITY_BYTES)
             parked = authority.parent / "parked.json"
             interloper = authority.parent / "interloper.json"
             interloper.write_bytes(_FALSE_AUTHORITY_BYTES)
+            parent_metadata = authority.parent.stat()
+            expected_parent_identity = (
+                parent_metadata.st_dev,
+                parent_metadata.st_ino,
+            )
             real_open = route_shadow_authority.os.open
             did_aba = []
 
             def open_during_aba(path, flags, *args, **kwargs):
                 if path == "enabled.json" and not did_aba:
-                    authority.rename(parked)
-                    interloper.rename(authority)
-                    descriptor = real_open(path, flags, *args, **kwargs)
-                    authority.rename(interloper)
-                    parked.rename(authority)
-                    did_aba.append(True)
-                    return descriptor
+                    dir_fd = kwargs.get("dir_fd")
+                    if dir_fd is not None:
+                        trigger_parent = os.fstat(dir_fd)
+                        trigger_parent_identity = (
+                            trigger_parent.st_dev,
+                            trigger_parent.st_ino,
+                        )
+                        if trigger_parent_identity == expected_parent_identity:
+                            authority.rename(parked)
+                            interloper.rename(authority)
+                            descriptor = real_open(path, flags, *args, **kwargs)
+                            authority.rename(interloper)
+                            parked.rename(authority)
+                            did_aba.append(trigger_parent_identity)
+                            return descriptor
                 return real_open(path, flags, *args, **kwargs)
 
             with patch.object(
@@ -410,31 +424,45 @@ class RouteShadowAuthorityTests(unittest.TestCase):
             ):
                 result = load_committed_route_shadow_authority(data_dir)
 
-            self.assertEqual(did_aba, [True])
+            self.assertEqual(did_aba, [expected_parent_identity])
             self.assertEqual(result["status"], "invalid")
             self.assertIsNone(result["authority_sha256"])
             self.assertEqual(result["reason_code"], "authority_evidence_invalid")
 
     def test_data_dir_rename_aba_during_open_is_unsafe(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            same_named_ancestor = Path(directory) / "data"
+            root = same_named_ancestor / "dataset-root"
             data_dir = root / "data"
             _write_authority(data_dir, _FALSE_AUTHORITY_BYTES)
             detached = root / "data-detached"
             foreign_data = root / "foreign-data"
             _write_authority(foreign_data, _FALSE_AUTHORITY_BYTES)
+            root_metadata = root.stat()
+            expected_parent_identity = (
+                root_metadata.st_dev,
+                root_metadata.st_ino,
+            )
             real_open = route_shadow_authority.os.open
             did_aba = []
 
             def open_foreign_data_then_restore(path, flags, *args, **kwargs):
                 if path == "data" and not did_aba:
-                    data_dir.rename(detached)
-                    foreign_data.rename(data_dir)
-                    descriptor = real_open(path, flags, *args, **kwargs)
-                    data_dir.rename(foreign_data)
-                    detached.rename(data_dir)
-                    did_aba.append(True)
-                    return descriptor
+                    dir_fd = kwargs.get("dir_fd")
+                    if dir_fd is not None:
+                        trigger_parent = os.fstat(dir_fd)
+                        trigger_parent_identity = (
+                            trigger_parent.st_dev,
+                            trigger_parent.st_ino,
+                        )
+                        if trigger_parent_identity == expected_parent_identity:
+                            data_dir.rename(detached)
+                            foreign_data.rename(data_dir)
+                            descriptor = real_open(path, flags, *args, **kwargs)
+                            data_dir.rename(foreign_data)
+                            detached.rename(data_dir)
+                            did_aba.append(trigger_parent_identity)
+                            return descriptor
                 return real_open(path, flags, *args, **kwargs)
 
             with patch.object(
@@ -444,7 +472,7 @@ class RouteShadowAuthorityTests(unittest.TestCase):
             ):
                 result = load_committed_route_shadow_authority(data_dir)
 
-            self.assertEqual(did_aba, [True])
+            self.assertEqual(did_aba, [expected_parent_identity])
             self.assertEqual(result["status"], "invalid")
             self.assertIsNone(result["authority_sha256"])
             self.assertEqual(result["reason_code"], "authority_evidence_invalid")
