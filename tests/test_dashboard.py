@@ -7300,7 +7300,6 @@ class MarketMonitorServerTest(unittest.TestCase):
             "A and B must be different. Choose another market explicitly.",
             app_js,
         )
-        self.assertIn("The previous markets were cleared.", app_js)
         self.assertIn("aggregate_cex_volume_usd", app_js)
         self.assertIn("aggregate_dex_volume_share", app_js)
         self.assertIn("formatCurrency(aggregates.aggregateDex)", app_js)

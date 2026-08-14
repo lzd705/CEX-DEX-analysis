@@ -5985,7 +5985,12 @@ global.document = { getElementById(id) { return controls[id] || null; } };
 global.window = { location: { pathname: "/tokens/AAVE/markets", search: "" } };
 app.payload = {
   metadata: { start_date: "2026-07-01", end_date: "2026-07-30" },
-  tokens: [{ token_symbol: "AAVE" }, { token_symbol: "BTC" }, { token_symbol: "ETH" }],
+  tokens: [
+    { token_symbol: "AAVE" },
+    { token_symbol: "BTC" },
+    { token_symbol: "ETH" },
+    { token_symbol: "RAY" },
+  ],
 };
 app.route = { kind: "workspace", token: "AAVE", page: "markets", state: {} };
 app.workspaceSelection = "";
@@ -5997,9 +6002,11 @@ const paths = [];
 navigateTo = (path) => { paths.push(path); };
 selectWorkspaceToken("BTC");
 selectWorkspaceToken("ETH");
+selectWorkspaceToken("RAY");
+const notice = controls["workspace-context-notice"].textContent;
 app.workspaceSelection = "single";
 const empty = workspaceStateWithoutMarkets("markets");
-console.log(JSON.stringify({ paths, empty, stored: app.pairSelections }));
+console.log(JSON.stringify({ paths, notice, empty, stored: app.pairSelections }));
 """,
             prelude="""
 globalThis.MarketMonitorNavigation = {
@@ -6015,6 +6022,7 @@ globalThis.MarketMonitorNavigation = {
         )
         btc = result["paths"][0]
         eth = result["paths"][1]
+        ray = result["paths"][2]
         self.assertIn("/tokens/BTC/markets?", btc)
         self.assertIn("marketA=cex%3Abinance%3ABTC%2FUSDT", btc)
         self.assertIn("selection=single", btc)
@@ -6025,6 +6033,15 @@ globalThis.MarketMonitorNavigation = {
         self.assertIn("marketB=dex%3Aeth%3Auniswap%3AETH%2FWETH", eth)
         self.assertNotIn("selection=", eth)
         self.assertNotIn("pairMode=", eth)
+        self.assertIn("/tokens/RAY/markets?", ray)
+        self.assertIn("pairMode=manual", ray)
+        self.assertNotIn("marketA=", ray)
+        self.assertNotIn("marketB=", ray)
+        self.assertNotIn("selection=", ray)
+        self.assertEqual(
+            result["notice"],
+            "Token changed from AAVE to RAY. Choose its markets.",
+        )
         self.assertNotIn("marketA", result["empty"])
         self.assertNotIn("marketB", result["empty"])
         self.assertNotIn("selection", result["empty"])
