@@ -4958,6 +4958,305 @@ console.log(JSON.stringify({ comparison: comparisonMarkup, liquidity }));
         self.assertIn("source unavailable", result["liquidity"][1].lower())
         self.assertIn("both selected markets", result["liquidity"][2])
 
+    def test_single_comparison_renderer_has_only_a_facts_and_three_columns(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    attributes: {}, disabled: false,
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const ids = [
+  "facts-workbench", "facts-token", "compare-markets", "comparison-error",
+  "comparison-status", "comparison-body", "comparison-table-region",
+  "comparison-table-caption", "comparison-chart-title", "comparison-chart-note",
+  "comparison-chart-description", "market-a-price-heading",
+  "market-a-volume-heading", "market-b-price-heading", "market-b-volume-heading",
+  "compare-date", "compare-absolute", "compare-bps", "compare-days",
+  "compare-a-return", "compare-b-return", "compare-a-volatility",
+  "compare-b-volatility",
+];
+const nodes = new Map(ids.map((id) => [id, control(id === "facts-token" ? "AAVE" : "")]));
+const pairOnly = Array.from({ length: 8 }, () => control());
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+  querySelectorAll(selector) { return selector === "[data-pair-only]" ? pairOnly : []; },
+};
+global.window = { lucide: null };
+renderComparisonChart = () => {};
+
+renderComparison({
+  token_symbol: "AAVE",
+  selection_mode: "single",
+  market_a: {
+    market_id: "cex:binance:AAVE/USDT", market_type: "cex",
+    venue: "binance", instrument: "AAVE/USDT",
+  },
+  market_b: null,
+  market_a_statistics: { window_return: 0.01, daily_volatility: null },
+  latest_market_a_observation: {
+    date: "2026-07-30",
+    market_a: { price_usd: 300, volume_usd: 0 },
+  },
+  observations: [{
+    date: "2026-07-30",
+    market_a: { price_usd: 300, volume_usd: 0 },
+  }],
+  metadata: { union_observation_days: 1 },
+});
+const populated = {
+  body: nodes.get("comparison-body").innerHTML,
+  date: nodes.get("compare-date").textContent,
+  aReturn: nodes.get("compare-a-return").textContent,
+  aVolatility: nodes.get("compare-a-volatility").innerHTML,
+  headings: [
+    nodes.get("market-a-price-heading").textContent,
+    nodes.get("market-a-volume-heading").textContent,
+  ],
+  caption: nodes.get("comparison-table-caption").textContent,
+  regionLabel: nodes.get("comparison-table-region").attributes["aria-label"],
+  pairHidden: pairOnly.every((node) => node.hidden),
+  status: nodes.get("comparison-status").textContent,
+};
+renderComparison({
+  token_symbol: "AAVE",
+  selection_mode: "single",
+  market_a: {
+    market_id: "cex:binance:AAVE/USDT", market_type: "cex",
+    venue: "binance", instrument: "AAVE/USDT",
+  },
+  market_b: null,
+  market_a_statistics: { window_return: null, daily_volatility: null },
+  latest_market_a_observation: null,
+  observations: [],
+  metadata: { union_observation_days: 0 },
+});
+console.log(JSON.stringify({
+  populated,
+  emptyBody: nodes.get("comparison-body").innerHTML,
+  emptyDate: nodes.get("compare-date").innerHTML,
+}));
+"""
+        )
+
+        populated = result["populated"]
+        self.assertEqual(populated["date"], "2026-07-30")
+        self.assertEqual(populated["aReturn"], "+1%")
+        self.assertIn('class="na-disclosure"', populated["aVolatility"])
+        self.assertEqual(populated["headings"], ["binance Price (USD)", "binance Volume (USD)"])
+        self.assertEqual(populated["body"].count("<td>"), 3)
+        self.assertIn("$300", populated["body"])
+        self.assertIn("$0", populated["body"])
+        self.assertNotIn("market_b", populated["body"])
+        self.assertNotIn("Comparable", populated["body"])
+        self.assertTrue(populated["pairHidden"])
+        self.assertIn("Market A", populated["caption"])
+        self.assertIn("Market A", populated["regionLabel"])
+        self.assertIn("Market A current", populated["status"])
+        self.assertIn('colspan="3"', result["emptyBody"])
+        self.assertIn("No observations", result["emptyBody"])
+        self.assertIn('class="na-disclosure"', result["emptyDate"])
+
+    def test_single_comparison_request_omits_b_and_rejects_wrong_identity(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    disabled: false, attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const elements = new Map(Object.entries({
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control(""),
+  "facts-workbench": control(),
+  "compare-markets": control(),
+}));
+global.document = {
+  getElementById(id) {
+    if (!elements.has(id)) elements.set(id, control());
+    return elements.get(id);
+  },
+  querySelectorAll() { return []; },
+};
+global.window = { location: { pathname: "/tokens/AAVE/compare", search: "" } };
+app.catalog = { markets: [] };
+app.workspaceSelection = "single";
+app.route = {
+  kind: "workspace", token: "AAVE", page: "compare",
+  state: { marketA: "cex:binance:AAVE/USDT", selection: "single", start: "2026-07-01", end: "2026-07-30" },
+};
+app.payload = { metadata: { start_date: "2026-07-01", end_date: "2026-07-30" } };
+setComparisonLoading = () => {};
+clearComparisonResult = (message) => { app.errorMessage = message; };
+fetchEventFacts = async () => ({ availability: { status: "available" }, events: [] });
+renderComparisonChart = () => {};
+const rendered = [];
+renderComparison = (payload) => { rendered.push(payload.token_symbol); app.comparison = payload; };
+const urls = [];
+let wrongIdentity = false;
+global.fetch = async (url) => {
+  urls.push(url);
+  return {
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        token_symbol: wrongIdentity ? "BTC" : "AAVE",
+        selection_mode: "single",
+        market_a: { market_id: "cex:binance:AAVE/USDT" },
+        market_b: null,
+        market_a_statistics: {}, latest_market_a_observation: null,
+        observations: [], metadata: {},
+      };
+    },
+  };
+};
+(async () => {
+  const accepted = await loadComparison();
+  wrongIdentity = true;
+  const rejected = await loadComparison();
+  console.log(JSON.stringify({ urls, accepted, rejected, rendered, error: app.errorMessage }));
+})();
+"""
+        )
+
+        first = result["urls"][0]
+        self.assertIn("token=AAVE", first)
+        self.assertIn("market_a=cex%3Abinance%3AAAVE%2FUSDT", first)
+        self.assertIn("selection=single", first)
+        self.assertIn("start=2026-07-01", first)
+        self.assertIn("end=2026-07-30", first)
+        self.assertNotIn("market_b=", first)
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["rejected"])
+        self.assertEqual(result["rendered"], ["AAVE"])
+        self.assertIn("contract", result["error"].lower())
+
+    def test_delayed_single_response_cannot_overwrite_new_pair(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    disabled: false, attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const elements = new Map(Object.entries({
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control(""),
+  "facts-workbench": control(),
+  "compare-markets": control(),
+}));
+global.document = {
+  getElementById(id) {
+    if (!elements.has(id)) elements.set(id, control());
+    return elements.get(id);
+  },
+  querySelectorAll() { return []; },
+};
+global.window = { location: { pathname: "/tokens/AAVE/compare", search: "" } };
+app.catalog = { markets: [] };
+app.workspaceSelection = "single";
+app.route = { kind: "workspace", token: "AAVE", page: "compare", state: { start: "2026-07-01", end: "2026-07-30" } };
+app.payload = { metadata: { start_date: "2026-07-01", end_date: "2026-07-30" } };
+setComparisonLoading = () => {};
+clearComparisonResult = () => {};
+fetchEventFacts = async () => null;
+renderComparisonChart = () => {};
+const rendered = [];
+renderComparison = (payload) => { rendered.push(payload.selection_mode); app.comparison = payload; };
+const pending = [];
+global.fetch = (url) => new Promise((resolve) => pending.push({ url, resolve }));
+const marketB = "dex:eth:uniswap_v3:AAVE/WETH:0.05%";
+const singlePayload = {
+  token_symbol: "AAVE", selection_mode: "single",
+  market_a: { market_id: "cex:binance:AAVE/USDT" }, market_b: null,
+};
+const pairPayload = {
+  token_symbol: "AAVE", selection_mode: "pair",
+  market_a: { market_id: "cex:binance:AAVE/USDT" },
+  market_b: { market_id: marketB },
+};
+(async () => {
+  const oldSingle = loadComparison();
+  await Promise.resolve();
+  elements.get("facts-market-b").value = marketB;
+  app.workspaceSelection = "";
+  app.route.state = { marketA: "cex:binance:AAVE/USDT", marketB, start: "2026-07-01", end: "2026-07-30" };
+  const newPair = loadComparison();
+  await Promise.resolve();
+  pending.find((item) => item.url.includes("market_b=")).resolve({
+    ok: true, status: 200, json: async () => pairPayload,
+  });
+  const pairLoaded = await newPair;
+  pending.find((item) => item.url.includes("selection=single")).resolve({
+    ok: true, status: 200, json: async () => singlePayload,
+  });
+  const singleLoaded = await oldSingle;
+  console.log(JSON.stringify({ rendered, pairLoaded, singleLoaded, finalMode: app.comparison?.selection_mode }));
+})();
+"""
+        )
+
+        self.assertTrue(result["pairLoaded"])
+        self.assertFalse(result["singleLoaded"])
+        self.assertEqual(result["rendered"], ["pair"])
+        self.assertEqual(result["finalMode"], "pair")
+
+    def test_snapshot_refresh_owner_key_includes_single_selection_marker(self):
+        result = run_app_javascript(
+            r"""
+const elements = {
+  "facts-token": { value: "AAVE" },
+  "facts-market-a": { value: "cex:binance:AAVE/USDT" },
+  "facts-market-b": { value: "dex:eth:uniswap_v3:AAVE/WETH:0.05%" },
+};
+global.document = { getElementById(id) { return elements[id] || null; } };
+global.window = { location: { pathname: "/tokens/AAVE/compare", search: "" } };
+app.route = { kind: "workspace", token: "AAVE", page: "compare", state: {} };
+app.workspaceSelection = "";
+const pairContext = snapshotRefreshRouteContext();
+const owner = {
+  requestId: 1,
+  controller: { signal: { aborted: false } },
+  routeContext: pairContext,
+  tokenSymbol: "AAVE",
+};
+app.snapshotRefreshRequestId = 1;
+app.snapshotRefreshController = owner.controller;
+elements["facts-market-b"].value = "";
+app.workspaceSelection = "single";
+const singleContext = snapshotRefreshRouteContext();
+console.log(JSON.stringify({
+  pairContext,
+  singleContext,
+  oldOwnerCurrent: snapshotRefreshOwnerIsCurrent(owner),
+}));
+"""
+        )
+
+        self.assertNotEqual(result["pairContext"], result["singleContext"])
+        self.assertIn('"selection":"single"', result["singleContext"])
+        self.assertFalse(result["oldOwnerCurrent"])
+
+
+
     def test_pair_identity_change_clears_screener_drilldown(self):
         result = run_app_javascript(
             """

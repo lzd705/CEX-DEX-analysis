@@ -7,7 +7,12 @@ const fixture = JSON.parse(fs.readFileSync(
   "utf8",
 ));
 
-async function installApiRoutes(page, { catalog = fixture.catalog_pair, calls = [] } = {}) {
+async function installApiRoutes(page, {
+  catalog = fixture.catalog_pair,
+  calls = [],
+  compareSingle = fixture.compare_single,
+  events = fixture.events,
+} = {}) {
   await page.route("**/api/markets/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(`${url.pathname}${url.search}`);
@@ -16,18 +21,124 @@ async function installApiRoutes(page, { catalog = fixture.catalog_pair, calls = 
     else if (url.pathname.endsWith("/catalog")) body = catalog;
     else if (url.pathname.endsWith("/compare")) {
       body = url.searchParams.get("selection") === "single"
-        ? fixture.compare_single
+        ? compareSingle
         : fixture.compare_pair;
     } else if (url.pathname.endsWith("/execution-cost")) {
       body = url.searchParams.get("selection") === "single"
         ? fixture.execution_single
         : fixture.execution_pair;
     } else if (url.pathname.endsWith("/quality")) body = fixture.quality_selected;
-    else if (url.pathname.endsWith("/events")) body = fixture.events;
+    else if (url.pathname.endsWith("/events")) body = events;
     else throw new Error(`Unexpected API route: ${url.pathname}`);
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
 }
+
+const singleCompare = {
+  token_symbol: "AAVE",
+  selection_mode: "single",
+  market_a: {
+    market_id: "cex:binance:AAVE/USDT",
+    market_type: "cex",
+    venue: "binance",
+    instrument: "AAVE/USDT",
+  },
+  market_b: null,
+  market_a_statistics: { window_return: 0.01, daily_volatility: 0.02 },
+  latest_market_a_observation: {
+    date: "2026-07-30",
+    market_a: { price_usd: 300, volume_usd: 0 },
+  },
+  observations: [
+    { date: "2026-07-28", market_a: { price_usd: 297, volume_usd: 800000 } },
+    { date: "2026-07-29", market_a: { price_usd: null, volume_usd: null } },
+    { date: "2026-07-30", market_a: { price_usd: 300, volume_usd: 0 } },
+  ],
+  metadata: { union_observation_days: 3 },
+};
+
+const overlayEvents = {
+  schema: "event_facts_api/v2",
+  clock_as_of_utc: "2026-08-01T00:00:00Z",
+  availability: { status: "available", reason: null },
+  query: { token: "AAVE", lifecycle: null, clock_state: null },
+  events: [{
+    token_symbol: "AAVE",
+    event_name: "Verified release",
+    event_type: "unlock",
+    lifecycle: "scheduled",
+    revision: 1,
+    clock: { state: "past", as_of_utc: "2026-08-01T00:00:00Z" },
+    time: {
+      effective_date_start: "2026-07-30",
+      effective_date_end: "2026-07-30",
+      effective_at: "2026-07-30",
+      effective_at_precision: "day",
+    },
+    source: { url: "https://example.test/release" },
+  }],
+  metadata: {},
+};
+
+test("single Compare renders only Market A", async ({ page }) => {
+  const consoleErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  page.on("pageerror", (error) => consoleErrors.push(error.message));
+  await installApiRoutes(page, { compareSingle: singleCompare, events: overlayEvents });
+  await page.goto(
+    "/tokens/AAVE/compare?marketA=cex%3Abinance%3AAAVE%2FUSDT&selection=single&start=2026-07-01&end=2026-07-30",
+  );
+  await expect(page.locator("#comparison-status")).toContainText("Market A current");
+  await expect(page.locator("#comparison-table-region").getByRole("columnheader"))
+    .toHaveText(["Date (UTC)", "binance Price (USD)", "binance Volume (USD)"]);
+  await expect(page.locator("#comparison-chart-legend .comparison-legend-item")).toHaveCount(2);
+  await expect(page.locator("#comparison-chart-legend")).toContainText("A · CEX · binance · AAVE/USDT");
+  await expect(page.locator("#comparison-chart-legend")).not.toContainText("B ·");
+  await expect(page.locator("#comparison-chart-description")).not.toContainText("Market B");
+  await expect(page.locator("#comparison-chart-description")).not.toContainText("comparable");
+  await expect(page.locator("#workspace-page-compare [data-single-only]"))
+    .toContainText("Only Market A source observations");
+  await expect(page.locator(".comparison-marker.series-a")).toHaveCount(2);
+  await expect(page.locator(".comparison-marker.series-a").first())
+    .toHaveAttribute("data-series-offset", "0");
+  await expect(page.locator(".comparison-event-overlay")).toHaveCount(1);
+  await expect(page.locator("#comparison-event-status")).toContainText("timing only");
+  await expect(page.locator("[data-pair-only]:visible")).toHaveCount(0);
+  expect(await page.locator("[data-pair-only]").evaluateAll((nodes) => nodes.every((node) => (
+    node.hidden
+  )))).toBe(true);
+  await expect(page.getByRole("button", { name: "Daily Price Gap" })).toHaveCount(0);
+  for (let index = 0; index < 12; index += 1) {
+    await page.keyboard.press("Tab");
+    expect(await page.evaluate(() => Boolean(document.activeElement?.closest?.("[data-pair-only]"))))
+      .toBe(false);
+  }
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  expect(consoleErrors).toEqual([]);
+});
+
+test("single Compare handles empty observations", async ({ page }) => {
+  const empty = {
+    ...singleCompare,
+    market_a_statistics: { window_return: null, daily_volatility: null },
+    latest_market_a_observation: null,
+    observations: [],
+    metadata: { union_observation_days: 0 },
+  };
+  await installApiRoutes(page, { compareSingle: empty });
+  await page.goto(
+    "/tokens/AAVE/compare?marketA=cex%3Abinance%3AAAVE%2FUSDT&selection=single&start=2026-07-01&end=2026-07-30",
+  );
+  await expect(page.locator("#comparison-status")).toContainText("Market A current");
+  await expect(page.locator("#comparison-chart-empty")).toContainText("No source-backed values");
+  await expect(page.locator("#comparison-body")).toContainText("No observations");
+  await expect(page.locator("#compare-date .na-disclosure")).toHaveCount(1);
+  await expect(page.locator("#comparison-chart-legend")).not.toContainText("B ·");
+  await expect(page.locator("[data-pair-only]:visible")).toHaveCount(0);
+  await expect(page.locator("#comparison-table-region").getByRole("columnheader")).toHaveCount(3);
+});
 
 test("single selection can be confirmed when Market B starts empty", async ({ page }) => {
   await installApiRoutes(page, { catalog: fixture.catalog_one });

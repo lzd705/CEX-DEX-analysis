@@ -28,6 +28,79 @@ def run_app_javascript(source):
 
 
 class EventFrontendTest(unittest.TestCase):
+    def test_single_compare_keeps_market_a_when_event_overlay_fails(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    disabled: false, attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const elements = new Map(Object.entries({
+  "facts-token": control("AAVE"),
+  "facts-market-a": control("cex:binance:AAVE/USDT"),
+  "facts-market-b": control(""),
+  "facts-workbench": control(),
+  "compare-markets": control(),
+}));
+global.document = {
+  getElementById(id) {
+    if (!elements.has(id)) elements.set(id, control());
+    return elements.get(id);
+  },
+  querySelectorAll() { return []; },
+};
+global.window = { location: { pathname: "/tokens/AAVE/compare", search: "" } };
+app.catalog = { markets: [] };
+app.workspaceSelection = "single";
+app.route = {
+  kind: "workspace", token: "AAVE", page: "compare",
+  state: { selection: "single", start: "2026-07-01", end: "2026-07-30" },
+};
+app.payload = { metadata: { start_date: "2026-07-01", end_date: "2026-07-30" } };
+setComparisonLoading = () => {};
+clearComparisonResult = (message) => { app.cleared = message; };
+fetchEventFacts = async () => { throw new Error("event publication unavailable"); };
+const chartStates = [];
+renderComparison = (payload) => { app.comparison = payload; };
+renderComparisonChart = (payload) => {
+  chartStates.push({ token: payload.token_symbol, eventFacts: app.eventFacts });
+};
+global.fetch = async () => ({
+  ok: true,
+  status: 200,
+  async json() {
+    return {
+      token_symbol: "AAVE", selection_mode: "single",
+      market_a: { market_id: "cex:binance:AAVE/USDT" }, market_b: null,
+      market_a_statistics: {}, latest_market_a_observation: null,
+      observations: [], metadata: {},
+    };
+  },
+});
+(async () => {
+  const loaded = await loadComparison();
+  console.log(JSON.stringify({
+    loaded,
+    comparisonToken: app.comparison?.token_symbol,
+    eventFacts: app.eventFacts,
+    chartStates,
+    cleared: app.cleared || null,
+  }));
+})();
+"""
+        )
+
+        self.assertTrue(result["loaded"])
+        self.assertEqual(result["comparisonToken"], "AAVE")
+        self.assertIsNone(result["eventFacts"])
+        self.assertEqual(result["chartStates"], [{"token": "AAVE", "eventFacts": None}])
+        self.assertIsNone(result["cleared"])
+
     def test_events_are_a_token_workspace_page_with_explicit_fact_boundary(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
         app = APP_PATH.read_text(encoding="utf-8")

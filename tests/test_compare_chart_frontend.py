@@ -94,6 +94,95 @@ const comparisonFixture = {
 
 
 class CompareChartFrontendTest(unittest.TestCase):
+    def test_single_market_chart_has_only_a_and_normalizes_pair_only_metric(self):
+        result = run_app_javascript(
+            r"""
+const payload = {
+  token_symbol: "TEST",
+  selection_mode: "single",
+  market_a: {
+    market_id: "cex:alpha:TEST/USD",
+    market_type: "cex",
+    venue: "alpha",
+    instrument: "TEST/USD",
+  },
+  market_b: null,
+  observations: [
+    { date: "2026-01-01", market_a: { price_usd: 100, volume_usd: 100 } },
+    { date: "2026-01-02", market_a: { price_usd: null, volume_usd: null } },
+    { date: "2026-01-04", market_a: { price_usd: 104, volume_usd: 0 } },
+  ],
+};
+const eventPayload = {
+  availability: { status: "available" },
+  events: [{
+    event_name: "Verified release",
+    event_type: "unlock",
+    lifecycle: "scheduled",
+    revision: 1,
+    time: {
+      effective_date_start: "2026-01-04",
+      effective_date_end: "2026-01-04",
+      effective_at: "2026-01-04",
+      effective_at_precision: "day",
+    },
+    source: { url: "https://example.test/release" },
+  }],
+};
+const price = comparisonChartModel(payload, "price", eventPayload);
+const volume = comparisonChartModel(payload, "volume", eventPayload);
+const requestedSpread = comparisonChartModel(payload, "spread", eventPayload);
+const x = () => 50;
+const y = () => 25;
+const marker = comparisonPointMarkup(price, price.series[0], price.series[0].points[0], x, y);
+const tooltip = comparisonChartTooltipText(price, price.series[0].points[2]);
+
+const pairOnly = [{ hidden: false }, { hidden: false }];
+const workbench = { dataset: {} };
+global.document = {
+  getElementById(id) { return id === "facts-workbench" ? workbench : null; },
+  querySelectorAll(selector) { return selector === "[data-pair-only]" ? pairOnly : []; },
+};
+app.comparisonMetric = "spread";
+applyWorkspaceSelectionMode("single");
+const singleMetric = app.comparisonMetric;
+applyWorkspaceSelectionMode("pair");
+
+console.log(JSON.stringify({
+  priceSeries: price.series.map((series) => series.slot),
+  volumeValues: volume.series[0].points.map((point) => point.value),
+  volumeSegments: volume.series[0].segments.map((segment) => segment.map((point) => point.date)),
+  requestedSpreadMetric: requestedSpread.definition.key,
+  requestedSpreadSeries: requestedSpread.series.map((series) => series.slot),
+  marker,
+  tooltip,
+  eventMarkers: price.eventMarkers.length,
+  singleMetric,
+  pairHiddenAfterSingleThenPair: pairOnly.map((element) => element.hidden),
+  mode: workbench.dataset.selectionMode,
+}));
+"""
+        )
+
+        self.assertEqual(result["priceSeries"], ["A"])
+        self.assertEqual(result["volumeValues"], [100, None, 0])
+        self.assertEqual(
+            result["volumeSegments"],
+            [["2026-01-01"], ["2026-01-04"]],
+        )
+        self.assertEqual(result["requestedSpreadMetric"], "price")
+        self.assertEqual(result["requestedSpreadSeries"], ["A"])
+        self.assertIn('cx="50"', result["marker"])
+        self.assertNotIn("Market B", result["tooltip"])
+        self.assertNotIn("comparable", result["tooltip"].lower())
+        self.assertNotIn("Daily Price Gap", result["tooltip"])
+        self.assertIn("timing", result["tooltip"])
+        self.assertIn("not causality", result["tooltip"])
+        self.assertEqual(result["eventMarkers"], 1)
+        self.assertEqual(result["singleMetric"], "price")
+        self.assertEqual(result["pairHiddenAfterSingleThenPair"], [False, False])
+        self.assertEqual(result["mode"], "pair")
+
     def test_daily_price_gap_copy_uses_same_utc_closes_and_never_claims_execution(self):
         result = run_app_javascript(
             FIXTURE

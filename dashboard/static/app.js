@@ -48,6 +48,7 @@ const app = {
   catalogController: null,
   marketRequestWindowKey: "",
   comparisonController: null,
+  comparisonRequestKey: "",
   executionController: null,
   qualityController: null,
   eventController: null,
@@ -444,6 +445,40 @@ function selectedWorkspaceToken() {
     || app.payload?.metadata?.default_workspace_token
     || app.payload?.tokens?.[0]?.token_symbol
     || "";
+}
+
+function applyWorkspaceSelectionMode(mode) {
+  const single = mode === "single";
+  const workbench = byId("facts-workbench");
+  if (workbench) workbench.dataset.selectionMode = single ? "single" : "pair";
+  document.querySelectorAll?.("[data-pair-only]").forEach((element) => {
+    element.hidden = single;
+  });
+  document.querySelectorAll?.("[data-single-only]").forEach((element) => {
+    element.hidden = !single;
+  });
+  if (single && app.comparisonMetric === "spread") {
+    app.comparisonMetric = "price";
+  }
+  document.querySelectorAll?.("[data-comparison-metric]").forEach((button) => {
+    const active = button.dataset.comparisonMetric === app.comparisonMetric;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
+
+function workspaceRequestKey(page, selection, extra = {}) {
+  const window = appliedTimeWindow();
+  return JSON.stringify({
+    page,
+    token: selectedWorkspaceToken(),
+    marketA: selection.marketA,
+    marketB: selection.marketB,
+    selection: selection.selection,
+    start: window.start,
+    end: window.end,
+    ...extra,
+  });
 }
 
 function tokenCatalogCacheKey(token, start, end, generation) {
@@ -1156,6 +1191,7 @@ function applyWorkspaceRoute(route) {
   }
   setActiveAppView("workspace");
   setActiveWorkspacePage(route.page);
+  applyWorkspaceSelectionMode(app.workspaceSelection);
   renderWorkspaceContext();
   renderWorkspaceMarkets();
   renderQualityFromCatalog();
@@ -5974,7 +6010,8 @@ function comparisonEventMarkers(eventPayload, rows) {
 }
 
 function comparisonChartModel(payload, metric = "price", eventPayload = null) {
-  const definition = comparisonMetricDefinition(metric);
+  const single = payload?.selection_mode === "single";
+  const definition = comparisonMetricDefinition(single && metric === "spread" ? "price" : metric);
   const rows = (Array.isArray(payload?.observations) ? payload.observations : [])
     .map((row, sourceIndex) => ({
       ...row,
@@ -5985,7 +6022,13 @@ function comparisonChartModel(payload, metric = "price", eventPayload = null) {
     .sort((left, right) => (
       left.dateMs - right.dateMs || left.sourceIndex - right.sourceIndex
     ));
-  const configurations = definition.key === "spread"
+  const configurations = single
+    ? [{
+        slot: "A",
+        className: "series-a",
+        label: comparisonMarketIdentity("A", payload?.market_a),
+      }]
+    : definition.key === "spread"
     ? [{
         slot: "spread",
         className: "series-spread",
@@ -6022,6 +6065,7 @@ function comparisonChartModel(payload, metric = "price", eventPayload = null) {
     series,
     marketA: payload?.market_a || null,
     marketB: payload?.market_b || null,
+    selectionMode: single ? "single" : "pair",
     eventMarkers: comparisonEventMarkers(eventPayload, rows),
   };
 }
@@ -6099,7 +6143,7 @@ function comparisonChartTooltipText(model, point) {
         `${event.time?.effective_at || point.date} (${event.time?.effective_at_precision || "unknown"} precision)`,
         eventSourceHostname(event.source?.url),
         `revision ${event.revision || "unavailable"}`,
-      ].join(" · ")).join("; ")} · temporal overlay only, not causality`
+      ].join(" · ")).join("; ")} · timing overlay only, not causality`
     : "no verified event marker on this date in the current release";
   if (metric === "spread") {
     return [
@@ -6114,6 +6158,17 @@ function comparisonChartTooltipText(model, point) {
     ].join(" · ");
   }
   const label = metric === "price" ? "price" : "volume";
+  if (model.selectionMode === "single") {
+    return [
+      `${point.date} UTC`,
+      `${model.series[0]?.label || "Market A"} ${label} ${formatComparisonChartValue(
+        metric,
+        comparisonChartValue(row, metric, "A"),
+      )}`,
+      "missing values are not filled",
+      eventText,
+    ].join(" · ");
+  }
   return [
     `${point.date} UTC`,
     `${model.series[0]?.label || "Market A"} ${label} ${formatComparisonChartValue(
@@ -6157,7 +6212,9 @@ function comparisonPathData(segment, x, y) {
 
 function comparisonPointMarkup(model, series, point, x, y) {
   const tooltip = escapeHtml(comparisonChartTooltipText(model, point));
-  const offset = series.slot === "A" ? -2.5 : series.slot === "B" ? 2.5 : 0;
+  const offset = model.selectionMode === "single"
+    ? 0
+    : series.slot === "A" ? -2.5 : series.slot === "B" ? 2.5 : 0;
   const xValue = Number((x(point.dateMs) + offset).toFixed(2));
   const yValue = Number(y(point.value).toFixed(2));
   if (series.slot === "B") {
@@ -6166,7 +6223,7 @@ function comparisonPointMarkup(model, series, point, x, y) {
   if (series.slot === "spread") {
     return `<path class="comparison-marker ${series.className}" d="M ${xValue} ${yValue - 4.5} L ${xValue + 4.5} ${yValue} L ${xValue} ${yValue + 4.5} L ${xValue - 4.5} ${yValue} Z"><title>${tooltip}</title></path>`;
   }
-  return `<circle class="comparison-marker ${series.className}" cx="${xValue}" cy="${yValue}" r="3.7"><title>${tooltip}</title></circle>`;
+  return `<circle class="comparison-marker ${series.className}" data-series-offset="${offset}" cx="${xValue}" cy="${yValue}" r="3.7"><title>${tooltip}</title></circle>`;
 }
 
 function comparisonEventMarkerMarkup(marker, x, dimensions) {
@@ -6307,10 +6364,13 @@ function renderComparisonSvg(model) {
 }
 
 function renderComparisonLegend(model) {
-  const identityItems = [
-    ["A", "series-a", model.marketA],
-    ["B", "series-b", model.marketB],
-  ].map(([slot, className, market]) => `<div class="comparison-legend-item">
+  const identities = model.selectionMode === "single"
+    ? [["A", "series-a", model.marketA]]
+    : [
+        ["A", "series-a", model.marketA],
+        ["B", "series-b", model.marketB],
+      ];
+  const identityItems = identities.map(([slot, className, market]) => `<div class="comparison-legend-item">
       <span class="comparison-legend-line ${className}" aria-hidden="true"></span>
       <span>${escapeHtml(comparisonMarketIdentity(slot, market))}${model.definition.key === "spread" ? " · input" : ""}</span>
     </div>`).join("");
@@ -6467,6 +6527,8 @@ function bindComparisonChartTooltipEvents() {
 function setComparisonLoading(message) {
   app.comparison = null;
   app.eventFacts = null;
+  applyWorkspaceSelectionMode(app.workspaceSelection);
+  setComparisonDocumentCopy(app.workspaceSelection === "single");
   byId("facts-workbench").setAttribute("aria-busy", "true");
   byId("compare-markets").disabled = true;
   hideError(byId("comparison-error"));
@@ -6484,18 +6546,22 @@ function setComparisonLoading(message) {
     byId(id).textContent = "—";
   });
   clearComparisonChart("Loading the selected markets…");
-  byId("comparison-body").innerHTML = '<tr><td colspan="8" class="missing">Loading the selected markets…</td></tr>';
+  const single = app.workspaceSelection === "single";
+  byId("comparison-body").innerHTML = `<tr><td colspan="${single ? 3 : 8}" class="missing">${single ? "Loading Market A…" : "Loading the selected markets…"}</td></tr>`;
 }
 
 function invalidateComparisonRequest() {
   if (app.comparisonController) app.comparisonController.abort();
   app.comparisonController = null;
+  app.comparisonRequestKey = "";
   app.comparisonRequestId += 1;
   return app.comparisonRequestId;
 }
 
 function clearComparisonResult(message = "") {
   app.comparison = null;
+  applyWorkspaceSelectionMode(app.workspaceSelection);
+  setComparisonDocumentCopy(app.workspaceSelection === "single");
   [
     "compare-date",
     "compare-absolute",
@@ -6513,7 +6579,7 @@ function clearComparisonResult(message = "") {
   byId("market-b-price-heading").textContent = "Market B Price (USD)";
   byId("market-b-volume-heading").textContent = "Market B Volume (USD)";
   clearComparisonChart(message || "No current comparison result.");
-  byId("comparison-body").innerHTML = '<tr><td colspan="8" class="missing">No current result.</td></tr>';
+  byId("comparison-body").innerHTML = `<tr><td colspan="${app.workspaceSelection === "single" ? 3 : 8}" class="missing">No current result.</td></tr>`;
   hideStatus(byId("comparison-status"));
   if (message) showError(byId("comparison-error"), message);
   else hideError(byId("comparison-error"));
@@ -6527,8 +6593,78 @@ function comparisonValueMarkup(value, formatter, reason, context = {}) {
     : naFactMarkup(reason, context);
 }
 
-function renderComparison(payload) {
+function setComparisonDocumentCopy(single) {
+  byId("daily-comparison-title").textContent = single
+    ? "Daily price and volume · Market A"
+    : "Daily price and volume comparison";
+  byId("comparison-plot").setAttribute(
+    "aria-label",
+    single ? "Interactive daily Market A chart" : "Interactive daily market comparison chart",
+  );
+  byId("comparison-table-region").setAttribute(
+    "aria-label",
+    single ? "Daily Market A observations" : "Daily two-market comparison observations",
+  );
+  byId("comparison-table-caption").textContent = single
+    ? "Daily observations for Market A; missing values are never filled."
+    : "Daily observations for the selected two markets; missing values are never filled.";
+}
+
+function renderSingleComparison(payload) {
   app.comparison = payload;
+  applyWorkspaceSelectionMode("single");
+  setComparisonDocumentCopy(true);
+  const latest = payload.latest_market_a_observation;
+  setFactValue(
+    "compare-date",
+    Boolean(latest?.date),
+    latest?.date || "",
+    "Market A has no source-backed UTC observation in this window.",
+    { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_a), factLabel: "latest Market A UTC date" },
+  );
+  [
+    ["compare-a-return", payload.market_a_statistics?.window_return, "Market A window return requires at least two valid daily closes."],
+    ["compare-a-volatility", payload.market_a_statistics?.daily_volatility, "Market A daily volatility requires sufficient valid return observations."],
+  ].forEach(([id, value, reason]) => setFactValue(
+    id,
+    finite(value),
+    formatPercent(value),
+    reason,
+    {
+      token: payload.token_symbol,
+      marketLabel: snapshotMarketContextLabel(payload.market_a),
+      factLabel: id.includes("return") ? "window return" : "daily volatility",
+    },
+  ));
+  byId("market-a-price-heading").textContent = `${payload.market_a.venue} Price (USD)`;
+  byId("market-a-volume-heading").textContent = `${payload.market_a.venue} Volume (USD)`;
+  renderComparisonChart(payload);
+  const rows = [...(payload.observations || [])].reverse();
+  byId("comparison-body").innerHTML = rows.length
+    ? rows.map((row) => `<tr>
+        <td>${escapeHtml(row.date)}</td>
+        <td>${comparisonValueMarkup(row.market_a?.price_usd, formatRawUsd, "Market A has no valid daily USD price on this UTC date.", { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_a), factLabel: `daily USD price on ${row.date}` })}</td>
+        <td>${comparisonValueMarkup(row.market_a?.volume_usd, formatRawVolume, "Market A has no valid daily USD volume on this UTC date.", { token: payload.token_symbol, marketLabel: snapshotMarketContextLabel(payload.market_a), factLabel: `daily USD volume on ${row.date}` })}</td>
+      </tr>`).join("")
+    : '<tr><td colspan="3" class="missing">No observations in this window.</td></tr>';
+  hideError(byId("comparison-error"));
+  showStatus(
+    byId("comparison-status"),
+    `${payload.token_symbol} Market A current · ${payload.metadata?.union_observation_days || 0} observation days.`,
+    "success",
+  );
+  byId("facts-workbench").setAttribute("aria-busy", "false");
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
+}
+
+function renderComparison(payload) {
+  if (payload?.selection_mode === "single") {
+    renderSingleComparison(payload);
+    return;
+  }
+  app.comparison = payload;
+  applyWorkspaceSelectionMode("pair");
+  setComparisonDocumentCopy(false);
   const latest = payload.latest_comparable_observation;
   setFactValue(
     "compare-date",
@@ -6624,6 +6760,29 @@ function publicErrorMessage(error, fallback = "Request failed.") {
   return message || fallback;
 }
 
+function comparisonPayloadMatchesSelection(payload, token, selection) {
+  if (
+    payload?.token_symbol !== token
+    || payload?.market_a?.market_id !== selection.marketA
+  ) return false;
+  if (selection.selection === "single") {
+    return payload.selection_mode === "single" && payload.market_b === null;
+  }
+  return (
+    payload.selection_mode === "pair"
+    && payload?.market_b?.market_id === selection.marketB
+  );
+}
+
+function comparisonRequestIsCurrent(requestId, requestKey, selection) {
+  return (
+    requestId === app.comparisonRequestId
+    && requestKey === app.comparisonRequestKey
+    && app.route?.page === "compare"
+    && requestKey === workspaceRequestKey("compare", selection)
+  );
+}
+
 async function loadComparison() {
   const window = appliedTimeWindow();
   const requestId = invalidateComparisonRequest();
@@ -6639,20 +6798,32 @@ async function loadComparison() {
   const token = byId("facts-token").value;
   const marketA = byId("facts-market-a").value;
   const marketB = byId("facts-market-b").value;
-  if (!token || !marketA || !marketB || marketA === marketB) {
+  const selection = {
+    marketA,
+    marketB,
+    selection: app.workspaceSelection === "single" ? "single" : "",
+  };
+  const single = selection.selection === "single";
+  if (!token || !marketA || (single ? Boolean(marketB) : !marketB || marketA === marketB)) {
     clearComparisonResult(
       token
-        ? "This Token does not currently have two distinct market series to compare."
-        : "Select a Token and two distinct market series.",
+        ? single
+          ? "Select Market A and leave Market B empty for the single-market view."
+          : "This Token does not currently have two distinct market series to compare."
+        : "Select a Token and valid market selection.",
     );
     return false;
   }
+  const requestKey = workspaceRequestKey("compare", selection);
+  app.comparisonRequestKey = requestKey;
   const controller = new AbortController();
   app.comparisonController = controller;
-  const query = new URLSearchParams({ token, market_a: marketA, market_b: marketB });
+  const query = new URLSearchParams({ token, market_a: marketA });
+  if (single) query.set("selection", "single");
+  else query.set("market_b", marketB);
   if (window.start) query.set("start", window.start);
   if (window.end) query.set("end", window.end);
-  setComparisonLoading(`Loading ${token} comparison…`);
+  setComparisonLoading(single ? `Loading ${token} Market A…` : `Loading ${token} comparison…`);
   try {
     const eventPromise = fetchEventFacts({
       token,
@@ -6665,19 +6836,25 @@ async function loadComparison() {
     });
     const payload = await responseJson(response);
     if (!response.ok) throw new Error(payload.error || "Comparison failed to load.");
-    if (requestId !== app.comparisonRequestId) return false;
+    if (!comparisonRequestIsCurrent(requestId, requestKey, selection)) return false;
+    if (!comparisonPayloadMatchesSelection(payload, token, selection)) {
+      throw new Error("The comparison response failed its Token, market, or selection contract.");
+    }
     renderComparison(payload);
     const eventPayload = await eventPromise;
-    if (requestId !== app.comparisonRequestId) return false;
+    if (!comparisonRequestIsCurrent(requestId, requestKey, selection)) return false;
     app.eventFacts = eventPayload;
     renderComparisonChart(payload);
     return true;
   } catch (error) {
-    if (error.name === "AbortError" || requestId !== app.comparisonRequestId) return false;
+    if (
+      error.name === "AbortError"
+      || !comparisonRequestIsCurrent(requestId, requestKey, selection)
+    ) return false;
     clearComparisonResult(publicErrorMessage(error, "Comparison failed to load."));
     return false;
   } finally {
-    if (requestId === app.comparisonRequestId) {
+    if (comparisonRequestIsCurrent(requestId, requestKey, selection)) {
       app.comparisonController = null;
       byId("compare-markets").disabled = false;
     }

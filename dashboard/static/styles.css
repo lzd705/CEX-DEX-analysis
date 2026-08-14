@@ -1335,6 +1335,9 @@ main { min-width: 0; padding: 14px 18px 30px; }
   border: 1px solid var(--line);
   background: var(--line);
 }
+.facts-workbench[data-selection-mode="single"] .comparison-summary {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
 .comparison-summary > div { padding: 12px 14px; background: var(--surface-2); }
 .comparison-summary span { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; }
 .comparison-summary strong {
@@ -1547,6 +1550,9 @@ main { min-width: 0; padding: 14px 18px 30px; }
   border-top: 0;
 }
 .comparison-table { min-width: 1250px; font-size: 13px; }
+.facts-workbench[data-selection-mode="single"] .comparison-table {
+  min-width: 640px;
+}
 .comparison-table th,
 .comparison-table td { text-align: right; }
 .comparison-table th:first-child,
@@ -2418,6 +2424,9 @@ footer {
     max-height: 55vh;
   }
   .comparison-summary { grid-template-columns: 1fr; }
+  .facts-workbench[data-selection-mode="single"] .comparison-table {
+    min-width: 0;
+  }
   .events-summary { grid-template-columns: 1fr; }
   .events-lifecycle-control {
     display: grid;

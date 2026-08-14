@@ -549,18 +549,19 @@
         >
         <div class="daily-comparison-heading">
           <div>
-            <h3>Daily price and volume comparison</h3>
+            <h3 id="daily-comparison-title">Daily price and volume comparison</h3>
             <div class="module-context" aria-label="Daily comparison module scope">
               <span class="module-chip">Daily UTC</span>
-              <span class="module-chip">Same-date comparison</span>
+              <span class="module-chip" data-pair-only>Same-date comparison</span>
               <span class="module-chip">No forward fill</span>
               <details class="context-info">
-                <summary aria-label="Daily comparison method details">
+                <summary aria-label="Daily observation method details">
                   <i data-lucide="info"></i>
                 </summary>
                 <div class="context-tooltip" role="tooltip">
-                  <strong>Comparison method</strong>
-                  <p>Only source observations inside the selected UTC date window are compared. Prices and volumes are never filled. Daily Price Gap exists only when both markets have valid closing prices on the same UTC date.</p>
+                  <strong>Daily observation method</strong>
+                  <p data-pair-only>Only source observations inside the selected UTC date window are compared. Prices and volumes are never filled. Daily Price Gap exists only when both markets have valid closing prices on the same UTC date.</p>
+                  <p data-single-only hidden>Only Market A source observations inside the selected UTC date window are shown. Prices and volumes are never filled.</p>
                   <p>Straight segments connect consecutive daily observations. Missing or invalid values and calendar gaps break the line; no interpolation or forward fill is applied. Verified event overlays show timing only and do not claim return impact or causality.</p>
                 </div>
               </details>
@@ -570,19 +571,19 @@
         </div>
 
         <div class="comparison-summary">
-          <div>
+          <div data-pair-only>
             <span>Latest comparable date</span>
             <strong id="compare-date">—</strong>
           </div>
-          <div>
+          <div data-pair-only>
             <span>Absolute Daily Price Gap</span>
             <strong id="compare-absolute">—</strong>
           </div>
-          <div>
+          <div data-pair-only>
             <span>Daily Price Gap (midpoint-relative bps)</span>
             <strong id="compare-bps">—</strong>
           </div>
-          <div>
+          <div data-pair-only>
             <span>Comparable days</span>
             <strong id="compare-days">—</strong>
           </div>
@@ -590,7 +591,7 @@
             <span>Market A return</span>
             <strong id="compare-a-return">—</strong>
           </div>
-          <div>
+          <div data-pair-only>
             <span>Market B return</span>
             <strong id="compare-b-return">—</strong>
           </div>
@@ -598,7 +599,7 @@
             <span>Market A daily volatility</span>
             <strong id="compare-a-volatility">—</strong>
           </div>
-          <div>
+          <div data-pair-only>
             <span>Market B daily volatility</span>
             <strong id="compare-b-volatility">—</strong>
           </div>
@@ -619,6 +620,7 @@
             <button
               type="button"
               data-comparison-metric="spread"
+              data-pair-only
               aria-pressed="false"
             >Daily Price Gap</button>
             <button
@@ -679,21 +681,22 @@
         <div
           class="comparison-table-scroll"
           role="region"
+          id="comparison-table-region"
           aria-label="Daily two-market comparison observations"
           tabindex="0"
         >
           <table class="comparison-table">
-            <caption>Daily observations for the selected two markets; missing values are never filled.</caption>
+            <caption id="comparison-table-caption">Daily observations for the selected two markets; missing values are never filled.</caption>
             <thead>
               <tr>
                 <th scope="col">Date (UTC)</th>
                 <th scope="col" id="market-a-price-heading">A Price (USD)</th>
                 <th scope="col" id="market-a-volume-heading">A Volume (USD)</th>
-                <th scope="col" id="market-b-price-heading">B Price (USD)</th>
-                <th scope="col" id="market-b-volume-heading">B Volume (USD)</th>
-                <th scope="col">Absolute Price Difference (USD)</th>
-                <th scope="col">Daily Price Gap (bps)</th>
-                <th scope="col">Missing-value Rule</th>
+                <th scope="col" id="market-b-price-heading" data-pair-only>B Price (USD)</th>
+                <th scope="col" id="market-b-volume-heading" data-pair-only>B Volume (USD)</th>
+                <th scope="col" data-pair-only>Absolute Price Difference (USD)</th>
+                <th scope="col" data-pair-only>Daily Price Gap (bps)</th>
+                <th scope="col" data-pair-only>Missing-value Rule</th>
               </tr>
             </thead>
             <tbody id="comparison-body">
