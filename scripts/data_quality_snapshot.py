@@ -2142,6 +2142,16 @@ def _validate_execution_rows_equivalent(
             if any(row[field] for field in RESULT_NUMERIC_COLUMNS):
                 raise ValueError("terminal execution row contains numeric facts")
             continue
+        if status == "partial" and any(
+            row[field]
+            for field in (
+                "filled_vwap_quote_per_token",
+                "filled_vwap_usd_per_token",
+                "quoted_execution_cost_usd",
+                "quoted_execution_cost_bps",
+            )
+        ):
+            raise ValueError("partial execution row contains complete-only facts")
 
         if any(not row[field] for field in MEASURED_PROVENANCE_COLUMNS):
             raise ValueError("measured execution provenance is incomplete")

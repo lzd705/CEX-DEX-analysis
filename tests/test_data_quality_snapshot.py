@@ -1384,6 +1384,32 @@ class DataQualitySnapshotExecutionAdapterTests(unittest.TestCase):
                         family["failure_reason"], "invalid_execution_contract"
                     )
 
+    def test_incomplete_partial_row_rejects_complete_only_derived_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = _execution_rows("cex")[:-1]
+            rows[0].update(
+                {
+                    "status": "partial",
+                    "status_reason": "source_level_limit",
+                    "filled_token_quantity": "5",
+                    "fill_ratio": "0.5",
+                    "quote_amount": "500",
+                    "quote_amount_usd": "500",
+                }
+            )
+            _write_csv(
+                Path(directory) / "cex_execution_cost_latest.csv",
+                EXECUTION_HEADER,
+                rows,
+            )
+
+            family = _family(_snapshot(directory), "cex_execution_cost")
+
+            self.assertEqual(family["state"], "failed")
+            self.assertEqual(
+                family["failure_reason"], "invalid_execution_contract"
+            )
+
     def test_execution_rows_bind_exact_retained_market_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = _execution_rows("cex")
