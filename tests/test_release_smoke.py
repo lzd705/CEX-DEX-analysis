@@ -3698,7 +3698,11 @@ class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
                         "comparison_generation": generation,
                         "start_date": query["start"],
                         "end_date": query["end"],
-                        **({} if single else {"comparison_days": 1}),
+                        **(
+                            {"observation_days": 1}
+                            if single
+                            else {"comparison_days": 1}
+                        ),
                     },
                     "observations": (
                         [{"date": query["start"], "market_a": 100.0}]
@@ -5937,6 +5941,7 @@ class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
                 "comparison_generation": "generation-1",
                 "start_date": "2026-01-01",
                 "end_date": "2026-01-31",
+                "observation_days": 2,
             },
             "market_a_statistics": {"observation_count": 2},
             "observations": [
@@ -5971,6 +5976,12 @@ class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):
             ),
             "pair union days": lambda payload: payload["metadata"].update(
                 union_observation_days=2
+            ),
+            "missing observation days": lambda payload: payload["metadata"].pop(
+                "observation_days"
+            ),
+            "wrong observation days": lambda payload: payload["metadata"].update(
+                observation_days=1
             ),
             "pair row": lambda payload: payload["observations"][0].update(
                 price_spread=0.01

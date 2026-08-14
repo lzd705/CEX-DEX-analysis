@@ -101,7 +101,7 @@ const singleCompare = {
     { date: "2026-07-29", market_a: { price_usd: null, volume_usd: null } },
     { date: "2026-07-30", market_a: { price_usd: 300, volume_usd: 0 } },
   ],
-  metadata: { union_observation_days: 3 },
+  metadata: { observation_days: 3 },
 };
 
 const overlayEvents = {
@@ -200,6 +200,7 @@ test("single Compare renders only Market A", async ({ page }) => {
     "/tokens/AAVE/compare?marketA=cex%3Abinance%3AAAVE%2FUSDT&selection=single&start=2026-07-01&end=2026-07-30",
   );
   await expect(page.locator("#comparison-status")).toContainText("Market A current");
+  await expect(page.locator("#comparison-status")).toContainText("3 observation days");
   const summaryColumns = await page.locator(".comparison-summary").evaluate((element) => (
     getComputedStyle(element).gridTemplateColumns.split(" ").filter(Boolean).length
   ));
@@ -238,7 +239,7 @@ test("single Compare handles empty observations", async ({ page }) => {
     market_a_statistics: { window_return: null, daily_volatility: null },
     latest_market_a_observation: null,
     observations: [],
-    metadata: { union_observation_days: 0 },
+    metadata: { observation_days: 0 },
   };
   await installApiRoutes(page, { compareSingle: empty });
   await page.goto(
@@ -275,12 +276,31 @@ test("restoring Market B restores the pair contract", async ({ page }) => {
   await installApiRoutes(page);
   await page.goto("/tokens/AAVE/markets");
   const marketB = page.getByLabel("Market B (optional)", { exact: true });
+  await expect(marketB).toHaveValue("dex:eth:uniswap_v3:AAVE/WETH:0.05%");
+  await page.waitForFunction(() => app.routeReady === true);
+  const beforeSingleDraft = page.url();
+  const sessionBeforeSingleDraft = await page.evaluate(() => (
+    sessionStorage.getItem("market-monitor:token-pairs:v1")
+  ));
   await marketB.selectOption("");
+  expect(page.url()).toBe(beforeSingleDraft);
+  expect(await page.evaluate(() => (
+    sessionStorage.getItem("market-monitor:token-pairs:v1")
+  ))).toBe(sessionBeforeSingleDraft);
   await page.getByRole("button", { name: "Apply selection" }).click();
   await expect(page).toHaveURL(/selection=single/);
   await page.getByRole("link", { name: "Change markets" }).click();
   await expect(page).toHaveURL(/\/tokens\/AAVE\/markets\?/);
+  await expect(marketB).toHaveValue("");
+  const beforePairDraft = page.url();
+  const sessionBeforePairDraft = await page.evaluate(() => (
+    sessionStorage.getItem("market-monitor:token-pairs:v1")
+  ));
   await marketB.selectOption("dex:eth:uniswap_v3:AAVE/WETH:0.05%");
+  expect(page.url()).toBe(beforePairDraft);
+  expect(await page.evaluate(() => (
+    sessionStorage.getItem("market-monitor:token-pairs:v1")
+  ))).toBe(sessionBeforePairDraft);
   await page.getByRole("button", { name: "Apply selection" }).click();
   await expect(page).not.toHaveURL(/selection=single/);
   await expect(page.locator("#comparison-status")).toContainText("comparison current");
@@ -289,6 +309,82 @@ test("restoring Market B restores the pair contract", async ({ page }) => {
   await page.reload();
   await expect(marketB).toHaveValue("dex:eth:uniswap_v3:AAVE/WETH:0.05%");
   expect(new URL(page.url()).searchParams.get("selection")).toBeNull();
+});
+
+test("saved single selection is applied from a route without market query", async ({ page }) => {
+  await page.addInitScript(() => {
+    sessionStorage.setItem("market-monitor:token-pairs:v1", JSON.stringify({
+      AAVE: {
+        marketA: "cex:binance:AAVE/USDT",
+        marketB: "",
+        selection: "single",
+      },
+    }));
+  });
+  await installApiRoutes(page);
+  await page.goto("/tokens/AAVE/markets");
+  await expect(page.getByLabel("Market A", { exact: true }))
+    .toHaveValue("cex:binance:AAVE/USDT");
+  await expect(page.getByLabel("Market B (optional)", { exact: true })).toHaveValue("");
+  await page.waitForFunction(() => (
+    app.workspaceAppliedSelection?.selection === "single"
+    && app.workspaceSelectionDirty === false
+  ));
+  await expect(page).toHaveURL(/marketA=cex%3Abinance%3AAAVE%2FUSDT/);
+  await expect(page).toHaveURL(/selection=single/);
+  await expect(page).not.toHaveURL(/marketB=/);
+  await expect(page).not.toHaveURL(/pairMode=/);
+});
+
+test("draft edit does not abort the applied pair request", async ({ page }) => {
+  let releasePair;
+  const pairGate = new Promise((resolve) => { releasePair = resolve; });
+  let pairRequestSeen;
+  const pairSeen = new Promise((resolve) => { pairRequestSeen = resolve; });
+  await page.route("**/api/markets/**", async (route) => {
+    const url = new URL(route.request().url());
+    let body = fixture.summary;
+    if (url.pathname.endsWith("/catalog")) body = fixture.catalog_pair;
+    else if (url.pathname.endsWith("/events")) body = overlayEvents;
+    else if (url.pathname.endsWith("/compare")) {
+      if (url.searchParams.get("selection") === "single") {
+        body = singleCompare;
+      } else {
+        pairRequestSeen();
+        await pairGate;
+        body = fixture.compare_pair;
+      }
+    }
+    try {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+    } catch {
+      // The deliberately delayed paired request may be aborted only after Apply succeeds.
+    }
+  });
+  await page.goto(
+    "/tokens/AAVE/compare?marketA=cex%3Abinance%3AAAVE%2FUSDT&marketB=dex%3Aeth%3Auniswap_v3%3AAAVE%2FWETH%3A0.05%25&start=2026-07-01&end=2026-07-30",
+    { waitUntil: "domcontentloaded" },
+  );
+  await pairSeen;
+  await page.getByRole("link", { name: "Change markets" }).click();
+  await expect(page).toHaveURL(/\/tokens\/AAVE\/markets\?/);
+  const beforeDraft = page.url();
+  const sessionBeforeDraft = await page.evaluate(() => (
+    sessionStorage.getItem("market-monitor:token-pairs:v1")
+  ));
+  await page.getByLabel("Market B (optional)", { exact: true }).selectOption("");
+  expect(page.url()).toBe(beforeDraft);
+  expect(await page.evaluate(() => (
+    sessionStorage.getItem("market-monitor:token-pairs:v1")
+  ))).toBe(sessionBeforeDraft);
+  await expect(page.locator("#compare-markets")).toBeEnabled();
+  await page.locator("#compare-markets").click();
+  await expect(page).toHaveURL(/selection=single/);
+  await expect(page.locator("#comparison-status")).toContainText("Market A current");
+  releasePair();
+  await page.waitForTimeout(100);
+  await expect(page.locator("#comparison-status")).toContainText("Market A current");
+  await expect(page.locator("#comparison-chart-legend")).not.toContainText("B · DEX");
 });
 
 test("invalid selection marker is not repaired", async ({ page }) => {
@@ -421,6 +517,12 @@ test("latest selection owns async responses", async ({ page }) => {
     app.workspaceSelection = "";
     app.route.state.marketB = b.value;
     delete app.route.state.selection;
+    setAppliedMarketSelection({
+      marketA: "cex:binance:AAVE/USDT",
+      marketB: b.value,
+      selection: "",
+    });
+    app.workspaceSelectionDirty = false;
     void loadComparison();
   });
   await expect(page.locator("#comparison-status")).toContainText("comparison current");

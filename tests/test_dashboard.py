@@ -4697,6 +4697,11 @@ class MarketMonitorServerTest(unittest.TestCase):
                 self.assertNotIn("market_b_statistics", result)
                 self.assertNotIn("latest_comparable_observation", result)
                 self.assertNotIn("comparison_days", result["metadata"])
+                self.assertNotIn("union_observation_days", result["metadata"])
+                self.assertEqual(
+                    result["metadata"]["observation_days"],
+                    len(expected_observations),
+                )
                 self.assertEqual(
                     result["latest_market_a_observation"],
                     result["observations"][-1],
@@ -4768,6 +4773,8 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertNotIn("market_b_statistics", result)
         self.assertNotIn("latest_comparable_observation", result)
         self.assertNotIn("comparison_days", result["metadata"])
+        self.assertNotIn("union_observation_days", result["metadata"])
+        self.assertEqual(result["metadata"]["observation_days"], 0)
         self.assertEqual(selected_rows.call_count, 1)
 
     def test_paired_compare_projection_is_unchanged_when_selection_is_absent(self):

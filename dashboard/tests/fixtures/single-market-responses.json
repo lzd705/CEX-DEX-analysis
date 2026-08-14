@@ -103,10 +103,9 @@
     "market_a": { "market_id": "cex:binance:AAVE/USDT", "market_type": "cex", "venue": "binance", "instrument": "AAVE/USDT" },
     "market_b": null,
     "market_a_statistics": { "window_return": 0.01, "daily_volatility": 0.02 },
-    "market_b_statistics": null,
-    "latest_comparable_observation": null,
-    "observations": [{ "date": "2026-07-30", "market_a_close": 300, "market_a_volume_usd": 900000 }],
-    "metadata": { "comparison_days": 0, "union_observation_days": 1 }
+    "latest_market_a_observation": { "date": "2026-07-30", "market_a": { "price_usd": 300, "volume_usd": 900000 } },
+    "observations": [{ "date": "2026-07-30", "market_a": { "price_usd": 300, "volume_usd": 900000 } }],
+    "metadata": { "observation_days": 1 }
   },
   "compare_pair": {
     "token_symbol": "AAVE",

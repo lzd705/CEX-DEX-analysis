@@ -30,6 +30,8 @@ const app = {
   pairSelections: {},
   pairSelectionSource: "",
   workspaceSelection: "",
+  workspaceAppliedSelection: null,
+  workspaceSelectionDirty: false,
   workspaceSelectionInvalid: false,
   routeReady: false,
   selections: {},
@@ -419,8 +421,34 @@ function selectedMarketSelection() {
   };
 }
 
+function normalizedWorkspaceSelectionState(selection = {}) {
+  return {
+    marketA: String(selection.marketA || ""),
+    marketB: String(selection.marketB || ""),
+    selection: selection.selection === "single" ? "single" : "",
+  };
+}
+
+function routeMarketSelection(route = app.route) {
+  return normalizedWorkspaceSelectionState(
+    route?.kind === "workspace" ? route.state || {} : {},
+  );
+}
+
+function appliedMarketSelection() {
+  if (app.workspaceAppliedSelection !== null) {
+    return normalizedWorkspaceSelectionState(app.workspaceAppliedSelection);
+  }
+  return selectedMarketSelection();
+}
+
+function setAppliedMarketSelection(selection = {}) {
+  app.workspaceAppliedSelection = normalizedWorkspaceSelectionState(selection);
+  return appliedMarketSelection();
+}
+
 function selectedPairState() {
-  const { marketA, marketB } = selectedMarketSelection();
+  const { marketA, marketB } = appliedMarketSelection();
   return { marketA, marketB };
 }
 
@@ -531,14 +559,14 @@ function currentScreenerFilters({ window = appliedTimeWindow() } = {}) {
 
 function currentWorkspaceRouteState(
   page,
-  { window = appliedTimeWindow() } = {},
+  { window = appliedTimeWindow(), marketSelection = null } = {},
 ) {
-  const state = selectedMarketSelection();
-  if (app.route?.kind === "workspace" && !app.catalog) {
-    state.marketA ||= app.route.state?.marketA || "";
-    state.marketB ||= app.route.state?.marketB || "";
-    state.selection ||= app.route.state?.selection === "single" ? "single" : "";
-  }
+  const state = normalizedWorkspaceSelectionState(
+    marketSelection
+      || (app.workspaceSelectionDirty
+        ? routeMarketSelection()
+        : appliedMarketSelection()),
+  );
   if (app.pairSelectionSource === "transient") state.pairMode = "transient";
   if (!state.marketA || (!state.marketB && state.selection !== "single")) {
     state.pairMode = "manual";
@@ -563,13 +591,13 @@ function currentWorkspaceRouteState(
 
 function currentWorkspacePath(
   page = app.route?.page || "markets",
-  { window = appliedTimeWindow() } = {},
+  { window = appliedTimeWindow(), marketSelection = null } = {},
 ) {
   if (!navigation) return "/screener";
   return navigation.buildWorkspacePath(
     selectedWorkspaceToken(),
     page,
-    currentWorkspaceRouteState(page, { window }),
+    currentWorkspaceRouteState(page, { window, marketSelection }),
   );
 }
 
@@ -1087,6 +1115,8 @@ function applyWorkspaceRoute(route) {
     ? "transient"
     : "";
   app.workspaceSelection = route.state?.selection || "";
+  setAppliedMarketSelection({});
+  app.workspaceSelectionDirty = false;
   app.workspaceSelectionInvalid = false;
   byId("facts-token").value = exactToken;
   const markets = factsMarketsForToken(exactToken);
@@ -1109,6 +1139,7 @@ function applyWorkspaceRoute(route) {
     ));
     app.workspaceSelectionInvalid = invalidReferenceErrors.length > 0;
     if (app.workspaceSelectionInvalid) {
+      app.workspaceSelectionDirty = true;
       populateFactsMarkets({
         requestedA: "",
         requestedB: "",
@@ -1128,6 +1159,15 @@ function applyWorkspaceRoute(route) {
       );
     } else {
       app.workspaceSelection = validation.mode === "single" ? "single" : "";
+      if (validation.valid) {
+        setAppliedMarketSelection({
+          marketA: validation.marketA.market_id,
+          marketB: validation.marketB?.market_id || "",
+          selection: validation.mode === "single" ? "single" : "",
+        });
+      } else {
+        app.workspaceSelectionDirty = true;
+      }
       populateFactsMarkets({
         requestedA: validation.marketA?.market_id || "",
         requestedB: validation.marketB?.market_id || "",
@@ -1145,6 +1185,7 @@ function applyWorkspaceRoute(route) {
       hideStatus(byId("workspace-context-notice"));
     }
   } else {
+    app.workspaceSelectionDirty = true;
     const savedValidation = savedSelection
       ? validateWorkspaceSelection(
         markets,
@@ -1155,6 +1196,8 @@ function applyWorkspaceRoute(route) {
       : null;
     if (savedValidation?.valid) {
       app.workspaceSelection = savedSelection.selection;
+      setAppliedMarketSelection(savedSelection);
+      app.workspaceSelectionDirty = false;
       populateFactsMarkets({
         requestedA: savedSelection.marketA,
         requestedB: savedSelection.marketB,
@@ -1163,7 +1206,7 @@ function applyWorkspaceRoute(route) {
       });
     } else {
       app.workspaceSelection = "";
-      populateFactsMarkets();
+      populateFactsMarkets({ persistSelection: false });
     }
     showStatus(
       byId("workspace-context-notice"),
@@ -1198,7 +1241,7 @@ function applyWorkspaceRoute(route) {
   }
   setActiveAppView("workspace");
   setActiveWorkspacePage(route.page);
-  applyWorkspaceSelectionMode(app.workspaceSelection);
+  applyWorkspaceSelectionMode(appliedMarketSelection().selection);
   renderWorkspaceContext();
   renderWorkspaceMarkets();
   renderQualityFromCatalog();
@@ -1239,6 +1282,8 @@ function setWorkspaceCatalogLoading(
 ) {
   if (!preserveGlobalError) hideError(byId("global-error"));
   const retainCatalog = app.activeCatalogKey === catalogKey && app.catalog;
+  setAppliedMarketSelection({});
+  app.workspaceSelectionDirty = true;
   invalidateComparisonRequest();
   invalidateExecutionRequest();
   invalidateQualityRequest();
@@ -1319,6 +1364,8 @@ function setWorkspaceCatalogLoading(
 
 function setWorkspaceDataUnavailable(token, message) {
   const exactToken = String(token || "Selected Token").toUpperCase();
+  setAppliedMarketSelection({});
+  app.workspaceSelectionDirty = true;
   app.catalog = null;
   app.activeCatalogToken = "";
   app.activeCatalogKey = "";
@@ -3161,7 +3208,7 @@ function snapshotRefreshInlineStatus(button) {
 function snapshotRefreshRouteContext() {
   const route = app.route || { kind: "unknown" };
   const routeState = route.kind === "workspace" ? route.state || {} : route.filters || {};
-  const selected = route.kind === "workspace" ? selectedMarketSelection() : {};
+  const selected = route.kind === "workspace" ? appliedMarketSelection() : {};
   const location = globalThis.window?.location;
   return JSON.stringify({
     kind: route.kind || "unknown",
@@ -4318,7 +4365,7 @@ function executionRequestIsCurrent(requestId, requestKey, selection) {
 async function loadExecutionCost() {
   const requestId = invalidateExecutionRequest();
   const token = selectedWorkspaceToken();
-  const selection = selectedMarketSelection();
+  const selection = appliedMarketSelection();
   const { marketA, marketB } = selection;
   const single = selection.selection === "single";
   if (!app.catalog || !token || !marketA || (single ? Boolean(marketB) : !marketB || marketA === marketB)) {
@@ -4399,7 +4446,7 @@ function qualityStatusTiers(counts) {
   };
 }
 
-function effectiveQualityScope(selection = selectedMarketSelection()) {
+function effectiveQualityScope(selection = appliedMarketSelection()) {
   return selection.selection === "single" ? "selected" : app.qualityScope;
 }
 
@@ -4435,7 +4482,7 @@ async function loadQuality() {
   const window = appliedTimeWindow();
   const requestId = invalidateQualityRequest();
   const token = selectedWorkspaceToken();
-  const selection = selectedMarketSelection();
+  const selection = appliedMarketSelection();
   const { marketA, marketB } = selection;
   const scope = effectiveQualityScope(selection);
   if (selection.selection === "single") app.qualityScope = "selected";
@@ -4784,7 +4831,7 @@ async function fetchEventFacts({
 async function loadEvents() {
   const requestId = invalidateEventRequest();
   const token = selectedWorkspaceToken();
-  const selection = selectedMarketSelection();
+  const selection = appliedMarketSelection();
   if (!app.catalog || !token) {
     showError(byId("events-error"), "Token catalog is unavailable.");
     return false;
@@ -5158,14 +5205,14 @@ function isMeasuredDepthStatus(market) {
   return MEASURED_DEPTH_STATUSES.has(market?.depth_status);
 }
 
-function selectedLiquidityMarkets() {
+function selectedLiquidityMarkets(selection = appliedMarketSelection()) {
   if (!app.catalog) return { token: "", marketA: null, marketB: null };
   const token = byId("facts-token").value;
   const markets = factsMarketsForToken(token);
   return {
     token,
-    marketA: markets.find((market) => market.market_id === byId("facts-market-a").value) || null,
-    marketB: markets.find((market) => market.market_id === byId("facts-market-b").value) || null,
+    marketA: markets.find((market) => market.market_id === selection.marketA) || null,
+    marketB: markets.find((market) => market.market_id === selection.marketB) || null,
   };
 }
 
@@ -5501,7 +5548,7 @@ function liquidityMarkerMarkup(series, point, x, y) {
 function renderLiquiditySvg(series) {
   const svg = byId("liquidity-chart");
   const emptyState = byId("liquidity-empty");
-  emptyState.textContent = app.workspaceSelection === "single"
+  emptyState.textContent = appliedMarketSelection().selection === "single"
     ? "No source-backed depth bands are available for Market A."
     : "No source-backed depth bands are available for the selected markets.";
   const dimensions = liquidityChartDimensions();
@@ -5796,9 +5843,9 @@ function renderLiquiditySummary(marketA, marketB, dataMarketA, dataMarketB, { si
 
 function renderLiquidityCurve() {
   if (!app.catalog) return;
-  const selection = selectedMarketSelection();
+  const selection = appliedMarketSelection();
   const single = selection.selection === "single" && !selection.marketB;
-  const { token, marketA, marketB } = selectedLiquidityMarkets();
+  const { token, marketA, marketB } = selectedLiquidityMarkets(selection);
   const issuesA = liquidityDepthIssues(marketA);
   const issuesB = single ? [] : liquidityDepthIssues(marketB);
   const dataMarketA = liquidityRenderableMarket(marketA, issuesA);
@@ -5941,7 +5988,7 @@ function populateFactsMarkets({
   requestedA = null,
   requestedB = null,
   allowDefaults = true,
-  persistSelection = app.pairSelectionSource !== "transient",
+  persistSelection = false,
 } = {}) {
   if (!app.catalog) return;
   const token = byId("facts-token").value;
@@ -6647,12 +6694,12 @@ function bindComparisonChartTooltipEvents() {
 }
 
 function setComparisonLoading(message) {
+  const single = appliedMarketSelection().selection === "single";
   app.comparison = null;
   app.eventFacts = null;
-  applyWorkspaceSelectionMode(app.workspaceSelection);
-  setComparisonDocumentCopy(app.workspaceSelection === "single");
+  applyWorkspaceSelectionMode(single ? "single" : "");
+  setComparisonDocumentCopy(single);
   byId("facts-workbench").setAttribute("aria-busy", "true");
-  byId("compare-markets").disabled = true;
   hideError(byId("comparison-error"));
   showStatus(byId("comparison-status"), message);
   [
@@ -6667,7 +6714,6 @@ function setComparisonLoading(message) {
   ].forEach((id) => {
     byId(id).textContent = "—";
   });
-  const single = app.workspaceSelection === "single";
   clearComparisonChart(single ? "Loading Market A…" : "Loading the selected markets…");
   byId("comparison-body").innerHTML = `<tr><td colspan="${single ? 3 : 8}" class="missing">${single ? "Loading Market A…" : "Loading the selected markets…"}</td></tr>`;
 }
@@ -6681,9 +6727,10 @@ function invalidateComparisonRequest() {
 }
 
 function clearComparisonResult(message = "") {
+  const single = appliedMarketSelection().selection === "single";
   app.comparison = null;
-  applyWorkspaceSelectionMode(app.workspaceSelection);
-  setComparisonDocumentCopy(app.workspaceSelection === "single");
+  applyWorkspaceSelectionMode(single ? "single" : "");
+  setComparisonDocumentCopy(single);
   [
     "compare-date",
     "compare-absolute",
@@ -6701,7 +6748,7 @@ function clearComparisonResult(message = "") {
   byId("market-b-price-heading").textContent = "Market B Price (USD)";
   byId("market-b-volume-heading").textContent = "Market B Volume (USD)";
   clearComparisonChart(message || "No current comparison result.");
-  byId("comparison-body").innerHTML = `<tr><td colspan="${app.workspaceSelection === "single" ? 3 : 8}" class="missing">No current result.</td></tr>`;
+  byId("comparison-body").innerHTML = `<tr><td colspan="${single ? 3 : 8}" class="missing">No current result.</td></tr>`;
   hideStatus(byId("comparison-status"));
   if (message) showError(byId("comparison-error"), message);
   else hideError(byId("comparison-error"));
@@ -6772,7 +6819,7 @@ function renderSingleComparison(payload) {
   hideError(byId("comparison-error"));
   showStatus(
     byId("comparison-status"),
-    `${payload.token_symbol} Market A current · ${payload.metadata?.union_observation_days || 0} observation days.`,
+    `${payload.token_symbol} Market A current · ${payload.metadata?.observation_days ?? 0} observation days.`,
     "success",
   );
   byId("facts-workbench").setAttribute("aria-busy", "false");
@@ -6918,13 +6965,8 @@ async function loadComparison() {
     return false;
   }
   const token = byId("facts-token").value;
-  const marketA = byId("facts-market-a").value;
-  const marketB = byId("facts-market-b").value;
-  const selection = {
-    marketA,
-    marketB,
-    selection: app.workspaceSelection === "single" ? "single" : "",
-  };
+  const selection = appliedMarketSelection();
+  const { marketA, marketB } = selection;
   const single = selection.selection === "single";
   if (!token || !marketA || (single ? Boolean(marketB) : !marketB || marketA === marketB)) {
     clearComparisonResult(
@@ -7356,9 +7398,8 @@ async function applyWindow(candidate = draftTimeWindow()) {
   return true;
 }
 
-function persistSelectedSelection() {
+function persistSelectedSelection(selection = selectedMarketSelection()) {
   const token = selectedWorkspaceToken();
-  const selection = selectedMarketSelection();
   const markets = app.catalog && token ? factsMarketsForToken(token) : [];
   const validation = validateWorkspaceSelection(
     markets,
@@ -7393,7 +7434,7 @@ function clearScreenerQualityDrilldown({ pairComplete = false } = {}) {
 }
 
 function applySelectedSelection() {
-  const draft = selectedMarketSelection();
+  let draft = selectedMarketSelection();
   if (
     draft.marketA
     && !draft.marketB
@@ -7401,15 +7442,15 @@ function applySelectedSelection() {
     && ["", "single"].includes(app.workspaceSelection)
   ) {
     app.workspaceSelection = "single";
+    draft = selectedMarketSelection();
   }
-  if (!persistSelectedSelection()) {
-    const attempted = selectedMarketSelection();
-    const validation = validateWorkspaceSelection(
-      app.catalog ? factsMarketsForToken(selectedWorkspaceToken()) : [],
-      attempted.marketA,
-      attempted.marketB,
-      app.workspaceSelection,
-    );
+  const validation = validateWorkspaceSelection(
+    app.catalog ? factsMarketsForToken(selectedWorkspaceToken()) : [],
+    draft.marketA,
+    draft.marketB,
+    draft.selection,
+  );
+  if (!validation?.valid) {
     const codes = validation?.errors?.map((error) => error.code).join(", ") || "selection_invalid";
     showStatus(
       byId("workspace-context-notice"),
@@ -7418,7 +7459,25 @@ function applySelectedSelection() {
     );
     return false;
   }
-  navigateTo(currentWorkspacePath("compare"));
+  const appliedSelection = {
+    marketA: validation.marketA.market_id,
+    marketB: validation.marketB?.market_id || "",
+    selection: validation.mode === "single" ? "single" : "",
+  };
+  if (!persistSelectedSelection(appliedSelection)) return false;
+  setAppliedMarketSelection(appliedSelection);
+  app.workspaceSelectionDirty = false;
+  clearScreenerQualityDrilldown({
+    pairComplete: validation.mode === "pair",
+  });
+  invalidateSnapshotRefreshRequest({ clearFeedback: true });
+  invalidateComparisonRequest();
+  invalidateExecutionRequest();
+  invalidateQualityRequest();
+  invalidateEventRequest();
+  navigateTo(currentWorkspacePath("compare", {
+    marketSelection: appliedSelection,
+  }));
   return true;
 }
 
@@ -7440,7 +7499,7 @@ function selectWorkspaceMarket(slot, marketIdValue) {
   const otherSlot = slot === "a" ? "b" : "a";
   const other = byId(`facts-market-${otherSlot}`);
   target.value = marketIdValue;
-  app.workspaceSelectionInvalid = false;
+  app.workspaceSelectionDirty = true;
   if (slot === "b") {
     app.workspaceSelection = marketIdValue ? "" : "single";
   }
@@ -7452,18 +7511,13 @@ function selectWorkspaceMarket(slot, marketIdValue) {
       `Market ${otherSlot.toUpperCase()} was cleared because A and B must be different. Choose another market explicitly.`,
       "stale",
     );
-  } else if (persistSelectedSelection()) {
-    hideStatus(byId("workspace-context-notice"));
+  } else {
+    showStatus(
+      byId("workspace-context-notice"),
+      "Selection changed. Apply selection to update the research pages.",
+      "stale",
+    );
   }
-  const pair = selectedPairState();
-  clearScreenerQualityDrilldown({
-    pairComplete: Boolean(
-      pair.marketA && pair.marketB && pair.marketA !== pair.marketB
-    ),
-  });
-  persistSelectedSelection();
-  replaceCurrentRoute();
-  refreshWorkspacePageData();
 }
 
 function selectWorkspaceToken(newToken) {

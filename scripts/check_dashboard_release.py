@@ -4229,6 +4229,11 @@ def validate_comparison(
     )
     if expected_mode == "single":
         require(
+            type(metadata.get("observation_days")) is int
+            and metadata["observation_days"] == len(observations),
+            "Compare observation-day count differs from daily observations",
+        )
+        require(
             all(set(row) == {"date", "market_a"} for row in observations),
             "Compare leaked pair-derived observation fields",
         )

@@ -2087,7 +2087,7 @@ globalThis.MarketMonitorNavigation = {
             )
         )
         self.assertIn(
-            "marketA=cex%3Acoinbase%3ABTC%2FUSD",
+            "marketA=cex%3Abinance%3ABTC%2FUSDT",
             result["queryOnlyMutation"]["routeAfterQueryMutation"],
         )
         self.assertTrue(
@@ -2096,13 +2096,13 @@ globalThis.MarketMonitorNavigation = {
             )
         )
         self.assertEqual(result["queryOnlyMutation"]["committedQuery"], {
-            "marketA": "cex:coinbase:BTC/USD",
+            "marketA": "cex:binance:BTC/USDT",
             "marketB": "dex:uniswap:BTC/USDC",
             "start": "2026-07-23",
             "end": "2026-07-29",
         })
         self.assertNotIn(
-            "cex%3Abinance%3ABTC%2FUSDT",
+            "cex%3Acoinbase%3ABTC%2FUSD",
             result["queryOnlyMutation"]["routeAfterSummary"],
         )
         self.assertEqual(result["staleFailure"], {
@@ -5405,7 +5405,7 @@ renderComparison({
     date: "2026-07-30",
     market_a: { price_usd: 300, volume_usd: 0 },
   }],
-  metadata: { union_observation_days: 1 },
+  metadata: { observation_days: 1 },
 });
 const populated = {
   body: nodes.get("comparison-body").innerHTML,
@@ -5432,7 +5432,7 @@ renderComparison({
   market_a_statistics: { window_return: null, daily_volatility: null },
   latest_market_a_observation: null,
   observations: [],
-  metadata: { union_observation_days: 0 },
+  metadata: { observation_days: 0 },
 });
 console.log(JSON.stringify({
   populated,
@@ -5456,6 +5456,7 @@ console.log(JSON.stringify({
         self.assertIn("Market A", populated["caption"])
         self.assertIn("Market A", populated["regionLabel"])
         self.assertIn("Market A current", populated["status"])
+        self.assertIn("1 observation days", populated["status"])
         self.assertIn('colspan="3"', result["emptyBody"])
         self.assertIn("No observations", result["emptyBody"])
         self.assertIn('class="na-disclosure"', result["emptyDate"])
@@ -5494,6 +5495,11 @@ app.route = {
   state: { marketA: "cex:binance:AAVE/USDT", selection: "single", start: "2026-07-01", end: "2026-07-30" },
 };
 app.payload = { metadata: { start_date: "2026-07-01", end_date: "2026-07-30" } };
+setAppliedMarketSelection({
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "",
+  selection: "single",
+});
 setComparisonLoading = () => {};
 clearComparisonResult = (message) => { app.errorMessage = message; };
 fetchEventFacts = async () => ({ availability: { status: "available" }, events: [] });
@@ -5611,6 +5617,62 @@ console.log(JSON.stringify({
         self.assertNotIn("selected markets", result["chartMessage"])
         self.assertEqual(result["plotLabel"], "Interactive daily Market A chart")
 
+    def test_unapplied_single_draft_does_not_change_pair_loading_or_empty_copy(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    disabled: false, attributes: {}, clientWidth: 900,
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map();
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+  querySelectorAll() { return []; },
+};
+global.window = {
+  matchMedia() { return { matches: false }; },
+};
+setAppliedMarketSelection({
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "dex:eth:uniswap_v3:AAVE/WETH:0.05%",
+  selection: "",
+});
+nodes.set("facts-market-a", control("cex:binance:AAVE/USDT"));
+nodes.set("facts-market-b", control(""));
+app.workspaceSelection = "single";
+app.workspaceSelectionDirty = true;
+let chartMessage = "";
+clearComparisonChart = (message) => { chartMessage = message; };
+setComparisonLoading("Loading applied selection…");
+renderLiquiditySvg([]);
+console.log(JSON.stringify({
+  chartMessage,
+  body: nodes.get("comparison-body").innerHTML,
+  plotLabel: nodes.get("comparison-plot").attributes["aria-label"],
+  liquidityEmpty: nodes.get("liquidity-empty").textContent,
+}));
+"""
+        )
+
+        self.assertEqual(result["chartMessage"], "Loading the selected markets…")
+        self.assertIn('colspan="8"', result["body"])
+        self.assertEqual(
+            result["plotLabel"],
+            "Interactive daily market comparison chart",
+        )
+        self.assertEqual(
+            result["liquidityEmpty"],
+            "No source-backed depth bands are available for the selected markets.",
+        )
+
     def test_delayed_single_response_cannot_overwrite_new_pair(self):
         result = run_app_javascript(
             r"""
@@ -5666,6 +5728,11 @@ const pairPayload = {
   elements.get("facts-market-b").value = marketB;
   app.workspaceSelection = "";
   app.route.state = { marketA: "cex:binance:AAVE/USDT", marketB, start: "2026-07-01", end: "2026-07-30" };
+  setAppliedMarketSelection({
+    marketA: "cex:binance:AAVE/USDT",
+    marketB,
+    selection: "",
+  });
   const newPair = loadComparison();
   await Promise.resolve();
   pending.find((item) => item.url.includes("market_b=")).resolve({
@@ -5698,6 +5765,11 @@ global.document = { getElementById(id) { return elements[id] || null; } };
 global.window = { location: { pathname: "/tokens/AAVE/compare", search: "" } };
 app.route = { kind: "workspace", token: "AAVE", page: "compare", state: {} };
 app.workspaceSelection = "";
+setAppliedMarketSelection({
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "dex:eth:uniswap_v3:AAVE/WETH:0.05%",
+  selection: "",
+});
 const pairContext = snapshotRefreshRouteContext();
 const owner = {
   requestId: 1,
@@ -5709,6 +5781,11 @@ app.snapshotRefreshRequestId = 1;
 app.snapshotRefreshController = owner.controller;
 elements["facts-market-b"].value = "";
 app.workspaceSelection = "single";
+setAppliedMarketSelection({
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "",
+  selection: "single",
+});
 const singleContext = snapshotRefreshRouteContext();
 console.log(JSON.stringify({
   pairContext,
@@ -5724,7 +5801,7 @@ console.log(JSON.stringify({
 
 
 
-    def test_pair_identity_change_clears_screener_drilldown(self):
+    def test_market_identity_change_stays_draft_until_apply(self):
         result = run_app_javascript(
             """
 function control(value = "") {
@@ -5740,40 +5817,90 @@ const nodes = {
 global.document = { getElementById(id) { return nodes[id] || control(); } };
 global.window = {
   location: { pathname: "/tokens/AAVE/quality", search: "?scope=all&severity=warning&origin=screener" },
-  history: { replaceState(_a, _b, path) { this.path = path; } },
-  localStorage: { setItem() {}, removeItem() {} },
+  history: { replaceState() { throw new Error("draft must not replace URL"); } },
+  sessionStorage: { setItem() { writes += 1; } },
 };
-app.route = { kind: "workspace", token: "AAVE", page: "quality", state: {} };
+app.payload = { metadata: { start_date: "2026-07-01", end_date: "2026-07-30" } };
+app.catalog = { markets: [
+  { token_symbol: "AAVE", market_id: "cex:binance:AAVE/USDT" },
+  { token_symbol: "AAVE", market_id: "cex:coinbase:AAVE/USD" },
+  { token_symbol: "AAVE", market_id: "dex:eth:uniswap:pool:AAVE" },
+] };
+app.route = { kind: "workspace", token: "AAVE", page: "quality", state: {
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "dex:eth:uniswap:pool:AAVE",
+} };
+app.workspaceAppliedSelection = {
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "dex:eth:uniswap:pool:AAVE",
+  selection: "",
+};
 app.routeReady = true;
 app.qualityScope = "all";
 app.qualityOrigin = "screener";
 app.qualitySeverity = "warning";
-app.pairSelections = {};
-renderFactsMarketWarnings = () => {};
-renderWorkspaceContext = () => {};
-renderWorkspaceMarkets = () => {};
-renderQualityFromCatalog = () => {};
-renderLiquidityCurve = () => {};
-loadQuality = () => {};
-updateRouteLinks = () => {};
+app.pairSelections = { AAVE: {
+  marketA: "cex:binance:AAVE/USDT",
+  marketB: "dex:eth:uniswap:pool:AAVE",
+} };
+let writes = 0;
+let refreshes = 0;
+let replacements = 0;
+const navigations = [];
+const invalidations = { snapshot: 0, compare: 0, execution: 0, quality: 0, events: 0 };
+refreshWorkspacePageData = () => { refreshes += 1; };
+replaceCurrentRoute = () => { replacements += 1; };
+navigateTo = (path) => { navigations.push(path); };
+invalidateSnapshotRefreshRequest = () => { invalidations.snapshot += 1; };
+invalidateComparisonRequest = () => { invalidations.compare += 1; };
+invalidateExecutionRequest = () => { invalidations.execution += 1; };
+invalidateQualityRequest = () => { invalidations.quality += 1; };
+invalidateEventRequest = () => { invalidations.events += 1; };
 selectWorkspaceMarket("a", "cex:coinbase:AAVE/USD");
-const pairPath = window.history.path;
-app.qualityOrigin = "screener";
-app.qualitySeverity = "critical";
-app.qualityScope = "selected";
-let tokenPath = "";
-navigateTo = (path) => { tokenPath = path; };
-selectWorkspaceToken("RAY");
-console.log(JSON.stringify({
+const beforeApply = {
   origin: app.qualityOrigin,
   severity: app.qualitySeverity,
   scope: app.qualityScope,
-  pairPath,
-  tokenPath,
+  saved: { ...app.pairSelections.AAVE },
+  writes,
+  refreshes,
+  replacements,
+  navigations: [...navigations],
+  invalidations: { ...invalidations },
+};
+const applied = applySelectedSelection();
+console.log(JSON.stringify({
+  beforeApply,
+  applied,
+  afterApply: {
+    origin: app.qualityOrigin,
+    severity: app.qualitySeverity,
+    scope: app.qualityScope,
+    saved: app.pairSelections.AAVE,
+    writes,
+    refreshes,
+    replacements,
+    navigations,
+    invalidations,
+  },
 }));
 """,
             prelude="""
 globalThis.MarketMonitorNavigation = {
+  validateSelection(markets, marketA, marketB, selection = "") {
+    const byId = new Map(markets.map((market) => [market.market_id, market]));
+    const single = selection === "single";
+    const valid = Boolean(byId.has(marketA) && (single
+      ? !marketB
+      : byId.has(marketB) && marketA !== marketB));
+    return {
+      valid,
+      mode: valid ? (single ? "single" : "pair") : null,
+      marketA: byId.get(marketA) || null,
+      marketB: single ? null : byId.get(marketB) || null,
+      errors: valid ? [] : [{ code: "selection_invalid" }],
+    };
+  },
   buildWorkspacePath(token, page, state = {}) {
     const query = new URLSearchParams();
     Object.entries(state).forEach(([key, value]) => {
@@ -5796,17 +5923,50 @@ globalThis.MarketMonitorNavigation = {
 };
 """,
         )
+        before = result["beforeApply"]
+        self.assertEqual(before["origin"], "screener")
+        self.assertEqual(before["severity"], "warning")
+        self.assertEqual(before["scope"], "all")
+        self.assertEqual(
+            before["saved"],
+            {
+                "marketA": "cex:binance:AAVE/USDT",
+                "marketB": "dex:eth:uniswap:pool:AAVE",
+            },
+        )
+        self.assertEqual(before["writes"], 0)
+        self.assertEqual(before["refreshes"], 0)
+        self.assertEqual(before["replacements"], 0)
+        self.assertEqual(before["navigations"], [])
+        self.assertEqual(
+            before["invalidations"],
+            {"snapshot": 0, "compare": 0, "execution": 0, "quality": 0, "events": 0},
+        )
 
-        self.assertEqual(result["origin"], "")
-        self.assertEqual(result["severity"], "")
-        self.assertEqual(result["scope"], "all")
-        for path in (result["pairPath"], result["tokenPath"]):
-            self.assertNotIn("origin=", path)
-            self.assertNotIn("severity=", path)
-        self.assertNotIn("marketA=", result["tokenPath"])
-        self.assertNotIn("marketB=", result["tokenPath"])
-        self.assertIn("/tokens/RAY/quality", result["tokenPath"])
-
+        self.assertTrue(result["applied"])
+        after = result["afterApply"]
+        self.assertEqual(after["origin"], "")
+        self.assertEqual(after["severity"], "")
+        self.assertEqual(after["scope"], "selected")
+        self.assertEqual(
+            after["saved"],
+            {
+                "marketA": "cex:coinbase:AAVE/USD",
+                "marketB": "dex:eth:uniswap:pool:AAVE",
+            },
+        )
+        self.assertEqual(after["writes"], 1)
+        self.assertEqual(after["refreshes"], 0)
+        self.assertEqual(after["replacements"], 0)
+        self.assertEqual(len(after["navigations"]), 1)
+        self.assertEqual(
+            after["invalidations"],
+            {"snapshot": 1, "compare": 1, "execution": 1, "quality": 1, "events": 1},
+        )
+        self.assertIn("marketA=cex%3Acoinbase%3AAAVE%2FUSD", after["navigations"][0])
+        self.assertIn("marketB=dex%3Aeth%3Auniswap%3Apool%3AAAVE", after["navigations"][0])
+        self.assertNotIn("origin=", after["navigations"][0])
+        self.assertNotIn("severity=", after["navigations"][0])
     def test_catalog_fallback_keeps_screener_projection_after_quality_request_failure(self):
         result = run_app_javascript(
             """
@@ -6047,6 +6207,108 @@ globalThis.MarketMonitorNavigation = {
         self.assertNotIn("selection", result["empty"])
         self.assertEqual(result["empty"]["pairMode"], "manual")
         self.assertEqual(result["stored"]["BTC"]["selection"], "single")
+
+    def test_saved_selection_without_route_query_is_promoted_to_applied(self):
+        result = run_app_javascript(
+            r"""
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    disabled: false, attributes: {},
+    setAttribute(name, next) { this.attributes[name] = String(next); },
+    getAttribute(name) { return this.attributes[name] || null; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const nodes = new Map();
+global.document = {
+  getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, control());
+    return nodes.get(id);
+  },
+  querySelectorAll() { return []; },
+};
+global.window = {
+  location: { pathname: "/tokens/AAVE/markets", search: "" },
+  history: { replaceState() {} },
+};
+app.payload = {
+  metadata: { start_date: "2026-07-01", end_date: "2026-07-30" },
+  tokens: [{ token_symbol: "AAVE" }],
+};
+app.catalog = { markets: [
+  { token_symbol: "AAVE", market_id: "cex:binance:AAVE/USDT" },
+] };
+app.pairSelections = {
+  AAVE: {
+    marketA: "cex:binance:AAVE/USDT",
+    marketB: "",
+    selection: "single",
+  },
+};
+populateFactsMarkets = ({ requestedA = "", requestedB = "" } = {}) => {
+  document.getElementById("facts-market-a").value = requestedA;
+  document.getElementById("facts-market-b").value = requestedB;
+};
+hideError = () => {};
+showStatus = () => {};
+hideStatus = () => {};
+customWindowIsOpen = () => false;
+setDraftTimeWindow = () => {};
+syncTimeWindowControls = () => {};
+syncMarketPayloadForWindow = () => {};
+setActiveAppView = () => {};
+setActiveWorkspacePage = () => {};
+applyWorkspaceSelectionMode = () => {};
+renderWorkspaceContext = () => {};
+renderWorkspaceMarkets = () => {};
+renderQualityFromCatalog = () => {};
+updateFactsContract = () => {};
+applyWorkspaceRoute({
+  kind: "workspace",
+  token: "AAVE",
+  page: "markets",
+  state: {},
+});
+console.log(JSON.stringify({
+  applied: appliedMarketSelection(),
+  dirty: app.workspaceSelectionDirty,
+  routeState: currentWorkspaceRouteState("markets"),
+}));
+""",
+            prelude=r"""
+globalThis.MarketMonitorNavigation = {
+  validateSelection(markets, marketA, marketB, selection = "") {
+    const byId = new Map(markets.map((market) => [market.market_id, market]));
+    const valid = selection === "single" && byId.has(marketA) && !marketB;
+    return {
+      valid,
+      mode: valid ? "single" : null,
+      marketA: byId.get(marketA) || null,
+      marketB: null,
+      errors: valid ? [] : [{ code: "selection_invalid" }],
+    };
+  },
+};
+""",
+        )
+
+        self.assertEqual(
+            result["applied"],
+            {
+                "marketA": "cex:binance:AAVE/USDT",
+                "marketB": "",
+                "selection": "single",
+            },
+        )
+        self.assertFalse(result["dirty"])
+        self.assertEqual(
+            result["routeState"]["marketA"],
+            "cex:binance:AAVE/USDT",
+        )
+        self.assertEqual(result["routeState"]["selection"], "single")
+        self.assertEqual(result["routeState"]["marketB"], "")
+        self.assertNotIn("pairMode", result["routeState"])
 
 
 if __name__ == "__main__":
