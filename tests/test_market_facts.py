@@ -14,6 +14,7 @@ from dashboard.market_facts import (
     market_quality_assessment,
     market_series_statistics,
     select_primary_market,
+    single_market_daily_rows,
 )
 
 
@@ -84,6 +85,37 @@ class MarketFactKnownAnswerTests(unittest.TestCase):
         self.assertIsNone(result[0]["spread_bps"])
         self.assertEqual(result[1]["absolute_spread_usd"], 3.0)
         self.assertEqual(result[2]["missing_reason"], "market_a_missing")
+
+    def test_single_market_projection_preserves_zero_and_null(self):
+        rows = [
+            {
+                "date": "2026-01-01",
+                "price_usd": 100,
+                "volume_usd": 0,
+            },
+            {
+                "date": "2026-01-02",
+                "price_usd": None,
+                "volume_usd": None,
+            },
+        ]
+
+        self.assertEqual(
+            single_market_daily_rows(rows),
+            [
+                {
+                    "date": "2026-01-01",
+                    "market_a": {"price_usd": 100, "volume_usd": 0},
+                },
+                {
+                    "date": "2026-01-02",
+                    "market_a": {
+                        "price_usd": None,
+                        "volume_usd": None,
+                    },
+                },
+            ],
+        )
 
     def test_catalog_rejects_duplicate_global_market_ids(self):
         market = {

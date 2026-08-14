@@ -1332,3 +1332,19 @@ def compare_daily_rows(
             }
         )
     return observations
+
+
+def single_market_daily_rows(
+    rows_a: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project one raw series without manufacturing pair fields."""
+    return [
+        {
+            "date": row["date"],
+            "market_a": {
+                "price_usd": row.get("price_usd"),
+                "volume_usd": row.get("volume_usd"),
+            },
+        }
+        for row in rows_a
+    ]

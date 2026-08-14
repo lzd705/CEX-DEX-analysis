@@ -2042,7 +2042,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             handler.do_GET()
 
         send_json.assert_called_once_with(
-            {"error": "token, market_a, and market_b are required"},
+            {"error": "token is required"},
             400,
         )
 
@@ -4563,6 +4563,278 @@ class MarketMonitorServerTest(unittest.TestCase):
             1,
         )
 
+    def test_compare_requires_explicit_single_marker_when_market_b_missing(self):
+        market_a = "cex:binance:BTC/USDT"
+        with patch.object(
+            server,
+            "build_market_catalog",
+            side_effect=AssertionError("catalog must not be read"),
+        ) as build_catalog:
+            with self.assertRaisesRegex(
+                server.PublicClientRequestError,
+                "market_b is required unless selection=single",
+            ):
+                server.build_market_comparison("BTC", market_a, None)
+        build_catalog.assert_not_called()
+
+        with patch.object(
+            server,
+            "build_market_catalog",
+            side_effect=RuntimeError("catalog reached"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "catalog reached"):
+                server.build_market_comparison(
+                    "BTC",
+                    market_a,
+                    None,
+                    selection="single",
+                )
+
+    def test_single_selection_cardinality_rejects_conflicting_or_unknown_modes(self):
+        market_a = "cex:binance:BTC/USDT"
+        market_b = "dex:eth:uniswap:0xpool:BTC"
+
+        self.assertEqual(
+            server.validate_market_selection_cardinality(
+                market_a,
+                None,
+                "single",
+            ),
+            "single",
+        )
+        self.assertEqual(
+            server.validate_market_selection_cardinality(
+                market_a,
+                market_b,
+                None,
+            ),
+            "pair",
+        )
+        with self.assertRaisesRegex(
+            server.PublicClientRequestError,
+            "selection must be single when provided",
+        ):
+            server.validate_market_selection_cardinality(
+                market_a,
+                None,
+                "pair",
+            )
+        with self.assertRaisesRegex(
+            server.PublicClientRequestError,
+            "market_b must be omitted when selection=single",
+        ):
+            server.validate_market_selection_cardinality(
+                market_a,
+                market_b,
+                "single",
+            )
+
+    def test_compare_single_selection_returns_only_market_a_projection(self):
+        cases = (
+            (
+                "cex:binance:BTC/USDT",
+                [
+                    {
+                        "date": "2026-01-01",
+                        "market_a": {
+                            "price_usd": 100.0,
+                            "volume_usd": 1000.0,
+                        },
+                    },
+                    {
+                        "date": "2026-01-02",
+                        "market_a": {
+                            "price_usd": 102.0,
+                            "volume_usd": 1200.0,
+                        },
+                    },
+                ],
+            ),
+            (
+                "dex:eth:uniswap:0xpool:BTC",
+                [
+                    {
+                        "date": "2026-01-01",
+                        "market_a": {
+                            "price_usd": 101.0,
+                            "volume_usd": 300.0,
+                        },
+                    },
+                    {
+                        "date": "2026-01-02",
+                        "market_a": {
+                            "price_usd": 105.0,
+                            "volume_usd": 400.0,
+                        },
+                    },
+                ],
+            ),
+        )
+
+        for market_a_id, expected_observations in cases:
+            with self.subTest(market_a_id=market_a_id):
+                with patch.dict(
+                    server.os.environ,
+                    self.environment,
+                    clear=True,
+                ), patch.object(
+                    server,
+                    "selected_market_rows",
+                    wraps=server.selected_market_rows,
+                ) as selected_rows:
+                    result = server.build_market_comparison(
+                        "BTC",
+                        market_a_id,
+                        None,
+                        "2026-01-01",
+                        "2026-01-02",
+                        selection="single",
+                    )
+
+                self.assertEqual(result["selection_mode"], "single")
+                self.assertEqual(result["market_a"]["market_id"], market_a_id)
+                self.assertIsNone(result["market_b"])
+                self.assertNotIn("market_b_statistics", result)
+                self.assertNotIn("latest_comparable_observation", result)
+                self.assertNotIn("comparison_days", result["metadata"])
+                self.assertEqual(
+                    result["latest_market_a_observation"],
+                    result["observations"][-1],
+                )
+                self.assertEqual(result["observations"], expected_observations)
+                self.assertTrue(
+                    all(
+                        set(row) == {"date", "market_a"}
+                        for row in result["observations"]
+                    )
+                )
+                self.assertEqual(selected_rows.call_count, 1)
+                self.assertEqual(
+                    [
+                        call.args[0]["market_id"]
+                        for call in selected_rows.call_args_list
+                    ],
+                    [market_a_id],
+                )
+
+    def test_compare_single_empty_series_returns_bounded_na_without_pair_fields(self):
+        market_a_id = "cex:binance:BTC/USDT"
+        with patch.dict(
+            server.os.environ,
+            self.environment,
+            clear=True,
+        ), patch.object(
+            server,
+            "selected_market_rows",
+            return_value=[],
+        ) as selected_rows:
+            result = server.build_market_comparison(
+                "BTC",
+                market_a_id,
+                None,
+                "2026-01-01",
+                "2026-01-02",
+                selection="single",
+            )
+
+        self.assertEqual(result["observations"], [])
+        self.assertIsNone(result["latest_market_a_observation"])
+        self.assertEqual(
+            result["market_a_statistics"],
+            {
+                "price_usd": None,
+                "window_return": None,
+                "daily_volatility": None,
+                "first_observed_date": None,
+                "latest_observed_date": None,
+                "calendar_span_days": 0,
+                "requested_window_days": 2,
+                "coverage_expected_start": "2026-01-01",
+                "coverage_expected_end": "2026-01-02",
+                "coverage_start_method": "max_query_source_start",
+                "observation_count": 0,
+                "coverage_ratio": 0.0,
+                "missing_calendar_days": 2,
+                "return_interval_count": 0,
+                "skipped_gap_interval_count": 0,
+                "max_gap_days": None,
+                "window_return_method": "first_to_last_observed_close",
+                "daily_volatility_method": (
+                    "adjacent_utc_daily_log_returns_only_v1"
+                ),
+            },
+        )
+        self.assertIsNone(result["market_b"])
+        self.assertNotIn("market_b_statistics", result)
+        self.assertNotIn("latest_comparable_observation", result)
+        self.assertNotIn("comparison_days", result["metadata"])
+        self.assertEqual(selected_rows.call_count, 1)
+
+    def test_paired_compare_projection_is_unchanged_when_selection_is_absent(self):
+        with patch.dict(server.os.environ, self.environment, clear=True):
+            result = server.build_market_comparison(
+                "BTC",
+                "cex:binance:BTC/USDT",
+                "dex:eth:uniswap:0xpool:BTC",
+                "2026-01-01",
+                "2026-01-02",
+            )
+
+        self.assertEqual(
+            set(result),
+            {
+                "metadata",
+                "token_symbol",
+                "market_a",
+                "market_b",
+                "market_a_statistics",
+                "market_b_statistics",
+                "latest_comparable_observation",
+                "observations",
+            },
+        )
+        self.assertEqual(
+            set(result["metadata"]),
+            {
+                "catalog_version",
+                "time_grain",
+                "price_field",
+                "price_quote_asset",
+                "volume_quote_asset",
+                "comparison_formula",
+                "missing_value_rule",
+                "semantic_boundary",
+                "market_id_semantics",
+                "primary_selection",
+                "market_quality_thresholds",
+                "series_statistics",
+                "available_start",
+                "available_end",
+                "source_date_ranges",
+                "freshness",
+                "start_date",
+                "end_date",
+                "sources",
+                "storage",
+                "data_generation",
+                "comparison_generation",
+                "comparison_days",
+                "union_observation_days",
+            },
+        )
+        self.assertEqual(result["metadata"]["comparison_days"], 2)
+        self.assertEqual(result["metadata"]["union_observation_days"], 2)
+        self.assertEqual(result["token_symbol"], "BTC")
+        self.assertEqual(
+            result["market_a"]["market_id"],
+            "cex:binance:BTC/USDT",
+        )
+        self.assertEqual(
+            result["market_b"]["market_id"],
+            "dex:eth:uniswap:0xpool:BTC",
+        )
+        self.assertNotIn("selection_mode", result)
+
     def test_comparison_rejects_same_or_wrong_token_market(self):
         with patch.dict(server.os.environ, self.environment, clear=True):
             with self.assertRaisesRegex(ValueError, "must be different"):
@@ -5027,7 +5299,10 @@ class MarketMonitorServerTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "scope must"):
                 server.build_market_quality("BTC", "pair")
-            with self.assertRaisesRegex(ValueError, "are required"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "market_b is required unless selection=single",
+            ):
                 server.build_market_quality(
                     "BTC",
                     "selected",
@@ -6458,6 +6733,123 @@ class MarketMonitorServerTest(unittest.TestCase):
             ),
         )
 
+    def test_public_api_query_items_keeps_selection_in_projection_cache_key(self):
+        paired_query = {
+            "token": ["BTC"],
+            "market_a": ["cex:binance:BTC/USDT"],
+            "market_b": ["dex:eth:uniswap:0xpool:BTC"],
+        }
+        single_query = {
+            "token": ["BTC"],
+            "market_a": ["cex:binance:BTC/USDT"],
+            "selection": ["single"],
+        }
+        expected_pair = (
+            ("token", "BTC"),
+            ("market_a", "cex:binance:BTC/USDT"),
+            ("market_b", "dex:eth:uniswap:0xpool:BTC"),
+        )
+        expected_single = (
+            ("token", "BTC"),
+            ("market_a", "cex:binance:BTC/USDT"),
+            ("selection", "single"),
+        )
+
+        pair_items = server.public_api_query_items("compare", paired_query)
+        single_items = server.public_api_query_items("compare", single_query)
+
+        self.assertEqual(pair_items, expected_pair)
+        self.assertEqual(single_items, expected_single)
+        self.assertNotEqual(pair_items, single_items)
+        self.assertEqual(
+            server.public_api_query_items(
+                "compare",
+                {**paired_query, "unsupported": ["ignored"]},
+            ),
+            expected_pair,
+        )
+        self.assertEqual(
+            server.public_api_query_items(
+                "compare",
+                {**single_query, "unsupported": ["ignored"]},
+            ),
+            expected_single,
+        )
+
+    def test_public_response_cache_separates_pair_and_single_projections(self):
+        pair_items = (
+            ("token", "BTC"),
+            ("market_a", "cex:binance:BTC/USDT"),
+            ("market_b", "dex:eth:uniswap:0xpool:BTC"),
+        )
+        single_items = (
+            ("token", "BTC"),
+            ("market_a", "cex:binance:BTC/USDT"),
+            ("selection", "single"),
+        )
+        pair_literal = {
+            "selection_mode": "pair",
+            "observations": [{"projection": "pair-only"}],
+        }
+        single_literal = {
+            "selection_mode": "single",
+            "observations": [{"projection": "single-only"}],
+        }
+
+        def build_projection(route, query_items, source_signature=None):
+            self.assertEqual(route, "compare")
+            if query_items == pair_items:
+                return pair_literal
+            if query_items == single_items:
+                return single_literal
+            self.fail(f"unexpected query items: {query_items!r}")
+
+        def decode(response):
+            body, compressed = response
+            return json.loads(gzip.decompress(body) if compressed else body)
+
+        server._build_public_api_response_cached.cache_clear()
+        try:
+            with patch.dict(server.os.environ, self.environment, clear=True):
+                source_signature = server.api_source_signature()
+                with patch.object(
+                    server,
+                    "_build_public_api_payload",
+                    side_effect=build_projection,
+                ) as build_payload:
+                    first_pair = decode(
+                        server._build_public_api_response_cached(
+                            "compare",
+                            pair_items,
+                            source_signature,
+                            100,
+                        )
+                    )
+                    single = decode(
+                        server._build_public_api_response_cached(
+                            "compare",
+                            single_items,
+                            source_signature,
+                            100,
+                        )
+                    )
+                    second_pair = decode(
+                        server._build_public_api_response_cached(
+                            "compare",
+                            pair_items,
+                            source_signature,
+                            100,
+                        )
+                    )
+
+            self.assertEqual(build_payload.call_count, 2)
+            self.assertEqual(first_pair, pair_literal)
+            self.assertEqual(single, single_literal)
+            self.assertEqual(second_pair, pair_literal)
+            self.assertNotEqual(first_pair, single)
+        finally:
+            server._build_public_api_response_cached.cache_clear()
+
     def test_public_api_cold_miss_is_single_flight(self):
         server._build_public_api_response_cached.cache_clear()
         payload = {"metadata": {}, "markets": []}
@@ -7333,6 +7725,71 @@ assert.equal(
         self.assertEqual(payload["dex_pools"][0]["tvl_usd"], 5000)
 
 class DashboardApiTest(unittest.TestCase):
+    def test_single_selection_public_queries_fail_closed_before_payload_build(self):
+        cases = (
+            (
+                (
+                    "/api/markets/compare?token=BTC"
+                    "&market_a=cex%3Abinance%3ABTC%2FUSDT"
+                ),
+                "market_b is required unless selection=single",
+            ),
+            (
+                (
+                    "/api/markets/execution-cost?token=BTC"
+                    "&market_a=cex%3Abinance%3ABTC%2FUSDT"
+                    "&market_b=dex%3Aeth%3Auniswap%3A0xpool%3ABTC"
+                    "&selection=single"
+                ),
+                "market_b must be omitted when selection=single",
+            ),
+            (
+                "/api/markets/quality?token=BTC&scope=all&selection=single",
+                "selection is not supported when scope=all",
+            ),
+        )
+
+        for path, expected_error in cases:
+            with self.subTest(path=path):
+                handler = object.__new__(server.MarketMonitorHandler)
+                handler.path = path
+                handler.headers = {}
+                with patch.object(
+                    server,
+                    "api_source_signature",
+                    side_effect=AssertionError("source must not be read"),
+                ) as source_signature, patch.object(
+                    server,
+                    "_build_public_api_payload",
+                    side_effect=AssertionError("payload must not be built"),
+                ) as build_payload, patch.object(
+                    server,
+                    "build_market_comparison",
+                    side_effect=AssertionError("Compare must not be built"),
+                ) as build_compare, patch.object(
+                    server,
+                    "build_execution_cost_comparison",
+                    side_effect=AssertionError("Execution must not be built"),
+                ) as build_execution, patch.object(
+                    server,
+                    "build_market_quality",
+                    side_effect=AssertionError("Quality must not be built"),
+                ) as build_quality, patch.object(
+                    server.MarketMonitorHandler,
+                    "send_json",
+                ) as send_json:
+                    handler.do_GET()
+
+                send_json.assert_called_once_with(
+                    {"error": expected_error},
+                    400,
+                )
+                source_signature.assert_not_called()
+                build_payload.assert_not_called()
+                build_compare.assert_not_called()
+                build_execution.assert_not_called()
+                build_quality.assert_not_called()
+
     def test_public_api_metadata_exposes_fail_closed_fact_refresh_capability(self):
         source_payload = {
             "metadata": {"response_scope": "screener_summary"},

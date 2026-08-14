@@ -66,6 +66,7 @@ try:
         dex_market_id,
         enrich_market_quality,
         market_series_statistics,
+        single_market_daily_rows,
     )
     from scripts.quality_outcomes import (
         aggregate_daily_quality_status,
@@ -134,6 +135,7 @@ except ModuleNotFoundError:
         dex_market_id,
         enrich_market_quality,
         market_series_statistics,
+        single_market_daily_rows,
     )
     from scripts.quality_outcomes import (
         aggregate_daily_quality_status,
@@ -510,13 +512,21 @@ PUBLIC_API_QUERY_FIELDS = {
     "catalog": ("token", "start", "end"),
     "summary": ("start", "end"),
     "market": ("start", "end"),
-    "compare": ("token", "market_a", "market_b", "start", "end"),
-    "execution_cost": ("token", "market_a", "market_b"),
+    "compare": (
+        "token",
+        "market_a",
+        "market_b",
+        "selection",
+        "start",
+        "end",
+    ),
+    "execution_cost": ("token", "market_a", "market_b", "selection"),
     "quality": (
         "token",
         "scope",
         "market_a",
         "market_b",
+        "selection",
         "start",
         "end",
     ),
@@ -548,6 +558,34 @@ class DepthExecutionCohortError(RuntimeError):
 
 class PublicClientRequestError(ValueError):
     """A bounded public GET parameter error that is safe to return as HTTP 400."""
+
+
+def validate_market_selection_cardinality(
+    market_a_id: str | None,
+    market_b_id: str | None,
+    selection: str | None,
+) -> str:
+    if selection not in (None, "", "single"):
+        raise PublicClientRequestError(
+            "selection must be single when provided"
+        )
+    if not market_a_id:
+        raise PublicClientRequestError("market_a is required")
+    if selection == "single":
+        if market_b_id:
+            raise PublicClientRequestError(
+                "market_b must be omitted when selection=single"
+            )
+        return "single"
+    if not market_b_id:
+        raise PublicClientRequestError(
+            "market_b is required unless selection=single"
+        )
+    if market_a_id == market_b_id:
+        raise PublicClientRequestError(
+            "market_a and market_b must be different"
+        )
+    return "pair"
 
 ADMIN_STATIC_PATHS = {"/admin.html", "/admin.js", "/admin.css"}
 SPA_TOKEN_PAGES = {"markets", "compare", "liquidity", "events", "quality"}
@@ -3835,18 +3873,18 @@ def build_market_comparison(
     start: str | None = None,
     end: str | None = None,
     *,
+    selection: str | None = None,
     source_signature: SourceSignature | None = None,
 ) -> dict[str, Any]:
-    """Return aligned raw daily facts for two selected markets."""
-    if not token_symbol or not market_a_id or not market_b_id:
-        raise PublicClientRequestError(
-            "token, market_a, and market_b are required"
-        )
+    """Return raw daily facts for the intentional market selection."""
+    if not token_symbol:
+        raise PublicClientRequestError("token is required")
+    selection_mode = validate_market_selection_cardinality(
+        market_a_id,
+        market_b_id,
+        selection,
+    )
     token = token_symbol.upper()
-    if market_a_id == market_b_id:
-        raise PublicClientRequestError(
-            "market_a and market_b must be different"
-        )
 
     catalog = build_market_catalog(source_signature=source_signature)
     metadata = catalog["metadata"]
@@ -3862,30 +3900,22 @@ def build_market_comparison(
         if market["token_symbol"] == token
     }
     market_a = markets.get(market_a_id)
-    market_b = markets.get(market_b_id)
-    if market_a is None or market_b is None:
+    if market_a is None:
+        raise PublicClientRequestError(
+            "Selected market is not cataloged for the requested token"
+        )
+    market_b = markets.get(market_b_id) if selection_mode == "pair" else None
+    if selection_mode == "pair" and market_b is None:
         raise PublicClientRequestError(
             "Selected market is not cataloged for the requested token"
         )
 
-    rows_a = selected_market_rows(market_a, effective_start, effective_end)
-    rows_b = selected_market_rows(market_b, effective_start, effective_end)
-    statistics_a = market_series_statistics(
-        rows_a,
-        price_field="price_usd",
-        requested_start=effective_start,
-        requested_end=effective_end,
-    )
-    statistics_b = market_series_statistics(
-        rows_b,
-        price_field="price_usd",
-        requested_start=effective_start,
-        requested_end=effective_end,
-    )
-    observations = compare_daily_rows(rows_a, rows_b)
-    comparable = [row for row in observations if row["spread_bps"] is not None]
-    return {
-        "metadata": {
+    def comparison_metadata(
+        *,
+        observation_days: int,
+        comparison_days: int | None = None,
+    ) -> dict[str, Any]:
+        result = {
             **catalog_contract(),
             "available_start": metadata["available_start"],
             "available_end": metadata["available_end"],
@@ -3897,9 +3927,56 @@ def build_market_comparison(
             "storage": metadata["storage"],
             "data_generation": metadata["data_generation"],
             "comparison_generation": metadata["data_generation"],
-            "comparison_days": len(comparable),
-            "union_observation_days": len(observations),
-        },
+        }
+        if comparison_days is None:
+            result["observation_days"] = observation_days
+        else:
+            result["comparison_days"] = comparison_days
+            result["union_observation_days"] = observation_days
+        return result
+
+    rows_a = selected_market_rows(market_a, effective_start, effective_end)
+    statistics_a = market_series_statistics(
+        rows_a,
+        price_field="price_usd",
+        requested_start=effective_start,
+        requested_end=effective_end,
+    )
+    if selection_mode == "single":
+        observations = single_market_daily_rows(rows_a)
+        return {
+            "selection_mode": "single",
+            "metadata": comparison_metadata(
+                observation_days=len(observations),
+            ),
+            "token_symbol": token,
+            "market_a": market_a,
+            "market_b": None,
+            "market_a_statistics": statistics_a,
+            "latest_market_a_observation": (
+                observations[-1] if observations else None
+            ),
+            "observations": observations,
+        }
+
+    if market_b is None:  # pragma: no cover - guarded before A is loaded.
+        raise PublicClientRequestError(
+            "Selected market is not cataloged for the requested token"
+        )
+    rows_b = selected_market_rows(market_b, effective_start, effective_end)
+    statistics_b = market_series_statistics(
+        rows_b,
+        price_field="price_usd",
+        requested_start=effective_start,
+        requested_end=effective_end,
+    )
+    observations = compare_daily_rows(rows_a, rows_b)
+    comparable = [row for row in observations if row["spread_bps"] is not None]
+    return {
+        "metadata": comparison_metadata(
+            observation_days=len(observations),
+            comparison_days=len(comparable),
+        ),
         "token_symbol": token,
         "market_a": market_a,
         "market_b": market_b,
@@ -4279,17 +4356,17 @@ def build_execution_cost_comparison(
     market_a_id: str | None,
     market_b_id: str | None,
     *,
+    selection: str | None = None,
     source_signature: SourceSignature | None = None,
 ) -> dict[str, Any]:
     """Return source-backed fixed-notional facts for two exact catalog markets."""
-    if not token_symbol or not market_a_id or not market_b_id:
-        raise PublicClientRequestError(
-            "token, market_a, and market_b are required"
-        )
-    if market_a_id == market_b_id:
-        raise PublicClientRequestError(
-            "market_a and market_b must be different"
-        )
+    if not token_symbol:
+        raise PublicClientRequestError("token is required")
+    validate_market_selection_cardinality(
+        market_a_id,
+        market_b_id,
+        selection,
+    )
     token = token_symbol.upper()
     catalog = build_market_catalog(source_signature=source_signature)
     markets = {
@@ -5913,6 +5990,8 @@ def build_market_quality(
     market_b_id: str | None = None,
     start: str | None = None,
     end: str | None = None,
+    *,
+    selection: str | None = None,
 ) -> dict[str, Any]:
     """Return a fact-by-market quality inventory for one exact Token."""
     if not token_symbol:
@@ -5921,6 +6000,17 @@ def build_market_quality(
     normalized_scope = (scope or "all").strip().lower()
     if normalized_scope not in {"all", "selected"}:
         raise PublicClientRequestError("scope must be all or selected")
+    if normalized_scope == "all":
+        if selection not in (None, ""):
+            raise PublicClientRequestError(
+                "selection is not supported when scope=all"
+            )
+    else:
+        validate_market_selection_cardinality(
+            market_a_id,
+            market_b_id,
+            selection,
+        )
 
     catalog = build_token_market_catalog(
         token,
@@ -5938,14 +6028,6 @@ def build_market_quality(
     by_id = {market["market_id"]: market for market in token_markets}
     selected_ids: list[str] = []
     if normalized_scope == "selected":
-        if not market_a_id or not market_b_id:
-            raise PublicClientRequestError(
-                "market_a and market_b are required for selected scope"
-            )
-        if market_a_id == market_b_id:
-            raise PublicClientRequestError(
-                "market_a and market_b must be different"
-            )
         if market_a_id not in by_id or market_b_id not in by_id:
             raise PublicClientRequestError(
                 "Selected market is not cataloged for the requested token"
@@ -6623,29 +6705,30 @@ def _validate_public_api_client_query(
             "Token is required for a single-Token market catalog"
         )
     if route in {"compare", "execution_cost"}:
-        if not all(query.get(field) for field in ("token", "market_a", "market_b")):
-            raise PublicClientRequestError(
-                "token, market_a, and market_b are required"
-            )
-        if query["market_a"] == query["market_b"]:
-            raise PublicClientRequestError(
-                "market_a and market_b must be different"
-            )
+        if not query.get("token"):
+            raise PublicClientRequestError("token is required")
+        validate_market_selection_cardinality(
+            query.get("market_a"),
+            query.get("market_b"),
+            query.get("selection"),
+        )
     if route == "quality":
         if not query.get("token"):
             raise PublicClientRequestError("token is required")
         scope = (query.get("scope") or "all").strip().lower()
         if scope not in {"all", "selected"}:
             raise PublicClientRequestError("scope must be all or selected")
-        if scope == "selected":
-            if not query.get("market_a") or not query.get("market_b"):
+        if scope == "all":
+            if query.get("selection") not in (None, ""):
                 raise PublicClientRequestError(
-                    "market_a and market_b are required for selected scope"
+                    "selection is not supported when scope=all"
                 )
-            if query["market_a"] == query["market_b"]:
-                raise PublicClientRequestError(
-                    "market_a and market_b must be different"
-                )
+        else:
+            validate_market_selection_cardinality(
+                query.get("market_a"),
+                query.get("market_b"),
+                query.get("selection"),
+            )
     if route == "events":
         lifecycle = (query.get("lifecycle") or "").strip().lower()
         if lifecycle and lifecycle not in LIFECYCLES:
@@ -6694,6 +6777,7 @@ def _build_public_api_payload(
             market_b_id=query.get("market_b"),
             start=query.get("start"),
             end=query.get("end"),
+            selection=query.get("selection"),
             source_signature=source_signature,
         )
     elif route == "execution_cost":
@@ -6701,6 +6785,7 @@ def _build_public_api_payload(
             token_symbol=query.get("token"),
             market_a_id=query.get("market_a"),
             market_b_id=query.get("market_b"),
+            selection=query.get("selection"),
             source_signature=source_signature,
         )
     elif route == "quality":
@@ -6711,6 +6796,7 @@ def _build_public_api_payload(
             market_b_id=query.get("market_b"),
             start=query.get("start"),
             end=query.get("end"),
+            selection=query.get("selection"),
         )
     elif route == "events":
         payload = build_event_facts(
@@ -7109,6 +7195,7 @@ def build_public_api_response(
     accepts_gzip: bool,
 ) -> tuple[bytes, bool]:
     """Single-flight one route without blocking independent public endpoints."""
+    _validate_public_api_client_query(route, dict(query_items))
     with PUBLIC_API_ROUTE_LOCKS[route]:
         for _attempt in range(3):
             source_signature = api_source_signature()
