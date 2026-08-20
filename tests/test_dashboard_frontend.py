@@ -2346,7 +2346,7 @@ if (typeof openCustomWindowEditor !== "function") {
         index = INDEX_PATH.read_text(encoding="utf-8")
         styles = STYLES_PATH.read_text(encoding="utf-8")
 
-        self.assertIn("<h3>Token Market Coverage</h3>", index)
+        self.assertIn("<h3>Token Market Inventory</h3>", index)
         self.assertNotIn("Where this Token trades", index)
         self.assertIn('class="module-chip"', index)
 
@@ -2377,6 +2377,302 @@ if (typeof openCustomWindowEditor !== "function") {
         )
         self.assertIn("@media (max-width: 700px)", styles)
         self.assertIn("max-height: 52vh", styles)
+
+    def test_daily_close_coverage_names_the_ratio_and_missing_days(self):
+        result = run_app_javascript(
+            """
+const render = (row) => typeof dailyCoverageMarkup === "function"
+  ? dailyCoverageMarkup(row, {
+      token: "AAVE",
+      marketLabel: "CEX · binance · AAVE/USDT",
+      factLabel: "daily close coverage",
+    })
+  : "coverage renderer missing";
+console.log(JSON.stringify({
+  partial: render({
+    observation_count: 3,
+    requested_window_days: 4,
+    missing_calendar_days: 1,
+    coverage_ratio: 0.75,
+  }),
+  complete: render({
+    observation_count: 4,
+    requested_window_days: 4,
+    missing_calendar_days: 0,
+    coverage_ratio: 1,
+  }),
+  unavailable: render({
+    observation_count: null,
+    requested_window_days: null,
+    coverage_ratio: null,
+  }),
+}));
+"""
+        )
+        index = INDEX_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("<h3>Token Market Inventory</h3>", index)
+        self.assertIn("Daily Close Coverage", index)
+        self.assertIn("valid daily closes ÷ expected UTC calendar days", index)
+        self.assertIn("3 / 4 valid UTC days", result["partial"])
+        self.assertIn("75%", result["partial"])
+        self.assertIn(
+            "1 expected UTC day has no finite positive daily close",
+            result["partial"],
+        )
+        self.assertIn("4 / 4 valid UTC days", result["complete"])
+        self.assertIn("100%", result["complete"])
+        self.assertIn(
+            "All expected UTC days have a finite positive daily close",
+            result["complete"],
+        )
+        self.assertIn("N/A", result["unavailable"])
+        self.assertIn("numerator or expected-day denominator", result["unavailable"])
+
+    def test_market_inventory_filters_only_fresh_current_absences(self):
+        result = run_app_javascript(
+            """
+const controls = {
+  "facts-token": { value: "AAVE" },
+  "facts-market-a": { value: "" },
+  "facts-market-b": { value: "" },
+};
+global.document = { getElementById(id) { return controls[id] || null; } };
+const markets = [
+  {
+    market_id: "cex:binance:AAVE/USDT",
+    token_symbol: "AAVE",
+    market_type: "cex",
+    venue: "binance",
+    instrument: "AAVE/USDT",
+    quality_status: "ok",
+    window_metrics: { observation_count: 4, coverage_ratio: 1 },
+  },
+  {
+    market_id: "cex:crypto_com:AAVE/USDT",
+    token_symbol: "AAVE",
+    market_type: "cex",
+    venue: "crypto_com",
+    instrument: "AAVE/USDT",
+    quality_status: "info",
+    current_listing_status: "absent_from_official_current_catalog",
+    window_metrics: {
+      observation_count: null,
+      historical_observation_count: 7,
+      selected_window_observation_count: 2,
+      coverage_ratio: null,
+    },
+  },
+  {
+    market_id: "cex:crypto_com:AAVE/USD",
+    token_symbol: "AAVE",
+    market_type: "cex",
+    venue: "crypto_com",
+    instrument: "AAVE/USD",
+    quality_status: "info",
+    current_listing_status: "absent_from_official_current_catalog",
+    window_metrics: {
+      historical_observation_count: 4,
+      selected_window_observation_count: 0,
+    },
+  },
+  {
+    market_id: "cex:crypto_com:AAVE/USDC",
+    token_symbol: "AAVE",
+    market_type: "cex",
+    venue: "crypto_com",
+    instrument: "AAVE/USDC",
+    quality_status: "warning",
+    current_listing_status: "official_catalog_evidence_stale",
+    current_listing_reason_code: "official_catalog_evidence_stale",
+    window_metrics: null,
+  },
+];
+app.payload = {
+  metadata: { available_end: "2026-08-10" },
+  tokens: [{ token_symbol: "AAVE" }],
+};
+app.catalog = {
+  metadata: {
+    window_end: "2026-08-10",
+    market_quality_thresholds: { minimum_primary_coverage_ratio: 0.8 },
+  },
+  markets,
+};
+app.qualityScope = "all";
+const ids = (rows) => rows.map((market) => market.market_id);
+const current = {
+  mode: marketInventoryMode(),
+  description: marketInventoryModeDescription(),
+  visible: ids(researchMarketsForToken("AAVE")),
+  quality: catalogQualityPayload().markets.map((entry) => entry.market.market_id),
+};
+app.catalog.metadata.window_end = "2026-08-01";
+const historical = {
+  mode: marketInventoryMode(),
+  description: marketInventoryModeDescription(),
+  visible: ids(researchMarketsForToken("AAVE")),
+};
+console.log(JSON.stringify({ current, historical }));
+"""
+        )
+
+        active = "cex:binance:AAVE/USDT"
+        observed_absence = "cex:crypto_com:AAVE/USDT"
+        unobserved_absence = "cex:crypto_com:AAVE/USD"
+        stale = "cex:crypto_com:AAVE/USDC"
+        self.assertEqual(result["current"]["mode"], "current")
+        self.assertIn("fresh official current-catalog absences are hidden", result["current"]["description"])
+        self.assertIn("stale evidence remains visible", result["current"]["description"])
+        self.assertEqual(result["current"]["visible"], [active, stale])
+        self.assertEqual(
+            result["current"]["quality"],
+            [active, observed_absence, unobserved_absence, stale],
+        )
+        self.assertEqual(result["historical"]["mode"], "historical")
+        self.assertIn("selected window contains daily observations", result["historical"]["description"])
+        self.assertEqual(
+            result["historical"]["visible"],
+            [active, observed_absence, stale],
+        )
+
+    def test_workspace_url_pair_validation_uses_visible_market_inventory(self):
+        result = run_app_javascript(
+            """
+function control(value = "") {
+  return {
+    value, hidden: false, textContent: "", innerHTML: "", dataset: {},
+    attributes: {}, setAttribute(name, next) { this.attributes[name] = next; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  };
+}
+const controls = new Map([
+  ["facts-token", control("AAVE")],
+  ["facts-market-a", control()],
+  ["facts-market-b", control()],
+  ["global-error", control()],
+  ["workspace-context-notice", control()],
+  ["facts-workbench", control()],
+]);
+global.document = {
+  getElementById(id) {
+    if (!controls.has(id)) controls.set(id, control());
+    return controls.get(id);
+  },
+};
+global.window = { history: { replaceState() {} }, location: { pathname: "", search: "" } };
+app.payload = {
+  metadata: { available_end: "2026-08-10" },
+  tokens: [{ token_symbol: "AAVE" }],
+};
+app.catalog = {
+  metadata: { window_end: "2026-08-10" },
+  markets: [
+    {
+      market_id: "cex:binance:AAVE/USDT", token_symbol: "AAVE",
+      market_type: "cex", venue: "binance", instrument: "AAVE/USDT",
+    },
+    {
+      market_id: "cex:crypto_com:AAVE/USDT", token_symbol: "AAVE",
+      market_type: "cex", venue: "crypto_com", instrument: "AAVE/USDT",
+      current_listing_status: "absent_from_official_current_catalog",
+      window_metrics: {
+        historical_observation_count: 3,
+        selected_window_observation_count: 3,
+      },
+    },
+  ],
+};
+let validatedIds = [];
+let populated = null;
+navigation.validatePair = (markets, marketA, marketB) => {
+  validatedIds = markets.map((market) => market.market_id);
+  const resolvedA = markets.find((market) => market.market_id === marketA) || null;
+  const resolvedB = markets.find((market) => market.market_id === marketB) || null;
+  const errors = [];
+  if (marketA && !resolvedA) errors.push({ code: "market_a_unknown" });
+  if (marketB && !resolvedB) errors.push({ code: "market_b_unknown" });
+  return { valid: errors.length === 0, errors, marketA: resolvedA, marketB: resolvedB };
+};
+populateFactsMarkets = (options) => { populated = options; };
+compareRouteWindow = () => ({ start: "2026-08-01", end: "2026-08-10" });
+customWindowIsOpen = () => true;
+syncTimeWindowControls = () => {};
+syncMarketPayloadForWindow = () => {};
+setActiveAppView = () => {};
+setActiveWorkspacePage = () => {};
+renderWorkspaceContext = () => {};
+renderWorkspaceMarkets = () => {};
+renderQualityFromCatalog = () => {};
+updateFactsContract = () => {};
+applyWorkspaceRoute({
+  token: "AAVE", page: "markets",
+  state: {
+    marketA: "cex:crypto_com:AAVE/USDT",
+    marketB: "cex:binance:AAVE/USDT",
+    pairMode: "manual",
+  },
+});
+console.log(JSON.stringify({
+  validatedIds,
+  populated,
+  notice: controls.get("workspace-context-notice").textContent,
+}));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = {
+  validatePair() { throw new Error("test replaces validatePair"); },
+};
+""",
+        )
+
+        self.assertEqual(
+            result["validatedIds"],
+            ["cex:binance:AAVE/USDT"],
+        )
+        self.assertEqual(result["populated"]["requestedA"], "")
+        self.assertEqual(
+            result["populated"]["requestedB"],
+            "cex:binance:AAVE/USDT",
+        )
+        self.assertIn("invalid market pair", result["notice"])
+
+    def test_cex_depth_copy_marks_point_in_time_and_retained_history_boundary(self):
+        result = run_app_javascript(
+            """
+console.log(JSON.stringify({
+  retained: cexDepthProvenanceText({
+    observed_at: "2026-08-10T12:00:00+00:00",
+    retained_history_status: "available",
+    retained_history_available_from: "2026-07-01T00:00:00+00:00",
+    retained_history_row_count: 42,
+  }),
+  unavailable: cexDepthProvenanceText({
+    observed_at: "2026-08-10T12:00:00+00:00",
+    retained_history_status: "unavailable",
+    retained_history_available_from: null,
+    retained_history_row_count: null,
+  }),
+}));
+"""
+        )
+
+        self.assertIn("Point-in-time snapshot at", result["retained"])
+        self.assertIn("retained self-collected history from", result["retained"])
+        self.assertIn("42 retained market rows", result["retained"])
+        self.assertIn(
+            "no order-book history is claimed before",
+            result["retained"],
+        )
+        self.assertIn("Point-in-time snapshot at", result["unavailable"])
+        self.assertIn(
+            "retained history start unavailable",
+            result["unavailable"],
+        )
+        self.assertIn(
+            "no earlier order-book history is claimed",
+            result["unavailable"],
+        )
 
     def test_execution_timing_is_visible_and_distinct_from_market_state_skew(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
@@ -4328,7 +4624,7 @@ console.log(JSON.stringify({
         self.assertGreaterEqual(router.count("setWorkspaceDataUnavailable("), 3)
         self.assertIn('setAttribute("aria-busy", "false")', unavailable)
         self.assertNotIn("Loading", unavailable)
-        self.assertIn("formatRatio(row?.coverage_ratio)", workspace_markets)
+        self.assertIn("dailyCoverageMarkup(", workspace_markets)
         self.assertNotIn("formatRatio(market.coverage_ratio)", workspace_markets)
         self.assertIn('byId("export-csv").disabled = true;', loader)
         self.assertNotIn('byId("date-start").value =', loader)

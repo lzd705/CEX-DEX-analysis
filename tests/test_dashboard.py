@@ -2851,6 +2851,145 @@ class MarketMonitorServerTest(unittest.TestCase):
             },
         )
 
+    def test_cex_depth_metadata_reports_only_retained_history_start(self):
+        self.write_cex_depth_cohort(
+            [{
+                "exchange": "binance",
+                "observed_at": "2026-07-27T02:03:04+00:00",
+            }]
+        )
+        history_path = self.depth_path.with_name(
+            server.CEX_DEPTH_HISTORY_FILENAME
+        )
+        with self.depth_path.open(newline="", encoding="utf-8") as handle:
+            latest_row = next(csv.DictReader(handle))
+        write_csv(
+            history_path,
+            DEPTH_COLUMNS_ALL,
+            [
+                {
+                    **latest_row,
+                    "snapshot_id": "retained-depth-2",
+                    "observed_at": "2026-07-10T00:00:00+00:00",
+                },
+                {
+                    **latest_row,
+                    "snapshot_id": "retained-depth-1",
+                    "observed_at": "2026-07-01T00:00:00+00:00",
+                },
+            ],
+        )
+        environment = {
+            **self.environment,
+            "MARKET_CEX_DEPTH_DATA": str(self.depth_path),
+        }
+
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, environment, clear=True):
+                available_signature = server.api_source_signature()
+                available_payload = server.build_market_payload(
+                    "2026-01-01", "2026-01-02"
+                )
+                available = available_payload["metadata"]["cex_depth_snapshot"]
+                available_generation = server.build_market_catalog()[
+                    "metadata"
+                ]["data_generation"]
+                history_path.unlink()
+                missing_signature = server.api_source_signature()
+                missing_payload = server.build_market_payload(
+                    "2026-01-01", "2026-01-02"
+                )
+                missing = missing_payload["metadata"]["cex_depth_snapshot"]
+                missing_generation = server.build_market_catalog()[
+                    "metadata"
+                ]["data_generation"]
+                write_csv(
+                    history_path,
+                    DEPTH_COLUMNS_ALL,
+                    [{**latest_row, "observed_at": "not-a-time"}],
+                )
+                invalid = server.build_market_payload(
+                    "2026-01-01", "2026-01-02"
+                )["metadata"]["cex_depth_snapshot"]
+        finally:
+            server.clear_runtime_caches()
+
+        self.assertEqual(available["scope"], "point_in_time")
+        self.assertEqual(available["retained_history_status"], "available")
+        self.assertEqual(
+            available["retained_history_available_from"],
+            "2026-07-01T00:00:00+00:00",
+        )
+        self.assertEqual(available["retained_history_row_count"], 2)
+        self.assertIsNotNone(available["retained_history_source"])
+        self.assertNotEqual(available_signature, missing_signature)
+        self.assertNotEqual(available_generation, missing_generation)
+        for unavailable in (missing, invalid):
+            with self.subTest(status=unavailable["retained_history_status"]):
+                self.assertEqual(
+                    unavailable["retained_history_status"], "unavailable"
+                )
+                self.assertIsNone(
+                    unavailable["retained_history_available_from"]
+                )
+                self.assertIsNone(unavailable["retained_history_row_count"])
+                self.assertIsNone(unavailable["retained_history_source"])
+                self.assertNotEqual(
+                    unavailable["retained_history_available_from"],
+                    unavailable["observed_at"],
+                )
+
+    def test_selected_window_metrics_separate_window_from_lifecycle_history(self):
+        with self.cex_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            cex_fields = list(reader.fieldnames or [])
+            cex_rows = list(reader)
+        cex_rows.append({
+            "date": "2026-01-01",
+            "token_symbol": "CAKE",
+            "exchange": "crypto_com",
+            "cex_symbol": "CAKE/USDT",
+            "close": "2",
+            "quote_volume_usd": "100",
+        })
+        write_csv(self.cex_path, cex_fields, cex_rows)
+
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, self.environment, clear=True):
+                observed_catalog = server.build_token_market_catalog(
+                    "CAKE", "2026-01-01", "2026-01-01"
+                )
+                unobserved_catalog = server.build_token_market_catalog(
+                    "CAKE", "2026-01-02", "2026-01-02"
+                )
+        finally:
+            server.clear_runtime_caches()
+
+        observed = next(
+            row for row in observed_catalog["markets"]
+            if row["market_id"] == "cex:crypto_com:CAKE/USDT"
+        )
+        unobserved = next(
+            row for row in unobserved_catalog["markets"]
+            if row["market_id"] == "cex:crypto_com:CAKE/USDT"
+        )
+        for market in (observed, unobserved):
+            self.assertIsNone(market["window_metrics"]["observation_count"])
+            self.assertEqual(
+                market["window_metrics"]["historical_observation_count"],
+                1,
+            )
+        self.assertEqual(
+            observed["window_metrics"]["selected_window_observation_count"],
+            1,
+        )
+        self.assertEqual(
+            unobserved["window_metrics"]["selected_window_observation_count"],
+            0,
+        )
+
     def test_fixed_block_dex_depth_overlays_pool_without_using_tvl_proxy(self):
         depth_row = {field: "" for field in DEX_DEPTH_COLUMNS}
         depth_row.update(
@@ -3703,6 +3842,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             with self.subTest(token=token):
                 market = by_id[f"cex:crypto_com:{token}/USDT"]
                 self.assertEqual(market["historical_observation_count"], 1)
+                self.assertEqual(market["selected_window_observation_count"], 0)
                 self.assertEqual(
                     market["historical_first_observed_date"],
                     "2026-01-01",
@@ -3720,6 +3860,7 @@ class MarketMonitorServerTest(unittest.TestCase):
             with self.subTest(token=token):
                 market = by_id[f"cex:crypto_com:{token}/USDT"]
                 self.assertEqual(market["historical_observation_count"], 0)
+                self.assertEqual(market["selected_window_observation_count"], 0)
                 self.assertIsNone(market["historical_first_observed_date"])
                 self.assertIsNone(market["historical_latest_observed_date"])
 

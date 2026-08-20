@@ -1002,7 +1002,7 @@ function applyWorkspaceRoute(route) {
     ? "transient"
     : "";
   byId("facts-token").value = exactToken;
-  const markets = factsMarketsForToken(exactToken);
+  const markets = researchMarketsForToken(exactToken);
   const routeProvidedPair = Boolean(route.state?.marketA || route.state?.marketB);
   const manualPair = route.state?.pairMode === "manual";
   const hadSavedPair = Boolean(app.pairSelections[exactToken]);
@@ -2120,6 +2120,31 @@ function naFactMarkup(reason, {
     <summary aria-label="${escapeHtml(naFactAriaLabel(context))}"><span>N/A</span><i data-lucide="info"></i></summary>
     <div class="na-disclosure-panel"><p>${escapeHtml(reason)}</p>${action}</div>
   </details>`;
+}
+
+function dailyCoverageMarkup(row, disclosureOptions = {}) {
+  const observed = row?.observation_count;
+  const expected = row?.requested_window_days;
+  const ratio = row?.coverage_ratio;
+  if (
+    !Number.isInteger(observed)
+    || observed < 0
+    || !Number.isInteger(expected)
+    || expected <= 0
+    || observed > expected
+    || !finite(ratio)
+  ) {
+    return naFactMarkup(
+      "Daily close coverage is unavailable because the valid-day numerator or expected-day denominator was not published.",
+      disclosureOptions,
+    );
+  }
+  const missing = expected - observed;
+  const detail = missing === 0
+    ? "All expected UTC days have a finite positive daily close"
+    : `${missing} expected UTC day${missing === 1 ? "" : "s"} ${missing === 1 ? "has" : "have"} no finite positive daily close`;
+  return `<strong>${observed} / ${expected} valid UTC days</strong>`
+    + `<span class="metric-note">${formatRatio(ratio)} · ${detail}</span>`;
 }
 
 function opportunityNumber(value) {
@@ -3306,7 +3331,7 @@ function qualityStateMarkup(status, label = "", tooltip = "") {
 function renderWorkspaceContext() {
   if (!app.catalog || !app.payload) return;
   const token = selectedWorkspaceToken();
-  const markets = factsMarketsForToken(token);
+  const markets = researchMarketsForToken(token);
   const tokenSummary = app.payload.tokens.find((row) => row.token_symbol === token);
   const cexCount = markets.filter((market) => market.market_type === "cex").length;
   const dexCount = markets.length - cexCount;
@@ -3332,6 +3357,8 @@ function renderWorkspaceContext() {
     : `Daily through ${app.payload.metadata.available_end || "unavailable"}`;
   byId("workspace-quality-status").textContent = qualityText;
   byId("workspace-quality-status").dataset.state = qualityState;
+  const inventoryMode = byId("market-inventory-mode");
+  if (inventoryMode) inventoryMode.textContent = marketInventoryModeDescription();
   if (tokenSummary) {
     const aggregates = aggregateFacts(tokenSummary, [], []);
     const aggregateText = finite(aggregates.aggregateTotal)
@@ -3358,7 +3385,7 @@ function renderWorkspaceMarkets() {
   if (!app.catalog || !app.payload || !byId("workspace-market-body")) return;
   const token = selectedWorkspaceToken();
   const pair = selectedPairState();
-  const markets = factsMarketsForToken(token).filter((market) => (
+  const markets = researchMarketsForToken(token).filter((market) => (
     app.workspaceMarketType === "all" || market.market_type === app.workspaceMarketType
   ));
   byId("workspace-market-body").innerHTML = markets.length
@@ -3453,12 +3480,10 @@ function renderWorkspaceMarkets() {
             )}</td>
           <td data-label="TVL">${tvl}</td>
           <td data-label="±100 bps depth">${depth}<span class="metric-note">${escapeHtml(market.depth_status || "unavailable")}</span></td>
-          <td data-label="Coverage">${finite(row?.coverage_ratio)
-            ? formatRatio(row?.coverage_ratio)
-            : naFactMarkup(
-              "Coverage is unavailable because no valid daily observation count was published.",
-              { token, marketLabel: factsMarketLabel(market), factLabel: "daily coverage" },
-            )}</td>
+          <td data-label="Daily Close Coverage">${dailyCoverageMarkup(
+            row,
+            { token, marketLabel: factsMarketLabel(market), factLabel: "daily close coverage" },
+          )}</td>
           <td data-label="Quality">
             ${qualityStateMarkup(rowQualityStatus, rowQualityLabel)}
             <span class="metric-note">${flags.length} reason${flags.length === 1 ? "" : "s"}</span>
@@ -4622,6 +4647,24 @@ function snapshotFreshnessText(item) {
   return `${item.status} · age ${item.age_hours.toFixed(1)}h`;
 }
 
+function cexDepthProvenanceText(depth) {
+  if (!depth?.observed_at) return "CEX point-in-time snapshot unavailable";
+  const snapshot = `Point-in-time snapshot at ${formatUtcTimestamp(depth.observed_at)}`;
+  if (
+    depth.retained_history_status === "available"
+    && depth.retained_history_available_from
+    && Number.isInteger(depth.retained_history_row_count)
+    && depth.retained_history_row_count > 0
+  ) {
+    return `${snapshot} · retained self-collected history from `
+      + `${formatUtcTimestamp(depth.retained_history_available_from)} · `
+      + `${depth.retained_history_row_count} retained market rows · `
+      + `no order-book history is claimed before ${formatUtcTimestamp(depth.retained_history_available_from)}`;
+  }
+  return `${snapshot} · retained history start unavailable · `
+    + "no earlier order-book history is claimed";
+}
+
 function updateMetadata() {
   const metadata = app.payload.metadata;
   const start = byId("date-start");
@@ -4669,7 +4712,7 @@ function updateMetadata() {
     : metadata.tvl_note;
   const depth = metadata.cex_depth_snapshot;
   byId("depth-source-status").textContent = depth
-    ? `CEX depth ${formatUtcTimestamp(depth.observed_at)} · ${depth.status_counts.observed} complete · ${depth.status_counts.partial} partial · ${depth.status_counts.failed} failed · ${snapshotFreshnessText(freshness?.cex_depth)} · ${depth.method}`
+    ? `CEX depth · ${cexDepthProvenanceText(depth)} · ${depth.status_counts.observed} complete · ${depth.status_counts.partial} partial · ${depth.status_counts.failed} failed · ${snapshotFreshnessText(freshness?.cex_depth)} · ${depth.method}`
     : metadata.cex_depth_note;
   const dexDepth = metadata.dex_depth_snapshot;
   const dexStatuses = dexDepth?.status_counts || {};
@@ -4690,6 +4733,40 @@ function factsMarketLabel(market) {
 
 function factsMarketsForToken(token) {
   return app.catalog.markets.filter((market) => market.token_symbol === token);
+}
+
+function marketInventoryMode() {
+  const selectedEnd = app.catalog?.metadata?.window_end;
+  const availableEnd = app.payload?.metadata?.available_end
+    || app.catalog?.metadata?.available_end;
+  if (!selectedEnd || !availableEnd) return "unavailable";
+  if (selectedEnd === availableEnd) return "current";
+  return selectedEnd < availableEnd ? "historical" : "unavailable";
+}
+
+function marketInventoryModeDescription() {
+  const mode = marketInventoryMode();
+  if (mode === "current") {
+    return "Current market view: fresh official current-catalog absences are hidden; stale evidence remains visible for review.";
+  }
+  if (mode === "historical") {
+    return "Historical market view: a currently absent market appears only when the selected window contains daily observations.";
+  }
+  return "Market view mode unavailable: no catalog market is hidden.";
+}
+
+function researchMarketsForToken(token) {
+  const mode = marketInventoryMode();
+  return factsMarketsForToken(token).filter((market) => {
+    if (market.current_listing_status !== "absent_from_official_current_catalog") {
+      return true;
+    }
+    if (mode === "current") return false;
+    if (mode !== "historical") return true;
+    const windowMetrics = payloadMarketForCatalog(market);
+    const observations = windowMetrics?.selected_window_observation_count;
+    return Number.isInteger(observations) && observations > 0;
+  });
 }
 
 function factsOptions(markets, selectedId) {
@@ -4924,7 +5001,7 @@ function isMeasuredDepthStatus(market) {
 function selectedLiquidityMarkets() {
   if (!app.catalog) return { token: "", marketA: null, marketB: null };
   const token = byId("facts-token").value;
-  const markets = factsMarketsForToken(token);
+  const markets = researchMarketsForToken(token);
   return {
     token,
     marketA: markets.find((market) => market.market_id === byId("facts-market-a").value) || null,
@@ -5698,7 +5775,7 @@ function populateFactsMarkets({
 } = {}) {
   if (!app.catalog) return;
   const token = byId("facts-token").value;
-  const markets = factsMarketsForToken(token);
+  const markets = researchMarketsForToken(token);
   const tokenSummary = app.payload?.tokens.find((row) => row.token_symbol === token);
   const saved = app.pairSelections[token] || {};
   const previousA = requestedA ?? (preserve ? byId("facts-market-a").value : saved.marketA || "");
@@ -5764,7 +5841,7 @@ function updateFactsContract() {
         + ` observed at ${formatUtcTimestamp(tvl.observed_at)}.`
       : "",
     metadata.cex_depth_snapshot
-      ? `CEX depth: ${metadata.cex_depth_snapshot.status_counts.observed} complete, ${metadata.cex_depth_snapshot.status_counts.partial} partial, ${metadata.cex_depth_snapshot.status_counts.failed} failed at ${formatUtcTimestamp(metadata.cex_depth_snapshot.observed_at)}.`
+      ? `CEX depth: ${metadata.cex_depth_snapshot.status_counts.observed} complete, ${metadata.cex_depth_snapshot.status_counts.partial} partial, ${metadata.cex_depth_snapshot.status_counts.failed} failed. ${cexDepthProvenanceText(metadata.cex_depth_snapshot)}.`
       : "",
     metadata.dex_depth_snapshot
       ? `DEX depth: ${metadata.dex_depth_snapshot.status_counts.observed || 0} complete, ${metadata.dex_depth_snapshot.status_counts.partial || 0} partial, ${metadata.dex_depth_snapshot.status_counts.unsupported || 0} unsupported, ${metadata.dex_depth_snapshot.status_counts.failed || 0} failed at ${formatUtcTimestamp(metadata.dex_depth_snapshot.observed_at)}.`

@@ -223,6 +223,7 @@ DEX_FILENAME = "dex_pool_volume_daily.csv"
 DATABASE_FILENAME = "market_facts.sqlite3"
 TVL_FILENAME = "dex_pool_tvl_latest.csv"
 CEX_DEPTH_FILENAME = "cex_depth_latest.csv"
+CEX_DEPTH_HISTORY_FILENAME = "cex_depth_history.csv"
 DEX_DEPTH_FILENAME = "dex_depth_latest.csv"
 CEX_EXECUTION_COST_FILENAME = "cex_execution_cost_latest.csv"
 DEX_EXECUTION_COST_FILENAME = "dex_execution_cost_latest.csv"
@@ -824,6 +825,14 @@ def resolve_cex_depth_path() -> Path | None:
         if depth_path.exists():
             return depth_path
     return None
+
+
+def resolve_cex_depth_history_path(depth_path: Path | None) -> Path | None:
+    """Resolve the retained normalized history beside the latest snapshot."""
+    if depth_path is None:
+        return None
+    history_path = depth_path.with_name(CEX_DEPTH_HISTORY_FILENAME)
+    return history_path if history_path.exists() else None
 
 
 def resolve_dex_depth_path() -> Path | None:
@@ -1656,6 +1665,10 @@ def overlay_cex_instrument_lifecycle(
     stale_evidence_count = (
         0 if root_evidence_is_fresh else configured_market_count
     )
+    selected_window_market_ids = {
+        cex_market_id(market.get("venue"), market.get("instrument"))
+        for market in result["cex_markets"]
+    }
     existing_market_ids = {
         cex_market_id(market.get("venue"), market.get("instrument"))
         for market in result["cex_markets"]
@@ -1710,6 +1723,24 @@ def overlay_cex_instrument_lifecycle(
             listing_status = "official_catalog_evidence_stale"
             listing_reason = "official_catalog_evidence_stale"
             depth_status = "needs_review"
+        if market_id in selected_window_market_ids:
+            selected_window_observation_count = market.get(
+                "observation_count"
+            )
+            if (
+                isinstance(selected_window_observation_count, bool)
+                or not isinstance(selected_window_observation_count, int)
+                or selected_window_observation_count < 0
+            ):
+                price_points = market.get("price_points")
+                selected_window_observation_count = (
+                    len(price_points) if isinstance(price_points, list) else 0
+                )
+        else:
+            selected_window_observation_count = 0
+        market["selected_window_observation_count"] = (
+            selected_window_observation_count
+        )
         market["historical_observation_count"] = market.get(
             "observation_count",
             market.get("observation_days"),
@@ -2017,6 +2048,49 @@ def _load_cex_depth_snapshot_cached(
     }
 
 
+def _cex_depth_history_summary(history_path: Path | None) -> dict[str, Any]:
+    unavailable = {
+        "retained_history_status": "unavailable",
+        "retained_history_available_from": None,
+        "retained_history_row_count": None,
+        "retained_history_source": None,
+    }
+    if history_path is None:
+        return unavailable
+    try:
+        with history_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            required = {
+                "snapshot_id",
+                "observed_at",
+                "token_symbol",
+                "exchange",
+                "cex_symbol",
+            }
+            if required - set(reader.fieldnames or []):
+                return unavailable
+            rows = list(reader)
+        if not rows or any(
+            not isinstance(row.get(field), str)
+            or not row[field]
+            or row[field] != row[field].strip()
+            for row in rows
+            for field in required
+        ):
+            return unavailable
+        available_from, _available_to = _cohort_observed_at_bounds(rows)
+        if available_from is None:
+            return unavailable
+        return {
+            "retained_history_status": "available",
+            "retained_history_available_from": available_from,
+            "retained_history_row_count": len(rows),
+            "retained_history_source": file_metadata(history_path),
+        }
+    except (OSError, ValueError, csv.Error, DepthExecutionCohortError):
+        return unavailable
+
+
 def cex_depth_reason_code(depth_row: dict[str, str]) -> str | None:
     """Prefer the stable collector code and classify legacy rows conservatively."""
     classified_reason = cex_reason_code(
@@ -2037,6 +2111,7 @@ def cex_depth_reason_code(depth_row: dict[str, str]) -> str | None:
 def overlay_cex_depth_snapshot(
     payload: dict[str, Any],
     depth_path: Path | None,
+    history_path: Path | None,
 ) -> dict[str, Any]:
     """Overlay current real order-book depth without rewriting daily OHLCV."""
     result = _copy_payload_for_overlay(payload)
@@ -2150,6 +2225,7 @@ def overlay_cex_depth_snapshot(
         "bands are observed lower bounds, not complete depth."
     )
     metadata["cex_depth_snapshot"] = {
+        "scope": "point_in_time",
         "snapshot_ids": snapshot["snapshot_ids"],
         "observed_at": snapshot["observed_at"],
         "observed_at_min": snapshot["observed_at_min"],
@@ -2163,6 +2239,7 @@ def overlay_cex_depth_snapshot(
         "bands_bps": [10, 25, 50, 100],
         "source": file_metadata(depth_path),
         "method": "midpoint_symmetric_quote_notional",
+        **_cex_depth_history_summary(history_path),
     }
     metadata["sources"].append(file_metadata(depth_path))
     return result
@@ -2789,6 +2866,7 @@ def market_payload_cache_key(
     """Resolve every fact source into a hashable, invalidation-aware cache key."""
     tvl_path = resolve_tvl_path()
     depth_path = resolve_cex_depth_path()
+    depth_history_path = resolve_cex_depth_history_path(depth_path)
     dex_depth_path = resolve_dex_depth_path()
     database_path = resolve_database_path()
     if database_path is not None:
@@ -2809,6 +2887,8 @@ def market_payload_cache_key(
         _optional_signature(tvl_path),
         str(depth_path) if depth_path is not None else "",
         _optional_signature(depth_path),
+        str(depth_history_path) if depth_history_path is not None else "",
+        _optional_signature(depth_history_path),
         str(dex_depth_path) if dex_depth_path is not None else "",
         _optional_signature(dex_depth_path),
     )
@@ -2827,6 +2907,8 @@ def _build_enriched_payload_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]
         _tvl_signature,
         depth_path_text,
         _depth_signature,
+        depth_history_path_text,
+        _depth_history_signature,
         dex_depth_path_text,
         _dex_depth_signature,
     ) = cache_key
@@ -2849,6 +2931,7 @@ def _build_enriched_payload_cached(cache_key: tuple[Any, ...]) -> dict[str, Any]
     payload = overlay_cex_depth_snapshot(
         payload,
         Path(depth_path_text) if depth_path_text else None,
+        Path(depth_history_path_text) if depth_history_path_text else None,
     )
     payload = overlay_dex_depth_snapshot(
         payload,
@@ -3310,6 +3393,8 @@ WINDOW_MARKET_FIELDS = (
     "latest_observed_date",
     "observation_days",
     "observation_count",
+    "selected_window_observation_count",
+    "historical_observation_count",
     "requested_window_days",
     "missing_calendar_days",
     "coverage_ratio",
@@ -6503,6 +6588,7 @@ def build_route_opportunities(
 def api_source_signature() -> SourceSignature:
     """Return one signature covering every source that can change public facts."""
     database_path = resolve_database_path()
+    cex_depth_path = resolve_cex_depth_path()
     paths: list[Path] = []
     if database_path is not None:
         paths.append(database_path)
@@ -6510,7 +6596,8 @@ def api_source_signature() -> SourceSignature:
         paths.extend(resolve_data_paths())
     for optional_path in (
         resolve_tvl_path(),
-        resolve_cex_depth_path(),
+        cex_depth_path,
+        resolve_cex_depth_history_path(cex_depth_path),
         resolve_dex_depth_path(),
         resolve_cex_execution_cost_path(),
         resolve_dex_execution_cost_path(),

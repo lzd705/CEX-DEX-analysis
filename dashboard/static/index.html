@@ -264,21 +264,22 @@
           <div class="page-heading">
             <div>
               <span class="eyebrow">Market inventory</span>
-              <h3>Token Market Coverage</h3>
-              <div class="module-context" aria-label="Market coverage module scope">
-                <span class="module-chip">Full catalog</span>
+              <h3>Token Market Inventory</h3>
+              <div class="module-context" aria-label="Market inventory module scope">
+                <span class="module-chip">Mode-aware catalog</span>
                 <span class="module-chip">CEX + DEX</span>
                 <span class="module-chip">A/B selectable</span>
                 <details class="context-info">
-                  <summary aria-label="Token market coverage details">
+                  <summary aria-label="Token market inventory details">
                     <i data-lucide="info"></i>
                   </summary>
                   <div class="context-tooltip" role="tooltip">
-                    <strong>Market coverage</strong>
-                    <p>Review every cataloged CEX instrument and DEX pool for the selected Token. Set any two distinct markets as A and B before moving to comparison or execution analysis.</p>
+                    <strong>Daily close coverage</strong>
+                    <p>Daily Close Coverage is valid daily closes ÷ expected UTC calendar days in the selected window. Review the visible CEX instruments and DEX pools, then set two distinct markets as A and B.</p>
                   </div>
                 </details>
               </div>
+              <p id="market-inventory-mode" class="metric-note">Checking current or historical market view</p>
             </div>
             <div class="segmented-control" role="group" aria-label="Market type filter">
               <button type="button" data-workspace-market-type="all" class="active" aria-pressed="true">All</button>
@@ -288,7 +289,7 @@
           </div>
           <div class="table-scroll" role="region" aria-label="Selected Token market inventory" tabindex="0">
             <table id="workspace-market-table" class="workspace-market-table">
-              <caption>All cataloged markets for the selected Token with current fact availability.</caption>
+              <caption>Markets visible under the current or historical evidence rule for the selected Token.</caption>
               <thead>
                 <tr>
                   <th scope="col">Market</th>
@@ -297,7 +298,7 @@
                   <th scope="col">Window Volume</th>
                   <th scope="col">TVL</th>
                   <th scope="col">±100 bps Depth</th>
-                  <th scope="col">Coverage</th>
+                  <th scope="col">Daily Close Coverage</th>
                   <th scope="col">Status</th>
                   <th scope="col">Pair Actions</th>
                 </tr>
