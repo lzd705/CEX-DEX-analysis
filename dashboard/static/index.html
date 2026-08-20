@@ -279,7 +279,23 @@
                   </div>
                 </details>
               </div>
-              <p id="market-inventory-mode" class="metric-note">Checking current or historical market view</p>
+              <div class="module-context compact-context" aria-label="Current or historical market view">
+                <span id="market-inventory-mode" class="metric-note">Checking current or historical market view</span>
+                <details id="market-inventory-mode-help" class="context-info">
+                  <summary
+                    aria-label="Explain current and historical market views"
+                    aria-controls="market-inventory-mode-explanation"
+                  >
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div id="market-inventory-mode-explanation" class="context-tooltip context-tooltip-wide" role="tooltip">
+                    <strong>Market view modes</strong>
+                    <p><strong>Current view</strong> hides a market only when fresh official-current-catalog evidence confirms that it is absent.</p>
+                    <p><strong>Historical view</strong> shows such a market only when the selected date window contains actual daily observations for it.</p>
+                    <p>Stale official-catalog evidence remains visible for review. This status does not infer an exact delisting date.</p>
+                  </div>
+                </details>
+              </div>
             </div>
             <div class="segmented-control" role="group" aria-label="Market type filter">
               <button type="button" data-workspace-market-type="all" class="active" aria-pressed="true">All</button>

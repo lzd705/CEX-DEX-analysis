@@ -2536,6 +2536,22 @@ console.log(JSON.stringify({ current, historical }));
             [active, observed_absence, stale],
         )
 
+    def test_market_inventory_mode_has_accessible_info_disclosure(self):
+        index = INDEX_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('id="market-inventory-mode-help"', index)
+        self.assertIn(
+            'aria-label="Explain current and historical market views"',
+            index,
+        )
+        self.assertIn("<strong>Current view</strong>", index)
+        self.assertIn("<strong>Historical view</strong>", index)
+        self.assertIn(
+            "Stale official-catalog evidence remains visible",
+            index,
+        )
+        self.assertIn("does not infer an exact delisting date", index)
+
     def test_workspace_url_pair_validation_uses_visible_market_inventory(self):
         result = run_app_javascript(
             """
