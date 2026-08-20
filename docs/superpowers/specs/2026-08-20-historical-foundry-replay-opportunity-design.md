@@ -439,18 +439,24 @@ EVM rule set.
 
 The dashboard runtime does not install Foundry. Replay is an offline collection
 and publication job. The first connected build downloads the pinned compiler
-and dependency. Before evidence collection, two separate gates must pass:
+and dependency. Before evidence collection, two separate sealed bootstrap modes
+must pass:
 
-```text
-forge test --offline --match-path foundry/test/TwoVenueV2Unit.t.sol
-forge test --match-path foundry/test/TwoVenueV2Fork.t.sol \
-  --fork-url <sealed-archive-rpc> --fork-block-number <fixed-kat-block>
+```bash
+python3 -m scripts.bootstrap_historical_foundry_toolchain \
+  --verify-offline-tests
+python3 -m scripts.bootstrap_historical_foundry_toolchain \
+  --verify-connected-kat
 ```
 
 The offline gate covers compilation, constructor/runtime identity, direction,
 authorization, residual-balance, and pure arithmetic tests without silently
 skipping a fork. The connected gate proves the fixed-block fork behavior. The
-wrapper supplies the sealed endpoint without persisting it in output.
+wrapper supplies the sealed endpoint without persisting it in output. Both
+modes open the reviewed project-local toolchain capability and construct the
+fixed forge/Anvil/cast/solc command vectors internally. Ambient `PATH`, direct
+binary invocation, caller executable paths, and caller argument suffixes are
+forbidden as implementation and completion evidence.
 
 ### Solidity boundary
 
@@ -611,18 +617,51 @@ Each DEX-to-DEX scenario has exactly nine cost rows:
 | route | `mev_buffer` | `assumed` |
 
 The topology change applies only to `atomic_onchain`; non-atomic DEX legs keep
-their existing leg-level gas contract. One shared canonical topology helper is
-the sole source of expected component keys. It is consumed by the Opportunity
-producer, complete publication validator, dashboard reader, and both release
-checker validation paths; no consumer keeps a private copy.
+their existing leg-level gas contract. The selected status-one Phase-2
+`result.json` contains one exact
+`historical_foundry_cost_proof_inputs/v1` object with exactly `schema`,
+`scenario_key`, `policy_sha256`, `receipt_sha256`, `trace_sha256`,
+`adapter_proof_sha256`, `rows`, and `proof_inputs_hash`.
+`proof_inputs_hash` is the typed hash over the other seven fields. `rows` is an
+ordered nine-element array in the table order above. Every proof row has
+exactly `grain`, `component`, `value_status`, `embedded`,
+`amount_usd_exact`, `rate_bps_exact`, `proof_role`, and `proof_sha256`.
+Phase 3 consumes this object and hash directly; it cannot reconstruct a private
+variant, reorder/rename fields, or derive expected proof values from the public
+cost rows being checked.
 
-The helper's live-versus-historical publication profile is derived internally
-from the validated manifest stage and route mode, not accepted from a public
-caller. The live profile keeps its current component inventory byte-for-byte;
-the historical `atomic_onchain` profile returns the nine keys above.
+One shared module-private historical matrix validator is the sole low-level
+source of the nine row identities, statuses, embedded bits, and expected
+amount/proof comparisons. It is context-free and accepts no context, manifest,
+stage, profile, member list, or source-root policy. In addition to the other
+proof expectations it receives exact
+`expected_pool_fee_amount_usd_by_leg`; both public embedded pool-fee amounts
+must equal the corresponding `amount_usd_exact` values from the validated
+Phase-2 object while remaining excluded from additive cost.
+
+Only sealed wrappers in historical publication may invoke that low-level
+validator. The producer/complete writer wrapper holds and first validates an
+identity-sealed `HistoricalReplayBuildContext`, descriptor-rereads every bound
+raw scenario member and validates the exact Phase-2 proof object/hash, then
+issues a sentinel-guarded immutable `ValidatedHistoricalScenarioInputs`
+capability. The context-free pure bridge consumes only that capability. The
+writer rechecks the capability's held descriptor ancestry/currentness after
+the pure call, derives scalar expectations from the same capability, and only
+then invokes the low-level validator. The published-reader wrapper first
+validates its held pointer/report/manifest/core/raw view, then loads and
+validates the retained proof object/hash, then invokes the low-level validator.
+Dashboard projection and both release paths consume the reader's validated
+view and never import or call the low-level validator. Writer call-order tests
+require `context_validated`, `raw_descriptors_reread`,
+`proof_inputs_validated`, `scenario_capability_issued`, `pure_bridge_called`,
+`capability_current_rechecked`, then `low_level_matrix_called`; forged or stale
+contexts/capabilities and proof tampering fail before the low-level call. The
+live profile keeps its current helper, inventory, and wrapper signatures
+byte-for-byte and never accepts historical inputs.
 
 The two 30 bps pool-fee rows are embedded in reserve outputs and are not
-deducted again. Router fee and transfer tax are zero only when the composed
+deducted again; their exact informational USD amounts remain proof-bound as
+described above. Router fee and transfer tax are zero only when the composed
 receipt, balance deltas, and verified adapter prove zero; they are not marked
 `not_applicable`. The route gas amount equals the receipt gas cost exactly. The
 MEV row is bound to the policy hash and equals the requested notional times the
@@ -746,6 +785,9 @@ Each row binds:
   successful execution status;
 - policy, authority, toolchain, block, overlay, executor creation/runtime,
   calldata, transaction, receipt, trace, and result hashes;
+- exact `proof_inputs_hash`, equal to the typed
+  `historical_foundry_cost_proof_inputs/v1` hash reread from that scenario's
+  retained result member;
 - sender, executor, nonce, type-2 gas limit, empty access list, max priority fee,
   max fee, calldata bytes, transaction hash, and transaction index;
 - receipt status, block number/hash, gas used, effective gas price, and exact
@@ -881,9 +923,14 @@ raw-run manifest, policy/authority/toolchain, selection, selected block, and
 historical source reader. Their constructors are guarded by a module-private
 sentinel; ordinary callers cannot manufacture a context or choose a profile.
 For identical bytes the staged and committed contexts must be byte-equivalent.
-Complete-bundle production and the nine-row topology helper require one of
-these contexts. Published-bundle readers instead select their sealed profile
-only from a validated pointer schema and manifest stage.
+Complete-bundle production requires one of these contexts, and the dedicated
+writer retains it while validating all ten proof-input objects and cost groups.
+The context is never passed into the low-level nine-row validator. Published
+bundle readers instead construct a separate sealed validated view only after
+pointer/report/manifest/core/raw validation and use that view to load proof
+inputs before their wrapper reaches the same context-free validator. Tests
+instrument both wrappers and prove that context/view and proof validation
+strictly precede the sole low-level call.
 
 Success and failure tests take byte snapshots of both live pointers,
 `routes/core/latest.json` and `routes/latest.json`, and require them to remain
@@ -1036,6 +1083,15 @@ loader:
   reader, the nine-row atomic topology, and the no-current-clock historical
   timing projection.
 
+The historical writer owns the validated build context and consumes each
+scenario's exact `historical_foundry_cost_proof_inputs/v1` object before it can
+serialize CSV or SQLite. The historical reader owns the validated published
+view and rereads the same retained objects before returning rows. Both compare
+all nine public rows, including both embedded pool-fee informational amounts,
+to the proof object and `proof_inputs_hash` through the sealed wrappers defined
+above. Neither dashboard nor release code reconstructs a parallel proof or
+calls the context-free low-level validator directly.
+
 No public function accepts a profile name, profile object, member list, source
 root default, or timing policy from its caller. The implementation extracts
 the current CSV, SQLite, row-schema, hash, descriptor, and referential-integrity
@@ -1158,6 +1214,16 @@ therefore returns fail-closed rather than old rows. A pointer, report, or member
 change invalidates the cache before a response is served; no minute bucket can
 keep the previous replay visible after an atomic pointer move.
 
+In addition, the process records a set-if-absent association from each observed
+pointer physical SHA-256 to the first fully validated physical publication
+signature covering pointer, report, manifest, immutable core, five complete
+members, and retained raw members. Ordinary response-cache invalidation never
+clears or overwrites this association. If the same pointer bytes/SHA are later
+observed with any different descendant descriptor identity, including an
+identical-byte inode replacement whose content hash still matches, the handler
+returns HTTP 503. Only a genuinely new pointer SHA may establish a new physical
+signature. Pre-cache and pre-return probes both enforce this guard.
+
 Missing historical pointer returns HTTP 200 with no inferred route inventory
 and reason `historical_replay_pointer_absent`. A malformed, hash-invalid, or
 semantically invalid historical bundle returns HTTP 503 and no stale or partial
@@ -1190,6 +1256,17 @@ verification, gas, receipt/trace hashes, policy baseline, and stress outcome.
 Positive and negative verified scenarios remain visible. Evidence failures
 invalidate the historical bundle instead of being mixed into its ten rows; the
 Unavailable table is empty for a valid MVP bundle.
+
+The dedicated release flag fetches and retains the exact served bytes from
+`/opportunities?opportunity_scope=historical`; it does not substitute the
+checkout template or a synthetic DOM fixture. It validates those HTML bytes'
+versioned asset references against `/health` application SHA and asset
+SHA/version, hashes the HTML bytes separately, and runs the exact served
+HTML/navigation/app bytes against the unfiltered ten-scenario API payload. The
+DOM result binds application SHA, asset SHA, HTML SHA-256, and API
+`data_generation` in one typed surface hash and checks all ten visible rows.
+After the probe the checker rereads health, every versioned asset, the same HTML
+URL, and the API, requiring unchanged bytes and identities before success.
 
 ## Error model
 
@@ -1316,8 +1393,12 @@ Implementation proceeds in independently green slices.
 - Foundry result is rederived rather than trusted;
 - atomic route has one route-level gas row and no leg-level duplicate gas;
 - exactly nine cost rows per scenario and ninety total;
-- pool fee embedded, router/tax proof, route transfer N/A, receipt gas, and
-  10 bps MEV arithmetic;
+- exact direct consumption of ten
+  `historical_foundry_cost_proof_inputs/v1` objects and their
+  `proof_inputs_hash` values, with missing/extra/reordered/renamed/tampered
+  proof fields or rows rejected;
+- pool fee embedded with both exact proof-bound informational USD amounts,
+  router/tax proof, route transfer N/A, receipt gas, and 10 bps MEV arithmetic;
 - unique baseline p50+10, stress p90+25, and stress p90+50 arithmetic;
 - all ten published rows research-only with status-one receipts, no unavailable
   rows, no attestation, and no strict promotion; and
@@ -1331,6 +1412,10 @@ Implementation proceeds in independently green slices.
 - `HistoricalReplayBuildContext` construction only from a validated historical
   staged or committed core, staged/committed byte-equivalence, and rejection of
   forged, transplanted, live-stage, or stale contexts;
+- writer-held context and reader-held validated-view call-order tests proving
+  context/view validation, then exact proof-input validation, then the sole
+  context-free low-level nine-row validator call; direct dashboard/release
+  low-level calls are rejected by import-boundary tests;
 - exact six-file bundle, member inventory, row counts, hashes, and canonical
   order;
 - sealed stage-derived profile selection, rejection of caller-injected profile
@@ -1343,7 +1428,8 @@ Implementation proceeds in independently green slices.
 - proof that Foundry-only fields remain exclusively in `replay_evidence.json`
   and do not widen existing CSV or SQLite row schemas;
 - closed replay-evidence schema, one-to-one linkage with all ten Opportunity
-  rows, and source-run member reread;
+  rows, all ten exact `proof_inputs_hash` values, both pool-fee amount
+  parities, and source-run member reread;
 - missing, failed, wrong-pointer, wrong-inventory, or TOCTOU-mutated connected
   verification report rejection;
 - proof that connected verification replays the selected ten plus every newer
@@ -1374,9 +1460,15 @@ Implementation proceeds in independently green slices.
 - filters, sorting, counts, strict-empty result, and cache invalidation,
   including deletion, mutation, or inode swap of the verification report after
   a warm cache;
+- process-lifetime pointer-SHA-to-full-physical-signature guarding, including
+  HTTP 503 for identical pointer/member bytes installed under a new descendant
+  inode;
 - current/history response race isolation;
 - URL round trip and fixed disclaimer;
 - no Current/Executable language in historical mode;
+- actual served historical HTML/JavaScript DOM parity bound to unchanged
+  application SHA, asset SHA/version, HTML SHA, API generation, and post-probe
+  rereads;
 - ten research rows, two directions, five notionals, unavailable,
   strict/executable/attested count zero, Foundry-verified count ten, and
   positive count at least one; and
@@ -1404,6 +1496,9 @@ It requires:
 - two opposite DEX routes;
 - five notionals per route and ten total scenarios;
 - ten Foundry-verified scenario proofs;
+- ten exact `historical_foundry_cost_proof_inputs/v1` objects and hashes, each
+  matching all nine public rows including both embedded pool-fee informational
+  amounts;
 - all ten rows `research_estimate` with status-one receipts and no unavailable,
   strict, executable, or attested rows;
 - at least one available `research_net_edge_usd > 0`;
@@ -1411,8 +1506,10 @@ It requires:
   selected block, and every skipped older candidate closed as
   `not_needed_older_than_selected`;
 - selected block `newest_publishable_policy_positive` proof;
-- retained source-run member reread and replay-evidence parity; and
-- UI/API count, filter, classification, and arithmetic parity.
+- retained source-run member reread and replay-evidence parity;
+- the process-lifetime pointer-SHA-to-physical-signature guard; and
+- actual served HTML/application/asset/API-generation-bound DOM parity for all
+  ten scenarios, followed by exact post-probe rereads.
 
 The existing `--require-route-opportunities` flag is not redefined and does not
 stand in for this stronger MVP gate.
