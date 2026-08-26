@@ -321,7 +321,11 @@ ROUTE_V2_POOL_STATE_FIELDS = (
     "state_id",
 )
 _ROUTE_BLOCK_HASH = re.compile(r"0x[0-9a-f]{64}\Z", flags=re.ASCII)
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z", flags=re.ASCII)
 _EVM_ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z", flags=re.ASCII)
+_EXACT_SNAPSHOT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+_QUOTER_CALL_DATA = re.compile(r"0x[0-9a-f]{328}\Z", flags=re.ASCII)
+_QUOTER_RESULT_DATA = re.compile(r"0x[0-9a-f]{256}\Z", flags=re.ASCII)
 V3_DEXES = {
     "aerodrome-slipstream",
     "uniswap_v3",
@@ -2025,6 +2029,30 @@ def _evidence_directory(path: Path, label: str) -> None:
         raise ValueError(f"{label} directory is not regular evidence")
 
 
+def _snapshot_evidence_directory(
+    root: Path,
+    snapshot_id: str,
+    label: str,
+) -> Path:
+    if (
+        type(snapshot_id) is not str
+        or _EXACT_SNAPSHOT_ID.fullmatch(snapshot_id) is None
+    ):
+        raise ValueError(f"{label} snapshot ID is invalid")
+    root = Path(root)
+    directory = root / snapshot_id
+    _evidence_directory(root, f"{label} evidence root")
+    _evidence_directory(directory, label)
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_directory = directory.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"{label} evidence root is invalid") from error
+    if resolved_directory.parent != resolved_root:
+        raise ValueError(f"{label} evidence escapes its configured evidence root")
+    return directory
+
+
 def _manifest_raw_paths(
     directory: Path,
     manifest: Mapping[str, Any],
@@ -2068,10 +2096,11 @@ def _retained_quoter_results(
     *,
     quoter_v2_address: str,
     block_number: int,
-) -> list[tuple[str, int, int, int]]:
+) -> list[dict[str, Any]]:
     if not isinstance(records, list):
         raise ValueError("Uniswap V3 raw Quoter transcript is missing")
     results = []
+    request_ids = set()
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -2079,11 +2108,6 @@ def _retained_quoter_results(
         responses = record.get("response")
         request_items = requests if isinstance(requests, list) else [requests]
         response_items = responses if isinstance(responses, list) else [responses]
-        responses_by_id = {
-            response.get("id"): response
-            for response in response_items
-            if isinstance(response, dict) and type(response.get("id")) is int
-        }
         for request in request_items:
             if not isinstance(request, dict) or request.get("method") != "eth_call":
                 continue
@@ -2095,28 +2119,114 @@ def _retained_quoter_results(
                 continue
             if str(call.get("to") or "").lower() != quoter_v2_address:
                 continue
+            record_request_ids = [
+                item.get("id")
+                for item in request_items
+                if isinstance(item, dict)
+            ]
+            record_response_ids = [
+                item.get("id")
+                for item in response_items
+                if isinstance(item, dict)
+            ]
+            if (
+                len(record_request_ids) != len(request_items)
+                or len(record_response_ids) != len(response_items)
+                or len(record_request_ids) != len(record_response_ids)
+                or any(type(value) is not int for value in record_request_ids)
+                or any(type(value) is not int for value in record_response_ids)
+                or len(record_request_ids) != len(set(record_request_ids))
+                or len(record_response_ids) != len(set(record_response_ids))
+                or set(record_request_ids) != set(record_response_ids)
+            ):
+                raise ValueError("Uniswap V3 raw Quoter request mapping is invalid")
             data = str(call.get("data") or "").lower()
-            if data.startswith(SELECTOR_QUOTE_EXACT_INPUT_SINGLE_V2):
+            if _QUOTER_CALL_DATA.fullmatch(data) is None:
+                raise ValueError("Uniswap V3 raw Quoter calldata is invalid")
+            selector = data[:10]
+            if selector == SELECTOR_QUOTE_EXACT_INPUT_SINGLE_V2:
                 direction = "sell_token"
-            elif data.startswith(SELECTOR_QUOTE_EXACT_OUTPUT_SINGLE_V2):
+            elif selector == SELECTOR_QUOTE_EXACT_OUTPUT_SINGLE_V2:
                 direction = "buy_token"
             else:
                 raise ValueError("Uniswap V3 raw Quoter selector is invalid")
             if params[1] != hex(block_number):
                 raise ValueError("Uniswap V3 raw Quoter block is invalid")
-            response = responses_by_id.get(request.get("id"))
+            request_id = request.get("id")
+            if (
+                request.get("jsonrpc") != "2.0"
+                or type(request_id) is not int
+                or request_id in request_ids
+            ):
+                raise ValueError("Uniswap V3 raw Quoter request mapping is invalid")
+            request_ids.add(request_id)
+            matching_responses = [
+                response
+                for response in response_items
+                if isinstance(response, dict) and response.get("id") == request_id
+            ]
+            if len(matching_responses) != 1:
+                raise ValueError("Uniswap V3 raw Quoter request mapping is invalid")
+            response = matching_responses[0]
+            if response.get("jsonrpc") != "2.0" or "error" in response:
+                raise ValueError("Uniswap V3 raw Quoter response is invalid")
             result = response.get("result") if isinstance(response, dict) else None
-            if not isinstance(result, str) or len(words(result)) != 4:
+            if (
+                not isinstance(result, str)
+                or _QUOTER_RESULT_DATA.fullmatch(result) is None
+            ):
                 raise ValueError("Uniswap V3 raw Quoter result is invalid")
+            calldata_words = [
+                data[index:index + 64]
+                for index in range(10, len(data), 64)
+            ]
+            if any(word[:24] != "0" * 24 for word in calldata_words[:2]):
+                raise ValueError("Uniswap V3 raw Quoter token address is invalid")
+            token_in = "0x" + calldata_words[0][24:]
+            token_out = "0x" + calldata_words[1][24:]
+            amount = int(calldata_words[2], 16)
+            fee_pips = int(calldata_words[3], 16)
+            sqrt_price_limit_x96 = int(calldata_words[4], 16)
+            response_words = tuple(decode_uint(result, index) for index in range(4))
+            if (
+                token_in == token_out
+                or amount <= 0
+                or fee_pips >= 1_000_000
+                or sqrt_price_limit_x96 >= 1 << 160
+                or response_words[0] <= 0
+                or response_words[1] >= 1 << 160
+                or response_words[2] >= 1 << 32
+                or response_words[3] <= 0
+            ):
+                raise ValueError("Uniswap V3 raw Quoter ABI value is invalid")
             results.append(
-                (
-                    direction,
-                    decode_uint(result, 0),
-                    decode_uint(result, 1),
-                    decode_uint(result, 2),
-                )
+                {
+                    "direction": direction,
+                    "token_in": token_in,
+                    "token_out": token_out,
+                    "amount": amount,
+                    "fee_pips": fee_pips,
+                    "sqrt_price_limit_x96": sqrt_price_limit_x96,
+                    "response_words": response_words,
+                }
             )
     return results
+
+
+def _execution_quantity_raw(row: Mapping[str, Any], field: str, decimals: int) -> int:
+    if type(decimals) is not int or not 0 <= decimals <= 255:
+        raise ValueError("Uniswap V3 execution token decimals are invalid")
+    try:
+        quantity = Decimal(str(row.get(field) or ""))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("Uniswap V3 execution quantity is invalid") from error
+    if not quantity.is_finite() or quantity <= 0:
+        raise ValueError("Uniswap V3 execution quantity is invalid")
+    raw = quantity * (Decimal(10) ** decimals)
+    integral = raw.to_integral_value()
+    if raw != integral or integral >= 1 << 256:
+        raise ValueError("Uniswap V3 execution quantity is not base-unit exact")
+    return int(integral)
 
 
 def _retained_finalized_block(records: Any, block_number: int) -> dict[str, str]:
@@ -2322,19 +2432,35 @@ def validate_uniswap_v3_exact_candidate(
         ):
             raise ValueError("Uniswap V3 exact execution snapshot lineage is invalid")
 
-    tvl_directory = Path(tvl_raw_root) / tvl_snapshot_id
-    depth_directory = Path(depth_raw_root) / depth_snapshot_id
-    _evidence_directory(tvl_directory, "TVL evidence")
-    _evidence_directory(depth_directory, "depth evidence")
+    tvl_directory = _snapshot_evidence_directory(
+        Path(tvl_raw_root), tvl_snapshot_id, "TVL evidence"
+    )
+    depth_directory = _snapshot_evidence_directory(
+        Path(depth_raw_root), depth_snapshot_id, "depth evidence"
+    )
     tvl_manifest_bytes, tvl_manifest = _evidence_json(
         tvl_directory / "manifest.json", "TVL manifest"
     )
     depth_manifest_bytes, depth_manifest = _evidence_json(
         depth_directory / "manifest.json", "depth manifest"
     )
+    expected_tvl_status_counts = {
+        status: sum(row.get("status") == status for row in inventory)
+        for status in ("observed", "missing", "not_found", "failed")
+    }
+    expected_tvl_reason_counts = dict(
+        sorted(Counter(str(row.get("reason_code") or "") for row in inventory).items())
+    )
     if (
-        tvl_manifest.get("snapshot_id") != tvl_snapshot_id
+        "" in expected_tvl_reason_counts
+        or tvl_manifest.get("snapshot_id") != tvl_snapshot_id
         or tvl_manifest.get("pool_count") != len(inventory)
+        or tvl_manifest.get("token_count")
+        != len({row.get("token_symbol") for row in inventory})
+        or tvl_manifest.get("chain_count")
+        != len({row.get("chain") for row in inventory})
+        or tvl_manifest.get("status_counts") != expected_tvl_status_counts
+        or tvl_manifest.get("reason_code_counts") != expected_tvl_reason_counts
     ):
         raise ValueError("TVL manifest does not match the production inventory")
     if (
@@ -2356,6 +2482,17 @@ def validate_uniswap_v3_exact_candidate(
         raw, payload = _evidence_json(path, "GeckoTerminal raw response")
         tvl_payloads_by_hash[hashlib.sha256(raw).hexdigest()] = payload
     tvl_hashes = set(tvl_payloads_by_hash)
+    inventory_tvl_hashes = {
+        str(row.get("raw_response_sha256") or "") for row in inventory
+    }
+    if (
+        not inventory_tvl_hashes
+        or any(_SHA256.fullmatch(value) is None for value in inventory_tvl_hashes)
+        or inventory_tvl_hashes != tvl_hashes
+    ):
+        raise ValueError(
+            "retained GeckoTerminal raw files do not cover the production inventory"
+        )
     scoped_tvl_hashes = {
         str(row.get("raw_response_sha256") or "")
         for row in inventory_by_market.values()
@@ -2489,6 +2626,7 @@ def validate_uniswap_v3_exact_candidate(
         if not isinstance(parity, list):
             raise ValueError("Uniswap V3 Quoter parity evidence is missing")
         parity_scenarios = []
+        parity_by_scenario = {}
         for item in parity:
             if (
                 not isinstance(item, dict)
@@ -2496,15 +2634,21 @@ def validate_uniswap_v3_exact_candidate(
                 or type(item.get("amount_raw")) is not int
                 or type(item.get("sqrt_price_x96_after")) is not int
                 or type(item.get("initialized_ticks_crossed")) is not int
+                or type(item.get("gas_estimate_raw")) is not int
                 or type(item.get("core_liquidity_boundaries_crossed")) is not int
+                or item["amount_raw"] <= 0
+                or not 0 <= item["sqrt_price_x96_after"] < 1 << 160
+                or not 0 <= item["initialized_ticks_crossed"] < 1 << 32
+                or item["gas_estimate_raw"] <= 0
+                or item["core_liquidity_boundaries_crossed"] < 0
             ):
                 raise ValueError("Uniswap V3 Quoter parity is not exact")
-            parity_scenarios.append(
-                (
-                    str(item.get("direction") or ""),
-                    str(item.get("requested_notional_usd") or ""),
-                )
+            scenario = (
+                str(item.get("direction") or ""),
+                str(item.get("requested_notional_usd") or ""),
             )
+            parity_scenarios.append(scenario)
+            parity_by_scenario[scenario] = item
         if (
             len(parity_scenarios) != len(expected_scenarios)
             or len(parity_scenarios) != len(set(parity_scenarios))
@@ -2516,16 +2660,98 @@ def validate_uniswap_v3_exact_candidate(
             quoter_v2_address=record["quoter_v2_address"],
             block_number=int(block_number),
         )
-        expected_raw_quoter = [
-            (
-                str(item["direction"]),
-                int(item["amount_raw"]),
-                int(item["sqrt_price_x96_after"]),
-                int(item["initialized_ticks_crossed"]),
+        retained_by_call = {}
+        for item in retained_quoter:
+            call_identity = (
+                item["direction"],
+                item["token_in"],
+                item["token_out"],
+                item["amount"],
+                item["fee_pips"],
+                item["sqrt_price_limit_x96"],
             )
-            for item in parity
-        ]
-        if retained_quoter != expected_raw_quoter:
+            if call_identity in retained_by_call:
+                raise ValueError("Uniswap V3 raw Quoter request mapping is invalid")
+            retained_by_call[call_identity] = item["response_words"]
+        execution_by_scenario = {
+            (
+                str(row.get("direction") or ""),
+                str(row.get("requested_notional_usd") or ""),
+            ): row
+            for row in market_execution
+        }
+        expected_calls = set()
+        directions = scan["directions"]
+        for scenario in sorted(expected_scenarios):
+            direction, _notional = scenario
+            execution_row = execution_by_scenario[scenario]
+            target_address = str(
+                execution_row.get("target_token_address") or ""
+            ).lower()
+            quote_address = str(
+                execution_row.get("quote_token_address") or ""
+            ).lower()
+            if (
+                target_address != record["token0_address"]
+                or quote_address != record["token1_address"]
+                or str(execution_row.get("target_token_decimals") or "")
+                != str(record["token0_decimals"])
+                or str(execution_row.get("quote_token_decimals") or "")
+                != str(record["token1_decimals"])
+                or decimal_text(execution_row.get("fee_rate_bps"))
+                != decimal_text(Decimal(record["fee_pips"]) / Decimal(100))
+            ):
+                raise ValueError("Uniswap V3 execution authority fields are invalid")
+            target_raw = _execution_quantity_raw(
+                execution_row,
+                "target_token_quantity",
+                record["token0_decimals"],
+            )
+            if _execution_quantity_raw(
+                execution_row,
+                "filled_token_quantity",
+                record["token0_decimals"],
+            ) != target_raw:
+                raise ValueError("Uniswap V3 observed execution fill is not exact")
+            quote_raw = _execution_quantity_raw(
+                execution_row,
+                "quote_amount",
+                record["token1_decimals"],
+            )
+            zero_for_one = direction == "sell_token"
+            direction_name = "zero_for_one" if zero_for_one else "one_for_zero"
+            direction_evidence = directions.get(direction_name)
+            price_limit = (
+                direction_evidence.get("price_limit_x96")
+                if isinstance(direction_evidence, dict)
+                else None
+            )
+            if type(price_limit) is not int or not 0 <= price_limit < 1 << 160:
+                raise ValueError("Uniswap V3 Quoter price limit evidence is invalid")
+            token_in, token_out = (
+                (target_address, quote_address)
+                if zero_for_one
+                else (quote_address, target_address)
+            )
+            call_identity = (
+                direction,
+                token_in,
+                token_out,
+                target_raw,
+                record["fee_pips"],
+                price_limit,
+            )
+            expected_calls.add(call_identity)
+            response_words = retained_by_call.get(call_identity)
+            parity_item = parity_by_scenario[scenario]
+            if response_words != (
+                parity_item["amount_raw"],
+                parity_item["sqrt_price_x96_after"],
+                parity_item["initialized_ticks_crossed"],
+                parity_item["gas_estimate_raw"],
+            ) or response_words[0] != quote_raw:
+                raise ValueError("Uniswap V3 raw Quoter parity is inconsistent")
+        if set(retained_by_call) != expected_calls:
             raise ValueError("Uniswap V3 raw Quoter parity is inconsistent")
         inventory_row = inventory_by_market[market_id]
         if (
@@ -3275,6 +3501,7 @@ def v3_execution_rows(
                 quoter_amount = decode_uint(quoter_result, 0)
                 quoter_sqrt_after = decode_uint(quoter_result, 1)
                 quoter_ticks_crossed = decode_uint(quoter_result, 2)
+                quoter_gas_estimate = decode_uint(quoter_result, 3)
                 if quoter_sqrt_after >= 1 << 160:
                     raise ValueError("QuoterV2 sqrtPriceX96After exceeds uint160")
                 if quoter_ticks_crossed >= 1 << 32:
@@ -3313,6 +3540,7 @@ def v3_execution_rows(
                         "amount_raw": quoter_amount,
                         "sqrt_price_x96_after": quoter_sqrt_after,
                         "initialized_ticks_crossed": quoter_ticks_crossed,
+                        "gas_estimate_raw": quoter_gas_estimate,
                         "core_liquidity_boundaries_crossed": (
                             result.initialized_ticks_crossed
                         ),

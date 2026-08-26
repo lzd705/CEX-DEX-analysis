@@ -2,6 +2,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +16,18 @@ BLOCK_HASH = "0x" + "a" * 64
 
 
 class ExactCandidateFixture:
+    @staticmethod
+    def quoter_calldata(selector, token_in, token_out, amount, fee, price_limit):
+        return selector + "".join(
+            (
+                token_in[2:].rjust(64, "0"),
+                token_out[2:].rjust(64, "0"),
+                f"{amount:064x}",
+                f"{fee:064x}",
+                f"{price_limit:064x}",
+            )
+        )
+
     def __init__(self, root):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -77,6 +90,7 @@ class ExactCandidateFixture:
                 "base_token_id": "eth_" + authority["token0_address"],
                 "quote_token_id": "eth_" + authority["token1_address"],
                 "status": "observed",
+                "reason_code": "observed",
                 "source": "GeckoTerminal API v2",
                 "source_endpoint": (
                     "https://api.geckoterminal.com/api/v2/networks/eth/"
@@ -85,25 +99,9 @@ class ExactCandidateFixture:
                 "raw_response_sha256": self.gecko_sha256,
             }
             self.inventory.append(inventory_row)
-            parity = [
-                {
-                    "direction": direction,
-                    "requested_notional_usd": str(notional),
-                    "status": "exact_match",
-                    "amount_raw": index * 1000 + scenario_index,
-                    "sqrt_price_x96_after": index * 2000 + scenario_index,
-                    "initialized_ticks_crossed": scenario_index,
-                    "core_liquidity_boundaries_crossed": scenario_index,
-                }
-                for scenario_index, (notional, direction) in enumerate(
-                    (
-                        (notional, direction)
-                        for notional in EXECUTION_NOTIONALS_USD
-                        for direction in EXECUTION_DIRECTIONS
-                    ),
-                    start=1,
-                )
-            ]
+            price_limits = {"zero_for_one": 111, "one_for_zero": 222}
+            parity = []
+            scenario_facts = {}
             records = [
                 {
                     "request": {
@@ -124,19 +122,55 @@ class ExactCandidateFixture:
                     "response_sha256": "e" * 64,
                 }
             ]
-            for request_id, item in enumerate(parity, start=1):
+            scenarios = (
+                (notional, direction)
+                for notional in EXECUTION_NOTIONALS_USD
+                for direction in EXECUTION_DIRECTIONS
+            )
+            for request_id, (notional, direction) in enumerate(scenarios, start=1):
                 selector = (
                     fetch_dex_depth.SELECTOR_QUOTE_EXACT_INPUT_SINGLE_V2
-                    if item["direction"] == "sell_token"
+                    if direction == "sell_token"
                     else fetch_dex_depth.SELECTOR_QUOTE_EXACT_OUTPUT_SINGLE_V2
                 )
+                target_raw = request_id * 10**18
+                amount_raw = index * 1000 + request_id
+                zero_for_one = direction == "sell_token"
+                token_in = (
+                    authority["token0_address"]
+                    if zero_for_one
+                    else authority["token1_address"]
+                )
+                token_out = (
+                    authority["token1_address"]
+                    if zero_for_one
+                    else authority["token0_address"]
+                )
+                price_limit = price_limits[
+                    "zero_for_one" if zero_for_one else "one_for_zero"
+                ]
+                item = {
+                    "direction": direction,
+                    "requested_notional_usd": str(notional),
+                    "status": "exact_match",
+                    "amount_raw": amount_raw,
+                    "sqrt_price_x96_after": index * 2000 + request_id,
+                    "initialized_ticks_crossed": request_id,
+                    "gas_estimate_raw": 100000 + request_id,
+                    "core_liquidity_boundaries_crossed": request_id,
+                }
+                parity.append(item)
+                scenario_facts[(direction, str(notional))] = {
+                    "target_raw": target_raw,
+                    "amount_raw": amount_raw,
+                }
                 result = "0x" + "".join(
                     f"{value:064x}"
                     for value in (
                         item["amount_raw"],
                         item["sqrt_price_x96_after"],
                         item["initialized_ticks_crossed"],
-                        100000,
+                        item["gas_estimate_raw"],
                     )
                 )
                 records.append(
@@ -149,7 +183,14 @@ class ExactCandidateFixture:
                                 "params": [
                                     {
                                         "to": authority["quoter_v2_address"],
-                                        "data": selector + "00" * 160,
+                                        "data": self.quoter_calldata(
+                                            selector,
+                                            token_in,
+                                            token_out,
+                                            target_raw,
+                                            authority["fee_pips"],
+                                            price_limit,
+                                        ),
                                     },
                                     "0x7b",
                                 ],
@@ -201,7 +242,10 @@ class ExactCandidateFixture:
                     "block_final": dict(block),
                     "bitmap_words": [],
                     "tick_evidence": [],
-                    "directions": {},
+                    "directions": {
+                        name: {"price_limit_x96": price_limit}
+                        for name, price_limit in price_limits.items()
+                    },
                     "bitmap_word_radius": authority["bitmap_word_radius"],
                     "quoter_v2_parity": parity,
                 },
@@ -233,6 +277,13 @@ class ExactCandidateFixture:
             self.depth_rows.append(depth_row)
             for direction in EXECUTION_DIRECTIONS:
                 for notional in EXECUTION_NOTIONALS_USD:
+                    facts = scenario_facts[(direction, str(notional))]
+                    target_quantity = Decimal(facts["target_raw"]) / Decimal(
+                        10**authority["token0_decimals"]
+                    )
+                    quote_quantity = Decimal(facts["amount_raw"]) / Decimal(
+                        10**authority["token1_decimals"]
+                    )
                     self.execution_rows.append(
                         {
                             "snapshot_id": self.depth_snapshot_id,
@@ -240,6 +291,18 @@ class ExactCandidateFixture:
                             "market_id": market_id,
                             "direction": direction,
                             "requested_notional_usd": str(notional),
+                            "target_token_address": authority["token0_address"],
+                            "target_token_decimals": str(
+                                authority["token0_decimals"]
+                            ),
+                            "quote_token_address": authority["token1_address"],
+                            "quote_token_decimals": str(
+                                authority["token1_decimals"]
+                            ),
+                            "target_token_quantity": format(target_quantity, "f"),
+                            "filled_token_quantity": format(target_quantity, "f"),
+                            "quote_amount": format(quote_quantity, "f"),
+                            "fee_rate_bps": str(authority["fee_pips"] // 100),
                             "status": "observed",
                             "block_number": "123",
                             "raw_response_sha256": transcript_hash,
@@ -251,6 +314,17 @@ class ExactCandidateFixture:
     @staticmethod
     def sha256(path):
         return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @staticmethod
+    def replace_abi_word(value, index, replacement):
+        start = 10 + index * 64
+        return value[:start] + f"{replacement:064x}" + value[start + 64 :]
+
+    @staticmethod
+    def replace_address_word(value, index, replacement):
+        start = 10 + index * 64
+        word = replacement[2:].rjust(64, "0")
+        return value[:start] + word + value[start + 64 :]
 
     def write_manifests(self):
         tvl_manifest = {
@@ -264,6 +338,7 @@ class ExactCandidateFixture:
                 "not_found": 0,
                 "failed": 0,
             },
+            "reason_code_counts": {"observed": len(self.inventory)},
             "raw_files": [self.gecko_path.name],
         }
         self.tvl_manifest_path = self.tvl_directory / "manifest.json"
@@ -308,6 +383,43 @@ class ExactCandidateFixture:
             for row in self.execution_rows:
                 if row["market_id"] == market_id:
                     row["raw_response_sha256"] = new_hash
+
+    def rebind_tvl_snapshot(self, snapshot_id, destination=None):
+        if destination is not None and destination != self.tvl_directory:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self.tvl_directory.rename(destination)
+            self.tvl_directory = destination
+            self.gecko_path = destination / self.gecko_path.name
+            self.tvl_manifest_path = destination / "manifest.json"
+        self.tvl_snapshot_id = snapshot_id
+        for row in self.inventory:
+            row["snapshot_id"] = snapshot_id
+        for market_id in self.market_ids:
+            self.rewrite_transcript(
+                market_id,
+                lambda transcript, snapshot_id=snapshot_id: transcript[
+                    "usd_price_evidence"
+                ].update(source_snapshot_id=snapshot_id),
+            )
+        self.write_manifests()
+
+    def rebind_depth_snapshot(self, snapshot_id, destination=None):
+        if destination is not None and destination != self.depth_directory:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self.depth_directory.rename(destination)
+            self.depth_directory = destination
+            self.depth_manifest_path = destination / "manifest.json"
+            self.transcript_paths = {
+                market_id: destination / path.name
+                for market_id, path in self.transcript_paths.items()
+            }
+        self.depth_snapshot_id = snapshot_id
+        for row in self.depth_rows:
+            row["snapshot_id"] = snapshot_id
+        for row in self.execution_rows:
+            row["snapshot_id"] = snapshot_id
+            row["source_snapshot_id"] = snapshot_id
+        self.write_manifests()
 
 
 class UniswapV3ExactPublicationTest(unittest.TestCase):
@@ -466,6 +578,89 @@ class UniswapV3ExactPublicationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "raw Quoter"):
             self.fixture.validate()
 
+    def test_quoter_calldata_must_match_authority_scenario_and_execution_row(self):
+        market_id = self.fixture.market_ids[0]
+        authority = self.fixture.authority[market_id]
+
+        def mutate_data(payload, mutation):
+            call = payload["records"][1]["request"][0]["params"][0]
+            call["data"] = mutation(call["data"])
+
+        cases = {
+            "token_in": lambda data: self.fixture.replace_address_word(
+                data, 0, authority["token1_address"]
+            ),
+            "token_out": lambda data: self.fixture.replace_address_word(
+                data, 1, authority["token0_address"]
+            ),
+            "amount": lambda data: self.fixture.replace_abi_word(
+                data, 2, 10**18 + 1
+            ),
+            "fee": lambda data: self.fixture.replace_abi_word(data, 3, 500),
+            "price_limit": lambda data: self.fixture.replace_abi_word(
+                data, 4, 112
+            ),
+        }
+        for name, mutation in cases.items():
+            with self.subTest(name=name):
+                fresh = ExactCandidateFixture(self.root / f"calldata-{name}")
+                fresh.rewrite_transcript(
+                    market_id,
+                    lambda payload, mutation=mutation: mutate_data(
+                        payload, mutation
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "Quoter|execution"):
+                    fresh.validate()
+
+    def test_quoter_response_binds_all_words_and_exact_request_id(self):
+        market_id = self.fixture.market_ids[0]
+        cases = {
+            "gas_estimate": lambda payload: payload["v3_tick_scan_manifest"][
+                "quoter_v2_parity"
+            ][0].update(gas_estimate_raw=100002),
+            "sqrt_uint160": lambda payload: self._rebind_quoter_word(
+                payload, 0, 1, 1 << 160, "sqrt_price_x96_after"
+            ),
+            "ticks_uint32": lambda payload: self._rebind_quoter_word(
+                payload, 0, 2, 1 << 32, "initialized_ticks_crossed"
+            ),
+            "duplicate_response_id": lambda payload: payload["records"][1][
+                "response"
+            ].append(dict(payload["records"][1]["response"][0])),
+            "orphan_response_id": lambda payload: payload["records"][1][
+                "response"
+            ].append(
+                {
+                    **payload["records"][1]["response"][0],
+                    "id": 999,
+                }
+            ),
+        }
+        for name, mutation in cases.items():
+            with self.subTest(name=name):
+                fresh = ExactCandidateFixture(self.root / f"response-{name}")
+                fresh.rewrite_transcript(market_id, mutation)
+                with self.assertRaisesRegex(ValueError, "Quoter"):
+                    fresh.validate()
+
+    @staticmethod
+    def _rebind_quoter_word(payload, parity_index, word_index, value, field):
+        parity = payload["v3_tick_scan_manifest"]["quoter_v2_parity"][
+            parity_index
+        ]
+        parity[field] = value
+        response = payload["records"][parity_index + 1]["response"][0]
+        response["result"] = ExactCandidateFixture.replace_abi_word(
+            response["result"], word_index, value
+        )
+
+    def test_candidate_execution_output_must_match_quoter_result(self):
+        self.fixture.execution_rows[0]["quote_amount"] = "999999"
+
+        with self.assertRaisesRegex(ValueError, "Quoter|execution"):
+            self.fixture.validate()
+
     def test_finalized_block_must_match_retained_rpc_result(self):
         market_id = self.fixture.market_ids[0]
         self.fixture.rewrite_transcript(
@@ -551,6 +746,81 @@ class UniswapV3ExactPublicationTest(unittest.TestCase):
                 )
                 mutation(path)
                 with self.assertRaisesRegex(ValueError, pattern):
+                    fresh.validate()
+
+    def test_tvl_manifest_semantic_counters_are_recomputed(self):
+        cases = {
+            "token_count": 2,
+            "chain_count": 2,
+            "status_counts": {"observed": 1, "failed": 1},
+            "reason_code_counts": {"observed": 1, "validation": 1},
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                fresh = ExactCandidateFixture(self.root / f"tvl-{field}")
+                manifest = json.loads(
+                    fresh.tvl_manifest_path.read_text(encoding="utf-8")
+                )
+                manifest[field] = value
+                fresh.tvl_manifest_path.write_text(
+                    json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ValueError, "TVL manifest"):
+                    fresh.validate()
+
+    def test_tvl_manifest_raw_files_exactly_cover_candidate_inventory(self):
+        extra_path = self.fixture.tvl_directory / "002-extra.json"
+        extra_path.write_text('{"data": []}\n', encoding="utf-8")
+        manifest = json.loads(
+            self.fixture.tvl_manifest_path.read_text(encoding="utf-8")
+        )
+        manifest["raw_files"].append(extra_path.name)
+        self.fixture.tvl_manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(ValueError, "GeckoTerminal|TVL manifest"):
+            self.fixture.validate()
+
+    def test_snapshot_ids_are_canonical_and_cannot_escape_evidence_roots(self):
+        cases = (
+            (
+                "absolute_tvl",
+                "tvl",
+                lambda fresh: str(fresh.tvl_directory),
+                lambda fresh, _snapshot_id: fresh.tvl_directory,
+            ),
+            (
+                "credentialed_uri",
+                "tvl",
+                lambda _fresh: "https://user:secret@example.invalid/snapshot",
+                lambda fresh, snapshot_id: fresh.tvl_raw_root / snapshot_id,
+            ),
+            (
+                "traversal_tvl",
+                "tvl",
+                lambda _fresh: "../outside-tvl",
+                lambda fresh, snapshot_id: fresh.tvl_raw_root / snapshot_id,
+            ),
+            (
+                "traversal_depth",
+                "depth",
+                lambda _fresh: "nested/../depth-snapshot",
+                lambda fresh, _snapshot_id: fresh.depth_directory,
+            ),
+        )
+        for name, kind, snapshot_id_fn, destination_fn in cases:
+            with self.subTest(name=name):
+                fresh = ExactCandidateFixture(self.root / name)
+                snapshot_id = snapshot_id_fn(fresh)
+                destination = destination_fn(fresh, snapshot_id)
+                if name == "traversal_depth":
+                    (fresh.depth_raw_root / "nested").mkdir()
+                if kind == "tvl":
+                    fresh.rebind_tvl_snapshot(snapshot_id, destination)
+                else:
+                    fresh.rebind_depth_snapshot(snapshot_id, destination)
+                with self.assertRaisesRegex(ValueError, "snapshot|evidence root"):
                     fresh.validate()
 
     def test_tampered_or_symlinked_geckoterminal_response_is_rejected(self):

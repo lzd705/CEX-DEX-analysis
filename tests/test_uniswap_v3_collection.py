@@ -422,6 +422,14 @@ class UniswapV3CollectionTest(unittest.TestCase):
             )
         )
         self.assertIn("exact_match", {item["status"] for item in parity})
+        self.assertEqual(
+            {
+                item["gas_estimate_raw"]
+                for item in parity
+                if item["status"] == "exact_match"
+            },
+            {100000},
+        )
 
         rpc_requests = [record["request"] for record in raw["records"]]
         state_requests = [
