@@ -2395,6 +2395,9 @@ class FetchCexDepthTest(unittest.TestCase):
                 request_started_at="2026-07-27T01:00:00+00:00",
                 response_received_at="2026-07-27T01:00:01+00:00",
                 error=RuntimeError("venue outage"),
+                raw_response_sha256=hashlib.sha256(
+                    complete_book()["raw"]
+                ).hexdigest(),
             )
         ]
 

@@ -88,7 +88,9 @@ quoted execution cost bps
 No value is interpolated from the cumulative 10/25/50/100 bps depth bands.
 CEX results walk the original returned price levels. Supported DEX V2 results
 execute the exact integer constant-product invariant captured at the fixed
-block. DEX V3 fixed-notional execution is not published by this release.
+block. The two authority-bound Ethereum Uniswap V3 UNI pools use the exact
+integer adapter described below; other V3 markets remain structurally
+unsupported.
 
 ## Cost scope
 
@@ -247,6 +249,8 @@ is not a lower bound and must never be displayed with `>=`.
 - `source_level_limit`;
 - `full_book_insufficient_liquidity`;
 - `full_pool_reserve_insufficient`;
+- `full_target_quantity_filled`;
+- `source_tick_scan_limit`;
 - `exact_integer_swap_math_not_implemented`;
 - `unsupported_protocol_or_chain`;
 - `order_book_fetch_or_normalization_failed`,
@@ -254,17 +258,34 @@ is not a lower bound and must never be displayed with `>=`.
 
 ## DEX adapter boundary
 
-Constant-product V2 pools can calculate the configured targets directly,
-subject to reserve constraints. Concentrated-liquidity V3 depth remains
-available through the separately validated +/-100 bps depth scan, but this
-release does not publish V3 fixed-notional execution cost. Decimal continuous
-segment formulas are not protocol-exact integer `SwapMath` or a same-block
-Quoter result, so all V3 execution scenarios are `unsupported` with
-`exact_integer_swap_math_not_implemented` and no numeric execution fields.
+Constant-product V2 pools calculate the configured targets directly, subject
+to reserve constraints. V3 execution is enabled only for the exact identities
+in `config/uniswap_v3_execution_markets.json`: the Ethereum Uniswap V3
+UNI/USDT 0.3% and UNI/WETH 0.3% pools. The authority binds chain ID, pool,
+factory, `factory.getPool`, token order and decimals, fee, tick spacing, and
+QuoterV2 address. Any mismatch fails the supported adapter; it does not fall
+back to a generic V3 label.
 
-A later V3 execution adapter must implement stepwise protocol integer rounding
-or validate against a project-validated same-block Quoter. It must also retain a bounded
-scan guard and explicit partial state when the target is still not proved.
+For those two markets, depth and execution share one finalized-block state
+window. The collector reads the current bitmap word and expands in each
+direction up to the configured bounded radius, retaining every bitmap word and
+every initialized tick in the raw transcript. `scripts/uniswap_v3_math.py`
+ports the observable integer rounding of core `TickMath`, `SqrtPriceMath`, and
+`SwapMath`; sells are exact-input simulations and buys are exact-output
+simulations. Decimal arithmetic is used only after the integer quote for human
+units and USD presentation.
+
+Every complete scenario must match same-block QuoterV2 on the quoted raw
+amount, final `sqrtPriceX96`, and the periphery bitmap tick counter. A mismatch
+or invalid response makes all ten execution scenarios for that pool `failed`,
+while independently valid depth remains available. The Quoter response must be
+the complete four-word ABI result, with the documented uint160 and uint32
+widths; truncated or over-wide evidence also fails. Reaching the proven bitmap
+boundary before the amount resolves is `partial` with
+`source_tick_scan_limit`; full cost fields remain blank. All V3 identities
+outside the two-record authority remain
+`unsupported` with `exact_integer_swap_math_not_implemented` and null numeric
+execution fields.
 
 ## Files and publication
 
@@ -283,7 +304,9 @@ Depth and execution coverage are preflighted as one publication bundle. A
 coverage regression in execution blocks the matching depth commit phase. CEX
 requires 90% current usable scenario coverage; supported DEX execution
 requires 80%; both retain at least 95% of comparable prior usable scenario
-identities. Expected DEX V3 `unsupported` scenarios are excluded.
+identities. An authority-approved V3 market is in the supported denominator,
+so `unsupported` or `failed` rows cannot hide as a structural gap. Other V3
+identities remain excluded until separately approved.
 Full-inventory publishes still replace the files separately. A canonical
 one-market retry stages and failure-atomically replaces the bounded
 depth/history/execution bundle for ordinary I/O exceptions, while deliberately

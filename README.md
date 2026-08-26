@@ -131,9 +131,11 @@ are `deploy/systemd/cex-dex-dashboard.service.in`,
   and DEX pool-state depth are separately collected point-in-time snapshots.
   None is historical daily liquidity, and TVL is never converted into depth.
 - Fixed-notional quoted cost walks the original CEX levels or executes the
-  supported DEX V2 invariant captured by those collectors. DEX V3 execution is
-  explicitly unsupported in this release. Cost is never interpolated from the
-  four depth bands. Every CEX row explicitly marks its numeric trading fee as
+  supported DEX V2 invariant captured by those collectors. It also supports
+  protocol-exact pool-only execution for the two authority-bound Ethereum
+  Uniswap V3 UNI pools; all other V3 identities remain unsupported. Cost is
+  never interpolated from the four depth bands. Every CEX row explicitly marks
+  its numeric trading fee as
   `excluded_unknown_account_tier`; the value remains null rather than being
   treated as zero. Supported DEX V2 rows include the pool's swap fee in the
   invariant calculation. This is a pool swap fee, not a claim about protocol
@@ -149,7 +151,7 @@ are `deploy/systemd/cex-dex-dashboard.service.in`,
 
 ## Future scope
 
-Funding rates, numeric CEX account fees, gas/MEV-aware quotes, DEX V3
+Funding rates, numeric CEX account fees, gas/MEV-aware quotes, broader DEX V3
 fixed-notional execution, event-study returns/impact, additional DEX protocol
 adapters, anomaly rules, historical TVL backfills, historical depth
 reconstruction, and automatic CEX mapping for runtime Tokens require separate

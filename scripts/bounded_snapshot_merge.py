@@ -52,6 +52,25 @@ def _uniform_schema(rows: List[Row], *, label: str) -> set:
     return schema
 
 
+def _source_market_id(row: Row) -> str:
+    supplied = str(row.get("market_id") or "").strip()
+    if supplied:
+        return supplied
+    pool_address = str(row.get("pool_address") or "").strip().lower()
+    if pool_address:
+        return "dex:{}:{}:{}:{}".format(
+            str(row.get("chain") or "").strip().lower(),
+            str(row.get("dex") or "").strip().lower(),
+            pool_address,
+            str(row.get("token_symbol") or "").strip().upper(),
+        )
+    exchange = str(row.get("exchange") or "").strip().lower()
+    cex_symbol = str(row.get("cex_symbol") or "").strip().upper()
+    if exchange and cex_symbol:
+        return "cex:{}:{}".format(exchange, cex_symbol)
+    raise ValueError("raw evidence row has no canonical market identity")
+
+
 def require_aligned_depth_execution_lineage(
     depth_rows: List[Row],
     execution_rows: List[Row],
@@ -76,6 +95,27 @@ def require_aligned_depth_execution_lineage(
         raise ValueError(
             "depth and execution must identify the same source publication"
         )
+    if any("raw_response_sha256" in row for row in depth_rows + execution_rows):
+        depth_hashes = {
+            _source_market_id(row): str(
+                row.get("raw_response_sha256") or ""
+            ).strip()
+            for row in depth_rows
+        }
+        if len(depth_hashes) != len(depth_rows):
+            raise ValueError("depth publication has duplicate raw evidence market")
+        execution_hashes: Dict[str, set] = {}
+        for row in execution_rows:
+            execution_hashes.setdefault(_source_market_id(row), set()).add(
+                str(row.get("raw_response_sha256") or "").strip()
+            )
+        if set(depth_hashes) != set(execution_hashes) or any(
+            execution_hashes[market_id] != {raw_hash}
+            for market_id, raw_hash in depth_hashes.items()
+        ):
+            raise ValueError(
+                "depth and execution must share raw evidence per market"
+            )
     return depth_snapshot_id
 
 

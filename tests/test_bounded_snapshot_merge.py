@@ -14,6 +14,7 @@ def row(
     notional="",
     value="old",
     source_snapshot_id=None,
+    raw_hash=None,
 ):
     result = {
         "snapshot_id": snapshot_id,
@@ -24,6 +25,8 @@ def row(
     }
     if source_snapshot_id is not None:
         result["source_snapshot_id"] = source_snapshot_id
+    if raw_hash is not None:
+        result["raw_response_sha256"] = raw_hash
     return result
 
 
@@ -41,6 +44,22 @@ class BoundedSnapshotMergeTest(unittest.TestCase):
         ]
 
         with self.assertRaisesRegex(ValueError, "same source publication"):
+            require_aligned_depth_execution_lineage(depth, execution)
+
+    def test_depth_execution_bundle_requires_same_raw_evidence_per_market(self):
+        market_id = "dex:eth:uniswap_v3:0xpool:UNI"
+        depth = [row(market_id, raw_hash="a" * 64)]
+        execution = [
+            row(
+                market_id,
+                direction="buy_token",
+                notional="1000",
+                source_snapshot_id="baseline-1",
+                raw_hash="b" * 64,
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "raw evidence"):
             require_aligned_depth_execution_lineage(depth, execution)
 
     def test_replaces_only_exact_target_and_rebinds_publication_identity(self):

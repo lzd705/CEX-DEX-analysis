@@ -87,7 +87,37 @@ amounts through every active-liquidity segment, applies the pool swap fee to gro
 input, and changes active liquidity when crossing an initialized tick. The
 Uniswap V3 core contract defines those state fields and follows the same
 tick-by-tick swap sequence:
-[Uniswap V3 pool source](https://github.com/Uniswap/v3-core/blob/main/contracts/UniswapV3Pool.sol).
+[Uniswap V3 pool source](https://github.com/Uniswap/v3-core/blob/ed88be38ab2032d82bf10ac6f8d03aa631889d48/contracts/UniswapV3Pool.sol).
+
+### Exact shared-engine canary scope
+
+The Ethereum Uniswap V3 UNI/USDT 0.3% and UNI/WETH 0.3% pools listed in
+`config/uniswap_v3_execution_markets.json` use the shared protocol-integer
+engine for both the four depth bands and fixed-notional execution. The
+collector binds one finalized block, verifies the canonical factory and
+`factory.getPool` result, reads every initialized tick advertised by each
+captured bitmap word, and rechecks the same block number and hash after the
+pool reads and again after the final Quoter call. If any approved V3 pool is in
+a chain cohort, that chain's block is selected from `finalized` before the
+first pool, so input order cannot make the V3 pool inherit a newer head block.
+The raw per-pool evidence contains the RPC transcript plus a
+`uniswap_v3_tick_scan_manifest/v1` summary of the authority, word range,
+initialized ticks, directional proof boundary, QuoterV2 parity, and terminal
+reason.
+
+The transcript also binds the exact GeckoTerminal source snapshot, response
+time, endpoint, raw-response SHA-256, token identities, and USD prices used for
+conversion. Publication requires every depth row and all ten matching
+execution rows to carry the same per-market transcript SHA-256.
+
+The configured bitmap radius is a proof bound, not an estimate. Depth is
+complete only when both directions reach the exact integer 10/25/50/100 bps
+price limits. Execution is complete only when the full integer target amount
+resolves before that bound and its same-block QuoterV2 check matches. A bound
+that is too short yields `partial`; an identity, RPC, arithmetic, transcript,
+or parity defect yields `failed`. Other V3 markets continue through the
+existing depth adapter but do not gain fixed-notional execution support from a
+DEX-name match.
 
 PancakeSwap documents its V3 fee tiers as 0.01%, 0.05%, 0.25%, and 1%; the
 collector reads the actual fee from each pool rather than parsing the pool name:
@@ -159,6 +189,19 @@ off-market pool. The actual pool-state depth remains visible with its lineage.
 | Price dependency | `data/processed/dex_pool_tvl_snapshot.csv` | Temporary current-run GeckoTerminal USD-price input; not a published TVL fact |
 | Raw evidence | `data/raw/dex-depth/<snapshot_id>/*.json` | Per-pool RPC transcripts and errors |
 | Raw manifest | `data/raw/dex-depth/<snapshot_id>/manifest.json` | Fixed blocks, status counts, bands, and raw-file inventory |
+
+The two-pool canary is intentionally non-publishing:
+
+```bash
+python3 scripts/run_uniswap_v3_canary.py --evidence-root /absolute/new/path
+```
+
+It creates a new evidence directory, refreshes the GeckoTerminal price input,
+collects both pools, and returns `"published": false`. It never replaces a
+`data/local` current pointer or production bundle. A passing run writes
+`canary_result.json`, which records the one shared block number and hash, the
+two pool transcript hashes, the retained USD-source hash, and the exact
+two-direction by five-notional scenario counts.
 
 The public and private depth-current files intentionally share the basename
 `dex_depth_snapshot.csv`; their `data/local` versus `data/processed`

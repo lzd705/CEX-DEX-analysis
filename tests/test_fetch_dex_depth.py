@@ -1709,6 +1709,7 @@ class DexDepthCollectionTest(unittest.TestCase):
                     status="failed",
                     status_reason="pool_state_collection_failed",
                     error="RuntimeError: temporary RPC failure",
+                    raw_response_sha256="a" * 64,
                 )
             )
         _snapshot_id, candidate_depth, candidate_execution = (
