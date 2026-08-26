@@ -44,6 +44,7 @@ from scripts.collection_lock_evidence import (
     open_verified_directory_chain,
     open_verified_regular_at,
 )
+from scripts.fetch_dex_depth import load_uniswap_v3_execution_authority
 from scripts.timestamp_contract import (
     parse_rfc3339_utc,
     validate_observation_bounds,
@@ -461,6 +462,7 @@ def build_step_commands(
     deadline_seconds: float = 60.0,
     market_id: str | None = None,
     full_rebuild: bool = False,
+    require_uniswap_v3_exact_validation: bool = False,
 ) -> list[tuple[str, list[str]]]:
     if profile not in PROFILE_STEPS:
         raise ValueError(f"Unknown collection profile: {profile}")
@@ -491,6 +493,16 @@ def build_step_commands(
                     family.upper() or "unknown",
                 )
             )
+        if market_id in load_uniswap_v3_execution_authority():
+            raise ValueError(
+                "Uniswap V3 authority markets cannot use bounded collection"
+            )
+    if require_uniswap_v3_exact_validation and (
+        profile not in {"full", "depth", "dex_depth"} or market_id is not None
+    ):
+        raise ValueError(
+            "exact Uniswap V3 validation requires a full DEX depth inventory"
+        )
     data_dir = data_dir.expanduser().resolve()
     processed_dir = processed_dir_for(data_dir)
     dex_price_input = processed_dir / DEX_PRICE_INPUT.name
@@ -616,6 +628,16 @@ def build_step_commands(
                 command.extend(["--publish-dir", str(data_dir)])
                 if market_id is not None:
                     command.append("--merge-publish")
+            if market_id is None and (
+                publish_local or require_uniswap_v3_exact_validation
+            ):
+                command.extend(
+                    [
+                        "--require-uniswap-v3-exact-validation",
+                        "--tvl-raw-root",
+                        str(raw_root / "tvl"),
+                    ]
+                )
         commands.append((step, command))
     return commands
 
@@ -843,6 +865,7 @@ def run_collection_cycle(
     deadline_seconds: float = 60.0,
     market_id: str | None = None,
     full_rebuild: bool = False,
+    require_uniswap_v3_exact_validation: bool = False,
     fail_fast: bool = False,
     dry_run: bool = False,
     step_runner: Callable[[list[str], Path], int] = default_step_runner,
@@ -865,6 +888,9 @@ def run_collection_cycle(
         deadline_seconds=deadline_seconds,
         market_id=market_id,
         full_rebuild=full_rebuild,
+        require_uniswap_v3_exact_validation=(
+            require_uniswap_v3_exact_validation
+        ),
     )
     if dry_run:
         return {
@@ -1171,6 +1197,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Replace daily processed output instead of incremental upsert",
     )
+    parser.add_argument(
+        "--require-uniswap-v3-exact-validation",
+        action="store_true",
+        help="Gate a full DEX-depth candidate without requiring publication",
+    )
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -1188,6 +1219,9 @@ def main() -> None:
         deadline_seconds=args.deadline_seconds,
         market_id=args.market_id,
         full_rebuild=args.full_rebuild,
+        require_uniswap_v3_exact_validation=(
+            args.require_uniswap_v3_exact_validation
+        ),
         fail_fast=args.fail_fast,
         dry_run=args.dry_run,
     )

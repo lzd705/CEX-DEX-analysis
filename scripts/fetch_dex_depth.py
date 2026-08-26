@@ -27,6 +27,7 @@ import math
 import os
 import re
 import ssl
+import stat
 import time
 import urllib.error
 import urllib.parse
@@ -157,6 +158,7 @@ DEFAULT_TVL_CSV = PROJECT_ROOT / "data/local/dex_pool_tvl_latest.csv"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data/processed"
 DEFAULT_PUBLISH_DIR = PROJECT_ROOT / "data/local"
 DEFAULT_RAW_ROOT = PROJECT_ROOT / "data/raw/dex-depth"
+DEFAULT_TVL_RAW_ROOT = PROJECT_ROOT / "data/raw/tvl"
 DEFAULT_V3_EXECUTION_AUTHORITY = (
     PROJECT_ROOT / "config/uniswap_v3_execution_markets.json"
 )
@@ -1983,6 +1985,619 @@ def load_uniswap_v3_execution_authority(
             raise ValueError("Uniswap V3 execution authority has duplicate market")
         result[market_id] = market
     return result
+
+
+def _regular_evidence_bytes(path: Path, label: str) -> bytes:
+    """Read one retained evidence file without following a symlink."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{label} is missing or is not regular evidence") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{label} is not regular evidence")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            return source.read()
+    finally:
+        os.close(descriptor)
+
+
+def _evidence_json(path: Path, label: str) -> tuple[bytes, dict[str, Any]]:
+    raw = _regular_evidence_bytes(path, label)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is unreadable") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} is not a JSON object")
+    return raw, payload
+
+
+def _evidence_directory(path: Path, label: str) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise ValueError(f"{label} directory is missing") from error
+    if not stat.S_ISDIR(mode):
+        raise ValueError(f"{label} directory is not regular evidence")
+
+
+def _manifest_raw_paths(
+    directory: Path,
+    manifest: Mapping[str, Any],
+    *,
+    label: str,
+) -> list[Path]:
+    raw_files = manifest.get("raw_files")
+    if (
+        not isinstance(raw_files, list)
+        or not raw_files
+        or any(type(name) is not str for name in raw_files)
+        or len(raw_files) != len(set(raw_files))
+    ):
+        raise ValueError(f"{label} manifest raw file inventory is invalid")
+    for name in raw_files:
+        if Path(name).name != name or name == "manifest.json" or not name.endswith(".json"):
+            raise ValueError(f"{label} manifest raw file inventory is invalid")
+    actual = sorted(
+        path.name
+        for path in directory.iterdir()
+        if path.name != "manifest.json" and path.suffix == ".json"
+    )
+    if sorted(raw_files) != actual:
+        raise ValueError(f"{label} manifest does not match retained evidence")
+    paths = [directory / name for name in sorted(raw_files)]
+    for path in paths:
+        _regular_evidence_bytes(path, f"{label} raw evidence")
+    return paths
+
+
+def _exact_scenarios() -> list[tuple[str, str]]:
+    return [
+        (direction, decimal_text(notional))
+        for notional in EXECUTION_NOTIONALS_USD
+        for direction in EXECUTION_DIRECTIONS
+    ]
+
+
+def _retained_quoter_results(
+    records: Any,
+    *,
+    quoter_v2_address: str,
+    block_number: int,
+) -> list[tuple[str, int, int, int]]:
+    if not isinstance(records, list):
+        raise ValueError("Uniswap V3 raw Quoter transcript is missing")
+    results = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        requests = record.get("request")
+        responses = record.get("response")
+        request_items = requests if isinstance(requests, list) else [requests]
+        response_items = responses if isinstance(responses, list) else [responses]
+        responses_by_id = {
+            response.get("id"): response
+            for response in response_items
+            if isinstance(response, dict) and type(response.get("id")) is int
+        }
+        for request in request_items:
+            if not isinstance(request, dict) or request.get("method") != "eth_call":
+                continue
+            params = request.get("params")
+            if not isinstance(params, list) or len(params) != 2:
+                continue
+            call = params[0]
+            if not isinstance(call, dict):
+                continue
+            if str(call.get("to") or "").lower() != quoter_v2_address:
+                continue
+            data = str(call.get("data") or "").lower()
+            if data.startswith(SELECTOR_QUOTE_EXACT_INPUT_SINGLE_V2):
+                direction = "sell_token"
+            elif data.startswith(SELECTOR_QUOTE_EXACT_OUTPUT_SINGLE_V2):
+                direction = "buy_token"
+            else:
+                raise ValueError("Uniswap V3 raw Quoter selector is invalid")
+            if params[1] != hex(block_number):
+                raise ValueError("Uniswap V3 raw Quoter block is invalid")
+            response = responses_by_id.get(request.get("id"))
+            result = response.get("result") if isinstance(response, dict) else None
+            if not isinstance(result, str) or len(words(result)) != 4:
+                raise ValueError("Uniswap V3 raw Quoter result is invalid")
+            results.append(
+                (
+                    direction,
+                    decode_uint(result, 0),
+                    decode_uint(result, 1),
+                    decode_uint(result, 2),
+                )
+            )
+    return results
+
+
+def _retained_finalized_block(records: Any, block_number: int) -> dict[str, str]:
+    if not isinstance(records, list):
+        raise ValueError("Uniswap V3 raw finalized block proof is missing")
+    identities = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        requests = record.get("request")
+        responses = record.get("response")
+        request_items = requests if isinstance(requests, list) else [requests]
+        response_items = responses if isinstance(responses, list) else [responses]
+        responses_by_id = {
+            response.get("id"): response
+            for response in response_items
+            if isinstance(response, dict) and type(response.get("id")) is int
+        }
+        for request in request_items:
+            if (
+                not isinstance(request, dict)
+                or request.get("method") != "eth_getBlockByNumber"
+                or request.get("params") != ["finalized", False]
+            ):
+                continue
+            response = responses_by_id.get(request.get("id"))
+            result = response.get("result") if isinstance(response, dict) else None
+            try:
+                identities.append(exact_v3_block_identity(result, block_number))
+            except (RpcError, TypeError, ValueError) as error:
+                raise ValueError(
+                    "Uniswap V3 raw finalized block proof is invalid"
+                ) from error
+    if not identities or any(identity != identities[0] for identity in identities):
+        raise ValueError("Uniswap V3 raw finalized block proof is invalid")
+    return identities[0]
+
+
+def require_uniswap_v3_publication_scope(
+    inventory: Iterable[Mapping[str, Any]],
+    *,
+    market_id: str,
+    merge_publish: bool,
+    exact_validation_enabled: bool,
+    publishing: bool,
+) -> None:
+    """Prevent authority pools from bypassing the two-market gate."""
+    authority = load_uniswap_v3_execution_authority()
+    target = str(market_id or "").strip()
+    if merge_publish and target in authority:
+        raise ValueError(
+            "Uniswap V3 authority markets cannot use bounded merge-publication"
+        )
+    present = set()
+    authority_pool_addresses = {
+        record["pool_address"]: authority_market_id
+        for authority_market_id, record in authority.items()
+    }
+    for row in inventory:
+        pool_address = str(row.get("pool_address") or "").strip().lower()
+        authority_market_id = authority_pool_addresses.get(pool_address)
+        if authority_market_id is not None:
+            present.add(authority_market_id)
+    if publishing and not merge_publish and present and not exact_validation_enabled:
+        raise ValueError(
+            "Uniswap V3 authority publication requires exact validation"
+        )
+
+
+def validate_uniswap_v3_exact_candidate(
+    inventory: list[dict[str, str]],
+    depth_rows: list[dict[str, str]],
+    execution_rows: list[dict[str, str]],
+    *,
+    tvl_raw_root: Path,
+    depth_raw_root: Path,
+    authority_path: Path = V3_EXECUTION_AUTHORITY_PATH,
+) -> dict[str, Any]:
+    """Validate the exact two-pool candidate and return its public-safe receipt."""
+    authority_bytes = _regular_evidence_bytes(
+        authority_path, "Uniswap V3 execution authority"
+    )
+    authority = load_uniswap_v3_execution_authority(authority_path)
+    market_ids = sorted(authority)
+    authority_by_pool = {
+        record["pool_address"]: (market_id, record)
+        for market_id, record in authority.items()
+    }
+
+    inventory_by_market: dict[str, dict[str, str]] = {}
+    for pool_address, (market_id, record) in authority_by_pool.items():
+        matches = [
+            row
+            for row in inventory
+            if str(row.get("pool_address") or "").strip().lower() == pool_address
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "Uniswap V3 production inventory must contain both authority pools"
+            )
+        row = matches[0]
+        expected_identity = {
+            "chain": record["chain"],
+            "dex": record["dex"],
+            "pool_address": record["pool_address"],
+        }
+        actual_identity = {
+            "chain": str(row.get("chain") or "").strip().lower(),
+            "dex": str(row.get("dex") or "").strip().lower(),
+            "pool_address": str(row.get("pool_address") or "").strip().lower(),
+        }
+        token_addresses = (
+            address_from_token_id(str(row.get("base_token_id") or "")),
+            address_from_token_id(str(row.get("quote_token_id") or "")),
+        )
+        if (
+            actual_identity != expected_identity
+            or str(row.get("token_symbol") or "").strip().upper()
+            != market_id.rsplit(":", 1)[-1]
+            or set(token_addresses)
+            != {record["token0_address"], record["token1_address"]}
+            or row.get("status") != "observed"
+            or dex_market_id(dict(row)) != market_id
+        ):
+            raise ValueError("Uniswap V3 production inventory authority mismatch")
+        require_v3_usd_price_lineage(
+            snapshot_id=row.get("snapshot_id"),
+            source=row.get("source"),
+            endpoint=row.get("source_endpoint"),
+            raw_sha256=row.get("raw_response_sha256"),
+        )
+        inventory_by_market[market_id] = row
+    tvl_snapshot_ids = {
+        str(row.get("snapshot_id") or "") for row in inventory_by_market.values()
+    }
+    if len(tvl_snapshot_ids) != 1 or "" in tvl_snapshot_ids:
+        raise ValueError("Uniswap V3 production inventory TVL lineage is invalid")
+    tvl_snapshot_id = next(iter(tvl_snapshot_ids))
+
+    scoped_depth = [
+        row for row in depth_rows if dex_market_id(row) in authority
+    ]
+    depth_by_market: dict[str, dict[str, str]] = {}
+    for row in scoped_depth:
+        market_id = dex_market_id(row)
+        if market_id in depth_by_market:
+            raise ValueError("Uniswap V3 exact depth inventory contains duplicates")
+        depth_by_market[market_id] = row
+    if set(depth_by_market) != set(market_ids):
+        raise ValueError("Uniswap V3 exact depth inventory must contain 2/2 pools")
+    for market_id, row in depth_by_market.items():
+        record = authority[market_id]
+        if (
+            row.get("status") != "observed"
+            or any(
+                row.get(f"depth_{band}bps_complete") != "1"
+                for band in DEPTH_BANDS_BPS
+            )
+            or str(row.get("token0_address") or "").lower()
+            != record["token0_address"]
+            or str(row.get("token1_address") or "").lower()
+            != record["token1_address"]
+            or decimal_text(record["fee_pips"] // 100)
+            != str(row.get("fee_bps") or "")
+        ):
+            raise ValueError("Uniswap V3 exact depth must be complete and observed")
+    depth_snapshot_ids = {
+        str(row.get("snapshot_id") or "") for row in depth_by_market.values()
+    }
+    if len(depth_snapshot_ids) != 1 or "" in depth_snapshot_ids:
+        raise ValueError("Uniswap V3 exact depth snapshot lineage is invalid")
+    depth_snapshot_id = next(iter(depth_snapshot_ids))
+
+    expected_scenarios = set(_exact_scenarios())
+    scoped_execution = [
+        row for row in execution_rows if str(row.get("market_id") or "") in authority
+    ]
+    execution_by_market: dict[str, list[dict[str, str]]] = {
+        market_id: [] for market_id in market_ids
+    }
+    for row in scoped_execution:
+        execution_by_market[str(row.get("market_id") or "")].append(row)
+    for market_id, rows in execution_by_market.items():
+        scenarios = [
+            (
+                str(row.get("direction") or ""),
+                str(row.get("requested_notional_usd") or ""),
+            )
+            for row in rows
+        ]
+        if (
+            len(rows) != len(expected_scenarios)
+            or len(scenarios) != len(set(scenarios))
+            or set(scenarios) != expected_scenarios
+        ):
+            raise ValueError("Uniswap V3 exact execution scenario inventory is invalid")
+        if any(row.get("status") != "observed" for row in rows):
+            raise ValueError("Uniswap V3 exact execution scenarios must be observed")
+        if any(
+            str(row.get("snapshot_id") or "") != depth_snapshot_id
+            or str(row.get("source_snapshot_id") or "") != depth_snapshot_id
+            for row in rows
+        ):
+            raise ValueError("Uniswap V3 exact execution snapshot lineage is invalid")
+
+    tvl_directory = Path(tvl_raw_root) / tvl_snapshot_id
+    depth_directory = Path(depth_raw_root) / depth_snapshot_id
+    _evidence_directory(tvl_directory, "TVL evidence")
+    _evidence_directory(depth_directory, "depth evidence")
+    tvl_manifest_bytes, tvl_manifest = _evidence_json(
+        tvl_directory / "manifest.json", "TVL manifest"
+    )
+    depth_manifest_bytes, depth_manifest = _evidence_json(
+        depth_directory / "manifest.json", "depth manifest"
+    )
+    if (
+        tvl_manifest.get("snapshot_id") != tvl_snapshot_id
+        or tvl_manifest.get("pool_count") != len(inventory)
+    ):
+        raise ValueError("TVL manifest does not match the production inventory")
+    if (
+        depth_manifest.get("snapshot_id") != depth_snapshot_id
+        or depth_manifest.get("pool_count") != len(depth_rows)
+        or depth_manifest.get("execution_row_count") != len(execution_rows)
+        or depth_manifest.get("status_counts")
+        != dict(Counter(row.get("status") for row in depth_rows))
+    ):
+        raise ValueError("depth manifest does not match the candidate")
+    tvl_raw_paths = _manifest_raw_paths(
+        tvl_directory, tvl_manifest, label="TVL"
+    )
+    depth_raw_paths = _manifest_raw_paths(
+        depth_directory, depth_manifest, label="depth"
+    )
+    tvl_payloads_by_hash = {}
+    for path in tvl_raw_paths:
+        raw, payload = _evidence_json(path, "GeckoTerminal raw response")
+        tvl_payloads_by_hash[hashlib.sha256(raw).hexdigest()] = payload
+    tvl_hashes = set(tvl_payloads_by_hash)
+    scoped_tvl_hashes = {
+        str(row.get("raw_response_sha256") or "")
+        for row in inventory_by_market.values()
+    }
+    if not scoped_tvl_hashes or not scoped_tvl_hashes.issubset(tvl_hashes):
+        raise ValueError("retained GeckoTerminal response does not match TVL rows")
+    for market_id, row in inventory_by_market.items():
+        payload = tvl_payloads_by_hash[str(row["raw_response_sha256"])]
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise ValueError("GeckoTerminal raw response identity is invalid")
+        record = authority[market_id]
+        matches = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            attributes = item.get("attributes")
+            relationships = item.get("relationships")
+            if not isinstance(attributes, dict) or not isinstance(relationships, dict):
+                continue
+            if str(attributes.get("address") or "").lower() == record["pool_address"]:
+                matches.append((item, relationships))
+        if len(matches) != 1:
+            raise ValueError("GeckoTerminal authority pool identity is invalid")
+        item, relationships = matches[0]
+
+        def relationship_id(name: str) -> str:
+            relationship = relationships.get(name)
+            if not isinstance(relationship, dict):
+                return ""
+            relationship_data = relationship.get("data")
+            if not isinstance(relationship_data, dict):
+                return ""
+            return str(relationship_data.get("id") or "")
+
+        if (
+            item.get("type") != "pool"
+            or str(item.get("id") or "").lower()
+            != f"{record['chain']}_{record['pool_address']}"
+            or relationship_id("dex") != record["dex"]
+            or relationship_id("base_token").lower()
+            != str(row.get("base_token_id") or "").lower()
+            or relationship_id("quote_token").lower()
+            != str(row.get("quote_token_id") or "").lower()
+        ):
+            raise ValueError("GeckoTerminal authority pool identity is invalid")
+
+    transcript_payloads: dict[str, tuple[Path, bytes, dict[str, Any]]] = {}
+    for path in depth_raw_paths:
+        raw, payload = _evidence_json(path, "depth pool transcript")
+        scan = payload.get("v3_tick_scan_manifest")
+        if not isinstance(scan, dict):
+            continue
+        market_id = str(scan.get("market_id") or "")
+        if market_id not in authority:
+            continue
+        if market_id in transcript_payloads:
+            raise ValueError("Uniswap V3 exact transcript coverage has duplicates")
+        transcript_payloads[market_id] = (path, raw, payload)
+    if set(transcript_payloads) != set(market_ids):
+        raise ValueError("Uniswap V3 exact transcript coverage is incomplete")
+
+    block_identities = set()
+    pool_evidence = []
+    for market_id in market_ids:
+        _path, transcript_bytes, transcript = transcript_payloads[market_id]
+        transcript_hash = hashlib.sha256(transcript_bytes).hexdigest()
+        record = authority[market_id]
+        pool = transcript.get("pool")
+        scan = transcript.get("v3_tick_scan_manifest")
+        usd = transcript.get("usd_price_evidence")
+        if not isinstance(pool, dict) or not isinstance(scan, dict):
+            raise ValueError("Uniswap V3 exact transcript identity is invalid")
+        if {
+            "token_symbol": pool.get("token_symbol"),
+            "chain": pool.get("chain"),
+            "dex": pool.get("dex"),
+            "pool_address": str(pool.get("pool_address") or "").lower(),
+        } != {
+            "token_symbol": market_id.rsplit(":", 1)[-1],
+            "chain": record["chain"],
+            "dex": record["dex"],
+            "pool_address": record["pool_address"],
+        }:
+            raise ValueError("Uniswap V3 exact transcript identity is invalid")
+        if (
+            scan.get("schema") != "uniswap_v3_tick_scan_manifest/v1"
+            or scan.get("authority") != record
+            or scan.get("market_id") != market_id
+            or scan.get("chain_id") != hex(record["chain_id"])
+            or str(scan.get("pool_address") or "").lower()
+            != record["pool_address"]
+            or scan.get("bitmap_word_radius") != record["bitmap_word_radius"]
+            or not isinstance(scan.get("bitmap_words"), list)
+            or not isinstance(scan.get("tick_evidence"), list)
+            or not isinstance(scan.get("directions"), dict)
+        ):
+            raise ValueError("Uniswap V3 scan manifest authority is invalid")
+        block = scan.get("block")
+        if not isinstance(block, dict) or scan.get("block_final") != block:
+            raise ValueError("Uniswap V3 shared finalized block evidence is invalid")
+        block_number = str(block.get("number") or "")
+        block_hash = str(block.get("hash") or "").lower()
+        if (
+            not block_number.isdigit()
+            or _ROUTE_BLOCK_HASH.fullmatch(block_hash) is None
+            or not str(block.get("timestamp") or "")
+            or scan.get("block_number") != int(block_number)
+            or str(scan.get("block_hash") or "").lower() != block_hash
+            or transcript.get("block_number") != int(block_number)
+        ):
+            raise ValueError("Uniswap V3 shared finalized block evidence is invalid")
+        block_identities.add((int(block_number), block_hash))
+        if _retained_finalized_block(
+            transcript.get("records"), int(block_number)
+        ) != block:
+            raise ValueError("Uniswap V3 raw finalized block proof is inconsistent")
+        depth_row = depth_by_market[market_id]
+        market_execution = execution_by_market[market_id]
+        if (
+            str(depth_row.get("block_number") or "") != block_number
+            or str(depth_row.get("raw_response_sha256") or "") != transcript_hash
+            or any(
+                str(row.get("block_number") or "") != block_number
+                or str(row.get("raw_response_sha256") or "") != transcript_hash
+                for row in market_execution
+            )
+        ):
+            raise ValueError("Uniswap V3 transcript hash or block lineage is invalid")
+        parity = scan.get("quoter_v2_parity")
+        if not isinstance(parity, list):
+            raise ValueError("Uniswap V3 Quoter parity evidence is missing")
+        parity_scenarios = []
+        for item in parity:
+            if (
+                not isinstance(item, dict)
+                or item.get("status") != "exact_match"
+                or type(item.get("amount_raw")) is not int
+                or type(item.get("sqrt_price_x96_after")) is not int
+                or type(item.get("initialized_ticks_crossed")) is not int
+                or type(item.get("core_liquidity_boundaries_crossed")) is not int
+            ):
+                raise ValueError("Uniswap V3 Quoter parity is not exact")
+            parity_scenarios.append(
+                (
+                    str(item.get("direction") or ""),
+                    str(item.get("requested_notional_usd") or ""),
+                )
+            )
+        if (
+            len(parity_scenarios) != len(expected_scenarios)
+            or len(parity_scenarios) != len(set(parity_scenarios))
+            or set(parity_scenarios) != expected_scenarios
+        ):
+            raise ValueError("Uniswap V3 Quoter scenario inventory is invalid")
+        retained_quoter = _retained_quoter_results(
+            transcript.get("records"),
+            quoter_v2_address=record["quoter_v2_address"],
+            block_number=int(block_number),
+        )
+        expected_raw_quoter = [
+            (
+                str(item["direction"]),
+                int(item["amount_raw"]),
+                int(item["sqrt_price_x96_after"]),
+                int(item["initialized_ticks_crossed"]),
+            )
+            for item in parity
+        ]
+        if retained_quoter != expected_raw_quoter:
+            raise ValueError("Uniswap V3 raw Quoter parity is inconsistent")
+        inventory_row = inventory_by_market[market_id]
+        if (
+            not isinstance(usd, dict)
+            or usd.get("source_snapshot_id") != tvl_snapshot_id
+            or usd.get("source") != "GeckoTerminal API v2"
+            or not str(usd.get("source_endpoint") or "").startswith(
+                "https://api.geckoterminal.com/api/v2/"
+            )
+            or not str(usd.get("observed_at") or "")
+            or usd.get("raw_response_sha256")
+            != inventory_row.get("raw_response_sha256")
+            or usd.get("base_token_id") != inventory_row.get("base_token_id")
+            or usd.get("quote_token_id") != inventory_row.get("quote_token_id")
+            or str(usd.get("raw_response_sha256") or "") not in tvl_hashes
+        ):
+            raise ValueError("Uniswap V3 GeckoTerminal transcript lineage is invalid")
+        parity_hash = hashlib.sha256(
+            json.dumps(
+                parity,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        pool_evidence.append(
+            {
+                "market_id": market_id,
+                "transcript_sha256": transcript_hash,
+                "geckoterminal_raw_response_sha256": str(
+                    usd["raw_response_sha256"]
+                ),
+                "quoter_parity_sha256": parity_hash,
+            }
+        )
+    if len(block_identities) != 1:
+        raise ValueError("Uniswap V3 shared finalized block is inconsistent")
+    shared_block_number, shared_block_hash = next(iter(block_identities))
+
+    return {
+        "schema": "uniswap_v3_exact_validation/v1",
+        "authority_sha256": hashlib.sha256(authority_bytes).hexdigest(),
+        "market_ids": market_ids,
+        "tvl_snapshot_id": tvl_snapshot_id,
+        "depth_snapshot_id": depth_snapshot_id,
+        "shared_finalized_block": {
+            "number": shared_block_number,
+            "hash": shared_block_hash,
+        },
+        "depth_rows_sha256": publication_rows_sha256(
+            scoped_depth, identity=dex_market_id
+        ),
+        "execution_rows_sha256": publication_rows_sha256(
+            scoped_execution,
+            identity=lambda row: (
+                row.get("market_id"),
+                row.get("direction"),
+                row.get("requested_notional_usd"),
+            ),
+        ),
+        "tvl_manifest_sha256": hashlib.sha256(tvl_manifest_bytes).hexdigest(),
+        "depth_manifest_sha256": hashlib.sha256(depth_manifest_bytes).hexdigest(),
+        "geckoterminal_raw_response_sha256": sorted(scoped_tvl_hashes),
+        "pool_evidence": pool_evidence,
+        "depth_observed_count": len(scoped_depth),
+        "execution_observed_scenario_count": len(scoped_execution),
+        "validated_scenario_inventory": {
+            "directions": list(EXECUTION_DIRECTIONS),
+            "notionals_usd": [decimal_text(value) for value in EXECUTION_NOTIONALS_USD],
+            "scenario_count_per_market": len(expected_scenarios),
+        },
+    }
 
 
 def match_uniswap_v3_execution_authority(
@@ -4782,6 +5397,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tvl-csv", type=Path, default=DEFAULT_TVL_CSV)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT)
+    parser.add_argument(
+        "--tvl-raw-root",
+        type=Path,
+        default=DEFAULT_TVL_RAW_ROOT,
+        help="Retained GeckoTerminal evidence root for exact V3 validation",
+    )
     parser.add_argument("--publish-local", action="store_true")
     parser.add_argument(
         "--publish-dir",
@@ -4799,6 +5420,11 @@ def parse_args() -> argparse.Namespace:
         "--merge-publish",
         action="store_true",
         help="Merge one exact pool into an existing full publication",
+    )
+    parser.add_argument(
+        "--require-uniswap-v3-exact-validation",
+        action="store_true",
+        help="Require the full two-authority-pool raw-evidence gate",
     )
     return parser.parse_args()
 
@@ -4833,6 +5459,12 @@ def main() -> None:
     )
     if market_id and (tokens or chains):
         raise ValueError("--market-id cannot be combined with other filters")
+    if args.require_uniswap_v3_exact_validation and (
+        market_id or tokens or chains or args.merge_publish
+    ):
+        raise ValueError(
+            "exact Uniswap V3 validation requires an unfiltered full inventory"
+        )
     if args.merge_publish and (publish_dir is None or not market_id):
         raise ValueError(
             "--merge-publish requires --publish-dir and --market-id"
@@ -4843,6 +5475,13 @@ def main() -> None:
         )
     if not args.merge_publish:
         ensure_full_publish_scope(publish_dir is not None, tokens, chains)
+    require_uniswap_v3_publication_scope(
+        pools,
+        market_id=market_id,
+        merge_publish=args.merge_publish,
+        exact_validation_enabled=args.require_uniswap_v3_exact_validation,
+        publishing=publish_dir is not None,
+    )
     if tokens:
         pools = [row for row in pools if row["token_symbol"].upper() in tokens]
     if chains:
@@ -4858,6 +5497,15 @@ def main() -> None:
         sleep_seconds=max(0.0, args.sleep_seconds),
         allow_terminal_only=args.merge_publish,
     )
+    exact_validation_receipt = None
+    if args.require_uniswap_v3_exact_validation:
+        exact_validation_receipt = validate_uniswap_v3_exact_candidate(
+            pools,
+            rows,
+            execution_rows,
+            tvl_raw_root=args.tvl_raw_root,
+            depth_raw_root=args.raw_root,
+        )
     collected_rows = rows
     collected_execution_rows = execution_rows
     if args.merge_publish:
@@ -4939,6 +5587,8 @@ def main() -> None:
     }
     if result_publication_gates:
         result["publication_gates"] = result_publication_gates
+    if exact_validation_receipt is not None:
+        result["uniswap_v3_exact_validation"] = exact_validation_receipt
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
