@@ -611,8 +611,12 @@ The gate uses these stable identities:
 `observed` is usable for TVL. `observed` and truthful `partial` lower bounds are
 usable for depth/execution. Structurally unsupported DEX adapters are excluded
 from the supported denominator; a pool classified as V2/V3 depth-capable but
-returned as `unsupported` counts as failed coverage. DEX V3 execution remains
-structurally unsupported until exact integer swap math is implemented.
+returned as `unsupported` counts as failed coverage. Exact DEX V3 execution is
+supported only for the authority-approved Ethereum Uniswap V3 UNI/USDT pool
+`0x3470447f3cecffac709d3e783a307790b0208d60` and UNI/WETH pool
+`0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801`, as defined by
+`config/uniswap_v3_execution_markets.json`; every other V3 market remains
+structurally unsupported.
 
 | Family | Minimum current usable coverage | Minimum retention of comparable prior usable identities |
 | --- | ---: | ---: |
@@ -914,8 +918,11 @@ retention requirement before applying or enabling
   requests a non-empty scoped Event response for every covered Token.
   An unavailable Event bundle is not reported as a verified zero-event result.
 
-Funding rates, DEX V3 fixed-notional execution, and event-study outputs remain
-unsupported. Existing depth execution rows also continue to exclude
+Funding rates, non-authority DEX V3 fixed-notional execution, and event-study
+outputs remain unsupported. The two authority-approved Ethereum Uniswap V3 UNI
+pools publish pool-only exact execution, including the pool swap fee and
+excluding gas, router fees, transfer taxes, and MEV. Existing depth execution
+rows also continue to exclude
 account-specific CEX fees and gas; only the synchronized route pipeline may
 add authenticated or validated-private CEX fees and adapter-bound gas evidence.
 Collection operations must not manufacture any of these values from spot

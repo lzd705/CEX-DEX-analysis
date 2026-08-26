@@ -186,6 +186,7 @@ from scripts.execution_cost import (
     usd_price_timing,
     validate_execution_snapshot,
 )
+from scripts.fetch_dex_depth import load_uniswap_v3_execution_authority
 from scripts.cex_instrument_lifecycle import (
     configured_market_ids_sha256,
     load_cex_instrument_lifecycle_manifest,
@@ -4109,6 +4110,22 @@ def _execution_snapshot_metadata(
     }
 
 
+def uniswap_v3_execution_scope_metadata() -> dict[str, Any]:
+    """Return the bounded public capability contract for exact V3 quotes."""
+    authority = load_uniswap_v3_execution_authority()
+    return {
+        "support": "exact_pool_only",
+        "authority_schema": "uniswap_v3_execution_markets/v1",
+        "approved_markets": [
+            authority[market_id]
+            for market_id in sorted(authority)
+        ],
+        "other_v3_market_status": "unsupported",
+        "included_costs": ["pool_swap_fee"],
+        "excluded_costs": ["gas", "router_fee", "transfer_tax", "MEV"],
+    }
+
+
 def _one_cohort_id(value: Any, label: str) -> str:
     if (
         not isinstance(value, list)
@@ -4438,9 +4455,11 @@ def build_execution_cost_comparison(
                 "Source-mechanics quoted cost, not realized or all-in cost. "
                 "CEX account taker fees are excluded. Supported DEX V2 quotes "
                 "include pool swap fees while gas, router fees, transfer "
-                "taxes, and MEV are excluded. DEX V3 execution is explicitly "
-                "unsupported in this release."
+                "taxes, and MEV are excluded. DEX V3 quotes are supported only "
+                "for the exact pool-only authority scope; every other V3 market "
+                "is unsupported."
             ),
+            "uniswap_v3_execution": uniswap_v3_execution_scope_metadata(),
             "missing_value_rule": (
                 "Partial, unsupported, failed, unavailable, and not-cataloged "
                 "full-request cost fields remain null; they are never zero-filled "
