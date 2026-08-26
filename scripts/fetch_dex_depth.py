@@ -41,7 +41,7 @@ from decimal import (
     localcontext,
 )
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 try:
     import certifi
@@ -169,6 +169,8 @@ LATEST_FILENAME = "dex_depth_latest.csv"
 HISTORY_FILENAME = "dex_depth_history.csv"
 EXECUTION_CURRENT_FILENAME = "dex_execution_cost_snapshot.csv"
 EXECUTION_LATEST_FILENAME = "dex_execution_cost_latest.csv"
+UNISWAP_V3_EXACT_LATEST_FILENAME = "uniswap_v3_exact_latest.json"
+UNISWAP_V3_EXACT_RAW_RECEIPT_FILENAME = "uniswap_v3_exact_validation.json"
 MINIMUM_PUBLISHABLE_COVERAGE_BPS = 8000
 MINIMUM_BASELINE_RETENTION_BPS = 9500
 DEPTH_COVERAGE_POLICY = {
@@ -2073,7 +2075,9 @@ def _manifest_raw_paths(
     actual = sorted(
         path.name
         for path in directory.iterdir()
-        if path.name != "manifest.json" and path.suffix == ".json"
+        if path.name
+        not in {"manifest.json", UNISWAP_V3_EXACT_RAW_RECEIPT_FILENAME}
+        and path.suffix == ".json"
     )
     if sorted(raw_files) != actual:
         raise ValueError(f"{label} manifest does not match retained evidence")
@@ -2824,6 +2828,330 @@ def validate_uniswap_v3_exact_candidate(
             "scenario_count_per_market": len(expected_scenarios),
         },
     }
+
+
+UNISWAP_V3_EXACT_RECEIPT_FIELDS = frozenset(
+    {
+        "schema",
+        "authority_sha256",
+        "market_ids",
+        "tvl_snapshot_id",
+        "depth_snapshot_id",
+        "shared_finalized_block",
+        "depth_rows_sha256",
+        "execution_rows_sha256",
+        "tvl_manifest_sha256",
+        "depth_manifest_sha256",
+        "geckoterminal_raw_response_sha256",
+        "pool_evidence",
+        "depth_observed_count",
+        "execution_observed_scenario_count",
+        "validated_scenario_inventory",
+    }
+)
+
+
+def uniswap_v3_exact_receipt_bytes(receipt: Mapping[str, Any]) -> bytes:
+    """Return the one canonical private/public representation of a receipt."""
+    return (
+        json.dumps(
+            receipt,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def validate_uniswap_v3_exact_public_receipt(
+    receipt: Mapping[str, Any],
+    depth_rows: list[dict[str, str]],
+    execution_rows: list[dict[str, str]],
+    *,
+    authority_path: Path = V3_EXECUTION_AUTHORITY_PATH,
+) -> dict[str, Any]:
+    """Revalidate a raw-gate receipt against the exact public candidate rows."""
+    if not isinstance(receipt, dict) or set(receipt) != set(
+        UNISWAP_V3_EXACT_RECEIPT_FIELDS
+    ):
+        raise ValueError("Uniswap V3 exact validation receipt schema is invalid")
+    if receipt.get("schema") != "uniswap_v3_exact_validation/v1":
+        raise ValueError("Uniswap V3 exact validation receipt schema is invalid")
+
+    authority_bytes = _regular_evidence_bytes(
+        Path(authority_path), "Uniswap V3 execution authority"
+    )
+    authority = load_uniswap_v3_execution_authority(Path(authority_path))
+    market_ids = sorted(authority)
+    if (
+        receipt.get("market_ids") != market_ids
+        or receipt.get("authority_sha256")
+        != hashlib.sha256(authority_bytes).hexdigest()
+    ):
+        raise ValueError("Uniswap V3 exact validation receipt authority is invalid")
+
+    snapshot_ids = (
+        receipt.get("tvl_snapshot_id"),
+        receipt.get("depth_snapshot_id"),
+    )
+    if any(
+        type(value) is not str or _EXACT_SNAPSHOT_ID.fullmatch(value) is None
+        for value in snapshot_ids
+    ):
+        raise ValueError("Uniswap V3 exact validation receipt snapshot is invalid")
+
+    hash_fields = (
+        "authority_sha256",
+        "depth_rows_sha256",
+        "execution_rows_sha256",
+        "tvl_manifest_sha256",
+        "depth_manifest_sha256",
+    )
+    if any(
+        type(receipt.get(field)) is not str
+        or _SHA256.fullmatch(str(receipt.get(field))) is None
+        for field in hash_fields
+    ):
+        raise ValueError("Uniswap V3 exact validation receipt hash is invalid")
+
+    block = receipt.get("shared_finalized_block")
+    if (
+        not isinstance(block, dict)
+        or set(block) != {"number", "hash"}
+        or type(block.get("number")) is not int
+        or block["number"] <= 0
+        or type(block.get("hash")) is not str
+        or _ROUTE_BLOCK_HASH.fullmatch(block["hash"]) is None
+    ):
+        raise ValueError("Uniswap V3 exact validation receipt block is invalid")
+
+    scoped_depth = [
+        row for row in depth_rows if dex_market_id(row) in authority
+    ]
+    depth_by_market = {}
+    for row in scoped_depth:
+        market_id = dex_market_id(row)
+        if market_id in depth_by_market:
+            raise ValueError("Uniswap V3 exact public depth contains duplicates")
+        depth_by_market[market_id] = row
+    if set(depth_by_market) != set(market_ids):
+        raise ValueError("Uniswap V3 exact public depth must contain 2/2 markets")
+    for market_id, row in depth_by_market.items():
+        record = authority[market_id]
+        if (
+            str(row.get("token0_address") or "").strip().lower()
+            != record["token0_address"]
+            or str(row.get("token1_address") or "").strip().lower()
+            != record["token1_address"]
+            or decimal_text(row.get("fee_bps"))
+            != decimal_text(Decimal(record["fee_pips"]) / Decimal(100))
+        ):
+            raise ValueError("Uniswap V3 exact public depth authority is invalid")
+    if any(
+        row.get("status") != "observed"
+        or str(row.get("snapshot_id") or "") != receipt["depth_snapshot_id"]
+        or str(row.get("block_number") or "") != str(block["number"])
+        or any(
+            row.get("depth_{}bps_complete".format(band)) != "1"
+            for band in DEPTH_BANDS_BPS
+        )
+        for row in scoped_depth
+    ):
+        raise ValueError("Uniswap V3 exact public depth is invalid")
+    if (
+        receipt.get("depth_observed_count") != len(scoped_depth)
+        or len(scoped_depth) != len(market_ids)
+        or receipt.get("depth_rows_sha256")
+        != publication_rows_sha256(scoped_depth, identity=dex_market_id)
+    ):
+        raise ValueError("Uniswap V3 exact validation receipt depth hash is invalid")
+
+    scoped_execution = [
+        row
+        for row in execution_rows
+        if str(row.get("market_id") or "") in authority
+    ]
+    expected_scenarios = set(_exact_scenarios())
+    execution_by_market = {market_id: [] for market_id in market_ids}
+    for row in scoped_execution:
+        execution_by_market[str(row.get("market_id") or "")].append(row)
+    for market_id, rows in execution_by_market.items():
+        record = authority[market_id]
+        scenarios = [
+            (
+                str(row.get("direction") or ""),
+                str(row.get("requested_notional_usd") or ""),
+            )
+            for row in rows
+        ]
+        if (
+            len(rows) != len(expected_scenarios)
+            or len(scenarios) != len(set(scenarios))
+            or set(scenarios) != expected_scenarios
+            or any(
+                row.get("status") != "observed"
+                or str(row.get("snapshot_id") or "")
+                != receipt["depth_snapshot_id"]
+                or str(row.get("source_snapshot_id") or "")
+                != receipt["depth_snapshot_id"]
+                or str(row.get("block_number") or "") != str(block["number"])
+                for row in rows
+            )
+            or any(
+                str(row.get("target_token_address") or "").strip().lower()
+                != record["token0_address"]
+                or str(row.get("quote_token_address") or "").strip().lower()
+                != record["token1_address"]
+                or str(row.get("target_token_decimals") or "")
+                != str(record["token0_decimals"])
+                or str(row.get("quote_token_decimals") or "")
+                != str(record["token1_decimals"])
+                or decimal_text(row.get("fee_rate_bps"))
+                != decimal_text(Decimal(record["fee_pips"]) / Decimal(100))
+                for row in rows
+            )
+        ):
+            raise ValueError(
+                "Uniswap V3 exact public execution scenario inventory is invalid"
+            )
+    if (
+        receipt.get("execution_observed_scenario_count")
+        != len(scoped_execution)
+        or len(scoped_execution) != len(market_ids) * len(expected_scenarios)
+        or receipt.get("execution_rows_sha256")
+        != publication_rows_sha256(
+            scoped_execution,
+            identity=lambda row: (
+                row.get("market_id"),
+                row.get("direction"),
+                row.get("requested_notional_usd"),
+            ),
+        )
+    ):
+        raise ValueError(
+            "Uniswap V3 exact validation receipt execution hash is invalid"
+        )
+
+    scenario_inventory = receipt.get("validated_scenario_inventory")
+    if scenario_inventory != {
+        "directions": list(EXECUTION_DIRECTIONS),
+        "notionals_usd": [
+            decimal_text(value) for value in EXECUTION_NOTIONALS_USD
+        ],
+        "scenario_count_per_market": len(expected_scenarios),
+    }:
+        raise ValueError("Uniswap V3 exact validation receipt scenarios are invalid")
+
+    gecko_hashes = receipt.get("geckoterminal_raw_response_sha256")
+    if (
+        not isinstance(gecko_hashes, list)
+        or not gecko_hashes
+        or gecko_hashes != sorted(set(gecko_hashes))
+        or any(
+            type(value) is not str or _SHA256.fullmatch(value) is None
+            for value in gecko_hashes
+        )
+    ):
+        raise ValueError("Uniswap V3 exact validation receipt USD hashes are invalid")
+    pool_evidence = receipt.get("pool_evidence")
+    if (
+        not isinstance(pool_evidence, list)
+        or len(pool_evidence) != len(market_ids)
+        or [item.get("market_id") for item in pool_evidence if isinstance(item, dict)]
+        != market_ids
+    ):
+        raise ValueError("Uniswap V3 exact validation receipt pool evidence is invalid")
+    referenced_gecko_hashes = set()
+    for item in pool_evidence:
+        if (
+            not isinstance(item, dict)
+            or set(item)
+            != {
+                "market_id",
+                "transcript_sha256",
+                "geckoterminal_raw_response_sha256",
+                "quoter_parity_sha256",
+            }
+            or any(
+                type(item.get(field)) is not str
+                or _SHA256.fullmatch(str(item.get(field))) is None
+                for field in (
+                    "transcript_sha256",
+                    "geckoterminal_raw_response_sha256",
+                    "quoter_parity_sha256",
+                )
+            )
+            or item["geckoterminal_raw_response_sha256"] not in gecko_hashes
+        ):
+            raise ValueError(
+                "Uniswap V3 exact validation receipt pool evidence is invalid"
+            )
+        referenced_gecko_hashes.add(item["geckoterminal_raw_response_sha256"])
+        market_id = item["market_id"]
+        transcript_hash = item["transcript_sha256"]
+        if (
+            str(depth_by_market[market_id].get("raw_response_sha256") or "")
+            != transcript_hash
+            or any(
+                str(row.get("raw_response_sha256") or "") != transcript_hash
+                for row in execution_by_market[market_id]
+            )
+        ):
+            raise ValueError(
+                "Uniswap V3 exact validation receipt transcript hash is invalid"
+            )
+    if referenced_gecko_hashes != set(gecko_hashes):
+        raise ValueError("Uniswap V3 exact validation receipt USD hashes are invalid")
+
+    return dict(receipt)
+
+
+def write_uniswap_v3_exact_raw_receipt(
+    depth_raw_root: Path,
+    receipt: Mapping[str, Any],
+) -> Path:
+    """Durably install the private receipt under its retained depth snapshot."""
+    snapshot_id = str(receipt.get("depth_snapshot_id") or "")
+    directory = _snapshot_evidence_directory(
+        Path(depth_raw_root), snapshot_id, "depth evidence"
+    )
+    path = directory / UNISWAP_V3_EXACT_RAW_RECEIPT_FILENAME
+    payload = uniswap_v3_exact_receipt_bytes(receipt)
+    try:
+        existing = _regular_evidence_bytes(path, "Uniswap V3 exact raw receipt")
+    except ValueError:
+        existing = None
+    if existing is not None:
+        if existing != payload:
+            raise ValueError("Uniswap V3 exact raw receipt already differs")
+        return path
+    descriptor = os.open(
+        str(path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o644,
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("Uniswap V3 exact receipt write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        directory_descriptor = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return path
+    try:
+        os.fsync(directory_descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(directory_descriptor)
+    return path
 
 
 def match_uniswap_v3_execution_authority(
@@ -5340,23 +5668,45 @@ def publish_full_publication_bundle(
     output_dir: Path,
     publish_dir: Path,
     preflight_reports: dict[str, dict[str, Any]],
+    exact_validation_receipt: Optional[Mapping[str, Any]] = None,
+    authority_path: Path = V3_EXECUTION_AUTHORITY_PATH,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Failure-atomically publish one full DEX depth/execution cohort."""
     depth_rows = migrate_legacy_dex_depth_reason_codes(depth_rows)
+    authority_market_ids = set(
+        load_uniswap_v3_execution_authority(Path(authority_path))
+    )
+    contains_exact_scope = any(
+        dex_market_id(row) in authority_market_ids for row in depth_rows
+    )
+    if contains_exact_scope and exact_validation_receipt is None:
+        raise ValueError("Uniswap V3 exact validation receipt is required")
+    validated_exact_receipt = None
+    if exact_validation_receipt is not None:
+        validated_exact_receipt = validate_uniswap_v3_exact_public_receipt(
+            exact_validation_receipt,
+            depth_rows,
+            execution_rows,
+            authority_path=Path(authority_path),
+        )
     current_path = output_dir / CURRENT_FILENAME
     execution_current_path = output_dir / EXECUTION_CURRENT_FILENAME
     history_path = publish_dir / HISTORY_FILENAME
     latest_path = publish_dir / LATEST_FILENAME
     public_current_path = publish_dir / CURRENT_FILENAME
     execution_latest_path = publish_dir / EXECUTION_LATEST_FILENAME
+    exact_receipt_path = publish_dir / UNISWAP_V3_EXACT_LATEST_FILENAME
+    public_destinations = [
+        history_path,
+        latest_path,
+        public_current_path,
+        execution_latest_path,
+    ]
+    if validated_exact_receipt is not None:
+        public_destinations.append(exact_receipt_path)
     _require_disjoint_publication_destinations(
         (current_path, execution_current_path),
-        (
-            history_path,
-            latest_path,
-            public_current_path,
-            execution_latest_path,
-        ),
+        public_destinations,
     )
     require_aligned_depth_execution_lineage(depth_rows, execution_rows)
     expected_market_ids = {dex_market_id(row) for row in depth_rows}
@@ -5424,23 +5774,29 @@ def publish_full_publication_bundle(
             row.get("pool_address", ""),
         ),
     )
-    atomic_replace_bundle(
+    public_bundle = [
+        (history_path, csv_payload(DEX_DEPTH_COLUMNS, history_rows)),
         (
-            (history_path, csv_payload(DEX_DEPTH_COLUMNS, history_rows)),
+            latest_path,
+            csv_payload(DEX_DEPTH_COLUMNS, depth_rows),
+        ),
+        (
+            public_current_path,
+            csv_payload(DEX_DEPTH_COLUMNS, depth_rows),
+        ),
+        (
+            execution_latest_path,
+            csv_payload(EXECUTION_COST_COLUMNS, execution_rows),
+        ),
+    ]
+    if validated_exact_receipt is not None:
+        public_bundle.append(
             (
-                latest_path,
-                csv_payload(DEX_DEPTH_COLUMNS, depth_rows),
-            ),
-            (
-                public_current_path,
-                csv_payload(DEX_DEPTH_COLUMNS, depth_rows),
-            ),
-            (
-                execution_latest_path,
-                csv_payload(EXECUTION_COST_COLUMNS, execution_rows),
-            ),
+                exact_receipt_path,
+                uniswap_v3_exact_receipt_bytes(validated_exact_receipt),
+            )
         )
-    )
+    atomic_replace_bundle(public_bundle)
     return (
         {
             "current_path": str(current_path),
@@ -5449,6 +5805,11 @@ def publish_full_publication_bundle(
             "history_path": str(history_path),
             "history_row_count": len(history_rows),
             "publication_gate": depth_gate,
+            "uniswap_v3_exact_receipt_path": (
+                str(exact_receipt_path)
+                if validated_exact_receipt is not None
+                else None
+            ),
         },
         {
             "execution_current_path": str(execution_current_path),
@@ -5734,6 +6095,10 @@ def main() -> None:
             tvl_raw_root=args.tvl_raw_root,
             depth_raw_root=args.raw_root,
         )
+        write_uniswap_v3_exact_raw_receipt(
+            args.raw_root,
+            exact_validation_receipt,
+        )
     collected_rows = rows
     collected_execution_rows = execution_rows
     if args.merge_publish:
@@ -5772,6 +6137,7 @@ def main() -> None:
             output_dir=args.output_dir,
             publish_dir=publish_dir,
             preflight_reports=publication_gates,
+            exact_validation_receipt=exact_validation_receipt,
         )
     else:
         result = publish_snapshot(

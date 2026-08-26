@@ -304,6 +304,26 @@ The rendered retention unit passes
 to that external directory; it no longer assumes raw snapshots live under the
 application checkout.
 
+## Uniswap V3 launch evidence retention
+
+The exact two-pool launch writes
+`raw/dex-depth/<snapshot_id>/uniswap_v3_exact_validation.json` beside the two
+retained RPC transcripts and publishes the same canonical receipt as
+`uniswap_v3_exact_latest.json`. Keep that raw depth snapshot, its referenced
+TVL/GeckoTerminal snapshot, the scan manifests and transcripts, and the
+versioned prelaunch rollback backup for the complete launch observation
+window. The rollback backup must retain every replaceable public byte and its
+SHA-256 plus the deployed application SHA.
+
+No general DEX-depth/TVL cleanup daemon currently owns these files. The CEX
+depth retention timer is scoped only to `raw/cex-depth` and must not be widened
+to either exact-evidence root. Protection during the observation window is an
+operator-owned hold: do not manually remove, archive, or rewrite the current
+receipt generation, its referenced evidence, or the declared prelaunch
+rollback generation. Release the hold only after the observation window is
+explicitly closed and the next scheduled DEX-depth cycle has reproduced a
+current 2/2 depth and 20/20 execution scope.
+
 ## Cache generation behavior
 
 The process retains only the active published source generation. When SQLite,

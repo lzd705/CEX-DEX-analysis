@@ -180,15 +180,17 @@ off-market pool. The actual pool-state depth remains visible with its lineage.
 
 | Boundary | File | Meaning |
 | --- | --- | --- |
-| Public bundle 1/4 | `data/local/dex_depth_history.csv` | Normalized depth history keyed by snapshot and pool |
-| Public bundle 2/4 | `data/local/dex_depth_latest.csv` | Latest published complete depth inventory |
-| Public bundle 3/4 | `data/local/dex_depth_snapshot.csv` | Public current depth view |
-| Public bundle 4/4 | `data/local/dex_execution_cost_latest.csv` | Latest execution scenarios derived from the same source cohort |
+| Public bundle 1/5 | `data/local/dex_depth_history.csv` | Normalized depth history keyed by snapshot and pool |
+| Public bundle 2/5 | `data/local/dex_depth_latest.csv` | Latest published complete depth inventory |
+| Public bundle 3/5 | `data/local/dex_depth_snapshot.csv` | Public current depth view |
+| Public bundle 4/5 | `data/local/dex_execution_cost_latest.csv` | Latest execution scenarios derived from the same source cohort |
+| Public exact sidecar 5/5 | `data/local/uniswap_v3_exact_latest.json` | Canonical two-authority-market validation receipt, replaced in the same bundle when exact scope is present |
 | Private current 1/2 | `data/processed/dex_depth_snapshot.csv` | Candidate depth current file awaiting/recording publication work |
 | Private current 2/2 | `data/processed/dex_execution_cost_snapshot.csv` | Candidate execution current file awaiting/recording publication work |
 | Price dependency | `data/processed/dex_pool_tvl_snapshot.csv` | Temporary current-run GeckoTerminal USD-price input; not a published TVL fact |
 | Raw evidence | `data/raw/dex-depth/<snapshot_id>/*.json` | Per-pool RPC transcripts and errors |
 | Raw manifest | `data/raw/dex-depth/<snapshot_id>/manifest.json` | Fixed blocks, status counts, bands, and raw-file inventory |
+| Raw exact receipt | `data/raw/dex-depth/<snapshot_id>/uniswap_v3_exact_validation.json` | Private canonical result written after raw validation and before processed/public writes |
 
 The two-pool canary is intentionally non-publishing:
 
@@ -198,10 +200,12 @@ python3 scripts/run_uniswap_v3_canary.py --evidence-root /absolute/new/path
 
 It creates a new evidence directory, refreshes the GeckoTerminal price input,
 collects both pools, and returns `"published": false`. It never replaces a
-`data/local` current pointer or production bundle. A passing run writes
-`canary_result.json`, which records the one shared block number and hash, the
-two pool transcript hashes, the retained USD-source hash, and the exact
-two-direction by five-notional scenario counts.
+`data/local` current pointer or production bundle. A passing run writes the
+shared raw validation receipt under the depth snapshot and embeds that
+identical, path-free receipt in `canary_result.json`. The receipt records the
+one shared block number/hash, both pool transcript hashes, retained USD-source
+and manifest hashes, authority hash, scoped row hashes, and the exact
+two-direction by five-notional scenario inventory.
 
 The public and private depth-current files intentionally share the basename
 `dex_depth_snapshot.csv`; their `data/local` versus `data/processed`
@@ -238,17 +242,19 @@ therefore exposes canonical `observed_at_min`, `observed_at_max`, and
 `observation_span_seconds`. The span measures earliest-to-latest cohort skew;
 it does not redefine the snapshot ID or create cross-chain simultaneity.
 
-Both full and exact publication first resolve the two private and four public
-destinations above and reject any private/public overlap before making any
-write. Full publication then validates aligned depth/execution lineage, the
+Both full and exact publication first resolve the two private and four
+ordinary public destinations above and reject any private/public overlap
+before making any write. A full publication containing the exact two-pool V3
+scope also validates the sidecar receipt and resolves it as the fifth public
+destination. Full publication then validates aligned depth/execution lineage, the
 exact execution scenario inventory (including DEX USD-price timing), and both
 standard coverage reports. Exact publication instead checks aligned lineage
 and complete execution scenarios with DEX USD-price timing, validates both
 candidate-bound exact-target coverage reports and their target/mode/common
 generation, and requires exactly one target history row identical to the
 target depth-latest row. Only after those guards pass are the two private
-current files written independently and the four public destinations passed
-to one family bundle.
+current files written independently and all applicable public destinations
+passed to one family bundle.
 
 An ordinary in-process I/O exception rolls all public destinations back to
 their pre-call bytes. This is failure-atomic for ordinary I/O failures only,

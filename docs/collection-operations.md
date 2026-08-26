@@ -653,10 +653,13 @@ copied into `steps[].publication_gates` in the collection manifest.
 
 For both full-inventory and canonical one-market `--merge-publish`
 publication, a shared guard first resolves and compares all destinations. Each
-CEX/DEX family has four public destinations—depth history, depth latest, public
-depth current, and execution latest—and two private destinations—processed
-depth current and processed execution current. Any resolved private/public
-overlap is rejected before `mkdir`, private writes, history reads, or public
+CEX/DEX family has four ordinary public destinations—depth history, depth
+latest, public depth current, and execution latest—and two private
+destinations—processed depth current and processed execution current. A full
+DEX publication containing the two authority V3 markets adds the validated
+`uniswap_v3_exact_latest.json` receipt as the fifth public destination. Any
+resolved private/public overlap is rejected before `mkdir`, private writes,
+history reads, or public
 replacement. This pre-write guard applies to both full and exact publication.
 
 After the overlap guard, full publication validates aligned lineage, execution
@@ -665,7 +668,8 @@ checks aligned lineage and complete execution scenarios, validates both
 candidate-bound exact-target reports and their target/mode/common generation,
 and requires exactly one target history row identical to the target
 depth-latest row. The private current files are then written independently.
-The four public bytes are passed to one staged replacement bundle; if an
+The four ordinary public bytes, plus the exact receipt when required, are
+passed to one staged replacement bundle; if an
 ordinary in-process I/O exception interrupts replacement, the helper restores
 every public destination to its pre-call bytes.
 
@@ -754,8 +758,9 @@ every server-visible replacement require all old files to remain byte-identical
 on failure; this still does not claim crash-atomic multi-file semantics.
 Before either the full or exact helper writes anything, the shared resolved-
 destination guard also requires the two private current paths to be disjoint
-from all four public paths. This overlap check is not a TOCTOU guarantee against
-unsupported concurrent path or symlink mutation.
+from every applicable public path, including the exact receipt sidecar for a
+full authority-scope publication. This overlap check is not a TOCTOU guarantee
+against unsupported concurrent path or symlink mutation.
 
 The exact preflight seal binds every raw candidate field, not only identity and
 status. Commit revalidates the current baseline hash, the common
@@ -796,7 +801,12 @@ with zero.
 
 Freshness is a data-quality signal, not process liveness. `/health` remains HTTP
 200 when the server and data files are readable, while `data_status` reports
-`current`, `partial`, or `stale`.
+`current`, `partial`, or `stale`. Its `uniswap_v3_exact` member independently
+rereads depth, execution, and the canonical receipt and reports
+`current|stale|invalid|missing`, the authority market IDs, 2/2 and 20/20
+counts, shared finalized block, observation age, and receipt/row/authority
+hashes. A non-current exact scope changes overall `data_status` to `stale` but
+does not hide otherwise readable core spot facts.
 
 ## Summary warmup readiness
 
@@ -878,6 +888,15 @@ a data-contract claim. Review the printed actions and the research/audit
 retention requirement before applying or enabling
 `cex-dex-cex-depth-retention.timer`. See
 `docs/production-hardening.md` for the systemd template and safety boundary.
+
+There is deliberately no corresponding general DEX-depth or TVL retention
+daemon. During the two-pool V3 launch observation window, protect the raw
+snapshot containing `uniswap_v3_exact_validation.json`, both referenced pool
+transcripts, the depth/TVL manifests, the referenced GeckoTerminal bytes, and
+the versioned prelaunch rollback backup. The CEX-depth cleanup timer does not
+own any of those paths. Keep the current and declared rollback generations
+unchanged until the observation window is explicitly closed; see
+`docs/production-hardening.md` for the release condition.
 
 ## Operational acceptance
 

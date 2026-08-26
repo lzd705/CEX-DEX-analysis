@@ -54,6 +54,10 @@ try:
         load_latest_complete_route_bundle,
     )
     from scripts.execution_cost_components import validate_cost_components
+    from scripts.fetch_dex_depth import (
+        V3_EXECUTION_AUTHORITY_PATH,
+        load_uniswap_v3_execution_authority,
+    )
     from scripts.route_opportunity import (
         MAX_ROUTE_AGE_SECONDS,
         MAX_ROUTE_SKEW_SECONDS,
@@ -77,6 +81,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
     )
     from execution_cost_components import (  # type: ignore[no-redef]
         validate_cost_components,
+    )
+    from fetch_dex_depth import (  # type: ignore[no-redef]
+        V3_EXECUTION_AUTHORITY_PATH,
+        load_uniswap_v3_execution_authority,
     )
     from route_opportunity import (  # type: ignore[no-redef]
         MAX_ROUTE_AGE_SECONDS,
@@ -1599,6 +1607,81 @@ def configured_route_root() -> Path:
     return DEFAULT_ROUTE_ROOT
 
 
+def validate_uniswap_v3_exact_release(value: Any) -> None:
+    """Require the exact two-market public receipt projection to be current."""
+    require(
+        isinstance(value, dict),
+        "Uniswap V3 exact health is missing or invalid",
+    )
+    require(
+        value.get("status") == "current",
+        "Uniswap V3 exact health status is not current",
+    )
+    expected_market_ids = sorted(
+        load_uniswap_v3_execution_authority(V3_EXECUTION_AUTHORITY_PATH)
+    )
+    require(
+        value.get("authority_market_ids") == expected_market_ids,
+        "Uniswap V3 exact authority market identities are invalid",
+    )
+    require(
+        value.get("depth_required_count") == 2
+        and value.get("depth_observed_count") == 2,
+        "Uniswap V3 exact depth count is not 2/2",
+    )
+    require(
+        value.get("execution_required_scenario_count") == 20
+        and value.get("execution_observed_scenario_count") == 20,
+        "Uniswap V3 exact execution count is not 20/20",
+    )
+    for field in (
+        "authority_sha256",
+        "depth_rows_sha256",
+        "execution_rows_sha256",
+        "receipt_sha256",
+    ):
+        require(
+            isinstance(value.get(field), str)
+            and re.fullmatch(r"[0-9a-f]{64}", value[field]) is not None,
+            "Uniswap V3 exact {} is invalid".format(field),
+        )
+    expected_authority_sha256 = hashlib.sha256(
+        V3_EXECUTION_AUTHORITY_PATH.read_bytes()
+    ).hexdigest()
+    require(
+        value.get("authority_sha256") == expected_authority_sha256,
+        "Uniswap V3 exact authority SHA does not match this release",
+    )
+    block = value.get("shared_finalized_block")
+    require(
+        isinstance(block, dict)
+        and set(block) == {"number", "hash"}
+        and type(block.get("number")) is int
+        and block["number"] > 0
+        and isinstance(block.get("hash"), str)
+        and re.fullmatch(r"0x[0-9a-f]{64}", block["hash"]) is not None,
+        "Uniswap V3 exact shared block identity is invalid",
+    )
+    observed_at = value.get("observed_at")
+    try:
+        exact_rfc3339_epoch_seconds(observed_at)
+    except (TypeError, ValueError) as error:
+        raise ReleaseCheckError(
+            "Uniswap V3 exact observation time is invalid"
+        ) from error
+    age = value.get("observation_age_hours")
+    max_age = value.get("max_age_hours")
+    require(
+        type(age) in {int, float}
+        and math.isfinite(age)
+        and 0 <= age <= 2.0
+        and type(max_age) in {int, float}
+        and math.isfinite(max_age)
+        and max_age == 2.0,
+        "Uniswap V3 exact observation age is invalid",
+    )
+
+
 def validate_release_health(
     health: dict[str, Any],
     *,
@@ -1643,6 +1726,7 @@ def validate_release_health(
         asset_version == expected_version,
         "Health asset version does not match application and asset SHA evidence",
     )
+    validate_uniswap_v3_exact_release(health.get("uniswap_v3_exact"))
     require(
         health.get("data_status") == "current",
         "Health freshness status is not current",

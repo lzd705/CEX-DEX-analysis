@@ -6978,6 +6978,10 @@ class MarketMonitorServerTest(unittest.TestCase):
             "build_market_payload",
             return_value=payload,
         ), patch.object(
+            server,
+            "uniswap_v3_exact_health",
+            return_value={"status": "current"},
+        ), patch.object(
             server.MarketMonitorHandler,
             "send_json",
         ) as send_json:
@@ -7012,6 +7016,10 @@ class MarketMonitorServerTest(unittest.TestCase):
             server,
             "build_market_payload",
             return_value=payload,
+        ), patch.object(
+            server,
+            "uniswap_v3_exact_health",
+            return_value={"status": "current"},
         ), patch.object(
             server.MarketMonitorHandler,
             "send_json",

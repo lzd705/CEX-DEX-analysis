@@ -173,6 +173,12 @@ CSVs and a validated SQLite database back into `data/local/`.
   remains `unsupported`. These quotes include the pool swap fee only and
   exclude gas, router fees, transfer taxes, MEV, account inventory, and
   realized execution.
+- The `/health` response member `uniswap_v3_exact` rereads the public depth,
+  execution, and canonical receipt bytes. It reports `current`, `stale`,
+  `invalid`, or `missing` with
+  the two authority IDs, 2/2 depth and 20/20 execution counts, shared block,
+  observation age, and receipt/row/authority hashes. A non-current exact
+  scope makes overall `data_status` stale without hiding readable spot facts.
 - `/api/markets/events?token=...&start=...&end=...&lifecycle=...` returns the
   latest revision of matching source-backed events, explicit time bounds and
   precision, lifecycle, evidence status, source-check lineage, and null-safe
