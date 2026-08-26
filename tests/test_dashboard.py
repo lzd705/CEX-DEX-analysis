@@ -4847,7 +4847,14 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(scope["included_costs"], ["pool_swap_fee"])
         self.assertEqual(
             scope["excluded_costs"],
-            ["gas", "router_fee", "transfer_tax", "MEV"],
+            [
+                "gas",
+                "router_fee",
+                "transfer_tax",
+                "MEV",
+                "account_inventory",
+                "realized_execution",
+            ],
         )
         self.assertEqual(
             scope["approved_markets"],
@@ -4864,6 +4871,143 @@ class MarketMonitorServerTest(unittest.TestCase):
         self.assertEqual(
             {row["status"] for row in snapshot["by_market"][unsupported_market]},
             {"unsupported"},
+        )
+
+    def test_execution_api_downgrades_unapproved_observed_uniswap_v3_rows(self):
+        uni = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+        usdt = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+        approved_pool = "0x3470447f3cecffac709d3e783a307790b0208d60"
+        unapproved_pool = "0x7777777777777777777777777777777777777777"
+        approved_market = f"dex:eth:uniswap_v3:{approved_pool}:UNI"
+        unapproved_market = f"dex:eth:uniswap_v3:{unapproved_pool}:UNI"
+
+        with self.dex_path.open(newline="", encoding="utf-8") as handle:
+            daily_rows = list(csv.DictReader(handle))
+        for market_id, pool_address in (
+            (approved_market, approved_pool),
+            (unapproved_market, unapproved_pool),
+        ):
+            daily_rows.append(
+                {
+                    "date": "2026-01-02",
+                    "token_symbol": "UNI",
+                    "chain": "eth",
+                    "dex": "uniswap_v3",
+                    "pool_address": pool_address,
+                    "pool_name": market_id,
+                    "close": "10",
+                    "dex_volume_usd": "1000",
+                    "pool_tvl_usd": "10000",
+                }
+            )
+        write_csv(
+            self.dex_path,
+            [
+                "date",
+                "token_symbol",
+                "chain",
+                "dex",
+                "pool_address",
+                "pool_name",
+                "open",
+                "high",
+                "low",
+                "close",
+                "dex_volume_usd",
+                "pool_tvl_usd",
+            ],
+            daily_rows,
+        )
+        self.write_dex_depth_cohort(
+            [
+                {
+                    "token_symbol": "UNI",
+                    "chain": "eth",
+                    "dex": "uniswap_v3",
+                    "pool_address": pool_address,
+                    "protocol_model": "concentrated_liquidity_v3",
+                }
+                for pool_address in (approved_pool, unapproved_pool)
+            ]
+        )
+
+        execution_rows = []
+        for market_id, pool_address in (
+            (approved_market, approved_pool),
+            (unapproved_market, unapproved_pool),
+        ):
+            market_rows = self.execution_rows(
+                market_id,
+                "dex",
+                state_observed_at="2026-01-02T00:00:00+00:00",
+                status="observed",
+            )
+            for row in market_rows:
+                row.update(
+                    {
+                        "token_symbol": "UNI",
+                        "dex": "uniswap_v3",
+                        "pool_address": pool_address,
+                        "protocol_model": "concentrated_liquidity_v3",
+                        "target_token_address": uni,
+                        "target_token_decimals": "18",
+                        "quote_token_address": usdt,
+                        "quote_token_decimals": "6",
+                        "calculation_method": "uniswap_v3_exact_integer_swap",
+                    }
+                )
+            execution_rows.extend(market_rows)
+        write_csv(
+            self.dex_execution_path,
+            EXECUTION_COST_COLUMNS,
+            execution_rows,
+        )
+        environment = {
+            **self.environment,
+            "MARKET_DEX_DEPTH_DATA": str(self.dex_depth_path),
+            "MARKET_DEX_EXECUTION_COST_DATA": str(
+                self.dex_execution_path
+            ),
+        }
+
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(server.os.environ, environment, clear=True):
+                encoded, compressed = server.build_public_api_response(
+                    "execution_cost",
+                    (
+                        ("market_a", unapproved_market),
+                        ("market_b", approved_market),
+                        ("token", "UNI"),
+                    ),
+                    False,
+                )
+                published = json.loads(encoded)
+        finally:
+            server.clear_runtime_caches()
+
+        self.assertFalse(compressed)
+        self.assertEqual(
+            {row["status"] for row in published["market_a"]["rows"]},
+            {"unsupported"},
+        )
+        self.assertEqual(
+            {
+                row["status_reason"]
+                for row in published["market_a"]["rows"]
+            },
+            {"unsupported_protocol_or_chain"},
+        )
+        self.assertEqual(
+            {row["source_status"] for row in published["market_a"]["rows"]},
+            {"observed"},
+        )
+        for row in published["market_a"]["rows"]:
+            for field in RESULT_NUMERIC_COLUMNS:
+                self.assertIsNone(row[field], field)
+        self.assertEqual(
+            {row["status"] for row in published["market_b"]["rows"]},
+            {"observed"},
         )
 
     def test_stale_dex_price_time_withholds_public_execution_and_flags_quality(self):

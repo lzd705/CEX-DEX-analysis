@@ -4071,6 +4071,36 @@ def _execution_public_rows(
         row.get("status") in {"observed", "partial"}
         for row in rows
     )
+    v3_market = any(
+        row.get("market_type") == "dex"
+        and (
+            row.get("protocol_model") == "concentrated_liquidity_v3"
+            or row.get("dex") == "uniswap_v3"
+        )
+        for row in rows
+    )
+    market_ids = {
+        row.get("market_id")
+        for row in rows
+        if row.get("market_id")
+    }
+    authority_market_ids = set(load_uniswap_v3_execution_authority())
+    if measured and v3_market and not market_ids.issubset(
+        authority_market_ids
+    ):
+        for source_row, public_row in zip(rows, public_rows):
+            if source_row.get("status") not in {"observed", "partial"}:
+                continue
+            public_row["source_status"] = public_row.get("status")
+            public_row["source_status_reason"] = public_row.get(
+                "status_reason"
+            )
+            public_row["status"] = "unsupported"
+            public_row["status_reason"] = "unsupported_protocol_or_chain"
+            public_row["error"] = None
+            for field in RESULT_NUMERIC_COLUMNS:
+                public_row[field] = None
+        return public_rows
     if not measured or timing["usable"]:
         return public_rows
     for source_row, public_row in zip(rows, public_rows):
@@ -4122,7 +4152,14 @@ def uniswap_v3_execution_scope_metadata() -> dict[str, Any]:
         ],
         "other_v3_market_status": "unsupported",
         "included_costs": ["pool_swap_fee"],
-        "excluded_costs": ["gas", "router_fee", "transfer_tax", "MEV"],
+        "excluded_costs": [
+            "gas",
+            "router_fee",
+            "transfer_tax",
+            "MEV",
+            "account_inventory",
+            "realized_execution",
+        ],
     }
 
 
@@ -4455,9 +4492,10 @@ def build_execution_cost_comparison(
                 "Source-mechanics quoted cost, not realized or all-in cost. "
                 "CEX account taker fees are excluded. Supported DEX V2 quotes "
                 "include pool swap fees while gas, router fees, transfer "
-                "taxes, and MEV are excluded. DEX V3 quotes are supported only "
-                "for the exact pool-only authority scope; every other V3 market "
-                "is unsupported."
+                "taxes, MEV, account inventory, and realized execution are "
+                "excluded. DEX V3 quotes are supported only for the exact "
+                "pool-only authority scope; every other V3 market is "
+                "unsupported."
             ),
             "uniswap_v3_execution": uniswap_v3_execution_scope_metadata(),
             "missing_value_rule": (

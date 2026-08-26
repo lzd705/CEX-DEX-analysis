@@ -921,8 +921,8 @@ retention requirement before applying or enabling
 Funding rates, non-authority DEX V3 fixed-notional execution, and event-study
 outputs remain unsupported. The two authority-approved Ethereum Uniswap V3 UNI
 pools publish pool-only exact execution, including the pool swap fee and
-excluding gas, router fees, transfer taxes, and MEV. Existing depth execution
-rows also continue to exclude
+excluding gas, router fees, transfer taxes, MEV, account inventory, and
+realized execution. Existing depth execution rows also continue to exclude
 account-specific CEX fees and gas; only the synchronized route pipeline may
 add authenticated or validated-private CEX fees and adapter-bound gas evidence.
 Collection operations must not manufacture any of these values from spot

@@ -171,7 +171,8 @@ CSVs and a validated SQLite database back into `data/local/`.
   `0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801`. The API publishes their
   authority identity in `metadata.uniswap_v3_execution`; every other V3 market
   remains `unsupported`. These quotes include the pool swap fee only and
-  exclude gas, router fees, transfer taxes, and MEV.
+  exclude gas, router fees, transfer taxes, MEV, account inventory, and
+  realized execution.
 - `/api/markets/events?token=...&start=...&end=...&lifecycle=...` returns the
   latest revision of matching source-backed events, explicit time bounds and
   precision, lifecycle, evidence status, source-check lineage, and null-safe
