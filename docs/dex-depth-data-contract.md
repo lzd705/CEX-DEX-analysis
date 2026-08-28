@@ -87,7 +87,37 @@ amounts through every active-liquidity segment, applies the pool swap fee to gro
 input, and changes active liquidity when crossing an initialized tick. The
 Uniswap V3 core contract defines those state fields and follows the same
 tick-by-tick swap sequence:
-[Uniswap V3 pool source](https://github.com/Uniswap/v3-core/blob/main/contracts/UniswapV3Pool.sol).
+[Uniswap V3 pool source](https://github.com/Uniswap/v3-core/blob/ed88be38ab2032d82bf10ac6f8d03aa631889d48/contracts/UniswapV3Pool.sol).
+
+### Exact shared-engine canary scope
+
+The Ethereum Uniswap V3 UNI/USDT 0.3% and UNI/WETH 0.3% pools listed in
+`config/uniswap_v3_execution_markets.json` use the shared protocol-integer
+engine for both the four depth bands and fixed-notional execution. The
+collector binds one finalized block, verifies the canonical factory and
+`factory.getPool` result, reads every initialized tick advertised by each
+captured bitmap word, and rechecks the same block number and hash after the
+pool reads and again after the final Quoter call. If any approved V3 pool is in
+a chain cohort, that chain's block is selected from `finalized` before the
+first pool, so input order cannot make the V3 pool inherit a newer head block.
+The raw per-pool evidence contains the RPC transcript plus a
+`uniswap_v3_tick_scan_manifest/v1` summary of the authority, word range,
+initialized ticks, directional proof boundary, QuoterV2 parity, and terminal
+reason.
+
+The transcript also binds the exact GeckoTerminal source snapshot, response
+time, endpoint, raw-response SHA-256, token identities, and USD prices used for
+conversion. Publication requires every depth row and all ten matching
+execution rows to carry the same per-market transcript SHA-256.
+
+The configured bitmap radius is a proof bound, not an estimate. Depth is
+complete only when both directions reach the exact integer 10/25/50/100 bps
+price limits. Execution is complete only when the full integer target amount
+resolves before that bound and its same-block QuoterV2 check matches. A bound
+that is too short yields `partial`; an identity, RPC, arithmetic, transcript,
+or parity defect yields `failed`. Other V3 markets continue through the
+existing depth adapter but do not gain fixed-notional execution support from a
+DEX-name match.
 
 PancakeSwap documents its V3 fee tiers as 0.01%, 0.05%, 0.25%, and 1%; the
 collector reads the actual fee from each pool rather than parsing the pool name:
@@ -150,15 +180,32 @@ off-market pool. The actual pool-state depth remains visible with its lineage.
 
 | Boundary | File | Meaning |
 | --- | --- | --- |
-| Public bundle 1/4 | `data/local/dex_depth_history.csv` | Normalized depth history keyed by snapshot and pool |
-| Public bundle 2/4 | `data/local/dex_depth_latest.csv` | Latest published complete depth inventory |
-| Public bundle 3/4 | `data/local/dex_depth_snapshot.csv` | Public current depth view |
-| Public bundle 4/4 | `data/local/dex_execution_cost_latest.csv` | Latest execution scenarios derived from the same source cohort |
+| Public bundle 1/5 | `data/local/dex_depth_history.csv` | Normalized depth history keyed by snapshot and pool |
+| Public bundle 2/5 | `data/local/dex_depth_latest.csv` | Latest published complete depth inventory |
+| Public bundle 3/5 | `data/local/dex_depth_snapshot.csv` | Public current depth view |
+| Public bundle 4/5 | `data/local/dex_execution_cost_latest.csv` | Latest execution scenarios derived from the same source cohort |
+| Public exact sidecar 5/5 | `data/local/uniswap_v3_exact_latest.json` | Canonical two-authority-market validation receipt, replaced in the same bundle when exact scope is present |
 | Private current 1/2 | `data/processed/dex_depth_snapshot.csv` | Candidate depth current file awaiting/recording publication work |
 | Private current 2/2 | `data/processed/dex_execution_cost_snapshot.csv` | Candidate execution current file awaiting/recording publication work |
 | Price dependency | `data/processed/dex_pool_tvl_snapshot.csv` | Temporary current-run GeckoTerminal USD-price input; not a published TVL fact |
 | Raw evidence | `data/raw/dex-depth/<snapshot_id>/*.json` | Per-pool RPC transcripts and errors |
 | Raw manifest | `data/raw/dex-depth/<snapshot_id>/manifest.json` | Fixed blocks, status counts, bands, and raw-file inventory |
+| Raw exact receipt | `data/raw/dex-depth/<snapshot_id>/uniswap_v3_exact_validation.json` | Private canonical result written after raw validation and before processed/public writes |
+
+The two-pool canary is intentionally non-publishing:
+
+```bash
+python3 scripts/run_uniswap_v3_canary.py --evidence-root /absolute/new/path
+```
+
+It creates a new evidence directory, refreshes the GeckoTerminal price input,
+collects both pools, and returns `"published": false`. It never replaces a
+`data/local` current pointer or production bundle. A passing run writes the
+shared raw validation receipt under the depth snapshot and embeds that
+identical, path-free receipt in `canary_result.json`. The receipt records the
+one shared block number/hash, both pool transcript hashes, retained USD-source
+and manifest hashes, authority hash, scoped row hashes, and the exact
+two-direction by five-notional scenario inventory.
 
 The public and private depth-current files intentionally share the basename
 `dex_depth_snapshot.csv`; their `data/local` versus `data/processed`
@@ -195,17 +242,19 @@ therefore exposes canonical `observed_at_min`, `observed_at_max`, and
 `observation_span_seconds`. The span measures earliest-to-latest cohort skew;
 it does not redefine the snapshot ID or create cross-chain simultaneity.
 
-Both full and exact publication first resolve the two private and four public
-destinations above and reject any private/public overlap before making any
-write. Full publication then validates aligned depth/execution lineage, the
+Both full and exact publication first resolve the two private and four
+ordinary public destinations above and reject any private/public overlap
+before making any write. A full publication containing the exact two-pool V3
+scope also validates the sidecar receipt and resolves it as the fifth public
+destination. Full publication then validates aligned depth/execution lineage, the
 exact execution scenario inventory (including DEX USD-price timing), and both
 standard coverage reports. Exact publication instead checks aligned lineage
 and complete execution scenarios with DEX USD-price timing, validates both
 candidate-bound exact-target coverage reports and their target/mode/common
 generation, and requires exactly one target history row identical to the
 target depth-latest row. Only after those guards pass are the two private
-current files written independently and the four public destinations passed
-to one family bundle.
+current files written independently and all applicable public destinations
+passed to one family bundle.
 
 An ordinary in-process I/O exception rolls all public destinations back to
 their pre-call bytes. This is failure-atomic for ordinary I/O failures only,

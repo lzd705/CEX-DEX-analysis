@@ -31,6 +31,7 @@ The mounted directory must contain:
 - `cex_execution_cost_latest.csv`
 - `dex_execution_cost_latest.csv`
 - `dex_pool_tvl_latest.csv`
+- `uniswap_v3_exact_latest.json`
 
 Deploy a new application commit without changing the data directory. In the
 production systemd layout, publish a reviewed data snapshot by atomically

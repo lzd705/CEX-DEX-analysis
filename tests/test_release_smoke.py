@@ -3251,6 +3251,31 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "application_sha": "a" * 40,
             "asset_sha": "b" * 64,
             "asset_version": f"{'a' * 12}-{'b' * 12}",
+            "uniswap_v3_exact": {
+                "status": "current",
+                "authority_market_ids": sorted(
+                    release_checker.load_uniswap_v3_execution_authority(
+                        release_checker.V3_EXECUTION_AUTHORITY_PATH
+                    )
+                ),
+                "depth_observed_count": 2,
+                "depth_required_count": 2,
+                "execution_observed_scenario_count": 20,
+                "execution_required_scenario_count": 20,
+                "authority_sha256": hashlib.sha256(
+                    release_checker.V3_EXECUTION_AUTHORITY_PATH.read_bytes()
+                ).hexdigest(),
+                "depth_rows_sha256": "c" * 64,
+                "execution_rows_sha256": "d" * 64,
+                "receipt_sha256": "e" * 64,
+                "shared_finalized_block": {
+                    "number": 123,
+                    "hash": "0x" + "f" * 64,
+                },
+                "observed_at": "2026-08-27T00:00:00+00:00",
+                "observation_age_hours": 1.0,
+                "max_age_hours": 2.0,
+            },
         }
         fetched_paths = []
         served_asset_state = {"sha": "b" * 64}
