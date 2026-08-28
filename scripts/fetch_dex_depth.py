@@ -89,6 +89,16 @@ try:
         validate_v2_quantity_quote_against_state,
     )
     from scripts.timestamp_contract import validate_observation_bounds
+    from scripts.uniswap_v3_math import (
+        MAX_SQRT_RATIO as V3_MAX_SQRT_RATIO,
+        MAX_TICK as V3_MAX_TICK,
+        MIN_SQRT_RATIO as V3_MIN_SQRT_RATIO,
+        MIN_TICK as V3_MIN_TICK,
+        count_initialized_ticks_crossed as count_v3_initialized_ticks_crossed,
+        get_sqrt_ratio_at_tick as exact_v3_sqrt_ratio_at_tick,
+        simulate_swap as simulate_exact_v3_swap,
+        sqrt_price_limit_for_bps as exact_v3_price_limit_for_bps,
+    )
 except ModuleNotFoundError:
     from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
     from atomic_publication import atomic_replace_bundle, csv_payload
@@ -128,6 +138,16 @@ except ModuleNotFoundError:
         validate_v2_quantity_quote_against_state,
     )
     from timestamp_contract import validate_observation_bounds
+    from uniswap_v3_math import (
+        MAX_SQRT_RATIO as V3_MAX_SQRT_RATIO,
+        MAX_TICK as V3_MAX_TICK,
+        MIN_SQRT_RATIO as V3_MIN_SQRT_RATIO,
+        MIN_TICK as V3_MIN_TICK,
+        count_initialized_ticks_crossed as count_v3_initialized_ticks_crossed,
+        get_sqrt_ratio_at_tick as exact_v3_sqrt_ratio_at_tick,
+        simulate_swap as simulate_exact_v3_swap,
+        sqrt_price_limit_for_bps as exact_v3_price_limit_for_bps,
+    )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -257,7 +277,6 @@ V3_DEXES = {
 }
 _V3_BLOCK_HASH = re.compile(r"0x[0-9a-f]{64}\Z", flags=re.ASCII)
 _EVM_ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z", flags=re.ASCII)
-V3_MAX_TICK = 887_272
 V3_MAX_BITMAP_WORDS_PER_DIRECTION = 8
 
 # Ethereum ABI selectors.  The signatures are documented in the protocol
@@ -273,6 +292,10 @@ SELECTOR_FEE = "0xddca3f43"
 SELECTOR_TICK_SPACING = "0xd0c93a7c"
 SELECTOR_TICK_BITMAP = "0x5339c296"
 SELECTOR_TICKS = "0xf30dba93"
+SELECTOR_FACTORY = "0xc45a0155"
+SELECTOR_FACTORY_GET_POOL = "0x1698ee82"
+SELECTOR_QUOTE_EXACT_INPUT_SINGLE_V2 = "0xc6a5026a"
+SELECTOR_QUOTE_EXACT_OUTPUT_SINGLE_V2 = "0xbd21704a"
 
 BASE_COLUMNS = [
     "snapshot_id",
@@ -712,6 +735,13 @@ def require_usable_pool_usd_price(
         )
     finite_decimal(pool.get("base_token_price_usd"), positive=True)
     finite_decimal(pool.get("quote_token_price_usd"), positive=True)
+    if is_uniswap_v3_execution_approved(pool):
+        require_v3_usd_price_lineage(
+            snapshot_id=pool.get("snapshot_id"),
+            source=pool.get("source"),
+            endpoint=pool.get("source_endpoint"),
+            raw_sha256=pool.get("raw_response_sha256"),
+        )
     timing = pool_usd_price_timing(pool, block_timestamp)
     if not timing["usable"]:
         raise UsdPriceTimeMismatch(
@@ -719,6 +749,27 @@ def require_usable_pool_usd_price(
             f"{timing['reason']}"
         )
     return timing
+
+
+def require_v3_usd_price_lineage(
+    *,
+    snapshot_id: Any,
+    source: Any,
+    endpoint: Any,
+    raw_sha256: Any,
+) -> None:
+    if not str(snapshot_id or "").strip():
+        raise ValueError("V3 USD price source snapshot identity is missing")
+    if str(source or "").strip() != "GeckoTerminal API v2":
+        raise ValueError("V3 USD price source is not GeckoTerminal API v2")
+    source_endpoint = str(endpoint or "").strip()
+    if not source_endpoint.startswith(
+        "https://api.geckoterminal.com/api/v2/"
+    ):
+        raise ValueError("V3 USD price source endpoint is invalid")
+    source_hash = str(raw_sha256 or "").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", source_hash, flags=re.ASCII) is None:
+        raise ValueError("V3 USD price raw response hash is invalid")
 
 
 def http_json_rpc(
@@ -1040,6 +1091,57 @@ def encode_signed_word(value: int, bits: int) -> str:
 
 def call_with_int(selector: str, value: int, bits: int) -> str:
     return selector + encode_signed_word(value, bits)
+
+
+def encode_address_word(address: str) -> str:
+    normalized = str(address).lower()
+    if _EVM_ADDRESS.fullmatch(normalized) is None:
+        raise ValueError("invalid EVM address")
+    return normalized[2:].rjust(64, "0")
+
+
+def factory_get_pool_call(token0: str, token1: str, fee_pips: int) -> str:
+    if type(fee_pips) is not int or not 0 <= fee_pips < 1_000_000:
+        raise ValueError("invalid Uniswap V3 fee")
+    return (
+        SELECTOR_FACTORY_GET_POOL
+        + encode_address_word(token0)
+        + encode_address_word(token1)
+        + f"{fee_pips:064x}"
+    )
+
+
+def quoter_v2_single_call(
+    *,
+    exact_input: bool,
+    token_in: str,
+    token_out: str,
+    amount: int,
+    fee_pips: int,
+    sqrt_price_limit_x96: int,
+) -> str:
+    if type(amount) is not int or amount <= 0 or amount >= 1 << 256:
+        raise ValueError("invalid Quoter V2 amount")
+    if type(fee_pips) is not int or not 0 <= fee_pips < 1_000_000:
+        raise ValueError("invalid Quoter V2 fee")
+    if (
+        type(sqrt_price_limit_x96) is not int
+        or not 0 <= sqrt_price_limit_x96 < 1 << 160
+    ):
+        raise ValueError("invalid Quoter V2 price limit")
+    selector = (
+        SELECTOR_QUOTE_EXACT_INPUT_SINGLE_V2
+        if exact_input
+        else SELECTOR_QUOTE_EXACT_OUTPUT_SINGLE_V2
+    )
+    return (
+        selector
+        + encode_address_word(token_in)
+        + encode_address_word(token_out)
+        + f"{amount:064x}"
+        + f"{fee_pips:064x}"
+        + f"{sqrt_price_limit_x96:064x}"
+    )
 
 
 def price_map_from_inventory(row: dict[str, str]) -> dict[str, Decimal]:
@@ -1400,6 +1502,178 @@ def collect_initialized_ticks(
     }
 
 
+def _collect_exact_v3_bitmap_word(
+    client: RpcClient,
+    pool_address: str,
+    block_tag: str,
+    word_position: int,
+    tick_spacing: int,
+) -> tuple[dict[int, int], list[dict[str, int]]]:
+    """Collect one complete bitmap word and every state row asserted by it."""
+    bitmap_result = client.eth_calls(
+        pool_address,
+        [call_with_int(SELECTOR_TICK_BITMAP, word_position, 16)],
+        block_tag,
+    )[0]
+    bitmap = decode_uint(bitmap_result)
+    tick_indexes = [
+        (word_position * 256 + bit) * tick_spacing
+        for bit in range(256)
+        if bitmap & (1 << bit)
+    ]
+    if any(not V3_MIN_TICK <= tick <= V3_MAX_TICK for tick in tick_indexes):
+        raise ValueError("V3 bitmap asserts a tick outside protocol bounds")
+    tick_results = (
+        client.eth_calls(
+            pool_address,
+            [call_with_int(SELECTOR_TICKS, tick, 24) for tick in tick_indexes],
+            block_tag,
+        )
+        if tick_indexes
+        else []
+    )
+    ticks: dict[int, int] = {}
+    evidence: list[dict[str, int]] = []
+    for tick, result in zip(tick_indexes, tick_results):
+        liquidity_gross = decode_uint(result, 0)
+        liquidity_net = decode_int(result, 1, 128)
+        if liquidity_gross <= 0:
+            raise ValueError("V3 bitmap/tick liquidityGross evidence is inconsistent")
+        ticks[tick] = liquidity_net
+        evidence.append(
+            {
+                "word_position": word_position,
+                "bit_position": (tick // tick_spacing) - word_position * 256,
+                "tick": tick,
+                "liquidity_gross": liquidity_gross,
+                "liquidity_net": liquidity_net,
+            }
+        )
+    return ticks, evidence
+
+
+def collect_exact_v3_state_window(
+    client: RpcClient,
+    pool_address: str,
+    block_tag: str,
+    *,
+    sqrt_price_x96: int,
+    current_tick: int,
+    active_liquidity: int,
+    fee_pips: int,
+    tick_spacing: int,
+    zero_for_one_amount_specified: int,
+    one_for_zero_amount_specified: int,
+    bitmap_word_radius: int,
+) -> dict[str, Any]:
+    """Expand complete bitmap words until depth and max execution are proven."""
+    if type(bitmap_word_radius) is not int or not (
+        1 <= bitmap_word_radius <= V3_MAX_BITMAP_WORDS_PER_DIRECTION
+    ):
+        raise ValueError("V3 bitmap word radius is invalid")
+    current_word = (current_tick // tick_spacing) >> 8
+    word_cache: dict[int, tuple[dict[int, int], list[dict[str, int]]]] = {}
+    all_ticks: dict[int, int] = {}
+    tick_evidence: dict[int, dict[str, int]] = {}
+
+    def load_word(word_position: int) -> None:
+        if word_position in word_cache:
+            return
+        ticks, evidence = _collect_exact_v3_bitmap_word(
+            client,
+            pool_address,
+            block_tag,
+            word_position,
+            tick_spacing,
+        )
+        word_cache[word_position] = (ticks, evidence)
+        all_ticks.update(ticks)
+        for item in evidence:
+            tick_evidence[item["tick"]] = item
+
+    direction_results: dict[str, dict[str, Any]] = {}
+    maximum_depth_limit = {
+        True: exact_v3_price_limit_for_bps(
+            sqrt_price_x96,
+            max(DEPTH_BANDS_BPS),
+            zero_for_one=True,
+        ),
+        False: exact_v3_price_limit_for_bps(
+            sqrt_price_x96,
+            max(DEPTH_BANDS_BPS),
+            zero_for_one=False,
+        ),
+    }
+    for zero_for_one, amount_specified in (
+        (True, zero_for_one_amount_specified),
+        (False, one_for_zero_amount_specified),
+    ):
+        scanned_words: list[int] = []
+        last_limit: int | None = None
+        max_result = None
+        for offset in range(bitmap_word_radius):
+            word_position = current_word - offset if zero_for_one else current_word + offset
+            load_word(word_position)
+            scanned_words.append(word_position)
+            if zero_for_one:
+                boundary_tick = max(
+                    V3_MIN_TICK,
+                    word_position * 256 * tick_spacing,
+                )
+            else:
+                boundary_tick = min(
+                    V3_MAX_TICK,
+                    (word_position * 256 + 255) * tick_spacing,
+                )
+            boundary_sqrt = exact_v3_sqrt_ratio_at_tick(boundary_tick)
+            if zero_for_one and boundary_sqrt >= sqrt_price_x96:
+                continue
+            if not zero_for_one and boundary_sqrt <= sqrt_price_x96:
+                continue
+            last_limit = boundary_sqrt
+            max_result = simulate_exact_v3_swap(
+                sqrt_price_x96=sqrt_price_x96,
+                current_tick=current_tick,
+                liquidity=active_liquidity,
+                fee_pips=fee_pips,
+                initialized_ticks=all_ticks,
+                amount_specified=amount_specified,
+                zero_for_one=zero_for_one,
+                sqrt_price_limit_x96=boundary_sqrt,
+            )
+            depth_covered = (
+                boundary_sqrt <= maximum_depth_limit[True]
+                if zero_for_one
+                else boundary_sqrt >= maximum_depth_limit[False]
+            )
+            if max_result.complete and depth_covered:
+                break
+        if last_limit is None or max_result is None:
+            raise ValueError("V3 bitmap scan did not establish a price window")
+        direction_results["zero_for_one" if zero_for_one else "one_for_zero"] = {
+            "price_limit_x96": last_limit,
+            "word_positions": scanned_words,
+            "max_execution_complete": max_result.complete,
+            "terminal_reason": (
+                "requirements_proven"
+                if max_result.complete
+                and (
+                    last_limit <= maximum_depth_limit[True]
+                    if zero_for_one
+                    else last_limit >= maximum_depth_limit[False]
+                )
+                else "source_tick_scan_limit"
+            ),
+        }
+    return {
+        "initialized_ticks": dict(sorted(all_ticks.items())),
+        "tick_evidence": [tick_evidence[tick] for tick in sorted(tick_evidence)],
+        "bitmap_words": sorted(word_cache),
+        "directions": direction_results,
+        "bitmap_word_radius": bitmap_word_radius,
+    }
+
+
 def base_row(
     pool: dict[str, str],
     *,
@@ -1714,6 +1988,27 @@ def match_uniswap_v3_execution_authority(
     return dict(record)
 
 
+def is_uniswap_v3_execution_approved(pool: Mapping[str, Any]) -> bool:
+    authority = load_uniswap_v3_execution_authority()
+    market_id = str(pool.get("market_id") or "")
+    if market_id and market_id in authority:
+        return True
+    try:
+        if dex_market_id(dict(pool)) in authority:
+            return True
+    except (KeyError, TypeError):
+        pass
+    chain = str(pool.get("chain") or "").strip().lower()
+    dex = str(pool.get("dex") or "").strip().lower()
+    pool_address = str(pool.get("pool_address") or "").strip().lower()
+    return any(
+        record["chain"] == chain
+        and record["dex"] == dex
+        and record["pool_address"] == pool_address
+        for record in authority.values()
+    )
+
+
 def block_timestamp_text(block: dict[str, Any]) -> str:
     from datetime import datetime, timezone
 
@@ -1722,6 +2017,32 @@ def block_timestamp_text(block: dict[str, Any]) -> str:
         raise ValueError("fixed block is missing timestamp")
     timestamp = int(raw, 16) if isinstance(raw, str) else int(raw)
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+
+
+def exact_v3_block_identity(
+    block: Mapping[str, Any],
+    expected_block_number: int,
+) -> dict[str, str]:
+    if not isinstance(block, Mapping):
+        raise ValueError("V3 fixed block header is unavailable")
+    number = block.get("number")
+    if isinstance(number, str):
+        canonical_rpc_quantity(number, "V3 fixed block number")
+        parsed_number = int(number, 16)
+    elif type(number) is int and number >= 0:
+        parsed_number = number
+    else:
+        raise ValueError("V3 fixed block number is unavailable")
+    if parsed_number != expected_block_number:
+        raise ValueError("V3 fixed block number changed during collection")
+    block_hash = str(block.get("hash") or "").lower()
+    if _V3_BLOCK_HASH.fullmatch(block_hash) is None:
+        raise ValueError("V3 fixed block hash is unavailable")
+    return {
+        "number": str(parsed_number),
+        "hash": block_hash,
+        "timestamp": block_timestamp_text(dict(block)),
+    }
 
 
 def _execution_common(
@@ -2059,6 +2380,200 @@ def _v2_execution_rows(
     return rows
 
 
+def v3_execution_rows(
+    pool: dict[str, str],
+    *,
+    client: RpcClient,
+    block_tag: str,
+    token0_address: str,
+    token1_address: str,
+    quoter_v2_address: str,
+    common: dict[str, Any],
+    target_position_index: int,
+    token0_decimals: int,
+    token1_decimals: int,
+    token0_price: Decimal,
+    token1_price: Decimal,
+    sqrt_price_x96: int,
+    current_tick: int,
+    active_liquidity: int,
+    fee_pips: int,
+    tick_spacing: int,
+    initialized_ticks: Mapping[int, int],
+    scan_directions: Mapping[str, Mapping[str, Any]],
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Calculate fixed-notional facts with the shared protocol-exact engine."""
+    starting_ratio = _sqrt_human_token1_per_token0(
+        Decimal(sqrt_price_x96),
+        token0_decimals,
+        token1_decimals,
+    )
+    reference_quote = _target_quote_ratio(
+        starting_ratio,
+        target_position_index,
+    )
+    quote_to_usd = (
+        token1_price if target_position_index == 0 else token0_price
+    )
+    target_decimals = (
+        token0_decimals if target_position_index == 0 else token1_decimals
+    )
+    target_scale = Decimal(10) ** target_decimals
+    quote_scale = Decimal(10) ** (
+        token1_decimals if target_position_index == 0 else token0_decimals
+    )
+    rows: list[dict[str, str]] = []
+    parity_evidence: list[dict[str, Any]] = []
+    for notional in EXECUTION_NOTIONALS_USD:
+        target_raw_decimal, target_quantity = _quantized_target(
+            notional,
+            reference_quote,
+            quote_to_usd,
+            target_decimals,
+        )
+        target_raw = int(target_raw_decimal)
+        for direction in EXECUTION_DIRECTIONS:
+            if direction == "sell_token":
+                zero_for_one = target_position_index == 0
+                amount_specified = target_raw
+            else:
+                zero_for_one = target_position_index == 1
+                amount_specified = -target_raw
+            scan = scan_directions[
+                "zero_for_one" if zero_for_one else "one_for_zero"
+            ]
+            result = simulate_exact_v3_swap(
+                sqrt_price_x96=sqrt_price_x96,
+                current_tick=current_tick,
+                liquidity=active_liquidity,
+                fee_pips=fee_pips,
+                initialized_ticks=initialized_ticks,
+                amount_specified=amount_specified,
+                zero_for_one=zero_for_one,
+                sqrt_price_limit_x96=int(scan["price_limit_x96"]),
+            )
+            filled_raw = (
+                result.amount_in if direction == "sell_token" else result.amount_out
+            )
+            quote_raw = (
+                result.amount_out if direction == "sell_token" else result.amount_in
+            )
+            status = "observed" if result.complete else "partial"
+            if result.complete:
+                token_in = token0_address if zero_for_one else token1_address
+                token_out = token1_address if zero_for_one else token0_address
+                quoter_result = client.eth_calls(
+                    quoter_v2_address,
+                    [
+                        quoter_v2_single_call(
+                            exact_input=direction == "sell_token",
+                            token_in=token_in,
+                            token_out=token_out,
+                            amount=target_raw,
+                            fee_pips=fee_pips,
+                            sqrt_price_limit_x96=int(scan["price_limit_x96"]),
+                        )
+                    ],
+                    block_tag,
+                )[0]
+                quoter_words = words(quoter_result)
+                if len(quoter_words) != 4:
+                    raise ValueError("QuoterV2 response must contain four words")
+                quoter_amount = decode_uint(quoter_result, 0)
+                quoter_sqrt_after = decode_uint(quoter_result, 1)
+                quoter_ticks_crossed = decode_uint(quoter_result, 2)
+                quoter_gas_estimate = decode_uint(quoter_result, 3)
+                if quoter_sqrt_after >= 1 << 160:
+                    raise ValueError("QuoterV2 sqrtPriceX96After exceeds uint160")
+                if quoter_ticks_crossed >= 1 << 32:
+                    raise ValueError(
+                        "QuoterV2 initializedTicksCrossed exceeds uint32"
+                    )
+                local_quoter_ticks_crossed = count_v3_initialized_ticks_crossed(
+                    tick_before=current_tick,
+                    tick_after=result.tick,
+                    tick_spacing=tick_spacing,
+                    initialized_ticks=initialized_ticks,
+                )
+                local_quote_amount = (
+                    result.amount_out
+                    if direction == "sell_token"
+                    else result.amount_in
+                )
+                if (
+                    quoter_amount != local_quote_amount
+                    or quoter_sqrt_after != result.sqrt_price_x96
+                    or quoter_ticks_crossed != local_quoter_ticks_crossed
+                ):
+                    raise ValueError(
+                        "Uniswap V3 exact engine does not match same-block "
+                        "QuoterV2:"
+                        f"amount={local_quote_amount}/{quoter_amount}:"
+                        f"sqrt={result.sqrt_price_x96}/{quoter_sqrt_after}:"
+                        "initialized_ticks_crossed="
+                        f"{local_quoter_ticks_crossed}/{quoter_ticks_crossed}"
+                    )
+                parity_evidence.append(
+                    {
+                        "direction": direction,
+                        "requested_notional_usd": decimal_text(notional),
+                        "status": "exact_match",
+                        "amount_raw": quoter_amount,
+                        "sqrt_price_x96_after": quoter_sqrt_after,
+                        "initialized_ticks_crossed": quoter_ticks_crossed,
+                        "gas_estimate_raw": quoter_gas_estimate,
+                        "core_liquidity_boundaries_crossed": (
+                            result.initialized_ticks_crossed
+                        ),
+                    }
+                )
+            else:
+                parity_evidence.append(
+                    {
+                        "direction": direction,
+                        "requested_notional_usd": decimal_text(notional),
+                        "status": "not_checked_partial_scan",
+                    }
+                )
+            ending_ratio = _sqrt_human_token1_per_token0(
+                Decimal(result.sqrt_price_x96),
+                token0_decimals,
+                token1_decimals,
+            )
+            rows.append(
+                execution_fact_row(
+                    common=common,
+                    direction=direction,
+                    requested_notional_usd=notional,
+                    status=status,
+                    status_reason=(
+                        "full_target_quantity_filled"
+                        if result.complete
+                        else "source_tick_scan_limit"
+                    ),
+                    reference_price_quote_per_token=reference_quote,
+                    quote_to_usd=quote_to_usd,
+                    target_token_quantity=target_quantity,
+                    filled_token_quantity=(
+                        Decimal(filled_raw) / target_scale
+                        if filled_raw > 0
+                        else None
+                    ),
+                    quote_amount=(
+                        Decimal(quote_raw) / quote_scale
+                        if quote_raw > 0
+                        else None
+                    ),
+                    levels_or_ticks_consumed=result.steps,
+                    ending_marginal_price_quote_per_token=_target_quote_ratio(
+                        ending_ratio,
+                        target_position_index,
+                    ),
+                )
+            )
+    return rows, parity_evidence
+
+
 def _sqrt_human_token1_per_token0(
     sqrt_price_x96: Decimal,
     token0_decimals: int,
@@ -2082,6 +2597,7 @@ def observed_pool_row(
     request_started_at: str,
     raw_response_sha256: str,
     protocol: str,
+    expected_v3_block_identity: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     block_tag = hex(block_number)
     pool_address = pool["pool_address"].lower()
@@ -2092,6 +2608,15 @@ def observed_pool_row(
     price_map = price_map_from_inventory(pool)
     if len(price_map) < 2:
         raise ValueError("TVL inventory is missing one or both token USD prices")
+    exact_v3_enabled = (
+        protocol == "concentrated_liquidity_v3"
+        and is_uniswap_v3_execution_approved(pool)
+    )
+    exact_authority: dict[str, Any] | None = None
+    exact_block_before: dict[str, str] | None = None
+    exact_chain_id: int | None = None
+    exact_factory: str | None = None
+    exact_state_window: dict[str, Any] | None = None
 
     if protocol == "constant_product_v2":
         token0_result, token1_result, reserves_result = client.eth_calls(
@@ -2109,6 +2634,38 @@ def observed_pool_row(
         active_liquidity = None
         initialized_ticks: dict[int, int] = {}
     else:
+        if exact_v3_enabled:
+            exact_block_before = exact_v3_block_identity(
+                client.block(block_tag),
+                block_number,
+            )
+            if (
+                expected_v3_block_identity is not None
+                and dict(expected_v3_block_identity) != exact_block_before
+            ):
+                raise ValueError(
+                    "V3 finalized block identity does not match state block"
+                )
+            chain_id_quantity = client.chain_id()
+            exact_chain_id = int(
+                canonical_rpc_quantity(chain_id_quantity, "V3 chain id"),
+                16,
+            )
+        state_selectors = [
+            SELECTOR_TOKEN0,
+            SELECTOR_TOKEN1,
+            SELECTOR_SLOT0,
+            SELECTOR_LIQUIDITY,
+            SELECTOR_FEE,
+            SELECTOR_TICK_SPACING,
+        ]
+        if exact_v3_enabled:
+            state_selectors.append(SELECTOR_FACTORY)
+        state_results = client.eth_calls(
+            pool_address,
+            state_selectors,
+            block_tag,
+        )
         (
             token0_result,
             token1_result,
@@ -2116,18 +2673,9 @@ def observed_pool_row(
             liquidity_result,
             fee_result,
             spacing_result,
-        ) = client.eth_calls(
-            pool_address,
-            [
-                SELECTOR_TOKEN0,
-                SELECTOR_TOKEN1,
-                SELECTOR_SLOT0,
-                SELECTOR_LIQUIDITY,
-                SELECTOR_FEE,
-                SELECTOR_TICK_SPACING,
-            ],
-            block_tag,
-        )
+        ) = state_results[:6]
+        if exact_v3_enabled:
+            exact_factory = decode_address(state_results[6])
         token0 = decode_address(token0_result)
         token1 = decode_address(token1_result)
         sqrt_price_x96 = decode_uint(slot0_result, 0)
@@ -2136,14 +2684,22 @@ def observed_pool_row(
         fee_pips = decode_uint(fee_result)
         fee_bps = Decimal(fee_pips) / Decimal(100)
         tick_spacing = decode_int(spacing_result, 0, 24)
-        if sqrt_price_x96 <= 0 or active_liquidity <= 0:
+        if not V3_MIN_SQRT_RATIO <= sqrt_price_x96 < V3_MAX_SQRT_RATIO:
+            raise ValueError("V3 pool sqrt price is outside protocol bounds")
+        if not V3_MIN_TICK <= current_tick <= V3_MAX_TICK:
+            raise ValueError("V3 pool current tick is outside protocol bounds")
+        if not exact_v3_enabled and active_liquidity <= 0:
             raise ValueError("V3 pool is uninitialized or has zero active liquidity")
-        initialized_ticks = collect_initialized_ticks(
-            client,
-            pool_address,
-            block_tag,
-            current_tick,
-            tick_spacing,
+        initialized_ticks = (
+            {}
+            if exact_v3_enabled
+            else collect_initialized_ticks(
+                client,
+                pool_address,
+                block_tag,
+                current_tick,
+                tick_spacing,
+            )
         )
         reserve0 = reserve1 = Decimal(0)
 
@@ -2163,6 +2719,82 @@ def observed_pool_row(
         )
     token0_price = price_map[token0]
     token1_price = price_map[token1]
+
+    if exact_v3_enabled:
+        assert exact_factory is not None
+        assert exact_chain_id is not None
+        assert sqrt_price_x96 is not None
+        assert current_tick is not None
+        assert active_liquidity is not None
+        factory_pool_result = client.eth_calls(
+            exact_factory,
+            [factory_get_pool_call(token0, token1, fee_pips)],
+            block_tag,
+        )[0]
+        factory_pool_address = decode_address(factory_pool_result)
+        exact_authority = match_uniswap_v3_execution_authority(
+            pool,
+            {
+                "chain_id": exact_chain_id,
+                "pool_address": pool_address,
+                "factory_address": exact_factory,
+                "factory_get_pool_address": factory_pool_address,
+                "token0_address": token0,
+                "token0_decimals": token0_decimals,
+                "token1_address": token1,
+                "token1_decimals": token1_decimals,
+                "fee_pips": fee_pips,
+                "tick_spacing": tick_spacing,
+            },
+        )
+        if exact_authority is None:
+            raise ValueError("approved V3 market lost its authority binding")
+        exact_raw_ratio = _sqrt_human_token1_per_token0(
+            Decimal(sqrt_price_x96),
+            token0_decimals,
+            token1_decimals,
+        )
+        exact_reference_quote = _target_quote_ratio(
+            exact_raw_ratio,
+            target_index,
+        )
+        exact_quote_to_usd = (
+            token1_price if target_index == 0 else token0_price
+        )
+        maximum_target_raw, _maximum_target_quantity = _quantized_target(
+            max(EXECUTION_NOTIONALS_USD),
+            exact_reference_quote,
+            exact_quote_to_usd,
+            token0_decimals if target_index == 0 else token1_decimals,
+        )
+        if target_index == 0:
+            zero_amount_specified = int(maximum_target_raw)
+            one_amount_specified = -int(maximum_target_raw)
+        else:
+            zero_amount_specified = -int(maximum_target_raw)
+            one_amount_specified = int(maximum_target_raw)
+        exact_state_window = collect_exact_v3_state_window(
+            client,
+            pool_address,
+            block_tag,
+            sqrt_price_x96=sqrt_price_x96,
+            current_tick=current_tick,
+            active_liquidity=active_liquidity,
+            fee_pips=fee_pips,
+            tick_spacing=tick_spacing,
+            zero_for_one_amount_specified=zero_amount_specified,
+            one_for_zero_amount_specified=one_amount_specified,
+            bitmap_word_radius=int(exact_authority["bitmap_word_radius"]),
+        )
+        initialized_ticks = exact_state_window["initialized_ticks"]
+        exact_block_after = exact_v3_block_identity(
+            client.block(block_tag),
+            block_number,
+        )
+        if exact_block_before != exact_block_after:
+            raise ValueError("V3 fixed block identity changed during collection")
+        if exact_block_after["timestamp"] != block_timestamp:
+            raise ValueError("V3 fixed block timestamp does not match cohort")
 
     band_amounts: dict[int, dict[str, Any]] = {}
     if protocol == "constant_product_v2":
@@ -2187,51 +2819,98 @@ def observed_pool_row(
         assert active_liquidity is not None
         assert current_tick is not None
         fee_pips = int(fee_bps * Decimal(100))
-        for band in DEPTH_BANDS_BPS:
+        if exact_v3_enabled:
+            exact_depth_input = (1 << 255) - 1
+            for band in DEPTH_BANDS_BPS:
+                down_target = exact_v3_price_limit_for_bps(
+                    sqrt_price_x96,
+                    band,
+                    zero_for_one=True,
+                )
+                up_target = exact_v3_price_limit_for_bps(
+                    sqrt_price_x96,
+                    band,
+                    zero_for_one=False,
+                )
+                zero_result = simulate_exact_v3_swap(
+                    sqrt_price_x96=sqrt_price_x96,
+                    current_tick=current_tick,
+                    liquidity=active_liquidity,
+                    fee_pips=fee_pips,
+                    initialized_ticks=initialized_ticks,
+                    amount_specified=exact_depth_input,
+                    zero_for_one=True,
+                    sqrt_price_limit_x96=down_target,
+                )
+                one_result = simulate_exact_v3_swap(
+                    sqrt_price_x96=sqrt_price_x96,
+                    current_tick=current_tick,
+                    liquidity=active_liquidity,
+                    fee_pips=fee_pips,
+                    initialized_ticks=initialized_ticks,
+                    amount_specified=exact_depth_input,
+                    zero_for_one=False,
+                    sqrt_price_limit_x96=up_target,
+                )
+                band_amounts[band] = {
+                    "zero_input": Decimal(zero_result.amount_in),
+                    "zero_output": Decimal(zero_result.amount_out),
+                    "one_input": Decimal(one_result.amount_in),
+                    "one_output": Decimal(one_result.amount_out),
+                    "zero_complete": zero_result.sqrt_price_x96 == down_target,
+                    "one_complete": one_result.sqrt_price_x96 == up_target,
+                }
+            raw_ratio = _sqrt_human_token1_per_token0(
+                Decimal(sqrt_price_x96),
+                token0_decimals,
+                token1_decimals,
+            )
+        else:
+            for band in DEPTH_BANDS_BPS:
+                with localcontext() as context:
+                    context.prec = 100
+                    down_target = (
+                        Decimal(sqrt_price_x96)
+                        * (
+                            Decimal(1) - Decimal(band) / Decimal(10_000)
+                        ).sqrt()
+                    )
+                    up_target = (
+                        Decimal(sqrt_price_x96)
+                        * (
+                            Decimal(1) + Decimal(band) / Decimal(10_000)
+                        ).sqrt()
+                    )
+                zero_input, zero_output, zero_complete = v3_move_to_price(
+                    sqrt_price_x96,
+                    down_target,
+                    active_liquidity,
+                    fee_pips,
+                    initialized_ticks,
+                    zero_for_one=True,
+                )
+                one_input, one_output, one_complete = v3_move_to_price(
+                    sqrt_price_x96,
+                    up_target,
+                    active_liquidity,
+                    fee_pips,
+                    initialized_ticks,
+                    zero_for_one=False,
+                )
+                band_amounts[band] = {
+                    "zero_input": zero_input,
+                    "zero_output": zero_output,
+                    "one_input": one_input,
+                    "one_output": one_output,
+                    "zero_complete": zero_complete,
+                    "one_complete": one_complete,
+                }
             with localcontext() as context:
                 context.prec = 100
-                down_target = (
-                    Decimal(sqrt_price_x96)
-                    * (
-                        Decimal(1) - Decimal(band) / Decimal(10_000)
-                    ).sqrt()
+                raw_ratio = (
+                    (Decimal(sqrt_price_x96) / Q96) ** 2
+                    * (Decimal(10) ** (token0_decimals - token1_decimals))
                 )
-                up_target = (
-                    Decimal(sqrt_price_x96)
-                    * (
-                        Decimal(1) + Decimal(band) / Decimal(10_000)
-                    ).sqrt()
-                )
-            zero_input, zero_output, zero_complete = v3_move_to_price(
-                sqrt_price_x96,
-                down_target,
-                active_liquidity,
-                fee_pips,
-                initialized_ticks,
-                zero_for_one=True,
-            )
-            one_input, one_output, one_complete = v3_move_to_price(
-                sqrt_price_x96,
-                up_target,
-                active_liquidity,
-                fee_pips,
-                initialized_ticks,
-                zero_for_one=False,
-            )
-            band_amounts[band] = {
-                "zero_input": zero_input,
-                "zero_output": zero_output,
-                "one_input": one_input,
-                "one_output": one_output,
-                "zero_complete": zero_complete,
-                "one_complete": one_complete,
-            }
-        with localcontext() as context:
-            context.prec = 100
-            raw_ratio = (
-                (Decimal(sqrt_price_x96) / Q96) ** 2
-                * (Decimal(10) ** (token0_decimals - token1_decimals))
-            )
 
     response_received_at = utc_now_text()
     row = base_row(
@@ -2281,6 +2960,27 @@ def observed_pool_row(
             "raw_response_sha256": raw_response_sha256,
         }
     )
+    if exact_v3_enabled:
+        assert exact_state_window is not None
+        assert exact_authority is not None
+        assert exact_block_before is not None
+        row["_v3_tick_scan_manifest"] = {
+            "schema": "uniswap_v3_tick_scan_manifest/v1",
+            "market_id": exact_authority["market_id"],
+            "chain_id": hex(exact_chain_id),
+            "block_number": block_number,
+            "block_hash": exact_block_before["hash"],
+            "pool_address": pool_address,
+            "authority": exact_authority,
+            "block": exact_block_before,
+            "bitmap_words": [
+                {"word_position": word_position}
+                for word_position in exact_state_window["bitmap_words"]
+            ],
+            "tick_evidence": exact_state_window["tick_evidence"],
+            "directions": exact_state_window["directions"],
+            "bitmap_word_radius": exact_state_window["bitmap_word_radius"],
+        }
     row.update(
         depth_fields(
             target_position_index=target_index,
@@ -2300,7 +3000,7 @@ def observed_pool_row(
         "observed" if row["status"] == "observed" else "measurement_limit"
     )
     response_received_at = row["response_received_at"]
-    if protocol == "concentrated_liquidity_v3":
+    if protocol == "concentrated_liquidity_v3" and not exact_v3_enabled:
         # The depth bands above are valid pool-state facts, but producing an
         # executable V3 quote requires protocol-identical integer swap math at
         # every step and tick crossing.  The removed continuous Decimal
@@ -2341,18 +3041,47 @@ def observed_pool_row(
             quote_token_decimals=quote_decimals,
             fee_bps=fee_bps,
         )
-        execution_rows = v2_execution_rows(
-            pool,
-            common=common,
-            target_position_index=target_index,
-            token0_decimals=token0_decimals,
-            token1_decimals=token1_decimals,
-            token0_price=token0_price,
-            token1_price=token1_price,
-            reserve0=reserve0,
-            reserve1=reserve1,
-            fee_bps=fee_bps,
-        )
+        if exact_v3_enabled:
+            assert sqrt_price_x96 is not None
+            assert current_tick is not None
+            assert active_liquidity is not None
+            assert exact_state_window is not None
+            assert exact_authority is not None
+            execution_rows, parity_evidence = v3_execution_rows(
+                pool,
+                client=client,
+                block_tag=block_tag,
+                token0_address=token0,
+                token1_address=token1,
+                quoter_v2_address=exact_authority["quoter_v2_address"],
+                common=common,
+                target_position_index=target_index,
+                token0_decimals=token0_decimals,
+                token1_decimals=token1_decimals,
+                token0_price=token0_price,
+                token1_price=token1_price,
+                sqrt_price_x96=sqrt_price_x96,
+                current_tick=current_tick,
+                active_liquidity=active_liquidity,
+                fee_pips=fee_pips,
+                tick_spacing=tick_spacing,
+                initialized_ticks=initialized_ticks,
+                scan_directions=exact_state_window["directions"],
+            )
+            row["_v3_tick_scan_manifest"]["quoter_v2_parity"] = parity_evidence
+        else:
+            execution_rows = v2_execution_rows(
+                pool,
+                common=common,
+                target_position_index=target_index,
+                token0_decimals=token0_decimals,
+                token1_decimals=token1_decimals,
+                token0_price=token0_price,
+                token1_price=token1_price,
+                reserve0=reserve0,
+                reserve1=reserve1,
+                fee_bps=fee_bps,
+            )
     except Exception as execution_error:
         # Depth is already a valid independent fact at this point.  A defect or
         # unsupported edge in the derived execution calculation must not erase
@@ -2371,6 +3100,24 @@ def observed_pool_row(
             source_endpoint=client.endpoint,
             raw_response_sha256=raw_response_sha256,
         )
+        if exact_v3_enabled and isinstance(
+            row.get("_v3_tick_scan_manifest"), dict
+        ):
+            row["_v3_tick_scan_manifest"]["execution_error"] = (
+                f"{type(execution_error).__name__}: {execution_error}"
+            )
+    if exact_v3_enabled:
+        assert exact_block_before is not None
+        exact_block_final = exact_v3_block_identity(
+            client.block(block_tag),
+            block_number,
+        )
+        if exact_block_before != exact_block_final:
+            raise ValueError("V3 fixed block identity changed during collection")
+        if exact_block_final["timestamp"] != block_timestamp:
+            raise ValueError("V3 fixed block timestamp does not match cohort")
+        if isinstance(row.get("_v3_tick_scan_manifest"), dict):
+            row["_v3_tick_scan_manifest"]["block_final"] = exact_block_final
     return row, execution_rows
 
 
@@ -2381,6 +3128,7 @@ def raw_transcript_bytes(
     endpoint: str,
     records: list[dict[str, Any]],
     error: Exception | None = None,
+    v3_tick_scan_manifest: Mapping[str, Any] | None = None,
 ) -> bytes:
     payload: dict[str, Any] = {
         "pool": {
@@ -2393,6 +3141,27 @@ def raw_transcript_bytes(
         "source_endpoint": endpoint,
         "records": records,
     }
+    if any(
+        str(pool.get(field) or "").strip()
+        for field in ("source", "source_endpoint", "raw_response_sha256")
+    ):
+        payload["usd_price_evidence"] = {
+            "source_snapshot_id": pool.get("snapshot_id", ""),
+            "observed_at": (
+                pool.get("response_received_at")
+                or pool.get("observed_at")
+                or ""
+            ),
+            "source": pool.get("source", ""),
+            "source_endpoint": pool.get("source_endpoint", ""),
+            "raw_response_sha256": pool.get("raw_response_sha256", ""),
+            "base_token_id": pool.get("base_token_id", ""),
+            "quote_token_id": pool.get("quote_token_id", ""),
+            "base_token_price_usd": pool.get("base_token_price_usd", ""),
+            "quote_token_price_usd": pool.get("quote_token_price_usd", ""),
+        }
+    if v3_tick_scan_manifest is not None:
+        payload["v3_tick_scan_manifest"] = dict(v3_tick_scan_manifest)
     if error is not None:
         payload["error_type"] = type(error).__name__
         payload["error"] = str(error)
@@ -2410,6 +3179,7 @@ def collect_dex_pool_observation(
     client: RpcClient | None = None,
     fixed_block_number: int | None = None,
     fixed_block_timestamp: str = "",
+    expected_v3_block_identity: Mapping[str, str] | None = None,
     deadline: CollectionDeadline | None = None,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Collect one DEX pool with isolated client state unless one is supplied."""
@@ -2476,8 +3246,61 @@ def collect_dex_pool_observation(
     block_number = fixed_block_number
     block_timestamp = fixed_block_timestamp
     try:
+        exact_v3_approved = (
+            protocol == "concentrated_liquidity_v3"
+            and is_uniswap_v3_execution_approved(pool)
+        )
         if block_number is None:
-            block_number = active_client.block_number()
+            if exact_v3_approved:
+                finalized_block = active_client.block("finalized")
+                finalized_number = finalized_block.get("number")
+                if not isinstance(finalized_number, str):
+                    raise ValueError("finalized Ethereum block is unavailable")
+                block_number = int(
+                    canonical_rpc_quantity(
+                        finalized_number,
+                        "finalized Ethereum block number",
+                    ),
+                    16,
+                )
+                block_timestamp = block_timestamp_text(finalized_block)
+                finalized_identity = exact_v3_block_identity(
+                    finalized_block,
+                    block_number,
+                )
+                if (
+                    expected_v3_block_identity is not None
+                    and dict(expected_v3_block_identity) != finalized_identity
+                ):
+                    raise ValueError("V3 finalized block authority changed")
+                expected_v3_block_identity = finalized_identity
+            else:
+                block_number = active_client.block_number()
+        elif exact_v3_approved:
+            finalized_head = active_client.block("finalized")
+            finalized_number_raw = finalized_head.get("number")
+            if not isinstance(finalized_number_raw, str):
+                raise ValueError("finalized Ethereum block is unavailable")
+            finalized_number = int(
+                canonical_rpc_quantity(
+                    finalized_number_raw,
+                    "finalized Ethereum block number",
+                ),
+                16,
+            )
+            if block_number > finalized_number:
+                raise ValueError("V3 fixed block is not finalized")
+            if block_number == finalized_number:
+                finalized_identity = exact_v3_block_identity(
+                    finalized_head,
+                    finalized_number,
+                )
+                if (
+                    expected_v3_block_identity is not None
+                    and dict(expected_v3_block_identity) != finalized_identity
+                ):
+                    raise ValueError("V3 finalized block authority changed")
+                expected_v3_block_identity = finalized_identity
         if not block_timestamp:
             block = active_client.block(hex(block_number))
             returned_number = block.get("number")
@@ -2499,18 +3322,26 @@ def collect_dex_pool_observation(
             request_started_at=request_started_at,
             raw_response_sha256="",
             protocol=protocol,
+            expected_v3_block_identity=expected_v3_block_identity,
         )
+        v3_tick_scan_manifest = row.get("_v3_tick_scan_manifest")
         transcript = raw_transcript_bytes(
             pool=pool,
             block_number=block_number,
             endpoint=active_client.endpoint,
             records=active_client.records[record_start:],
+            v3_tick_scan_manifest=(
+                v3_tick_scan_manifest
+                if isinstance(v3_tick_scan_manifest, Mapping)
+                else None
+            ),
         )
         raw_path.write_bytes(transcript)
         raw_hash = hashlib.sha256(transcript).hexdigest()
         row["raw_response_sha256"] = raw_hash
         for execution_row in pool_execution_rows:
             execution_row["raw_response_sha256"] = raw_hash
+        row.pop("_v3_tick_scan_manifest", None)
     except CollectionDeadlineExceeded:
         raise
     except Exception as error:
@@ -2591,6 +3422,17 @@ def collect_dex_depth_with_execution(
     clients: dict[str, RpcClient] = {}
     blocks: dict[str, int] = {}
     block_timestamps: dict[str, str] = {}
+    block_identities: dict[str, dict[str, str]] = {}
+    finalized_chains = {
+        pool["chain"].lower()
+        for pool in pools
+        if protocol_model(
+            pool["dex"],
+            pool["chain"],
+            pool["pool_address"],
+        )[0] == "concentrated_liquidity_v3"
+        and is_uniswap_v3_execution_approved(pool)
+    }
     rows: list[dict[str, str]] = []
     execution_rows: list[dict[str, str]] = []
 
@@ -2625,6 +3467,26 @@ def collect_dex_depth_with_execution(
         client = clients.setdefault(chain, rpc_factory(chain, rpc_url))
         block_number = blocks.get(chain)
         block_timestamp = block_timestamps.get(chain, "")
+        if block_number is None and chain in finalized_chains:
+            finalized_header = client.block("finalized")
+            finalized_number_raw = finalized_header.get("number")
+            if not isinstance(finalized_number_raw, str):
+                raise ValueError("finalized Ethereum block is unavailable")
+            block_number = int(
+                canonical_rpc_quantity(
+                    finalized_number_raw,
+                    "finalized Ethereum block number",
+                ),
+                16,
+            )
+            block_timestamp = block_timestamp_text(finalized_header)
+            block_identity = exact_v3_block_identity(
+                finalized_header,
+                block_number,
+            )
+            blocks[chain] = block_number
+            block_timestamps[chain] = block_timestamp
+            block_identities[chain] = block_identity
         row, pool_execution_rows = collect_dex_pool_observation(
             pool,
             snapshot_id=snapshot_id,
@@ -2633,6 +3495,7 @@ def collect_dex_depth_with_execution(
             client=client,
             fixed_block_number=block_number,
             fixed_block_timestamp=block_timestamp,
+            expected_v3_block_identity=block_identities.get(chain),
         )
         if row["block_number"] and row["block_timestamp"]:
             blocks[chain] = int(row["block_number"])
