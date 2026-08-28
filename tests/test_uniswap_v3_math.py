@@ -36,6 +36,14 @@ class UniswapV3TickMathTest(unittest.TestCase):
             self.assertEqual(get_tick_at_sqrt_ratio(ratio), tick)
             self.assertEqual(get_tick_at_sqrt_ratio(ratio + 1), tick)
 
+    def test_frozen_negative_mainnet_tick_matches_literal_ratio(self):
+        # Hand-derived with 250-digit Decimal precision and ceiling rounding;
+        # this tick is the frozen UNI/WETH mainnet state used by Quoter tests.
+        self.assertEqual(
+            get_sqrt_ratio_at_tick(-63_666),
+            3_284_422_959_523_475_363_597_913_604,
+        )
+
     def test_price_band_limits_are_conservative_integer_boundaries(self):
         self.assertEqual(
             sqrt_price_limit_for_bps(Q96, 100, zero_for_one=True),
@@ -109,6 +117,24 @@ class UniswapV3SwapMathTest(unittest.TestCase):
 
 
 class UniswapV3SimulationTest(unittest.TestCase):
+    def test_zero_liquidity_gap_advances_to_later_initialized_range(self):
+        result = simulate_swap(
+            sqrt_price_x96=Q96,
+            current_tick=0,
+            liquidity=0,
+            fee_pips=3_000,
+            initialized_ticks={60: 1_000_000_000_000_000_000},
+            amount_specified=1_000_000_000_000_000,
+            zero_for_one=False,
+            sqrt_price_limit_x96=get_sqrt_ratio_at_tick(120),
+        )
+
+        self.assertTrue(result.complete)
+        self.assertEqual(result.terminal_reason, "amount_resolved")
+        self.assertEqual(result.initialized_ticks_crossed, 1)
+        self.assertEqual(result.liquidity, 1_000_000_000_000_000_000)
+        self.assertGreater(result.amount_out, 0)
+
     def test_tick_crossing_applies_liquidity_net_by_direction(self):
         up = simulate_swap(
             sqrt_price_x96=Q96, current_tick=0, liquidity=10**18, fee_pips=3000,

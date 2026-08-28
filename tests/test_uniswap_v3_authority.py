@@ -106,6 +106,31 @@ class UniswapV3AuthorityTest(unittest.TestCase):
             observed_identity(unapproved), authority=authority,
         ))
 
+    def test_supplied_market_id_must_match_the_canonical_pool_identity(self):
+        authority = load_uniswap_v3_execution_authority(self.write_authority())
+        pool = pool_inventory_record()
+        pool["market_id"] = "dex:eth:uniswap_v3:{}:UNI".format("0x" + "7" * 40)
+
+        with self.assertRaisesRegex(ValueError, "market_id"):
+            match_uniswap_v3_execution_authority(
+                pool,
+                observed_identity(),
+                authority=authority,
+            )
+
+    def test_unapproved_pool_with_missing_observed_identity_fails_closed(self):
+        authority = load_uniswap_v3_execution_authority(self.write_authority())
+        unapproved = "0x" + "7" * 40
+
+        with self.assertRaisesRegex(ValueError, "chain_id"):
+            match_uniswap_v3_execution_authority(
+                pool_inventory_record(
+                    "dex:eth:uniswap_v3:{}:UNI".format(unapproved)
+                ),
+                {},
+                authority=authority,
+            )
+
     def test_identity_mismatch_and_missing_identity_fail_closed(self):
         authority = load_uniswap_v3_execution_authority(self.write_authority())
         cases = {

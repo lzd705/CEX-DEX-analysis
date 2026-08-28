@@ -1610,13 +1610,66 @@ def match_uniswap_v3_execution_authority(
 ) -> dict[str, Any] | None:
     """Return the authority record or reject an approved identity mismatch."""
     records = dict(authority) if authority is not None else load_uniswap_v3_execution_authority()
-    supplied_market_id = str(pool.get("market_id") or "")
     try:
         derived_market_id = dex_market_id(dict(pool))
     except (KeyError, TypeError, AttributeError) as error:
         raise ValueError("Uniswap V3 authority pool identity is invalid") from error
-    market_id = supplied_market_id if supplied_market_id in records else derived_market_id
-    record = records.get(market_id)
+    supplied_market_id = pool.get("market_id")
+    if supplied_market_id not in (None, ""):
+        supplied_record = records.get(str(supplied_market_id))
+        if supplied_record is not None:
+            for field in ("chain", "dex", "pool_address"):
+                actual = str(pool.get(field) or "")
+                if field == "pool_address":
+                    actual = actual.lower()
+                if actual != supplied_record[field]:
+                    raise ValueError("Uniswap V3 authority mismatch: " + field)
+        if str(supplied_market_id) != derived_market_id:
+            raise ValueError("Uniswap V3 authority mismatch: market_id")
+
+    pool_address = str(pool.get("pool_address") or "").strip().lower()
+    if _EVM_ADDRESS.fullmatch(pool_address) is None:
+        raise ValueError("Uniswap V3 authority pool identity has bad pool_address")
+    if not str(pool.get("chain") or "").strip():
+        raise ValueError("Uniswap V3 authority pool identity is missing chain")
+    if not str(pool.get("dex") or "").strip():
+        raise ValueError("Uniswap V3 authority pool identity is missing dex")
+    if not str(pool.get("token_symbol") or "").strip():
+        raise ValueError("Uniswap V3 authority pool identity is missing token_symbol")
+    if not isinstance(observed_identity, Mapping):
+        raise ValueError("Uniswap V3 authority observed identity is invalid")
+
+    observed_fields = (
+        "chain_id", "pool_address", "factory_address",
+        "factory_get_pool_address", "token0_address", "token0_decimals",
+        "token1_address", "token1_decimals", "fee_pips", "tick_spacing",
+    )
+    for field in observed_fields:
+        if field not in observed_identity:
+            raise ValueError("Uniswap V3 authority evidence is missing " + field)
+    for field in (
+        "pool_address", "factory_address", "factory_get_pool_address",
+        "token0_address", "token1_address",
+    ):
+        value = str(observed_identity[field]).lower()
+        if _EVM_ADDRESS.fullmatch(value) is None:
+            raise ValueError("Uniswap V3 authority evidence has bad " + field)
+    for field, (minimum, maximum) in {
+        "chain_id": (1, 2**63 - 1),
+        "token0_decimals": (0, 255),
+        "token1_decimals": (0, 255),
+        "fee_pips": (1, 999_999),
+        "tick_spacing": (1, V3_MAX_TICK),
+    }.items():
+        value = observed_identity[field]
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError("Uniswap V3 authority evidence has bad " + field)
+    if str(observed_identity["pool_address"]).lower() != pool_address:
+        raise ValueError("Uniswap V3 authority mismatch: pool_address")
+    if str(observed_identity["factory_get_pool_address"]).lower() != pool_address:
+        raise ValueError("Uniswap V3 authority mismatch: factory_get_pool_address")
+
+    record = records.get(derived_market_id)
     if record is None:
         return None
     for field, expected in {
