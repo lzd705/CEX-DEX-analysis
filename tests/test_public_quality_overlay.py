@@ -940,11 +940,13 @@ const mixedMarkup = qualityFactMarkup("daily", {
 console.log(JSON.stringify({ markup, mixedMarkup }));
 """
         completed = subprocess.run(
-            [node, "-e", script],
+            [node, "-"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
             check=True,
+            encoding="utf-8",
+            input=script,
         )
         result = json.loads(completed.stdout)
         markup = result["markup"]
