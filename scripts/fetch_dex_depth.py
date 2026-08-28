@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import ssl
 import time
 import urllib.error
@@ -39,7 +40,7 @@ from decimal import (
     localcontext,
 )
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 try:
     import certifi
@@ -130,6 +131,9 @@ except ModuleNotFoundError:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+V3_EXECUTION_AUTHORITY_PATH = (
+    PROJECT_ROOT / "config/uniswap_v3_execution_markets.json"
+)
 DEFAULT_TVL_CSV = PROJECT_ROOT / "data/local/dex_pool_tvl_latest.csv"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data/processed"
 DEFAULT_PUBLISH_DIR = PROJECT_ROOT / "data/local"
@@ -243,6 +247,10 @@ V3_DEXES = {
     "pancakeswap-v3-bsc",
     "velodrome-finance-slipstream",
 }
+_V3_BLOCK_HASH = re.compile(r"0x[0-9a-f]{64}\Z", flags=re.ASCII)
+_EVM_ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z", flags=re.ASCII)
+V3_MAX_TICK = 887_272
+V3_MAX_BITMAP_WORDS_PER_DIRECTION = 8
 
 # Ethereum ABI selectors.  The signatures are documented in the protocol
 # interfaces cited by docs/dex-depth-data-contract.md.
@@ -1524,6 +1532,119 @@ def dex_market_id(pool: dict[str, str]) -> str:
         f"dex:{chain}:{pool['dex'].strip().lower()}:"
         f"{address}:{pool['token_symbol'].strip().upper()}"
     )
+
+
+def load_uniswap_v3_execution_authority(
+    path: Path = V3_EXECUTION_AUTHORITY_PATH,
+) -> dict[str, dict[str, Any]]:
+    """Load the exact two-pool V3 capability authority, failing closed."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Uniswap V3 execution authority is unavailable") from error
+    if not isinstance(payload, dict) or payload.get("schema") != (
+        "uniswap_v3_execution_markets/v1"
+    ):
+        raise ValueError("Uniswap V3 execution authority has wrong schema")
+    markets = payload.get("markets")
+    if not isinstance(markets, list) or len(markets) != 2:
+        raise ValueError("Uniswap V3 execution authority must contain two markets")
+    required = {
+        "market_id", "chain", "chain_id", "dex", "pool_address",
+        "factory_address", "quoter_v2_address", "token0_address",
+        "token0_decimals", "token1_address", "token1_decimals",
+        "fee_pips", "tick_spacing", "bitmap_word_radius",
+    }
+    result = {}
+    for index, raw_market in enumerate(markets):
+        if not isinstance(raw_market, dict):
+            raise ValueError("authority market {} is not an object".format(index))
+        missing = sorted(required - set(raw_market))
+        if missing:
+            raise ValueError("Uniswap V3 execution authority is missing " + missing[0])
+        if set(raw_market) != required:
+            raise ValueError("Uniswap V3 execution authority has unknown fields")
+        market = dict(raw_market)
+        for field in (
+            "pool_address", "factory_address", "quoter_v2_address",
+            "token0_address", "token1_address",
+        ):
+            value = market[field]
+            if not isinstance(value, str) or _EVM_ADDRESS.fullmatch(value) is None:
+                raise ValueError("Uniswap V3 execution authority has bad " + field)
+        if market["chain"] != "eth":
+            raise ValueError("Uniswap V3 execution authority has wrong chain")
+        if market["dex"] != "uniswap_v3":
+            raise ValueError("Uniswap V3 execution authority has wrong dex")
+        bounds = {
+            "chain_id": (1, 2**63 - 1),
+            "token0_decimals": (0, 255), "token1_decimals": (0, 255),
+            "fee_pips": (1, 999_999), "tick_spacing": (1, V3_MAX_TICK),
+            "bitmap_word_radius": (1, V3_MAX_BITMAP_WORDS_PER_DIRECTION),
+        }
+        for field, (minimum, maximum) in bounds.items():
+            value = market[field]
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError("Uniswap V3 execution authority has bad " + field)
+        market_id = market["market_id"]
+        if not isinstance(market_id, str):
+            raise ValueError("Uniswap V3 execution authority has bad market_id")
+        parts = market_id.split(":")
+        if (
+            len(parts) != 5 or parts[:3] != ["dex", market["chain"], market["dex"]]
+            or parts[3] != market["pool_address"] or not parts[4]
+            or parts[4] != parts[4].upper()
+        ):
+            raise ValueError("Uniswap V3 execution authority market identity mismatch")
+        if market_id in result:
+            raise ValueError("Uniswap V3 execution authority has duplicate market")
+        result[market_id] = market
+    return result
+
+
+def match_uniswap_v3_execution_authority(
+    pool: Mapping[str, Any],
+    observed_identity: Mapping[str, Any],
+    *,
+    authority: Mapping[str, Mapping[str, Any]] = None,
+) -> dict[str, Any] | None:
+    """Return the authority record or reject an approved identity mismatch."""
+    records = dict(authority) if authority is not None else load_uniswap_v3_execution_authority()
+    supplied_market_id = str(pool.get("market_id") or "")
+    try:
+        derived_market_id = dex_market_id(dict(pool))
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError("Uniswap V3 authority pool identity is invalid") from error
+    market_id = supplied_market_id if supplied_market_id in records else derived_market_id
+    record = records.get(market_id)
+    if record is None:
+        return None
+    for field, expected in {
+        "chain": record["chain"], "dex": record["dex"],
+        "pool_address": record["pool_address"],
+    }.items():
+        actual = str(pool.get(field) or "")
+        if field == "pool_address":
+            actual = actual.lower()
+        if actual != expected:
+            raise ValueError("Uniswap V3 authority mismatch: " + field)
+    expected_observed = {
+        "chain_id": record["chain_id"], "pool_address": record["pool_address"],
+        "factory_address": record["factory_address"],
+        "factory_get_pool_address": record["pool_address"],
+        "token0_address": record["token0_address"], "token0_decimals": record["token0_decimals"],
+        "token1_address": record["token1_address"], "token1_decimals": record["token1_decimals"],
+        "fee_pips": record["fee_pips"], "tick_spacing": record["tick_spacing"],
+    }
+    for field, expected in expected_observed.items():
+        if field not in observed_identity:
+            raise ValueError("Uniswap V3 authority evidence is missing " + field)
+        actual = observed_identity[field]
+        if field.endswith("_address"):
+            actual = str(actual).lower()
+        if actual != expected:
+            raise ValueError("Uniswap V3 authority mismatch: " + field)
+    return dict(record)
 
 
 def block_timestamp_text(block: dict[str, Any]) -> str:
