@@ -3148,6 +3148,20 @@ def validate_uniswap_v3_exact_public_receipt(
     return dict(receipt)
 
 
+def read_uniswap_v3_exact_raw_receipt_bytes(
+    depth_raw_root: Path,
+    snapshot_id: str,
+) -> bytes:
+    """Safely read the retained private receipt for one exact snapshot."""
+    directory = _snapshot_evidence_directory(
+        Path(depth_raw_root), snapshot_id, "depth evidence"
+    )
+    return _regular_evidence_bytes(
+        directory / UNISWAP_V3_EXACT_RAW_RECEIPT_FILENAME,
+        "Uniswap V3 exact raw receipt",
+    )
+
+
 def write_uniswap_v3_exact_raw_receipt(
     depth_raw_root: Path,
     receipt: Mapping[str, Any],

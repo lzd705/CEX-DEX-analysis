@@ -192,6 +192,23 @@ off-market pool. The actual pool-state depth remains visible with its lineage.
 | Raw manifest | `data/raw/dex-depth/<snapshot_id>/manifest.json` | Fixed blocks, status counts, bands, and raw-file inventory |
 | Raw exact receipt | `data/raw/dex-depth/<snapshot_id>/uniswap_v3_exact_validation.json` | Private canonical result written after raw validation and before processed/public writes |
 
+The public sidecar is not its own trust anchor. Dashboard health first
+canonicalizes and validates it against the two public CSVs, then safely
+resolves the retained raw receipt from its validated `depth_snapshot_id`.
+Snapshot IDs must remain canonical, the evidence root/snapshot must be real
+directories, and the receipt must be a regular non-symlink file whose bytes
+exactly match the public sidecar. Only then may health report `current` or
+`stale`; it exposes equal `receipt_sha256` and `trusted_receipt_sha256` values,
+never a raw path. An unresolved raw root reports `missing`; an expected raw
+artifact that is absent, nonregular, symlinked, tampered, or byte-mismatched
+reports `invalid`. Release requires `current` and equal valid receipt hashes.
+
+Production normally resolves the raw root as
+`$MARKET_DATA_DIR/raw/dex-depth`. Staging or any split data layout sets
+`MARKET_UNISWAP_V3_EXACT_RAW_ROOT` explicitly. The retained receipt remains
+private and outside the atomic five-file public bundle; there is no sixth
+public file or allow-missing bootstrap mode.
+
 The two-pool canary is intentionally non-publishing:
 
 ```bash

@@ -192,6 +192,7 @@ from scripts.fetch_dex_depth import (
     UNISWAP_V3_EXACT_LATEST_FILENAME,
     V3_EXECUTION_AUTHORITY_PATH,
     load_uniswap_v3_execution_authority,
+    read_uniswap_v3_exact_raw_receipt_bytes,
     uniswap_v3_exact_receipt_bytes,
     validate_uniswap_v3_exact_public_receipt,
 )
@@ -849,6 +850,23 @@ def resolve_uniswap_v3_exact_path() -> Optional[Path]:
             return candidate
     return None
 
+
+def resolve_uniswap_v3_exact_raw_root() -> Optional[Path]:
+    """Resolve the private exact-receipt root without following symlinks."""
+    explicit = os.environ.get("MARKET_UNISWAP_V3_EXACT_RAW_ROOT")
+    if explicit:
+        return Path(explicit).expanduser().absolute()
+    configured_dir = os.environ.get("MARKET_DATA_DIR")
+    if configured_dir:
+        return (
+            Path(configured_dir).expanduser().absolute()
+            / "raw"
+            / "dex-depth"
+        )
+    candidate = PROJECT_ROOT / "data" / "raw" / "dex-depth"
+    return candidate if candidate.exists() else None
+
+
 def _uniswap_v3_exact_health_base(
     authority_market_ids: list[str],
 ) -> dict[str, Any]:
@@ -863,6 +881,7 @@ def _uniswap_v3_exact_health_base(
         "depth_rows_sha256": None,
         "execution_rows_sha256": None,
         "receipt_sha256": None,
+        "trusted_receipt_sha256": None,
         "shared_finalized_block": None,
         "observed_at": None,
         "observation_age_hours": None,
@@ -875,6 +894,7 @@ def uniswap_v3_exact_health(
     depth_path: Optional[Path] = None,
     execution_path: Optional[Path] = None,
     receipt_path: Optional[Path] = None,
+    exact_raw_root: Optional[Path] = None,
     authority_path: Path = V3_EXECUTION_AUTHORITY_PATH,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
@@ -995,6 +1015,23 @@ def uniswap_v3_exact_health(
             execution_rows,
             authority_path=Path(authority_path),
         )
+        resolved_raw_root = (
+            Path(exact_raw_root)
+            if exact_raw_root is not None
+            else resolve_uniswap_v3_exact_raw_root()
+        )
+        if resolved_raw_root is None:
+            result["status"] = "missing"
+            return result
+        raw_receipt_bytes = read_uniswap_v3_exact_raw_receipt_bytes(
+            resolved_raw_root,
+            validated["depth_snapshot_id"],
+        )
+        if raw_receipt_bytes != receipt_bytes:
+            return result
+        result["trusted_receipt_sha256"] = hashlib.sha256(
+            raw_receipt_bytes
+        ).hexdigest()
         required_rows = []
         for row in depth_rows:
             market_id = depth_market_id(row)

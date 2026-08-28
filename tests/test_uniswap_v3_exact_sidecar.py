@@ -15,6 +15,7 @@ from scripts import fetch_dex_depth
 from scripts.check_dashboard_release import (
     ReleaseCheckError,
     validate_release_health,
+    validate_uniswap_v3_exact_release,
 )
 from scripts.execution_cost import EXECUTION_COST_COLUMNS
 from scripts.run_uniswap_v3_canary import run_canary
@@ -334,6 +335,11 @@ class UniswapV3ExactHealthTest(unittest.TestCase):
         self.receipt_path = (
             self.root / fetch_dex_depth.UNISWAP_V3_EXACT_LATEST_FILENAME
         )
+        self.raw_root = self.fixture.depth_raw_root
+        self.raw_receipt_path = (
+            self.fixture.depth_directory
+            / fetch_dex_depth.UNISWAP_V3_EXACT_RAW_RECEIPT_FILENAME
+        )
         write_csv(
             self.depth_path,
             fetch_dex_depth.DEX_DEPTH_COLUMNS,
@@ -345,12 +351,17 @@ class UniswapV3ExactHealthTest(unittest.TestCase):
             self.fixture.execution_rows,
         )
         self.receipt_path.write_bytes(canonical_receipt_bytes(self.receipt))
+        fetch_dex_depth.write_uniswap_v3_exact_raw_receipt(
+            self.raw_root,
+            self.receipt,
+        )
 
     def health(self, now):
         return server.uniswap_v3_exact_health(
             depth_path=self.depth_path,
             execution_path=self.execution_path,
             receipt_path=self.receipt_path,
+            exact_raw_root=self.raw_root,
             authority_path=self.fixture.authority_path,
             now=now,
         )
@@ -367,13 +378,141 @@ class UniswapV3ExactHealthTest(unittest.TestCase):
         self.assertEqual(result["shared_finalized_block"], {"number": 123, "hash": "0x" + "a" * 64})
         self.assertEqual(result["observed_at"], self.observed_at)
         self.assertEqual(result["observation_age_hours"], 1.0)
+        self.assertEqual(
+            result["trusted_receipt_sha256"],
+            result["receipt_sha256"],
+        )
+        self.assertNotIn(str(self.root), json.dumps(result, sort_keys=True))
         for field in (
             "receipt_sha256",
+            "trusted_receipt_sha256",
             "authority_sha256",
             "depth_rows_sha256",
             "execution_rows_sha256",
         ):
             self.assertRegex(result[field], r"^[0-9a-f]{64}$")
+
+    def test_public_only_manifest_or_block_hash_mutation_is_invalid(self):
+        cases = (
+            ("depth_manifest_sha256", "f" * 64),
+            (
+                "shared_finalized_block",
+                {"number": 123, "hash": "0x" + "b" * 64},
+            ),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                forged = {**self.receipt, field: value}
+                self.receipt_path.write_bytes(canonical_receipt_bytes(forged))
+
+                result = self.health(
+                    datetime(2026, 8, 27, 1, tzinfo=timezone.utc)
+                )
+
+                self.assertEqual(result["status"], "invalid")
+                self.assertIsNone(result["trusted_receipt_sha256"])
+                with self.assertRaisesRegex(
+                    ReleaseCheckError,
+                    "Uniswap V3 exact",
+                ):
+                    validate_uniswap_v3_exact_release(result)
+                self.receipt_path.write_bytes(
+                    canonical_receipt_bytes(self.receipt)
+                )
+
+    def test_untrusted_private_receipt_never_reports_current_or_releases(self):
+        original = self.raw_receipt_path.read_bytes()
+        outside = self.root / "outside-receipt.json"
+        outside.write_bytes(original)
+        cases = (
+            ("missing", lambda: self.raw_receipt_path.unlink()),
+            (
+                "symlink",
+                lambda: (
+                    self.raw_receipt_path.unlink(),
+                    self.raw_receipt_path.symlink_to(outside),
+                ),
+            ),
+            (
+                "nonregular",
+                lambda: (
+                    self.raw_receipt_path.unlink(),
+                    self.raw_receipt_path.mkdir(),
+                ),
+            ),
+            (
+                "tampered",
+                lambda: self.raw_receipt_path.write_bytes(b"tampered\n"),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                mutate()
+                try:
+                    result = self.health(
+                        datetime(2026, 8, 27, 1, tzinfo=timezone.utc)
+                    )
+
+                    self.assertNotIn(result["status"], {"current", "stale"})
+                    self.assertIsNone(result["trusted_receipt_sha256"])
+                    with self.assertRaisesRegex(
+                        ReleaseCheckError,
+                        "Uniswap V3 exact",
+                    ):
+                        validate_uniswap_v3_exact_release(result)
+                finally:
+                    if self.raw_receipt_path.is_symlink():
+                        self.raw_receipt_path.unlink()
+                    elif self.raw_receipt_path.is_dir():
+                        self.raw_receipt_path.rmdir()
+                    elif self.raw_receipt_path.exists():
+                        self.raw_receipt_path.unlink()
+                    self.raw_receipt_path.write_bytes(original)
+
+    def test_health_resolves_staging_raw_root_override(self):
+        with patch.dict(
+            "os.environ",
+            {"MARKET_UNISWAP_V3_EXACT_RAW_ROOT": str(self.raw_root)},
+        ):
+            result = server.uniswap_v3_exact_health(
+                depth_path=self.depth_path,
+                execution_path=self.execution_path,
+                receipt_path=self.receipt_path,
+                authority_path=self.fixture.authority_path,
+                now=datetime(2026, 8, 27, 1, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(result["status"], "current")
+        self.assertEqual(
+            result["trusted_receipt_sha256"],
+            result["receipt_sha256"],
+        )
+
+    def test_health_uses_configured_data_directory_raw_root(self):
+        configured_data = self.root / "configured-data"
+        configured_raw_root = configured_data / "raw" / "dex-depth"
+        shutil.copytree(
+            self.fixture.depth_directory,
+            configured_raw_root / self.fixture.depth_snapshot_id,
+        )
+        with patch.dict(
+            "os.environ",
+            {"MARKET_DATA_DIR": str(configured_data)},
+        ):
+            server.os.environ.pop("MARKET_UNISWAP_V3_EXACT_RAW_ROOT", None)
+            result = server.uniswap_v3_exact_health(
+                depth_path=self.depth_path,
+                execution_path=self.execution_path,
+                receipt_path=self.receipt_path,
+                authority_path=self.fixture.authority_path,
+                now=datetime(2026, 8, 27, 1, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(result["status"], "current")
+        self.assertEqual(
+            result["trusted_receipt_sha256"],
+            result["receipt_sha256"],
+        )
 
     def test_stale_health_preserves_exact_facts_but_marks_scope_stale(self):
         result = self.health(datetime(2026, 8, 27, 3, tzinfo=timezone.utc))
@@ -482,6 +621,7 @@ class UniswapV3ExactReleaseTest(unittest.TestCase):
             "depth_rows_sha256": "b" * 64,
             "execution_rows_sha256": "c" * 64,
             "receipt_sha256": "d" * 64,
+            "trusted_receipt_sha256": "d" * 64,
             "shared_finalized_block": {"number": 123, "hash": "0x" + "e" * 64},
             "observed_at": "2026-08-27T00:00:00+00:00",
             "observation_age_hours": 1.0,
@@ -513,6 +653,14 @@ class UniswapV3ExactReleaseTest(unittest.TestCase):
                 "depth_count": {**valid, "depth_observed_count": 1},
                 "execution_count": {**valid, "execution_observed_scenario_count": 19},
                 "receipt_hash": {**valid, "receipt_sha256": "not-a-sha"},
+                "trusted_receipt_hash": {
+                    **valid,
+                    "trusted_receipt_sha256": "not-a-sha",
+                },
+                "trusted_receipt_mismatch": {
+                    **valid,
+                    "trusted_receipt_sha256": "e" * 64,
+                },
                 "block_hash": {**valid, "shared_finalized_block": {"number": 123, "hash": "0x1234"}},
             }
             for name, exact in cases.items():

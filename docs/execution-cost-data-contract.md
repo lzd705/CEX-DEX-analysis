@@ -311,6 +311,13 @@ one-market retry stages and failure-atomically replaces the bounded
 depth/history/execution bundle for ordinary I/O exceptions, while deliberately
 making no crash-atomic multi-file claim; see `collection-operations.md`.
 
+For the two authority-approved V3 markets, release health also binds the
+canonical public exact receipt to the retained private raw receipt created
+before publication. The two byte hashes must be valid and equal; a missing,
+nonregular, symlinked, tampered, or mismatched private receipt cannot release.
+The raw artifact remains outside the five public destinations and its path is
+never projected through the API.
+
 For a canonical one-market retry, the candidate must contain the exact ten
 scenario keys already assigned to that market. The merge preserves every
 non-target scenario fact, rejects mixed source lineage, and publishes the full

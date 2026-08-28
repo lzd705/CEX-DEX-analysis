@@ -174,11 +174,19 @@ CSVs and a validated SQLite database back into `data/local/`.
   exclude gas, router fees, transfer taxes, MEV, account inventory, and
   realized execution.
 - The `/health` response member `uniswap_v3_exact` rereads the public depth,
-  execution, and canonical receipt bytes. It reports `current`, `stale`,
+  execution, and canonical receipt bytes, then requires the retained private
+  raw receipt for that depth snapshot to match the public bytes exactly. It
+  reports `current`, `stale`,
   `invalid`, or `missing` with the two authority IDs, 2/2 depth and 20/20
   execution counts, shared block, observation age, and
-  receipt/row/authority hashes. A non-current exact scope makes overall
-  `data_status` stale without hiding readable spot facts.
+  public/trusted-receipt, row, and authority hashes. A non-current exact scope
+  makes overall `data_status` stale without hiding readable spot facts.
+
+The dashboard resolves that private receipt from
+`$MARKET_DATA_DIR/raw/dex-depth` by default. A staged or separately mounted raw
+evidence tree must set `MARKET_UNISWAP_V3_EXACT_RAW_ROOT` to its `dex-depth`
+root. The raw receipt stays outside the five-file public bundle and no health
+field exposes its filesystem path.
 - `/api/markets/events?token=...&start=...&end=...&lifecycle=...` returns the
   latest revision of matching source-backed events, explicit time bounds and
   precision, lifecycle, evidence status, source-check lineage, and null-safe

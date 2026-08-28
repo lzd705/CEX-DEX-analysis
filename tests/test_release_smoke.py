@@ -3268,6 +3268,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
                 "depth_rows_sha256": "c" * 64,
                 "execution_rows_sha256": "d" * 64,
                 "receipt_sha256": "e" * 64,
+                "trusted_receipt_sha256": "e" * 64,
                 "shared_finalized_block": {
                     "number": 123,
                     "hash": "0x" + "f" * 64,

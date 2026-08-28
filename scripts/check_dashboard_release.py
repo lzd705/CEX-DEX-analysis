@@ -1633,12 +1633,17 @@ def validate_uniswap_v3_exact_release(value: Any) -> None:
         "depth_rows_sha256",
         "execution_rows_sha256",
         "receipt_sha256",
+        "trusted_receipt_sha256",
     ):
         require(
             isinstance(value.get(field), str)
             and re.fullmatch(r"[0-9a-f]{64}", value[field]) is not None,
             "Uniswap V3 exact {} is invalid".format(field),
         )
+    require(
+        value.get("trusted_receipt_sha256") == value.get("receipt_sha256"),
+        "Uniswap V3 exact trusted receipt SHA does not match the public receipt",
+    )
     expected_authority_sha256 = hashlib.sha256(
         V3_EXECUTION_AUTHORITY_PATH.read_bytes()
     ).hexdigest()
