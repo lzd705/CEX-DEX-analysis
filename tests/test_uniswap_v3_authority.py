@@ -131,6 +131,21 @@ class UniswapV3AuthorityTest(unittest.TestCase):
                 authority=authority,
             )
 
+    def test_unapproved_pool_chain_id_must_match_pool_chain(self):
+        authority = load_uniswap_v3_execution_authority(self.write_authority())
+        unapproved = "0x" + "7" * 40
+        identity = observed_identity(unapproved)
+        identity["chain_id"] = 42_161
+
+        with self.assertRaisesRegex(ValueError, "chain_id"):
+            match_uniswap_v3_execution_authority(
+                pool_inventory_record(
+                    "dex:eth:uniswap_v3:{}:UNI".format(unapproved)
+                ),
+                identity,
+                authority=authority,
+            )
+
     def test_identity_mismatch_and_missing_identity_fail_closed(self):
         authority = load_uniswap_v3_execution_authority(self.write_authority())
         cases = {

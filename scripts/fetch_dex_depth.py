@@ -211,6 +211,14 @@ DEFAULT_RPC_URLS = {
     "bsc": "https://bsc-dataseed.bnbchain.org",
     "zksync": "https://mainnet.era.zksync.io",
 }
+V3_CHAIN_ID_BY_NAME = {
+    "eth": 1,
+    "arbitrum": 42_161,
+    "optimism": 10,
+    "base": 8_453,
+    "bsc": 56,
+    "zksync": 324,
+}
 RPC_ENV_KEYS = {
     chain: f"DEX_DEPTH_RPC_{chain.upper()}"
     for chain in DEFAULT_RPC_URLS
@@ -1630,7 +1638,8 @@ def match_uniswap_v3_execution_authority(
     pool_address = str(pool.get("pool_address") or "").strip().lower()
     if _EVM_ADDRESS.fullmatch(pool_address) is None:
         raise ValueError("Uniswap V3 authority pool identity has bad pool_address")
-    if not str(pool.get("chain") or "").strip():
+    pool_chain = str(pool.get("chain") or "").strip().lower()
+    if not pool_chain:
         raise ValueError("Uniswap V3 authority pool identity is missing chain")
     if not str(pool.get("dex") or "").strip():
         raise ValueError("Uniswap V3 authority pool identity is missing dex")
@@ -1664,6 +1673,11 @@ def match_uniswap_v3_execution_authority(
         value = observed_identity[field]
         if type(value) is not int or not minimum <= value <= maximum:
             raise ValueError("Uniswap V3 authority evidence has bad " + field)
+    expected_chain_id = V3_CHAIN_ID_BY_NAME.get(pool_chain)
+    if expected_chain_id is None:
+        raise ValueError("Uniswap V3 authority chain_id has unsupported chain")
+    if observed_identity["chain_id"] != expected_chain_id:
+        raise ValueError("Uniswap V3 authority mismatch: chain_id")
     if str(observed_identity["pool_address"]).lower() != pool_address:
         raise ValueError("Uniswap V3 authority mismatch: pool_address")
     if str(observed_identity["factory_get_pool_address"]).lower() != pool_address:
