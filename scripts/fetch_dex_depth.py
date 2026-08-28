@@ -1144,6 +1144,22 @@ def quoter_v2_single_call(
     )
 
 
+def decode_v3_quoter_result(value: Any) -> tuple[int, int, int, int]:
+    if not isinstance(value, str):
+        raise ValueError("QuoterV2 response must be a string")
+    if not value.startswith("0x"):
+        raise ValueError("QuoterV2 response must be 0x-prefixed")
+    if len(value) != 2 + 4 * 64:
+        raise ValueError("QuoterV2 response must contain four words")
+    payload = value[2:]
+    if re.fullmatch(r"[0-9a-fA-F]{256}", payload, flags=re.ASCII) is None:
+        raise ValueError("QuoterV2 response contains invalid hex")
+    return tuple(
+        int(payload[index:index + 64], 16)
+        for index in range(0, len(payload), 64)
+    )
+
+
 def price_map_from_inventory(row: dict[str, str]) -> dict[str, Decimal]:
     result: dict[str, Decimal] = {}
     for side in ("base", "quote"):
@@ -2476,13 +2492,12 @@ def v3_execution_rows(
                     ],
                     block_tag,
                 )[0]
-                quoter_words = words(quoter_result)
-                if len(quoter_words) != 4:
-                    raise ValueError("QuoterV2 response must contain four words")
-                quoter_amount = decode_uint(quoter_result, 0)
-                quoter_sqrt_after = decode_uint(quoter_result, 1)
-                quoter_ticks_crossed = decode_uint(quoter_result, 2)
-                quoter_gas_estimate = decode_uint(quoter_result, 3)
+                (
+                    quoter_amount,
+                    quoter_sqrt_after,
+                    quoter_ticks_crossed,
+                    quoter_gas_estimate,
+                ) = decode_v3_quoter_result(quoter_result)
                 if quoter_sqrt_after >= 1 << 160:
                     raise ValueError("QuoterV2 sqrtPriceX96After exceeds uint160")
                 if quoter_ticks_crossed >= 1 << 32:
@@ -3118,6 +3133,12 @@ def observed_pool_row(
             raise ValueError("V3 fixed block timestamp does not match cohort")
         if isinstance(row.get("_v3_tick_scan_manifest"), dict):
             row["_v3_tick_scan_manifest"]["block_final"] = exact_block_final
+        final_response_received_at = utc_now_text()
+        row["observed_at"] = final_response_received_at
+        row["response_received_at"] = final_response_received_at
+        for execution_row in execution_rows:
+            execution_row["observed_at"] = final_response_received_at
+            execution_row["response_received_at"] = final_response_received_at
     return row, execution_rows
 
 

@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.execution_cost import (
     EXECUTION_DIRECTIONS,
@@ -255,6 +256,14 @@ class TruncatedQuoterV3Rpc(FakeApprovedUniUsdtV3Rpc):
         return result
 
 
+class UnframedQuoterV3Rpc(FakeApprovedUniUsdtV3Rpc):
+    def _response(self, to, data):
+        result = super()._response(to, data)
+        if to == QUOTER_V2:
+            return result[2:]
+        return result
+
+
 class ReorgAfterQuoterV3Rpc(FakeApprovedUniUsdtV3Rpc):
     def __init__(self):
         super().__init__()
@@ -309,6 +318,31 @@ class MixedFinalizedCohortV3Rpc(OrderedTwoPoolV3Rpc):
             if self.finalized_calls > 1:
                 result["hash"] = "0x" + "e" * 64
         return result
+
+
+class ResponseEventMixin:
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def block(self, block_tag):
+        result = super().block(block_tag)
+        self.events.append(("block", block_tag))
+        return result
+
+    def eth_calls(self, to, data_values, block_tag):
+        result = super().eth_calls(to, data_values, block_tag)
+        if to.lower() == QUOTER_V2:
+            self.events.append(("quoter", block_tag))
+        return result
+
+
+class TimedApprovedV3Rpc(ResponseEventMixin, FakeApprovedUniUsdtV3Rpc):
+    pass
+
+
+class TimedMismatchingV3Rpc(ResponseEventMixin, MismatchingQuoterV3Rpc):
+    pass
 
 
 class UniswapV3CollectionTest(unittest.TestCase):
@@ -629,6 +663,75 @@ class UniswapV3CollectionTest(unittest.TestCase):
         self.assertTrue(
             all("four words" in row["error"] for row in execution)
         )
+
+    def test_unframed_quoter_abi_fails_execution(self):
+        depth, execution = collect_dex_pool_observation(
+            _pool(),
+            snapshot_id="unframed-quoter",
+            raw_path=self.root / "unframed-quoter.json",
+            client=UnframedQuoterV3Rpc(),
+            fixed_block_number=BLOCK_NUMBER,
+        )
+
+        self.assertIn(depth["status"], {"observed", "partial"})
+        self.assertEqual({row["status"] for row in execution}, {"failed"})
+        self.assertTrue(
+            all("0x-prefixed" in row["error"] for row in execution)
+        )
+
+    def test_exact_rows_are_timestamped_after_final_block_response(self):
+        for client_type, expected_execution_status in (
+            (TimedApprovedV3Rpc, {"observed", "partial"}),
+            (TimedMismatchingV3Rpc, {"failed"}),
+        ):
+            with self.subTest(client_type=client_type.__name__):
+                events = []
+                timestamps = iter(
+                    (
+                        "2024-01-01T00:00:01+00:00",
+                        "2024-01-01T00:00:02+00:00",
+                        "2024-01-01T00:00:03+00:00",
+                    )
+                )
+
+                def next_timestamp():
+                    value = next(timestamps)
+                    events.append(("clock", value))
+                    return value
+
+                with patch(
+                    "scripts.fetch_dex_depth.utc_now_text",
+                    side_effect=next_timestamp,
+                ):
+                    depth, execution = collect_dex_pool_observation(
+                        _pool(),
+                        snapshot_id="final-response-time-" + client_type.__name__,
+                        raw_path=self.root / (client_type.__name__ + ".json"),
+                        client=client_type(events),
+                        fixed_block_number=BLOCK_NUMBER,
+                    )
+
+                final_timestamp = "2024-01-01T00:00:03+00:00"
+                self.assertEqual(depth["response_received_at"], final_timestamp)
+                self.assertEqual(depth["observed_at"], final_timestamp)
+                self.assertEqual(
+                    {row["status"] for row in execution},
+                    expected_execution_status,
+                )
+                self.assertTrue(
+                    all(
+                        row["response_received_at"] == final_timestamp
+                        and row["observed_at"] == final_timestamp
+                        for row in execution
+                    )
+                )
+                final_clock_index = events.index(("clock", final_timestamp))
+                last_rpc_index = max(
+                    index
+                    for index, event in enumerate(events)
+                    if event[0] in {"block", "quoter"}
+                )
+                self.assertGreater(final_clock_index, last_rpc_index)
 
     def test_block_identity_is_rechecked_after_quoter_evidence(self):
         client = ReorgAfterQuoterV3Rpc()
