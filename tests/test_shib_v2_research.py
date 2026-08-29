@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
 from unittest import mock
 
 from scripts import shib_v2_research
@@ -33,6 +34,7 @@ from scripts.route_quantity import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = PROJECT_ROOT / "config/shib_v2_research_pools.json"
+BUILD_SCRIPT = PROJECT_ROOT / "scripts/build_shib_v2_research_snapshot.py"
 
 
 def valid_registry_payload():
@@ -2672,6 +2674,242 @@ class ResearchSnapshotTests(unittest.TestCase):
             snapshot["snapshot_sha256"],
             shib_v2_research.snapshot_sha256(snapshot),
         )
+
+
+class ResearchBuildCliTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.external_cwd = self.root / "external"
+        self.external_cwd.mkdir()
+        self.registry_path = self.root / "registry.json"
+        self.evidence_path = self.root / "evidence.json"
+        self.output_path = self.root / "snapshot.json"
+        registry, _, self.trust_anchor = fixture_registry_and_code_results()
+        self.authority_patcher = mock.patch.object(
+            shib_v2_research, "_AUTHORITY_TRUST_ANCHOR", self.trust_anchor
+        )
+        self.authority_patcher.start()
+        self.addCleanup(self.authority_patcher.stop)
+        self.registry = shib_v2_research.load_research_registry(registry)
+        self.evidence = valid_evidence_payload(self.registry)
+        shib_v2_research_io.atomic_write_canonical_json(
+            self.registry_path, self.registry
+        )
+        shib_v2_research_io.atomic_write_canonical_json(
+            self.evidence_path, self.evidence
+        )
+        self.site_directory = self.root / "site"
+        self.site_directory.mkdir()
+        (self.site_directory / "sitecustomize.py").write_text(
+            "import builtins\n"
+            "import sys\n"
+            "_original_import = builtins.__import__\n"
+            "def _patched_import(name, globals=None, locals=None, "
+            "fromlist=(), level=0):\n"
+            "    module = _original_import(name, globals, locals, fromlist, level)\n"
+            "    target = sys.modules.get('scripts.shib_v2_research')\n"
+            "    if target is not None:\n"
+            "        target._AUTHORITY_TRUST_ANCHOR = {!r}\n"
+            "    return module\n"
+            "builtins.__import__ = _patched_import\n".format(
+                self.trust_anchor
+            ),
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _fixture_environment(self):
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(self.site_directory)
+        return environment
+
+    def _run_cli(
+        self,
+        *,
+        registry_path=None,
+        evidence_path=None,
+        application_sha="1" * 40,
+        output_path=None,
+        cwd=None,
+    ):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(BUILD_SCRIPT),
+                "--registry",
+                str(registry_path or self.registry_path),
+                "--evidence",
+                str(evidence_path or self.evidence_path),
+                "--application-sha",
+                application_sha,
+                "--output",
+                str(output_path or self.output_path),
+            ],
+            cwd=str(cwd or self.external_cwd),
+            env=self._fixture_environment(),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+
+    def test_cli_replays_without_network_from_external_working_directory(self):
+        result = self._run_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        snapshot = load_bounded_json(self.output_path, "snapshot")
+        self.assertEqual(
+            self.output_path.read_bytes(),
+            shib_v2_research.canonical_json_bytes(
+                shib_v2_research.validate_research_snapshot(
+                    snapshot, self.evidence, self.registry
+                )
+            ) + b"\n",
+        )
+
+    def test_in_process_build_has_no_socket_or_urlopen_path(self):
+        import importlib
+
+        build_cli = importlib.import_module(
+            "scripts.build_shib_v2_research_snapshot"
+        )
+        arguments = [
+            str(BUILD_SCRIPT),
+            "--registry",
+            str(self.registry_path),
+            "--evidence",
+            str(self.evidence_path),
+            "--application-sha",
+            "1" * 40,
+            "--output",
+            str(self.output_path),
+        ]
+        with mock.patch.object(sys, "argv", arguments), mock.patch(
+            "socket.socket", side_effect=AssertionError("network forbidden")
+        ), mock.patch.object(
+            urllib.request,
+            "urlopen",
+            side_effect=AssertionError("network forbidden"),
+        ):
+            self.assertEqual(build_cli.main(), 0)
+        snapshot = load_bounded_json(self.output_path, "snapshot")
+        self.assertEqual(
+            shib_v2_research.validate_research_snapshot(
+                snapshot, self.evidence, self.registry
+            ),
+            snapshot,
+        )
+
+    def test_missing_evidence_is_not_evaluated_and_never_writes_output(self):
+        missing = self.root / "missing-evidence.json"
+        for original in (None, b"old-output\n"):
+            with self.subTest(original=original):
+                self.output_path.unlink(missing_ok=True)
+                if original is not None:
+                    self.output_path.write_bytes(original)
+                result = self._run_cli(evidence_path=missing)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "evidence_not_evaluated\n")
+                if original is None:
+                    self.assertFalse(self.output_path.exists())
+                else:
+                    self.assertEqual(self.output_path.read_bytes(), original)
+
+    def test_invalid_present_inputs_and_sha_preserve_absent_or_prior_output(self):
+        evidence_symlink = self.root / "evidence-symlink.json"
+        evidence_symlink.symlink_to(self.evidence_path)
+        oversized_evidence = self.root / "evidence-oversized.json"
+        oversized_evidence.write_bytes(
+            b" " * (shib_v2_research_io.MAX_JSON_BYTES + 1)
+        )
+        noncanonical_evidence = self.root / "evidence-noncanonical.json"
+        noncanonical_evidence.write_text('{"schema": "invalid"}\n', encoding="utf-8")
+        cases = (
+            ("symlink", evidence_symlink, "1" * 40),
+            ("oversized", oversized_evidence, "1" * 40),
+            ("noncanonical", noncanonical_evidence, "1" * 40),
+            ("uppercase_sha", self.evidence_path, "A" * 40),
+            ("short_sha", self.evidence_path, "1" * 39),
+        )
+        for label, evidence_path, application_sha in cases:
+            for original in (None, b"old-output\n"):
+                with self.subTest(label=label, original=original):
+                    self.output_path.unlink(missing_ok=True)
+                    if original is not None:
+                        self.output_path.write_bytes(original)
+                    result = self._run_cli(
+                        evidence_path=evidence_path,
+                        application_sha=application_sha,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(result.stderr, "evidence_failed\n")
+                    if original is None:
+                        self.assertFalse(self.output_path.exists())
+                    else:
+                        self.assertEqual(self.output_path.read_bytes(), original)
+
+    def test_invalid_registry_preserves_absent_or_prior_output(self):
+        invalid_registry = self.root / "registry-invalid.json"
+        invalid_registry.write_text('{"schema": "invalid"}\n', encoding="utf-8")
+        for original in (None, b"old-output\n"):
+            with self.subTest(original=original):
+                self.output_path.unlink(missing_ok=True)
+                if original is not None:
+                    self.output_path.write_bytes(original)
+                result = self._run_cli(registry_path=invalid_registry)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "registry_invalid\n")
+                if original is None:
+                    self.assertFalse(self.output_path.exists())
+                else:
+                    self.assertEqual(self.output_path.read_bytes(), original)
+
+    def test_help_works_from_repository_and_external_working_directories(self):
+        for cwd in (PROJECT_ROOT, self.external_cwd):
+            with self.subTest(cwd=cwd):
+                result = subprocess.run(
+                    [sys.executable, str(BUILD_SCRIPT), "--help"],
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--registry REGISTRY", result.stdout)
+                self.assertIn("--evidence EVIDENCE", result.stdout)
+                self.assertIn("--application-sha APPLICATION_SHA", result.stdout)
+                self.assertIn("--output OUTPUT", result.stdout)
+
+    def test_public_artifacts_exclude_private_inputs_and_forbidden_imports(self):
+        result = self._run_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered = self.output_path.read_text(encoding="utf-8")
+        slash = chr(47)
+        for forbidden in (
+            "https://",
+            slash + "Users" + slash,
+            slash + "private" + slash,
+            "rpc_url",
+            "cookie",
+            "authorization",
+        ):
+            self.assertNotIn(forbidden, rendered.lower())
+        for source_path in (
+            PROJECT_ROOT / "scripts/shib_v2_research.py",
+            BUILD_SCRIPT,
+        ):
+            source = source_path.read_text(encoding="utf-8")
+            for forbidden in (
+                "fetch_cex", "usdt", "uniswap_v3", "connector", "dashboard",
+            ):
+                self.assertNotIn(forbidden, source.lower())
 
 
 class SafeJsonBoundaryTests(unittest.TestCase):
