@@ -227,6 +227,199 @@ def _call_group_sha256(calls):
     ).hexdigest()
 
 
+_REVIEWED_SELECTORS = {
+    "getPair(address,address)": "e6a43905",
+    "factory()": "c45a0155",
+    "WETH()": "ad5c4648",
+    "token0()": "0dfe1681",
+    "token1()": "d21220a7",
+    "getReserves()": "0902f1ac",
+    "decimals()": "313ce567",
+    "balanceOf(address)": "70a08231",
+    "totalFee()": "1df4ccfc",
+    "alpha()": "db1d0fd5",
+    "beta()": "9faa3c91",
+    "description()": "7284e416",
+    "latestRoundData()": "feaf968c",
+}
+
+
+def _test_canonical_json_bytes(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _test_abi_call(signature, arguments=()):
+    encoded = bytearray.fromhex(_REVIEWED_SELECTORS[signature])
+    for address in arguments:
+        encoded.extend(_abi_address(address))
+    return "0x" + bytes(encoded).hex()
+
+
+def _test_inventory_call(method, target, calldata):
+    identity = {
+        "method": method,
+        "target": target,
+        "calldata_sha256": hashlib.sha256(
+            bytes.fromhex(calldata[2:])
+        ).hexdigest(),
+        "block_selector": "eip1898_block_hash_require_canonical",
+    }
+    record = dict(identity)
+    record["logical_call_id"] = "call:" + hashlib.sha256(
+        b"shib-v2-logical-call/v1\n" + _test_canonical_json_bytes(identity)
+    ).hexdigest()
+    record["calldata"] = calldata
+    return record
+
+
+def _expected_logical_call_inventory(registry):
+    calls = []
+    code_targets = []
+    for pool in registry["pools"]:
+        code_targets.extend(
+            pool[role]["address"] for role in ("factory", "router", "pair")
+        )
+    code_targets.extend(
+        registry["tokens"][symbol]["address"] for symbol in ("SHIB", "WETH")
+    )
+    code_targets.append(registry["usd_reference"]["proxy_address"])
+    for target in code_targets:
+        calls.append(_test_inventory_call("eth_getCode", target, "0x"))
+    shib = registry["tokens"]["SHIB"]["address"]
+    weth = registry["tokens"]["WETH"]["address"]
+    for pool in registry["pools"]:
+        factory = pool["factory"]["address"]
+        router = pool["router"]["address"]
+        pair = pool["pair"]["address"]
+        calls.extend((
+            _test_inventory_call(
+                "factory.getPair",
+                factory,
+                _test_abi_call("getPair(address,address)", (shib, weth)),
+            ),
+            _test_inventory_call("router.factory", router, _test_abi_call("factory()")),
+            _test_inventory_call("router.weth", router, _test_abi_call("WETH()")),
+            _test_inventory_call("pair.factory", pair, _test_abi_call("factory()")),
+            _test_inventory_call("pair.token0", pair, _test_abi_call("token0()")),
+            _test_inventory_call("pair.token1", pair, _test_abi_call("token1()")),
+            _test_inventory_call(
+                "pair.getReserves", pair, _test_abi_call("getReserves()")
+            ),
+            _test_inventory_call(
+                "erc20.balanceOf", shib, _test_abi_call("balanceOf(address)", (pair,))
+            ),
+            _test_inventory_call(
+                "erc20.balanceOf", weth, _test_abi_call("balanceOf(address)", (pair,))
+            ),
+        ))
+    for token in (shib, weth):
+        calls.append(_test_inventory_call(
+            "erc20.decimals", token, _test_abi_call("decimals()")
+        ))
+    shiba_pair = registry["pools"][1]["pair"]["address"]
+    calls.extend((
+        _test_inventory_call("fee.totalFee", shiba_pair, _test_abi_call("totalFee()")),
+        _test_inventory_call("fee.alpha", shiba_pair, _test_abi_call("alpha()")),
+        _test_inventory_call("fee.beta", shiba_pair, _test_abi_call("beta()")),
+    ))
+    feed = registry["usd_reference"]["proxy_address"]
+    calls.extend((
+        _test_inventory_call("feed.decimals", feed, _test_abi_call("decimals()")),
+        _test_inventory_call(
+            "feed.description", feed, _test_abi_call("description()")
+        ),
+        _test_inventory_call(
+            "feed.latestRoundData", feed, _test_abi_call("latestRoundData()")
+        ),
+    ))
+    return sorted(calls, key=lambda call: call["logical_call_id"])
+
+
+def _test_count_nulls(value):
+    if value is None:
+        return 1
+    if isinstance(value, dict):
+        return sum(_test_count_nulls(child) for child in value.values())
+    if isinstance(value, list):
+        return sum(_test_count_nulls(child) for child in value)
+    return 0
+
+
+def _test_count_numeric_zeroes(value):
+    if type(value) is int:
+        return int(value == 0)
+    if isinstance(value, dict):
+        return sum(_test_count_numeric_zeroes(child) for child in value.values())
+    if isinstance(value, list):
+        return sum(_test_count_numeric_zeroes(child) for child in value)
+    return 0
+
+
+def _derive_test_quality(evidence, expected_logical_call_count):
+    logical_calls = evidence["logical_calls"]
+    observations = evidence["provider_observations"]
+    logical_ids = [call["logical_call_id"] for call in logical_calls]
+    provider_keys = [
+        (observation["provider_label"], observation["logical_call_id"])
+        for observation in observations
+    ]
+    calls_by_id = {call["logical_call_id"]: call for call in logical_calls}
+    agreement_count = 0
+    disagreement_count = 0
+    for logical_call_id in set(logical_ids):
+        hashes = [
+            observation["result_sha256"]
+            for observation in observations
+            if observation["logical_call_id"] == logical_call_id
+            and observation["status"] == "observed"
+        ]
+        expected_hash = calls_by_id[logical_call_id]["result_sha256"]
+        if len(hashes) == 2 and len(set(hashes)) == 1 and hashes[0] == expected_hash:
+            agreement_count += 1
+        elif hashes:
+            disagreement_count += 1
+    required = {
+        key: value for key, value in evidence.items()
+        if key not in {"collection_quality", "evidence_identity"}
+    }
+    observed_values = {
+        key: evidence[key] for key in ("block", "tokens", "pools", "usd_reference")
+    }
+    return {
+        "state": "evaluated",
+        "expected_logical_call_count": expected_logical_call_count,
+        "observed_logical_call_count": len(logical_calls),
+        "usable_logical_call_count": sum(
+            call["result_hex"] != "0x" for call in logical_calls
+        ),
+        "expected_provider_observation_count": expected_logical_call_count * 2,
+        "observed_provider_observation_count": len(observations),
+        "usable_provider_observation_count": sum(
+            observation["status"] == "observed" for observation in observations
+        ),
+        "duplicate_logical_call_key_count": len(logical_ids) - len(set(logical_ids)),
+        "duplicate_provider_observation_key_count": (
+            len(provider_keys) - len(set(provider_keys))
+        ),
+        "required_field_null_count": _test_count_nulls(required),
+        "measured_zero_count": _test_count_numeric_zeroes(observed_values),
+        "missing_null_count": 0,
+        "provider_agreement_count": agreement_count,
+        "provider_disagreement_count": disagreement_count,
+        "status_counts": {
+            "observed": sum(
+                observation["status"] == "observed" for observation in observations
+            )
+        },
+    }
+
+
 def _fixture_code_results(registry):
     authorities = [
         registry["pools"][0]["factory"],
@@ -306,7 +499,7 @@ def _fixture_call_result(call, registry):
 
 
 def valid_evidence_payload(registry):
-    inventory = shib_v2_research.build_logical_call_inventory(registry)
+    inventory = _expected_logical_call_inventory(registry)
     logical_calls = []
     for inventory_call in inventory:
         result_hex = _fixture_call_result(inventory_call, registry)
@@ -470,36 +663,11 @@ def valid_evidence_payload(registry):
         "freshness_lag_seconds": 10,
         "call_results_sha256": _call_group_sha256(reference_calls),
     }
-    quality = {
-        "state": "evaluated",
-        "expected_logical_call_count": len(inventory),
-        "observed_logical_call_count": len(logical_calls),
-        "usable_logical_call_count": sum(
-            call["result_hex"] != "0x" for call in logical_calls
-        ),
-        "expected_provider_observation_count": len(inventory) * 2,
-        "observed_provider_observation_count": len(provider_observations),
-        "usable_provider_observation_count": sum(
-            observation["status"] == "observed"
-            for observation in provider_observations
-        ),
-        "duplicate_logical_call_key_count": len(logical_calls) - len({
-            call["logical_call_id"] for call in logical_calls
-        }),
-        "duplicate_provider_observation_key_count": len(provider_observations) - len({
-            (observation["provider_label"], observation["logical_call_id"])
-            for observation in provider_observations
-        }),
-        "required_field_null_count": 0,
-        "measured_zero_count": 1,
-        "missing_null_count": 0,
-        "provider_agreement_count": len(logical_calls),
-        "provider_disagreement_count": 0,
-        "status_counts": {"observed": len(provider_observations)},
-    }
     evidence = {
         "schema": "shib_v2_research_evidence/v1",
-        "registry_sha256": shib_v2_research.registry_sha256(registry),
+        "registry_sha256": hashlib.sha256(
+            _test_canonical_json_bytes(registry)
+        ).hexdigest(),
         "chain": {"name": "eth", "chain_id": 1},
         "block": block,
         "logical_calls": logical_calls,
@@ -507,71 +675,112 @@ def valid_evidence_payload(registry):
         "tokens": tokens,
         "usd_reference": usd_reference,
         "pools": pools,
-        "collection_quality": quality,
     }
-    evidence["evidence_identity"] = hashlib.sha256(
-        b"shib-v2-research-evidence/v1\n"
-        + json.dumps(
-            evidence,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    evidence["collection_quality"] = _derive_test_quality(evidence, len(inventory))
+    evidence["evidence_identity"] = _test_evidence_identity(evidence)
     return evidence
 
 
 def remove_logical_call(payload):
-    payload["logical_calls"].pop()
-    return payload
+    removed = next(
+        call for call in payload["logical_calls"] if call["method"] == "fee.beta"
+    )
+    payload["logical_calls"].remove(removed)
+    payload["provider_observations"] = [
+        observation for observation in payload["provider_observations"]
+        if observation["logical_call_id"] != removed["logical_call_id"]
+    ]
+    return _reseal_evidence(payload)
 
 
 def add_unknown_call(payload):
-    call = copy.deepcopy(payload["logical_calls"][-1])
-    call["logical_call_id"] = "call:" + "f" * 64
+    call = copy.deepcopy(next(
+        item for item in payload["logical_calls"]
+        if item["method"] == "erc20.decimals"
+    ))
+    call["calldata"] += "00"
+    _reseal_test_call_identity(call)
     payload["logical_calls"].append(call)
-    return payload
+    payload["provider_observations"].extend(
+        {
+            "provider_label": label,
+            "logical_call_id": call["logical_call_id"],
+            "block_hash": payload["block"]["hash"],
+            "result_sha256": call["result_sha256"],
+            "status": "observed",
+        }
+        for label in ("provider_a", "provider_b")
+    )
+    _sort_test_ledger(payload)
+    return _reseal_evidence(payload)
 
 
 def duplicate_logical_key(payload):
-    payload["logical_calls"].append(copy.deepcopy(payload["logical_calls"][-1]))
-    return payload
+    duplicate = copy.deepcopy(payload["logical_calls"][-1])
+    payload["logical_calls"].append(duplicate)
+    duplicate_observations = [
+        copy.deepcopy(observation)
+        for observation in payload["provider_observations"]
+        if observation["logical_call_id"] == duplicate["logical_call_id"]
+    ]
+    payload["provider_observations"].extend(duplicate_observations)
+    _sort_test_ledger(payload)
+    return _reseal_evidence(payload)
 
 
 def remove_provider_observation(payload):
     payload["provider_observations"].pop()
-    return payload
+    return _reseal_evidence(payload)
 
 
 def disagree_provider_result(payload):
     payload["provider_observations"][0]["result_sha256"] = "f" * 64
-    return payload
+    return _reseal_evidence(payload)
 
 
 def change_block_hash(payload):
-    payload["block"]["hash"] = "0x" + "44" * 32
-    return payload
+    payload["provider_observations"][0]["block_hash"] = "0x" + "44" * 32
+    return _reseal_evidence(payload, rebind_groups=False, rebind_quality=False)
 
 
 def change_factory_pair(payload):
-    payload["pools"][0]["factory_get_pair_result"] = "0x" + "44" * 20
-    return payload
+    wrong = "0x" + "44" * 20
+    pool = payload["pools"][0]
+    pool["factory_get_pair_result"] = wrong
+    _replace_test_call_result(
+        payload, "factory.getPair", pool["factory_address"], _result_hex(_abi_address(wrong))
+    )
+    return _reseal_evidence(payload)
 
 
 def change_pair_factory(payload):
-    payload["pools"][0]["pair_factory_result"] = "0x" + "44" * 20
-    return payload
+    wrong = "0x" + "44" * 20
+    pool = payload["pools"][0]
+    pool["pair_factory_result"] = wrong
+    _replace_test_call_result(
+        payload, "pair.factory", pool["pair_address"], _result_hex(_abi_address(wrong))
+    )
+    return _reseal_evidence(payload)
 
 
 def change_router_factory(payload):
-    payload["pools"][0]["router_factory_result"] = "0x" + "44" * 20
-    return payload
+    wrong = "0x" + "44" * 20
+    pool = payload["pools"][0]
+    pool["router_factory_result"] = wrong
+    _replace_test_call_result(
+        payload, "router.factory", pool["router_address"], _result_hex(_abi_address(wrong))
+    )
+    return _reseal_evidence(payload)
 
 
 def change_router_weth(payload):
-    payload["pools"][0]["router_weth_result"] = "0x" + "44" * 20
-    return payload
+    wrong = "0x" + "44" * 20
+    pool = payload["pools"][0]
+    pool["router_weth_result"] = wrong
+    _replace_test_call_result(
+        payload, "router.weth", pool["router_address"], _result_hex(_abi_address(wrong))
+    )
+    return _reseal_evidence(payload)
 
 
 def change_token_order(payload):
@@ -579,41 +788,254 @@ def change_token_order(payload):
     pool["token0_address"], pool["token1_address"] = (
         pool["token1_address"], pool["token0_address"]
     )
-    return payload
+    _replace_test_call_result(
+        payload,
+        "pair.token0",
+        pool["pair_address"],
+        _result_hex(_abi_address(pool["token0_address"])),
+    )
+    _replace_test_call_result(
+        payload,
+        "pair.token1",
+        pool["pair_address"],
+        _result_hex(_abi_address(pool["token1_address"])),
+    )
+    return _reseal_evidence(payload)
 
 
 def change_runtime_code_hash(payload):
-    payload["tokens"][0]["runtime_code_sha256"] = "f" * 64
-    return payload
+    token = payload["tokens"][0]
+    call = _find_test_call(payload, "eth_getCode", token["address"])
+    code = bytes.fromhex(call["result_hex"][2:]) + b"\x0a"
+    token["runtime_code_size_bytes"] = len(code)
+    token["runtime_code_sha256"] = hashlib.sha256(code).hexdigest()
+    _replace_test_call_result(
+        payload, "eth_getCode", token["address"], _result_hex(code)
+    )
+    return _reseal_evidence(payload)
 
 
 def change_balance(payload):
-    payload["pools"][0]["token0_balance_raw"] += 1
-    return payload
+    pool = payload["pools"][0]
+    pool["token0_balance_raw"] += 1
+    _replace_test_call_result(
+        payload,
+        "erc20.balanceOf",
+        pool["token0_address"],
+        _result_hex(_abi_word(pool["token0_balance_raw"])),
+        calldata_suffix=pool["pair_address"][2:],
+    )
+    return _reseal_evidence(payload)
 
 
 def change_shibaswap_fee(payload):
-    payload["pools"][1]["fee_parameters"]["total_fee"] += 1
-    return payload
+    pool = payload["pools"][1]
+    pool["fee_parameters"]["total_fee"] += 1
+    _replace_test_call_result(
+        payload,
+        "fee.totalFee",
+        pool["pair_address"],
+        _result_hex(_abi_word(pool["fee_parameters"]["total_fee"])),
+    )
+    return _reseal_evidence(payload)
 
 
 def stale_chainlink_round(payload):
-    payload["usd_reference"]["updated_at"] = payload["block"]["timestamp"] - 3601
-    return payload
+    reference = payload["usd_reference"]
+    reference["started_at"] = payload["block"]["timestamp"] - 3601
+    reference["updated_at"] = payload["block"]["timestamp"] - 3601
+    reference["freshness_lag_seconds"] = 3601
+    _replace_test_chainlink_round(payload)
+    return _reseal_evidence(payload)
 
 
 def future_chainlink_round(payload):
-    payload["usd_reference"]["updated_at"] = payload["block"]["timestamp"] + 1
-    return payload
+    reference = payload["usd_reference"]
+    reference["started_at"] = payload["block"]["timestamp"] + 1
+    reference["updated_at"] = payload["block"]["timestamp"] + 1
+    reference["freshness_lag_seconds"] = 0
+    _replace_test_chainlink_round(payload)
+    return _reseal_evidence(payload)
 
 
 def forge_quality_summary(payload):
     payload["collection_quality"]["usable_logical_call_count"] -= 1
+    payload["evidence_identity"] = _test_evidence_identity(payload)
     return payload
 
 
 def forge_evidence_identity(payload):
     payload["evidence_identity"] = "f" * 64
+    return payload
+
+
+def _test_evidence_identity(payload):
+    body = dict(payload)
+    body.pop("evidence_identity", None)
+    return hashlib.sha256(
+        b"shib-v2-research-evidence/v1\n"
+        + json.dumps(
+            body,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _find_test_call(payload, method, target, calldata_suffix=None):
+    matches = [
+        call for call in payload["logical_calls"]
+        if call["method"] == method
+        and call["target"] == target
+        and (calldata_suffix is None or call["calldata"].endswith(calldata_suffix))
+    ]
+    if len(matches) != 1:
+        raise AssertionError("test call lookup is ambiguous: {} {}".format(method, target))
+    return matches[0]
+
+
+def _reseal_test_call_identity(call):
+    call["calldata_sha256"] = hashlib.sha256(
+        bytes.fromhex(call["calldata"][2:])
+    ).hexdigest()
+    identity = {
+        "method": call["method"],
+        "target": call["target"],
+        "calldata_sha256": call["calldata_sha256"],
+        "block_selector": "eip1898_block_hash_require_canonical",
+    }
+    call["logical_call_id"] = "call:" + hashlib.sha256(
+        b"shib-v2-logical-call/v1\n" + _test_canonical_json_bytes(identity)
+    ).hexdigest()
+
+
+def _replace_test_call_result(
+    payload, method, target, result_hex, calldata_suffix=None
+):
+    call = _find_test_call(payload, method, target, calldata_suffix)
+    call["result_hex"] = result_hex
+    call["result_sha256"] = hashlib.sha256(
+        bytes.fromhex(result_hex[2:])
+    ).hexdigest()
+    for observation in payload["provider_observations"]:
+        if observation["logical_call_id"] == call["logical_call_id"]:
+            observation["result_sha256"] = call["result_sha256"]
+
+
+def _replace_test_chainlink_round(payload):
+    reference = payload["usd_reference"]
+    _replace_test_call_result(
+        payload,
+        "feed.latestRoundData",
+        reference["proxy_address"],
+        _result_hex(
+            _abi_word(reference["round_id"])
+            + _abi_word(reference["answer"])
+            + _abi_word(reference["started_at"])
+            + _abi_word(reference["updated_at"])
+            + _abi_word(reference["answered_in_round"])
+        ),
+    )
+
+
+def _sort_test_ledger(payload):
+    payload["logical_calls"].sort(key=lambda call: call["logical_call_id"])
+    label_order = {"provider_a": 0, "provider_b": 1}
+    payload["provider_observations"].sort(
+        key=lambda observation: (
+            observation["logical_call_id"],
+            label_order[observation["provider_label"]],
+        )
+    )
+
+
+def _reseal_test_group_hashes(payload):
+    calls = payload["logical_calls"]
+    for token in payload["tokens"]:
+        token_calls = [
+            call for call in calls
+            if call["target"] == token["address"]
+            and call["method"] in {"eth_getCode", "erc20.decimals"}
+        ]
+        token["call_results_sha256"] = _call_group_sha256(token_calls)
+    for pool in payload["pools"]:
+        pair = pool["pair_address"]
+        pool_calls = [
+            call for call in calls
+            if call["target"] in {
+                pool["factory_address"], pool["router_address"], pair,
+            }
+            or call["method"] == "erc20.decimals"
+            or (
+                call["method"] == "erc20.balanceOf"
+                and call["calldata"].endswith(pair[2:])
+            )
+        ]
+        pool["call_results_sha256"] = _call_group_sha256(pool_calls)
+        if pool["dex"] == "uniswap_v2":
+            fee_calls = [
+                call for call in calls
+                if call["method"] == "eth_getCode" and call["target"] == pair
+            ]
+        else:
+            fee_calls = [
+                call for call in calls
+                if call["target"] == pair and call["method"] in {
+                    "fee.totalFee", "fee.alpha", "fee.beta",
+                }
+            ]
+        pool["fee_evidence_sha256"] = _call_group_sha256(fee_calls)
+    reference = payload["usd_reference"]
+    reference_calls = [
+        call for call in calls
+        if call["target"] == reference["proxy_address"]
+        and call["method"] in {
+            "eth_getCode", "feed.decimals", "feed.description",
+            "feed.latestRoundData",
+        }
+    ]
+    reference["call_results_sha256"] = _call_group_sha256(reference_calls)
+
+
+def _reseal_evidence(
+    payload, rebind_groups=True, rebind_quality=True, expected_call_count=35
+):
+    if rebind_groups:
+        _reseal_test_group_hashes(payload)
+    if rebind_quality:
+        payload["collection_quality"] = _derive_test_quality(
+            payload, expected_call_count
+        )
+    payload["evidence_identity"] = _test_evidence_identity(payload)
+    return payload
+
+
+def _reseal_block(payload, block_hash):
+    payload["block"]["hash"] = block_hash
+    header = {
+        field: payload["block"][field]
+        for field in (
+            "number", "hash", "parent_hash", "timestamp", "state_root",
+            "base_fee_per_gas",
+        )
+    }
+    header_sha256 = hashlib.sha256(
+        json.dumps(
+            header,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    payload["block"]["canonical_header_sha256"] = header_sha256
+    for observation in payload["block"]["provider_header_observations"]:
+        observation["canonical_header_sha256"] = header_sha256
+    for observation in payload["provider_observations"]:
+        observation["block_hash"] = block_hash
+    payload["evidence_identity"] = _test_evidence_identity(payload)
     return payload
 
 
@@ -692,6 +1114,7 @@ class ResearchEvidenceTests(unittest.TestCase):
             calls = shib_v2_research.build_logical_call_inventory(self.registry)
         except AttributeError as error:
             self.fail("closed inventory is missing: {}".format(error))
+        self.assertEqual(calls, _expected_logical_call_inventory(self.registry))
         self.assertEqual(len(calls), 35)
         self.assertEqual(len(calls), len({call["logical_call_id"] for call in calls}))
         self.assertEqual(
@@ -761,7 +1184,76 @@ class ResearchEvidenceTests(unittest.TestCase):
         self.assertEqual(quality["usable_provider_observation_count"], 70)
         self.assertEqual(quality["provider_disagreement_count"], 0)
 
+    def test_fully_resealed_zero_canonical_block_hash_is_rejected(self):
+        payload = _reseal_block(
+            valid_evidence_payload(self.registry), "0x" + "00" * 32
+        )
+        with self.assertRaisesRegex(
+            shib_v2_research.ResearchContractError,
+            "^canonical block hash must be nonzero$",
+        ):
+            shib_v2_research.validate_research_evidence(payload, self.registry)
+
+    def test_valid_fixture_is_independent_of_production_inventory_builder(self):
+        with mock.patch.object(
+            shib_v2_research,
+            "build_logical_call_inventory",
+            side_effect=AssertionError("fixture called production inventory"),
+        ):
+            try:
+                payload = valid_evidence_payload(self.registry)
+            except AssertionError as error:
+                self.fail(str(error))
+        self.assertEqual(len(payload["logical_calls"]), 35)
+
+    def test_independent_oracle_detects_broken_production_inventory_identity(self):
+        payload = valid_evidence_payload(self.registry)
+        broken = _expected_logical_call_inventory(self.registry)
+        broken[0] = dict(broken[0], logical_call_id="call:" + "f" * 64)
+        with mock.patch.object(
+            shib_v2_research,
+            "build_logical_call_inventory",
+            return_value=broken,
+        ):
+            with self.assertRaisesRegex(
+                shib_v2_research.ResearchContractError,
+                "^logical call set is not exact$",
+            ):
+                shib_v2_research.validate_research_evidence(payload, self.registry)
+
     def test_evidence_fails_closed_on_each_completeness_and_authority_break(self):
+        mutations = (
+            (remove_logical_call, "logical call set is not exact"),
+            (add_unknown_call, "logical call set is not exact"),
+            (duplicate_logical_key, "logical call set is not exact"),
+            (remove_provider_observation, "provider observation set is not exact"),
+            (disagree_provider_result, "provider results do not agree"),
+            (change_block_hash, "provider observation block binding is invalid"),
+            (change_factory_pair, "pool identity round trip is invalid"),
+            (change_pair_factory, "pool identity round trip is invalid"),
+            (change_router_factory, "pool identity round trip is invalid"),
+            (change_router_weth, "pool identity round trip is invalid"),
+            (change_token_order, "pool identity round trip is invalid"),
+            (change_runtime_code_hash, "runtime code authority is invalid"),
+            (change_balance, "pool balances do not equal reserves"),
+            (change_shibaswap_fee, "ShibaSwap fee authority is invalid"),
+            (stale_chainlink_round, "USD reference authority is invalid"),
+            (future_chainlink_round, "USD reference authority is invalid"),
+            (forge_quality_summary, "collection quality does not recompute"),
+            (forge_evidence_identity, "evidence identity does not recompute"),
+        )
+        for mutation, message in mutations:
+            with self.subTest(mutation=mutation.__name__):
+                payload = mutation(valid_evidence_payload(self.registry))
+                with self.assertRaisesRegex(
+                    shib_v2_research.ResearchContractError,
+                    "^{}$".format(message),
+                ):
+                    shib_v2_research.validate_research_evidence(
+                        payload, self.registry
+                    )
+
+    def test_mutations_reseal_unrelated_identity_and_quality_dependencies(self):
         mutations = (
             remove_logical_call, add_unknown_call, duplicate_logical_key,
             remove_provider_observation, disagree_provider_result,
@@ -774,9 +1266,23 @@ class ResearchEvidenceTests(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutation.__name__):
                 payload = mutation(valid_evidence_payload(self.registry))
-                with self.assertRaises(shib_v2_research.ResearchContractError):
-                    shib_v2_research.validate_research_evidence(
-                        payload, self.registry
+                recomputed_identity = _test_evidence_identity(payload)
+                if mutation is forge_evidence_identity:
+                    self.assertNotEqual(
+                        payload["evidence_identity"], recomputed_identity
+                    )
+                else:
+                    self.assertEqual(
+                        payload["evidence_identity"], recomputed_identity
+                    )
+                recomputed_quality = _derive_test_quality(payload, 35)
+                if mutation is forge_quality_summary:
+                    self.assertNotEqual(
+                        payload["collection_quality"], recomputed_quality
+                    )
+                else:
+                    self.assertEqual(
+                        payload["collection_quality"], recomputed_quality
                     )
 
     def test_measured_zero_is_preserved_but_missing_base_fee_fails(self):
@@ -788,7 +1294,11 @@ class ResearchEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["collection_quality"]["measured_zero_count"], 1)
         missing = valid_evidence_payload(self.registry)
         del missing["block"]["base_fee_per_gas"]
-        with self.assertRaises(shib_v2_research.ResearchContractError):
+        missing["evidence_identity"] = _test_evidence_identity(missing)
+        with self.assertRaisesRegex(
+            shib_v2_research.ResearchContractError,
+            "^evidence block schema is invalid$",
+        ):
             shib_v2_research.validate_research_evidence(missing, self.registry)
 
     def test_abi_codec_rejects_noncanonical_and_oversized_results(self):

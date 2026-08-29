@@ -685,6 +685,8 @@ def _validate_evidence_shape(payload: object) -> dict:
     block = _exact_fields(evidence["block"], _BLOCK_FIELDS, "evidence block")
     _positive_int(block["number"], "block number")
     _hash32(block["hash"], "block hash")
+    if block["hash"] == "0x" + "00" * 32:
+        raise ResearchContractError("canonical block hash must be nonzero")
     _hash32(block["parent_hash"], "parent block hash")
     _uint(block["timestamp"], 256, "block timestamp", positive=True)
     if not isinstance(block["timestamp_utc"], str):
