@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -1405,66 +1407,63 @@ class ResearchCaptureTests(unittest.TestCase):
                     else:
                         self.assertEqual(self.output.read_bytes(), original)
 
-    def test_capture_rolls_back_post_replace_fsync_and_safety_check_failures(self):
+    def test_capture_returns_committed_evidence_after_postcommit_fsync_failure(self):
         real_fsync = shib_v2_research_io.os.fsync
-        real_recheck = shib_v2_research_io._recheck_directory_chain
+        real_replace = shib_v2_research_io.os.replace
 
-        for failure in ("directory_fsync", "safety_recheck"):
-            for original in (None, b"old-output\n"):
-                with self.subTest(failure=failure, original=original):
-                    self.output.unlink(missing_ok=True)
-                    if original is not None:
-                        self.output.write_bytes(original)
-                    responses_a, responses_b = valid_rpc_responses(self.registry)
-                    providers = self._provider_pair(
-                        RecordingRpc(responses_a), RecordingRpc(responses_b)
-                    )
-                    failed = {"value": False}
+        for original in (None, b"old-output\n"):
+            with self.subTest(original=original):
+                self.output.unlink(missing_ok=True)
+                if original is not None:
+                    self.output.write_bytes(original)
+                responses_a, responses_b = valid_rpc_responses(self.registry)
+                providers = self._provider_pair(
+                    RecordingRpc(responses_a), RecordingRpc(responses_b)
+                )
+                state = {"committed": False, "postcommit_fsync_failures": 0}
 
-                    def fail_first_directory_fsync(descriptor):
-                        metadata = os.fstat(descriptor)
-                        if stat.S_ISDIR(metadata.st_mode) and not failed["value"]:
-                            failed["value"] = True
-                            raise OSError("post-replace directory fsync failure")
-                        return real_fsync(descriptor)
+                def record_replace(*args, **kwargs):
+                    result = real_replace(*args, **kwargs)
+                    state["committed"] = True
+                    return result
 
-                    def fail_recheck_after_replacement(path, expected):
-                        replaced = (
-                            self.output.exists()
-                            and self.output.read_bytes() != original
+                def fail_postcommit_directory_fsync(descriptor):
+                    metadata = os.fstat(descriptor)
+                    if stat.S_ISDIR(metadata.st_mode) and state["committed"]:
+                        state["postcommit_fsync_failures"] += 1
+                        raise OSError("postcommit directory fsync failure")
+                    return real_fsync(descriptor)
+
+                with mock.patch.object(
+                    shib_v2_research_io.os,
+                    "replace",
+                    side_effect=record_replace,
+                ), mock.patch.object(
+                    shib_v2_research_io.os,
+                    "fsync",
+                    side_effect=fail_postcommit_directory_fsync,
+                ):
+                    try:
+                        evidence = capture.capture_research_evidence(
+                            self.registry, providers, self.output
                         )
-                        if replaced:
-                            raise shib_v2_research.ResearchContractError(
-                                "post-replace safety prose is not stable"
+                    except capture.CaptureError as error:
+                        self.fail(
+                            "postcommit fsync surfaced as capture failure: {}".format(
+                                error.reason_code
                             )
-                        return real_recheck(path, expected)
-
-                    patcher = mock.patch.object(
-                        shib_v2_research_io.os,
-                        "fsync",
-                        side_effect=fail_first_directory_fsync,
-                    ) if failure == "directory_fsync" else mock.patch.object(
-                        shib_v2_research_io,
-                        "_recheck_directory_chain",
-                        side_effect=fail_recheck_after_replacement,
-                    )
-                    with patcher:
-                        with self.assertRaisesRegex(
-                            capture.CaptureError, "^unsafe_output_path$"
-                        ):
-                            capture.capture_research_evidence(
-                                self.registry, providers, self.output
-                            )
-                    if original is None:
-                        self.assertFalse(self.output.exists())
-                    else:
-                        self.assertEqual(self.output.read_bytes(), original)
-                    leaked = [
-                        path.name
-                        for path in self.output.parent.iterdir()
-                        if path.name.startswith("." + self.output.name + ".")
-                    ]
-                    self.assertEqual(leaked, [])
+                        )
+                self.assertEqual(state["postcommit_fsync_failures"], 1)
+                self.assertEqual(
+                    self.output.read_bytes(),
+                    shib_v2_research.canonical_json_bytes(evidence) + b"\n",
+                )
+                leaked = [
+                    path.name
+                    for path in self.output.parent.iterdir()
+                    if path.name.startswith("." + self.output.name + ".")
+                ]
+                self.assertEqual(leaked, [])
 
     def test_capture_reason_classification_does_not_depend_on_validator_prose(self):
         for message in (
@@ -2182,3 +2181,170 @@ class SafeJsonBoundaryTests(unittest.TestCase):
                 with self.assertRaises(shib_v2_research.ResearchContractError):
                     atomic_write_canonical_json(path, payload)
                 self.assertEqual(path.read_bytes(), original)
+
+    def test_atomic_writer_precommit_and_replace_failures_preserve_prior_state(self):
+        from scripts.shib_v2_research_io import atomic_write_canonical_json
+
+        path = self.root / "registry.json"
+        real_fsync = shib_v2_research_io.os.fsync
+        real_replace = shib_v2_research_io.os.replace
+        real_stat = shib_v2_research_io.os.stat
+        real_recheck = shib_v2_research_io._recheck_directory_chain
+        payload = {"new": 2}
+
+        for failure in (
+            "serialization",
+            "directory_open",
+            "target_check",
+            "temp_write",
+            "file_fsync",
+            "precommit_directory_fsync",
+            "ancestor_recheck",
+            "target_recheck",
+            "replace",
+        ):
+            for original in (None, b'{"old":1}\n'):
+                with self.subTest(failure=failure, original=original):
+                    path.unlink(missing_ok=True)
+                    if original is not None:
+                        path.write_bytes(original)
+                    state = {"replace_calls": 0, "target_stats": 0}
+
+                    def record_or_fail_replace(*args, **kwargs):
+                        state["replace_calls"] += 1
+                        if failure == "replace":
+                            raise OSError("injected replace failure")
+                        return real_replace(*args, **kwargs)
+
+                    def fail_selected_fsync(descriptor):
+                        metadata = os.fstat(descriptor)
+                        if failure == "file_fsync" and stat.S_ISREG(metadata.st_mode):
+                            raise OSError("injected file fsync failure")
+                        if (
+                            failure == "precommit_directory_fsync"
+                            and stat.S_ISDIR(metadata.st_mode)
+                        ):
+                            raise OSError("injected precommit directory fsync failure")
+                        return real_fsync(descriptor)
+
+                    def fail_selected_stat(name, *args, **kwargs):
+                        if name == path.name and kwargs.get("dir_fd") is not None:
+                            state["target_stats"] += 1
+                            if failure == "target_check":
+                                raise OSError("injected target check failure")
+                            if failure == "target_recheck" and state["target_stats"] == 2:
+                                raise OSError("injected target recheck failure")
+                        return real_stat(name, *args, **kwargs)
+
+                    def fail_selected_recheck(directory, expected):
+                        if failure == "ancestor_recheck":
+                            raise shib_v2_research.ResearchContractError(
+                                "injected ancestor recheck failure"
+                            )
+                        return real_recheck(directory, expected)
+
+                    serialization_patcher = mock.patch.object(
+                        shib_v2_research_io,
+                        "canonical_json_bytes",
+                        side_effect=shib_v2_research.ResearchContractError(
+                            "injected serialization failure"
+                        ),
+                    ) if failure == "serialization" else mock.patch.object(
+                        shib_v2_research_io,
+                        "canonical_json_bytes",
+                        wraps=shib_v2_research_io.canonical_json_bytes,
+                    )
+                    directory_patcher = mock.patch.object(
+                        shib_v2_research_io,
+                        "_open_directory_chain",
+                        side_effect=shib_v2_research.ResearchContractError(
+                            "injected directory open failure"
+                        ),
+                    ) if failure == "directory_open" else mock.patch.object(
+                        shib_v2_research_io,
+                        "_open_directory_chain",
+                        wraps=shib_v2_research_io._open_directory_chain,
+                    )
+                    write_patcher = mock.patch.object(
+                        shib_v2_research_io,
+                        "_write_all",
+                        side_effect=OSError("injected staged write failure"),
+                    ) if failure == "temp_write" else mock.patch.object(
+                        shib_v2_research_io,
+                        "_write_all",
+                        wraps=shib_v2_research_io._write_all,
+                    )
+                    with serialization_patcher, directory_patcher, write_patcher, mock.patch.object(
+                        shib_v2_research_io.os,
+                        "fsync",
+                        side_effect=fail_selected_fsync,
+                    ), mock.patch.object(
+                        shib_v2_research_io.os,
+                        "stat",
+                        side_effect=fail_selected_stat,
+                    ), mock.patch.object(
+                        shib_v2_research_io,
+                        "_recheck_directory_chain",
+                        side_effect=fail_selected_recheck,
+                    ), mock.patch.object(
+                        shib_v2_research_io.os,
+                        "replace",
+                        side_effect=record_or_fail_replace,
+                    ):
+                        with self.assertRaises(
+                            shib_v2_research.ResearchContractError
+                        ):
+                            atomic_write_canonical_json(path, payload)
+                    if original is None:
+                        self.assertFalse(path.exists())
+                    else:
+                        self.assertEqual(path.read_bytes(), original)
+                    expected_replace_calls = 1 if failure == "replace" else 0
+                    self.assertEqual(
+                        state["replace_calls"], expected_replace_calls
+                    )
+                    leaked = [
+                        child.name
+                        for child in self.root.iterdir()
+                        if child.name.startswith("." + path.name + ".")
+                    ]
+                    self.assertEqual(leaked, [])
+
+        real_target = self.root / "real.json"
+        original = b'{"kept":1}\n'
+        real_target.write_bytes(original)
+        path.unlink(missing_ok=True)
+        path.symlink_to(real_target)
+        with self.assertRaises(shib_v2_research.ResearchContractError):
+            atomic_write_canonical_json(path, payload)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(real_target.read_bytes(), original)
+
+    def test_atomic_writer_has_one_explicit_nonraising_postcommit_tail(self):
+        helper = getattr(shib_v2_research_io, "_commit_staged_json", None)
+        self.assertIsNotNone(helper, "single commit helper is missing")
+        function = ast.parse(inspect.getsource(helper)).body[0]
+        self.assertEqual(len(function.body), 2)
+        replace_try, postcommit_try = function.body
+        self.assertIsInstance(replace_try, ast.Try)
+        replace_call = replace_try.body[0].value.func
+        self.assertIsInstance(replace_call, ast.Attribute)
+        self.assertEqual(replace_call.attr, "replace")
+        self.assertEqual(replace_try.handlers[0].type.id, "OSError")
+        self.assertTrue(any(
+            isinstance(node, ast.Raise)
+            for node in ast.walk(replace_try.handlers[0])
+        ))
+        self.assertIsInstance(postcommit_try, ast.Try)
+        postcommit_call = postcommit_try.body[0].value.func
+        self.assertIsInstance(postcommit_call, ast.Attribute)
+        self.assertEqual(postcommit_call.attr, "fsync")
+        self.assertEqual(postcommit_try.handlers[0].type.id, "BaseException")
+        self.assertFalse(any(
+            isinstance(node, ast.Raise) for node in ast.walk(postcommit_try)
+        ))
+        writer_source = inspect.getsource(
+            shib_v2_research_io.atomic_write_canonical_json
+        )
+        self.assertNotIn("rollback", writer_source)
+        self.assertNotIn("backup", writer_source)
