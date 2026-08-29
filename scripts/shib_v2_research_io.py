@@ -175,6 +175,26 @@ def _reject_constant(_token: str) -> object:
     raise ResearchContractError("JSON nonfinite tokens are forbidden")
 
 
+def _parse_bounded_canonical_json(raw: bytes, label: str) -> object:
+    if len(raw) > MAX_JSON_BYTES:
+        raise ResearchContractError("JSON input exceeds 1 MiB limit")
+    _preflight_json_bytes(raw)
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_int=_bounded_int,
+            parse_float=_reject_float,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ResearchContractError("{} is invalid JSON".format(label)) from error
+    scan_public_payload(value)
+    if raw != canonical_json_bytes(value) + b"\n":
+        raise ResearchContractError("{} is not canonical JSON".format(label))
+    return value
+
+
 def load_bounded_json(path: Path, label: str) -> object:
     """Read one canonical, bounded JSON file without following symlinks."""
     if not isinstance(path, Path) or not isinstance(label, str) or not label:
@@ -218,21 +238,7 @@ def load_bounded_json(path: Path, label: str) -> object:
             os.close(descriptor)
         os.close(directory_fd)
     _recheck_directory_chain(absolute.parent, ancestors)
-    _preflight_json_bytes(raw)
-    try:
-        value = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_int=_bounded_int,
-            parse_float=_reject_float,
-            parse_constant=_reject_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ResearchContractError("{} is invalid JSON".format(label)) from error
-    scan_public_payload(value)
-    if raw != canonical_json_bytes(value) + b"\n":
-        raise ResearchContractError("{} is not canonical JSON".format(label))
-    return value
+    return _parse_bounded_canonical_json(raw, label)
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -250,6 +256,7 @@ def atomic_write_canonical_json(path: Path, payload: object) -> None:
         raise ResearchContractError("JSON destination is invalid")
     scan_public_payload(payload)
     rendered = canonical_json_bytes(payload) + b"\n"
+    _parse_bounded_canonical_json(rendered, "JSON output")
     absolute = _absolute_path(path)
     if absolute.name in {"", ".", ".."}:
         raise ResearchContractError("JSON destination filename is invalid")

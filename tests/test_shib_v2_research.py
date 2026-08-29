@@ -9,6 +9,7 @@ import tempfile
 import unittest
 
 from scripts import shib_v2_research
+from scripts import shib_v2_research_io
 from scripts.shib_v2_research_io import load_bounded_json
 
 
@@ -154,6 +155,18 @@ class ResearchRegistryTests(unittest.TestCase):
                         mutation(copy.deepcopy(valid_registry_payload()))
                     )
 
+    def test_registry_rejects_fee_drift_that_preserves_native_relationships(self):
+        mutations = (
+            (0, {"fee_bps": 1, "fee_numerator": 999}),
+            (1, {"fee_bps": 15, "fee_denominator": 2000}),
+        )
+        for pool_index, changes in mutations:
+            with self.subTest(pool_index=pool_index, changes=changes):
+                payload = valid_registry_payload()
+                payload["pools"][pool_index]["fee_model"].update(changes)
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research.load_research_registry(payload)
+
 
 class SafeJsonBoundaryTests(unittest.TestCase):
     def setUp(self):
@@ -195,6 +208,26 @@ class SafeJsonBoundaryTests(unittest.TestCase):
                 with self.assertRaises(shib_v2_research.ResearchContractError):
                     shib_v2_research.scan_public_payload({"value": value})
 
+    def test_public_scan_rejects_private_paths_secret_and_key_aliases(self):
+        for payload in (
+            {"value": "/root/research"},
+            {"value": "/etc/passwd"},
+            {"value": "ghp_abcdefghijklmnopqrstuvwxyz1234567890"},
+            {"privatePath": "hidden"},
+            {"providerError": "hidden"},
+            {"raw_payload": "hidden"},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research.scan_public_payload(payload)
+
+    def test_public_scan_keeps_legitimate_token_and_evm_address_fields(self):
+        self.assertIsNone(shib_v2_research.scan_public_payload({
+            "token": "SHIB",
+            "address": "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce",
+            "description": "ETH / USD",
+        }))
+
     def test_bounded_loader_rejects_float_exponent_and_nonfinite_tokens(self):
         for token in ("1.0", "1e3", "NaN", "Infinity", "-Infinity"):
             path = self.root / "numeric.json"
@@ -202,6 +235,36 @@ class SafeJsonBoundaryTests(unittest.TestCase):
             with self.subTest(token=token):
                 with self.assertRaises(shib_v2_research.ResearchContractError):
                     load_bounded_json(path, "numeric fixture")
+
+    def test_bounded_loader_rejects_size_and_parser_bounds(self):
+        cases = (
+            ("size", b" " * (shib_v2_research_io.MAX_JSON_BYTES + 1)),
+            ("nesting", b'{"value":' + b"[" * 65 + b"0" + b"]" * 65 + b"}\n"),
+            (
+                "members",
+                b"{" + b",".join(
+                    b'"k%05d":0' % index for index in range(4097)
+                ) + b"}\n",
+            ),
+            (
+                "string",
+                b'{"value":"' + b"a" * (
+                    shib_v2_research_io.MAX_JSON_STRING_TOKEN_BYTES + 1
+                ) + b'"}\n',
+            ),
+            (
+                "integer",
+                b'{"value":' + b"1" * (
+                    shib_v2_research_io.MAX_JSON_INTEGER_TOKEN_BYTES + 1
+                ) + b"}\n",
+            ),
+        )
+        path = self.root / "bounded.json"
+        for label, raw in cases:
+            with self.subTest(label=label):
+                path.write_bytes(raw)
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    load_bounded_json(path, label)
 
     def test_bounded_loader_requires_canonical_bytes_and_writer_round_trips(self):
         from scripts.shib_v2_research_io import atomic_write_canonical_json
@@ -213,3 +276,21 @@ class SafeJsonBoundaryTests(unittest.TestCase):
         atomic_write_canonical_json(path, {"b": 1, "a": 2})
         self.assertEqual(path.read_bytes(), b'{"a":2,"b":1}\n')
         self.assertEqual(load_bounded_json(path, "registry"), {"a": 2, "b": 1})
+
+    def test_atomic_writer_preserves_existing_file_on_rejected_payload(self):
+        from scripts.shib_v2_research_io import atomic_write_canonical_json
+
+        path = self.root / "registry.json"
+        original = b'{"kept":1}\n'
+        path.write_bytes(original)
+        rejected_payloads = (
+            {"value": "a" * (shib_v2_research_io.MAX_JSON_BYTES + 1)},
+            {"value": "a" * (
+                shib_v2_research_io.MAX_JSON_STRING_TOKEN_BYTES + 1
+            )},
+        )
+        for payload in rejected_payloads:
+            with self.subTest(length=len(payload["value"])):
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    atomic_write_canonical_json(path, payload)
+                self.assertEqual(path.read_bytes(), original)

@@ -11,23 +11,27 @@ from typing import Dict, Sequence
 REGISTRY_SCHEMA = "shib_v2_research_registry/v1"
 _ADDRESS = re.compile(r"0x[0-9a-f]{40}$")
 _SHA256 = re.compile(r"[0-9a-f]{64}$")
-_FORBIDDEN_KEYS = {
-    "api_key",
+_FORBIDDEN_KEY_NORMALIZED = {
+    "apikey",
     "authorization",
     "endpoint",
     "headers",
-    "private_key",
-    "private_path",
-    "provider_error",
-    "raw_response",
-    "raw_rpc",
-    "rpc_url",
+    "privatekey",
+    "privatepath",
+    "providererror",
+    "rawpayload",
+    "rawresponse",
+    "rawrpc",
+    "rpcurl",
     "secret",
     "url",
 }
 _UNSAFE_TEXT = re.compile(
-    r"(?:https?|wss?)://|(?:^|[^a-z0-9])sk-[a-z0-9_-]+|"
-    r"/(?:Users|home|private)/|[A-Za-z]:\\(?:Users|private)\\",
+    r"(?:https?|wss?)://|(?:^|[^a-z0-9])(?:sk|rk|pk)[_-][a-z0-9_-]{8,}|"
+    r"(?:^|[^a-z0-9])gh[pous]_[a-z0-9]{16,}|github_pat_[a-z0-9_]{16,}|"
+    r"(?:^|[^a-z0-9])(?:secret|password|credential)[ _:=.-]+[a-z0-9_-]{6,}|"
+    r"(?:^|[\s\"'])/(?:root|etc|Users|home|private)(?:/|$)|"
+    r"[A-Za-z]:[\\/](?:root|etc|Users|home|private)(?:[\\/]|$)",
     re.IGNORECASE,
 )
 
@@ -117,6 +121,8 @@ def _fee_model(value: object, dex: str) -> dict:
     denominator = _positive_int(record["fee_denominator"], dex + " fee denominator")
     if numerator >= denominator:
         raise ResearchContractError(dex + " fee fraction is invalid")
+    if (fee_bps, numerator, denominator) != (30, 997, 1000):
+        raise ResearchContractError(dex + " fee parameters are invalid")
 
     evidence = record["evidence"]
     if dex == "uniswap_v2":
@@ -355,7 +361,8 @@ def scan_public_payload(payload: object) -> None:
             for key, child in value.items():
                 if not isinstance(key, str):
                     raise ResearchContractError("public payload key is invalid")
-                if key.lower() in _FORBIDDEN_KEYS:
+                normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+                if normalized_key in _FORBIDDEN_KEY_NORMALIZED:
                     raise ResearchContractError("public payload contains forbidden key")
                 scan(child)
         elif isinstance(value, list):
