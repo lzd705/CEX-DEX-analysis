@@ -800,6 +800,52 @@ GeckoTerminal endpoint is IP-rate-limited, so pool requests are spaced and 429
 responses trigger a conservative backoff; a 148-pool refresh is intentionally
 slower than the CEX phase.
 
+## Exact V3 first-publication hold point
+
+The exact Uniswap V3 first publication uses
+`scripts/uniswap_v3_launch.py`; it is not a special timer mode. Run its
+`preflight`, `pause`, `backup`, `stage`, and `verify-stage` phases before the
+cutover. The staged command is always the full unfiltered `dex_depth` profile
+with `--publish-local` and `--require-uniswap-v3-exact-validation`. A
+one-market refresh, Token filter, bounded merge, or no-publication canary is
+not a production candidate.
+
+The stage data root and the collection runner's derived processed sibling are
+both fresh and private. Live `raw`, processed, collection status, and public
+files remain untouched during staging. The transient loopback dashboard reads
+unchanged live fact families while these four exact overrides point to the
+stage:
+
+```text
+MARKET_DEX_DEPTH_DATA=STAGE_DIR/dex_depth_latest.csv
+MARKET_DEX_EXECUTION_COST_DATA=STAGE_DIR/dex_execution_cost_latest.csv
+MARKET_UNISWAP_V3_EXACT_DATA=STAGE_DIR/uniswap_v3_exact_latest.json
+MARKET_UNISWAP_V3_EXACT_RAW_ROOT=STAGE_DIR/raw/dex-depth
+```
+
+Only after normal target-SHA release verification succeeds against that
+transient dashboard may the operator stop the production dashboard, promote
+the checksummed five-file data generation, switch the external application
+pointer, and validate the target. Resume the timers last. On failure, restore
+the old application pointer and checksummed data while the dashboard is
+stopped, start and validate the old app, and resume timers only after the
+previous-SHA rollback evidence passes. See `docs/production-hardening.md` for
+the complete receipt ledger, first-sidecar absence, CAS, and retention rules.
+
+Promotion copies no staged raw transcript or TVL tree into the live root. It
+installs only the already validated canonical private receipt beneath the
+matching live `raw/dex-depth/<snapshot_id>` directory, then promotes the five
+public files. The normal forward dashboard therefore uses its default live raw
+root; the stage raw-root override is transient verification only. Keep the
+complete staged raw DEX/TVL evidence and processed root private and unchanged
+through the observation window. Rollback removes a trusted receipt created by
+this launch, but validates and preserves a byte-identical preexisting receipt.
+
+The launcher manages only the fixed daily/depth timers and their matching
+services. It does not operate the dashboard unit, install units, edit
+environment files, access the live RPC itself, switch Git, or infer system
+resource/OOM evidence.
+
 ## Timer installation
 
 The repository includes user-level systemd timer templates. On the production
