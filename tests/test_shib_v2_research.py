@@ -2370,8 +2370,16 @@ class ResearchSnapshotTests(unittest.TestCase):
         self.assertEqual(row["common_shib_raw"], 1_250_000 * 10**18)
         self.assertEqual(row["buy_quote_status"], "unavailable")
         self.assertEqual(row["buy_quote_reason"], "pool_reserve_insufficient")
+        self.assertEqual(row["sell_quote_status"], "calculation_complete")
+        self.assertEqual(
+            row["sell_quote_reason"],
+            "fixed_block_fee_proof_not_authenticated",
+        )
         self.assertEqual(row["classification"], "unavailable")
-        self.assertEqual(row["reason_codes"], ["pool_reserve_insufficient"])
+        self.assertEqual(row["reason_codes"], [
+            "pool_reserve_insufficient",
+            "fixed_block_fee_proof_not_authenticated",
+        ])
         for field in (
             "buy_weth_raw", "sell_weth_raw", "gross_edge_weth_raw",
             "buy_cost_usd", "sell_proceeds_usd", "gross_edge_usd",
@@ -2380,6 +2388,48 @@ class ResearchSnapshotTests(unittest.TestCase):
             self.assertIsNone(row[field], field)
         self.assertGreater(
             snapshot["summary"]["classification_counts"]["unavailable"], 0
+        )
+
+    def test_complete_buy_and_unavailable_sell_keep_both_reasons_in_leg_order(self):
+        reserve_shib = 1_000_000 * 10**18
+        snapshot = build_from_reserves((
+            (reserve_shib, 90 * 10**18),
+            (reserve_shib, 1),
+        ))
+        row = snapshot["scenarios"][0]
+        self.assertEqual(row["buy_quote_status"], "calculation_complete")
+        self.assertEqual(row["sell_quote_status"], "unavailable")
+        self.assertEqual(row["sell_quote_reason"], "pool_output_below_one_raw")
+        self.assertEqual(row["reason_codes"], [
+            "fixed_block_fee_proof_not_authenticated",
+            "pool_output_below_one_raw",
+        ])
+
+    def test_both_unavailable_reasons_are_unique_in_buy_then_sell_order(self):
+        reserve_shib = 1_000_000 * 10**18
+        snapshot = build_from_reserves((
+            (reserve_shib, 40 * 10**18),
+            (reserve_shib, 1),
+        ))
+        row = snapshot["scenarios"][4]
+        self.assertEqual(row["buy_quote_status"], "unavailable")
+        self.assertEqual(row["sell_quote_status"], "unavailable")
+        self.assertEqual(row["reason_codes"], [
+            "pool_reserve_insufficient",
+            "pool_output_below_one_raw",
+        ])
+
+        duplicate = v2_quote_oracle(
+            reserve_shib,
+            90 * 10**18,
+            reserve_shib,
+            "buy",
+        )
+        self.assertEqual(
+            shib_v2_research._scenario_reason_codes(
+                duplicate, duplicate, "unavailable"
+            ),
+            ["pool_reserve_insufficient"],
         )
 
     def test_same_inputs_are_byte_identical_and_mutation_changes_identity(self):
@@ -2400,6 +2450,98 @@ class ResearchSnapshotTests(unittest.TestCase):
             )["snapshot_sha256"],
             first["snapshot_sha256"],
         )
+
+    def test_public_validator_requires_and_rebuilds_from_authorities(self):
+        snapshot = shib_v2_research.build_research_snapshot(
+            self.evidence, self.registry, "1" * 40
+        )
+        self.assertEqual(
+            shib_v2_research.validate_research_snapshot(
+                snapshot, self.evidence, self.registry
+            ),
+            snapshot,
+        )
+        with self.assertRaises(TypeError):
+            shib_v2_research.validate_research_snapshot(snapshot)
+
+        changed_evidence = mutate_reserve_and_rebind(self.evidence)
+        with self.assertRaises(shib_v2_research.ResearchContractError):
+            shib_v2_research.validate_research_snapshot(
+                snapshot, changed_evidence, self.registry
+            )
+
+    def test_authority_validator_rejects_fully_resealed_forgeries(self):
+        snapshot = shib_v2_research.build_research_snapshot(
+            self.evidence, self.registry, "1" * 40
+        )
+        quote_forgery = copy.deepcopy(snapshot)
+        row = quote_forgery["scenarios"][0]
+        original_buy_cost = Fraction(
+            row["buy_cost_usd"]["numerator"],
+            row["buy_cost_usd"]["denominator"],
+        )
+        usd_per_weth_raw = original_buy_cost / row["buy_weth_raw"]
+        row["buy_weth_raw"] = row["sell_weth_raw"] - 1
+        row["gross_edge_weth_raw"] = 1
+        for field, value in (
+            ("buy_cost_usd", row["buy_weth_raw"] * usd_per_weth_raw),
+            ("gross_edge_usd", usd_per_weth_raw),
+            ("gross_edge_bps", Fraction(10000, row["buy_weth_raw"])),
+        ):
+            row[field] = {
+                "numerator": value.numerator,
+                "denominator": value.denominator,
+            }
+        row["classification"] = "positive_pool_edge_costs_incomplete"
+        row["reason_codes"] = [
+            "fixed_block_fee_proof_not_authenticated",
+            "route_costs_not_evaluated",
+        ]
+        counts = quote_forgery["summary"]["classification_counts"]
+        counts["non_positive_pool_edge"] -= 1
+        counts["positive_pool_edge_costs_incomplete"] += 1
+        quote_forgery = _reseal_snapshot(quote_forgery)
+
+        block_forgery = copy.deepcopy(snapshot)
+        block_forgery["as_of_block_number"] += 1
+        block_forgery = _reseal_snapshot(block_forgery)
+
+        call_forgery = copy.deepcopy(snapshot)
+        call_forgery["pool_identities"][0]["call_results_sha256"] = "d" * 64
+        call_forgery = _reseal_snapshot(call_forgery)
+
+        fee_forgery = copy.deepcopy(snapshot)
+        fee_forgery["pool_identities"][0]["fee_evidence_sha256"] = "e" * 64
+        fee_forgery = _reseal_snapshot(fee_forgery)
+
+        state_forgery = copy.deepcopy(snapshot)
+        old_state = state_forgery["pool_identities"][0]["state_id"]
+        new_state = "dex-v2-quantity:" + "f" * 64
+        state_forgery["pool_identities"][0]["state_id"] = new_state
+        for scenario in state_forgery["scenarios"]:
+            for field in ("buy_pool_state_id", "sell_pool_state_id"):
+                if scenario[field] == old_state:
+                    scenario[field] = new_state
+        state_forgery = _reseal_snapshot(state_forgery)
+
+        for label, forgery in (
+            ("quote_and_dependencies", quote_forgery),
+            ("block", block_forgery),
+            ("pool_call", call_forgery),
+            ("fee", fee_forgery),
+            ("state", state_forgery),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(
+                    shib_v2_research._validate_research_snapshot_structure(
+                        forgery
+                    ),
+                    forgery,
+                )
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research.validate_research_snapshot(
+                        forgery, self.evidence, self.registry
+                    )
 
     def test_validator_rejects_forged_scenario_summary_and_self_hash(self):
         snapshot = shib_v2_research.build_research_snapshot(
@@ -2444,7 +2586,9 @@ class ResearchSnapshotTests(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(hash=mutation["snapshot_sha256"]):
                 with self.assertRaises(shib_v2_research.ResearchContractError):
-                    shib_v2_research.validate_research_snapshot(mutation)
+                    shib_v2_research.validate_research_snapshot(
+                        mutation, self.evidence, self.registry
+                    )
 
     def test_validator_rejects_arbitrary_dex_quote_reason_and_reason_order(self):
         positive = build_from_reserves(positive_edge_reserves())
@@ -2478,7 +2622,30 @@ class ResearchSnapshotTests(unittest.TestCase):
             _reseal_snapshot(mutation)
             with self.subTest(reason=mutation["scenarios"][0]["reason_codes"]):
                 with self.assertRaises(shib_v2_research.ResearchContractError):
-                    shib_v2_research.validate_research_snapshot(mutation)
+                    shib_v2_research.validate_research_snapshot(
+                        mutation, self.evidence, self.registry
+                    )
+
+    def test_unavailable_quote_reason_must_be_a_string(self):
+        reserve_shib = 1_000_000 * 10**18
+        snapshot = build_from_reserves((
+            (reserve_shib, 40 * 10**18),
+            (reserve_shib, 40 * 10**18),
+        ))
+        for adversarial_reason in (
+            ["pool_reserve_insufficient"],
+            {"reason": "pool_reserve_insufficient"},
+        ):
+            with self.subTest(reason_type=type(adversarial_reason).__name__):
+                mutation = copy.deepcopy(snapshot)
+                mutation["scenarios"][4]["buy_quote_reason"] = (
+                    adversarial_reason
+                )
+                _reseal_snapshot(mutation)
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research.validate_research_snapshot(
+                        mutation, self.evidence, self.registry
+                    )
 
     def test_application_sha_and_summary_are_strict_and_recomputed(self):
         with self.assertRaises(shib_v2_research.ResearchContractError):

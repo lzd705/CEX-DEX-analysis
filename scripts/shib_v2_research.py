@@ -1472,7 +1472,7 @@ def _scenario_reason_codes(
     if classification == "unavailable":
         reasons = []
         for quote in (buy_quote, sell_quote):
-            if quote.status == "unavailable" and quote.reason_code not in reasons:
+            if quote.reason_code not in reasons:
                 reasons.append(quote.reason_code)
         return reasons
     reasons = [_COMPLETE_QUOTE_REASON]
@@ -1683,10 +1683,12 @@ def build_research_snapshot(
         "scenarios": scenarios,
     }
     snapshot["snapshot_sha256"] = snapshot_sha256(snapshot)
-    return validate_research_snapshot(snapshot)
+    return _validate_research_snapshot_structure(snapshot)
 
 
 def _validate_quote_status_reason(status: object, reason: object, label: str) -> None:
+    if type(reason) is not str:
+        raise ResearchContractError("{} reason is invalid".format(label))
     if status == "calculation_complete":
         if reason != _COMPLETE_QUOTE_REASON:
             raise ResearchContractError("{} complete reason is invalid".format(label))
@@ -1791,11 +1793,8 @@ def _validate_scenario(
                 raise ResearchContractError("unavailable quote values must be null")
         expected_classification = "unavailable"
         expected_reasons = []
-        for status_field, reason_field in (
-            ("buy_quote_status", "buy_quote_reason"),
-            ("sell_quote_status", "sell_quote_reason"),
-        ):
-            if row[status_field] == "unavailable" and row[reason_field] not in expected_reasons:
+        for reason_field in ("buy_quote_reason", "sell_quote_reason"):
+            if row[reason_field] not in expected_reasons:
                 expected_reasons.append(row[reason_field])
     if row["classification"] != expected_classification:
         raise ResearchContractError("research scenario classification is invalid")
@@ -1804,8 +1803,8 @@ def _validate_scenario(
     return row
 
 
-def validate_research_snapshot(payload: object) -> dict:
-    """Validate one deterministic, non-executable historical replay snapshot."""
+def _validate_research_snapshot_structure(payload: object) -> dict:
+    """Validate the self-contained structure of one historical replay."""
     snapshot = _exact_fields(
         payload,
         (
@@ -1963,6 +1962,23 @@ def validate_research_snapshot(payload: object) -> dict:
         raise ResearchContractError("snapshot self-hash does not recompute")
     scan_public_payload(snapshot)
     return json.loads(canonical_json_bytes(snapshot).decode("utf-8"))
+
+
+def validate_research_snapshot(
+    payload: object,
+    evidence: dict,
+    registry: dict,
+) -> dict:
+    """Authenticate a snapshot by rebuilding it from exact public authorities."""
+    registry = load_research_registry(registry)
+    evidence = validate_research_evidence(evidence, registry)
+    snapshot = _validate_research_snapshot_structure(payload)
+    expected = build_research_snapshot(
+        evidence, registry, snapshot["application_sha"]
+    )
+    if canonical_json_bytes(snapshot) != canonical_json_bytes(expected):
+        raise ResearchContractError("research snapshot does not reproduce")
+    return snapshot
 
 
 def scan_public_payload(payload: object) -> None:
