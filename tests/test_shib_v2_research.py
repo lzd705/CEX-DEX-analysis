@@ -7,7 +7,6 @@ import copy
 from decimal import Decimal
 from fractions import Fraction
 import hashlib
-import http.server
 import inspect
 import json
 import os
@@ -16,8 +15,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
+import urllib.error
 import urllib.request
 from unittest import mock
 
@@ -1777,45 +1776,40 @@ class ResearchCaptureTests(unittest.TestCase):
 
     def test_bounded_transport_uses_fixed_public_user_agent(self):
         expected_user_agent = "CEX-DEX-analysis-research-capture/1"
-        observed = []
+        expected_headers = {
+            "user_agent": expected_user_agent,
+            "authorization": None,
+            "cookie": None,
+            "proxy_authorization": None,
+        }
 
-        class UserAgentGate(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", "0"))
-                self.rfile.read(length)
-                observed.append({
-                    "user_agent": self.headers.get("User-Agent"),
-                    "authorization": self.headers.get("Authorization"),
-                })
-                if observed[-1]["user_agent"] != expected_user_agent:
-                    self.send_response(403)
-                    self.end_headers()
-                    return
-                body = b'{"id":1,"jsonrpc":"2.0","result":"0x1"}'
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+        class UserAgentGateOpener(StaticOpener):
+            def __init__(self):
+                super().__init__(b'{"id":1,"jsonrpc":"2.0","result":"0x1"}')
+                self.observed_headers = []
 
-            def log_message(self, format, *args):
-                pass
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                headers = {
+                    "user_agent": request.get_header("User-agent"),
+                    "authorization": request.get_header("Authorization"),
+                    "cookie": request.get_header("Cookie"),
+                    "proxy_authorization": request.get_header(
+                        "Proxy-authorization"
+                    ),
+                }
+                self.observed_headers.append(headers)
+                if headers != expected_headers:
+                    raise urllib.error.HTTPError(
+                        request.full_url, 403, "Forbidden", None, None
+                    )
+                return StaticHttpResponse(self.body)
 
-        server = http.server.HTTPServer(("127.0.0.1", 0), UserAgentGate)
-        thread = threading.Thread(target=server.serve_forever)
-        thread.daemon = True
-        thread.start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(thread.join)
-        self.addCleanup(server.shutdown)
-
-        endpoint = "http://127.0.0.1:{}".format(server.server_port)
-        transport = capture.BoundedJsonRpcTransport(endpoint, 2)
+        transport = capture.BoundedJsonRpcTransport("https://rpc.example", 2)
+        gate = UserAgentGateOpener()
+        transport._opener = gate
         self.assertEqual(transport("eth_chainId", []), "0x1")
-        self.assertEqual(
-            observed,
-            [{"user_agent": expected_user_agent, "authorization": None}],
-        )
+        self.assertEqual(gate.observed_headers, [expected_headers])
 
     def test_bounded_transport_uses_fixed_post_envelope_and_maps_remote_errors(self):
         endpoint = "https://rpc.example/v2/sk-live-private"
