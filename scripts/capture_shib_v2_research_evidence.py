@@ -49,6 +49,7 @@ MAX_RPC_DEPTH = 16
 MAX_RPC_STRING_BYTES = 192 * 1024
 MAX_CALL_RESULT_BYTES = 64 * 1024
 MAX_TIMEOUT_SECONDS = 60
+PUBLIC_USER_AGENT = "CEX-DEX-analysis-research-capture/1"
 _HASH32 = re.compile(r"0x[0-9a-f]{64}$")
 _ADDRESS = re.compile(r"0x[0-9a-f]{40}$")
 _HEX_DATA = re.compile(r"0x(?:[0-9a-f]{2})*$")
@@ -271,7 +272,11 @@ class BoundedJsonRpcTransport:
         rpc_request = urllib_request.Request(
             self._endpoint,
             data=payload,
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": PUBLIC_USER_AGENT,
+            },
             method="POST",
         )
         try:
