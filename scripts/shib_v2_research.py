@@ -6,14 +6,28 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
+from fractions import Fraction
 from typing import Dict, List, Sequence
+
+from scripts.route_quantity import (
+    CommonTarget,
+    MarketRules,
+    QuantityQuote,
+    V2PoolState,
+    quote_v2_pool_quantity,
+    validate_v2_quantity_quote_against_state,
+)
 
 
 REGISTRY_SCHEMA = "shib_v2_research_registry/v1"
 EVIDENCE_SCHEMA = "shib_v2_research_evidence/v1"
+SNAPSHOT_SCHEMA = "shib_v2_research_snapshot/v1"
 _ADDRESS = re.compile(r"0x[0-9a-f]{40}$")
 _SHA256 = re.compile(r"[0-9a-f]{64}$")
+_GIT_SHA = re.compile(r"[0-9a-f]{40}$")
 _HASH32 = re.compile(r"0x[0-9a-f]{64}$")
+_V2_STATE_ID = re.compile(r"dex-v2-quantity:[0-9a-f]{64}$")
 _CALL_ID = re.compile(r"call:[0-9a-f]{64}$")
 _HEX = re.compile(r"0x(?:[0-9a-f]{2})*$")
 _MAX_CALLDATA_BYTES = 512
@@ -133,6 +147,72 @@ _AUTHORITY_TRUST_ANCHOR = (
         3600,
     ),
 )
+_FIXED_POOLS = (
+    ("uniswap_v2", "0x811beed0119b4afce20d2583eb608c6f7af1954f"),
+    ("shibaswap_v1", "0xcf6daab95c476106eca715d48de4b13287ffdeaa"),
+)
+_FIXED_ROUTES = (
+    (
+        "shib-v2v2:eth:uniswap_v2:"
+        "0x811beed0119b4afce20d2583eb608c6f7af1954f:to:shibaswap_v1:"
+        "0xcf6daab95c476106eca715d48de4b13287ffdeaa",
+        _FIXED_POOLS[0],
+        _FIXED_POOLS[1],
+    ),
+    (
+        "shib-v2v2:eth:shibaswap_v1:"
+        "0xcf6daab95c476106eca715d48de4b13287ffdeaa:to:uniswap_v2:"
+        "0x811beed0119b4afce20d2583eb608c6f7af1954f",
+        _FIXED_POOLS[1],
+        _FIXED_POOLS[0],
+    ),
+)
+_REQUESTED_NOTIONALS = ("1000", "5000", "10000", "50000", "100000")
+_COMPLETE_QUOTE_REASON = "fixed_block_fee_proof_not_authenticated"
+_UNAVAILABLE_QUOTE_REASONS = frozenset({
+    "pool_state_binding_mismatch",
+    "pool_state_not_current",
+    "market_rules_binding_mismatch",
+    "market_rules_not_current",
+    "pool_state_market_mismatch",
+    "target_asset_mismatch",
+    "pool_state_token_address_mismatch",
+    "pool_state_token_decimals_mismatch",
+    "target_base_unit_misaligned",
+    "target_lot_misaligned",
+    "minimum_base_quantity_not_met",
+    "pool_output_below_one_raw",
+    "pool_reserve_insufficient",
+    "minimum_notional_not_met",
+})
+MISSING_COST_FIELDS = (
+    "network_gas_usd",
+    "router_or_integrator_fee_usd",
+    "token_transfer_tax_usd",
+    "mev_cost_usd",
+    "atomic_execution_cost_usd",
+    "net_edge_usd",
+    "net_edge_bps",
+)
+LIMITATIONS = (
+    "network_gas_not_evaluated",
+    "router_fee_not_evaluated",
+    "token_transfer_tax_not_evaluated",
+    "mev_not_evaluated",
+    "atomic_route_simulation_unavailable",
+)
+_SCENARIO_FIELDS = (
+    "route_id", "buy_dex", "buy_pair_address", "sell_dex",
+    "sell_pair_address", "requested_notional_usd",
+    "buy_pool_reference_shib_usd", "sell_pool_reference_shib_usd",
+    "common_target_reference_shib_usd", "common_shib_raw",
+    "buy_weth_raw", "sell_weth_raw", "gross_edge_weth_raw",
+    "buy_cost_usd", "sell_proceeds_usd", "gross_edge_usd",
+    "gross_edge_bps", "buy_pool_state_id", "sell_pool_state_id",
+    "buy_quote_status", "sell_quote_status", "buy_quote_reason",
+    "sell_quote_reason", "classification", "reason_codes",
+    "strict_eligible", "executable", "limitations",
+) + MISSING_COST_FIELDS
 
 
 class ResearchContractError(ValueError):
@@ -1220,6 +1300,669 @@ def validate_research_evidence(payload: object, registry: dict) -> dict:
         raise ResearchContractError("evidence identity does not recompute")
     scan_public_payload(evidence)
     return json.loads(canonical_json_bytes(evidence).decode("utf-8"))
+
+
+def _ratio(value: Fraction) -> dict:
+    exact = Fraction(value)
+    return {"numerator": exact.numerator, "denominator": exact.denominator}
+
+
+def _validated_ratio(value: object, label: str, *, positive: bool = False) -> Fraction:
+    record = _exact_fields(value, ("numerator", "denominator"), label)
+    if type(record["numerator"]) is not int:
+        raise ResearchContractError("{} numerator is invalid".format(label))
+    denominator = _positive_int(record["denominator"], label + " denominator")
+    exact = Fraction(record["numerator"], denominator)
+    if (
+        exact.numerator != record["numerator"]
+        or exact.denominator != denominator
+        or (positive and exact <= 0)
+    ):
+        raise ResearchContractError("{} is not a canonical ratio".format(label))
+    return exact
+
+
+def _pool_state(pool: dict, block: dict) -> V2PoolState:
+    try:
+        return V2PoolState(
+            chain="eth",
+            chain_id=1,
+            dex=pool["dex"],
+            pool_address=pool["pair_address"],
+            token0_address=pool["token0_address"],
+            token1_address=pool["token1_address"],
+            token0_decimals=pool["token0_decimals"],
+            token1_decimals=pool["token1_decimals"],
+            reserve0_raw=pool["reserve0_raw"],
+            reserve1_raw=pool["reserve1_raw"],
+            reserve_timestamp_last_raw=pool["reserve_timestamp_last_raw"],
+            fee_bps=pool["fee_bps"],
+            fee_numerator=pool["fee_numerator"],
+            fee_denominator=pool["fee_denominator"],
+            fee_formula=pool["fee_formula"],
+            fee_proof_sha256=pool["fee_evidence_sha256"],
+            block_number=block["number"],
+            block_hash=block["hash"],
+            block_header_sha256=block["canonical_header_sha256"],
+            observed_at=block["timestamp_utc"],
+            raw_response_sha256=pool["call_results_sha256"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ResearchContractError("pool state is invalid") from error
+
+
+def _market_rules(pool: dict, block: dict) -> MarketRules:
+    try:
+        valid_until = datetime.fromtimestamp(
+            block["timestamp"] + 1, timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return MarketRules(
+            market_id="dex:eth:{}:{}:SHIB".format(
+                pool["dex"], pool["pair_address"]
+            ),
+            base_asset="SHIB",
+            quote_asset="WETH",
+            base_unit_decimals=18,
+            quote_unit_decimals=18,
+            base_increment=Decimal("0.000000000000000001"),
+            quote_increment=Decimal("0.000000000000000001"),
+            min_base_quantity=Decimal(0),
+            min_quote_notional=Decimal(0),
+            observed_at=block["timestamp_utc"],
+            valid_until=valid_until,
+            source_record_sha256=pool["call_results_sha256"],
+        )
+    except (KeyError, TypeError, ValueError, OverflowError, OSError) as error:
+        raise ResearchContractError("market rules are invalid") from error
+
+
+def _common_target(notional_usd: int, reference_price: Fraction) -> CommonTarget:
+    theoretical_raw = Fraction(notional_usd * 10**18, 1) / reference_price
+    raw = theoretical_raw.numerator // theoretical_raw.denominator
+    if raw <= 0:
+        raise ResearchContractError("common target is below one SHIB wei")
+    try:
+        return CommonTarget(
+            asset="SHIB", unit_decimals=18, raw_quantity=raw, lattice_raw=1
+        )
+    except ValueError as error:
+        raise ResearchContractError("common target is invalid") from error
+
+
+def _quote_weth_raw(quote: QuantityQuote) -> int:
+    if quote.gross_quote_quantity is None:
+        raise ResearchContractError("quote has no WETH amount")
+    raw = Fraction(quote.gross_quote_quantity) * 10**18
+    if raw.denominator != 1:
+        raise ResearchContractError("quote WETH amount is not raw-unit exact")
+    return raw.numerator
+
+
+def _pool_reference_shib_usd(
+    pool: dict,
+    shib_address: str,
+    weth_address: str,
+    eth_usd: Fraction,
+) -> Fraction:
+    if (pool["token0_address"], pool["token1_address"]) == (
+        shib_address,
+        weth_address,
+    ):
+        reserve_shib = pool["reserve0_raw"]
+        reserve_weth = pool["reserve1_raw"]
+        shib_decimals = pool["token0_decimals"]
+        weth_decimals = pool["token1_decimals"]
+    elif (pool["token0_address"], pool["token1_address"]) == (
+        weth_address,
+        shib_address,
+    ):
+        reserve_shib = pool["reserve1_raw"]
+        reserve_weth = pool["reserve0_raw"]
+        shib_decimals = pool["token1_decimals"]
+        weth_decimals = pool["token0_decimals"]
+    else:
+        raise ResearchContractError("pool token order is invalid")
+    reference = (
+        Fraction(reserve_weth * 10**shib_decimals, reserve_shib * 10**weth_decimals)
+        * eth_usd
+    )
+    if reference <= 0:
+        raise ResearchContractError("pool SHIB/USD reference is invalid")
+    return reference
+
+
+def _quote_for_scenario(
+    state: V2PoolState,
+    target: CommonTarget,
+    rules: MarketRules,
+    direction: str,
+    shib_address: str,
+    weth_address: str,
+    block_time: str,
+) -> QuantityQuote:
+    try:
+        quote = quote_v2_pool_quantity(
+            state,
+            target,
+            rules,
+            direction=direction,
+            target_token_address=shib_address,
+            quote_token_address=weth_address,
+            cohort_now=block_time,
+        )
+        return validate_v2_quantity_quote_against_state(
+            quote,
+            state,
+            target,
+            rules,
+            direction=direction,
+            target_token_address=shib_address,
+            quote_token_address=weth_address,
+            cohort_now=block_time,
+        )
+    except ValueError as error:
+        raise ResearchContractError("V2 quantity quote is invalid") from error
+
+
+def _scenario_reason_codes(
+    buy_quote: QuantityQuote,
+    sell_quote: QuantityQuote,
+    classification: str,
+) -> List[str]:
+    if classification == "unavailable":
+        reasons = []
+        for quote in (buy_quote, sell_quote):
+            if quote.status == "unavailable" and quote.reason_code not in reasons:
+                reasons.append(quote.reason_code)
+        return reasons
+    reasons = [_COMPLETE_QUOTE_REASON]
+    if classification == "positive_pool_edge_costs_incomplete":
+        reasons.append("route_costs_not_evaluated")
+    return reasons
+
+
+def _snapshot_summary(scenarios: Sequence[dict]) -> dict:
+    classifications = (
+        "non_positive_pool_edge",
+        "positive_pool_edge_costs_incomplete",
+        "unavailable",
+    )
+    return {
+        "expected_scenario_count": 10,
+        "observed_scenario_count": len(scenarios),
+        "usable_scenario_count": sum(
+            row["classification"] != "unavailable" for row in scenarios
+        ),
+        "classification_counts": {
+            classification: sum(
+                row["classification"] == classification for row in scenarios
+            )
+            for classification in classifications
+        },
+        "strict_eligible_count": sum(row["strict_eligible"] for row in scenarios),
+        "executable_count": sum(row["executable"] for row in scenarios),
+        "missing_cost_field_count": sum(
+            row[field] is None
+            for row in scenarios
+            for field in MISSING_COST_FIELDS
+        ),
+    }
+
+
+def snapshot_sha256(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        raise ResearchContractError("research snapshot is invalid")
+    body = dict(payload)
+    body.pop("snapshot_sha256", None)
+    return hashlib.sha256(
+        b"shib-v2-research-snapshot/v1\n" + canonical_json_bytes(body)
+    ).hexdigest()
+
+
+def build_research_snapshot(
+    evidence: dict,
+    registry: dict,
+    application_sha: str,
+) -> dict:
+    """Replay the two fixed SHIB V2/V2 routes from authenticated evidence."""
+    registry = load_research_registry(registry)
+    evidence = validate_research_evidence(evidence, registry)
+    if (
+        not isinstance(application_sha, str)
+        or _GIT_SHA.fullmatch(application_sha) is None
+    ):
+        raise ResearchContractError("application SHA is invalid")
+
+    block = evidence["block"]
+    block_time = block["timestamp_utc"]
+    token_by_symbol = {token["symbol"]: token for token in evidence["tokens"]}
+    shib = token_by_symbol["SHIB"]
+    weth = token_by_symbol["WETH"]
+    pool_by_identity = {
+        (pool["dex"], pool["pair_address"]): pool for pool in evidence["pools"]
+    }
+    states = {
+        identity: _pool_state(pool, block)
+        for identity, pool in pool_by_identity.items()
+    }
+    rules = {
+        identity: _market_rules(pool, block)
+        for identity, pool in pool_by_identity.items()
+    }
+    eth_usd = Fraction(
+        evidence["usd_reference"]["answer"],
+        10 ** evidence["usd_reference"]["decimals"],
+    )
+    if eth_usd <= 0:
+        raise ResearchContractError("ETH/USD reference is invalid")
+    references = {
+        identity: _pool_reference_shib_usd(
+            pool, shib["address"], weth["address"], eth_usd
+        )
+        for identity, pool in pool_by_identity.items()
+    }
+
+    scenarios = []
+    for route_id, buy_identity, sell_identity in _FIXED_ROUTES:
+        buy_reference = references[buy_identity]
+        sell_reference = references[sell_identity]
+        common_reference = max(buy_reference, sell_reference)
+        for notional_text in _REQUESTED_NOTIONALS:
+            target = _common_target(int(notional_text), common_reference)
+            buy_quote = _quote_for_scenario(
+                states[buy_identity], target, rules[buy_identity], "buy",
+                shib["address"], weth["address"], block_time,
+            )
+            sell_quote = _quote_for_scenario(
+                states[sell_identity], target, rules[sell_identity], "sell",
+                shib["address"], weth["address"], block_time,
+            )
+            both_complete = (
+                buy_quote.status == "calculation_complete"
+                and sell_quote.status == "calculation_complete"
+            )
+            if both_complete:
+                buy_weth_raw = _quote_weth_raw(buy_quote)
+                sell_weth_raw = _quote_weth_raw(sell_quote)
+                gross_edge_weth_raw = sell_weth_raw - buy_weth_raw
+                buy_cost_usd = Fraction(buy_weth_raw, 10**18) * eth_usd
+                sell_proceeds_usd = Fraction(sell_weth_raw, 10**18) * eth_usd
+                gross_edge_usd = Fraction(gross_edge_weth_raw, 10**18) * eth_usd
+                gross_edge_bps = Fraction(
+                    gross_edge_weth_raw * 10000, buy_weth_raw
+                )
+                classification = (
+                    "positive_pool_edge_costs_incomplete"
+                    if gross_edge_weth_raw > 0
+                    else "non_positive_pool_edge"
+                )
+                quote_values = {
+                    "buy_weth_raw": buy_weth_raw,
+                    "sell_weth_raw": sell_weth_raw,
+                    "gross_edge_weth_raw": gross_edge_weth_raw,
+                    "buy_cost_usd": _ratio(buy_cost_usd),
+                    "sell_proceeds_usd": _ratio(sell_proceeds_usd),
+                    "gross_edge_usd": _ratio(gross_edge_usd),
+                    "gross_edge_bps": _ratio(gross_edge_bps),
+                }
+            else:
+                classification = "unavailable"
+                quote_values = {
+                    "buy_weth_raw": None,
+                    "sell_weth_raw": None,
+                    "gross_edge_weth_raw": None,
+                    "buy_cost_usd": None,
+                    "sell_proceeds_usd": None,
+                    "gross_edge_usd": None,
+                    "gross_edge_bps": None,
+                }
+            scenario = {
+                "route_id": route_id,
+                "buy_dex": buy_identity[0],
+                "buy_pair_address": buy_identity[1],
+                "sell_dex": sell_identity[0],
+                "sell_pair_address": sell_identity[1],
+                "requested_notional_usd": notional_text,
+                "buy_pool_reference_shib_usd": _ratio(buy_reference),
+                "sell_pool_reference_shib_usd": _ratio(sell_reference),
+                "common_target_reference_shib_usd": _ratio(common_reference),
+                "common_shib_raw": target.raw_quantity,
+                "buy_pool_state_id": states[buy_identity].state_id,
+                "sell_pool_state_id": states[sell_identity].state_id,
+                "buy_quote_status": buy_quote.status,
+                "sell_quote_status": sell_quote.status,
+                "buy_quote_reason": buy_quote.reason_code,
+                "sell_quote_reason": sell_quote.reason_code,
+                "classification": classification,
+                "reason_codes": _scenario_reason_codes(
+                    buy_quote, sell_quote, classification
+                ),
+                "strict_eligible": False,
+                "executable": False,
+                "limitations": list(LIMITATIONS),
+            }
+            scenario.update(quote_values)
+            scenario.update({field: None for field in MISSING_COST_FIELDS})
+            scenarios.append(scenario)
+
+    pool_identities = []
+    for identity in _FIXED_POOLS:
+        pool = pool_by_identity[identity]
+        pool_identities.append({
+            "dex": pool["dex"],
+            "pair_address": pool["pair_address"],
+            "state_id": states[identity].state_id,
+            "call_results_sha256": pool["call_results_sha256"],
+            "fee_evidence_sha256": pool["fee_evidence_sha256"],
+            "reserve_timestamp_last_raw": pool["reserve_timestamp_last_raw"],
+            "reserve_lag_seconds": pool["reserve_lag_seconds"],
+        })
+    snapshot = {
+        "schema": SNAPSHOT_SCHEMA,
+        "application_sha": application_sha,
+        "registry_sha256": registry_sha256(registry),
+        "evidence_identity": evidence["evidence_identity"],
+        "as_of_block_number": block["number"],
+        "as_of_block_hash": block["hash"],
+        "as_of_utc": block_time,
+        "mode": "historical_replay",
+        "token": {
+            "symbol": "SHIB",
+            "address": shib["address"],
+            "decimals": shib["decimals"],
+        },
+        "quote_asset": {
+            "symbol": "WETH",
+            "address": weth["address"],
+            "decimals": weth["decimals"],
+        },
+        "requested_notionals_usd": list(_REQUESTED_NOTIONALS),
+        "pool_identities": pool_identities,
+        "scenario_count": len(scenarios),
+        "summary": _snapshot_summary(scenarios),
+        "scenarios": scenarios,
+    }
+    snapshot["snapshot_sha256"] = snapshot_sha256(snapshot)
+    return validate_research_snapshot(snapshot)
+
+
+def _validate_quote_status_reason(status: object, reason: object, label: str) -> None:
+    if status == "calculation_complete":
+        if reason != _COMPLETE_QUOTE_REASON:
+            raise ResearchContractError("{} complete reason is invalid".format(label))
+    elif status == "unavailable":
+        if reason not in _UNAVAILABLE_QUOTE_REASONS:
+            raise ResearchContractError("{} unavailable reason is invalid".format(label))
+    else:
+        raise ResearchContractError("{} status is invalid".format(label))
+
+
+def _validate_scenario(
+    value: object,
+    expected_route: tuple,
+    expected_notional: str,
+    state_ids: Dict[tuple, str],
+) -> dict:
+    row = _exact_fields(value, _SCENARIO_FIELDS, "research scenario")
+    route_id, buy_identity, sell_identity = expected_route
+    exact_identity = (
+        row["route_id"],
+        (row["buy_dex"], row["buy_pair_address"]),
+        (row["sell_dex"], row["sell_pair_address"]),
+    )
+    if exact_identity != (route_id, buy_identity, sell_identity):
+        raise ResearchContractError("research scenario route is invalid")
+    if row["requested_notional_usd"] != expected_notional:
+        raise ResearchContractError("research scenario notional is invalid")
+    buy_reference = _validated_ratio(
+        row["buy_pool_reference_shib_usd"], "buy pool reference", positive=True
+    )
+    sell_reference = _validated_ratio(
+        row["sell_pool_reference_shib_usd"], "sell pool reference", positive=True
+    )
+    common_reference = _validated_ratio(
+        row["common_target_reference_shib_usd"],
+        "common target reference",
+        positive=True,
+    )
+    if common_reference != max(buy_reference, sell_reference):
+        raise ResearchContractError("common target reference does not recompute")
+    expected_target = _common_target(int(expected_notional), common_reference)
+    if row["common_shib_raw"] != expected_target.raw_quantity:
+        raise ResearchContractError("common SHIB quantity does not recompute")
+    if (
+        row["buy_pool_state_id"] != state_ids[buy_identity]
+        or row["sell_pool_state_id"] != state_ids[sell_identity]
+    ):
+        raise ResearchContractError("scenario pool state identity is invalid")
+    _validate_quote_status_reason(
+        row["buy_quote_status"], row["buy_quote_reason"], "buy quote"
+    )
+    _validate_quote_status_reason(
+        row["sell_quote_status"], row["sell_quote_reason"], "sell quote"
+    )
+    if row["strict_eligible"] is not False or row["executable"] is not False:
+        raise ResearchContractError("research scenario cannot be executable")
+    if row["limitations"] != list(LIMITATIONS):
+        raise ResearchContractError("research scenario limitations are invalid")
+    if any(row[field] is not None for field in MISSING_COST_FIELDS):
+        raise ResearchContractError("research scenario missing costs must be null")
+
+    both_complete = (
+        row["buy_quote_status"] == "calculation_complete"
+        and row["sell_quote_status"] == "calculation_complete"
+    )
+    if both_complete:
+        buy_raw = _positive_int(row["buy_weth_raw"], "buy WETH raw")
+        sell_raw = _nonnegative_int(row["sell_weth_raw"], "sell WETH raw")
+        if row["gross_edge_weth_raw"] != sell_raw - buy_raw:
+            raise ResearchContractError("gross WETH edge does not recompute")
+        gross_raw = row["gross_edge_weth_raw"]
+        if type(gross_raw) is not int:
+            raise ResearchContractError("gross WETH edge is invalid")
+        buy_cost = _validated_ratio(row["buy_cost_usd"], "buy cost", positive=True)
+        sell_proceeds = _validated_ratio(
+            row["sell_proceeds_usd"], "sell proceeds", positive=True
+        )
+        gross_edge = _validated_ratio(row["gross_edge_usd"], "gross USD edge")
+        gross_bps = _validated_ratio(row["gross_edge_bps"], "gross edge bps")
+        usd_per_weth_raw = buy_cost / buy_raw
+        if (
+            sell_proceeds != sell_raw * usd_per_weth_raw
+            or gross_edge != gross_raw * usd_per_weth_raw
+            or gross_bps != Fraction(gross_raw * 10000, buy_raw)
+        ):
+            raise ResearchContractError("research scenario USD arithmetic is invalid")
+        expected_classification = (
+            "positive_pool_edge_costs_incomplete"
+            if gross_raw > 0
+            else "non_positive_pool_edge"
+        )
+        expected_reasons = [_COMPLETE_QUOTE_REASON]
+        if gross_raw > 0:
+            expected_reasons.append("route_costs_not_evaluated")
+    else:
+        for field in (
+            "buy_weth_raw", "sell_weth_raw", "gross_edge_weth_raw",
+            "buy_cost_usd", "sell_proceeds_usd", "gross_edge_usd",
+            "gross_edge_bps",
+        ):
+            if row[field] is not None:
+                raise ResearchContractError("unavailable quote values must be null")
+        expected_classification = "unavailable"
+        expected_reasons = []
+        for status_field, reason_field in (
+            ("buy_quote_status", "buy_quote_reason"),
+            ("sell_quote_status", "sell_quote_reason"),
+        ):
+            if row[status_field] == "unavailable" and row[reason_field] not in expected_reasons:
+                expected_reasons.append(row[reason_field])
+    if row["classification"] != expected_classification:
+        raise ResearchContractError("research scenario classification is invalid")
+    if row["reason_codes"] != expected_reasons:
+        raise ResearchContractError("research scenario reason codes are invalid")
+    return row
+
+
+def validate_research_snapshot(payload: object) -> dict:
+    """Validate one deterministic, non-executable historical replay snapshot."""
+    snapshot = _exact_fields(
+        payload,
+        (
+            "schema", "application_sha", "registry_sha256", "evidence_identity",
+            "as_of_block_number", "as_of_block_hash", "as_of_utc", "mode",
+            "token", "quote_asset", "requested_notionals_usd",
+            "pool_identities", "scenario_count", "summary", "scenarios",
+            "snapshot_sha256",
+        ),
+        "research snapshot",
+    )
+    if snapshot["schema"] != SNAPSHOT_SCHEMA:
+        raise ResearchContractError("research snapshot schema is invalid")
+    if (
+        not isinstance(snapshot["application_sha"], str)
+        or _GIT_SHA.fullmatch(snapshot["application_sha"]) is None
+    ):
+        raise ResearchContractError("application SHA is invalid")
+    _sha256(snapshot["registry_sha256"], "snapshot registry hash")
+    _sha256(snapshot["evidence_identity"], "snapshot evidence identity")
+    _positive_int(snapshot["as_of_block_number"], "snapshot block number")
+    _hash32(snapshot["as_of_block_hash"], "snapshot block hash")
+    if snapshot["as_of_block_hash"] == "0x" + "00" * 32:
+        raise ResearchContractError("snapshot block hash must be nonzero")
+    if not isinstance(snapshot["as_of_utc"], str):
+        raise ResearchContractError("snapshot UTC is invalid")
+    try:
+        parsed_utc = datetime.strptime(
+            snapshot["as_of_utc"], "%Y-%m-%dT%H:%M:%SZ"
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise ResearchContractError("snapshot UTC is invalid") from error
+    if parsed_utc != snapshot["as_of_utc"] or snapshot["mode"] != "historical_replay":
+        raise ResearchContractError("snapshot time or mode is invalid")
+    token = _exact_fields(
+        snapshot["token"], ("symbol", "address", "decimals"), "snapshot token"
+    )
+    quote_asset = _exact_fields(
+        snapshot["quote_asset"], ("symbol", "address", "decimals"),
+        "snapshot quote asset",
+    )
+    expected_token = {
+        "symbol": "SHIB",
+        "address": "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce",
+        "decimals": 18,
+    }
+    expected_quote = {
+        "symbol": "WETH",
+        "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "decimals": 18,
+    }
+    if token != expected_token or quote_asset != expected_quote:
+        raise ResearchContractError("snapshot asset identity is invalid")
+    if snapshot["requested_notionals_usd"] != list(_REQUESTED_NOTIONALS):
+        raise ResearchContractError("snapshot notionals are invalid")
+    if (
+        not isinstance(snapshot["pool_identities"], list)
+        or len(snapshot["pool_identities"]) != 2
+    ):
+        raise ResearchContractError("snapshot pool identities are invalid")
+    state_ids = {}
+    for value, expected_identity in zip(snapshot["pool_identities"], _FIXED_POOLS):
+        pool = _exact_fields(
+            value,
+            (
+                "dex", "pair_address", "state_id", "call_results_sha256",
+                "fee_evidence_sha256", "reserve_timestamp_last_raw",
+                "reserve_lag_seconds",
+            ),
+            "snapshot pool identity",
+        )
+        if (pool["dex"], pool["pair_address"]) != expected_identity:
+            raise ResearchContractError("snapshot pool identity is invalid")
+        if (
+            not isinstance(pool["state_id"], str)
+            or _V2_STATE_ID.fullmatch(pool["state_id"]) is None
+        ):
+            raise ResearchContractError("snapshot pool state ID is invalid")
+        _sha256(pool["call_results_sha256"], "pool call-results hash")
+        _sha256(pool["fee_evidence_sha256"], "pool fee-evidence hash")
+        _uint(pool["reserve_timestamp_last_raw"], 32, "pool reserve timestamp")
+        _uint(pool["reserve_lag_seconds"], 32, "pool reserve lag")
+        state_ids[expected_identity] = pool["state_id"]
+    if snapshot["scenario_count"] != 10 or type(snapshot["scenario_count"]) is not int:
+        raise ResearchContractError("snapshot scenario count is invalid")
+    if (
+        not isinstance(snapshot["scenarios"], list)
+        or len(snapshot["scenarios"]) != 10
+    ):
+        raise ResearchContractError("snapshot scenarios are invalid")
+    index = 0
+    scenarios = []
+    pool_references = {}
+    usd_per_weth_raw = None
+    for route in _FIXED_ROUTES:
+        for notional in _REQUESTED_NOTIONALS:
+            scenario = _validate_scenario(
+                snapshot["scenarios"][index], route, notional, state_ids
+            )
+            for identity, field in (
+                (route[1], "buy_pool_reference_shib_usd"),
+                (route[2], "sell_pool_reference_shib_usd"),
+            ):
+                reference = _validated_ratio(
+                    scenario[field], "scenario pool reference", positive=True
+                )
+                prior = pool_references.setdefault(identity, reference)
+                if reference != prior:
+                    raise ResearchContractError(
+                        "scenario pool reference is inconsistent"
+                    )
+            if scenario["classification"] != "unavailable":
+                scenario_conversion = _validated_ratio(
+                    scenario["buy_cost_usd"], "scenario buy cost", positive=True
+                ) / scenario["buy_weth_raw"]
+                if usd_per_weth_raw is None:
+                    usd_per_weth_raw = scenario_conversion
+                elif scenario_conversion != usd_per_weth_raw:
+                    raise ResearchContractError(
+                        "scenario USD conversion is inconsistent"
+                    )
+            scenarios.append(scenario)
+            index += 1
+    summary = _exact_fields(
+        snapshot["summary"],
+        (
+            "expected_scenario_count", "observed_scenario_count",
+            "usable_scenario_count", "classification_counts",
+            "strict_eligible_count", "executable_count",
+            "missing_cost_field_count",
+        ),
+        "snapshot summary",
+    )
+    counts = _exact_fields(
+        summary["classification_counts"],
+        (
+            "non_positive_pool_edge",
+            "positive_pool_edge_costs_incomplete",
+            "unavailable",
+        ),
+        "snapshot classification counts",
+    )
+    for field in (
+        "expected_scenario_count", "observed_scenario_count",
+        "usable_scenario_count", "strict_eligible_count", "executable_count",
+        "missing_cost_field_count",
+    ):
+        _nonnegative_int(summary[field], "snapshot summary " + field)
+    for classification, count in counts.items():
+        _nonnegative_int(count, "snapshot classification " + classification)
+    if summary != _snapshot_summary(scenarios):
+        raise ResearchContractError("snapshot summary does not recompute")
+    _sha256(snapshot["snapshot_sha256"], "snapshot self-hash")
+    if snapshot["snapshot_sha256"] != snapshot_sha256(snapshot):
+        raise ResearchContractError("snapshot self-hash does not recompute")
+    scan_public_payload(snapshot)
+    return json.loads(canonical_json_bytes(snapshot).decode("utf-8"))
 
 
 def scan_public_payload(payload: object) -> None:

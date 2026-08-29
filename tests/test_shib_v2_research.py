@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import copy
+from decimal import Decimal
+from fractions import Fraction
 import hashlib
 import inspect
 import json
@@ -21,6 +23,12 @@ from scripts import shib_v2_research_io
 from scripts import capture_shib_v2_research_evidence as capture
 from scripts.capture_shib_v2_research_evidence import Provider
 from scripts.shib_v2_research_io import load_bounded_json
+from scripts.route_quantity import (
+    CommonTarget,
+    MarketRules,
+    V2PoolState,
+    quote_v2_pool_quantity,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -727,6 +735,183 @@ def valid_rpc_responses(registry):
     }
     responses = {"chain_id": "0x1", "header": header, "results": results}
     return copy.deepcopy(responses), copy.deepcopy(responses)
+
+
+def expected_scenario_keys():
+    routes = (
+        "shib-v2v2:eth:uniswap_v2:"
+        "0x811beed0119b4afce20d2583eb608c6f7af1954f:to:shibaswap_v1:"
+        "0xcf6daab95c476106eca715d48de4b13287ffdeaa",
+        "shib-v2v2:eth:shibaswap_v1:"
+        "0xcf6daab95c476106eca715d48de4b13287ffdeaa:to:uniswap_v2:"
+        "0x811beed0119b4afce20d2583eb608c6f7af1954f",
+    )
+    notionals = ("1000", "5000", "10000", "50000", "100000")
+    return [
+        (route, notional)
+        for route in routes
+        for notional in notionals
+    ]
+
+
+def _set_fixture_pool_reserves(evidence, reserve_pairs):
+    shib_address = next(
+        token["address"] for token in evidence["tokens"]
+        if token["symbol"] == "SHIB"
+    )
+    weth_address = next(
+        token["address"] for token in evidence["tokens"]
+        if token["symbol"] == "WETH"
+    )
+    for pool, (shib_raw, weth_raw) in zip(evidence["pools"], reserve_pairs):
+        if (pool["token0_address"], pool["token1_address"]) != (
+            shib_address, weth_address
+        ):
+            raise AssertionError("fixture pool token order changed")
+        pool["reserve0_raw"] = shib_raw
+        pool["reserve1_raw"] = weth_raw
+        pool["token0_balance_raw"] = shib_raw
+        pool["token1_balance_raw"] = weth_raw
+        pair = pool["pair_address"]
+        _replace_test_call_result(
+            evidence,
+            "pair.getReserves",
+            pair,
+            _result_hex(
+                _abi_word(shib_raw)
+                + _abi_word(weth_raw)
+                + _abi_word(pool["reserve_timestamp_last_raw"])
+            ),
+        )
+        _replace_test_call_result(
+            evidence,
+            "erc20.balanceOf",
+            shib_address,
+            _result_hex(_abi_word(shib_raw)),
+            pair[2:],
+        )
+        _replace_test_call_result(
+            evidence,
+            "erc20.balanceOf",
+            weth_address,
+            _result_hex(_abi_word(weth_raw)),
+            pair[2:],
+        )
+    return _reseal_evidence(evidence)
+
+
+def build_from_reserves(reserve_pairs):
+    registry, _, trust_anchor = fixture_registry_and_code_results()
+    with mock.patch.object(
+        shib_v2_research, "_AUTHORITY_TRUST_ANCHOR", trust_anchor
+    ):
+        registry = shib_v2_research.load_research_registry(registry)
+        evidence = _set_fixture_pool_reserves(
+            valid_evidence_payload(registry), reserve_pairs
+        )
+        return shib_v2_research.build_research_snapshot(
+            evidence, registry, "1" * 40
+        )
+
+
+def positive_edge_reserves():
+    reserve_shib = 1_000_000 * 10**18
+    return (
+        (reserve_shib, 90 * 10**18),
+        (reserve_shib, 100 * 10**18),
+    )
+
+
+def v2_quote_oracle(
+    reserve_shib_raw,
+    reserve_weth_raw,
+    target_shib_raw,
+    direction,
+    shib_is_token0=True,
+):
+    shib_address = "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce"
+    weth_address = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+    pool_address = "0x811beed0119b4afce20d2583eb608c6f7af1954f"
+    token0_address = shib_address if shib_is_token0 else weth_address
+    token1_address = weth_address if shib_is_token0 else shib_address
+    reserve0_raw = reserve_shib_raw if shib_is_token0 else reserve_weth_raw
+    reserve1_raw = reserve_weth_raw if shib_is_token0 else reserve_shib_raw
+    observed_at = "2024-03-09T16:00:00Z"
+    state = V2PoolState(
+        chain="eth",
+        chain_id=1,
+        dex="uniswap_v2",
+        pool_address=pool_address,
+        token0_address=token0_address,
+        token1_address=token1_address,
+        token0_decimals=18,
+        token1_decimals=18,
+        reserve0_raw=reserve0_raw,
+        reserve1_raw=reserve1_raw,
+        reserve_timestamp_last_raw=1709999990,
+        fee_bps=30,
+        fee_numerator=997,
+        fee_denominator=1000,
+        fee_formula=(
+            "amount_in_with_fee=amount_in*fee_numerator;"
+            "denominator=reserve_in*fee_denominator+amount_in_with_fee"
+        ),
+        fee_proof_sha256="a" * 64,
+        block_number=20000000,
+        block_hash="0x" + "1" * 64,
+        block_header_sha256="b" * 64,
+        observed_at=observed_at,
+        raw_response_sha256="c" * 64,
+    )
+    rules = MarketRules(
+        market_id="dex:eth:uniswap_v2:{}:SHIB".format(pool_address),
+        base_asset="SHIB",
+        quote_asset="WETH",
+        base_unit_decimals=18,
+        quote_unit_decimals=18,
+        base_increment=Decimal("0.000000000000000001"),
+        quote_increment=Decimal("0.000000000000000001"),
+        min_base_quantity=Decimal(0),
+        min_quote_notional=Decimal(0),
+        observed_at=observed_at,
+        valid_until="2024-03-09T16:00:01Z",
+        source_record_sha256="c" * 64,
+    )
+    target = CommonTarget(
+        asset="SHIB",
+        unit_decimals=18,
+        raw_quantity=target_shib_raw,
+        lattice_raw=1,
+    )
+    return quote_v2_pool_quantity(
+        state,
+        target,
+        rules,
+        direction=direction,
+        target_token_address=shib_address,
+        quote_token_address=weth_address,
+        cohort_now=observed_at,
+    )
+
+
+def mutate_reserve_and_rebind(evidence):
+    changed = copy.deepcopy(evidence)
+    pool = changed["pools"][0]
+    return _set_fixture_pool_reserves(
+        changed,
+        (
+            (pool["reserve0_raw"] + 1, pool["reserve1_raw"]),
+            (
+                changed["pools"][1]["reserve0_raw"],
+                changed["pools"][1]["reserve1_raw"],
+            ),
+        ),
+    )
+
+
+def _reseal_snapshot(snapshot):
+    snapshot["snapshot_sha256"] = shib_v2_research.snapshot_sha256(snapshot)
+    return snapshot
 
 
 class RecordingRpc:
@@ -2053,6 +2238,273 @@ class ResearchEvidenceTests(unittest.TestCase):
         except Exception as error:
             self.fail("validator leaked non-contract error: {!r}".format(error))
         self.fail("out-of-range block timestamp was accepted")
+
+
+class ResearchSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        registry, _, trust_anchor = fixture_registry_and_code_results()
+        self.authority_patcher = mock.patch.object(
+            shib_v2_research, "_AUTHORITY_TRUST_ANCHOR", trust_anchor
+        )
+        self.authority_patcher.start()
+        self.addCleanup(self.authority_patcher.stop)
+        self.registry = shib_v2_research.load_research_registry(registry)
+        self.evidence = valid_evidence_payload(self.registry)
+
+    def test_snapshot_has_two_routes_five_notionals_and_no_executable_claim(self):
+        snapshot = shib_v2_research.build_research_snapshot(
+            self.evidence, self.registry, "1" * 40
+        )
+        self.assertEqual(snapshot["schema"], "shib_v2_research_snapshot/v1")
+        self.assertEqual(snapshot["mode"], "historical_replay")
+        self.assertEqual(snapshot["scenario_count"], 10)
+        self.assertEqual(
+            [
+                (row["route_id"], row["requested_notional_usd"])
+                for row in snapshot["scenarios"]
+            ],
+            expected_scenario_keys(),
+        )
+        for row in snapshot["scenarios"]:
+            self.assertFalse(row["strict_eligible"])
+            self.assertFalse(row["executable"])
+            self.assertIsNone(row["network_gas_usd"])
+            self.assertIsNone(row["net_edge_usd"])
+
+    def test_positive_edge_is_cost_incomplete_not_opportunity(self):
+        snapshot = build_from_reserves(positive_edge_reserves())
+        row = next(
+            item for item in snapshot["scenarios"]
+            if item["route_id"] == expected_scenario_keys()[0][0]
+            and item["requested_notional_usd"] == "1000"
+        )
+        self.assertEqual(row["common_shib_raw"], 5_000 * 10**18)
+        self.assertEqual(row["buy_weth_raw"], 453622173051818773)
+        self.assertEqual(row["sell_weth_raw"], 496027303890107812)
+        self.assertEqual(row["gross_edge_weth_raw"], 42405130838289039)
+        self.assertEqual(
+            row["classification"], "positive_pool_edge_costs_incomplete"
+        )
+        self.assertEqual(row["reason_codes"], [
+            "fixed_block_fee_proof_not_authenticated",
+            "route_costs_not_evaluated",
+        ])
+        self.assertNotIn("opportunity", json.dumps(row))
+        self.assertIsNone(row["net_edge_usd"])
+
+    def test_v2_integer_rounding_oracles_and_token_order(self):
+        shib = 1_000_000 * 10**18
+        target = 5_000 * 10**18
+        expected = {
+            (90 * 10**18, "buy"): 453622173051818773,
+            (90 * 10**18, "sell"): 446424573501097031,
+            (100 * 10**18, "buy"): 504024636724243082,
+            (100 * 10**18, "sell"): 496027303890107812,
+        }
+        for shib_is_token0 in (True, False):
+            for (weth, direction), expected_raw in expected.items():
+                with self.subTest(
+                    shib_is_token0=shib_is_token0,
+                    weth=weth,
+                    direction=direction,
+                ):
+                    quote = v2_quote_oracle(
+                        shib,
+                        weth,
+                        target,
+                        direction,
+                        shib_is_token0=shib_is_token0,
+                    )
+                    self.assertEqual(quote.status, "calculation_complete")
+                    self.assertEqual(
+                        shib_v2_research._quote_weth_raw(quote), expected_raw
+                    )
+
+    def test_exact_output_at_reserve_is_unavailable_not_zero(self):
+        reserve_shib = 1_000_000 * 10**18
+        quote = v2_quote_oracle(
+            reserve_shib,
+            90 * 10**18,
+            reserve_shib,
+            "buy",
+        )
+        self.assertEqual(quote.status, "unavailable")
+        self.assertEqual(quote.reason_code, "pool_reserve_insufficient")
+        self.assertIsNone(quote.gross_quote_quantity)
+
+    def test_negative_and_measured_zero_edges_remain_distinct_exact_values(self):
+        reverse = tuple(reversed(positive_edge_reserves()))
+        negative = build_from_reserves(reverse)
+        negative_row = negative["scenarios"][0]
+        self.assertLess(negative_row["gross_edge_weth_raw"], 0)
+        self.assertEqual(
+            negative_row["classification"], "non_positive_pool_edge"
+        )
+        self.assertEqual(negative_row["reason_codes"], [
+            "fixed_block_fee_proof_not_authenticated"
+        ])
+
+        reserve_shib = 1_000_000 * 10**18
+        measured_zero = build_from_reserves((
+            (reserve_shib, 90 * 10**18),
+            (reserve_shib, 91535531406622513776),
+        ))
+        zero_row = measured_zero["scenarios"][0]
+        self.assertEqual(zero_row["gross_edge_weth_raw"], 0)
+        self.assertEqual(
+            zero_row["gross_edge_usd"], {"numerator": 0, "denominator": 1}
+        )
+        self.assertEqual(
+            zero_row["gross_edge_bps"], {"numerator": 0, "denominator": 1}
+        )
+        self.assertEqual(zero_row["classification"], "non_positive_pool_edge")
+
+    def test_unavailable_scenario_keeps_quote_and_edge_values_null(self):
+        reserve_shib = 1_000_000 * 10**18
+        snapshot = build_from_reserves((
+            (reserve_shib, 40 * 10**18),
+            (reserve_shib, 40 * 10**18),
+        ))
+        row = snapshot["scenarios"][4]
+        self.assertEqual(row["requested_notional_usd"], "100000")
+        self.assertEqual(row["common_shib_raw"], 1_250_000 * 10**18)
+        self.assertEqual(row["buy_quote_status"], "unavailable")
+        self.assertEqual(row["buy_quote_reason"], "pool_reserve_insufficient")
+        self.assertEqual(row["classification"], "unavailable")
+        self.assertEqual(row["reason_codes"], ["pool_reserve_insufficient"])
+        for field in (
+            "buy_weth_raw", "sell_weth_raw", "gross_edge_weth_raw",
+            "buy_cost_usd", "sell_proceeds_usd", "gross_edge_usd",
+            "gross_edge_bps", "network_gas_usd", "net_edge_usd",
+        ):
+            self.assertIsNone(row[field], field)
+        self.assertGreater(
+            snapshot["summary"]["classification_counts"]["unavailable"], 0
+        )
+
+    def test_same_inputs_are_byte_identical_and_mutation_changes_identity(self):
+        first = shib_v2_research.build_research_snapshot(
+            self.evidence, self.registry, "1" * 40
+        )
+        second = shib_v2_research.build_research_snapshot(
+            self.evidence, self.registry, "1" * 40
+        )
+        self.assertEqual(
+            shib_v2_research.canonical_json_bytes(first),
+            shib_v2_research.canonical_json_bytes(second),
+        )
+        changed = mutate_reserve_and_rebind(self.evidence)
+        self.assertNotEqual(
+            shib_v2_research.build_research_snapshot(
+                changed, self.registry, "1" * 40
+            )["snapshot_sha256"],
+            first["snapshot_sha256"],
+        )
+
+    def test_validator_rejects_forged_scenario_summary_and_self_hash(self):
+        snapshot = shib_v2_research.build_research_snapshot(
+            self.evidence, self.registry, "1" * 40
+        )
+        mutations = []
+
+        forged_scenario = copy.deepcopy(snapshot)
+        forged_scenario["scenarios"][0]["buy_weth_raw"] += 1
+        mutations.append(_reseal_snapshot(forged_scenario))
+
+        forged_summary = copy.deepcopy(snapshot)
+        forged_summary["summary"]["usable_scenario_count"] -= 1
+        mutations.append(_reseal_snapshot(forged_summary))
+
+        forged_hash = copy.deepcopy(snapshot)
+        forged_hash["snapshot_sha256"] = "f" * 64
+        mutations.append(forged_hash)
+
+        noncanonical_ratio = copy.deepcopy(snapshot)
+        ratio = noncanonical_ratio["scenarios"][0]["buy_cost_usd"]
+        ratio["numerator"] *= 2
+        ratio["denominator"] *= 2
+        mutations.append(_reseal_snapshot(noncanonical_ratio))
+
+        forged_pool_reference = copy.deepcopy(snapshot)
+        forged_pool_reference["scenarios"][0][
+            "buy_pool_reference_shib_usd"
+        ] = {"numerator": 1, "denominator": 1000}
+        mutations.append(_reseal_snapshot(forged_pool_reference))
+
+        forged_usd_conversion = copy.deepcopy(snapshot)
+        for field in ("buy_cost_usd", "sell_proceeds_usd", "gross_edge_usd"):
+            ratio = forged_usd_conversion["scenarios"][0][field]
+            doubled = Fraction(ratio["numerator"] * 2, ratio["denominator"])
+            forged_usd_conversion["scenarios"][0][field] = {
+                "numerator": doubled.numerator,
+                "denominator": doubled.denominator,
+            }
+        mutations.append(_reseal_snapshot(forged_usd_conversion))
+
+        for mutation in mutations:
+            with self.subTest(hash=mutation["snapshot_sha256"]):
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research.validate_research_snapshot(mutation)
+
+    def test_validator_rejects_arbitrary_dex_quote_reason_and_reason_order(self):
+        positive = build_from_reserves(positive_edge_reserves())
+        arbitrary_dex = copy.deepcopy(positive)
+        arbitrary_dex["scenarios"][0]["buy_dex"] = "arbitrary_dex"
+
+        arbitrary_complete_reason = copy.deepcopy(positive)
+        arbitrary_complete_reason["scenarios"][0]["buy_quote_reason"] = (
+            "arbitrary_quote_reason"
+        )
+
+        wrong_reason_order = copy.deepcopy(positive)
+        wrong_reason_order["scenarios"][0]["reason_codes"].reverse()
+
+        reserve_shib = 1_000_000 * 10**18
+        unavailable = build_from_reserves((
+            (reserve_shib, 40 * 10**18),
+            (reserve_shib, 40 * 10**18),
+        ))
+        arbitrary_unavailable_reason = copy.deepcopy(unavailable)
+        arbitrary_unavailable_reason["scenarios"][4]["buy_quote_reason"] = (
+            "source_quote_asset_mismatch"
+        )
+
+        for mutation in (
+            arbitrary_dex,
+            arbitrary_complete_reason,
+            wrong_reason_order,
+            arbitrary_unavailable_reason,
+        ):
+            _reseal_snapshot(mutation)
+            with self.subTest(reason=mutation["scenarios"][0]["reason_codes"]):
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research.validate_research_snapshot(mutation)
+
+    def test_application_sha_and_summary_are_strict_and_recomputed(self):
+        with self.assertRaises(shib_v2_research.ResearchContractError):
+            shib_v2_research.build_research_snapshot(
+                self.evidence, self.registry, "A" * 40
+            )
+        snapshot = shib_v2_research.build_research_snapshot(
+            self.evidence, self.registry, "1" * 40
+        )
+        self.assertEqual(snapshot["summary"], {
+            "expected_scenario_count": 10,
+            "observed_scenario_count": 10,
+            "usable_scenario_count": 10,
+            "classification_counts": {
+                "non_positive_pool_edge": 10,
+                "positive_pool_edge_costs_incomplete": 0,
+                "unavailable": 0,
+            },
+            "strict_eligible_count": 0,
+            "executable_count": 0,
+            "missing_cost_field_count": 70,
+        })
+        self.assertEqual(
+            snapshot["snapshot_sha256"],
+            shib_v2_research.snapshot_sha256(snapshot),
+        )
 
 
 class SafeJsonBoundaryTests(unittest.TestCase):
