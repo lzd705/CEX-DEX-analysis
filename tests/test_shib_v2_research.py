@@ -6,12 +6,16 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from scripts import shib_v2_research
 from scripts import shib_v2_research_io
+from scripts import capture_shib_v2_research_evidence as capture
+from scripts.capture_shib_v2_research_evidence import Provider
 from scripts.shib_v2_research_io import load_bounded_json
 
 
@@ -681,6 +685,125 @@ def valid_evidence_payload(registry):
     return evidence
 
 
+def valid_rpc_responses(registry):
+    evidence = valid_evidence_payload(registry)
+    block = evidence["block"]
+    header = {
+        "number": hex(block["number"]),
+        "hash": block["hash"],
+        "parentHash": block["parent_hash"],
+        "timestamp": hex(block["timestamp"]),
+        "stateRoot": block["state_root"],
+        "baseFeePerGas": hex(block["base_fee_per_gas"]),
+    }
+    results = {
+        (call["target"], call["calldata"]): call["result_hex"]
+        for call in evidence["logical_calls"]
+    }
+    responses = {"chain_id": "0x1", "header": header, "results": results}
+    return copy.deepcopy(responses), copy.deepcopy(responses)
+
+
+class RecordingRpc:
+    def __init__(self, responses):
+        self.responses = responses
+        self.requests = []
+
+    @property
+    def fixed_block_state_requests(self):
+        return [
+            request for request in self.requests
+            if request["method"] in {"eth_call", "eth_getCode"}
+        ]
+
+    def __call__(self, method, params):
+        request = {"method": method, "params": copy.deepcopy(params)}
+        self.requests.append(request)
+        if method == "eth_chainId":
+            return self.responses["chain_id"]
+        if method in {"eth_getBlockByNumber", "eth_getBlockByHash"}:
+            return copy.deepcopy(self.responses["header"])
+        if method == "eth_getCode":
+            return self.responses["results"][(params[0], "0x")]
+        if method == "eth_call":
+            return self.responses["results"][(params[0]["to"], params[0]["data"])]
+        raise AssertionError("unexpected RPC method: {}".format(method))
+
+
+class ChangedRoundTripRpc(RecordingRpc):
+    def __call__(self, method, params):
+        if method == "eth_getBlockByHash":
+            self.requests.append({"method": method, "params": copy.deepcopy(params)})
+            header = copy.deepcopy(self.responses["header"])
+            header["stateRoot"] = "0x" + "44" * 32
+            return header
+        return super().__call__(method, params)
+
+
+class ChangedFinalRoundTripRpc(RecordingRpc):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.by_hash_count = 0
+
+    def __call__(self, method, params):
+        if method == "eth_getBlockByHash":
+            self.by_hash_count += 1
+            if self.by_hash_count == 2:
+                self.requests.append({
+                    "method": method,
+                    "params": copy.deepcopy(params),
+                })
+                header = copy.deepcopy(self.responses["header"])
+                header["stateRoot"] = "0x" + "66" * 32
+                return header
+        return super().__call__(method, params)
+
+
+class Eip1898RejectingRpc(RecordingRpc):
+    def __call__(self, method, params):
+        if method in {"eth_call", "eth_getCode"}:
+            self.requests.append({"method": method, "params": copy.deepcopy(params)})
+            raise capture.CaptureError("eip1898_unavailable")
+        return super().__call__(method, params)
+
+
+class TransientStateRpc(RecordingRpc):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.failed_once = False
+
+    def __call__(self, method, params):
+        if method in {"eth_call", "eth_getCode"} and not self.failed_once:
+            self.failed_once = True
+            self.requests.append({"method": method, "params": copy.deepcopy(params)})
+            raise OSError("transient provider failure")
+        return super().__call__(method, params)
+
+
+class StaticHttpResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def read(self, limit):
+        return self.body[:limit]
+
+
+class StaticOpener:
+    def __init__(self, body):
+        self.body = body
+        self.requests = []
+
+    def open(self, request, timeout):
+        self.requests.append((request, timeout))
+        return StaticHttpResponse(self.body)
+
+
 def remove_logical_call(payload):
     removed = next(
         call for call in payload["logical_calls"] if call["method"] == "fee.beta"
@@ -1095,6 +1218,413 @@ class ResearchRegistryTests(unittest.TestCase):
             shib_v2_research.load_research_registry(repository_registry)["schema"],
             "shib_v2_research_registry/v1",
         )
+
+
+class ResearchCaptureTests(unittest.TestCase):
+    def setUp(self):
+        registry, _, trust_anchor = fixture_registry_and_code_results()
+        self.authority_patcher = mock.patch.object(
+            shib_v2_research, "_AUTHORITY_TRUST_ANCHOR", trust_anchor
+        )
+        self.authority_patcher.start()
+        self.addCleanup(self.authority_patcher.stop)
+        self.registry = shib_v2_research.load_research_registry(registry)
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.output = Path(self.temporary_directory.name) / "evidence.json"
+        self.block_hash = "0x" + "11" * 32
+
+    def test_capture_uses_one_finalized_hash_and_eip1898_for_every_call(self):
+        responses_a, responses_b = valid_rpc_responses(self.registry)
+        provider_a = RecordingRpc(responses_a)
+        provider_b = RecordingRpc(responses_b)
+        evidence = capture.capture_research_evidence(
+            self.registry,
+            [
+                Provider("provider_a", "a" * 64, provider_a),
+                Provider("provider_b", "b" * 64, provider_b),
+            ],
+            self.output,
+        )
+        self.assertEqual(evidence["collection_quality"]["state"], "evaluated")
+        self.assertEqual(len(evidence["logical_calls"]), 35)
+        self.assertEqual(len(evidence["provider_observations"]), 70)
+        for recorder in (provider_a, provider_b):
+            self.assertEqual(len(recorder.fixed_block_state_requests), 35)
+            for request in recorder.fixed_block_state_requests:
+                self.assertEqual(
+                    request["params"][1],
+                    {"blockHash": self.block_hash, "requireCanonical": True},
+                )
+        self.assertEqual(
+            self.output.read_bytes(),
+            shib_v2_research.canonical_json_bytes(evidence) + b"\n",
+        )
+        rendered = self.output.read_text(encoding="utf-8")
+        self.assertNotIn("a" * 64, rendered)
+        self.assertNotIn("b" * 64, rendered)
+        for recorder in (provider_a, provider_b):
+            methods = [request["method"] for request in recorder.requests]
+            self.assertEqual(methods.count("eth_getBlockByNumber"), 1)
+            self.assertEqual(methods.count("eth_getBlockByHash"), 2)
+            self.assertEqual(
+                {request["method"] for request in recorder.fixed_block_state_requests},
+                {"eth_call", "eth_getCode"},
+            )
+            self.assertEqual(
+                [
+                    request["params"]
+                    for request in recorder.requests
+                    if request["method"] == "eth_getBlockByNumber"
+                ],
+                [["finalized", False]],
+            )
+            self.assertEqual(
+                [
+                    request["params"]
+                    for request in recorder.requests
+                    if request["method"] == "eth_getBlockByHash"
+                ],
+                [[self.block_hash, False], [self.block_hash, False]],
+            )
+
+    def _provider_pair(self, rpc_a, rpc_b):
+        return [
+            Provider("provider_a", "a" * 64, rpc_a),
+            Provider("provider_b", "b" * 64, rpc_b),
+        ]
+
+    def _failing_providers(self, failure):
+        responses_a, responses_b = valid_rpc_responses(self.registry)
+        if failure == "wrong_chain_id":
+            responses_a["chain_id"] = "0x2"
+        elif failure == "different_finalized_hash":
+            responses_b["header"]["hash"] = "0x" + "55" * 32
+        elif failure == "different_call_bytes":
+            first_key = next(iter(responses_b["results"]))
+            responses_b["results"][first_key] = "0x" + "ff" * 32
+        elif failure == "missing_state":
+            first_key = next(iter(responses_a["results"]))
+            responses_a["results"][first_key] = "0x"
+        elif failure == "oversized_response":
+            first_key = next(iter(responses_a["results"]))
+            responses_a["results"][first_key] = (
+                "0x" + "00" * (capture.MAX_CALL_RESULT_BYTES + 1)
+            )
+        rpc_a = RecordingRpc(responses_a)
+        rpc_b = RecordingRpc(responses_b)
+        if failure == "eip1898_error":
+            rpc_a = Eip1898RejectingRpc(responses_a)
+        elif failure == "changed_round_trip_header":
+            rpc_b = ChangedRoundTripRpc(responses_b)
+        elif failure == "changed_final_header":
+            rpc_b = ChangedFinalRoundTripRpc(responses_b)
+        return self._provider_pair(rpc_a, rpc_b)
+
+    def test_capture_preserves_absent_or_existing_output_on_every_failure(self):
+        failures = (
+            "wrong_chain_id",
+            "different_finalized_hash",
+            "different_call_bytes",
+            "eip1898_error",
+            "missing_state",
+            "changed_round_trip_header",
+            "changed_final_header",
+            "oversized_response",
+        )
+        for failure in failures:
+            for original in (None, b"old-output\n"):
+                with self.subTest(failure=failure, original=original):
+                    self.output.unlink(missing_ok=True)
+                    if original is not None:
+                        self.output.write_bytes(original)
+                    with self.assertRaises(capture.CaptureError) as caught:
+                        capture.capture_research_evidence(
+                            self.registry,
+                            self._failing_providers(failure),
+                            self.output,
+                        )
+                    self.assertIn(caught.exception.reason_code, capture.CAPTURE_REASONS)
+                    if original is None:
+                        self.assertFalse(self.output.exists())
+                    else:
+                        self.assertEqual(self.output.read_bytes(), original)
+
+    def test_configuration_rejects_cardinality_labels_and_endpoint_duplicates_first(
+        self,
+    ):
+        class NoRequestRpc:
+            def __call__(self, method, params):
+                raise AssertionError("configuration error reached transport")
+
+        rpc = NoRequestRpc()
+        invalid_provider_sets = (
+            [Provider("provider_a", "a" * 64, rpc)],
+            [
+                Provider("provider_a", "a" * 64, rpc),
+                Provider("provider_a", "b" * 64, rpc),
+            ],
+            [
+                Provider("provider_a", "a" * 64, rpc),
+                Provider("provider_b", "a" * 64, rpc),
+            ],
+            [
+                Provider("provider_a", "a" * 64, rpc),
+                Provider("provider_b", "b" * 64, rpc),
+                Provider("provider_b", "c" * 64, rpc),
+            ],
+        )
+        for providers in invalid_provider_sets:
+            for original in (None, b"old-output\n"):
+                with self.subTest(count=len(providers), original=original):
+                    self.output.unlink(missing_ok=True)
+                    if original is not None:
+                        self.output.write_bytes(original)
+                    with self.assertRaisesRegex(
+                        capture.CaptureError, "^capture_configuration_invalid$"
+                    ):
+                        capture.capture_research_evidence(
+                            self.registry, providers, self.output
+                        )
+                    if original is None:
+                        self.assertFalse(self.output.exists())
+                    else:
+                        self.assertEqual(self.output.read_bytes(), original)
+
+    def test_retry_repeats_the_same_eip1898_hash_without_new_block_selection(self):
+        responses_a, responses_b = valid_rpc_responses(self.registry)
+        provider_a = TransientStateRpc(responses_a)
+        provider_b = RecordingRpc(responses_b)
+        capture.capture_research_evidence(
+            self.registry,
+            self._provider_pair(provider_a, provider_b),
+            self.output,
+        )
+        first, retry = provider_a.fixed_block_state_requests[:2]
+        self.assertEqual(first, retry)
+        self.assertEqual(
+            first["params"][1],
+            {"blockHash": self.block_hash, "requireCanonical": True},
+        )
+        self.assertEqual(
+            sum(
+                request["method"] == "eth_getBlockByNumber"
+                for request in provider_a.requests
+            ),
+            1,
+        )
+
+    def test_capture_failure_never_contains_url_key_or_provider_body(self):
+        secret_url = "https://rpc.example/v2/sk-live-private"
+
+        class FailingRpc:
+            def __call__(self, method, params):
+                raise OSError(
+                    secret_url + " provider said account@example.test"
+                )
+
+        with self.assertRaises(capture.CaptureError) as caught:
+            capture.capture_research_evidence(
+                self.registry,
+                self._provider_pair(FailingRpc(), FailingRpc()),
+                self.output,
+            )
+        rendered = str(caught.exception)
+        self.assertEqual(rendered, "rpc_response_invalid")
+        self.assertNotIn(secret_url, rendered)
+        self.assertNotIn("account@example.test", rendered)
+        self.assertEqual(
+            capture.sanitize_capture_failure(
+                ValueError(secret_url + " account@example.test")
+            ),
+            "rpc_response_invalid",
+        )
+        self.assertEqual(
+            str(capture.CaptureError("not_allowlisted")),
+            "rpc_response_invalid",
+        )
+
+    def test_bounded_transport_uses_fixed_post_envelope_and_maps_remote_errors(self):
+        endpoint = "https://rpc.example/v2/sk-live-private"
+        transport = capture.BoundedJsonRpcTransport(endpoint, 7)
+        success = StaticOpener(
+            b'{"id":1,"jsonrpc":"2.0","result":"0x1"}'
+        )
+        transport._opener = success
+        self.assertEqual(transport("eth_chainId", []), "0x1")
+        request, timeout = success.requests[0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(timeout, 7)
+        self.assertEqual(
+            json.loads(request.data.decode("utf-8")),
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_chainId",
+                "params": [],
+            },
+        )
+
+        remote_error = StaticOpener(
+            b'{"error":{"code":-32000,"message":"sk-live-private '
+            b'account@example.test"},"id":1,"jsonrpc":"2.0"}'
+        )
+        transport._opener = remote_error
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^canonical_block_unavailable$"
+        ):
+            transport("eth_getBlockByNumber", ["finalized", False])
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^eip1898_unavailable$"
+        ):
+            transport(
+                "eth_getCode",
+                [
+                    "0x" + "11" * 20,
+                    {"blockHash": self.block_hash, "requireCanonical": True},
+                ],
+            )
+
+    def test_bounded_transport_rejects_oversize_members_and_unreviewed_requests(self):
+        transport = capture.BoundedJsonRpcTransport("https://rpc.example", 20)
+        transport._opener = StaticOpener(
+            b"x" * (capture.MAX_RPC_RESPONSE_BYTES + 1)
+        )
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^rpc_response_invalid$"
+        ):
+            transport("eth_chainId", [])
+        transport._opener = StaticOpener(
+            b'{"extra":0,"id":1,"jsonrpc":"2.0","result":"0x1"}'
+        )
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^rpc_response_invalid$"
+        ):
+            transport("eth_chainId", [])
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^capture_configuration_invalid$"
+        ):
+            transport("eth_getBalance", ["0x" + "11" * 20, "latest"])
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^capture_configuration_invalid$"
+        ):
+            transport(
+                "eth_getCode", ["0x" + "11" * 20, hex(20000000)]
+            )
+
+    def test_transport_accepts_bounded_blocks_and_rejects_structural_bombs(self):
+        block = {
+            "number": "0x1312d00",
+            "hash": self.block_hash,
+            "parentHash": "0x" + "22" * 32,
+            "timestamp": "0x65ec8780",
+            "stateRoot": "0x" + "33" * 32,
+            "baseFeePerGas": "0x0",
+            "transactions": ["0x" + "44" * 32 for _ in range(300)],
+        }
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": block},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        transport = capture.BoundedJsonRpcTransport("https://rpc.example", 20)
+        transport._opener = StaticOpener(body)
+        result = transport("eth_getBlockByNumber", ["finalized", False])
+        self.assertEqual(len(result["transactions"]), 300)
+
+        too_many = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [0] * (capture.MAX_RPC_MEMBERS + 1),
+        }).encode("utf-8")
+        transport._opener = StaticOpener(too_many)
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^rpc_response_invalid$"
+        ):
+            transport("eth_chainId", [])
+
+        nested = (
+            b'{"id":1,"jsonrpc":"2.0","result":'
+            + b"[" * 1100
+            + b"0"
+            + b"]" * 1100
+            + b"}"
+        )
+        transport._opener = StaticOpener(nested)
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^rpc_response_invalid$"
+        ):
+            transport("eth_chainId", [])
+
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^capture_configuration_invalid$"
+        ):
+            capture.BoundedJsonRpcTransport("http://[", 20)
+
+    def test_cli_rejects_equal_literal_urls_before_network_and_preserves_output(self):
+        registry_path = Path(self.temporary_directory.name) / "registry.json"
+        registry_path.write_bytes(REGISTRY_PATH.read_bytes())
+        command_prefix = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts/capture_shib_v2_research_evidence.py"),
+            "--registry",
+            str(registry_path),
+            "--rpc-url-a",
+            "http://127.0.0.1:1/private",
+            "--rpc-url-b",
+            "http://127.0.0.1:1/private",
+            "--output",
+            str(self.output),
+        ]
+        for original in (None, b"old-output\n"):
+            with self.subTest(original=original):
+                self.output.unlink(missing_ok=True)
+                if original is not None:
+                    self.output.write_bytes(original)
+                completed = subprocess.run(
+                    command_prefix,
+                    cwd=str(PROJECT_ROOT),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(completed.stdout, b"")
+                self.assertEqual(
+                    completed.stderr, b"capture_configuration_invalid\n"
+                )
+                if original is None:
+                    self.assertFalse(self.output.exists())
+                else:
+                    self.assertEqual(self.output.read_bytes(), original)
+
+    def test_cli_argument_errors_emit_only_allowlisted_configuration_reason(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(PROJECT_ROOT / "scripts/capture_shib_v2_research_evidence.py"),
+                "--registry",
+                str(REGISTRY_PATH),
+                "--rpc-url-a",
+                "http://127.0.0.1:1/a",
+                "--rpc-url-b",
+                "http://127.0.0.1:1/b",
+                "--output",
+                str(self.output),
+                "--timeout-seconds",
+                "sk-live-private-timeout",
+            ],
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"")
+        self.assertEqual(
+            completed.stderr, b"capture_configuration_invalid\n"
+        )
+        self.assertFalse(self.output.exists())
 
 
 class ResearchEvidenceTests(unittest.TestCase):
