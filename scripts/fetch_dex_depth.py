@@ -97,6 +97,7 @@ try:
         MIN_TICK as V3_MIN_TICK,
         count_initialized_ticks_crossed as count_v3_initialized_ticks_crossed,
         get_sqrt_ratio_at_tick as exact_v3_sqrt_ratio_at_tick,
+        get_tick_at_sqrt_ratio as exact_v3_tick_at_sqrt_ratio,
         simulate_swap as simulate_exact_v3_swap,
         sqrt_price_limit_for_bps as exact_v3_price_limit_for_bps,
     )
@@ -146,6 +147,7 @@ except ModuleNotFoundError:
         MIN_TICK as V3_MIN_TICK,
         count_initialized_ticks_crossed as count_v3_initialized_ticks_crossed,
         get_sqrt_ratio_at_tick as exact_v3_sqrt_ratio_at_tick,
+        get_tick_at_sqrt_ratio as exact_v3_tick_at_sqrt_ratio,
         simulate_swap as simulate_exact_v3_swap,
         sqrt_price_limit_for_bps as exact_v3_price_limit_for_bps,
     )
@@ -2258,6 +2260,501 @@ def _retained_quoter_results(
     return results
 
 
+def _retained_pool_call_results(
+    records: Any,
+    *,
+    pool_address: str,
+    block_number: int,
+) -> dict[str, str]:
+    """Return unique fixed-block pool eth_call results from retained records."""
+    if not isinstance(records, list):
+        raise ValueError("Uniswap V3 raw pool-state transcript is missing")
+    expected_block = hex(block_number)
+    results: dict[str, str] = {}
+    request_ids = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        requests = record.get("request")
+        responses = record.get("response")
+        request_items = requests if isinstance(requests, list) else [requests]
+        response_items = responses if isinstance(responses, list) else [responses]
+        selected = []
+        for request in request_items:
+            if not isinstance(request, dict) or request.get("method") != "eth_call":
+                continue
+            params = request.get("params")
+            call = params[0] if isinstance(params, list) and len(params) == 2 else None
+            if (
+                isinstance(call, dict)
+                and str(call.get("to") or "").strip().lower() == pool_address
+            ):
+                selected.append(request)
+        if not selected:
+            continue
+        record_request_ids = [
+            item.get("id") for item in request_items if isinstance(item, dict)
+        ]
+        record_response_ids = [
+            item.get("id") for item in response_items if isinstance(item, dict)
+        ]
+        if (
+            len(record_request_ids) != len(request_items)
+            or len(record_response_ids) != len(response_items)
+            or len(record_request_ids) != len(record_response_ids)
+            or any(type(value) is not int for value in record_request_ids)
+            or any(type(value) is not int for value in record_response_ids)
+            or len(record_request_ids) != len(set(record_request_ids))
+            or len(record_response_ids) != len(set(record_response_ids))
+            or set(record_request_ids) != set(record_response_ids)
+        ):
+            raise ValueError("Uniswap V3 raw pool-state request mapping is invalid")
+        responses_by_id = {
+            response["id"]: response
+            for response in response_items
+            if isinstance(response, dict) and type(response.get("id")) is int
+        }
+        for request in selected:
+            params = request["params"]
+            call = params[0]
+            request_id = request.get("id")
+            data = str(call.get("data") or "").strip().lower()
+            response = responses_by_id.get(request_id)
+            result = response.get("result") if isinstance(response, dict) else None
+            if (
+                request.get("jsonrpc") != "2.0"
+                or type(request_id) is not int
+                or request_id in request_ids
+                or params[1] != expected_block
+                or re.fullmatch(r"0x[0-9a-f]+", data, flags=re.ASCII) is None
+                or len(data) % 2 != 0
+                or not isinstance(response, dict)
+                or response.get("jsonrpc") != "2.0"
+                or response.get("id") != request_id
+                or "error" in response
+                or not isinstance(result, str)
+                or re.fullmatch(
+                    r"0x(?:[0-9a-f]{64})+", result, flags=re.ASCII
+                )
+                is None
+                or data in results
+            ):
+                raise ValueError("Uniswap V3 raw pool-state evidence is invalid")
+            request_ids.add(request_id)
+            results[data] = result
+    if not results:
+        raise ValueError("Uniswap V3 raw pool-state evidence is missing")
+    return results
+
+
+def _required_pool_call(
+    results: Mapping[str, str],
+    data: str,
+    label: str,
+) -> str:
+    result = results.get(data)
+    if result is None:
+        raise ValueError(f"Uniswap V3 raw {label} evidence is missing")
+    return result
+
+
+def _exact_abi_words(result: str, count: int, label: str) -> list[int]:
+    encoded_words = words(result)
+    if len(encoded_words) != count:
+        raise ValueError(f"Uniswap V3 raw {label} ABI word count is invalid")
+    return [int(value, 16) for value in encoded_words]
+
+
+def _exact_abi_uint(word: int, bits: int, label: str) -> int:
+    if type(word) is not int or not 0 <= word < 1 << bits:
+        raise ValueError(f"Uniswap V3 raw {label} ABI uint{bits} is invalid")
+    return word
+
+
+def _exact_abi_int(word: int, bits: int, label: str) -> int:
+    if type(word) is not int or not 0 <= word < 1 << 256:
+        raise ValueError(f"Uniswap V3 raw {label} ABI int{bits} is invalid")
+    masked = word & ((1 << bits) - 1)
+    value = masked - (1 << bits) if masked & (1 << (bits - 1)) else masked
+    if word != value % (1 << 256):
+        raise ValueError(
+            f"Uniswap V3 raw {label} ABI int{bits} extension is invalid"
+        )
+    return value
+
+
+def _exact_abi_address(word: int, label: str) -> str:
+    value = _exact_abi_uint(word, 160, label)
+    return f"0x{value:040x}"
+
+
+def _exact_abi_bool(word: int, label: str) -> bool:
+    if word not in (0, 1):
+        raise ValueError(f"Uniswap V3 raw {label} ABI bool is invalid")
+    return bool(word)
+
+
+def _exact_v3_max_liquidity_per_tick(tick_spacing: int) -> int:
+    if type(tick_spacing) is not int or tick_spacing <= 0:
+        raise ValueError("Uniswap V3 tick spacing is invalid")
+    minimum_tick = -(abs(V3_MIN_TICK) // tick_spacing) * tick_spacing
+    maximum_tick = (V3_MAX_TICK // tick_spacing) * tick_spacing
+    tick_count = (maximum_tick - minimum_tick) // tick_spacing + 1
+    return ((1 << 128) - 1) // tick_count
+
+
+def _replayed_exact_v3_depth_fields(
+    records: Any,
+    scan: Mapping[str, Any],
+    authority: Mapping[str, Any],
+    depth_row: Mapping[str, Any],
+    *,
+    block_number: int,
+    token0_price: Decimal,
+    token1_price: Decimal,
+) -> dict[str, str]:
+    """Independently replay exact depth from retained fixed-block RPC calls."""
+    pool_address = str(authority["pool_address"])
+    call_results = _retained_pool_call_results(
+        records,
+        pool_address=pool_address,
+        block_number=block_number,
+    )
+    try:
+        token0_word = _exact_abi_words(
+            _required_pool_call(call_results, SELECTOR_TOKEN0, "token0"),
+            1,
+            "token0",
+        )[0]
+        token1_word = _exact_abi_words(
+            _required_pool_call(call_results, SELECTOR_TOKEN1, "token1"),
+            1,
+            "token1",
+        )[0]
+        slot0 = _required_pool_call(call_results, SELECTOR_SLOT0, "slot0")
+        slot0_words = _exact_abi_words(slot0, 7, "slot0")
+        sqrt_price_x96 = _exact_abi_uint(slot0_words[0], 160, "sqrtPriceX96")
+        current_tick = _exact_abi_int(slot0_words[1], 24, "slot0 tick")
+        observation_index = _exact_abi_uint(
+            slot0_words[2], 16, "observationIndex"
+        )
+        observation_cardinality = _exact_abi_uint(
+            slot0_words[3], 16, "observationCardinality"
+        )
+        observation_cardinality_next = _exact_abi_uint(
+            slot0_words[4], 16, "observationCardinalityNext"
+        )
+        _exact_abi_uint(slot0_words[5], 8, "feeProtocol")
+        unlocked = _exact_abi_bool(slot0_words[6], "unlocked")
+        active_liquidity = _exact_abi_uint(
+            _exact_abi_words(
+                _required_pool_call(
+                    call_results, SELECTOR_LIQUIDITY, "liquidity"
+                ),
+                1,
+                "liquidity",
+            )[0],
+            128,
+            "liquidity",
+        )
+        fee_pips = _exact_abi_uint(
+            _exact_abi_words(
+                _required_pool_call(call_results, SELECTOR_FEE, "fee"),
+                1,
+                "fee",
+            )[0],
+            24,
+            "fee",
+        )
+        tick_spacing = _exact_abi_int(
+            _exact_abi_words(
+                _required_pool_call(
+                    call_results, SELECTOR_TICK_SPACING, "tick spacing"
+                ),
+                1,
+                "tick spacing",
+            )[0],
+            24,
+            "tick spacing",
+        )
+        factory = _exact_abi_address(
+            _exact_abi_words(
+                _required_pool_call(call_results, SELECTOR_FACTORY, "factory"),
+                1,
+                "factory",
+            )[0],
+            "factory",
+        )
+        token0 = _exact_abi_address(token0_word, "token0")
+        token1 = _exact_abi_address(token1_word, "token1")
+    except (IndexError, KeyError, TypeError, ValueError) as error:
+        raise ValueError("Uniswap V3 raw pool-state evidence is invalid") from error
+    if (
+        not V3_MIN_SQRT_RATIO <= sqrt_price_x96 < V3_MAX_SQRT_RATIO
+        or not V3_MIN_TICK <= current_tick <= V3_MAX_TICK
+    ):
+        raise ValueError("Uniswap V3 raw pool-state evidence is invalid")
+    derived_tick = exact_v3_tick_at_sqrt_ratio(sqrt_price_x96)
+    at_exact_tick_boundary = (
+        sqrt_price_x96 == exact_v3_sqrt_ratio_at_tick(derived_tick)
+    )
+    if (
+        token0 != authority["token0_address"]
+        or token1 != authority["token1_address"]
+        or factory != authority["factory_address"]
+        or fee_pips != authority["fee_pips"]
+        or tick_spacing != authority["tick_spacing"]
+        or active_liquidity <= 0
+        or not unlocked
+        or observation_cardinality <= 0
+        or observation_index >= observation_cardinality
+        or observation_cardinality_next < observation_cardinality
+        or (
+            current_tick != derived_tick
+            and not (
+                at_exact_tick_boundary and current_tick == derived_tick - 1
+            )
+        )
+    ):
+        raise ValueError("Uniswap V3 raw pool-state evidence is invalid")
+
+    directions = scan.get("directions")
+    if not isinstance(directions, dict) or set(directions) != {
+        "zero_for_one",
+        "one_for_zero",
+    }:
+        raise ValueError("Uniswap V3 depth replay direction evidence is invalid")
+    current_word = (current_tick // tick_spacing) >> 8
+    retained_words = set()
+    maximum_depth_limits = {
+        "zero_for_one": exact_v3_price_limit_for_bps(
+            sqrt_price_x96,
+            max(DEPTH_BANDS_BPS),
+            zero_for_one=True,
+        ),
+        "one_for_zero": exact_v3_price_limit_for_bps(
+            sqrt_price_x96,
+            max(DEPTH_BANDS_BPS),
+            zero_for_one=False,
+        ),
+    }
+    for name, step in (("zero_for_one", -1), ("one_for_zero", 1)):
+        direction = directions[name]
+        if not isinstance(direction, dict):
+            raise ValueError("Uniswap V3 depth replay direction evidence is invalid")
+        word_positions = direction.get("word_positions")
+        if (
+            not isinstance(word_positions, list)
+            or not 1 <= len(word_positions) <= authority["bitmap_word_radius"]
+            or any(type(value) is not int for value in word_positions)
+            or word_positions
+            != [current_word + step * offset for offset in range(len(word_positions))]
+            or direction.get("max_execution_complete") is not True
+            or direction.get("terminal_reason") != "requirements_proven"
+        ):
+            raise ValueError("Uniswap V3 depth replay direction evidence is invalid")
+        retained_words.update(word_positions)
+        boundary_prices = []
+        for word_position in word_positions:
+            boundary_tick = (
+                max(V3_MIN_TICK, word_position * 256 * tick_spacing)
+                if name == "zero_for_one"
+                else min(
+                    V3_MAX_TICK,
+                    (word_position * 256 + 255) * tick_spacing,
+                )
+            )
+            boundary_price = exact_v3_sqrt_ratio_at_tick(boundary_tick)
+            if (
+                name == "zero_for_one" and boundary_price < sqrt_price_x96
+            ) or (
+                name == "one_for_zero" and boundary_price > sqrt_price_x96
+            ):
+                boundary_prices.append(boundary_price)
+        price_limit = direction.get("price_limit_x96")
+        if (
+            not boundary_prices
+            or type(price_limit) is not int
+            or price_limit != boundary_prices[-1]
+            or (
+                name == "zero_for_one"
+                and price_limit > maximum_depth_limits[name]
+            )
+            or (
+                name == "one_for_zero"
+                and price_limit < maximum_depth_limits[name]
+            )
+        ):
+            raise ValueError("Uniswap V3 depth replay coverage evidence is invalid")
+
+    bitmap_word_evidence = scan.get("bitmap_words")
+    if not isinstance(bitmap_word_evidence, list):
+        raise ValueError("Uniswap V3 depth replay bitmap evidence is invalid")
+    bitmap_words = []
+    for evidence in bitmap_word_evidence:
+        if (
+            not isinstance(evidence, dict)
+            or set(evidence) != {"word_position"}
+            or type(evidence["word_position"]) is not int
+        ):
+            raise ValueError("Uniswap V3 depth replay bitmap evidence is invalid")
+        bitmap_words.append(evidence["word_position"])
+    if bitmap_words != sorted(retained_words):
+        raise ValueError("Uniswap V3 depth replay bitmap evidence is invalid")
+    expected_bitmap_calls = {
+        call_with_int(SELECTOR_TICK_BITMAP, word_position, 16)
+        for word_position in retained_words
+    }
+    actual_bitmap_calls = {
+        data for data in call_results if data.startswith(SELECTOR_TICK_BITMAP)
+    }
+    if actual_bitmap_calls != expected_bitmap_calls:
+        raise ValueError("Uniswap V3 depth replay bitmap evidence is invalid")
+
+    initialized_ticks = {}
+    expected_tick_evidence = []
+    maximum_liquidity_per_tick = _exact_v3_max_liquidity_per_tick(tick_spacing)
+    for word_position in sorted(retained_words):
+        bitmap = _exact_abi_words(
+            _required_pool_call(
+                call_results,
+                call_with_int(SELECTOR_TICK_BITMAP, word_position, 16),
+                "tick bitmap",
+            ),
+            1,
+            "tick bitmap",
+        )[0]
+        for bit_position in range(256):
+            if not bitmap & (1 << bit_position):
+                continue
+            tick = (word_position * 256 + bit_position) * tick_spacing
+            if not V3_MIN_TICK <= tick <= V3_MAX_TICK:
+                raise ValueError("Uniswap V3 depth replay tick evidence is invalid")
+            tick_result = _required_pool_call(
+                call_results,
+                call_with_int(SELECTOR_TICKS, tick, 24),
+                "initialized tick",
+            )
+            try:
+                tick_words = _exact_abi_words(
+                    tick_result,
+                    8,
+                    "initialized tick",
+                )
+                liquidity_gross = _exact_abi_uint(
+                    tick_words[0], 128, "tick liquidityGross"
+                )
+                liquidity_net = _exact_abi_int(
+                    tick_words[1], 128, "tick liquidityNet"
+                )
+                _exact_abi_int(
+                    tick_words[4], 56, "tick tickCumulativeOutside"
+                )
+                _exact_abi_uint(
+                    tick_words[5], 160, "tick secondsPerLiquidityOutsideX128"
+                )
+                _exact_abi_uint(
+                    tick_words[6], 32, "tick secondsOutside"
+                )
+                initialized = _exact_abi_bool(
+                    tick_words[7], "tick initialized"
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "Uniswap V3 depth replay tick evidence is invalid"
+                ) from error
+            if (
+                liquidity_gross <= 0
+                or liquidity_gross > maximum_liquidity_per_tick
+                or abs(liquidity_net) > liquidity_gross
+                or not initialized
+            ):
+                raise ValueError("Uniswap V3 depth replay tick evidence is invalid")
+            initialized_ticks[tick] = liquidity_net
+            expected_tick_evidence.append(
+                {
+                    "word_position": word_position,
+                    "bit_position": bit_position,
+                    "tick": tick,
+                    "liquidity_gross": liquidity_gross,
+                    "liquidity_net": liquidity_net,
+                }
+            )
+    expected_tick_calls = {
+        call_with_int(SELECTOR_TICKS, tick, 24) for tick in initialized_ticks
+    }
+    actual_tick_calls = {
+        data for data in call_results if data.startswith(SELECTOR_TICKS)
+    }
+    if (
+        actual_tick_calls != expected_tick_calls
+        or scan.get("tick_evidence") != expected_tick_evidence
+    ):
+        raise ValueError("Uniswap V3 depth replay tick evidence is invalid")
+
+    band_amounts = {}
+    for band in DEPTH_BANDS_BPS:
+        down_target = exact_v3_price_limit_for_bps(
+            sqrt_price_x96, band, zero_for_one=True
+        )
+        up_target = exact_v3_price_limit_for_bps(
+            sqrt_price_x96, band, zero_for_one=False
+        )
+        zero_result = simulate_exact_v3_swap(
+            sqrt_price_x96=sqrt_price_x96,
+            current_tick=current_tick,
+            liquidity=active_liquidity,
+            fee_pips=fee_pips,
+            initialized_ticks=initialized_ticks,
+            amount_specified=(1 << 255) - 1,
+            zero_for_one=True,
+            sqrt_price_limit_x96=down_target,
+        )
+        one_result = simulate_exact_v3_swap(
+            sqrt_price_x96=sqrt_price_x96,
+            current_tick=current_tick,
+            liquidity=active_liquidity,
+            fee_pips=fee_pips,
+            initialized_ticks=initialized_ticks,
+            amount_specified=(1 << 255) - 1,
+            zero_for_one=False,
+            sqrt_price_limit_x96=up_target,
+        )
+        band_amounts[band] = {
+            "zero_input": Decimal(zero_result.amount_in),
+            "zero_output": Decimal(zero_result.amount_out),
+            "one_input": Decimal(one_result.amount_in),
+            "one_output": Decimal(one_result.amount_out),
+            "zero_complete": zero_result.sqrt_price_x96 == down_target,
+            "one_complete": one_result.sqrt_price_x96 == up_target,
+        }
+    if (
+        str(depth_row.get("target_token_address") or "").strip().lower()
+        != authority["token0_address"]
+        or depth_row.get("target_token_position") != "token0"
+        or str(depth_row.get("token0_decimals") or "")
+        != str(authority["token0_decimals"])
+        or str(depth_row.get("token1_decimals") or "")
+        != str(authority["token1_decimals"])
+        or str(depth_row.get("token0_price_usd") or "")
+        != decimal_text(token0_price)
+        or str(depth_row.get("token1_price_usd") or "")
+        != decimal_text(token1_price)
+    ):
+        raise ValueError("Uniswap V3 exact depth replay authority is invalid")
+    expected_fields = depth_fields(
+        target_position_index=0,
+        token0_decimals=authority["token0_decimals"],
+        token1_decimals=authority["token1_decimals"],
+        token0_price=token0_price,
+        token1_price=token1_price,
+        band_amounts=band_amounts,
+    )
+    if any(depth_row.get(field) != value for field, value in expected_fields.items()):
+        raise ValueError("Uniswap V3 exact depth values do not match raw replay evidence")
+    return expected_fields
+
+
 def _execution_quantity_raw(row: Mapping[str, Any], field: str, decimals: int) -> int:
     if type(decimals) is not int or not 0 <= decimals <= 255:
         raise ValueError("Uniswap V3 execution token decimals are invalid")
@@ -2544,6 +3041,7 @@ def validate_uniswap_v3_exact_candidate(
     }
     if not scoped_tvl_hashes or not scoped_tvl_hashes.issubset(tvl_hashes):
         raise ValueError("retained GeckoTerminal response does not match TVL rows")
+    retained_prices_by_market: dict[str, dict[str, Decimal]] = {}
     for market_id, row in inventory_by_market.items():
         payload = tvl_payloads_by_hash[str(row["raw_response_sha256"])]
         data = payload.get("data")
@@ -2563,6 +3061,7 @@ def validate_uniswap_v3_exact_candidate(
         if len(matches) != 1:
             raise ValueError("GeckoTerminal authority pool identity is invalid")
         item, relationships = matches[0]
+        attributes = item["attributes"]
 
         def relationship_id(name: str) -> str:
             relationship = relationships.get(name)
@@ -2584,6 +3083,49 @@ def validate_uniswap_v3_exact_candidate(
             != str(row.get("quote_token_id") or "").lower()
         ):
             raise ValueError("GeckoTerminal authority pool identity is invalid")
+        try:
+            retained_base_price = finite_decimal(
+                attributes.get("base_token_price_usd"), positive=True
+            )
+            retained_quote_price = finite_decimal(
+                attributes.get("quote_token_price_usd"), positive=True
+            )
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError(
+                "GeckoTerminal retained USD price evidence is invalid"
+            ) from error
+        try:
+            inventory_base_price = finite_decimal(
+                row.get("base_token_price_usd"), positive=True
+            )
+            inventory_quote_price = finite_decimal(
+                row.get("quote_token_price_usd"), positive=True
+            )
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError(
+                "GeckoTerminal inventory USD price evidence is invalid"
+            ) from error
+        if (
+            inventory_base_price != retained_base_price
+            or inventory_quote_price != retained_quote_price
+        ):
+            raise ValueError(
+                "GeckoTerminal retained USD price does not match inventory"
+            )
+        retained_prices = {
+            address_from_token_id(str(row.get("base_token_id") or "")): (
+                retained_base_price
+            ),
+            address_from_token_id(str(row.get("quote_token_id") or "")): (
+                retained_quote_price
+            ),
+        }
+        if set(retained_prices) != {
+            record["token0_address"],
+            record["token1_address"],
+        }:
+            raise ValueError("GeckoTerminal retained USD price identity is invalid")
+        retained_prices_by_market[market_id] = retained_prices
 
     transcript_payloads: dict[str, tuple[Path, bytes, dict[str, Any]]] = {}
     for path in depth_raw_paths:
@@ -2814,6 +3356,41 @@ def validate_uniswap_v3_exact_candidate(
             or str(usd.get("raw_response_sha256") or "") not in tvl_hashes
         ):
             raise ValueError("Uniswap V3 GeckoTerminal transcript lineage is invalid")
+        retained_prices = retained_prices_by_market[market_id]
+        try:
+            transcript_base_price = finite_decimal(
+                usd.get("base_token_price_usd"), positive=True
+            )
+            transcript_quote_price = finite_decimal(
+                usd.get("quote_token_price_usd"), positive=True
+            )
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError(
+                "Uniswap V3 GeckoTerminal USD price evidence is invalid"
+            ) from error
+        transcript_prices = {
+            address_from_token_id(str(usd.get("base_token_id") or "")): (
+                transcript_base_price
+            ),
+            address_from_token_id(str(usd.get("quote_token_id") or "")): (
+                transcript_quote_price
+            ),
+        }
+        if (
+            transcript_prices != retained_prices
+        ):
+            raise ValueError(
+                "Uniswap V3 GeckoTerminal USD price evidence is inconsistent"
+            )
+        _replayed_exact_v3_depth_fields(
+            transcript.get("records"),
+            scan,
+            record,
+            depth_row,
+            block_number=int(block_number),
+            token0_price=retained_prices[record["token0_address"]],
+            token1_price=retained_prices[record["token1_address"]],
+        )
         parity_hash = hashlib.sha256(
             json.dumps(
                 parity,

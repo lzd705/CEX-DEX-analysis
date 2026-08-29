@@ -13,9 +13,91 @@ from scripts.run_collection_cycle import build_step_commands
 
 
 BLOCK_HASH = "0x" + "a" * 64
+START_SQRT_PRICE_X96 = 79228162514264337593543950336
+ACTIVE_LIQUIDITY = 10**18
+ZERO_FOR_ONE_SCAN_LIMIT = 36758526794156967312715787618
+ONE_FOR_ZERO_SCAN_LIMIT = 170254363637599206452736906702
+FROZEN_DEPTH_BY_QUOTE_DECIMALS = {
+    6: {
+        "sell_depth_10bps_usd": "500125062.539089",
+        "buy_depth_10bps_usd": "501379200.061149",
+        "total_depth_10bps_usd": "1001504262.600238",
+        "depth_10bps_complete": "1",
+        "sell_depth_25bps_usd": "1250782228.091054",
+        "buy_depth_25bps_usd": "1252978661.022355",
+        "total_depth_25bps_usd": "2503760889.113409",
+        "depth_25bps_complete": "1",
+        "sell_depth_50bps_usd": "2503132836.999833",
+        "buy_depth_50bps_usd": "2504395976.099367",
+        "total_depth_50bps_usd": "5007528813.0992",
+        "depth_50bps_complete": "1",
+        "sell_depth_100bps_usd": "5012562893.380045",
+        "buy_depth_100bps_usd": "5002569821.55369",
+        "total_depth_100bps_usd": "10015132714.933735",
+        "depth_100bps_complete": "1",
+    },
+    18: {
+        "sell_depth_10bps_usd": "1.500375187617267",
+        "buy_depth_10bps_usd": "1.504137600183447",
+        "total_depth_10bps_usd": "3.004512787800714",
+        "depth_10bps_complete": "1",
+        "sell_depth_25bps_usd": "3.752346684273162",
+        "buy_depth_25bps_usd": "3.758935983067065",
+        "total_depth_25bps_usd": "7.511282667340227",
+        "depth_25bps_complete": "1",
+        "sell_depth_50bps_usd": "7.509398510999499",
+        "buy_depth_50bps_usd": "7.513187928298101",
+        "total_depth_50bps_usd": "15.0225864392976",
+        "depth_50bps_complete": "1",
+        "sell_depth_100bps_usd": "15.037688680140135",
+        "buy_depth_100bps_usd": "15.00770946466107",
+        "total_depth_100bps_usd": "30.045398144801205",
+        "depth_100bps_complete": "1",
+    },
+}
 
 
 class ExactCandidateFixture:
+    @staticmethod
+    def abi_result(*values):
+        return "0x" + "".join(
+            f"{value % (1 << 256):064x}" for value in values
+        )
+
+    @staticmethod
+    def address_result(address):
+        return "0x" + address[2:].lower().rjust(64, "0")
+
+    @classmethod
+    def rpc_batch_record(cls, calls, *, first_id):
+        requests = []
+        responses = []
+        for offset, (to, data, result) in enumerate(calls):
+            request_id = first_id + offset
+            requests.append(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "eth_call",
+                    "params": [
+                        {"to": to, "data": data},
+                        "0x7b",
+                    ],
+                }
+            )
+            responses.append(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": result,
+                }
+            )
+        return {
+            "request": requests,
+            "response": responses,
+            "response_sha256": "c" * 64,
+        }
+
     @staticmethod
     def quoter_calldata(selector, token_in, token_out, amount, fee, price_limit):
         return selector + "".join(
@@ -48,12 +130,26 @@ class ExactCandidateFixture:
         self.tvl_directory.mkdir(parents=True)
         self.depth_directory.mkdir(parents=True)
 
+        quote_prices = {
+            record["pool_address"]: (
+                "1" if record["token1_decimals"] == 6 else "3000"
+            )
+            for record in self.authority.values()
+        }
         gecko_payload = {
             "data": [
                 {
                     "id": "eth_" + record["pool_address"],
                     "type": "pool",
-                    "attributes": {"address": record["pool_address"]},
+                    "attributes": {
+                        "address": record["pool_address"],
+                        "base_token_price_usd": "7.5000",
+                        "quote_token_price_usd": (
+                            "1.00"
+                            if record["token1_decimals"] == 6
+                            else "3000.0"
+                        ),
+                    },
                     "relationships": {
                         "dex": {"data": {"id": record["dex"]}},
                         "base_token": {
@@ -89,6 +185,8 @@ class ExactCandidateFixture:
                 "pool_address": authority["pool_address"],
                 "base_token_id": "eth_" + authority["token0_address"],
                 "quote_token_id": "eth_" + authority["token1_address"],
+                "base_token_price_usd": "7.5",
+                "quote_token_price_usd": quote_prices[authority["pool_address"]],
                 "status": "observed",
                 "reason_code": "observed",
                 "source": "GeckoTerminal API v2",
@@ -99,7 +197,10 @@ class ExactCandidateFixture:
                 "raw_response_sha256": self.gecko_sha256,
             }
             self.inventory.append(inventory_row)
-            price_limits = {"zero_for_one": 111, "one_for_zero": 222}
+            price_limits = {
+                "zero_for_one": ZERO_FOR_ONE_SCAN_LIMIT,
+                "one_for_zero": ONE_FOR_ZERO_SCAN_LIMIT,
+            }
             parity = []
             scenario_facts = {}
             records = [
@@ -206,6 +307,73 @@ class ExactCandidateFixture:
                         "response_sha256": "f" * 64,
                     }
                 )
+            records.append(
+                self.rpc_batch_record(
+                    [
+                        (
+                            authority["pool_address"],
+                            fetch_dex_depth.SELECTOR_TOKEN0,
+                            self.address_result(authority["token0_address"]),
+                        ),
+                        (
+                            authority["pool_address"],
+                            fetch_dex_depth.SELECTOR_TOKEN1,
+                            self.address_result(authority["token1_address"]),
+                        ),
+                        (
+                            authority["pool_address"],
+                            fetch_dex_depth.SELECTOR_SLOT0,
+                            self.abi_result(
+                                START_SQRT_PRICE_X96,
+                                0,
+                                0,
+                                1,
+                                1,
+                                0,
+                                1,
+                            ),
+                        ),
+                        (
+                            authority["pool_address"],
+                            fetch_dex_depth.SELECTOR_LIQUIDITY,
+                            self.abi_result(ACTIVE_LIQUIDITY),
+                        ),
+                        (
+                            authority["pool_address"],
+                            fetch_dex_depth.SELECTOR_FEE,
+                            self.abi_result(authority["fee_pips"]),
+                        ),
+                        (
+                            authority["pool_address"],
+                            fetch_dex_depth.SELECTOR_TICK_SPACING,
+                            self.abi_result(authority["tick_spacing"]),
+                        ),
+                        (
+                            authority["pool_address"],
+                            fetch_dex_depth.SELECTOR_FACTORY,
+                            self.address_result(authority["factory_address"]),
+                        ),
+                    ],
+                    first_id=100,
+                )
+            )
+            records.append(
+                self.rpc_batch_record(
+                    [
+                        (
+                            authority["pool_address"],
+                            fetch_dex_depth.call_with_int(
+                                fetch_dex_depth.SELECTOR_TICK_BITMAP,
+                                word_position,
+                                16,
+                            ),
+                            self.abi_result(0),
+                        )
+                        for word_position in (-1, 0)
+                    ],
+                    first_id=110,
+                )
+            )
             block = {
                 "number": "123",
                 "hash": BLOCK_HASH,
@@ -229,6 +397,12 @@ class ExactCandidateFixture:
                     "raw_response_sha256": self.gecko_sha256,
                     "base_token_id": inventory_row["base_token_id"],
                     "quote_token_id": inventory_row["quote_token_id"],
+                    "base_token_price_usd": inventory_row[
+                        "base_token_price_usd"
+                    ],
+                    "quote_token_price_usd": inventory_row[
+                        "quote_token_price_usd"
+                    ],
                 },
                 "v3_tick_scan_manifest": {
                     "schema": "uniswap_v3_tick_scan_manifest/v1",
@@ -240,11 +414,24 @@ class ExactCandidateFixture:
                     "authority": authority,
                     "block": block,
                     "block_final": dict(block),
-                    "bitmap_words": [],
+                    "bitmap_words": [
+                        {"word_position": -1},
+                        {"word_position": 0},
+                    ],
                     "tick_evidence": [],
                     "directions": {
-                        name: {"price_limit_x96": price_limit}
-                        for name, price_limit in price_limits.items()
+                        "zero_for_one": {
+                            "price_limit_x96": price_limits["zero_for_one"],
+                            "word_positions": [0, -1],
+                            "max_execution_complete": True,
+                            "terminal_reason": "requirements_proven",
+                        },
+                        "one_for_zero": {
+                            "price_limit_x96": price_limits["one_for_zero"],
+                            "word_positions": [0],
+                            "max_execution_complete": True,
+                            "terminal_reason": "requirements_proven",
+                        },
                     },
                     "bitmap_word_radius": authority["bitmap_word_radius"],
                     "quoter_v2_parity": parity,
@@ -263,16 +450,21 @@ class ExactCandidateFixture:
                 "chain": authority["chain"],
                 "dex": authority["dex"],
                 "pool_address": authority["pool_address"],
+                "target_token_address": authority["token0_address"],
+                "target_token_position": "token0",
                 "token0_address": authority["token0_address"],
+                "token0_decimals": str(authority["token0_decimals"]),
+                "token0_price_usd": inventory_row["base_token_price_usd"],
                 "token1_address": authority["token1_address"],
+                "token1_decimals": str(authority["token1_decimals"]),
+                "token1_price_usd": inventory_row["quote_token_price_usd"],
                 "fee_bps": str(authority["fee_pips"] // 100),
                 "status": "observed",
                 "block_number": "123",
                 "raw_response_sha256": transcript_hash,
-                **{
-                    f"depth_{band}bps_complete": "1"
-                    for band in fetch_dex_depth.DEPTH_BANDS_BPS
-                },
+                **FROZEN_DEPTH_BY_QUOTE_DECIMALS[
+                    authority["token1_decimals"]
+                ],
             }
             self.depth_rows.append(depth_row)
             for direction in EXECUTION_DIRECTIONS:
@@ -325,6 +517,32 @@ class ExactCandidateFixture:
         start = 10 + index * 64
         word = replacement[2:].rjust(64, "0")
         return value[:start] + word + value[start + 64 :]
+
+    @staticmethod
+    def replace_result_word(value, index, replacement):
+        start = 2 + index * 64
+        return value[:start] + f"{replacement:064x}" + value[start + 64 :]
+
+    @staticmethod
+    def mutate_rpc_result(payload, calldata, transform):
+        for record in payload["records"]:
+            requests = record["request"]
+            responses = record["response"]
+            request_items = requests if isinstance(requests, list) else [requests]
+            response_items = responses if isinstance(responses, list) else [responses]
+            for request in request_items:
+                params = request.get("params")
+                call = params[0] if isinstance(params, list) and params else None
+                if not isinstance(call, dict) or call.get("data") != calldata:
+                    continue
+                response = next(
+                    item
+                    for item in response_items
+                    if item.get("id") == request.get("id")
+                )
+                response["result"] = transform(response["result"])
+                return
+        raise AssertionError(f"missing fixture RPC call: {calldata}")
 
     def write_manifests(self):
         tvl_manifest = {
@@ -518,6 +736,281 @@ class UniswapV3ExactPublicationTest(unittest.TestCase):
                     depth_raw_root=self.fixture.depth_raw_root,
                     authority_path=self.fixture.authority_path,
                 )
+
+    def test_depth_values_are_replayed_from_retained_rpc_not_a_copied_self_proof(self):
+        for row in self.fixture.depth_rows:
+            copied_values = {}
+            for band in fetch_dex_depth.DEPTH_BANDS_BPS:
+                for field, multiplier in (
+                    (f"sell_depth_{band}bps_usd", Decimal("1000000")),
+                    (f"buy_depth_{band}bps_usd", Decimal("2000000")),
+                    (f"total_depth_{band}bps_usd", Decimal("3000000")),
+                ):
+                    row[field] = format(Decimal(row[field]) * multiplier, "f")
+                    copied_values[field] = row[field]
+                copied_values[f"depth_{band}bps_complete"] = "1"
+            market_id = fetch_dex_depth.dex_market_id(row)
+            self.fixture.rewrite_transcript(
+                market_id,
+                lambda payload, copied_values=copied_values: payload[
+                    "v3_tick_scan_manifest"
+                ].update(depth_value_evidence=copied_values),
+            )
+
+        with self.assertRaisesRegex(ValueError, "depth.*(evidence|replay|value)"):
+            self.fixture.validate()
+
+    def test_inventory_and_transcript_prices_must_match_retained_gecko_attributes(self):
+        for side, public_field in (
+            ("base", "token0_price_usd"),
+            ("quote", "token1_price_usd"),
+        ):
+            with self.subTest(side=side):
+                fresh = ExactCandidateFixture(self.root / f"price-{side}")
+                market_id = fresh.market_ids[0]
+                inventory_row = next(
+                    row
+                    for row in fresh.inventory
+                    if row["market_id"] == market_id
+                )
+                inventory_row[f"{side}_token_price_usd"] = "999999999"
+                depth_row = next(
+                    row
+                    for row in fresh.depth_rows
+                    if fetch_dex_depth.dex_market_id(row) == market_id
+                )
+                depth_row[public_field] = "999999999"
+                fresh.rewrite_transcript(
+                    market_id,
+                    lambda payload, side=side: payload[
+                        "usd_price_evidence"
+                    ].update({f"{side}_token_price_usd": "999999999"}),
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "GeckoTerminal.*price|USD price.*evidence",
+                ):
+                    fresh.validate()
+
+    def test_malformed_pool_abi_words_are_rejected(self):
+        cases = (
+            (
+                "address_padding",
+                fetch_dex_depth.SELECTOR_TOKEN0,
+                lambda value: self.fixture.replace_result_word(
+                    value,
+                    0,
+                    int(value[2:66], 16) | (1 << 200),
+                ),
+            ),
+            (
+                "tick_spacing_sign_extension",
+                fetch_dex_depth.SELECTOR_TICK_SPACING,
+                lambda value: self.fixture.replace_result_word(
+                    value,
+                    0,
+                    int(value[2:66], 16) | (1 << 24),
+                ),
+            ),
+            (
+                "slot0_tick_sign_extension",
+                fetch_dex_depth.SELECTOR_SLOT0,
+                lambda value: self.fixture.replace_result_word(value, 1, 1 << 24),
+            ),
+            (
+                "slot0_zero_observation_cardinality",
+                fetch_dex_depth.SELECTOR_SLOT0,
+                lambda value: self.fixture.replace_result_word(value, 3, 0),
+            ),
+            (
+                "slot0_observation_index_out_of_range",
+                fetch_dex_depth.SELECTOR_SLOT0,
+                lambda value: self.fixture.replace_result_word(value, 2, 1),
+            ),
+            (
+                "bitmap_word_arity",
+                fetch_dex_depth.call_with_int(
+                    fetch_dex_depth.SELECTOR_TICK_BITMAP,
+                    -1,
+                    16,
+                ),
+                lambda value: value + "0" * 64,
+            ),
+        )
+        for name, calldata, transform in cases:
+            with self.subTest(name=name):
+                fresh = ExactCandidateFixture(self.root / f"abi-{name}")
+                market_id = fresh.market_ids[0]
+                fresh.rewrite_transcript(
+                    market_id,
+                    lambda payload, calldata=calldata, transform=transform: (
+                        fresh.mutate_rpc_result(payload, calldata, transform)
+                    ),
+                )
+
+                with self.assertRaisesRegex(ValueError, "pool-state|ABI|bitmap"):
+                    fresh.validate()
+
+    def test_malformed_initialized_tick_tuple_is_rejected(self):
+        canonical = (1, 0, 0, 0, 0, 0, 0, 1)
+        cases = (
+            ("extra_word", canonical + (0,)),
+            ("liquidity_net_sign_extension", (1, 1 << 200) + canonical[2:]),
+            ("seconds_outside_width", canonical[:6] + (1 << 40, 1)),
+            ("initialized_bool", canonical[:7] + (2,)),
+        )
+        for name, tick_words in cases:
+            with self.subTest(name=name):
+                fresh = ExactCandidateFixture(self.root / f"tick-{name}")
+                market_id = fresh.market_ids[0]
+                authority = fresh.authority[market_id]
+
+                def add_tick(payload, tick_words=tick_words):
+                    bitmap_call = fetch_dex_depth.call_with_int(
+                        fetch_dex_depth.SELECTOR_TICK_BITMAP,
+                        0,
+                        16,
+                    )
+                    fresh.mutate_rpc_result(
+                        payload,
+                        bitmap_call,
+                        lambda _value: fresh.abi_result(2),
+                    )
+                    payload["records"].append(
+                        fresh.rpc_batch_record(
+                            [
+                                (
+                                    authority["pool_address"],
+                                    fetch_dex_depth.call_with_int(
+                                        fetch_dex_depth.SELECTOR_TICKS,
+                                        60,
+                                        24,
+                                    ),
+                                    fresh.abi_result(*tick_words),
+                                )
+                            ],
+                            first_id=120,
+                        )
+                    )
+                    payload["v3_tick_scan_manifest"]["tick_evidence"] = [
+                        {
+                            "word_position": 0,
+                            "bit_position": 1,
+                            "tick": 60,
+                            "liquidity_gross": 1,
+                            "liquidity_net": 0,
+                        }
+                    ]
+
+                fresh.rewrite_transcript(market_id, add_tick)
+
+                with self.assertRaisesRegex(ValueError, "tick evidence|ABI"):
+                    fresh.validate()
+
+    def test_initialized_tick_liquidity_invariants_are_rejected(self):
+        max_liquidity_per_tick_spacing_60 = (
+            11505743598341114571880798222544994
+        )
+        cases = (
+            ("net_exceeds_gross", (1, 2, 0, 0, 0, 0, 0, 1)),
+            (
+                "gross_exceeds_protocol_max",
+                (
+                    max_liquidity_per_tick_spacing_60 + 1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                ),
+            ),
+        )
+        for name, tick_words in cases:
+            with self.subTest(name=name):
+                fresh = ExactCandidateFixture(self.root / f"tick-invariant-{name}")
+                market_id = fresh.market_ids[0]
+                authority = fresh.authority[market_id]
+
+                def add_out_of_band_tick(payload, tick_words=tick_words):
+                    fresh.mutate_rpc_result(
+                        payload,
+                        fetch_dex_depth.call_with_int(
+                            fetch_dex_depth.SELECTOR_TICK_BITMAP,
+                            0,
+                            16,
+                        ),
+                        lambda _value: fresh.abi_result(1 << 200),
+                    )
+                    payload["records"].append(
+                        fresh.rpc_batch_record(
+                            [
+                                (
+                                    authority["pool_address"],
+                                    fetch_dex_depth.call_with_int(
+                                        fetch_dex_depth.SELECTOR_TICKS,
+                                        12_000,
+                                        24,
+                                    ),
+                                    fresh.abi_result(*tick_words),
+                                )
+                            ],
+                            first_id=120,
+                        )
+                    )
+                    payload["v3_tick_scan_manifest"]["tick_evidence"] = [
+                        {
+                            "word_position": 0,
+                            "bit_position": 200,
+                            "tick": 12_000,
+                            "liquidity_gross": tick_words[0],
+                            "liquidity_net": tick_words[1],
+                        }
+                    ]
+
+                fresh.rewrite_transcript(market_id, add_out_of_band_tick)
+
+                with self.assertRaisesRegex(ValueError, "tick evidence|liquidity"):
+                    fresh.validate()
+
+    def test_slot0_tick_must_match_sqrt_price_with_core_boundary_exception(self):
+        inconsistent = ExactCandidateFixture(self.root / "tick-inconsistent")
+        market_id = inconsistent.market_ids[0]
+        inconsistent.rewrite_transcript(
+            market_id,
+            lambda payload: inconsistent.mutate_rpc_result(
+                payload,
+                fetch_dex_depth.SELECTOR_SLOT0,
+                lambda value: inconsistent.replace_result_word(value, 1, 1),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "pool-state|tick"):
+            inconsistent.validate()
+
+        boundary = ExactCandidateFixture(self.root / "tick-boundary")
+        market_id = boundary.market_ids[0]
+
+        def move_to_core_zero_for_one_boundary(payload):
+            boundary.mutate_rpc_result(
+                payload,
+                fetch_dex_depth.SELECTOR_SLOT0,
+                lambda value: boundary.replace_result_word(
+                    value,
+                    1,
+                    (1 << 256) - 1,
+                ),
+            )
+            directions = payload["v3_tick_scan_manifest"]["directions"]
+            directions["zero_for_one"]["word_positions"] = [-1]
+            directions["one_for_zero"]["word_positions"] = [-1, 0]
+
+        boundary.rewrite_transcript(
+            market_id,
+            move_to_core_zero_for_one_boundary,
+        )
+        boundary.validate()
 
     def test_mixed_finalized_block_hashes_are_rejected(self):
         market_id = self.fixture.market_ids[1]
