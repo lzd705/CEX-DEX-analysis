@@ -22,11 +22,13 @@ def run_app_javascript(source: str, prelude: str = ""):
     script = prelude + "\n" + APP_PATH.read_text(encoding="utf-8") + "\n" + source
     try:
         completed = subprocess.run(
-            [node, "-e", script],
+            [node, "-"],
             cwd=PROJECT_ROOT,
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            input=script,
         )
     except subprocess.CalledProcessError as error:
         raise AssertionError(error.stderr or error.stdout) from error

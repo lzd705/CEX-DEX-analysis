@@ -1887,6 +1887,18 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             self.assertEqual(args.opportunity_raw_max, 2_000_000)
             self.assertEqual(args.opportunity_gzip_max, 300_000)
 
+    def test_legacy_rollback_pre_v3_flag_is_explicit_and_defaults_off(self):
+        with patch("sys.argv", ["check_dashboard_release.py"]):
+            default_args = release_checker.parse_args()
+        with patch(
+            "sys.argv",
+            ["check_dashboard_release.py", "--legacy-rollback-pre-v3"],
+        ):
+            rollback_args = release_checker.parse_args()
+
+        self.assertFalse(default_args.legacy_rollback_pre_v3)
+        self.assertTrue(rollback_args.legacy_rollback_pre_v3)
+
     def test_release_checks_required_complete_bundle_before_remote_requests(self):
         args = argparse.Namespace(
             base_url="https://dashboard.test",
@@ -2118,6 +2130,49 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
 
     def metrics(self, path="/api/markets/summary", raw=1000, wire=500):
         return ResponseMetrics(path, 1.0, wire, raw, True)
+
+    def test_legacy_rollback_health_exempts_only_the_pre_v3_exact_clause(self):
+        metadata = self.summary()["metadata"]
+        health = {
+            "status": "ok",
+            "data_ready": True,
+            "data_status": "current",
+            "freshness": self.freshness(),
+            "cex_instrument_lifecycle": copy.deepcopy(
+                metadata["cex_instrument_lifecycle"]
+            ),
+            "application_sha": "a" * 40,
+            "asset_sha": "b" * 64,
+            "asset_version": "{}-{}".format("a" * 12, "b" * 12),
+        }
+
+        with self.assertRaisesRegex(ReleaseCheckError, "Uniswap V3 exact"):
+            release_checker.validate_release_health(
+                health,
+                expected_application_sha="a" * 40,
+            )
+        self.assertEqual(
+            release_checker.validate_release_health(
+                health,
+                expected_application_sha="a" * 40,
+                legacy_rollback_pre_v3=True,
+            ),
+            ("a" * 40, "b" * 64, "{}-{}".format("a" * 12, "b" * 12)),
+        )
+        with self.assertRaisesRegex(ReleaseCheckError, "application SHA"):
+            release_checker.validate_release_health(
+                health,
+                expected_application_sha="c" * 40,
+                legacy_rollback_pre_v3=True,
+            )
+        invalid_asset = copy.deepcopy(health)
+        invalid_asset["asset_version"] = "wrong"
+        with self.assertRaisesRegex(ReleaseCheckError, "asset version"):
+            release_checker.validate_release_health(
+                invalid_asset,
+                expected_application_sha="a" * 40,
+                legacy_rollback_pre_v3=True,
+            )
 
     def screening_quality(self, token="AAVE"):
         def fact(status, reason_code, retryable=False, action=None):
@@ -3251,6 +3306,32 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             "application_sha": "a" * 40,
             "asset_sha": "b" * 64,
             "asset_version": f"{'a' * 12}-{'b' * 12}",
+            "uniswap_v3_exact": {
+                "status": "current",
+                "authority_market_ids": sorted(
+                    release_checker.load_uniswap_v3_execution_authority(
+                        release_checker.V3_EXECUTION_AUTHORITY_PATH
+                    )
+                ),
+                "depth_observed_count": 2,
+                "depth_required_count": 2,
+                "execution_observed_scenario_count": 20,
+                "execution_required_scenario_count": 20,
+                "authority_sha256": hashlib.sha256(
+                    release_checker.V3_EXECUTION_AUTHORITY_PATH.read_bytes()
+                ).hexdigest(),
+                "depth_rows_sha256": "c" * 64,
+                "execution_rows_sha256": "d" * 64,
+                "receipt_sha256": "e" * 64,
+                "trusted_receipt_sha256": "e" * 64,
+                "shared_finalized_block": {
+                    "number": 123,
+                    "hash": "0x" + "f" * 64,
+                },
+                "observed_at": "2026-08-27T00:00:00+00:00",
+                "observation_age_hours": 1.0,
+                "max_age_hours": 2.0,
+            },
         }
         fetched_paths = []
         served_asset_state = {"sha": "b" * 64}
@@ -3388,6 +3469,7 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
 
         self.assertEqual(result["application_sha"], "a" * 40)
         self.assertEqual(result["asset_sha"], "b" * 64)
+        self.assertIsNone(result["legacy_rollback_exemption"])
         self.assertEqual(
             result["route_opportunities"],
             {
@@ -3407,6 +3489,22 @@ class DashboardReleaseSmokeTest(unittest.TestCase):
             ],
             "generation-1",
         )
+
+        exact_health = health_payload.pop("uniswap_v3_exact")
+        original_fetched_paths = list(fetched_paths)
+        args.legacy_rollback_pre_v3 = True
+        try:
+            legacy_result = run_release()
+        finally:
+            args.legacy_rollback_pre_v3 = False
+            health_payload["uniswap_v3_exact"] = exact_health
+            fetched_paths[:] = original_fetched_paths
+        self.assertEqual(legacy_result["application_sha"], "a" * 40)
+        self.assertEqual(
+            legacy_result["legacy_rollback_exemption"],
+            "pre_v3_uniswap_exact_health_only",
+        )
+        self.assertGreater(len(legacy_result["requests"]), len(STATIC_ASSET_FILENAMES))
 
         baseline_summary = copy.deepcopy(summary)
         baseline_quality_by_token = copy.deepcopy(quality_by_token)

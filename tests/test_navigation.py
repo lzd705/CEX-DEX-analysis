@@ -18,11 +18,13 @@ def run_navigation_javascript(source: str):
         f"{source}"
     )
     completed = subprocess.run(
-        [node, "-e", script],
+        [node, "-"],
         cwd=PROJECT_ROOT,
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        input=script,
     )
     return json.loads(completed.stdout)
 

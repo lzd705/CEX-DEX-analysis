@@ -170,6 +170,155 @@ with an absolute `MARKET_DATA_DIR`. It renders the dedicated
 embedding that path rather than attempting to read the system-only
 `/etc/cex-dex/dashboard.env`.
 
+## Exact Uniswap V3 staged launch and rollback
+
+The exact V3 launch tool is an operator ledger, not a deployment manager. It
+requires Python 3.8 or newer on Linux, `fcntl` file locking, a user systemd
+manager, and the existing collection/dashboard/release dependencies. It never
+uses `sudo`, SSH, changes a Git or application pointer, edits environment or
+unit files, or starts/stops the production dashboard. Server-specific unit
+state, journal/cgroup/OOM evidence, the external application switch, and the
+browser smoke check remain operator evidence.
+
+Choose a fresh launch directory and a fresh data-directory sibling for the
+candidate. The collection runner also creates a processed sibling named
+`.v3-stage-YYYYMMDD-processed` when the stage basename is
+`v3-stage-YYYYMMDD`; both roots must be new and are bound into the stage
+receipt. Do not point either root at the live data directory, one of its
+descendants, a symlink, or an existing rehearsal.
+
+Every invocation takes the same immutable parameters:
+
+```bash
+TARGET_SHA="$(git rev-parse HEAD)"
+PREVIOUS_APP_SHA="<the 40-64 lowercase hex SHA reported by the live old app>"
+DATA_DIR="/absolute/live/market-data"
+LAUNCH_DIR="/absolute/private/v3-launch-YYYYMMDD"
+STAGE_DIR="/absolute/live/v3-stage-YYYYMMDD"
+
+python3 scripts/uniswap_v3_launch.py preflight \
+  --data-dir "$DATA_DIR" --launch-dir "$LAUNCH_DIR" \
+  --stage-dir "$STAGE_DIR" --target-sha "$TARGET_SHA" \
+  --previous-app-sha "$PREVIOUS_APP_SHA"
+```
+
+Without `--execute`, every phase prints only a redacted plan. It does not make
+a directory, write a receipt, query systemd, acquire/create the collection
+lock, start a process, run collection, publish, or make a network request.
+The launcher disables bytecode writes before importing project modules, so
+direct `--help` and plan execution do not create project-local `__pycache__`
+artifacts. Python interpreter or site initialization outside the project is an
+operating-system/runtime concern and is not controlled by this script.
+Review that plan, then add `--execute` and run exactly one phase at a time in
+this order:
+
+```text
+preflight -> pause -> backup -> stage -> verify-stage
+```
+
+`pause` manages only these fixed user units:
+`cex-dex-daily.timer`, `cex-dex-depth.timer`, and their matching `.service`
+units. It captures the exact timer enabled/active states, disables and stops
+the timers, stops both oneshot services, verifies the services inactive, and
+proves the live collection lock can be acquired. Every later phase that reads,
+copies, promotes, restores, or validates live state rechecks the paused state
+and holds that same live lock for the complete phase. The staged collection
+uses its separate lock below `STAGE_DIR`.
+
+`backup` stores the five fixed logical public files and their SHA-256, byte
+count, presence, and original mode. The launch/backup directories are `0700`;
+backup bytes and canonical receipts are `0600`, created with exclusive writes
+and fsynced. On a first launch,
+`uniswap_v3_exact_latest.json` may be represented only as `{"exists":false}`;
+the tool never fabricates an empty sidecar.
+
+`stage` copies only the live database, DEX daily input, and DEX depth history
+needed by a fresh full candidate. Its raw and processed observations are new.
+It runs the complete unfiltered `dex_depth` profile with local publication and
+the exact V3 requirement directed at the stage. `verify-stage` starts a
+loopback target dashboard with live unchanged facts plus staged DEX depth,
+execution, and sidecar overrides. It additionally sets
+`MARKET_UNISWAP_V3_EXACT_RAW_ROOT=STAGE_DIR/raw/dex-depth`, then invokes the
+normal release checker with the unchanged target-SHA requirement.
+
+After `verify-stage` succeeds, preserve this cutover order:
+
+1. Keep the daily/depth timers paused.
+2. Stop the production dashboard outside the launch tool.
+3. Run the `promote --execute` phase. It revalidates the Task 4 raw candidate,
+   public receipt, retained private receipt, staged root bindings, and live
+   baseline CAS. It first installs only the identical canonical private receipt
+   at `DATA_DIR/raw/dex-depth/<snapshot_id>/uniswap_v3_exact_validation.json`,
+   then replaces the fixed five-file public bundle. It does not copy the whole
+   staged raw snapshot.
+4. Switch the reviewed application pointer to `TARGET_SHA` outside the tool.
+5. Start the target dashboard and perform the normal target-SHA health,
+   release, and browser checks.
+6. Run `resume --execute`. It independently reruns the normal target-SHA
+   release checker after proving the promoted public sidecar still equals the
+   live trusted private receipt, then restores exactly the timer
+   enabled/active states recorded by `pause`.
+
+Do not promote while the old production dashboard is still serving, and do
+not resume timers merely because the external application switch succeeded.
+The launcher deliberately cannot make or infer either event. Keep both
+managed timers disabled and both services inactive throughout the hold point,
+and prevent all manual or non-cooperating writers from touching the live data
+root. The path-based precommit checks do not pin root names or protect the
+final replacement boundary from a late external writer or root replacement.
+
+If forward validation fails, keep the timers paused and use this rollback
+order:
+
+1. Stop the production dashboard.
+2. Restore the previous application pointer outside the tool.
+3. Run `restore --execute`. Restore uses CAS against the exact promoted
+   generation and restores every original byte and mode. An initially absent
+   sidecar returns to absence within the ordinary-I/O transaction. A trusted
+   private receipt created by this launch is removed in that transaction; a
+   byte-identical receipt that predated the launch is validated and preserved.
+4. Start the old dashboard and validate its previous application SHA and
+   current data health.
+5. Run `resume --execute`. Rollback resume first rechecks the restored
+   five-file generation against the restore receipt, then runs the full release
+   checker with the previous application SHA. The named
+   `legacy-rollback-pre-v3` exemption skips only the V3 exact-health clause that
+   the old application cannot expose; asset, API, freshness, lifecycle, and all
+   other release gates remain active. Only after that checker passes are the
+   recorded timer states restored; the resulting resume receipt records
+   `pre_v3_uniswap_exact_health_only`.
+
+Each state-changing phase consumes the canonical predecessor receipt, verifies
+its SHA binding, and creates exactly one next receipt with `O_EXCL`. Missing,
+reordered, replayed, tampered, or drifted phases fail closed. Portable receipts
+contain no absolute production path, RPC URL, environment content, or secret.
+
+The forward publisher reuses the existing bounded atomic five-file helper.
+Restore uses a launch-local replace-or-remove transaction so first-sidecar
+absence is supported. Both restore pre-call bytes after ordinary I/O errors;
+neither is a claim of multi-file crash atomicity across power loss or kernel
+failure, and neither protects against a non-cooperating late writer after the
+last path-based state check. If five-file promotion fails, the tool removes
+only a trusted receipt it created; a different or drifted live receipt fails
+closed.
+
+Phase receipt creation follows promotion or restore. If that receipt write
+fails after live bytes changed, keep the dashboard stopped and every managed
+timer/service paused. Do not retry blindly: compare the fixed five live files
+and trusted receipt against the retained backup, staged candidate, and their
+checksums, perform the appropriate manual checksummed forward or recovery
+action, and create no replacement ledger receipt until the live generation is
+unambiguously established. A failed `resume` leaves no resume completion
+receipt and attempts to return both timers and both services to
+disabled/inactive. Retry only after that compensation is verified. If
+compensation itself fails, reconcile every managed unit state manually and
+confirm the safe paused state before revalidating the predecessor.
+
+The normal forward dashboard uses the default live raw root, not a permanent
+stage-root override. Retain the private launch backup, receipts, complete
+staged raw/TVL evidence, validation receipt, and staged processed root through
+the complete observation and rollback window.
+
 ## Configure HTTPS
 
 Render `deploy/nginx/cex-dex-dashboard.conf.in` with the real domain, install it

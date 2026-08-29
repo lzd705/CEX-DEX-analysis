@@ -27,7 +27,7 @@ from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable, Tuple
+from typing import Any, Iterable, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 try:
@@ -38,8 +38,10 @@ try:
         environment_flag,
     )
     from dashboard.freshness import (
+        DEX_DEPTH_MAX_AGE_HOURS,
         build_source_freshness,
         route_opportunity_freshness,
+        snapshot_freshness,
     )
     from dashboard.opportunity_facts import (
         OpportunityBundleInvalid,
@@ -106,8 +108,10 @@ except ModuleNotFoundError:
         environment_flag,
     )
     from freshness import (  # type: ignore[no-redef]
+        DEX_DEPTH_MAX_AGE_HOURS,
         build_source_freshness,
         route_opportunity_freshness,
+        snapshot_freshness,
     )
     from opportunity_facts import (  # type: ignore[no-redef]
         OpportunityBundleInvalid,
@@ -184,6 +188,14 @@ from scripts.execution_cost import (
     usd_price_timing,
     validate_execution_snapshot,
 )
+from scripts.fetch_dex_depth import (
+    UNISWAP_V3_EXACT_LATEST_FILENAME,
+    V3_EXECUTION_AUTHORITY_PATH,
+    load_uniswap_v3_execution_authority,
+    read_uniswap_v3_exact_raw_receipt_bytes,
+    uniswap_v3_exact_receipt_bytes,
+    validate_uniswap_v3_exact_public_receipt,
+)
 from scripts.cex_instrument_lifecycle import (
     configured_market_ids_sha256,
     load_cex_instrument_lifecycle_manifest,
@@ -224,6 +236,7 @@ CEX_DEPTH_FILENAME = "cex_depth_latest.csv"
 DEX_DEPTH_FILENAME = "dex_depth_latest.csv"
 CEX_EXECUTION_COST_FILENAME = "cex_execution_cost_latest.csv"
 DEX_EXECUTION_COST_FILENAME = "dex_execution_cost_latest.csv"
+UNISWAP_V3_EXACT_FILENAME = UNISWAP_V3_EXACT_LATEST_FILENAME
 DAILY_QUALITY_REPORT_RELATIVE_PATH = Path("quality") / "daily-latest.json"
 DAILY_QUALITY_REPORT_SCHEMA = "fact_quality_report/v1"
 CEX_INSTRUMENT_LIFECYCLE_PATH = (
@@ -816,6 +829,252 @@ def iter_csv(path: Path) -> Iterable[dict[str, str]]:
     with path.open("r", newline="", encoding="utf-8") as handle:
         yield from csv.DictReader(handle)
 
+
+def resolve_uniswap_v3_exact_path() -> Optional[Path]:
+    """Resolve the exact-scope receipt next to the public DEX cohort."""
+    explicit = os.environ.get("MARKET_UNISWAP_V3_EXACT_DATA")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    depth_path = resolve_dex_depth_path()
+    if depth_path is not None:
+        return depth_path.parent / UNISWAP_V3_EXACT_FILENAME
+    configured_dir = os.environ.get("MARKET_DATA_DIR")
+    candidates = (
+        [Path(configured_dir).expanduser().resolve()]
+        if configured_dir
+        else DEFAULT_DATA_DIRS
+    )
+    for data_dir in candidates:
+        candidate = data_dir / UNISWAP_V3_EXACT_FILENAME
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def resolve_uniswap_v3_exact_raw_root() -> Optional[Path]:
+    """Resolve the private exact-receipt root without following symlinks."""
+    explicit = os.environ.get("MARKET_UNISWAP_V3_EXACT_RAW_ROOT")
+    if explicit:
+        return Path(explicit).expanduser().absolute()
+    configured_dir = os.environ.get("MARKET_DATA_DIR")
+    if configured_dir:
+        return (
+            Path(configured_dir).expanduser().absolute()
+            / "raw"
+            / "dex-depth"
+        )
+    candidate = PROJECT_ROOT / "data" / "raw" / "dex-depth"
+    return candidate if candidate.exists() else None
+
+
+def _uniswap_v3_exact_health_base(
+    authority_market_ids: list[str],
+) -> dict[str, Any]:
+    return {
+        "status": "invalid",
+        "authority_market_ids": authority_market_ids,
+        "depth_observed_count": 0,
+        "depth_required_count": 2,
+        "execution_observed_scenario_count": 0,
+        "execution_required_scenario_count": 20,
+        "authority_sha256": None,
+        "depth_rows_sha256": None,
+        "execution_rows_sha256": None,
+        "receipt_sha256": None,
+        "trusted_receipt_sha256": None,
+        "shared_finalized_block": None,
+        "observed_at": None,
+        "observation_age_hours": None,
+        "max_age_hours": DEX_DEPTH_MAX_AGE_HOURS,
+    }
+
+
+def uniswap_v3_exact_health(
+    *,
+    depth_path: Optional[Path] = None,
+    execution_path: Optional[Path] = None,
+    receipt_path: Optional[Path] = None,
+    exact_raw_root: Optional[Path] = None,
+    authority_path: Path = V3_EXECUTION_AUTHORITY_PATH,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Reread and validate the public exact V3 cohort without hiding core facts."""
+    try:
+        authority_market_ids = sorted(
+            load_uniswap_v3_execution_authority(Path(authority_path))
+        )
+    except Exception:
+        return _uniswap_v3_exact_health_base([])
+    result = _uniswap_v3_exact_health_base(authority_market_ids)
+    try:
+        resolved_depth = (
+            depth_path if depth_path is not None else resolve_dex_depth_path()
+        )
+        resolved_execution = (
+            execution_path
+            if execution_path is not None
+            else resolve_dex_execution_cost_path()
+        )
+        resolved_receipt = (
+            receipt_path
+            if receipt_path is not None
+            else resolve_uniswap_v3_exact_path()
+        )
+    except FileNotFoundError:
+        result["status"] = "missing"
+        return result
+    except OSError:
+        return result
+    if resolved_depth is None or resolved_execution is None:
+        result["status"] = "missing"
+        return result
+    try:
+        for path in (resolved_depth, resolved_execution):
+            path.lstat()
+            if path.is_symlink() or not path.is_file():
+                return result
+    except FileNotFoundError:
+        result["status"] = "missing"
+        return result
+    except OSError:
+        return result
+
+    try:
+        depth_rows = list(iter_csv(resolved_depth))
+        execution_rows = list(iter_csv(resolved_execution))
+        authority_set = set(authority_market_ids)
+
+        def depth_market_id(row: dict[str, str]) -> str:
+            return "dex:{}:{}:{}:{}".format(
+                str(row.get("chain") or "").strip().lower(),
+                str(row.get("dex") or "").strip().lower(),
+                str(row.get("pool_address") or "").strip().lower(),
+                str(row.get("token_symbol") or "").strip().upper(),
+            )
+
+        observed_depth = {
+            depth_market_id(row)
+            for row in depth_rows
+            if depth_market_id(row) in authority_set
+            and row.get("status") == "observed"
+            and all(
+                row.get("depth_{}bps_complete".format(band)) == "1"
+                for band in (10, 25, 50, 100)
+            )
+        }
+        expected_scenarios = {
+            (direction, str(notional))
+            for direction in EXECUTION_DIRECTIONS
+            for notional in EXECUTION_NOTIONALS_USD
+        }
+        observed_execution = {
+            (
+                str(row.get("market_id") or ""),
+                str(row.get("direction") or ""),
+                str(row.get("requested_notional_usd") or ""),
+            )
+            for row in execution_rows
+            if str(row.get("market_id") or "") in authority_set
+            and row.get("status") == "observed"
+            and (
+                str(row.get("direction") or ""),
+                str(row.get("requested_notional_usd") or ""),
+            )
+            in expected_scenarios
+        }
+        result["depth_observed_count"] = len(observed_depth)
+        result["execution_observed_scenario_count"] = len(observed_execution)
+    except Exception:
+        return result
+    if resolved_receipt is None:
+        result["status"] = "missing"
+        return result
+    try:
+        resolved_receipt.lstat()
+    except FileNotFoundError:
+        result["status"] = "missing"
+        return result
+    except OSError:
+        return result
+    if resolved_receipt.is_symlink() or not resolved_receipt.is_file():
+        return result
+    try:
+        receipt_bytes = resolved_receipt.read_bytes()
+        if len(receipt_bytes) > 1024 * 1024:
+            return result
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+        if (
+            not isinstance(receipt, dict)
+            or receipt_bytes != uniswap_v3_exact_receipt_bytes(receipt)
+        ):
+            return result
+        result["receipt_sha256"] = hashlib.sha256(receipt_bytes).hexdigest()
+        validated = validate_uniswap_v3_exact_public_receipt(
+            receipt,
+            depth_rows,
+            execution_rows,
+            authority_path=Path(authority_path),
+        )
+        resolved_raw_root = (
+            Path(exact_raw_root)
+            if exact_raw_root is not None
+            else resolve_uniswap_v3_exact_raw_root()
+        )
+        if resolved_raw_root is None:
+            result["status"] = "missing"
+            return result
+        raw_receipt_bytes = read_uniswap_v3_exact_raw_receipt_bytes(
+            resolved_raw_root,
+            validated["depth_snapshot_id"],
+        )
+        if raw_receipt_bytes != receipt_bytes:
+            return result
+        result["trusted_receipt_sha256"] = hashlib.sha256(
+            raw_receipt_bytes
+        ).hexdigest()
+        required_rows = []
+        for row in depth_rows:
+            market_id = depth_market_id(row)
+            if market_id in authority_set:
+                required_rows.append(row)
+        required_rows.extend(
+            row
+            for row in execution_rows
+            if str(row.get("market_id") or "") in authority_set
+        )
+        observed_values = [
+            str(row.get("observed_at") or "") for row in required_rows
+        ]
+        if len(observed_values) != 22 or any(
+            not value for value in observed_values
+        ):
+            return result
+        observed_times = [parse_rfc3339_utc(value) for value in observed_values]
+        observed_at = min(observed_times).isoformat()
+        freshness = snapshot_freshness(
+            "uniswap_v3_exact",
+            observed_at,
+            now=now,
+            max_age_hours=DEX_DEPTH_MAX_AGE_HOURS,
+        )
+        result.update(
+            {
+                "status": freshness["status"],
+                "depth_observed_count": validated["depth_observed_count"],
+                "execution_observed_scenario_count": validated[
+                    "execution_observed_scenario_count"
+                ],
+                "authority_sha256": validated["authority_sha256"],
+                "depth_rows_sha256": validated["depth_rows_sha256"],
+                "execution_rows_sha256": validated["execution_rows_sha256"],
+                "shared_finalized_block": validated["shared_finalized_block"],
+                "observed_at": freshness["observed_at"],
+                "observation_age_hours": freshness["age_hours"],
+            }
+        )
+        return result
+    except Exception:
+        return result
 
 def dataset_bounds(paths: Iterable[Path]) -> tuple[str, str]:
     dates: list[str] = []
@@ -3970,6 +4229,28 @@ def _execution_public_rows(
         row.get("status") in {"observed", "partial"}
         for row in rows
     )
+    v3_market = any(
+        row.get("market_type") == "dex"
+        and (
+            row.get("protocol_model") == "concentrated_liquidity_v3"
+            or row.get("dex") == "uniswap_v3"
+        )
+        for row in rows
+    )
+    market_ids = {row.get("market_id") for row in rows if row.get("market_id")}
+    authority_market_ids = set(load_uniswap_v3_execution_authority())
+    if measured and v3_market and not market_ids.issubset(authority_market_ids):
+        for source_row, public_row in zip(rows, public_rows):
+            if source_row.get("status") not in {"observed", "partial"}:
+                continue
+            public_row["source_status"] = public_row.get("status")
+            public_row["source_status_reason"] = public_row.get("status_reason")
+            public_row["status"] = "unsupported"
+            public_row["status_reason"] = "unsupported_protocol_or_chain"
+            public_row["error"] = None
+            for field in RESULT_NUMERIC_COLUMNS:
+                public_row[field] = None
+        return public_rows
     if not measured or timing["usable"]:
         return public_rows
     for source_row, public_row in zip(rows, public_rows):
@@ -4006,6 +4287,26 @@ def _execution_snapshot_metadata(
         "row_count": snapshot["row_count"],
         "status_counts": snapshot["status_counts"],
         "source": file_metadata(snapshot["path"]),
+    }
+
+
+def uniswap_v3_execution_scope_metadata() -> dict[str, Any]:
+    """Return the bounded public capability contract for exact V3 quotes."""
+    authority = load_uniswap_v3_execution_authority()
+    return {
+        "support": "exact_pool_only",
+        "authority_schema": "uniswap_v3_execution_markets/v1",
+        "approved_markets": [authority[market_id] for market_id in sorted(authority)],
+        "other_v3_market_status": "unsupported",
+        "included_costs": ["pool_swap_fee"],
+        "excluded_costs": [
+            "gas",
+            "router_fee",
+            "transfer_tax",
+            "MEV",
+            "account_inventory",
+            "realized_execution",
+        ],
     }
 
 
@@ -4338,9 +4639,11 @@ def build_execution_cost_comparison(
                 "Source-mechanics quoted cost, not realized or all-in cost. "
                 "CEX account taker fees are excluded. Supported DEX V2 quotes "
                 "include pool swap fees while gas, router fees, transfer "
-                "taxes, and MEV are excluded. DEX V3 execution is explicitly "
-                "unsupported in this release."
+                "taxes, MEV, account inventory, and realized execution are "
+                "excluded. DEX V3 quotes are supported only for the exact "
+                "pool-only authority scope; every other V3 market is unsupported."
             ),
+            "uniswap_v3_execution": uniswap_v3_execution_scope_metadata(),
             "missing_value_rule": (
                 "Partial, unsupported, failed, unavailable, and not-cataloged "
                 "full-request cost fields remain null; they are never zero-filled "
@@ -7991,6 +8294,9 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 data_status = metadata["freshness"]["overall_status"]
                 if not lifecycle_is_current:
                     data_status = "stale"
+                exact_health = uniswap_v3_exact_health()
+                if exact_health.get("status") != "current":
+                    data_status = "stale"
                 self.send_json(
                     {
                         "status": "ok",
@@ -8000,6 +8306,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                         "freshness": metadata["freshness"],
                         "cex_instrument_lifecycle": lifecycle,
                         "route_opportunities": opportunity_publication_health(),
+                        "uniswap_v3_exact": exact_health,
                         "application_sha": application_release_sha(),
                         "asset_sha": static_asset_sha(),
                         "asset_version": static_asset_version(),

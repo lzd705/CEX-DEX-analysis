@@ -165,6 +165,28 @@ CSVs and a validated SQLite database back into `data/local/`.
   `excluded_unknown_account_tier`; no numeric fee is guessed or zero-filled.
   Supported DEX V2 execution includes the pool swap fee in the captured pool
   mechanics. “Pool swap fee” does not mean protocol treasury or revenue fee.
+- DEX V3 execution is exact pool-only for the authority-approved Ethereum
+  Uniswap V3 UNI/USDT pool
+  `0x3470447f3cecffac709d3e783a307790b0208d60` and UNI/WETH pool
+  `0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801`. The API publishes their
+  authority identity in `metadata.uniswap_v3_execution`; every other V3 market
+  remains `unsupported`. These quotes include the pool swap fee only and
+  exclude gas, router fees, transfer taxes, MEV, account inventory, and
+  realized execution.
+- The `/health` response member `uniswap_v3_exact` rereads the public depth,
+  execution, and canonical receipt bytes, then requires the retained private
+  raw receipt for that depth snapshot to match the public bytes exactly. It
+  reports `current`, `stale`,
+  `invalid`, or `missing` with the two authority IDs, 2/2 depth and 20/20
+  execution counts, shared block, observation age, and
+  public/trusted-receipt, row, and authority hashes. A non-current exact scope
+  makes overall `data_status` stale without hiding readable spot facts.
+
+The dashboard resolves that private receipt from
+`$MARKET_DATA_DIR/raw/dex-depth` by default. A staged or separately mounted raw
+evidence tree must set `MARKET_UNISWAP_V3_EXACT_RAW_ROOT` to its `dex-depth`
+root. The raw receipt stays outside the five-file public bundle and no health
+field exposes its filesystem path.
 - `/api/markets/events?token=...&start=...&end=...&lifecycle=...` returns the
   latest revision of matching source-backed events, explicit time bounds and
   precision, lifecycle, evidence status, source-check lineage, and null-safe
@@ -193,8 +215,8 @@ The split primarily reduces network transfer and browser memory. Cold summary
 and Token-catalog construction still reuses the shared full fact/catalog
 builders, so backend query-level partitioning remains a separate optimization.
 
-Funding rates, numeric account-specific CEX fees, gas costs, DEX V3
-fixed-notional execution, and event-study impact/return estimates are not
+Funding rates, numeric account-specific CEX fees, gas costs, non-authority DEX
+V3 fixed-notional execution, and event-study impact/return estimates are not
 supported by this dashboard. They remain null or explicitly `unsupported`
 rather than being inferred.
 

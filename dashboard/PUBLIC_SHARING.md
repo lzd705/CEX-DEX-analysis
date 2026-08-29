@@ -12,7 +12,9 @@ docker build -t cex-dex-market-monitor .
 docker run --rm \
   -p 127.0.0.1:8765:8765 \
   -e ADMIN_ENABLED=false \
+  -e MARKET_UNISWAP_V3_EXACT_RAW_ROOT=/app/data/raw/dex-depth \
   --mount type=bind,src=/srv/cex-dex/current,dst=/app/data/local,readonly \
+  --mount type=bind,src=/srv/cex-dex/raw/dex-depth,dst=/app/data/raw/dex-depth,readonly \
   cex-dex-market-monitor
 ```
 
@@ -31,6 +33,14 @@ The mounted directory must contain:
 - `cex_execution_cost_latest.csv`
 - `dex_execution_cost_latest.csv`
 - `dex_pool_tvl_latest.csv`
+- `uniswap_v3_exact_latest.json`
+
+Exact V3 health also needs the separately mounted private
+`<raw-root>/<depth_snapshot_id>/uniswap_v3_exact_validation.json`. It must be
+the retained canonical receipt created before publication and byte-identical
+to the public sidecar. It is not a sixth public file and must not be served by
+Nginx. Task 5 staging sets `MARKET_UNISWAP_V3_EXACT_RAW_ROOT` to the staged raw
+tree before running health and release checks.
 
 Deploy a new application commit without changing the data directory. In the
 production systemd layout, publish a reviewed data snapshot by atomically
