@@ -84,6 +84,13 @@ class Provider:
     rpc: Callable[[str, list], object]
 
 
+@dataclass(frozen=True)
+class _CapturedBlock:
+    projected_header: dict
+    canonical_block_bytes: bytes
+    canonical_block_sha256: str
+
+
 class _RejectRedirects(urllib_request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -314,11 +321,18 @@ def _hash32(value: object, reason: str, nonzero: bool = False) -> str:
     return value
 
 
-def _load_header(provider: Provider, method: str, params: list) -> dict:
+def _load_header(provider: Provider, method: str, params: list) -> _CapturedBlock:
     result = _provider_result(provider, method, params, "rpc_response_invalid")
     if result is None:
         raise CaptureError("canonical_block_unavailable")
     if not isinstance(result, dict):
+        raise CaptureError("rpc_response_invalid")
+    try:
+        _check_rpc_shape(result)
+        canonical_block = shib_v2_research.canonical_json_bytes(result)
+    except (ValueError, shib_v2_research.ResearchContractError):
+        raise CaptureError("rpc_response_invalid")
+    if len(canonical_block) > MAX_RPC_RESPONSE_BYTES:
         raise CaptureError("rpc_response_invalid")
     required = {
         "number", "hash", "parentHash", "timestamp", "stateRoot", "baseFeePerGas"
@@ -337,24 +351,41 @@ def _load_header(provider: Provider, method: str, params: list) -> dict:
     }
     if header["number"] <= 0 or header["timestamp"] <= 0:
         raise CaptureError("rpc_response_invalid")
-    return header
+    return _CapturedBlock(
+        projected_header=header,
+        canonical_block_bytes=canonical_block,
+        canonical_block_sha256=hashlib.sha256(canonical_block).hexdigest(),
+    )
 
 
-def _load_finalized_header(provider: Provider) -> dict:
+def _load_finalized_header(provider: Provider) -> _CapturedBlock:
     return _load_header(provider, "eth_getBlockByNumber", ["finalized", False])
 
 
-def _require_identical_headers(headers: Sequence[dict]) -> dict:
-    if len(headers) != 2 or headers[0] != headers[1]:
+def _require_identical_headers(headers: Sequence[_CapturedBlock]) -> _CapturedBlock:
+    if (
+        len(headers) != 2
+        or headers[0].canonical_block_sha256
+        != headers[1].canonical_block_sha256
+        or headers[0].canonical_block_bytes
+        != headers[1].canonical_block_bytes
+    ):
         raise CaptureError("provider_disagreement")
-    return dict(headers[0])
+    return headers[0]
 
 
-def _require_header_round_trip(provider: Provider, header: dict) -> None:
+def _require_header_round_trip(
+    provider: Provider, captured: _CapturedBlock
+) -> None:
     reread = _load_header(
-        provider, "eth_getBlockByHash", [header["hash"], False]
+        provider,
+        "eth_getBlockByHash",
+        [captured.projected_header["hash"], False],
     )
-    if reread != header:
+    if (
+        reread.canonical_block_sha256 != captured.canonical_block_sha256
+        or reread.canonical_block_bytes != captured.canonical_block_bytes
+    ):
         raise CaptureError("canonical_block_unavailable")
 
 
@@ -832,25 +863,6 @@ def _validated_registry(registry: object) -> dict:
         raise CaptureError("registry_invalid")
 
 
-def _map_validation_error(
-    error: shib_v2_research.ResearchContractError,
-) -> CaptureError:
-    message = str(error).lower()
-    if "registry" in message:
-        return CaptureError("registry_invalid")
-    if "router" in message:
-        return CaptureError("router_authority_mismatch")
-    if "fee" in message:
-        return CaptureError("fee_authority_mismatch")
-    if "usd" in message or "chainlink" in message or "reference" in message:
-        return CaptureError("usd_reference_unavailable")
-    if "pool" in message or "token" in message or "runtime code" in message:
-        return CaptureError("pool_authority_mismatch")
-    if "block" in message or "header" in message:
-        return CaptureError("canonical_block_unavailable")
-    return CaptureError("rpc_response_invalid")
-
-
 def _validate_provider_configuration(providers: Sequence[Provider]) -> None:
     if not isinstance(providers, (list, tuple)) or len(providers) != 2:
         raise CaptureError("capture_configuration_invalid")
@@ -875,28 +887,35 @@ def capture_research_evidence(
     registry = _validated_registry(registry)
     _require_chain_ids(providers, expected=registry["chain"]["chain_id"])
     headers = [_load_finalized_header(provider) for provider in providers]
-    header = _require_identical_headers(headers)
+    captured = _require_identical_headers(headers)
     for provider in providers:
-        _require_header_round_trip(provider, header)
+        _require_header_round_trip(provider, captured)
     try:
         inventory = shib_v2_research.build_logical_call_inventory(registry)
-    except shib_v2_research.ResearchContractError as error:
-        raise _map_validation_error(error)
+    except shib_v2_research.ResearchContractError:
+        raise CaptureError("registry_invalid")
     logical, observations = _collect_agreed_calls(
-        providers, header, inventory
+        providers, captured.projected_header, inventory
     )
     for provider in providers:
-        _require_header_round_trip(provider, header)
-    candidate = _decode_evidence(
-        registry, header, logical, observations
-    )
-    candidate["evidence_identity"] = shib_v2_research.evidence_identity(candidate)
+        _require_header_round_trip(provider, captured)
+    try:
+        candidate = _decode_evidence(
+            registry, captured.projected_header, logical, observations
+        )
+        candidate["evidence_identity"] = shib_v2_research.evidence_identity(
+            candidate
+        )
+    except CaptureError:
+        raise
+    except shib_v2_research.ResearchContractError:
+        raise CaptureError("rpc_response_invalid")
     try:
         validated = shib_v2_research.validate_research_evidence(
             candidate, registry
         )
-    except shib_v2_research.ResearchContractError as error:
-        raise _map_validation_error(error)
+    except shib_v2_research.ResearchContractError:
+        raise CaptureError("rpc_response_invalid")
     try:
         atomic_write_canonical_json(output_path, validated)
     except shib_v2_research.ResearchContractError:

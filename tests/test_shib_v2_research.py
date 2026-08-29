@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -689,12 +691,33 @@ def valid_rpc_responses(registry):
     evidence = valid_evidence_payload(registry)
     block = evidence["block"]
     header = {
-        "number": hex(block["number"]),
-        "hash": block["hash"],
-        "parentHash": block["parent_hash"],
-        "timestamp": hex(block["timestamp"]),
-        "stateRoot": block["state_root"],
         "baseFeePerGas": hex(block["base_fee_per_gas"]),
+        "blobGasUsed": "0x0",
+        "difficulty": "0x0",
+        "excessBlobGas": "0x0",
+        "extraData": "0x",
+        "gasLimit": "0x1c9c380",
+        "gasUsed": "0x5208",
+        "hash": block["hash"],
+        "logsBloom": "0x" + "00" * 256,
+        "miner": "0x" + "77" * 20,
+        "mixHash": "0x" + "88" * 32,
+        "nonce": "0x0000000000000000",
+        "number": hex(block["number"]),
+        "parentHash": block["parent_hash"],
+        "parentBeaconBlockRoot": "0x" + "99" * 32,
+        "receiptsRoot": "0x" + "aa" * 32,
+        "requestsHash": "0x" + "ab" * 32,
+        "sha3Uncles": "0x" + "bb" * 32,
+        "size": "0x100",
+        "timestamp": hex(block["timestamp"]),
+        "totalDifficulty": "0x0",
+        "transactions": [],
+        "transactionsRoot": "0x" + "cc" * 32,
+        "stateRoot": block["state_root"],
+        "uncles": [],
+        "withdrawals": [],
+        "withdrawalsRoot": "0x" + "dd" * 32,
     }
     results = {
         (call["target"], call["calldata"]): call["result_hex"]
@@ -754,7 +777,7 @@ class ChangedFinalRoundTripRpc(RecordingRpc):
                     "params": copy.deepcopy(params),
                 })
                 header = copy.deepcopy(self.responses["header"])
-                header["stateRoot"] = "0x" + "66" * 32
+                header["transactionsRoot"] = "0x" + "66" * 32
                 return header
         return super().__call__(method, params)
 
@@ -1263,6 +1286,8 @@ class ResearchCaptureTests(unittest.TestCase):
         rendered = self.output.read_text(encoding="utf-8")
         self.assertNotIn("a" * 64, rendered)
         self.assertNotIn("b" * 64, rendered)
+        self.assertNotIn(responses_a["header"]["transactionsRoot"], rendered)
+        self.assertNotIn(responses_a["header"]["requestsHash"], rendered)
         for recorder in (provider_a, provider_b):
             methods = [request["method"] for request in recorder.requests]
             self.assertEqual(methods.count("eth_getBlockByNumber"), 1)
@@ -1300,6 +1325,10 @@ class ResearchCaptureTests(unittest.TestCase):
             responses_a["chain_id"] = "0x2"
         elif failure == "different_finalized_hash":
             responses_b["header"]["hash"] = "0x" + "55" * 32
+        elif failure == "different_transactions_root":
+            responses_b["header"]["transactionsRoot"] = "0x" + "55" * 32
+        elif failure == "different_requests_hash":
+            responses_b["header"]["requestsHash"] = "0x" + "55" * 32
         elif failure == "different_call_bytes":
             first_key = next(iter(responses_b["results"]))
             responses_b["results"][first_key] = "0x" + "ff" * 32
@@ -1325,6 +1354,8 @@ class ResearchCaptureTests(unittest.TestCase):
         failures = (
             "wrong_chain_id",
             "different_finalized_hash",
+            "different_transactions_root",
+            "different_requests_hash",
             "different_call_bytes",
             "eip1898_error",
             "missing_state",
@@ -1349,6 +1380,118 @@ class ResearchCaptureTests(unittest.TestCase):
                         self.assertFalse(self.output.exists())
                     else:
                         self.assertEqual(self.output.read_bytes(), original)
+
+    def test_full_block_agreement_rejects_nonprojected_initial_and_final_drift(self):
+        for failure, reason in (
+            ("different_transactions_root", "provider_disagreement"),
+            ("different_requests_hash", "provider_disagreement"),
+            ("changed_final_header", "canonical_block_unavailable"),
+        ):
+            for original in (None, b"old-output\n"):
+                with self.subTest(failure=failure, original=original):
+                    self.output.unlink(missing_ok=True)
+                    if original is not None:
+                        self.output.write_bytes(original)
+                    with self.assertRaisesRegex(
+                        capture.CaptureError, "^{}$".format(reason)
+                    ):
+                        capture.capture_research_evidence(
+                            self.registry,
+                            self._failing_providers(failure),
+                            self.output,
+                        )
+                    if original is None:
+                        self.assertFalse(self.output.exists())
+                    else:
+                        self.assertEqual(self.output.read_bytes(), original)
+
+    def test_capture_rolls_back_post_replace_fsync_and_safety_check_failures(self):
+        real_fsync = shib_v2_research_io.os.fsync
+        real_recheck = shib_v2_research_io._recheck_directory_chain
+
+        for failure in ("directory_fsync", "safety_recheck"):
+            for original in (None, b"old-output\n"):
+                with self.subTest(failure=failure, original=original):
+                    self.output.unlink(missing_ok=True)
+                    if original is not None:
+                        self.output.write_bytes(original)
+                    responses_a, responses_b = valid_rpc_responses(self.registry)
+                    providers = self._provider_pair(
+                        RecordingRpc(responses_a), RecordingRpc(responses_b)
+                    )
+                    failed = {"value": False}
+
+                    def fail_first_directory_fsync(descriptor):
+                        metadata = os.fstat(descriptor)
+                        if stat.S_ISDIR(metadata.st_mode) and not failed["value"]:
+                            failed["value"] = True
+                            raise OSError("post-replace directory fsync failure")
+                        return real_fsync(descriptor)
+
+                    def fail_recheck_after_replacement(path, expected):
+                        replaced = (
+                            self.output.exists()
+                            and self.output.read_bytes() != original
+                        )
+                        if replaced:
+                            raise shib_v2_research.ResearchContractError(
+                                "post-replace safety prose is not stable"
+                            )
+                        return real_recheck(path, expected)
+
+                    patcher = mock.patch.object(
+                        shib_v2_research_io.os,
+                        "fsync",
+                        side_effect=fail_first_directory_fsync,
+                    ) if failure == "directory_fsync" else mock.patch.object(
+                        shib_v2_research_io,
+                        "_recheck_directory_chain",
+                        side_effect=fail_recheck_after_replacement,
+                    )
+                    with patcher:
+                        with self.assertRaisesRegex(
+                            capture.CaptureError, "^unsafe_output_path$"
+                        ):
+                            capture.capture_research_evidence(
+                                self.registry, providers, self.output
+                            )
+                    if original is None:
+                        self.assertFalse(self.output.exists())
+                    else:
+                        self.assertEqual(self.output.read_bytes(), original)
+                    leaked = [
+                        path.name
+                        for path in self.output.parent.iterdir()
+                        if path.name.startswith("." + self.output.name + ".")
+                    ]
+                    self.assertEqual(leaked, [])
+
+    def test_capture_reason_classification_does_not_depend_on_validator_prose(self):
+        for message in (
+            "router wording changed",
+            "fee wording changed",
+            "USD reference wording changed",
+            "registry wording changed",
+            "block header wording changed",
+        ):
+            with self.subTest(message=message):
+                self.output.unlink(missing_ok=True)
+                responses_a, responses_b = valid_rpc_responses(self.registry)
+                providers = self._provider_pair(
+                    RecordingRpc(responses_a), RecordingRpc(responses_b)
+                )
+                with mock.patch.object(
+                    shib_v2_research,
+                    "validate_research_evidence",
+                    side_effect=shib_v2_research.ResearchContractError(message),
+                ):
+                    with self.assertRaisesRegex(
+                        capture.CaptureError, "^rpc_response_invalid$"
+                    ):
+                        capture.capture_research_evidence(
+                            self.registry, providers, self.output
+                        )
+                self.assertFalse(self.output.exists())
 
     def test_configuration_rejects_cardinality_labels_and_endpoint_duplicates_first(
         self,

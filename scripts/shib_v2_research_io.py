@@ -8,7 +8,7 @@ from pathlib import Path
 import stat
 import sys
 import uuid
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 try:
     from scripts.shib_v2_research import (
@@ -250,6 +250,92 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
+def _read_regular_bytes(directory_fd: int, name: str, label: str) -> bytes:
+    try:
+        path_before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ResearchContractError("{} is not a regular file".format(label)) from error
+    if not stat.S_ISREG(path_before.st_mode) or path_before.st_nlink != 1:
+        raise ResearchContractError("{} is not a regular file".format(label))
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ResearchContractError("secure file open is unavailable")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        descriptor_before = os.fstat(descriptor)
+        if _stable_metadata(path_before) != _stable_metadata(descriptor_before):
+            raise ResearchContractError("{} identity changed before read".format(label))
+        if descriptor_before.st_size > MAX_JSON_BYTES:
+            raise ResearchContractError("JSON input exceeds 1 MiB limit")
+        raw = _read_bounded(descriptor)
+        descriptor_after = os.fstat(descriptor)
+        path_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            _stable_metadata(descriptor_before) != _stable_metadata(descriptor_after)
+            or _stable_metadata(descriptor_before) != _stable_metadata(path_after)
+        ):
+            raise ResearchContractError("{} identity changed during read".format(label))
+        return raw
+    except OSError as error:
+        raise ResearchContractError("{} could not be read safely".format(label)) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _stage_bytes(directory_fd: int, name: str, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ResearchContractError("secure file open is unavailable")
+    descriptor = -1
+    try:
+        descriptor = os.open(name, flags | nofollow, 0o600, dir_fd=directory_fd)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ResearchContractError("staged JSON destination is not a regular file")
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _rollback_replacement(
+    directory_fd: int,
+    target_name: str,
+    backup_name: str,
+    original_bytes: Optional[bytes],
+) -> None:
+    if original_bytes is None:
+        try:
+            os.unlink(target_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+    else:
+        os.replace(
+            backup_name,
+            target_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    os.fsync(directory_fd)
+    if original_bytes is None:
+        try:
+            os.stat(target_name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise ResearchContractError("absent JSON destination was not restored")
+    restored = _read_regular_bytes(directory_fd, target_name, "restored JSON destination")
+    if restored != original_bytes:
+        raise ResearchContractError("JSON destination rollback bytes differ")
+
+
 def atomic_write_canonical_json(path: Path, payload: object) -> None:
     """Atomically replace one safe destination with canonical public JSON."""
     if not isinstance(path, Path):
@@ -262,7 +348,9 @@ def atomic_write_canonical_json(path: Path, payload: object) -> None:
         raise ResearchContractError("JSON destination filename is invalid")
     directory_fd, ancestors = _open_directory_chain(absolute.parent)
     staged_name = ".{}.{}.stage".format(absolute.name, uuid.uuid4().hex)
-    staged_fd = -1
+    backup_name = ".{}.{}.backup".format(absolute.name, uuid.uuid4().hex)
+    original_bytes = None
+    replaced = False
     try:
         try:
             existing = os.stat(
@@ -274,33 +362,65 @@ def atomic_write_canonical_json(path: Path, payload: object) -> None:
             not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1
         ):
             raise ResearchContractError("JSON destination is not a regular file")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-        nofollow = getattr(os, "O_NOFOLLOW", None)
-        if nofollow is None:
-            raise ResearchContractError("secure file open is unavailable")
-        staged_fd = os.open(staged_name, flags | nofollow, 0o600, dir_fd=directory_fd)
-        staged_metadata = os.fstat(staged_fd)
-        if not stat.S_ISREG(staged_metadata.st_mode) or staged_metadata.st_nlink != 1:
-            raise ResearchContractError("staged JSON destination is not a regular file")
-        _write_all(staged_fd, rendered)
-        os.fsync(staged_fd)
-        os.close(staged_fd)
-        staged_fd = -1
+        if existing is not None:
+            original_bytes = _read_regular_bytes(
+                directory_fd, absolute.name, "existing JSON destination"
+            )
+            _stage_bytes(directory_fd, backup_name, original_bytes)
+        _stage_bytes(directory_fd, staged_name, rendered)
+        _recheck_directory_chain(absolute.parent, ancestors)
+        try:
+            current = os.stat(
+                absolute.name, dir_fd=directory_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            current = None
+        if existing is None:
+            if current is not None:
+                raise ResearchContractError("JSON destination appeared before replace")
+        elif current is None or _stable_metadata(current) != _stable_metadata(existing):
+            raise ResearchContractError("JSON destination identity changed before replace")
         os.replace(
             staged_name,
             absolute.name,
             src_dir_fd=directory_fd,
             dst_dir_fd=directory_fd,
         )
-        os.fsync(directory_fd)
+        replaced = True
+        try:
+            os.fsync(directory_fd)
+            _recheck_directory_chain(absolute.parent, ancestors)
+            if original_bytes is not None:
+                os.unlink(backup_name, dir_fd=directory_fd)
+        except BaseException as error:
+            try:
+                _rollback_replacement(
+                    directory_fd,
+                    absolute.name,
+                    backup_name,
+                    original_bytes,
+                )
+            except BaseException as rollback_error:
+                raise ResearchContractError(
+                    "JSON destination rollback failed"
+                ) from rollback_error
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise ResearchContractError(
+                "JSON destination could not be replaced safely"
+            ) from error
+    except ResearchContractError:
+        raise
     except OSError as error:
         raise ResearchContractError("JSON destination could not be replaced safely") from error
     finally:
-        if staged_fd >= 0:
-            os.close(staged_fd)
+        for temporary_name in (staged_name, backup_name):
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except OSError:
+                pass
         try:
-            os.unlink(staged_name, dir_fd=directory_fd)
+            os.close(directory_fd)
         except OSError:
-            pass
-        os.close(directory_fd)
-    _recheck_directory_chain(absolute.parent, ancestors)
+            if not replaced:
+                raise
