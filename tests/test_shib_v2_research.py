@@ -2160,9 +2160,9 @@ class RepositoryEvidenceIntegrationTests(unittest.TestCase):
 
 
 class RepositorySnapshotIntegrationTests(unittest.TestCase):
-    APPLICATION_SHA = "31483cbb13c81d2dd193778d14505202ff1be5e7"
+    APPLICATION_SHA = "7f1e297e992fc79dc554ba882c0813db92c5fff3"
     SNAPSHOT_SHA256 = (
-        "a109661a50da44e04cb6e8f913319f5fb9b05df363da9c33249d5b7668ae667d"
+        "84b55173ded23bbf3accc3ba0745b487f0ff67358bebce7870aaf6225d9d7ce1"
     )
 
     def _load_authorities_and_snapshot(self):
