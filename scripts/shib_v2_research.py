@@ -79,18 +79,17 @@ _UNSAFE_TEXT = re.compile(
     r"(?:^|[^a-z0-9])gh[pous]_[a-z0-9]{16,}|github_pat_[a-z0-9_]{16,}|"
     r"(?:^|[^a-z0-9])(?:secret|password|credential)[ _:=.-]+[a-z0-9_-]{6,}|"
     r"(?<![a-z0-9])/(?![/\s])[^\s\"'<>|]*|"
+    r"(?<![a-z0-9])\\\\(?![\\\s])[^\\/\s\"'<>|]+[\\/][^\\/\s\"'<>|]+|"
     r"(?<![a-z0-9])[A-Za-z]:[\\/](?!\s)",
     re.IGNORECASE,
 )
-_UNSAFE_EMAIL_TEXT = re.compile(
-    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
-    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+_UNSAFE_AUTH_TEXT = re.compile(
+    r"(?:^|[\s,;:])(?:bearer|basic)[ \t]+[a-z0-9._~+/=-]+"
+    r"(?:$|[\s,;])",
     re.IGNORECASE,
 )
-_UNSAFE_AUTH_TEXT = re.compile(
-    r"(?:^|[\s,;:])(?:bearer|basic)[ \t]+[a-z0-9._~+/=-]{8,}"
-    r"(?:$|[\s,;])",
+_UNSAFE_COOKIE_HEADER_TEXT = re.compile(
+    r"(?:^|[\s,;])(?:set-cookie|cookie)[ \t]*:",
     re.IGNORECASE,
 )
 _UNSAFE_QUERY_TEXT = re.compile(
@@ -2054,8 +2053,9 @@ def scan_public_payload(payload: object) -> None:
         elif isinstance(value, str):
             if (
                 _UNSAFE_TEXT.search(value)
-                or ("@" in value and _UNSAFE_EMAIL_TEXT.search(value))
+                or "@" in value
                 or _UNSAFE_AUTH_TEXT.search(value)
+                or _UNSAFE_COOKIE_HEADER_TEXT.search(value)
                 or _UNSAFE_QUERY_TEXT.search(value)
             ):
                 raise ResearchContractError("public payload contains unsafe text")

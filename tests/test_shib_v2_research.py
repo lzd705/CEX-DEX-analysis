@@ -3441,6 +3441,16 @@ class SafeJsonBoundaryTests(unittest.TestCase):
                     shib_v2_research_io.atomic_write_canonical_json(output, payload)
                 self.assertEqual(output.read_bytes(), original)
 
+    def test_public_scan_rejects_cookie_and_short_auth_text(self):
+        for value in (
+            "Cookie: sessionid=abc",
+            "Set-Cookie: sid=abc",
+            "Bearer abc",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research.scan_public_payload({"value": value})
+
     def test_public_scan_and_writer_bound_in_memory_depth_and_members(self):
         deeply_nested = 0
         for _ in range(1100):
@@ -3466,6 +3476,8 @@ class SafeJsonBoundaryTests(unittest.TestCase):
         self.assertIsNone(shib_v2_research.scan_public_payload({
             "token": "SHIB",
             "address": "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce",
+            "block_hash": "0x" + "11" * 32,
+            "canonical_header_sha256": "22" * 32,
             "description": "ETH / USD",
             "fee_formula": (
                 "amount_in_with_fee=amount_in*fee_numerator;"
@@ -3553,6 +3565,49 @@ class SafeJsonBoundaryTests(unittest.TestCase):
             with self.subTest(length=len(payload["value"])):
                 with self.assertRaises(shib_v2_research.ResearchContractError):
                     atomic_write_canonical_json(path, payload)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_atomic_writer_rejects_at_text_and_preserves_existing_file(self):
+        from scripts.shib_v2_research_io import atomic_write_canonical_json
+
+        path = self.root / "registry.json"
+        original = b'{"kept":1}\n'
+        path.write_bytes(original)
+
+        with self.assertRaises(shib_v2_research.ResearchContractError):
+            atomic_write_canonical_json(path, {"value": "researcher@localhost"})
+
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_atomic_writer_rejects_unc_path_and_preserves_existing_file(self):
+        from scripts.shib_v2_research_io import atomic_write_canonical_json
+
+        path = self.root / "registry.json"
+        original = b'{"kept":1}\n'
+        path.write_bytes(original)
+
+        with self.assertRaises(shib_v2_research.ResearchContractError):
+            atomic_write_canonical_json(
+                path,
+                {"value": r"\\server\share\private.json"},
+            )
+
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_atomic_writer_rejects_cookie_and_short_auth_text_and_preserves_existing_file(self):
+        from scripts.shib_v2_research_io import atomic_write_canonical_json
+
+        path = self.root / "registry.json"
+        original = b'{"kept":1}\n'
+        for value in (
+            "Cookie: sessionid=abc",
+            "Set-Cookie: sid=abc",
+            "Bearer abc",
+        ):
+            with self.subTest(value=value):
+                path.write_bytes(original)
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    atomic_write_canonical_json(path, {"value": value})
                 self.assertEqual(path.read_bytes(), original)
 
     def test_atomic_writer_precommit_and_replace_failures_preserve_prior_state(self):
