@@ -38,6 +38,9 @@ REGISTRY_PATH = PROJECT_ROOT / "config/shib_v2_research_pools.json"
 EVIDENCE_PATH = (
     PROJECT_ROOT / "data/public/research/shib-v2v2/evidence.json"
 )
+SNAPSHOT_PATH = (
+    PROJECT_ROOT / "data/public/research/shib-v2v2/latest.json"
+)
 BUILD_SCRIPT = PROJECT_ROOT / "scripts/build_shib_v2_research_snapshot.py"
 
 
@@ -2072,6 +2075,172 @@ class RepositoryEvidenceIntegrationTests(unittest.TestCase):
             EVIDENCE_PATH.read_bytes(),
             shib_v2_research.canonical_json_bytes(evidence) + b"\n",
         )
+
+
+class RepositorySnapshotIntegrationTests(unittest.TestCase):
+    APPLICATION_SHA = "31483cbb13c81d2dd193778d14505202ff1be5e7"
+    SNAPSHOT_SHA256 = (
+        "a109661a50da44e04cb6e8f913319f5fb9b05df363da9c33249d5b7668ae667d"
+    )
+
+    def _load_authorities_and_snapshot(self):
+        self.assertTrue(
+            SNAPSHOT_PATH.is_file(), "tracked research snapshot is missing"
+        )
+        registry = shib_v2_research.load_research_registry(
+            load_bounded_json(REGISTRY_PATH, "research registry")
+        )
+        evidence = shib_v2_research.validate_research_evidence(
+            load_bounded_json(EVIDENCE_PATH, "research evidence"),
+            registry,
+        )
+        snapshot = load_bounded_json(SNAPSHOT_PATH, "research snapshot")
+        return registry, evidence, snapshot
+
+    def test_checked_in_snapshot_regenerates_byte_for_byte(self):
+        registry, evidence, snapshot = self._load_authorities_and_snapshot()
+        expected = SNAPSHOT_PATH.read_bytes()
+        rebuilt = shib_v2_research.build_research_snapshot(
+            evidence,
+            registry,
+            self.APPLICATION_SHA,
+        )
+
+        self.assertEqual(snapshot["application_sha"], self.APPLICATION_SHA)
+        self.assertEqual(
+            snapshot["evidence_identity"],
+            "bd87318aa60de73874e05f436ae6f84c66b4b56fd53612929d9cfe7cfa5c7427",
+        )
+        self.assertEqual(snapshot["as_of_block_number"], 25860867)
+        self.assertEqual(
+            snapshot["as_of_block_hash"],
+            "0x806fc920f52b11cb56749e7786d176d7d2d21310f145184e83cc5ec5d882d75b",
+        )
+        self.assertEqual(snapshot["snapshot_sha256"], self.SNAPSHOT_SHA256)
+        self.assertEqual(
+            shib_v2_research.validate_research_snapshot(
+                snapshot, evidence, registry
+            ),
+            snapshot,
+        )
+        self.assertEqual(
+            expected,
+            shib_v2_research.canonical_json_bytes(rebuilt) + b"\n",
+        )
+
+        hash_body = dict(snapshot)
+        del hash_body["snapshot_sha256"]
+        independent_sha256 = hashlib.sha256(
+            b"shib-v2-research-snapshot/v1\n"
+            + shib_v2_research.canonical_json_bytes(hash_body)
+        ).hexdigest()
+        self.assertEqual(independent_sha256, self.SNAPSHOT_SHA256)
+
+    def test_real_scenarios_preserve_classification_and_missing_costs(self):
+        _, _, snapshot = self._load_authorities_and_snapshot()
+        expected_counts = {
+            "non_positive_pool_edge": 10,
+            "positive_pool_edge_costs_incomplete": 0,
+            "unavailable": 0,
+        }
+        observed_counts = {classification: 0 for classification in expected_counts}
+        missing_cost_fields = (
+            "network_gas_usd",
+            "router_or_integrator_fee_usd",
+            "token_transfer_tax_usd",
+            "mev_cost_usd",
+            "atomic_execution_cost_usd",
+            "net_edge_usd",
+            "net_edge_bps",
+        )
+        edge_fields = (
+            "buy_weth_raw",
+            "sell_weth_raw",
+            "gross_edge_weth_raw",
+            "buy_cost_usd",
+            "sell_proceeds_usd",
+            "gross_edge_usd",
+            "gross_edge_bps",
+        )
+        expected_limitations = [
+            "network_gas_not_evaluated",
+            "router_fee_not_evaluated",
+            "token_transfer_tax_not_evaluated",
+            "mev_not_evaluated",
+            "atomic_route_simulation_unavailable",
+        ]
+
+        self.assertEqual(snapshot["scenario_count"], 10)
+        self.assertEqual(len(snapshot["scenarios"]), 10)
+        for row in snapshot["scenarios"]:
+            observed_counts[row["classification"]] += 1
+            self.assertFalse(row["strict_eligible"])
+            self.assertFalse(row["executable"])
+            self.assertNotIn("opportunity", row["classification"])
+            for field in missing_cost_fields:
+                self.assertIsNone(row[field], field)
+
+            available = (
+                row["buy_quote_status"] == "calculation_complete"
+                and row["sell_quote_status"] == "calculation_complete"
+            )
+            if available:
+                self.assertEqual(row["limitations"], expected_limitations)
+                if row["gross_edge_weth_raw"] > 0:
+                    self.assertEqual(
+                        row["classification"],
+                        "positive_pool_edge_costs_incomplete",
+                    )
+                else:
+                    self.assertEqual(
+                        row["classification"], "non_positive_pool_edge"
+                    )
+            else:
+                self.assertEqual(row["classification"], "unavailable")
+                for field in edge_fields:
+                    self.assertIsNone(row[field], field)
+
+        self.assertEqual(observed_counts, expected_counts)
+        self.assertEqual(
+            snapshot["summary"],
+            {
+                "expected_scenario_count": 10,
+                "observed_scenario_count": 10,
+                "usable_scenario_count": 10,
+                "classification_counts": expected_counts,
+                "strict_eligible_count": 0,
+                "executable_count": 0,
+                "missing_cost_field_count": 70,
+            },
+        )
+
+    def test_repository_snapshot_is_public_safe(self):
+        _, _, snapshot = self._load_authorities_and_snapshot()
+        rendered = SNAPSHOT_PATH.read_text(encoding="utf-8")
+
+        self.assertIsNone(shib_v2_research.scan_public_payload(snapshot))
+        self.assertNotIn("http" + "://", rendered.lower())
+        self.assertNotIn("wss" + "://", rendered.lower())
+        self.assertNotRegex(rendered, r"\?[A-Za-z0-9_.%~-]+(?:=|%3[dD])")
+        self.assertNotIn("@", rendered)
+        for forbidden in (
+            "authorization",
+            "cookie",
+            "api_key",
+            "private_key",
+            "provider_error",
+            "raw_response",
+            "raw_rpc",
+            "rpc_url",
+            "account",
+            "wallet",
+            "/Users" + "/",
+            "/home" + "/",
+            "/root" + "/",
+            "/private" + "/",
+            "/tmp" + "/",
+        ):
+            self.assertNotIn(forbidden.lower(), rendered.lower())
 
 
 class ResearchEvidenceTests(unittest.TestCase):
