@@ -57,7 +57,8 @@ not necessary to close the research loop and is explicitly deferred.
 
 ### Included
 
-- one Ethereum block number and hash shared by both pools and the ETH/USD feed;
+- one Ethereum block number and hash, independently agreed by two providers,
+  shared by both pools and the ETH/USD feed;
 - canonical factory-to-pair and pair-to-factory round trips;
 - pair and token runtime-code hashes;
 - `token0`, `token1`, token decimals, reserves, reserve timestamp, and pair
@@ -130,20 +131,27 @@ formula into a second implementation.
 ### `scripts/capture_shib_v2_research_evidence.py`
 
 This command is the only network-capable part of the increment. It accepts a
-registry path, an explicit output path, and an RPC URL supplied at runtime. It:
+registry path, an explicit output path, and two RPC URLs with distinct opaque
+provider labels supplied at runtime. The URLs are process-only inputs. It:
 
 1. resolves one finalized Ethereum header;
 2. re-reads that header by hash and verifies number/hash/parent/timestamp;
 3. uses EIP-1898 `{blockHash, requireCanonical: true}` for every `eth_call`;
-4. verifies factory `getPair`, pair factory, token ordering, code, decimals,
+4. executes the complete registry-derived call inventory against both
+   providers at that exact block hash;
+5. requires byte-identical reviewed results from both providers;
+6. verifies factory `getPair`, pair factory, token ordering, code, decimals,
    reserves, balances, fee parameters, and Chainlink round data;
-5. writes only the bounded result hex and decoded public fields needed for
-   replay.
+7. writes only the bounded result hex, provider-independent result hashes, and
+   decoded public fields needed for replay.
 
-If EIP-1898 is unsupported, state is pruned, the block is non-canonical, or an
-identity differs, capture fails closed. There is no block-number fallback.
-The RPC URL and provider error body are never written to the evidence file or
-included in the exception returned by the CLI.
+If either provider rejects EIP-1898, lacks the state, returns a non-canonical
+block, disagrees on a required byte, or exposes an identity mismatch, capture
+fails closed. A retry may repeat the same call at the same block hash but may
+not select a new block or change providers. There is no block-number fallback,
+single-provider publication, or majority-vote repair. RPC URLs and provider
+error bodies are never written to the evidence file or included in the
+exception returned by the CLI.
 
 ### `scripts/build_shib_v2_research_snapshot.py`
 
@@ -171,6 +179,169 @@ network access.
 
 No production collection or dashboard files are modified.
 
+## Collection quality gate
+
+The checked-in evidence is publishable only when every rule in this section
+passes. These are executable contract requirements, not documentation-only
+expectations.
+
+### Intended grain and keys
+
+| Entity | Grain | Candidate primary key |
+| --- | --- | --- |
+| evidence generation | one registry at one canonical Ethereum block | `(registry_sha256, chain_id, block_hash)` |
+| logical RPC call | one call target and calldata at the fixed block | `(block_hash, to_address, calldata_sha256)` |
+| provider observation | one provider result for one logical call | `(provider_label, block_hash, to_address, calldata_sha256)` |
+| token | one canonical token identity at the fixed block | `(block_hash, token_address)` |
+| pool | one canonical DEX pair state at the fixed block | `(block_hash, dex, pair_address)` |
+| USD reference | one Chainlink proxy round visible at the fixed block | `(block_hash, proxy_address, round_id)` |
+| research scenario | one directed route and requested USD notional | `(route_id, requested_notional_usd)` |
+
+Addresses are lower-case canonical EVM addresses before key construction.
+Near-duplicates caused by address case, whitespace, decimal formatting, or
+provider ordering are rejected rather than silently normalized into multiple
+records.
+
+### Authoritative sources
+
+The registry is the identity authority. The Ethereum state at the bound block
+is the observation authority. Documentation URLs may explain an authority
+record during review, but they are not runtime data and are not projected into
+the public evidence.
+
+For every pool, authority requires all of the following to agree:
+
+- registry chain, factory, router, pair, SHIB, WETH, runtime-code hashes, and
+  fee model;
+- factory `getPair(SHIB,WETH)`;
+- pair `factory()`, `token0()`, and `token1()`;
+- token decimals and runtime code;
+- pair reserves and both ERC-20 `balanceOf(pair)` values;
+- DEX-specific fee evidence.
+
+The ETH/USD authority is the registry-pinned Chainlink proxy read through
+`AggregatorV3Interface` at the same block hash. No exchange ticker, current
+HTTP price, stablecoin parity assumption, or fallback feed is allowed.
+
+### Exact expected inventory
+
+The registry deterministically expands into one closed call inventory before
+any request is sent. It contains:
+
+- one chain ID and one finalized block header, then the same header read back
+  by hash;
+- runtime code for every unique factory, router, pair, token, and feed proxy;
+- one `getPair(SHIB,WETH)` per factory;
+- `factory`, `token0`, `token1`, and `getReserves` per pair;
+- `decimals` for SHIB and WETH, plus both `balanceOf(pair)` calls per pair;
+- the registry-declared fee calls for each DEX, including ShibaSwap
+  `totalFee`, `alpha`, and `beta`;
+- Chainlink `decimals`, `description`, and `latestRoundData`.
+
+Every logical call must have exactly two provider observations and one agreed
+result. The expected inventory cannot shrink after a failed call. Unknown,
+extra, duplicate, or missing calls fail the generation. A pool with only one
+usable call is not partial coverage and cannot enter calculation.
+
+### Completeness, uniqueness, and quality metrics
+
+Evidence contains a `collection_quality` object with:
+
+```text
+state
+expected_logical_call_count
+observed_logical_call_count
+usable_logical_call_count
+expected_provider_observation_count
+observed_provider_observation_count
+usable_provider_observation_count
+duplicate_logical_call_key_count
+duplicate_provider_observation_key_count
+required_field_null_count
+measured_zero_count
+missing_null_count
+provider_agreement_count
+provider_disagreement_count
+status_counts
+```
+
+For a publishable generation, `state` is `evaluated`; all three logical-call
+counts are equal; all three provider-observation counts equal twice the logical
+count; duplicate, required-null, missing-null, and disagreement counts are
+zero; and agreement count equals the logical-call count. The validator
+recomputes every metric and rejects supplied summaries that do not match the
+records.
+
+A failed live capture returns one allowlisted reason such as
+`provider_disagreement`, `canonical_block_unavailable`,
+`required_call_missing`, `pool_authority_mismatch`, `fee_authority_mismatch`,
+or `usd_reference_unavailable`. It does not write a stable-looking evidence
+file. If a consumer is asked to build from an absent evidence file, the family
+is `not_evaluated`; it is never represented as zero calls or zero coverage.
+
+### Null, zero, and numeric validity
+
+Required on-chain values cannot be null. Required result hex cannot be empty.
+Chain ID, block number, timestamps, round ID, price answer, decimals, reserves,
+and code length obey their ABI integer bounds. Reserves and the ETH/USD answer
+must be positive.
+
+A measured zero that is valid for its field, such as a zero protocol-fee
+recipient, is retained and counted in `measured_zero_count`. Missing route-cost
+families are null and counted separately; they are never converted to zero.
+NaN, Infinity, exponent-form decimal text, binary floats, negative unsigned
+values, and values exceeding ABI bounds are rejected.
+
+### Time, finality, and freshness
+
+All times are canonical UTC. The block must be returned by the `finalized` tag
+from both providers and must round-trip by hash. All state calls use that hash.
+No observation from a different block can be joined into the generation.
+
+Chainlink `updated_at` must be positive, no later than the block timestamp, and
+no older than the registry maximum. Pair reserve timestamps are recorded and
+their lag is reported per pool; an old reserve timestamp is not rewritten to
+the block time. Because balances must equal reserves, it is an observed
+no-update interval rather than an inferred missing observation.
+
+The public snapshot is always historical even if captured recently. It never
+extends freshness from the replay time and never becomes current merely
+because `latest.json` was regenerated.
+
+This dataset has point-in-time grain, not daily grain. A 30-day date-span or
+daily completeness claim is therefore prohibited and is not part of its
+quality summary.
+
+### Consistency and integrity
+
+- block number, hash, timestamp, state root, and canonical-header hash agree
+  across providers and every entity;
+- every child entity refers to the single evidence generation;
+- pool token balances equal the decoded reserves at the fixed block;
+- fee bps, numerator, denominator, formula, and native fee parameters
+  recompute exactly;
+- Chainlink answer and decimals recompute the same exact ETH/USD rational used
+  in every scenario;
+- the ten scenario keys equal the Cartesian product of two routes and five
+  notionals, with no orphan or extra row;
+- evidence, registry, application, and snapshot hashes form an unbroken
+  lineage and are independently recomputed on load.
+
+Any integrity mismatch invalidates the complete generation; the loader does
+not drop the bad row and continue.
+
+### Shape, size, and privacy limits
+
+Registry, evidence, and snapshot files are regular non-symlink files no larger
+than 1 MiB. JSON nesting, member counts, string lengths, and result-hex lengths
+are bounded before full materialization. Duplicate JSON keys are rejected.
+
+Provider labels are fixed opaque identifiers. URLs, headers, query strings,
+credentials, cookies, account or wallet identities, arbitrary provider error
+text, absolute paths, home-directory fragments, and environment values are not
+allowed fields. Capture and replay run a final public-output scan before an
+atomic write.
+
 ## Evidence contract
 
 `shib_v2_research_evidence/v1` has these top-level members:
@@ -180,15 +351,25 @@ schema
 registry_sha256
 chain
 block
+logical_calls
+provider_observations
 tokens
 usd_reference
 pools
+collection_quality
 evidence_identity
 ```
 
 The evidence grain is one `(chain_id, block_hash, registry_sha256)` generation.
 The block record retains number, hash, parent hash, timestamp, state root,
 base-fee-per-gas, and the hash of its canonical reviewed projection.
+
+Each `logical_calls` member retains a canonical logical call ID, target,
+calldata, calldata SHA-256, bounded result hex, and result SHA-256. Each
+`provider_observations` member retains only the opaque provider label, logical
+call ID, block hash, result SHA-256, and status. The validator requires exactly
+two observations per logical call and requires both hashes to equal the stored
+logical result. Provider URLs and full JSON-RPC envelopes are never stored.
 
 Each pool record retains:
 
@@ -327,10 +508,14 @@ the capture transport with a fake RPC server.
 Required coverage:
 
 - exact registry shape and exactly two canonical pools;
+- exact call-inventory expansion, expected/observed/usable parity, duplicate
+  keys, recomputed quality metrics, and two-provider agreement;
 - wrong chain, factory, router, pair, token, token ordering, code hash, fee, or
   `getPair` round trip;
 - block-number/hash mismatch, changed header, noncanonical block, and EIP-1898
-  rejection;
+  rejection by either provider;
+- divergent provider header, code, call result, missing observation, retry that
+  attempts to change block, and attempted single-provider fallback;
 - missing, malformed, zero, negative, overflowed, or mismatched reserves and
   balances;
 - ShibaSwap fee-parameter mismatch and Uniswap fee-authority mismatch;
@@ -339,6 +524,8 @@ Required coverage:
 - ten-scenario completeness and requested-notional ordering;
 - negative edge, zero edge, positive pool comparison, and unavailable states;
 - missing costs remain null and never become zero;
+- valid measured zero remains distinct from missing/null and is counted
+  separately;
 - identical inputs produce identical canonical bytes and self-hash;
 - any input mutation changes evidence/publication identity or fails validation;
 - direct CLI execution from repository and external working directories;
@@ -353,7 +540,8 @@ Required coverage:
 
 The work is complete only when:
 
-1. the two pool authorities and one fixed-block evidence generation validate;
+1. the two pool authorities and one dual-provider fixed-block evidence
+   generation pass every collection-quality gate;
 2. offline replay produces exactly ten scenarios;
 3. the checked-in snapshot regenerates byte-for-byte from a clean checkout;
 4. negative output is preserved as a result, while missing costs remain null;
