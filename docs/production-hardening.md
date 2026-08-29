@@ -205,6 +205,10 @@ python3 scripts/uniswap_v3_launch.py preflight \
 Without `--execute`, every phase prints only a redacted plan. It does not make
 a directory, write a receipt, query systemd, acquire/create the collection
 lock, start a process, run collection, publish, or make a network request.
+The launcher disables bytecode writes before importing project modules, so
+direct `--help` and plan execution do not create project-local `__pycache__`
+artifacts. Python interpreter or site initialization outside the project is an
+operating-system/runtime concern and is not controlled by this script.
 Review that plan, then add `--execute` and run exactly one phase at a time in
 this order:
 
@@ -257,7 +261,11 @@ After `verify-stage` succeeds, preserve this cutover order:
 
 Do not promote while the old production dashboard is still serving, and do
 not resume timers merely because the external application switch succeeded.
-The launcher deliberately cannot make or infer either event.
+The launcher deliberately cannot make or infer either event. Keep both
+managed timers disabled and both services inactive throughout the hold point,
+and prevent all manual or non-cooperating writers from touching the live data
+root. The path-based precommit checks do not pin root names or protect the
+final replacement boundary from a late external writer or root replacement.
 
 If forward validation fails, keep the timers paused and use this rollback
 order:
@@ -266,8 +274,8 @@ order:
 2. Restore the previous application pointer outside the tool.
 3. Run `restore --execute`. Restore uses CAS against the exact promoted
    generation and restores every original byte and mode. An initially absent
-   sidecar returns atomically to absence. A trusted private receipt created by
-   this launch is removed in the same ordinary-I/O rollback transaction; a
+   sidecar returns to absence within the ordinary-I/O transaction. A trusted
+   private receipt created by this launch is removed in that transaction; a
    byte-identical receipt that predated the launch is validated and preserved.
 4. Start the old dashboard and validate its previous application SHA and
    current data health.
@@ -283,12 +291,27 @@ The forward publisher reuses the existing bounded atomic five-file helper.
 Restore uses a launch-local replace-or-remove transaction so first-sidecar
 absence is supported. Both restore pre-call bytes after ordinary I/O errors;
 neither is a claim of multi-file crash atomicity across power loss or kernel
-failure. If five-file promotion fails, the tool removes only a trusted receipt
-it created; a different or drifted live receipt fails closed. The normal
-forward dashboard uses the default live raw root, not a permanent stage-root
-override. Retain the private launch backup, receipts, complete staged raw/TVL
-evidence, validation receipt, and staged processed root through the complete
-observation and rollback window.
+failure, and neither protects against a non-cooperating late writer after the
+last path-based state check. If five-file promotion fails, the tool removes
+only a trusted receipt it created; a different or drifted live receipt fails
+closed.
+
+Phase receipt creation follows promotion or restore. If that receipt write
+fails after live bytes changed, keep the dashboard stopped and every managed
+timer/service paused. Do not retry blindly: compare the fixed five live files
+and trusted receipt against the retained backup, staged candidate, and their
+checksums, perform the appropriate manual checksummed forward or recovery
+action, and create no replacement ledger receipt until the live generation is
+unambiguously established. A failed `resume` leaves no resume completion
+receipt and attempts to return both timers and both services to
+disabled/inactive. Retry only after that compensation is verified. If
+compensation itself fails, reconcile every managed unit state manually and
+confirm the safe paused state before revalidating the predecessor.
+
+The normal forward dashboard uses the default live raw root, not a permanent
+stage-root override. Retain the private launch backup, receipts, complete
+staged raw/TVL evidence, validation receipt, and staged processed root through
+the complete observation and rollback window.
 
 ## Configure HTTPS
 

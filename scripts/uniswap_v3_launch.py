@@ -26,6 +26,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, TextIO, Tuple
 
+sys.dont_write_bytecode = True
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from scripts.atomic_publication import atomic_replace_bundle
 from scripts.fetch_dex_depth import (
     uniswap_v3_exact_receipt_bytes,
@@ -53,7 +58,6 @@ MAX_PUBLIC_FILE_BYTES = 512 * 1024 * 1024
 MAX_INPUT_FILE_BYTES = 8 * 1024 * 1024 * 1024
 MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 SHA_PATTERN = re.compile(r"[0-9a-f]{40,64}")
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 TIMER_UNITS = (
     "cex-dex-daily.timer",
@@ -492,8 +496,16 @@ def _read_csv_regular(path: Path, label: str) -> list[dict[str, str]]:
     return list(csv.DictReader(io.StringIO(text, newline="")))
 
 
-def _read_canonical_json(path: Path, label: str, *, limit: int) -> dict[str, Any]:
-    payload, _mode = _read_regular_bytes(path, label, limit=limit)
+def _read_canonical_json(
+    path: Path,
+    label: str,
+    *,
+    limit: int,
+    required_mode: Optional[int] = None,
+) -> dict[str, Any]:
+    payload, mode = _read_regular_bytes(path, label, limit=limit)
+    if required_mode is not None and mode != required_mode:
+        raise ValueError("{} must have mode {:04o}".format(label, required_mode))
     try:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -508,7 +520,7 @@ def _validate_stage_candidate(stage_dir: Path) -> dict[str, Any]:
     stage_dir = Path(stage_dir)
     _require_directory(stage_dir, "staging root", mode=0o700)
     inventory = _read_csv_regular(
-        stage_dir / "dex_pool_tvl_latest.csv",
+        processed_dir_for(stage_dir) / "dex_pool_tvl_snapshot.csv",
         "staged DEX TVL inventory",
     )
     depth_rows = _read_csv_regular(
@@ -598,7 +610,11 @@ def _ensure_private_relative_directories(
     for name in ("raw", "dex-depth", snapshot_id):
         current = current / name
         if os.path.lexists(str(current)):
-            _require_directory(current, "trusted receipt directory")
+            metadata = _require_directory(current, "trusted receipt directory")
+            if stat.S_IMODE(metadata.st_mode) & 0o022:
+                raise ValueError(
+                    "trusted receipt directory cannot be group/world writable"
+                )
         else:
             os.mkdir(str(current), 0o700)
             os.chmod(str(current), 0o700)
@@ -624,6 +640,8 @@ def _install_trusted_receipt(
             "live trusted exact receipt",
             limit=MAX_RECEIPT_BYTES,
         )
+        if mode != 0o600:
+            raise ValueError("live trusted exact receipt must have mode 0600")
         if existing != payload:
             raise ValueError("live trusted exact receipt differs from candidate")
     else:
@@ -656,6 +674,7 @@ def _trusted_receipt_path(data_dir: Path, record: Mapping[str, Any]) -> Path:
         or type(record.get("created")) is not bool
         or type(record.get("size")) is not int
         or type(record.get("mode")) is not int
+        or record.get("mode") != 0o600
         or type(record.get("sha256")) is not str
         or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None
     ):
@@ -789,6 +808,7 @@ def _load_backup_manifest(backup_dir: Path) -> dict[str, Any]:
         backup_dir / "manifest.json",
         "backup manifest",
         limit=MAX_RECEIPT_BYTES,
+        required_mode=0o600,
     )
     if (
         manifest.get("schema") != BACKUP_SCHEMA
@@ -1056,7 +1076,12 @@ def write_receipt(path: Path, receipt: Mapping[str, Any]) -> None:
 
 def read_receipt(path: Path) -> dict[str, Any]:
     """Read one descriptor-checked canonical receipt."""
-    return _read_canonical_json(Path(path), "launch receipt", limit=MAX_RECEIPT_BYTES)
+    return _read_canonical_json(
+        Path(path),
+        "launch receipt",
+        limit=MAX_RECEIPT_BYTES,
+        required_mode=0o600,
+    )
 
 
 @dataclass(frozen=True)
@@ -1261,25 +1286,41 @@ def _load_predecessor(
     receipt_path = config.launch_dir / RECEIPT_FILES[phase]
     if os.path.lexists(str(receipt_path)):
         raise FileExistsError("{} phase is already completed".format(phase))
-    for later_phase in PHASES[PHASES.index(phase) + 1:]:
-        if os.path.lexists(str(config.launch_dir / RECEIPT_FILES[later_phase])):
-            raise ValueError("launch receipt ledger order is invalid")
-    predecessor_phase = _phase_predecessor(phase, config.launch_dir)
-    if predecessor_phase is None:
+    if phase == "resume":
+        terminal_phase = (
+            "restore"
+            if os.path.lexists(
+                str(config.launch_dir / RECEIPT_FILES["restore"])
+            )
+            else "promote"
+        )
+        required_phases = list(
+            PHASES[:PHASES.index(terminal_phase) + 1]
+        )
+    else:
+        required_phases = list(PHASES[:PHASES.index(phase)])
+    forbidden_phases = [
+        candidate_phase
+        for candidate_phase in PHASES
+        if candidate_phase not in required_phases and candidate_phase != phase
+    ]
+    if any(
+        os.path.lexists(
+            str(config.launch_dir / RECEIPT_FILES[candidate_phase])
+        )
+        for candidate_phase in forbidden_phases
+    ):
+        raise ValueError("launch receipt ledger order is invalid")
+    if not required_phases:
         return None
-    predecessor_path = config.launch_dir / RECEIPT_FILES[predecessor_phase]
-    if not os.path.lexists(str(predecessor_path)):
-        raise ValueError("{} predecessor receipt is missing".format(phase))
 
     chain = []
-    for candidate_phase in PHASES:
-        if candidate_phase == "restore" and predecessor_phase == "promote":
-            continue
+    for candidate_phase in required_phases:
         candidate_path = config.launch_dir / RECEIPT_FILES[candidate_phase]
         if not os.path.lexists(str(candidate_path)):
-            if candidate_phase == predecessor_phase:
-                raise ValueError("{} predecessor receipt is missing".format(phase))
-            continue
+            raise ValueError(
+                "{} consecutive predecessor receipt is missing".format(phase)
+            )
         receipt = read_receipt(candidate_path)
         if (
             receipt.get("schema") != RECEIPT_SCHEMA
@@ -1293,9 +1334,7 @@ def _load_predecessor(
         if receipt.get("predecessor_receipt_sha256") != expected_hash:
             raise ValueError("launch receipt chain is invalid")
         chain.append(receipt)
-        if candidate_phase == predecessor_phase:
-            return receipt
-    raise ValueError("{} predecessor receipt is missing".format(phase))
+    return chain[-1]
 
 
 def _base_receipt(
@@ -1405,6 +1444,7 @@ def _preflight(config: LaunchConfig, runner: Any) -> dict[str, Any]:
 
 def _pause(config: LaunchConfig, runner: Any, predecessor: Mapping[str, Any]) -> dict[str, Any]:
     timer_states = _capture_timer_states(runner)
+    receipt_path = config.launch_dir / RECEIPT_FILES["pause"]
     try:
         for unit in TIMER_UNITS:
             _checked_run(
@@ -1421,7 +1461,18 @@ def _pause(config: LaunchConfig, runner: Any, predecessor: Mapping[str, Any]) ->
         _require_paused(runner)
         with _live_collection_lock(config.data_dir):
             pass
+        receipt = _base_receipt("pause", config, predecessor)
+        receipt.update({
+            "timer_states": timer_states,
+            "services": {unit: "inactive" for unit in SERVICE_UNITS},
+            "collection_lock": "verified_unheld",
+        })
+        return _write_phase_receipt("pause", config, receipt)
     except BaseException as phase_error:
+        try:
+            os.unlink(str(receipt_path))
+        except FileNotFoundError:
+            pass
         try:
             _restore_timer_states(runner, timer_states)
         except BaseException as restore_error:
@@ -1429,13 +1480,6 @@ def _pause(config: LaunchConfig, runner: Any, predecessor: Mapping[str, Any]) ->
                 "pause failed and captured timer states could not be restored"
             ) from restore_error
         raise phase_error
-    receipt = _base_receipt("pause", config, predecessor)
-    receipt.update({
-        "timer_states": timer_states,
-        "services": {unit: "inactive" for unit in SERVICE_UNITS},
-        "collection_lock": "verified_unheld",
-    })
-    return _write_phase_receipt("pause", config, receipt)
 
 
 def _backup(config: LaunchConfig, runner: Any, predecessor: Mapping[str, Any]) -> dict[str, Any]:
@@ -1767,6 +1811,35 @@ def _restore_timer_states(runner: Any, states: Mapping[str, Mapping[str, str]]) 
         raise RuntimeError("timer states were not restored exactly")
 
 
+def _force_safe_pause(runner: Any) -> None:
+    """Best-effort every fixed stop, then require the fail-closed state."""
+    errors = []
+    for unit in TIMER_UNITS:
+        try:
+            _checked_run(
+                runner,
+                ["systemctl", "--user", "disable", "--now", unit],
+                label="return managed timer to safe pause",
+            )
+        except BaseException as error:
+            errors.append(error)
+    for unit in SERVICE_UNITS:
+        try:
+            _checked_run(
+                runner,
+                ["systemctl", "--user", "stop", unit],
+                label="return managed service to safe pause",
+            )
+        except BaseException as error:
+            errors.append(error)
+    try:
+        _require_paused(runner)
+    except BaseException as error:
+        errors.append(error)
+    if errors:
+        raise RuntimeError("failed to return every managed unit to safe pause") from errors[0]
+
+
 def _resume(
     config: LaunchConfig,
     runner: Any,
@@ -1779,48 +1852,62 @@ def _resume(
         else config.target_sha
     )
     states = _timer_states_from_pause(config)
+    receipt_path = config.launch_dir / RECEIPT_FILES["resume"]
     with _live_collection_lock(config.data_dir):
-        _require_paused(runner)
-        if predecessor.get("phase") == "restore":
-            evidence = _verified_rollback_health(
-                runner,
-                base_url=config.live_base_url,
-                expected_sha=expected_sha,
-            )
-        else:
-            promotion = predecessor.get("promotion")
-            if not isinstance(promotion, Mapping):
-                raise ValueError("forward promotion receipt is invalid")
-            verify_bundle_state(
-                config.data_dir,
-                promotion.get("promoted"),
-                state="promoted",
-            )
-            _trusted_path, trusted_payload, _trusted_mode = (
-                _read_verified_trusted_receipt(
-                    config.data_dir,
-                    promotion.get("trusted_receipt"),
+        try:
+            _require_paused(runner)
+            if predecessor.get("phase") == "restore":
+                evidence = _verified_rollback_health(
+                    runner,
+                    base_url=config.live_base_url,
+                    expected_sha=expected_sha,
                 )
-            )
-            public_sidecar, _public_mode = _read_regular_bytes(
-                config.data_dir / PUBLIC_BUNDLE_NAMES[-1],
-                "promoted public exact receipt",
-                limit=MAX_RECEIPT_BYTES,
-            )
-            if public_sidecar != trusted_payload:
-                raise ValueError("trusted exact receipt drift detected")
-            evidence = _verified_release(
-                runner,
-                base_url=config.live_base_url,
-                expected_sha=expected_sha,
-            )
-        _restore_timer_states(runner, states)
-    receipt = _base_receipt("resume", config, predecessor)
-    receipt.update({
-        "release_evidence": evidence,
-        "restored_timer_states": states,
-    })
-    return _write_phase_receipt("resume", config, receipt)
+            else:
+                promotion = predecessor.get("promotion")
+                if not isinstance(promotion, Mapping):
+                    raise ValueError("forward promotion receipt is invalid")
+                verify_bundle_state(
+                    config.data_dir,
+                    promotion.get("promoted"),
+                    state="promoted",
+                )
+                _trusted_path, trusted_payload, _trusted_mode = (
+                    _read_verified_trusted_receipt(
+                        config.data_dir,
+                        promotion.get("trusted_receipt"),
+                    )
+                )
+                public_sidecar, _public_mode = _read_regular_bytes(
+                    config.data_dir / PUBLIC_BUNDLE_NAMES[-1],
+                    "promoted public exact receipt",
+                    limit=MAX_RECEIPT_BYTES,
+                )
+                if public_sidecar != trusted_payload:
+                    raise ValueError("trusted exact receipt drift detected")
+                evidence = _verified_release(
+                    runner,
+                    base_url=config.live_base_url,
+                    expected_sha=expected_sha,
+                )
+            _restore_timer_states(runner, states)
+            receipt = _base_receipt("resume", config, predecessor)
+            receipt.update({
+                "release_evidence": evidence,
+                "restored_timer_states": states,
+            })
+            return _write_phase_receipt("resume", config, receipt)
+        except BaseException as phase_error:
+            try:
+                os.unlink(str(receipt_path))
+            except FileNotFoundError:
+                pass
+            try:
+                _force_safe_pause(runner)
+            except BaseException as pause_error:
+                raise RuntimeError(
+                    "resume failed and safe paused state could not be restored"
+                ) from pause_error
+            raise phase_error
 
 
 def execute_phase(phase: str, config: LaunchConfig, runner: Any = None) -> dict[str, Any]:

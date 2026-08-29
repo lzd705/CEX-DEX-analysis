@@ -4,6 +4,8 @@ import io
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import uniswap_v3_launch as launch
+from scripts.run_collection_cycle import build_step_commands
 
 
 class LaunchFilesystemTest(unittest.TestCase):
@@ -65,6 +68,95 @@ class LaunchFilesystemTest(unittest.TestCase):
             self.originals[launch.PUBLIC_BUNDLE_NAMES[0]]
         ).hexdigest())
         self.assertEqual(first["mode"], 0o640)
+
+    def test_real_subprocess_help_and_plan_are_runnable_and_project_read_only(self):
+        cache_root = self.root / "bytecode-cache"
+        environment = dict(os.environ)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        environment["PYTHONPYCACHEPREFIX"] = str(cache_root)
+        script = Path(__file__).resolve().parents[1] / "scripts/uniswap_v3_launch.py"
+
+        help_result = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            cwd=script.parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("usage:", help_result.stdout)
+
+        absent_data = self.root / "absent-data"
+        absent_launch = self.root / "absent-launch"
+        absent_stage = self.root / "absent-stage"
+        plan_result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "preflight",
+                "--data-dir", str(absent_data),
+                "--launch-dir", str(absent_launch),
+                "--stage-dir", str(absent_stage),
+                "--target-sha", "a" * 40,
+                "--previous-app-sha", "b" * 40,
+            ],
+            cwd=script.parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(plan_result.returncode, 0, plan_result.stderr)
+        self.assertIn('"execute":false', plan_result.stdout)
+        self.assertFalse(absent_data.exists())
+        self.assertFalse(absent_launch.exists())
+        self.assertFalse(absent_stage.exists())
+        project_cache = cache_root / str(script.parents[1]).lstrip(os.sep)
+        self.assertFalse(project_cache.exists())
+
+    def test_stage_validator_reads_the_runner_dex_price_output_path(self):
+        stage = self.root / "candidate-path-integration"
+        stage.mkdir(mode=0o700)
+        commands = build_step_commands(
+            "dex_depth",
+            publish_local=True,
+            python_executable=sys.executable,
+            data_dir=stage,
+            require_uniswap_v3_exact_validation=True,
+        )
+        dex_command = next(
+            command
+            for name, command in commands
+            if name == "dex_depth"
+        )
+        tvl_path = Path(dex_command[dex_command.index("--tvl-csv") + 1])
+        tvl_path.parent.mkdir(mode=0o700)
+        tvl_path.write_text("pool_id\npool-from-processed\n")
+        (stage / "dex_depth_latest.csv").write_text("market_id\nmarket\n")
+        (stage / "dex_execution_cost_latest.csv").write_text(
+            "market_id\nmarket\n"
+        )
+        receipt = {"depth_snapshot_id": self.SNAPSHOT_ID}
+        receipt_bytes = launch.canonical_json_bytes(receipt)
+        (stage / "uniswap_v3_exact_latest.json").write_bytes(receipt_bytes)
+        raw_dir = stage / "raw/dex-depth" / self.SNAPSHOT_ID
+        raw_dir.mkdir(parents=True, mode=0o700)
+        (raw_dir / launch.RAW_RECEIPT_NAME).write_bytes(receipt_bytes)
+
+        with patch.object(
+            launch,
+            "validate_uniswap_v3_exact_candidate",
+            return_value=receipt,
+        ) as validate_candidate, patch.object(
+            launch,
+            "validate_uniswap_v3_exact_public_receipt",
+            return_value=receipt,
+        ):
+            self.assertEqual(launch._validate_stage_candidate(stage), receipt)
+
+        inventory = validate_candidate.call_args.args[0]
+        self.assertEqual(inventory, [{"pool_id": "pool-from-processed"}])
 
     def test_snapshot_rejects_symlink_special_file_and_symlink_root(self):
         target = self.data_dir / launch.PUBLIC_BUNDLE_NAMES[0]
@@ -326,7 +418,9 @@ class LaunchFilesystemTest(unittest.TestCase):
         stage = self._make_stage(baseline)
         live_raw = self.data_dir / "raw/dex-depth" / self.SNAPSHOT_ID
         live_raw.mkdir(parents=True)
-        (live_raw / launch.RAW_RECEIPT_NAME).write_bytes(b"collision\n")
+        live_receipt = live_raw / launch.RAW_RECEIPT_NAME
+        live_receipt.write_bytes(b"collision\n")
+        os.chmod(live_receipt, 0o600)
         original_live = {
             name: (self.data_dir / name).read_bytes()
             for name in launch.PUBLIC_BUNDLE_NAMES
@@ -340,6 +434,28 @@ class LaunchFilesystemTest(unittest.TestCase):
             {name: (self.data_dir / name).read_bytes() for name in launch.PUBLIC_BUNDLE_NAMES},
             original_live,
         )
+
+    def test_reused_trusted_receipt_and_directories_require_private_safe_modes(self):
+        self._write_sidecar()
+        baseline = launch.snapshot_public_bundle(self.data_dir)
+        stage = self._make_stage(baseline)
+        live_raw = self.data_dir / "raw/dex-depth" / self.SNAPSHOT_ID
+        live_raw.mkdir(parents=True)
+        live_receipt = live_raw / launch.RAW_RECEIPT_NAME
+        live_receipt.write_bytes(
+            (stage / launch.PUBLIC_BUNDLE_NAMES[-1]).read_bytes()
+        )
+        os.chmod(live_receipt, 0o666)
+
+        with patch.object(launch, "_validate_stage_candidate", return_value={}):
+            with self.assertRaisesRegex(ValueError, "mode|0600|trusted"):
+                launch.promote_stage(self.data_dir, stage, baseline)
+
+        os.chmod(live_receipt, 0o600)
+        os.chmod(live_raw.parent, 0o777)
+        with patch.object(launch, "_validate_stage_candidate", return_value={}):
+            with self.assertRaisesRegex(ValueError, "writable|directory|mode"):
+                launch.promote_stage(self.data_dir, stage, baseline)
 
     def test_public_promote_failure_removes_only_launch_created_private_receipt(self):
         self._write_sidecar()
@@ -646,6 +762,28 @@ class LaunchFilesystemTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "regular non-symlink"):
             launch.read_receipt(path)
 
+    def test_launch_and_backup_receipt_reads_require_mode_0600(self):
+        launch_dir = self.root / "private-receipts"
+        launch_dir.mkdir(mode=0o700)
+        phase_path = launch_dir / "phase.json"
+        launch.write_receipt(phase_path, {"schema": "test"})
+        os.chmod(phase_path, 0o666)
+        with self.assertRaisesRegex(ValueError, "0600|mode"):
+            launch.read_receipt(phase_path)
+
+        self._write_sidecar()
+        backup = launch.create_backup(
+            self.data_dir,
+            launch_dir,
+            target_sha="a" * 40,
+            previous_app_sha="b" * 40,
+        )
+        manifest_path = launch_dir / "backup/manifest.json"
+        os.chmod(manifest_path, 0o666)
+        with self.assertRaisesRegex(ValueError, "0600|mode"):
+            launch._load_backup_manifest(manifest_path.parent)
+        self.assertEqual(backup["schema"], launch.BACKUP_SCHEMA)
+
 
 class FakeProcess:
     def __init__(self):
@@ -887,6 +1025,26 @@ class LaunchOrchestrationTest(unittest.TestCase):
             (self.launch_dir / launch.RECEIPT_FILES["pause"]).exists()
         )
 
+    def test_pause_receipt_failure_restores_original_timer_state_and_allows_retry(self):
+        launch.execute_phase("preflight", self.config, self.runner)
+        with patch.object(
+            launch,
+            "write_receipt",
+            side_effect=OSError("injected pause receipt failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "pause receipt"):
+                launch.execute_phase("pause", self.config, self.runner)
+
+        self.assertEqual(self.runner.enabled["cex-dex-daily.timer"], "enabled")
+        self.assertEqual(self.runner.active["cex-dex-daily.timer"], "active")
+        self.assertEqual(self.runner.enabled["cex-dex-depth.timer"], "disabled")
+        self.assertEqual(self.runner.active["cex-dex-depth.timer"], "inactive")
+        self.assertFalse(
+            (self.launch_dir / launch.RECEIPT_FILES["pause"]).exists()
+        )
+        receipt = launch.execute_phase("pause", self.config, self.runner)
+        self.assertEqual(receipt["phase"], "pause")
+
     def test_stage_runs_full_unfiltered_exact_collection_only_against_stage_roots(self):
         receipt = self._run_to_stage()
 
@@ -986,6 +1144,38 @@ class LaunchOrchestrationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "staged.*drift"):
             launch.execute_phase("verify-stage", self.config, self.runner)
 
+    def test_receipt_chain_rejects_a_missing_consecutive_phase(self):
+        self.launch_dir.mkdir(mode=0o700)
+        preflight = {
+            "schema": launch.RECEIPT_SCHEMA,
+            "phase": "preflight",
+            "predecessor_receipt_sha256": None,
+            "target_sha": self.target_sha,
+            "previous_app_sha": self.previous_sha,
+        }
+        launch.write_receipt(
+            self.launch_dir / launch.RECEIPT_FILES["preflight"],
+            preflight,
+        )
+        backup = {
+            "schema": launch.RECEIPT_SCHEMA,
+            "phase": "backup",
+            "predecessor_receipt_sha256": hashlib.sha256(
+                launch.canonical_json_bytes(preflight)
+            ).hexdigest(),
+            "target_sha": self.target_sha,
+            "previous_app_sha": self.previous_sha,
+            "baseline": launch.snapshot_public_bundle(self.data_dir),
+            "baseline_sha256": "0" * 64,
+        }
+        launch.write_receipt(
+            self.launch_dir / launch.RECEIPT_FILES["backup"],
+            backup,
+        )
+
+        with self.assertRaisesRegex(ValueError, "consecutive|missing|order"):
+            launch._load_predecessor("stage", self.config.normalized())
+
     def test_promote_restore_and_resume_require_release_evidence_and_restore_timer_states(self):
         self._run_to_stage()
         with patch.object(launch, "_validate_stage_candidate", return_value={}):
@@ -1016,6 +1206,75 @@ class LaunchOrchestrationTest(unittest.TestCase):
         self.assertTrue(live_receipt.is_file())
         receipt = launch.execute_phase("resume", self.config, self.runner)
         self.assertEqual(receipt["release_evidence"]["application_sha"], self.target_sha)
+
+    def test_resume_failure_at_each_timer_restore_command_returns_to_safe_pause(self):
+        self._run_to_stage()
+        with patch.object(launch, "_validate_stage_candidate", return_value={}):
+            launch.execute_phase("verify-stage", self.config, self.runner)
+            launch.execute_phase("promote", self.config, self.runner)
+        resume_path = self.launch_dir / launch.RECEIPT_FILES["resume"]
+        restore_commands = [
+            ["systemctl", "--user", "enable", "cex-dex-daily.timer"],
+            ["systemctl", "--user", "start", "cex-dex-daily.timer"],
+            ["systemctl", "--user", "disable", "cex-dex-depth.timer"],
+            ["systemctl", "--user", "stop", "cex-dex-depth.timer"],
+        ]
+        real_run = self.runner.run
+        for failing_command in restore_commands:
+            with self.subTest(command=failing_command):
+                if resume_path.exists():
+                    resume_path.unlink()
+                for unit in launch.TIMER_UNITS:
+                    self.runner.enabled[unit] = "disabled"
+                    self.runner.active[unit] = "inactive"
+                failed = {"value": False}
+
+                def fail_once(command, *, env=None):
+                    if list(command) == failing_command and not failed["value"]:
+                        failed["value"] = True
+                        return launch.CommandResult(1, "", "injected")
+                    return real_run(command, env=env)
+
+                with patch.object(self.runner, "run", side_effect=fail_once):
+                    with self.assertRaisesRegex(RuntimeError, "restore timer"):
+                        launch.execute_phase("resume", self.config, self.runner)
+
+                self.assertFalse(resume_path.exists())
+                for unit in launch.TIMER_UNITS:
+                    self.assertEqual(self.runner.enabled[unit], "disabled")
+                    self.assertEqual(self.runner.active[unit], "inactive")
+                for unit in launch.SERVICE_UNITS:
+                    self.assertEqual(self.runner.active[unit], "inactive")
+                self.assertEqual(
+                    launch.execute_phase("resume", self.config, self.runner)["phase"],
+                    "resume",
+                )
+
+    def test_resume_receipt_failure_returns_to_safe_pause_and_allows_retry(self):
+        self._run_to_stage()
+        with patch.object(launch, "_validate_stage_candidate", return_value={}):
+            launch.execute_phase("verify-stage", self.config, self.runner)
+            launch.execute_phase("promote", self.config, self.runner)
+        resume_path = self.launch_dir / launch.RECEIPT_FILES["resume"]
+        real_write = launch.write_receipt
+
+        def fail_resume_receipt(path, receipt):
+            if Path(path) == resume_path:
+                raise OSError("injected resume receipt failure")
+            return real_write(path, receipt)
+
+        with patch.object(launch, "write_receipt", side_effect=fail_resume_receipt):
+            with self.assertRaisesRegex(OSError, "resume receipt"):
+                launch.execute_phase("resume", self.config, self.runner)
+
+        self.assertFalse(resume_path.exists())
+        for unit in launch.TIMER_UNITS:
+            self.assertEqual(self.runner.enabled[unit], "disabled")
+            self.assertEqual(self.runner.active[unit], "inactive")
+        self.assertEqual(
+            launch.execute_phase("resume", self.config, self.runner)["phase"],
+            "resume",
+        )
 
     def test_restore_rejects_completed_forward_resume_ledger(self):
         self._run_to_stage()

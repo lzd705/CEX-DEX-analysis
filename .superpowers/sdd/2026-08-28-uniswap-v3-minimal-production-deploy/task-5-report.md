@@ -47,7 +47,8 @@ performed.
 - Staging requires a fresh nonexisting sibling data root and its distinct
   processed sibling. Only the database, DEX daily input, and depth history are
   copied; staged raw and processed outputs are new. Root device/inode/hash
-  bindings and live baseline/input CAS checks prevent alias and drift.
+  bindings and live baseline/input CAS checks reject detected alias and
+  precommit drift; they do not pin root names through the final replacement.
 - The stage invokes the full unfiltered `dex_depth` profile with local publish
   and the exact-validation flag. Transient dashboard verification overrides
   the staged depth, execution, sidecar, and mandatory staged raw root while
@@ -82,7 +83,7 @@ roots/files, FIFO/special files, bounded reads, fresh-root isolation, raw and
 processed root binding, baseline and required-input drift, candidate mutation,
 private receipt absence/tamper/collision, public promotion cleanup, trusted
 receipt drift, byte-identical preservation, restore CAS at the transaction
-boundary, and injected failure at each of the five public replace/remove points
+entry, and injected failure at each of the five public replace/remove points
 plus trusted-receipt removal. Orchestration tests cover exact commands and
 environment, live flock ownership, fixed systemd states, partial pause recovery,
 canonical predecessor receipts, replay/order/tamper rejection, target and
@@ -126,3 +127,65 @@ evidence, and the observation window remain manual operator work. Backups,
 launch receipts, the live private receipt, and the complete staged raw/TVL and
 processed evidence must remain under the documented retention hold. No local
 test fabricates any of that server-dependent evidence.
+
+## Fix round 1 — operational launcher subset
+
+Status: complete in a separate commit with message
+`fix(deploy): make staged launch operational`; the final SHA is reported in the
+handoff.
+
+### RED/GREEN evidence
+
+- A real `python3 scripts/uniswap_v3_launch.py --help` subprocess initially
+  failed with `ModuleNotFoundError: No module named 'scripts'`. The launcher now
+  inserts the project root before local imports and sets
+  `sys.dont_write_bytecode = True` before those imports. Real help and default
+  plan subprocesses pass without project-local bytecode, data, stage, or launch
+  artifacts. Interpreter/site behavior outside the project is not claimed.
+- A `build_step_commands('dex_depth', ...)` integration test showed that the
+  real DEX price step writes
+  `processed_dir_for(stage)/dex_pool_tvl_snapshot.csv`, while validation looked
+  under the stage data root. Validation now reads the actual processed output.
+- A fabricated preflight-to-backup ledger with the pause receipt missing was
+  accepted. The ledger now requires every consecutive phase on the selected
+  forward or rollback branch and still rejects replay and late restore after a
+  completed forward resume.
+- Mode tests showed that canonical phase and backup-manifest reads and a reused
+  trusted receipt accepted `0666`. All now require `0600`; existing trusted
+  directory components reject group/world-write bits while safe collector
+  directories remain allowed.
+- Injected failure at each timer-state restoration command left a partial
+  resume state. Resume now attempts every fixed compensation command, verifies
+  disabled/inactive state, writes no completion receipt, and permits a retry
+  only when compensation succeeds. If compensation fails, it raises and
+  requires manual unit-state reconciliation. Pause receipt-write failure
+  restores the original captured timer state; resume receipt-write failure
+  returns to the safe paused state in the covered successful-compensation
+  cases.
+
+The retained launch suite passes 43 tests after these changes. The focused
+launch/Task 4/atomic/runner/dashboard/release suite passes 321 tests, and full
+discovery with the bundled Node runtime passes 1,606 tests with no skips.
+An independent read-only review found one resume-compensation documentation
+overclaim; the operator docs and this report now require manual unit-state
+reconciliation when compensation itself cannot establish the paused state.
+
+### User-deferred hardening and residual risk
+
+The user explicitly deferred the proposed fd-pinned, commit-boundary
+transaction hardening. Promotion and restore therefore retain path-based state
+checks. They do not protect against a non-cooperating late writer after the
+last check, replacement of a live/stage/launch root name during cutover, or a
+process/power failure. Their rollback guarantee remains limited to ordinary
+in-process I/O failures covered by the existing transactions.
+
+Promotion and restore also mutate live state before writing their phase
+completion receipt. If that receipt write fails, automatic cross-boundary
+recovery is not claimed: the dashboard must remain stopped, all managed
+timers/services must remain paused, and the operator must reconcile the fixed
+five files plus trusted receipt against the retained checksummed backup and
+staged evidence before any next phase or manual receipt decision. Operators
+must prevent all manual/non-cooperating writers for the full cutover window.
+
+No production deployment, publication, live RPC call, systemd mutation,
+application switch, push, or remote access was performed in this fix round.

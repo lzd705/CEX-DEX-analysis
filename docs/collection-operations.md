@@ -832,6 +832,17 @@ stopped, start and validate the old app, and resume timers only after the
 previous-SHA rollback evidence passes. See `docs/production-hardening.md` for
 the complete receipt ledger, first-sidecar absence, CAS, and retention rules.
 
+The launcher's CAS checks and ordinary-I/O rollback assume cooperative
+operations under the shared collection lock. Operators must also prevent
+manual or otherwise non-cooperating writers and must not replace the live or
+stage root names during cutover. The path-based final replacement boundary is
+not hardened against those races, and the transaction is not crash-atomic. If
+promotion or restore changes live bytes but its phase receipt cannot be
+written, leave the dashboard stopped and all four managed timer/service units
+paused, then reconcile the five files and trusted receipt manually against the
+retained checksummed backup and staged evidence before proceeding. Do not infer
+completion or retry the next ledger phase from an absent receipt alone.
+
 Promotion copies no staged raw transcript or TVL tree into the live root. It
 installs only the already validated canonical private receipt beneath the
 matching live `raw/dex-depth/<snapshot_id>` directory, then promotes the five
@@ -844,7 +855,10 @@ this launch, but validates and preserves a byte-identical preexisting receipt.
 The launcher manages only the fixed daily/depth timers and their matching
 services. It does not operate the dashboard unit, install units, edit
 environment files, access the live RPC itself, switch Git, or infer system
-resource/OOM evidence.
+resource/OOM evidence. A resume failure writes no completion receipt and
+attempts to compensate all managed units back to disabled/inactive. Retry only
+after that state is verified and the predecessor evidence is revalidated. If
+compensation fails, reconcile every managed unit state manually first.
 
 ## Timer installation
 
