@@ -109,8 +109,9 @@ and its SHA-256 is part of every evidence and snapshot identity.
 
 ### `scripts/shib_v2_research.py`
 
-This pure module owns schemas, canonicalization, validation, and calculation.
-It does not open sockets or write files. Its public boundaries are:
+This pure module owns schemas, canonicalization, validation, privacy scanning,
+and calculation. It does not open sockets, read paths, or write files. Its
+public boundaries are:
 
 ```python
 load_research_registry(payload: object) -> dict
@@ -128,15 +129,28 @@ The module reuses `V2PoolState`, `MarketRules`, `CommonTarget`, and the exact V2
 quote functions from `scripts/route_quantity.py`. It does not copy the V2
 formula into a second implementation.
 
+### `scripts/shib_v2_research_io.py`
+
+This narrow I/O module owns bounded no-symlink JSON reads and same-directory
+atomic canonical JSON writes. It imports the pure validators but contains no
+network logic. Capture and replay CLIs use it so filesystem concerns do not
+leak into `scripts/shib_v2_research.py`.
+
 ### `scripts/capture_shib_v2_research_evidence.py`
 
 This command is the only network-capable part of the increment. It accepts a
-registry path, an explicit output path, and two RPC URLs with distinct opaque
-provider labels supplied at runtime. The URLs are process-only inputs. It:
+registry path, an explicit output path, and two RPC URLs supplied at runtime.
+The persisted opaque labels are fixed as `provider_a` and `provider_b`; callers
+cannot vary them and thereby change evidence identity. The URLs are
+process-only inputs. The CLI and in-process capture boundary reject equal
+endpoint identities before any request; this proves only that the configured
+endpoint strings differ, not that their hidden infrastructure is independent.
+It:
 
 1. resolves one finalized Ethereum header;
 2. re-reads that header by hash and verifies number/hash/parent/timestamp;
-3. uses EIP-1898 `{blockHash, requireCanonical: true}` for every `eth_call`;
+3. uses EIP-1898 `{blockHash, requireCanonical: true}` for every `eth_call` and
+   `eth_getCode` state read;
 4. executes the complete registry-derived call inventory against both
    providers at that exact block hash;
 5. requires byte-identical reviewed results from both providers;
@@ -190,8 +204,8 @@ expectations.
 | Entity | Grain | Candidate primary key |
 | --- | --- | --- |
 | evidence generation | one registry at one canonical Ethereum block | `(registry_sha256, chain_id, block_hash)` |
-| logical RPC call | one call target and calldata at the fixed block | `(block_hash, to_address, calldata_sha256)` |
-| provider observation | one provider result for one logical call | `(provider_label, block_hash, to_address, calldata_sha256)` |
+| logical RPC call | one method, call target, and calldata at the fixed block | `(block_hash, method, to_address, calldata_sha256)` |
+| provider observation | one provider result for one logical call | `(provider_label, block_hash, method, to_address, calldata_sha256)` |
 | token | one canonical token identity at the fixed block | `(block_hash, token_address)` |
 | pool | one canonical DEX pair state at the fixed block | `(block_hash, dex, pair_address)` |
 | USD reference | one Chainlink proxy round visible at the fixed block | `(block_hash, proxy_address, round_id)` |
@@ -214,6 +228,7 @@ For every pool, authority requires all of the following to agree:
 - registry chain, factory, router, pair, SHIB, WETH, runtime-code hashes, and
   fee model;
 - factory `getPair(SHIB,WETH)`;
+- router `factory()` and `WETH()`;
 - pair `factory()`, `token0()`, and `token1()`;
 - token decimals and runtime code;
 - pair reserves and both ERC-20 `balanceOf(pair)` values;
@@ -226,16 +241,17 @@ HTTP price, stablecoin parity assumption, or fallback feed is allowed.
 ### Exact expected inventory
 
 The registry deterministically expands into one closed call inventory before
-any request is sent. It contains:
+any request is sent. Chain ID, two finalized-header reads, and the two by-hash
+header rereads are capture preflight rather than logical state reads. The state
+inventory contains exactly 35 logical reads and 70 provider observations:
 
-- one chain ID and one finalized block header, then the same header read back
-  by hash;
-- runtime code for every unique factory, router, pair, token, and feed proxy;
+- runtime code for every unique factory, router, pair, token, and feed proxy
+  (9 reads);
 - one `getPair(SHIB,WETH)` per factory;
+- `factory` and `WETH` per router;
 - `factory`, `token0`, `token1`, and `getReserves` per pair;
 - `decimals` for SHIB and WETH, plus both `balanceOf(pair)` calls per pair;
-- the registry-declared fee calls for each DEX, including ShibaSwap
-  `totalFee`, `alpha`, and `beta`;
+- the registry-declared ShibaSwap pair calls `totalFee`, `alpha`, and `beta`;
 - Chainlink `decimals`, `description`, and `latestRoundData`.
 
 Every logical call must have exactly two provider observations and one agreed
@@ -362,10 +378,17 @@ evidence_identity
 
 The evidence grain is one `(chain_id, block_hash, registry_sha256)` generation.
 The block record retains number, hash, parent hash, timestamp, state root,
-base-fee-per-gas, and the hash of its canonical reviewed projection.
+base-fee-per-gas, the hash of its canonical reviewed projection, and exactly
+two reviewed header observations containing only provider label, canonical
+header SHA-256, and status.
 
-Each `logical_calls` member retains a canonical logical call ID, target,
-calldata, calldata SHA-256, bounded result hex, and result SHA-256. Each
+The in-memory inventory additionally retains the fixed selector declaration
+`eip1898_block_hash_require_canonical`; it is a capture instruction, not an
+observed fact. Each persisted `logical_calls` member is its strict projection:
+a canonical logical call ID, fixed method, target, calldata, calldata SHA-256,
+bounded result hex, and result SHA-256.
+`eth_getCode` uses canonical empty calldata while remaining distinct by method.
+Each
 `provider_observations` member retains only the opaque provider label, logical
 call ID, block hash, result SHA-256, and status. The validator requires exactly
 two observations per logical call and requires both hashes to equal the stored
@@ -377,7 +400,8 @@ Each pool record retains:
 dex, factory_address, router_address, pair_address
 factory_runtime_code_sha256, router_runtime_code_sha256,
 pair_runtime_code_sha256
-factory_get_pair_result, pair_factory_result
+factory_get_pair_result, router_factory_result, router_weth_result,
+pair_factory_result
 token0_address, token1_address, token0_decimals, token1_decimals
 reserve0_raw, reserve1_raw, reserve_timestamp_last_raw
 token0_balance_raw, token1_balance_raw
@@ -386,6 +410,7 @@ fee_parameters, fee_evidence_sha256, call_results_sha256
 ```
 
 The validator requires `factory_get_pair_result == pair_address`,
+`router_factory_result == factory_address`, `router_weth_result == WETH`,
 `pair_factory_result == factory_address`, the exact SHIB/WETH token set and
 ordering, non-empty code with matching registry hashes, uint bounds, nonzero
 reserves, and balances equal to reserves. ShibaSwap `totalFee` must match the
@@ -396,9 +421,10 @@ positive answer, started/updated timestamps, answered-in-round, and call-result
 hash. `updated_at` must not be in the future and must be within the registry's
 maximum age at the fixed block. No alternative price source is inferred.
 
-`evidence_identity` is the SHA-256 of the canonical evidence object excluding
-that field. Reordering object keys cannot change it; changing any reviewed
-claim must change it.
+`evidence_identity` is the SHA-256 of the byte string
+`b"shib-v2-research-evidence/v1\n"` followed by the canonical evidence object
+excluding that field. Reordering object keys cannot change it; changing any
+reviewed claim must change it. The trailing file newline is not hashed.
 
 ## Calculation and scenario grain
 
@@ -441,6 +467,21 @@ Each scenario has one of these classifications:
 - `unavailable`: required identity, price, quantity, or quote evidence is not
   usable.
 
+The only DEX values are `uniswap_v2` and `shibaswap_v1`. Quote reasons are
+closed over the existing V2 quote contract: complete quotes use
+`fixed_block_fee_proof_not_authenticated`; unavailable quotes may use only
+`pool_state_binding_mismatch`, `pool_state_not_current`,
+`market_rules_binding_mismatch`, `market_rules_not_current`,
+`pool_state_market_mismatch`, `target_asset_mismatch`,
+`pool_state_token_address_mismatch`, `pool_state_token_decimals_mismatch`,
+`target_base_unit_misaligned`, `target_lot_misaligned`,
+`minimum_base_quantity_not_met`, `pool_output_below_one_raw`,
+`pool_reserve_insufficient`, or `minimum_notional_not_met`. Free text is never
+published. Scenario `reason_codes` are derived deterministically: unavailable
+leg reasons in buy-then-sell order with duplicates removed; otherwise the
+complete-quote reason, followed by `route_costs_not_evaluated` only for a
+positive pool edge whose route costs remain missing.
+
 `strict_eligible` and `executable` are always `false` in v1. The following
 fields are always null rather than fabricated:
 
@@ -476,7 +517,9 @@ snapshot_sha256
 ```
 
 Pools, routes, notionals, limitations, and reason codes use fixed canonical
-ordering. `snapshot_sha256` hashes canonical JSON with that field omitted.
+ordering. `snapshot_sha256` hashes
+`b"shib-v2-research-snapshot/v1\n"` followed by canonical JSON with that field
+omitted. The trailing file newline is not hashed.
 Given identical registry bytes, evidence bytes, and application SHA, the output
 must be byte-identical. Wall-clock time, UUIDs, absolute paths, directory
 metadata, and RPC endpoint text do not enter the snapshot.
