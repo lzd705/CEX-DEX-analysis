@@ -35,6 +35,9 @@ from scripts.route_quantity import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = PROJECT_ROOT / "config/shib_v2_research_pools.json"
+EVIDENCE_PATH = (
+    PROJECT_ROOT / "data/public/research/shib-v2v2/evidence.json"
+)
 BUILD_SCRIPT = PROJECT_ROOT / "scripts/build_shib_v2_research_snapshot.py"
 
 
@@ -1992,6 +1995,83 @@ class ResearchCaptureTests(unittest.TestCase):
             completed.stderr, b"capture_configuration_invalid\n"
         )
         self.assertFalse(self.output.exists())
+
+
+class RepositoryEvidenceIntegrationTests(unittest.TestCase):
+    def test_repository_evidence_is_exact_validated_and_public_safe(self):
+        self.assertTrue(EVIDENCE_PATH.is_file(), "tracked evidence file is missing")
+        registry = shib_v2_research.load_research_registry(
+            load_bounded_json(REGISTRY_PATH, "research registry")
+        )
+        evidence = shib_v2_research.validate_research_evidence(
+            load_bounded_json(EVIDENCE_PATH, "research evidence"),
+            registry,
+        )
+
+        self.assertEqual(
+            evidence["registry_sha256"],
+            "1099388921c6dc1a790a9e3e54fd87999a884a6e8eddebe761e1d63256e1c82c",
+        )
+        self.assertEqual(evidence["block"]["number"], 25860867)
+        self.assertEqual(
+            evidence["block"]["hash"],
+            "0x806fc920f52b11cb56749e7786d176d7d2d21310f145184e83cc5ec5d882d75b",
+        )
+        self.assertEqual(
+            evidence["evidence_identity"],
+            "bd87318aa60de73874e05f436ae6f84c66b4b56fd53612929d9cfe7cfa5c7427",
+        )
+
+        quality = evidence["collection_quality"]
+        self.assertEqual(quality["state"], "evaluated")
+        self.assertEqual(quality["expected_logical_call_count"], 35)
+        self.assertEqual(quality["observed_logical_call_count"], 35)
+        self.assertEqual(quality["usable_logical_call_count"], 35)
+        self.assertEqual(quality["expected_provider_observation_count"], 70)
+        self.assertEqual(quality["observed_provider_observation_count"], 70)
+        self.assertEqual(quality["usable_provider_observation_count"], 70)
+        self.assertEqual(quality["duplicate_logical_call_key_count"], 0)
+        self.assertEqual(quality["duplicate_provider_observation_key_count"], 0)
+        self.assertEqual(quality["required_field_null_count"], 0)
+        self.assertEqual(quality["missing_null_count"], 0)
+        self.assertEqual(quality["provider_disagreement_count"], 0)
+
+        observations = evidence["provider_observations"]
+        for call in evidence["logical_calls"]:
+            providers = [
+                observation["provider_label"]
+                for observation in observations
+                if observation["logical_call_id"] == call["logical_call_id"]
+            ]
+            self.assertEqual(providers, ["provider_a", "provider_b"])
+
+        rendered = EVIDENCE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("http" + "://", rendered.lower())
+        self.assertNotIn("wss" + "://", rendered.lower())
+        self.assertNotRegex(rendered, r"\?[A-Za-z0-9_.%~-]+(?:=|%3[dD])")
+        self.assertNotIn("@", rendered)
+        for forbidden in (
+            "authorization",
+            "cookie",
+            "api_key",
+            "private_key",
+            "provider_error",
+            "raw_response",
+            "raw_rpc",
+            "rpc_url",
+            "account",
+            "wallet",
+            "/Users" + "/",
+            "/home" + "/",
+            "/root" + "/",
+            "/private" + "/",
+            "/tmp" + "/",
+        ):
+            self.assertNotIn(forbidden.lower(), rendered.lower())
+        self.assertEqual(
+            EVIDENCE_PATH.read_bytes(),
+            shib_v2_research.canonical_json_bytes(evidence) + b"\n",
+        )
 
 
 class ResearchEvidenceTests(unittest.TestCase):
