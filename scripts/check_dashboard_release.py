@@ -114,6 +114,7 @@ class ReleaseCheckError(RuntimeError):
 
 STATIC_ASSET_FILENAMES = PUBLIC_STATIC_ASSET_FILENAMES
 MAX_STATIC_ASSET_BYTES = 4 * 1024 * 1024
+LEGACY_ROLLBACK_EXEMPTION = "pre_v3_uniswap_exact_health_only"
 
 
 def require(condition: bool, message: str) -> None:
@@ -1686,6 +1687,7 @@ def validate_release_health(
     *,
     expected_application_sha: str | None = None,
     expected_asset_sha: str | None = None,
+    legacy_rollback_pre_v3: bool = False,
 ) -> tuple[str, str, str]:
     application_sha = health.get("application_sha")
     asset_sha = health.get("asset_sha")
@@ -1725,7 +1727,13 @@ def validate_release_health(
         asset_version == expected_version,
         "Health asset version does not match application and asset SHA evidence",
     )
-    validate_uniswap_v3_exact_release(health.get("uniswap_v3_exact"))
+    if legacy_rollback_pre_v3:
+        require(
+            expected_application_sha is not None,
+            "Legacy pre-V3 rollback requires an expected previous application SHA",
+        )
+    else:
+        validate_uniswap_v3_exact_release(health.get("uniswap_v3_exact"))
     require(
         health.get("data_status") == "current",
         "Health freshness status is not current",
@@ -6371,6 +6379,9 @@ def validate_events(
 
 
 def release_check(args: argparse.Namespace) -> dict[str, Any]:
+    legacy_rollback_pre_v3 = bool(
+        getattr(args, "legacy_rollback_pre_v3", False)
+    )
     route_opportunity_validation = validate_route_opportunity_release(
         configured_route_root(),
         required=getattr(args, "require_route_cohort", False),
@@ -6405,6 +6416,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         health,
         expected_application_sha=getattr(args, "expected_application_sha", None),
         expected_asset_sha=getattr(args, "expected_asset_sha", None),
+        legacy_rollback_pre_v3=legacy_rollback_pre_v3,
     )
     served_asset_sha, asset_metrics = fetch_static_asset_bundle(
         args.base_url,
@@ -6816,6 +6828,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
             final_health,
             expected_application_sha=application_sha,
             expected_asset_sha=asset_sha,
+            legacy_rollback_pre_v3=legacy_rollback_pre_v3,
         )
     )
     require(
@@ -6863,6 +6876,9 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         "application_sha": application_sha,
         "asset_sha": asset_sha,
         "asset_version": asset_version,
+        "legacy_rollback_exemption": (
+            LEGACY_ROLLBACK_EXEMPTION if legacy_rollback_pre_v3 else None
+        ),
         "token_count": len(summary["tokens"]),
         "screening_quality_parity_count": screening_quality_parity_count,
         "screening_quality_market_count": screening_quality_market_count,
@@ -6916,6 +6932,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-asset-sha",
         help="Require /health to report this exact deployed frontend asset SHA",
+    )
+    parser.add_argument(
+        "--legacy-rollback-pre-v3",
+        action="store_true",
+        help=(
+            "Checksummed rollback only: exempt the previous pre-V3 application "
+            "from the Uniswap V3 exact-health clause while retaining every "
+            "other release check"
+        ),
     )
     parser.add_argument(
         "--require-route-cohort",

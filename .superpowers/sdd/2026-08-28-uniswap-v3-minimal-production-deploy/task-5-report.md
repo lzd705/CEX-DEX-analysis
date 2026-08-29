@@ -189,3 +189,20 @@ must prevent all manual/non-cooperating writers for the full cutover window.
 
 No production deployment, publication, live RPC call, systemd mutation,
 application switch, push, or remote access was performed in this fix round.
+
+## Fix round 2 — full rollback release verification
+
+The rollback `resume` path previously accepted the basic health checker before
+reenabling timers. It now revalidates the restored five-file manifest and runs
+the same full release checker used by the forward path with the recorded
+previous application SHA. A named, opt-in `legacy-rollback-pre-v3` mode skips
+only the V3 exact-health clause that the pre-V3 application cannot expose; all
+asset, API, freshness, lifecycle, and remaining release checks stay active.
+The checker output and launch receipt both identify the exemption as
+`pre_v3_uniswap_exact_health_only`. Forward and default release checks do not
+enable it.
+
+Focused tests first reproduced acceptance of basic health, then covered the
+full rollback checker, wrong previous SHA, restored-generation drift, explicit
+flag/default behavior, and the unchanged forward gate. No push, deployment,
+live RPC call, systemd mutation, or remote access was performed.

@@ -829,8 +829,11 @@ the checksummed five-file data generation, switch the external application
 pointer, and validate the target. Resume the timers last. On failure, restore
 the old application pointer and checksummed data while the dashboard is
 stopped, start and validate the old app, and resume timers only after the
-previous-SHA rollback evidence passes. See `docs/production-hardening.md` for
-the complete receipt ledger, first-sidecar absence, CAS, and retention rules.
+previous-SHA full release evidence passes. The rollback-only legacy exemption
+removes only the V3 exact-health clause absent from the pre-V3 application; it
+does not bypass assets, APIs, freshness, lifecycle, or restored-generation
+checks. See `docs/production-hardening.md` for the complete receipt ledger,
+first-sidecar absence, CAS, and retention rules.
 
 The launcher's CAS checks and ordinary-I/O rollback assume cooperative
 operations under the shared collection lock. Operators must also prevent

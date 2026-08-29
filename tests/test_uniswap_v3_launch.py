@@ -16,6 +16,9 @@ from scripts import uniswap_v3_launch as launch
 from scripts.run_collection_cycle import build_step_commands
 
 
+LEGACY_ROLLBACK_EXEMPTION = "pre_v3_uniswap_exact_health_only"
+
+
 class LaunchFilesystemTest(unittest.TestCase):
     SNAPSHOT_ID = "20260829T000000Z-v3"
 
@@ -851,6 +854,7 @@ class FakeRunner:
             return launch.CommandResult(0, json.dumps(payload) + "\n", "")
         if any(part.endswith("check_dashboard_release.py") for part in command):
             self._assert_live_lock_held()
+            legacy_rollback = "--legacy-rollback-pre-v3" in command
             return launch.CommandResult(
                 0,
                 json.dumps({
@@ -858,6 +862,11 @@ class FakeRunner:
                     "application_sha": command[
                         command.index("--expected-application-sha") + 1
                     ],
+                    "legacy_rollback_exemption": (
+                        LEGACY_ROLLBACK_EXEMPTION
+                        if legacy_rollback
+                        else None
+                    ),
                 }) + "\n",
                 "",
             )
@@ -1182,9 +1191,27 @@ class LaunchOrchestrationTest(unittest.TestCase):
             launch.execute_phase("verify-stage", self.config, self.runner)
             launch.execute_phase("promote", self.config, self.runner)
             launch.execute_phase("restore", self.config, self.runner)
+        command_count = len(self.runner.commands)
         receipt = launch.execute_phase("resume", self.config, self.runner)
 
         self.assertEqual(receipt["release_evidence"]["application_sha"], self.previous_sha)
+        self.assertEqual(
+            receipt["release_evidence"]["legacy_rollback_exemption"],
+            LEGACY_ROLLBACK_EXEMPTION,
+        )
+        rollback_commands = [
+            command
+            for command, _env in self.runner.commands[command_count:]
+            if any(part.endswith("check_dashboard_release.py") for part in command)
+        ]
+        self.assertEqual(len(rollback_commands), 1)
+        self.assertIn("--legacy-rollback-pre-v3", rollback_commands[0])
+        self.assertEqual(
+            rollback_commands[0][
+                rollback_commands[0].index("--expected-application-sha") + 1
+            ],
+            self.previous_sha,
+        )
         self.assertEqual(self.runner.enabled["cex-dex-daily.timer"], "enabled")
         self.assertEqual(self.runner.active["cex-dex-daily.timer"], "active")
         self.assertEqual(self.runner.enabled["cex-dex-depth.timer"], "disabled")
@@ -1204,8 +1231,99 @@ class LaunchOrchestrationTest(unittest.TestCase):
             / launch.RAW_RECEIPT_NAME
         )
         self.assertTrue(live_receipt.is_file())
+        command_count = len(self.runner.commands)
         receipt = launch.execute_phase("resume", self.config, self.runner)
         self.assertEqual(receipt["release_evidence"]["application_sha"], self.target_sha)
+        forward_commands = [
+            command
+            for command, _env in self.runner.commands[command_count:]
+            if any(part.endswith("check_dashboard_release.py") for part in command)
+        ]
+        self.assertEqual(len(forward_commands), 1)
+        self.assertNotIn("--legacy-rollback-pre-v3", forward_commands[0])
+        self.assertIsNone(
+            receipt["release_evidence"].get("legacy_rollback_exemption")
+        )
+
+    def test_rollback_resume_rejects_basic_health_without_full_release(self):
+        self._run_to_stage()
+        with patch.object(launch, "_validate_stage_candidate", return_value={}):
+            launch.execute_phase("verify-stage", self.config, self.runner)
+            launch.execute_phase("promote", self.config, self.runner)
+            launch.execute_phase("restore", self.config, self.runner)
+        real_run = self.runner.run
+
+        def fail_previous_release(command, *, env=None):
+            command = list(command)
+            if (
+                any(part.endswith("check_dashboard_release.py") for part in command)
+                and self.previous_sha in command
+            ):
+                return launch.CommandResult(1, '{"status":"failed"}\n', "")
+            return real_run(command, env=env)
+
+        with patch.object(self.runner, "run", side_effect=fail_previous_release):
+            with self.assertRaisesRegex(RuntimeError, "release verification"):
+                launch.execute_phase("resume", self.config, self.runner)
+
+        self.assertFalse(
+            (self.launch_dir / launch.RECEIPT_FILES["resume"]).exists()
+        )
+        for unit in launch.TIMER_UNITS:
+            self.assertEqual(self.runner.enabled[unit], "disabled")
+            self.assertEqual(self.runner.active[unit], "inactive")
+
+    def test_rollback_resume_rejects_wrong_previous_release_sha(self):
+        self._run_to_stage()
+        with patch.object(launch, "_validate_stage_candidate", return_value={}):
+            launch.execute_phase("verify-stage", self.config, self.runner)
+            launch.execute_phase("promote", self.config, self.runner)
+            launch.execute_phase("restore", self.config, self.runner)
+        real_run = self.runner.run
+
+        def wrong_previous_release(command, *, env=None):
+            command = list(command)
+            if (
+                any(part.endswith("check_dashboard_release.py") for part in command)
+                and self.previous_sha in command
+            ):
+                return launch.CommandResult(
+                    0,
+                    json.dumps({
+                        "status": "passed",
+                        "application_sha": "c" * 40,
+                        "legacy_rollback_exemption": (
+                            LEGACY_ROLLBACK_EXEMPTION
+                        ),
+                    }) + "\n",
+                    "",
+                )
+            return real_run(command, env=env)
+
+        with patch.object(self.runner, "run", side_effect=wrong_previous_release):
+            with self.assertRaisesRegex(ValueError, "application SHA"):
+                launch.execute_phase("resume", self.config, self.runner)
+
+        self.assertFalse(
+            (self.launch_dir / launch.RECEIPT_FILES["resume"]).exists()
+        )
+
+    def test_rollback_resume_requires_the_checksummed_restored_generation(self):
+        self._run_to_stage()
+        with patch.object(launch, "_validate_stage_candidate", return_value={}):
+            launch.execute_phase("verify-stage", self.config, self.runner)
+            launch.execute_phase("promote", self.config, self.runner)
+            launch.execute_phase("restore", self.config, self.runner)
+        (self.data_dir / launch.PUBLIC_BUNDLE_NAMES[0]).write_bytes(
+            b"late restored drift\n"
+        )
+
+        with self.assertRaisesRegex(ValueError, "restored.*drift"):
+            launch.execute_phase("resume", self.config, self.runner)
+
+        self.assertFalse(
+            (self.launch_dir / launch.RECEIPT_FILES["resume"]).exists()
+        )
 
     def test_resume_failure_at_each_timer_restore_command_returns_to_safe_pause(self):
         self._run_to_stage()

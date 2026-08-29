@@ -54,6 +54,7 @@ PROMOTION_SCHEMA = "uniswap_v3_launch_promotion/v1"
 RESTORE_SCHEMA = "uniswap_v3_launch_restore/v1"
 RECEIPT_SCHEMA = "uniswap_v3_launch_receipt/v1"
 RAW_RECEIPT_NAME = "uniswap_v3_exact_validation.json"
+LEGACY_ROLLBACK_EXEMPTION = "pre_v3_uniswap_exact_health_only"
 MAX_PUBLIC_FILE_BYTES = 512 * 1024 * 1024
 MAX_INPUT_FILE_BYTES = 8 * 1024 * 1024 * 1024
 MAX_RECEIPT_BYTES = 4 * 1024 * 1024
@@ -1600,8 +1601,13 @@ def _verify_bound_stage(config: LaunchConfig, stage_receipt: Mapping[str, Any]) 
         raise ValueError("staged candidate drift detected") from error
 
 
-def _release_command(base_url: str, expected_sha: str) -> list[str]:
-    return [
+def _release_command(
+    base_url: str,
+    expected_sha: str,
+    *,
+    legacy_rollback_pre_v3: bool = False,
+) -> list[str]:
+    command = [
         sys.executable,
         str(PROJECT_ROOT / "scripts/check_dashboard_release.py"),
         "--base-url",
@@ -1609,6 +1615,9 @@ def _release_command(base_url: str, expected_sha: str) -> list[str]:
         "--expected-application-sha",
         expected_sha,
     ]
+    if legacy_rollback_pre_v3:
+        command.append("--legacy-rollback-pre-v3")
+    return command
 
 
 def _verified_release(
@@ -1617,53 +1626,43 @@ def _verified_release(
     base_url: str,
     expected_sha: str,
     retries: int = 1,
+    legacy_rollback_pre_v3: bool = False,
 ) -> dict[str, Any]:
     last_result = None
     for attempt in range(retries):
-        result = runner.run(_release_command(base_url, expected_sha), env=None)
+        result = runner.run(
+            _release_command(
+                base_url,
+                expected_sha,
+                legacy_rollback_pre_v3=legacy_rollback_pre_v3,
+            ),
+            env=None,
+        )
         last_result = result
         if result.returncode == 0:
             evidence = _json_command_evidence(result, "release verification")
             if evidence.get("application_sha") != expected_sha:
                 raise ValueError("release evidence application SHA differs")
-            return {
+            expected_exemption = (
+                LEGACY_ROLLBACK_EXEMPTION
+                if legacy_rollback_pre_v3
+                else None
+            )
+            if evidence.get("legacy_rollback_exemption") != expected_exemption:
+                raise ValueError("release evidence rollback exemption differs")
+            verified = {
                 "application_sha": expected_sha,
                 "status": "passed",
             }
+            if expected_exemption is not None:
+                verified["legacy_rollback_exemption"] = expected_exemption
+            return verified
         if attempt + 1 < retries:
             time.sleep(0.25)
     assert last_result is not None
     raise RuntimeError(
         "release verification failed with exit {}".format(last_result.returncode)
     )
-
-
-def _verified_rollback_health(
-    runner: Any,
-    *,
-    base_url: str,
-    expected_sha: str,
-) -> dict[str, Any]:
-    """Verify the restored pre-V3 application without requiring V3 health."""
-    result = _checked_run(
-        runner,
-        [
-            sys.executable,
-            str(PROJECT_ROOT / "scripts/check_dashboard_health.py"),
-            "--url",
-            base_url + "/health",
-        ],
-        label="rollback health verification",
-    )
-    health = _json_command_evidence(result, "rollback health verification")
-    if (
-        health.get("status") != "ok"
-        or health.get("data_ready") is not True
-        or health.get("data_status") != "current"
-        or health.get("application_sha") != expected_sha
-    ):
-        raise ValueError("rollback health or application SHA is not current")
-    return {"application_sha": expected_sha, "status": "passed"}
 
 
 def _verify_stage(
@@ -1857,10 +1856,19 @@ def _resume(
         try:
             _require_paused(runner)
             if predecessor.get("phase") == "restore":
-                evidence = _verified_rollback_health(
+                restored = predecessor.get("restore")
+                if not isinstance(restored, Mapping):
+                    raise ValueError("rollback restore receipt is invalid")
+                verify_bundle_state(
+                    config.data_dir,
+                    restored.get("restored"),
+                    state="restored",
+                )
+                evidence = _verified_release(
                     runner,
                     base_url=config.live_base_url,
                     expected_sha=expected_sha,
+                    legacy_rollback_pre_v3=True,
                 )
             else:
                 promotion = predecessor.get("promotion")

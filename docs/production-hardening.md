@@ -279,8 +279,14 @@ order:
    byte-identical receipt that predated the launch is validated and preserved.
 4. Start the old dashboard and validate its previous application SHA and
    current data health.
-5. Run `resume --execute`; rollback resume repeats that previous-SHA health
-   validation before restoring the recorded timer states.
+5. Run `resume --execute`. Rollback resume first rechecks the restored
+   five-file generation against the restore receipt, then runs the full release
+   checker with the previous application SHA. The named
+   `legacy-rollback-pre-v3` exemption skips only the V3 exact-health clause that
+   the old application cannot expose; asset, API, freshness, lifecycle, and all
+   other release gates remain active. Only after that checker passes are the
+   recorded timer states restored; the resulting resume receipt records
+   `pre_v3_uniswap_exact_health_only`.
 
 Each state-changing phase consumes the canonical predecessor receipt, verifies
 its SHA binding, and creates exactly one next receipt with `O_EXCL`. Missing,
