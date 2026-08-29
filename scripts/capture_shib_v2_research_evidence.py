@@ -171,13 +171,18 @@ def _parse_rpc_response(raw: bytes) -> object:
     if not isinstance(response, dict):
         raise CaptureError("rpc_response_invalid")
     if set(response) == {"jsonrpc", "id", "result"}:
-        if response["jsonrpc"] != "2.0" or response["id"] != 1:
+        if (
+            response["jsonrpc"] != "2.0"
+            or type(response["id"]) is not int
+            or response["id"] != 1
+        ):
             raise CaptureError("rpc_response_invalid")
         return response["result"]
     if set(response) == {"jsonrpc", "id", "error"}:
         rpc_error = response["error"]
         if (
             response["jsonrpc"] != "2.0"
+            or type(response["id"]) is not int
             or response["id"] != 1
             or not isinstance(rpc_error, dict)
             or set(rpc_error) != {"code", "message"}
@@ -246,11 +251,17 @@ class BoundedJsonRpcTransport:
             raise CaptureError("capture_configuration_invalid")
         try:
             parsed = urlsplit(endpoint)
+            hostname = parsed.hostname
+            port = parsed.port
         except ValueError:
             raise CaptureError("capture_configuration_invalid")
         if (
-            parsed.scheme not in {"http", "https"}
+            parsed.scheme != "https"
             or not parsed.netloc
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or (port is not None and not 1 <= port <= 65535)
             or parsed.fragment
             or type(timeout_seconds) is not int
             or not 1 <= timeout_seconds <= MAX_TIMEOUT_SECONDS
@@ -258,7 +269,10 @@ class BoundedJsonRpcTransport:
             raise CaptureError("capture_configuration_invalid")
         self._endpoint = endpoint
         self._timeout_seconds = timeout_seconds
-        self._opener = urllib_request.build_opener(_RejectRedirects())
+        self._opener = urllib_request.build_opener(
+            urllib_request.ProxyHandler({}),
+            _RejectRedirects(),
+        )
 
     def __call__(self, method: str, params: list) -> object:
         _validate_rpc_request(method, params)
@@ -313,9 +327,12 @@ def _hex_quantity(value: object, reason: str) -> int:
     if not isinstance(value, str) or _HEX_QUANTITY.fullmatch(value) is None:
         raise CaptureError(reason)
     try:
-        return int(value[2:], 16)
+        quantity = int(value[2:], 16)
     except ValueError:
         raise CaptureError(reason)
+    if quantity >= 1 << 256:
+        raise CaptureError(reason)
+    return quantity
 
 
 def _hash32(value: object, reason: str, nonzero: bool = False) -> str:

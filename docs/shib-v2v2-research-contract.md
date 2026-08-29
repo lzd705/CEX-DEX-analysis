@@ -59,6 +59,12 @@ missing, duplicate, or extra call invalidates the whole generation. There is no
 single-provider publication, majority vote, partial-row publication, or
 inventory shrink after failure.
 
+Both process-only endpoints must use HTTPS and must not contain URL userinfo.
+Capture connects directly with TLS server authentication, explicitly ignores
+ambient HTTP(S) proxy settings, and does not inherit proxy credentials from the
+environment. An operator credential carried in a query or path remains only in
+the process-local URL; it is never copied into evidence, errors, or logs.
+
 ## Collection quality
 
 Evidence contains these recomputed `collection_quality` fields:
@@ -124,6 +130,14 @@ Scenario classifications mean:
 - `unavailable`: required identity, price, quantity, or quote evidence is not
   usable.
 
+Scenario `reason_codes` are ordered and deterministic. If either leg is
+unavailable, the buy-leg quote reason is emitted first and the sell-leg quote
+reason second; a complete leg still contributes
+`fixed_block_fee_proof_not_authenticated`. Duplicate reasons are removed while
+preserving their first occurrence. If both legs are complete, the list contains
+that complete-quote reason and adds `route_costs_not_evaluated` only when the
+pool-only edge is positive.
+
 Every scenario has `strict_eligible: false` and `executable: false`. For every
 available scenario, these fields are always JSON null:
 
@@ -157,8 +171,18 @@ identity field omitted. `snapshot_sha256` is SHA-256 over
 `b"shib-v2-research-snapshot/v1\n"` followed by canonical JSON with the
 self-hash omitted. The trailing file newline is not hashed. Both validators
 recompute their self-hashes and all dependent lineage; the public snapshot
-validator rebuilds the complete expected snapshot from the supplied evidence
-and registry before accepting it.
+validator is authority-bearing and must be called as
+`validate_research_snapshot(payload, evidence, registry)`. It rebuilds the
+complete expected snapshot from those supplied authorities before accepting
+it; there is no one-argument structural-success API.
+
+This validation establishes internal consistency, not self-contained chain or
+provider provenance. Evidence stores opaque provider labels and agreed result
+hashes, not signed provider attestations or Ethereum state proofs. The
+publication trust anchor is the reviewed, process-bound dual-provider capture,
+the expected registry/evidence/snapshot identities, and the verified Git commit
+that contains the canonical public bytes. Snapshot validation inherits this
+boundary even though it exactly rebuilds every derived scenario.
 
 Registry, evidence, and snapshot inputs are canonical UTF-8 JSON regular files
 of at most 1 MiB. Symlinks, non-regular files, duplicate keys, excessive JSON

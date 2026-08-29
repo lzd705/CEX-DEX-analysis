@@ -105,7 +105,7 @@ InventoryCall = {                              # process-only, never persisted
 }
 
 Block = {
-  number: positive int, hash: hash32, parent_hash: hash32,
+  number: positive uint256, hash: hash32, parent_hash: hash32,
   timestamp: positive int, timestamp_utc: canonical RFC3339 UTC,
   state_root: hash32, base_fee_per_gas: uint256,
   canonical_header_sha256: sha256,
@@ -217,7 +217,7 @@ schema: "shib_v2_research_snapshot/v1"
 application_sha: 40 lowercase hex
 registry_sha256: sha256
 evidence_identity: sha256
-as_of_block_number: positive int
+as_of_block_number: positive uint256
 as_of_block_hash: hash32
 as_of_utc: canonical RFC3339 UTC
 mode: "historical_replay"
@@ -315,7 +315,9 @@ Quote status and reason construction is exact, not free text:
 - null, unknown, mixed-case, URL-like, or otherwise free-form reasons are
   rejected;
 - when either leg is unavailable, `reason_codes` is the ordered unique list of
-  unavailable leg reasons in buy-then-sell order;
+  both leg quote reasons in buy-then-sell order; a complete leg contributes
+  `fixed_block_fee_proof_not_authenticated`, and duplicates are removed after
+  their first occurrence;
 - when both legs are complete and the edge is non-positive, `reason_codes` is
   exactly `["fixed_block_fee_proof_not_authenticated"]`;
 - when both legs are complete and the edge is positive but route costs are
@@ -905,7 +907,9 @@ def capture_research_evidence(registry: dict, providers: Sequence[Provider], out
 
 Use `urllib.request` with POST only, fixed JSON-RPC fields, response byte and
 member limits, a redirect-rejecting handler, and exact result/error envelope
-shapes. Accept
+shapes. Require HTTPS, reject URL userinfo, and install an explicit empty
+`ProxyHandler` so the TLS-authenticated connection never inherits ambient
+proxy routing or proxy credentials. Accept
 only `eth_chainId`, `eth_getBlockByNumber("finalized", false)`,
 `eth_getBlockByHash(hash, false)`, `eth_getCode`, and `eth_call`; no generic
 method parameter from the CLI. Do not include URLs or response text in raised
@@ -1022,7 +1026,7 @@ git commit -m "feat(research): capture dual-provider SHIB V2 evidence"
 
 **Interfaces:**
 - Consumes: validated evidence and the exact V2 types/functions from `scripts.route_quantity`.
-- Produces: `build_research_snapshot(evidence: dict, registry: dict, application_sha: str) -> dict`, `validate_research_snapshot(payload: object) -> dict`, and `snapshot_sha256(payload: dict) -> str`.
+- Produces: `build_research_snapshot(evidence: dict, registry: dict, application_sha: str) -> dict`, `validate_research_snapshot(payload: object, evidence: dict, registry: dict) -> dict`, and `snapshot_sha256(payload: dict) -> str`.
 
 - [ ] **Step 1: Add RED tests for ten exact research scenarios**
 
@@ -1284,7 +1288,9 @@ class ResearchBuildCliTests(unittest.TestCase):
         self.assertEqual(
             self.output_path.read_bytes(),
             canonical_json_bytes(validate_research_snapshot(
-                load_bounded_json(self.output_path, "snapshot")
+                load_bounded_json(self.output_path, "snapshot"),
+                self.evidence,
+                self.registry,
             )) + b"\n",
         )
 ```
@@ -1324,7 +1330,7 @@ def main() -> int:
         snapshot = build_research_snapshot(
             evidence, registry, args.application_sha
         )
-        validate_research_snapshot(snapshot)
+        snapshot = validate_research_snapshot(snapshot, evidence, registry)
         atomic_write_canonical_json(args.output, snapshot)
     except (OSError, ResearchContractError):
         print("evidence_failed", file=sys.stderr)

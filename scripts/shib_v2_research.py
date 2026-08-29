@@ -49,8 +49,12 @@ _FUNCTION_SELECTORS = {
     "latestRoundData()": "feaf968c",
 }
 _FORBIDDEN_KEY_NORMALIZED = {
+    "account",
     "apikey",
     "authorization",
+    "cookie",
+    "credential",
+    "email",
     "endpoint",
     "headers",
     "privatekey",
@@ -62,15 +66,43 @@ _FORBIDDEN_KEY_NORMALIZED = {
     "rpcurl",
     "secret",
     "url",
+    "wallet",
+}
+_FORBIDDEN_KEY_WORDS = {
+    "account", "accounts", "authorization", "cookie", "cookies",
+    "credential", "credentials", "email", "emails", "endpoint",
+    "endpoints", "headers", "secret", "secrets", "url", "urls",
+    "wallet", "wallets",
 }
 _UNSAFE_TEXT = re.compile(
     r"(?:https?|wss?)://|(?:^|[^a-z0-9])(?:sk|rk|pk)[_-][a-z0-9_-]{8,}|"
     r"(?:^|[^a-z0-9])gh[pous]_[a-z0-9]{16,}|github_pat_[a-z0-9_]{16,}|"
     r"(?:^|[^a-z0-9])(?:secret|password|credential)[ _:=.-]+[a-z0-9_-]{6,}|"
-    r"(?:^|[\s\"'])/(?:root|etc|Users|home|private)(?:/|$)|"
-    r"[A-Za-z]:[\\/](?:root|etc|Users|home|private)(?:[\\/]|$)",
+    r"(?<![a-z0-9])/(?![/\s])[^\s\"'<>|]*|"
+    r"(?<![a-z0-9])[A-Za-z]:[\\/](?!\s)",
     re.IGNORECASE,
 )
+_UNSAFE_EMAIL_TEXT = re.compile(
+    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+    re.IGNORECASE,
+)
+_UNSAFE_AUTH_TEXT = re.compile(
+    r"(?:^|[\s,;:])(?:bearer|basic)[ \t]+[a-z0-9._~+/=-]{8,}"
+    r"(?:$|[\s,;])",
+    re.IGNORECASE,
+)
+_UNSAFE_QUERY_TEXT = re.compile(
+    r"(?:^|[^a-z0-9_])\?[a-z0-9_.~%-]+=[^#\s]*|"
+    r"^(?:api[_-]?key|token|key|secret|auth|authorization|cookie|"
+    r"account|wallet|email)=[^&;\s]+(?:&[^\s]*)?$|"
+    r"^[a-z0-9_.~%-]+=[^&;\s]+"
+    r"(?:&[a-z0-9_.~%-]+=[^&;\s]*)+$",
+    re.IGNORECASE,
+)
+_MAX_PUBLIC_PAYLOAD_DEPTH = 64
+_MAX_PUBLIC_PAYLOAD_MEMBERS = 4096
 _AUTHORITY_TRUST_ANCHOR = (
     (
         (
@@ -763,7 +795,7 @@ def _validate_evidence_shape(payload: object) -> dict:
     if chain["name"] != "eth" or chain["chain_id"] != 1 or type(chain["chain_id"]) is not int:
         raise ResearchContractError("evidence chain is invalid")
     block = _exact_fields(evidence["block"], _BLOCK_FIELDS, "evidence block")
-    _positive_int(block["number"], "block number")
+    _uint(block["number"], 256, "block number", positive=True)
     _hash32(block["hash"], "block hash")
     if block["hash"] == "0x" + "00" * 32:
         raise ResearchContractError("canonical block hash must be nonzero")
@@ -1825,7 +1857,12 @@ def _validate_research_snapshot_structure(payload: object) -> dict:
         raise ResearchContractError("application SHA is invalid")
     _sha256(snapshot["registry_sha256"], "snapshot registry hash")
     _sha256(snapshot["evidence_identity"], "snapshot evidence identity")
-    _positive_int(snapshot["as_of_block_number"], "snapshot block number")
+    _uint(
+        snapshot["as_of_block_number"],
+        256,
+        "snapshot block number",
+        positive=True,
+    )
     _hash32(snapshot["as_of_block_hash"], "snapshot block hash")
     if snapshot["as_of_block_hash"] == "0x" + "00" * 32:
         raise ResearchContractError("snapshot block hash must be nonzero")
@@ -1969,7 +2006,7 @@ def validate_research_snapshot(
     evidence: dict,
     registry: dict,
 ) -> dict:
-    """Authenticate a snapshot by rebuilding it from exact public authorities."""
+    """Rebuild a snapshot under the documented publication trust boundary."""
     registry = load_research_registry(registry)
     evidence = validate_research_evidence(evidence, registry)
     snapshot = _validate_research_snapshot_structure(payload)
@@ -1983,27 +2020,48 @@ def validate_research_snapshot(
 
 def scan_public_payload(payload: object) -> None:
     """Reject keys and free text that are unsafe to publish in research data."""
-    def scan(value: object) -> None:
+    pending = [(payload, 0)]
+    members = 0
+    while pending:
+        value, depth = pending.pop()
+        if depth > _MAX_PUBLIC_PAYLOAD_DEPTH:
+            raise ResearchContractError("public payload nesting is too deep")
         if isinstance(value, dict):
+            members += len(value)
+            if members > _MAX_PUBLIC_PAYLOAD_MEMBERS:
+                raise ResearchContractError("public payload has too many members")
             for key, child in value.items():
                 if not isinstance(key, str):
                     raise ResearchContractError("public payload key is invalid")
                 normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
-                if normalized_key in _FORBIDDEN_KEY_NORMALIZED:
+                separated_key = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", key)
+                key_words = {
+                    word.lower()
+                    for word in re.findall(r"[A-Za-z0-9]+", separated_key)
+                }
+                if (
+                    normalized_key in _FORBIDDEN_KEY_NORMALIZED
+                    or key_words.intersection(_FORBIDDEN_KEY_WORDS)
+                ):
                     raise ResearchContractError("public payload contains forbidden key")
-                scan(child)
+                pending.append((child, depth + 1))
         elif isinstance(value, list):
+            members += len(value)
+            if members > _MAX_PUBLIC_PAYLOAD_MEMBERS:
+                raise ResearchContractError("public payload has too many members")
             for child in value:
-                scan(child)
+                pending.append((child, depth + 1))
         elif isinstance(value, str):
-            if _UNSAFE_TEXT.search(value):
+            if (
+                _UNSAFE_TEXT.search(value)
+                or ("@" in value and _UNSAFE_EMAIL_TEXT.search(value))
+                or _UNSAFE_AUTH_TEXT.search(value)
+                or _UNSAFE_QUERY_TEXT.search(value)
+            ):
                 raise ResearchContractError("public payload contains unsafe text")
-            return
         elif value is None or isinstance(value, (bool, int)):
-            return
+            continue
         elif isinstance(value, float):
             raise ResearchContractError("public payload contains binary float")
         else:
             raise ResearchContractError("public payload value is invalid")
-
-    scan(payload)

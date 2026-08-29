@@ -122,7 +122,11 @@ build_research_snapshot(
     application_sha: str,
 ) -> dict
 canonical_json_bytes(payload: object) -> bytes
-validate_research_snapshot(payload: object) -> dict
+validate_research_snapshot(
+    payload: object,
+    evidence: dict,
+    registry: dict,
+) -> dict
 ```
 
 The module reuses `V2PoolState`, `MarketRules`, `CommonTarget`, and the exact V2
@@ -145,6 +149,12 @@ cannot vary them and thereby change evidence identity. The URLs are
 process-only inputs. The CLI and in-process capture boundary reject equal
 endpoint identities before any request; this proves only that the configured
 endpoint strings differ, not that their hidden infrastructure is independent.
+Each endpoint must be HTTPS with no URL userinfo. The transport makes a direct,
+TLS-authenticated HTTPS connection using the platform trust store, disables
+ambient HTTP(S) proxies explicitly, and therefore cannot inherit proxy routes
+or proxy credentials from process environment variables. Query or path
+credentials, when an operator requires them, remain process-only URL material
+and are never projected into an artifact or error.
 It:
 
 1. resolves one finalized Ethereum header;
@@ -222,6 +232,17 @@ The registry is the identity authority. The Ethereum state at the bound block
 is the observation authority. Documentation URLs may explain an authority
 record during review, but they are not runtime data and are not projected into
 the public evidence.
+
+The publication trust anchor is the reviewed dual-provider capture process,
+the expected registry/evidence identities, and the Git commit that publishes
+the reviewed canonical bytes. The generic evidence validator proves schema,
+hash, authority-record, and internal state consistency against the supplied
+registry. Because public evidence retains opaque labels and agreed result
+hashes rather than signed provider attestations or Ethereum state proofs, the
+validator does not by itself prove that either provider returned those bytes
+or that the bytes are members of the claimed state root. Snapshot validation
+rebuilds every derived value from evidence and registry, but inherits that
+publication trust boundary.
 
 For every pool, authority requires all of the following to agree:
 
@@ -477,10 +498,13 @@ closed over the existing V2 quote contract: complete quotes use
 `target_base_unit_misaligned`, `target_lot_misaligned`,
 `minimum_base_quantity_not_met`, `pool_output_below_one_raw`,
 `pool_reserve_insufficient`, or `minimum_notional_not_met`. Free text is never
-published. Scenario `reason_codes` are derived deterministically: unavailable
-leg reasons in buy-then-sell order with duplicates removed; otherwise the
-complete-quote reason, followed by `route_costs_not_evaluated` only for a
-positive pool edge whose route costs remain missing.
+published. Scenario `reason_codes` are derived deterministically. If either
+leg is unavailable, both legs contribute their quote reason in buy-then-sell
+order, including `fixed_block_fee_proof_not_authenticated` for a complete leg,
+and duplicate reasons are removed after preserving their first occurrence.
+Otherwise the list contains the complete-quote reason, followed by
+`route_costs_not_evaluated` only for a positive pool edge whose route costs
+remain missing.
 
 `strict_eligible` and `executable` are always `false` in v1. The following
 fields are always null rather than fabricated:

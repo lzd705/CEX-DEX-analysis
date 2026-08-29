@@ -80,13 +80,17 @@ def _recheck_directory_chain(path: Path, expected: Sequence[Tuple[int, int]]) ->
         os.close(descriptor)
 
 
-def _stable_metadata(metadata: os.stat_result) -> Tuple[int, int, int, int, int]:
+def _stable_metadata(
+    metadata: os.stat_result,
+) -> Tuple[int, int, int, int, int, int, int]:
     return (
         metadata.st_dev,
         metadata.st_ino,
         stat.S_IFMT(metadata.st_mode),
         metadata.st_nlink,
         metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     )
 
 
@@ -107,6 +111,7 @@ def _read_bounded(descriptor: int) -> bytes:
 def _preflight_json_bytes(raw: bytes) -> None:
     depth = 0
     members = 0
+    containers = []
     index = 0
     in_string = False
     escaped = False
@@ -126,29 +131,62 @@ def _preflight_json_bytes(raw: bytes) -> None:
             index += 1
             continue
         if byte == 34:
+            if containers and containers[-1][0] == 91 and containers[-1][1]:
+                members += 1
+                if members > MAX_JSON_MEMBERS:
+                    raise ResearchContractError("JSON has too many members")
+                containers[-1][1] = False
             in_string = True
             string_start = index
         elif byte in (91, 123):
+            if containers and containers[-1][0] == 91 and containers[-1][1]:
+                members += 1
+                if members > MAX_JSON_MEMBERS:
+                    raise ResearchContractError("JSON has too many members")
+                containers[-1][1] = False
             depth += 1
             if depth > MAX_JSON_DEPTH:
                 raise ResearchContractError("JSON nesting is too deep")
+            containers.append([byte, byte == 91])
         elif byte in (93, 125):
+            expected_open = 91 if byte == 93 else 123
+            if not containers or containers[-1][0] != expected_open:
+                raise ResearchContractError("JSON nesting is invalid")
+            containers.pop()
             depth -= 1
             if depth < 0:
                 raise ResearchContractError("JSON nesting is invalid")
+        elif byte == 44:
+            if containers and containers[-1][0] == 91:
+                containers[-1][1] = True
         elif byte == 58:
             members += 1
             if members > MAX_JSON_MEMBERS:
                 raise ResearchContractError("JSON has too many members")
         elif byte == 45 or 48 <= byte <= 57:
+            if containers and containers[-1][0] == 91 and containers[-1][1]:
+                members += 1
+                if members > MAX_JSON_MEMBERS:
+                    raise ResearchContractError("JSON has too many members")
+                containers[-1][1] = False
             start = index
             while index < length and raw[index] not in b" \t\r\n,]}":
                 index += 1
             if index - start > MAX_JSON_INTEGER_TOKEN_BYTES:
                 raise ResearchContractError("JSON number token is too large")
             continue
+        elif (
+            containers
+            and containers[-1][0] == 91
+            and containers[-1][1]
+            and byte not in b" \t\r\n"
+        ):
+            members += 1
+            if members > MAX_JSON_MEMBERS:
+                raise ResearchContractError("JSON has too many members")
+            containers[-1][1] = False
         index += 1
-    if in_string or depth != 0:
+    if in_string or depth != 0 or containers:
         raise ResearchContractError("JSON structure is invalid")
 
 

@@ -1356,6 +1356,14 @@ def _reseal_evidence(
 
 def _reseal_block(payload, block_hash):
     payload["block"]["hash"] = block_hash
+    _reseal_header(payload)
+    for observation in payload["provider_observations"]:
+        observation["block_hash"] = block_hash
+    payload["evidence_identity"] = _test_evidence_identity(payload)
+    return payload
+
+
+def _reseal_header(payload):
     header = {
         field: payload["block"][field]
         for field in (
@@ -1375,8 +1383,6 @@ def _reseal_block(payload, block_hash):
     payload["block"]["canonical_header_sha256"] = header_sha256
     for observation in payload["block"]["provider_header_observations"]:
         observation["canonical_header_sha256"] = header_sha256
-    for observation in payload["provider_observations"]:
-        observation["block_hash"] = block_hash
     payload["evidence_identity"] = _test_evidence_identity(payload)
     return payload
 
@@ -1507,6 +1513,23 @@ class ResearchCaptureTests(unittest.TestCase):
                     if request["method"] == "eth_getBlockByHash"
                 ],
                 [[self.block_hash, False], [self.block_hash, False]],
+            )
+
+    def test_header_block_number_is_a_positive_uint256_quantity(self):
+        responses, _ = valid_rpc_responses(self.registry)
+        legal_maximum = (1 << 256) - 1
+        responses["header"]["number"] = "0x" + "f" * 64
+        captured = capture._load_finalized_header(
+            Provider("provider_a", "a" * 64, RecordingRpc(responses))
+        )
+        self.assertEqual(captured.projected_header["number"], legal_maximum)
+
+        responses["header"]["number"] = "0x1" + "0" * 64
+        with self.assertRaisesRegex(
+            capture.CaptureError, "^rpc_response_invalid$"
+        ):
+            capture._load_finalized_header(
+                Provider("provider_a", "a" * 64, RecordingRpc(responses))
             )
 
     def _provider_pair(self, rpc_a, rpc_b):
@@ -1817,6 +1840,48 @@ class ResearchCaptureTests(unittest.TestCase):
         self.assertEqual(transport("eth_chainId", []), "0x1")
         self.assertEqual(gate.observed_headers, [expected_headers])
 
+    def test_transport_ignores_ambient_proxy_and_proxy_credentials(self):
+        ambient = {
+            "HTTP_PROXY": "http://proxy-user:proxy-password@127.0.0.1:9",
+            "HTTPS_PROXY": "http://proxy-user:proxy-password@127.0.0.1:9",
+            "http_proxy": "http://proxy-user:proxy-password@127.0.0.1:9",
+            "https_proxy": "http://proxy-user:proxy-password@127.0.0.1:9",
+        }
+        with mock.patch.dict(os.environ, ambient, clear=False), mock.patch.object(
+            urllib.request,
+            "getproxies",
+            side_effect=AssertionError("ambient proxy configuration was consulted"),
+        ):
+            transport = capture.BoundedJsonRpcTransport(
+                "https://rpc.example/v2/public", 2
+            )
+
+        direct = StaticOpener(b'{"id":1,"jsonrpc":"2.0","result":"0x1"}')
+        transport._opener = direct
+        self.assertEqual(transport("eth_chainId", []), "0x1")
+        request, _ = direct.requests[0]
+        self.assertIsNone(request.get_header("Proxy-authorization"))
+        self.assertIsNone(request.get_header("Authorization"))
+
+    def test_transport_rejects_http_and_url_userinfo_before_network_setup(self):
+        endpoints = (
+            "http://rpc.example/v2/public",
+            "https://rpc-user@rpc.example/v2/public",
+            "https://rpc-user:rpc-password@rpc.example/v2/public",
+        )
+        with mock.patch.object(
+            urllib.request,
+            "build_opener",
+            side_effect=AssertionError("network opener setup was reached"),
+        ):
+            for endpoint in endpoints:
+                with self.subTest(endpoint=endpoint):
+                    with self.assertRaisesRegex(
+                        capture.CaptureError,
+                        "^capture_configuration_invalid$",
+                    ):
+                        capture.BoundedJsonRpcTransport(endpoint, 2)
+
     def test_bounded_transport_uses_fixed_post_envelope_and_maps_remote_errors(self):
         endpoint = "https://rpc.example/v2/sk-live-private"
         transport = capture.BoundedJsonRpcTransport(endpoint, 7)
@@ -1857,6 +1922,23 @@ class ResearchCaptureTests(unittest.TestCase):
                     {"blockHash": self.block_hash, "requireCanonical": True},
                 ],
             )
+
+    def test_json_rpc_success_and_error_envelopes_reject_boolean_ids(self):
+        transport = capture.BoundedJsonRpcTransport("https://rpc.example", 2)
+        bodies = (
+            b'{"id":true,"jsonrpc":"2.0","result":"0x1"}',
+            (
+                b'{"error":{"code":-32000,"message":"unavailable"},'
+                b'"id":true,"jsonrpc":"2.0"}'
+            ),
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                transport._opener = StaticOpener(body)
+                with self.assertRaisesRegex(
+                    capture.CaptureError, "^rpc_response_invalid$"
+                ):
+                    transport("eth_getBlockByNumber", ["finalized", False])
 
     def test_bounded_transport_rejects_oversize_members_and_unreviewed_requests(self):
         transport = capture.BoundedJsonRpcTransport("https://rpc.example", 20)
@@ -2330,6 +2412,25 @@ class ResearchEvidenceTests(unittest.TestCase):
         self.assertEqual(quality["usable_provider_observation_count"], 70)
         self.assertEqual(quality["provider_disagreement_count"], 0)
 
+    def test_evidence_block_number_is_a_positive_uint256(self):
+        legal = valid_evidence_payload(self.registry)
+        legal["block"]["number"] = (1 << 256) - 1
+        self.assertEqual(
+            shib_v2_research.validate_research_evidence(
+                _reseal_header(legal), self.registry
+            )["block"]["number"],
+            (1 << 256) - 1,
+        )
+
+        overflow = valid_evidence_payload(self.registry)
+        overflow["block"]["number"] = 1 << 256
+        with self.assertRaisesRegex(
+            shib_v2_research.ResearchContractError, "^block number is invalid$"
+        ):
+            shib_v2_research.validate_research_evidence(
+                _reseal_header(overflow), self.registry
+            )
+
     def test_fully_resealed_zero_canonical_block_hash_is_rejected(self):
         payload = _reseal_block(
             valid_evidence_payload(self.registry), "0x" + "00" * 32
@@ -2757,6 +2858,20 @@ class ResearchSnapshotTests(unittest.TestCase):
         with self.assertRaises(shib_v2_research.ResearchContractError):
             shib_v2_research.validate_research_snapshot(
                 snapshot, changed_evidence, self.registry
+            )
+
+    def test_snapshot_block_number_rejects_uint256_overflow(self):
+        snapshot = shib_v2_research.build_research_snapshot(
+            self.evidence, self.registry, "1" * 40
+        )
+        snapshot["as_of_block_number"] = 1 << 256
+        snapshot["snapshot_sha256"] = shib_v2_research.snapshot_sha256(snapshot)
+        with self.assertRaisesRegex(
+            shib_v2_research.ResearchContractError,
+            "^snapshot block number is invalid$",
+        ):
+            shib_v2_research.validate_research_snapshot(
+                snapshot, self.evidence, self.registry
             )
 
     def test_authority_validator_rejects_fully_resealed_forgeries(self):
@@ -3227,6 +3342,51 @@ class SafeJsonBoundaryTests(unittest.TestCase):
             "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce"
         ))
 
+    def test_bounded_loader_rejects_same_inode_same_size_mid_read_overwrite(self):
+        path = self.root / "changing.json"
+        original = shib_v2_research.canonical_json_bytes({
+            "left": "a" * 40000,
+            "right": "b" * 40000,
+        }) + b"\n"
+        replacement = shib_v2_research.canonical_json_bytes({
+            "left": "c" * 40000,
+            "right": "d" * 40000,
+        }) + b"\n"
+        self.assertEqual(len(original), len(replacement))
+        path.write_bytes(original)
+        before = path.stat()
+        real_read = shib_v2_research_io.os.read
+        state = {"overwritten": False}
+
+        def overwrite_after_first_chunk(descriptor, length):
+            block = real_read(descriptor, length)
+            if block and not state["overwritten"]:
+                state["overwritten"] = True
+                path.write_bytes(replacement)
+            return block
+
+        with mock.patch.object(
+            shib_v2_research_io.os,
+            "read",
+            side_effect=overwrite_after_first_chunk,
+        ):
+            with self.assertRaisesRegex(
+                shib_v2_research.ResearchContractError,
+                "identity changed during read",
+            ):
+                load_bounded_json(path, "changing fixture")
+
+        after = path.stat()
+        self.assertTrue(state["overwritten"])
+        self.assertEqual(
+            (before.st_dev, before.st_ino, before.st_size),
+            (after.st_dev, after.st_ino, after.st_size),
+        )
+        self.assertNotEqual(
+            (before.st_mtime_ns, before.st_ctime_ns),
+            (after.st_mtime_ns, after.st_ctime_ns),
+        )
+
     def test_public_scan_rejects_url_secret_private_path_and_provider_error(self):
         slash = chr(47)
         for value in (
@@ -3252,11 +3412,65 @@ class SafeJsonBoundaryTests(unittest.TestCase):
                 with self.assertRaises(shib_v2_research.ResearchContractError):
                     shib_v2_research.scan_public_payload(payload)
 
+    def test_public_scan_and_writer_reject_sensitive_keys_and_text(self):
+        forbidden_payloads = (
+            {"cookie": "session-value"},
+            {"account_label": "research-operator"},
+            {"walletAddress": "0x" + "11" * 20},
+            {"email_address": "researcher@example.test"},
+            {"value": "researcher@example.test"},
+            {"value": "Bearer abcdefghijklmnopqrstuvwxyz012345"},
+            {"value": "Basic dXNlcjpwYXNzd29yZA=="},
+            {"value": "?api_key=private-value&network=eth"},
+            {"value": "api_key=private-value&network=eth"},
+            {"value": "/opt/research/output.json"},
+            {"value": "source=/srv/research/output.json"},
+            {"value": "(/var/lib/research/output.json)"},
+            {"value": "C:\\research\\output.json"},
+            {"value": "D:/research/output.json"},
+            {"value": "(E:\\research\\output.json)"},
+        )
+        output = self.root / "public.json"
+        original = b'{"kept":1}\n'
+        for payload in forbidden_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research.scan_public_payload(payload)
+                output.write_bytes(original)
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research_io.atomic_write_canonical_json(output, payload)
+                self.assertEqual(output.read_bytes(), original)
+
+    def test_public_scan_and_writer_bound_in_memory_depth_and_members(self):
+        deeply_nested = 0
+        for _ in range(1100):
+            deeply_nested = [deeply_nested]
+        output = self.root / "public.json"
+        original = b'{"kept":1}\n'
+        output.write_bytes(original)
+        for payload in (deeply_nested, [0] * 4097):
+            with self.subTest(kind=type(payload).__name__):
+                try:
+                    shib_v2_research.scan_public_payload(payload)
+                except shib_v2_research.ResearchContractError:
+                    pass
+                except RecursionError as error:
+                    self.fail("public scanner leaked RecursionError: {!r}".format(error))
+                else:
+                    self.fail("unsafe in-memory payload was accepted")
+                with self.assertRaises(shib_v2_research.ResearchContractError):
+                    shib_v2_research_io.atomic_write_canonical_json(output, payload)
+                self.assertEqual(output.read_bytes(), original)
+
     def test_public_scan_keeps_legitimate_token_and_evm_address_fields(self):
         self.assertIsNone(shib_v2_research.scan_public_payload({
             "token": "SHIB",
             "address": "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce",
             "description": "ETH / USD",
+            "fee_formula": (
+                "amount_in_with_fee=amount_in*fee_numerator;"
+                "denominator=reserve_in*fee_denominator+amount_in_with_fee"
+            ),
         }))
 
     def test_bounded_loader_rejects_float_exponent_and_nonfinite_tokens(self):
@@ -3296,6 +3510,21 @@ class SafeJsonBoundaryTests(unittest.TestCase):
                 path.write_bytes(raw)
                 with self.assertRaises(shib_v2_research.ResearchContractError):
                     load_bounded_json(path, label)
+
+    def test_json_preflight_counts_array_elements_before_parsing(self):
+        oversized_array = self.root / "oversized-array.json"
+        oversized_array.write_bytes(
+            b"[" + b",".join(b"0" for _ in range(4097)) + b"]\n"
+        )
+        with self.assertRaisesRegex(
+            shib_v2_research.ResearchContractError,
+            "JSON has too many members",
+        ):
+            load_bounded_json(oversized_array, "oversized array")
+
+        evidence = load_bounded_json(EVIDENCE_PATH, "repository evidence")
+        self.assertEqual(len(evidence["logical_calls"]), 35)
+        self.assertEqual(len(evidence["provider_observations"]), 70)
 
     def test_bounded_loader_requires_canonical_bytes_and_writer_round_trips(self):
         from scripts.shib_v2_research_io import atomic_write_canonical_json
