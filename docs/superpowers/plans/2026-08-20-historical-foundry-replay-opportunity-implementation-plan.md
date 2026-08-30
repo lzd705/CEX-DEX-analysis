@@ -4,9 +4,9 @@
 
 **Goal:** Deliver one real, independently replayable historical UNI/WETH Opportunity bundle for Uniswap V2 and SushiSwap V2, covering the exact seven-day finalized window, two directions, five notionals, ten successful Foundry/Anvil receipts, at least one strictly positive policy-net research estimate, and a separate historical Dashboard surface.
 
-**Architecture:** Build four independently green phases. Phase 1 freezes policy, authority, toolchain, shared arithmetic, and the immutable Solidity executor. Phase 2 captures the complete seven-day archive evidence and replays candidate blocks in fresh Anvil forks. Phase 3 converts the selected evidence into the existing Opportunity economics through sealed historical core and complete-bundle profiles, then publishes only after connected verification. Phase 4 adds a historical-only API/UI/release gate and executes the first real nonfixture run. Live Shadow and live Opportunity contracts remain unchanged.
+**Architecture:** Build four independently green phases. Phase 1 freezes policy, authority, toolchain, shared arithmetic, and the immutable Solidity executor. Phase 2 orders window work as pure/offline planning, a minimal bounded descriptor spool, production capture/finalize/reconciliation, immutable chunks/snapshot, then prefilter/replay/selection. Task 4a freezes storage-owned base types, pending state, and a test bridge only; Task 3b then modifies RPC, scan, and storage together to add exact production transfer/finalization/reconciliation/mint/consume contracts. Immediately after the fresh claim and before the first logical root, its sole RPC binder atomically moves independently duplicated held source authority into a storage-owned claim/spool-bound binding; that live binding moves through seal, mint, consume, and the Task-4b staging snapshot even though normal finalization closes the original preflight sources. Only the resulting one-shot production capability may authorize Task 4b, and the connected gate runs after every Phase-2 slice is committed and review-clean. Phase 3 converts the selected evidence into the existing Opportunity economics through sealed historical core and complete-bundle profiles, then publishes only after connected verification. Phase 4 adds a historical-only API/UI/release gate and executes the first real nonfixture run. Live Shadow and live Opportunity contracts remain unchanged.
 
-**Tech Stack:** Python 3.8.10+ standard library, Solidity 0.8.36, Foundry/Anvil/Forge/Cast v1.7.1, forge-std v1.16.1 pinned to a full commit, Ethereum archive JSON-RPC, existing CSV/SQLite publication primitives, vanilla dashboard JavaScript and Python `unittest`.
+**Tech Stack:** Every command that collects, replays, verifies, publishes, releases, or otherwise creates/authorizes production evidence runs under the exact project-local CPython 3.8.10 runtime. The current system CPython is used only for additional offline regression and parse/compile checks and can never substitute for, or produce completion evidence in place of, the exact runtime. Solidity 0.8.36, Foundry/Anvil/Forge/Cast v1.7.1, forge-std v1.16.1 pinned to a full commit, Ethereum archive JSON-RPC, existing CSV/SQLite publication primitives, vanilla dashboard JavaScript, and Python `unittest`.
 
 **Spec:** `docs/superpowers/specs/2026-08-20-historical-foundry-replay-opportunity-design.md`
 
@@ -19,11 +19,12 @@
 - The current policy uses 10 bps acceptance MEV and 25/50 bps stress MEV. The generic policy validator permits a reviewed exact zero rate; no implementation may hard-code a positive-rate restriction or a hidden 10 bps fallback.
 - Every selected scenario runs in a fresh fork with one sealed overlay and exactly one type-2 transaction in synthetic block `B+1`. No reusable private key is retained.
 - Historical paths are namespaced under `raw/historical-foundry-replay` and `routes/historical`. Both live pointers, `routes/core/latest.json` and `routes/latest.json`, must remain byte-for-byte unchanged in every historical success and failure test.
-- All Python production code must parse and run on real CPython 3.8.10. Foundry is a pinned offline collection dependency and is never installed by the dashboard.
+- All Python production code must parse and run on the exact project-local CPython 3.8.10; every operational production command must actually use that runtime. A system-runtime pass is additional offline evidence only. Foundry is a pinned offline collection dependency and is never installed by the dashboard.
+- Phase-2 dependency order is exact: Task 3a pure/offline projection → Task 4a bounded descriptor spool → Task 3b production capture/finalize/reconcile → Task 4b immutable chunks/snapshot → Tasks 5–7. Storage alone owns the cross-module transfer, pending/committed receipt, source-binding, and final-capability classes plus their non-exported closure issuers/verifiers/revokers/one-shot guards. Task 4a has no production bridge; Task 3b adds only spool-bound exact bridge methods after the RPC/scan authority types exist. The sole claim-to-spool binder duplicates and transfers held source/ancestry descriptors exactly once before the first logical root; transfer/finalize/mint before binding reject, while the live binding survives original preflight-source cleanup and is moved—not copied—through Task 4b snapshot acceptance before exact-once revocation. A transfer is transport-only; fixture mappings and test capabilities cannot authorize storage, and no Phase-2 connected gate runs before all seven slices are committed and independently review-clean.
 - Use exact fixed-point strings, integers, `Decimal`, or `Fraction`; never binary floating point for economic authority.
 - Tests are written and observed RED before production code. Every task ends with focused GREEN, the phase ends with system and real-3.8 regressions, and no phase is called complete from fixture-only evidence.
 - Never persist an RPC URL, provider credential, header, cookie, private key, arbitrary error body, local absolute path, or exception text.
-- The user-set task budget is capped at 600,000,000 tokens. Never silently exceed it; if the goal meter cannot enforce that budget, stop manually when `tokensUsed` reaches 600,000,000 and report the tooling limitation rather than inventing usage.
+- The user-set task budget is capped at 400,000,000 tokens. Never silently exceed it; if the goal meter cannot enforce that budget, stop manually when `tokensUsed` reaches 400,000,000 and report the tooling limitation rather than inventing usage.
 
 ## Phase Plans and Dependency Order
 
@@ -31,6 +32,7 @@
    - Exit gate: three canonical config contracts, shared exact arithmetic, a hash-bound executor, offline unit tests, and one connected fixed-block fork KAT.
 2. [Seven-day scan and candidate replay](2026-08-20-historical-foundry-scan-replay-plan.md)
    - Depends on Phase 1.
+   - Internal order: Task 3a → Task 4a → Task 3b → Task 4b → Tasks 5–7; the connected repeat/full-window gate is last.
    - Exit gate: immutable full-window raw run with exact coverage, descending candidate resolution, and either a closed nonpublication result or one selected ten-success block.
 3. [Opportunity bridge and historical publication](2026-08-20-historical-foundry-publication-plan.md)
    - Depends on Phases 1–2.
@@ -75,8 +77,9 @@ python3 -m unittest \
 ```
 
 ```bash
-python3.8 -c 'import sys; assert sys.version_info[:3] == (3, 8, 10), sys.version'
-python3.8 -m unittest \
+/private/tmp/cpython-3.8.10-runtime-20260820/bin/python3.8 -B \
+  -c 'import sys; assert sys.version_info[:3] == (3, 8, 10), sys.version'
+/private/tmp/cpython-3.8.10-runtime-20260820/bin/python3.8 -B -m unittest \
   tests.test_historical_foundry_contracts \
   tests.test_historical_foundry_toolchain \
   tests.test_historical_foundry_storage \
@@ -103,25 +106,41 @@ The exact CPython command is a release blocker until the preceding version asser
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3.8 -m unittest discover -s tests -v
+/private/tmp/cpython-3.8.10-runtime-20260820/bin/python3.8 -B \
+  -m unittest discover -s tests -v
 ```
 
 ```bash
 python3 -m scripts.bootstrap_historical_foundry_toolchain \
   --verify-offline-tests
-python3 -m scripts.bootstrap_historical_foundry_toolchain \
+/private/tmp/cpython-3.8.10-runtime-20260820/bin/python3.8 -B \
+  -m scripts.bootstrap_historical_foundry_toolchain \
   --verify-connected-kat
 ```
 
 ```bash
-python3 -m scripts.run_historical_foundry_replay scan \
+/private/tmp/cpython-3.8.10-runtime-20260820/bin/python3.8 -B \
+  -m scripts.run_historical_foundry_replay scan \
   --data-dir "$MARKET_DATA_DIR" --publish
-python3 -m scripts.run_historical_foundry_replay verify \
+/private/tmp/cpython-3.8.10-runtime-20260820/bin/python3.8 -B \
+  -m scripts.run_historical_foundry_replay verify \
   --data-dir "$MARKET_DATA_DIR" \
   --bundle "$MARKET_DATA_DIR/routes/historical/bundles/$REPLAY_ID"
-python3 scripts/check_dashboard_release.py \
+/private/tmp/cpython-3.8.10-runtime-20260820/bin/python3.8 -B \
+  scripts/check_dashboard_release.py \
   --base-url http://127.0.0.1:8765 \
   --require-historical-foundry-replay
 ```
 
 Do not replace the connected run with fixtures, do not use `--require-route-opportunities` as a substitute for the historical gate, and do not report completion unless all evidence listed in the design's Completion Evidence section exists and has been reread.
+
+The connected `-m scripts.run_historical_foundry_replay scan` command imports
+`scripts.historical_foundry_scan` under its canonical module key; the direct
+`python -m scripts.historical_foundry_scan` resolver branch is an offline
+subprocess KAT only. Both branches must satisfy the exact source-binding rules
+in the scan plan without a second import. The claim itself performs no source
+bind; immediately afterward, the sole claim-to-spool binder resolves that
+already-running scan object without import, function-locally imports canonical
+storage, duplicates/transfers the verified held source and ancestry descriptors
+into the empty spool before the first logical root, and leaves no reference to
+the source authority that normal claimed-finalizer cleanup later closes.

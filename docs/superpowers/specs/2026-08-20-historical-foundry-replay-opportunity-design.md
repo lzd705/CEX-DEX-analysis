@@ -196,12 +196,13 @@ but stress-negative result remains eligible and is labelled
 
 ## Authority contract
 
-The authority file contains these lowercase Ethereum identities, which are
-verified against chain state at both the anchor and selected blocks:
+The authority file contains these canonical lowercase Ethereum identities,
+each encoded as `0x` plus exactly 40 hexadecimal digits. They are verified
+against chain state at both the anchor and selected blocks:
 
 | Object | Ethereum address |
 | --- | --- |
-| UNI | `0x1f9840a85d5af5bf1d1762f925bdadc4201f984` |
+| UNI | `0x1f9840a85d5af5bf1d1762f925bdaddc4201f984` |
 | WETH9 | `0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2` |
 | Uniswap V2 Factory | `0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f` |
 | Uniswap V2 Router02 | `0x7a250d5630b4cf539739df2c5dacb4c659f2488d` |
@@ -297,6 +298,260 @@ chunks, with p50 and p90 rewards, and its base-fee and gas-used projections are
 cross-checked against the retained headers. Missing, duplicated, truncated,
 reordered, or inconsistent requests or responses make the run `inconclusive`,
 never `no_publishable_profitable_block`.
+
+Window implementation is split at authority and retention boundaries in this
+exact order:
+
+```text
+Task 3a pure/offline plan and projection
+  -> Task 4a bounded spool, base handoff types, and test bridge
+  -> Task 3b claimed-source bind, production bridges, capture, finalization, reconciliation
+  -> Task 4b live-binding consume, immutable chunks, and held staging snapshot
+  -> Tasks 5-7 prefilter, replay, and selection
+```
+
+Task 3a converts the Task-2a pure anchor fixture to one normalized eight-field
+header, projects an ordered binary-search transcript plus a fresh predecessor/
+lower witness, and builds one compact gapless-ID plan. It exposes staged
+one-shot header then state descriptor factories; only the fully validated
+header inventory may provide block hashes to reserve/price rows. Header probes,
+witnesses, bulk headers, and the final reread share one request builder and one
+success projector. Complete original roots share one semantic projector, so
+production 413 children gain no independent typed meaning. For `H=A-L+1` and
+`F=ceil(H/1024)`, `1 <= H <= 50_401`, window requests equal `4H+F+1`, and IDs
+continue after Task-2a `1..48` and the `S` lower observations. Its output is
+explicitly `fixture_only_nonauthorizing`; no pure mapping, copied schema/hash,
+or test capability can authorize a spool, writer, chunk, or snapshot.
+
+Task 4a exists before any production window collection. Storage is the sole
+owner of the exact `_ProductionArchiveRpcExchangeTransfer`,
+`_PendingHistoricalWindowSpoolReceipt`, committed
+`_HistoricalWindowSpoolReceipt`, and
+`_ProductionHistoricalWindowCapability` classes, including their closure
+provenance, inaccessible constructors, private issuers, exact verifiers, and
+single-consumer guards. Task 4a freezes only these base classes, the pending
+state machine, and a storage-owned private test bridge. The issuer closures are
+not exported; no production transfer/mint/consume bridge exists or it rejects
+closed-unavailable in this slice. RPC and scan never receive an issuer callable
+or define a same-named class. They import storage only function-locally, while
+storage imports neither RPC nor scan at module load or runtime. The exact
+`_issue_historical_window_exchange_transfer_for_test(*, spool,
+exchange_projection, canonical_request_bytes, decoded_response_bytes)` bridge
+invokes only the test transfer issuer for Task 4a's positive exact-type KAT and
+makes no production-mint claim.
+
+Task 4a owns one no-follow descriptor-held append-only spool. A transfer is only
+a spool-bound transport object and never authorizes a historical window.
+`append_transfer` writes one successful physical exchange exactly as
+`uint64_be(request_len)||canonical_request_bytes||uint64_be(decoded_len)||decoded_response_bytes`,
+fsyncs and descriptor-rereads it, and returns a pending receipt without adding
+it to committed inventory. At most one pending receipt exists. Task 2b validates
+pending receipt against transfer, commits it through
+`commit_transfer(*, transfer, pending_receipt)`, validates the exact committed
+receipt again, and only then records or returns the exchange. On failure or
+cancellation it calls `abort_transfer(*, transfer, pending_receipt)` when
+possible; abort truncates the uncommitted tail and reverses its provisional
+quota debit, while abort failure terminalizes the spool. Bounded reread accepts
+only committed receipts. Task 3b modifies storage after the exact RPC and scan
+authority types exist, adding the spool-bound production transfer, receipt
+verification, mint, and consume bridges. Final authority exists only after a
+sealed spool, exact Task-2b finalization, and exact scan reconciliation.
+
+The RPC-side Task-3b boundary atomically claims its own completely fresh Task-2b
+production context and gives the scan scheduler only the claim and same held
+opening-config object, without a path reload or raw context/scope exposure.
+After that claim, the generic production batch is forbidden before HTTP. The
+scan scheduler rebuilds
+each complete closed-schema `anchor_stage`, `lower_observation`, or
+`window_root` logical root internally; the root contains complete requests,
+global logical index, segment/kind/root index, and derived 413 authority, so no
+caller can provide a separate boolean or partial root. The claim-scoped wrapper
+opens the existing exact explicit Task-2b logical scope over those complete
+requests and owns enter/exit; the scan scheduler never accesses the raw context
+or internal scope.
+
+Task 3b freezes these exact production bridge contracts. Forward-string and
+`Any` annotations keep Python 3.8 import direction; runtime authority still
+requires exact types from the held bound module objects:
+
+```python
+def _bind_claimed_historical_window_scan_source_module(
+    *, claim: "_ProductionHistoricalWindowRunClaim",
+) -> None: ...
+
+def _bind_claimed_historical_window_storage_source_module(
+    *, claim: "_ProductionHistoricalWindowRunClaim", module: Any,
+) -> None: ...
+
+def _bind_claimed_historical_window_sources_to_spool(
+    *, claim: "_ProductionHistoricalWindowRunClaim",
+    spool: "_HistoricalWindowExchangeSpool",
+) -> "_HistoricalWindowSpoolSourceBinding": ...
+
+def _finalize_claimed_production_archive_rpc_run_for_historical_window(
+    *, claim: "_ProductionHistoricalWindowRunClaim",
+) -> "_ProductionArchiveRpcFinalization": ...
+
+def _verify_claimed_historical_window_finalization(
+    *, claim: "_ProductionHistoricalWindowRunClaim",
+    finalization: "_ProductionArchiveRpcFinalization",
+    expected_receipt_inventory_sha256: str,
+) -> None: ...
+
+class _HistoricalWindowSpoolSourceBinding: ...
+
+class _HistoricalWindowExchangeSpool:
+    def issue_transfer_from_bound_rpc(
+        self, *, claim: Any, exchange_projection: Mapping[str, Any],
+        canonical_request_bytes: bytes, decoded_response_bytes: bytes,
+    ) -> "_ProductionArchiveRpcExchangeTransfer": ...
+    def append_transfer(
+        self, *, transfer: "_ProductionArchiveRpcExchangeTransfer",
+    ) -> "_PendingHistoricalWindowSpoolReceipt": ...
+    def verify_pending_receipt(
+        self, *, transfer: "_ProductionArchiveRpcExchangeTransfer",
+        pending_receipt: "_PendingHistoricalWindowSpoolReceipt",
+    ) -> None: ...
+    def commit_transfer(
+        self, *, transfer: "_ProductionArchiveRpcExchangeTransfer",
+        pending_receipt: "_PendingHistoricalWindowSpoolReceipt",
+    ) -> "_HistoricalWindowSpoolReceipt": ...
+    def verify_committed_receipt(
+        self, *, transfer: "_ProductionArchiveRpcExchangeTransfer",
+        receipt: "_HistoricalWindowSpoolReceipt",
+    ) -> None: ...
+    def abort_transfer(
+        self, *, transfer: "_ProductionArchiveRpcExchangeTransfer",
+        pending_receipt: "_PendingHistoricalWindowSpoolReceipt",
+    ) -> None: ...
+
+class _ProductionHistoricalWindowReconciliation: ...
+
+def _reconcile_production_historical_window(
+    *, claim: Any, finalization: Any, sealed_spool: Any,
+    frozen_pre_ledger: Sequence[Mapping[str, Any]],
+    plan: Mapping[str, Any], compact_projection: Mapping[str, Any],
+) -> "_ProductionHistoricalWindowReconciliation": ...
+
+def _verify_production_historical_window_reconciliation(
+    *, reconciliation: "_ProductionHistoricalWindowReconciliation",
+    expected_spool_identity: Any, expected_finalization_identity: Any,
+) -> None: ...
+
+class _SealedHistoricalWindowExchangeSpool:
+    def mint_production_historical_window_capability(
+        self, *, claim: Any, finalization: Any, reconciliation: Any,
+    ) -> "_ProductionHistoricalWindowCapability": ...
+
+class _ConsumedProductionHistoricalWindowCapabilityView: ...
+
+def consume_production_historical_window_capability(
+    *, capability: "_ProductionHistoricalWindowCapability",
+) -> "_ConsumedProductionHistoricalWindowCapabilityView": ...
+```
+
+The reconciliation and consumed-view classes are closure-issued exact private
+types, immutable, redacted, noncopyable, nonpickleable, nonserializable, and
+lookalike-rejecting. The reconciliation binds the claim, spool and receipt
+inventory, finalization identity, compact projection, and post-ledgers. The
+consumed view contains only its already-bound Task-4b payload and is issued once.
+
+The source-to-spool binder is the sole Task API that may reach
+`claim._context._preflight.sources`. Exactly once after a fresh claim and before
+the first logical root or transfer, it requires live held sources and an
+active, unbound, nonterminal, empty spool. Within one verification boundary it
+applies the fixed scan/storage module resolvers, reverifies every held source,
+no-follow duplicates the scan-, storage-, and RPC-related source FDs plus
+necessary ancestry descriptors, and rechecks FD identity, path/inode/file
+identity, bytes, and SHA-256 before and after duplication. Caller-supplied
+module/path/FD/hash/mapping inputs are impossible. The two module bind helpers
+are binder-only resolver substeps and do not independently expose the source
+authority.
+
+Only that spool's private storage closure slot may accept the exact module
+key/spec/object records and duplicated descriptors and issue one storage-owned
+`_HistoricalWindowSpoolSourceBinding`; this is not a free issuer or a second
+Task API. Acceptance also records the exact spool/binding membership in the
+claim's private closure state, allowing the claim-only finalizer to require the
+same live binding without accepting a spool or caller proof. The binding is
+immutable, redacted, noncopyable, nonpickleable,
+nonserializable, exact claim/spool-bound, and one-shot. Failure/cancellation
+closes all partial duplicates exactly once and leaves no binding. Second bind,
+pre-bind transfer/finalization/mint, cross-spool/claim, closed binding, and
+forged module/object/FD/path/hash use fail closed.
+
+Each successful attempt uses only
+`spool.issue_transfer_from_bound_rpc(...)`, whose bridge checks the claim
+against the live spool source binding's bound RPC module before invoking the
+non-exported issuer for at most one transfer. Every issue, append, pending/
+committed verification, commit, abort, and seal requires that same live
+claim/spool binding. Task 2b appends it, calls `verify_pending_receipt`, commits,
+calls `verify_committed_receipt`, then zeroes/releases both raw fields before
+another attempt, root, or finalization. Task-2b finalization retains only
+compact success records with
+exact exchange/logical/attempt indices, request/wire/decoded metadata, and spool
+member index/offset/length/hash; it contains no raw request/decoded body and no
+`spool_receipt_sha256`.
+
+The production pre-ledger has three ordered segments: three Task-2a anchor
+stages at global logical indices `1..3`, `S` lower-observation singletons at
+`4..3+S`, and zero-based window roots at `4+S+root_index`. Scheduling uses
+`with scope:` and catches literal HTTP 413 inside that active scope only for a
+Task-3a-authorized multirow header/reserve/price root. Its pending queue
+continues left-first and depth-first under the same cumulative 8-MiB budget; no
+child opens a new scope. Only a final successful child with an empty pending
+queue permits normal exit and summary completion. Anchor/lower, singleton, fee,
+final-anchor, disallowed 413, JSON-RPC text, 429, 5xx, timeout, and transport
+failures are terminalized by the wrapper and leave by exception. A recoverable
+413 creates no transfer or pending/committed receipt/member.
+
+After the exactly-once source bind and semantic equality of the final normalized
+anchor, Task 3b calls
+`_finalize_claimed_production_archive_rpc_run_for_historical_window` once; only
+that RPC closure can call the existing context finalizer. It then
+seals and rereads the spool, reconstructs complete roots, replays the three
+anchor stages, the full lower proof, staged headers, and staged state through
+the same pure projectors, and verifies gapless global IDs and all compact
+physical/typed ledgers and issues the exact
+`_ProductionHistoricalWindowReconciliation`. Normal claimed-finalizer cleanup
+may close the original RPC preflight source authority: the storage binding owns
+independent duplicated source/ancestry descriptors and never dereferences that
+closed object. `seal()` atomically moves the binding from active to sealed
+spool. Only then can
+`sealed_spool.mint_production_historical_window_capability(...)` obtain the
+live binding's bound RPC/scan module objects, require exact claim/finalization/
+reconciliation classes from them, call both bound verifier seams, verify the
+same claim/spool/receipt-inventory/finalization identities and exact
+`sealed + finalized + reconciled` state, and internally invoke storage's
+non-exported issuer for one exact, single-consumer
+production capability bound to the held config/source identities, reconciled
+sealed spool, compact projection, post-ledgers, and the still-live source
+binding—not merely its closed identity projection. A successful first mint
+moves the binding into the capability. A failed first mint terminalizes the
+sealed spool and revokes/closes the binding; repeat mint rejects without
+copying or transplanting binding ownership already moved to the capability.
+Direct issuer calls,
+cross-spool/cross-claim inputs, pre-finalization/pre-reconciliation mint, and
+repeat mint fail closed. A mapping, copied hash, boolean, lookalike, or forged
+bound-module class cannot substitute for an authority object. Task 4b is the
+only consumer: its scan bridge function-locally imports storage and calls
+`consume_production_historical_window_capability`, using only the exact private
+consumed view before materializing immutable raw
+exchange and typed role chunks and issuing the held capture snapshot used by
+Task 5. Consume moves the live binding into the consumed view and invalidates
+the capability. That view is an intermediate private state in one storage-
+managed consume/materialize transaction; return of the view alone is not
+consume success and it cannot be abandoned. Before the staging snapshot is
+issued, Task 4b rechecks actual
+module key/spec/object/origin/file and every duplicate source/ancestry FD, then
+moves the closed source-identity projection and necessary held-descriptor
+ownership into the descriptor-held snapshot. It then revokes/closes the
+consumed binding exactly once and closes duplicates not moved. Any failed or
+cancelled bind, pre-finalization lifecycle, reconciliation, first mint, or
+consume/materialization transaction closes its then-current binding/duplicates
+exactly once and issues no downstream authority. After a successful ownership
+move, repeat mint/consume and post-consume copy/transplant attempts reject
+without altering the new owner's live state.
 
 ### Authoritative reserve snapshots
 
@@ -684,11 +939,13 @@ raw/historical-foundry-replay/<run_id>/
   policy.json
   authority.json
   toolchain.json
+  rpc/*.bin
   headers/*.json.gz
   reserves/*.json.gz
   prices/*.json.gz
   fees/*.json.gz
-  scan/*.json.gz
+  scan/capture_inventory.json
+  scan/prefilter/*.json.gz
   candidate_manifest.json
   typed/<market_key>/dex_pool_state.json
   typed/<market_key>/dex_usd_price_context.json
@@ -731,6 +988,39 @@ status/reason code.
 The verifier opens members through retained descriptors, rejects links and
 unexpected files, rereads all member bytes, and recomputes every logical count
 and digest. No absolute filesystem path is evidence.
+
+The private Task-4a spool and its transfer/receipts are staging substrate, not a
+final run member or historical-window authority. Task 4b accepts only the exact
+storage-owned production capability issued after Task-3b reconciliation,
+calls `consume_production_historical_window_capability` once, accepts only its
+exact `_ConsumedProductionHistoricalWindowCapabilityView`, rereads every
+committed framed spool member, and writes no-replace immutable
+`rpc/*.bin` chunks that concatenate whole frames without splitting one. Each raw
+chunk is at most 16 MiB; typed header/reserve/price/fee canonical-gzip chunks and
+the canonical capture inventory are at most 16 MiB decoded. The capture
+inventory joins every raw frame to the exact compact finalization record,
+physical leaf/root ledger, typed role/count/digest, and continuous request-ID
+range. It also binds the exact three copied config bytes and the finalized source
+identity. Consume additionally requires the capability's same live exact
+`_HistoricalWindowSpoolSourceBinding`; a copied closed identity projection is
+not authority. Before snapshot issue, the writer rechecks the exact bound
+module objects and independent duplicate source/ancestry descriptors, transfers
+their closed projection and necessary descriptor ownership into the held
+staging snapshot, and then revokes/closes the consumed binding exactly once. A
+Task-3a projection, fixture, transfer, direct spool, copied
+capability properties, caller row mapping, or caller relative path is rejected
+before the writer opens or a quota debit occurs.
+
+The writer fsyncs and descriptor-rereads every capture member, independently
+reparses/reprojects its contents, freezes the complete `rpc/`, `headers/`,
+`reserves/`, `prices/`, `fees/`, configs, and `scan/capture_inventory.json` role
+set, then issues a read-only `HistoricalRunStagingSnapshot`. Task 5 may read only
+that frozen inventory while the same private writer later appends and freezes
+prefilter, scenario, candidate, typed, and selection role sets. `run_manifest.json`
+is created exactly once as the final staged member; the writer is then revoked,
+all members are reread, and the directory is renamed no-replace. Neither spool
+conversion nor a later role freeze weakens an earlier snapshot or resets the
+run-wide resource ledger.
 
 `selection.json` proves either:
 
@@ -1302,11 +1592,86 @@ and exit signals continue to propagate.
 - Collection requires a clean tracked source tree and retains repository HEAD,
   Python runtime identity, and the physical hashes of every policy/toolchain
   and executor input used by the run.
-- Header/state/fee requests use deterministic bounded batches; smaller batch
-  fallback is allowed only when the logical range and anchor remain unchanged,
-  and the final coverage inventory is exact.
+- Header/state/fee requests use deterministic bounded roots. Only a literal HTTP
+  413 may bisect a Task-3a descriptor-authorized multirow header/reserve/price
+  interval. The claim-scoped historical wrapper owns the existing explicit
+  Task-2b scope; the scheduler catches allowed 413 inside `with scope:`, keeps
+  that scope active, and drains its pending children left-first/depth-first
+  under the same cumulative limits. Normal exit occurs only after the final
+  success empties the queue. Fee/final/singleton/anchor/lower/disallowed 413 and
+  provider text, 429, 5xx, timeout, or transport failure are terminalized by the
+  wrapper and exit exceptionally.
 - JSON decoding retains the repository's wire, decompression, header, node,
   scalar, string, depth, duplicate-key, canonical-number, and deadline limits.
+- Every pure lower observation or complete logical root is guarded before copy,
+  canonicalization, or hash with exactly 1,048,576 nodes, 8,388,608 aggregate
+  scalar bytes, 262,144 ordinary-string bytes, depth 128, and 4,096 numeric-token
+  bytes. Hostile integers pass an unbound bit-length gate before decimal text;
+  Decimal ratios pass the exact 2,048-byte CPython-object preflight and bounded
+  tuple/scientific-token contract. System CPython and exact production CPython
+  3.8.10 must reproduce the frozen Decimal layout KAT before projection.
+- The maximum `H=50_401` plan contains exactly 5,094 roots: 1,261 header, 2,521
+  reserve, 1,261 price, 50 fee, and one final reread. A separate 8-MiB decoded
+  budget for each root could retain
+  `5_094 * 8_388_608 = 42_731_569_152` bytes, exactly `39.796875 GiB`, before
+  anchor/lower overhead. That arithmetic is why Task 4a precedes Task 3b; it is
+  not a RAM or disk guarantee.
+- One monotonic run quota begins when Task 4a opens staging and covers every
+  committed spool frame and every later raw/typed/config/scan/scenario/manifest
+  member: 8 GiB physical bytes and 200,000 members total. No phase, 413,
+  failure, reread, seal, conversion, or deletion resets it or creates a second
+  allowance. It is a lifecycle write budget, not a final retained-tree cap:
+  bytes are deliberately charged once for the successful spool frame and again
+  for its immutable Task-4b chunk. An aborted pending tail reverses only its
+  provisional debit and does not reset committed quota.
+- At most one Task-2b exchange transfer is live. A successful spool handoff
+  leaves the context's resident raw exchange-byte count exactly zero before the
+  next attempt/root/finalization; an outstanding transfer is terminal. Append
+  allows one pending receipt; Task 2b validates pending against transfer,
+  commits, revalidates committed receipt, and only then records/returns.
+  Exception or cancellation aborts the pending tail when possible and closes
+  transfer/context; failed abort terminalizes the spool. No rows or committed
+  receipt escape a spool write/receipt/commit failure.
+- Storage alone defines all transfer/pending-receipt/committed-receipt/final-
+  capability classes and, in Task 3b, the exact
+  `_HistoricalWindowSpoolSourceBinding`, with their closure issuers/verifiers/
+  revokers/one-shot guards. It
+  imports neither RPC nor scan at module load or runtime; RPC and scan import
+  storage only function-locally. Task 4a freezes the base types/state/test bridge
+  and leaves production methods absent or closed-unavailable; Task 3b modifies
+  storage to add the exact production methods after RPC/scan types exist.
+- Task 3b adds exactly
+  `("source:historical_foundry_scan", None, "scripts/historical_foundry_scan.py")`
+  and
+  `("source:historical_foundry_storage", None, "scripts/historical_foundry_storage.py")`
+  to Task-2b's held production source inventory. `module_name=None` prevents a
+  preflight import. The sole post-claim source-to-spool binder resolves scan
+  without importing it. If
+  `sys.modules["__main__"].__spec__.name` is exactly
+  `scripts.historical_foundry_scan`, it binds actual key `__main__`; a
+  simultaneously present canonical key must be the same object. Otherwise it
+  binds canonical key `scripts.historical_foundry_scan` only when that object's
+  `__spec__.name` is canonical. If neither case matches, reject; there is no
+  second import. Before the first logical root, the sole
+  `_bind_claimed_historical_window_sources_to_spool(*, claim, spool)` boundary
+  accesses the live held source authority and RPC function-locally imports storage,
+  which must exist at canonical key `scripts.historical_foundry_storage`, have
+  that exact spec name, and be the identical passed object; storage has no
+  `__main__` fallback. The binder verifies origin/file and held FD/path/inode/
+  file identity/bytes/hash, then retains role, fixed canonical name, actual key,
+  and exact module object. In the same boundary it no-follow duplicates every
+  scan/storage/RPC-related held source member and necessary ancestry descriptor,
+  with pre/post FD/path/inode/bytes/hash checks, into a storage-owned binding.
+  Caller supplies no module/path/FD/hash/mapping. Finalization and each later
+  authority transition recheck the same key/spec/object/origin/file and the
+  independent duplicate FD/path/inode/bytes/hash; any absence, conflicting
+  alias, reload, replacement, or drift raises exactly
+  `authority_mismatch/final_identity_drift`. Original preflight descriptors may
+  close after finalization without weakening the binding. The binding moves
+  active spool → sealed spool → capability → consumed view → held staging
+  snapshot and is revoked/closed exactly once after descriptor ownership moves
+  to the snapshot, or on any failed/cancelled lifecycle. Callers provide no
+  path/hash, and no neutral module means no third row.
 - Subprocess arguments are fixed; no shell interpolation, FFI, arbitrary test
   selector, environment echo, or caller-supplied executable path is allowed.
 - The executor never receives an RPC URL, private key, arbitrary router, token,
@@ -1352,6 +1717,68 @@ Implementation proceeds in independently green slices.
   checks;
 - feeHistory count/range/p50/p90 validation; and
 - missing, duplicated, truncated, reordered, or extra chunk rejection.
+
+### Capture and immutable storage split
+
+- Task 3a exact signatures, including the four-input header projector and
+  four-input complete-root seam; shared header builder/success projector use for
+  lower probes, witnesses, bulk headers, and final anchor;
+- pure lower transcript/fresh witness, gapless formula IDs, `H=1/50_400/50_401`
+  and `50_402` rejection, staged one-shot descriptors, exact final-anchor typed
+  digest without changing the `H` header inventory, and proof that every output
+  remains fixture-only and nonauthorizing;
+- guard-before-copy exact/+1 tests for nodes, scalar/string/depth/numeric-token
+  limits, hostile million-bit integers, strict Decimal preflight ordering,
+  exact 1832/2000/2048/2056 layout table, 4,096/4,097 digit/token boundaries,
+  signed zero/nonfinite/context invariance, and the strict one-quantum ratio
+  enclosure on system and exact CPython 3.8.10;
+- Task 4a storage-only ownership and private-test-bridge/issuer KAT for all four
+  handoff types; exact append-to-pending, commit, abort, committed-only reread,
+  seal, and close APIs; one-pending-only inventory exclusion; validation before
+  commit and after committed receipt; frame bytes, contiguous indices/offsets,
+  abort truncation/provisional-debit rollback and abort-failure terminalization;
+  descriptor/ancestry races, copy/pickle/reuse/transplant rejection, and one
+  lifecycle 8-GiB/200,000-member quota that deliberately double-charges spool
+  and chunks but never resets; plus proof that production transfer/mint/consume
+  methods are absent or closed-unavailable;
+- Task 3b fresh-context claim, same held config identity, generic-batch rejection
+  after claim; exact logical-root opener/attempt, claimed-finalizer/finalization-
+  verifier, spool transfer/pending/committed verifier, scan reconciliation/
+  verifier, sealed-spool mint, and one-shot consume APIs; zero resident raw
+  bytes, outstanding-transfer rejection, compact finalization field set and
+  recursive raw-field absence, three ordered ledger segments and global
+  indices, and exact pre/post-finalization cleanup/cancellation;
+- Task-3b storage bridge exact bound-module type checks and verifier calls;
+  rejection of mapping/hash/bool/lookalike substitutes, direct issuer access,
+  cross-spool/cross-claim, forged bound-module classes, pre-finalization,
+  pre-reconciliation, repeat mint, and repeat consume;
+- exact source-to-spool binder signature and sole-access boundary; pre-bind
+  transfer/finalize/mint, second bind, cross-spool/claim, forged module/object/
+  FD/path/hash, and drift before/after bind rejection; pre/post-duplication
+  descriptor rechecks, no leaked FDs after failed/cancelled bind, successful
+  recheck/mint after original preflight-source close, closed-before-mint
+  rejection, exact-once close after reconciliation failure, mint-to-consume-to-
+  snapshot ownership movement/revocation, and post-consume/repeat-use rejection;
+- exact held scan/storage source rows; direct `python -m` `__main__` binding,
+  canonical imported-runner binding, dual-key same/different-object cases,
+  no-import/no-reload behavior, storage canonical-key-only binding, and
+  finalization recheck of key/spec/object/origin/file/FD/path/inode/bytes/hash
+  with every missing/drift case closed as `final_identity_drift`;
+- existing explicit-scope state-machine REDs for catch location, pending
+  left-first/depth-first order, normal exit only after empty queue, exceptional
+  exit, cleanup, and cancellation; allowed multirow literal-413 continuation
+  versus terminal anchor/lower/fee/final/singleton/other failures, including a
+  six-row reserve root split `3+3` whose poisoned half-block leaves never
+  receive typed semantics;
+- reconciliation reread of every spool frame, complete anchor/lower/root/global
+  pure replay, request IDs `1..last_request_id`, physical leaf versus root-only
+  typed digests, final-anchor-before-finalize order, mismatch closure, and one
+  live transfer at maximum window; and
+- Task 4b exact storage one-shot-consumer ingress and exact private consumed
+  view, rejection of fixture/transfer/direct-spool/lookalike inputs before
+  writer open, immutable raw/typed chunk freeze, decode/reprojection reread,
+  lifecycle-quota continuity, snapshot currentness, and no-replace one-final-
+  manifest state machine.
 
 ### Candidate scan
 
@@ -1516,36 +1943,80 @@ stand in for this stronger MVP gate.
 
 ## Operational sequence
 
-1. Load and hash the fixed policy.
-2. Freeze and authority-check the finalized anchor.
-3. Resolve the seven-day lower bound and capture complete per-block headers,
-   two-pair reserve snapshots, proxy price snapshots, and fee evidence.
-4. Build the exact scan inventory and safe candidate set.
-5. Replay candidates newest to oldest until a valid publishable winner is
+1. Implement, test on the system runtime and exact CPython 3.8.10, independently
+   review, and commit Task 3a, then Task 4a, then Task 3b, then Task 4b, then
+   Tasks 5, 6, and 7. No Phase-2 endpoint or connected Anvil gate runs during
+   these slices. Task 4a ends with production bridge methods absent or
+   closed-unavailable; Task 3b modifies RPC, scan, and storage together to add
+   them.
+2. From a clean committed HEAD under exact CPython 3.8.10, load/hash the fixed
+   policy and held config/toolchain/source identities, open the Task-4a spool,
+   open Task 2b, and atomically claim the still-fresh context for the historical
+   window. The claim itself performs no import or source bind. The connected
+   runner will use the canonical imported-module resolver branch; direct
+   `python -m scripts.historical_foundry_scan` will use the exact `__main__`
+   branch inside Step 3's binder.
+3. Before the first logical root, call
+   `_bind_claimed_historical_window_sources_to_spool(*, claim, spool)` exactly
+   once. Inside it, function-locally import storage at its canonical key,
+   resolve both exact module bindings, reverify the held source authority, and
+   no-follow duplicate/transfer the required source and ancestry descriptors to
+   the storage-owned spool binding. Then capture all three Task-2a anchor stages
+   into the spool, issue each transfer only through
+   `spool.issue_transfer_from_bound_rpc(...)`, and replay the complete 48-row
+   anchor authority before backfilling any anchor-stage semantic digest.
+4. Acquire the ordered lower-bound probes and fresh boundary witness as
+   singleton logical scopes using the shared header seams, then replay the full
+   one-pass lower proof and build the compact Task-3a request plan.
+5. Execute staged header roots first. After complete header inventory validation,
+   execute reserves, prices, fees, and the final anchor. Every successful
+   physical exchange follows append, `verify_pending_receipt`, commit,
+   `verify_committed_receipt` before releasing resident raw bytes; exception/
+   cancellation aborts the pending tail when possible. Each complete root runs
+   in one claim-scoped `with scope:`;
+   only descriptor-authorized literal 413 intervals are caught inside it and
+   bisect without opening a new scope.
+6. Semantically compare the final normalized anchor; call the claimed finalizer
+   exactly once; seal the spool; issue the exact scan reconciliation by replaying
+   all pure projectors; recheck the live spool source binding after the original
+   finalizer cleanup; then call
+   `mint_production_historical_window_capability`, whose bound RPC/scan exact-
+   type and verifier checks validate it before the one-shot issuer is reachable.
+7. Task 4b calls `consume_production_historical_window_capability` once, accepts
+   only its exact private consumed view, rechecks and moves the source identity/
+   required held descriptors into the staging snapshot, writes and
+   descriptor-rereads immutable
+   raw RPC and typed
+   capture chunks under the same lifecycle quota, freezes the capture role set,
+   closes the spool, revokes/closes the consumed source binding exactly once,
+   and issues the held staging snapshot.
+8. Build, persist, freeze, and reread the exact scan inventory and safe candidate
+   set only through the held snapshot and validated window/grid capabilities.
+9. Replay candidates newest to oldest until a valid publishable winner is
    selected or the fully resolved window proves no publishable positive result.
-6. Reread all run evidence and verify zero gaps/unresolved newer candidates.
-7. Derive the selected-block typed members and finalize and reread the immutable
-   raw run manifest.
-8. Stage and fully validate the isolated historical private core and its exact
-   prospective core-pointer bytes without moving `latest.json`.
-9. Construct `HistoricalReplayBuildContext` only through the staged-core loader,
-   build the ten Opportunity inputs, and preflight the exact positive
-   research-net gate.
-10. In publish mode, commit and reread the historical private core, reconstruct
+10. Reread all staged evidence and verify zero gaps/unresolved newer candidates.
+    Derive selected-block typed members, create `run_manifest.json` last, revoke
+    the writer, rename no-replace, reopen, and reread the immutable raw run.
+11. Stage and fully validate the isolated historical private core and its exact
+    prospective core-pointer bytes without moving `latest.json`.
+12. Construct `HistoricalReplayBuildContext` only through the staged-core loader,
+    build the ten Opportunity inputs, and preflight the exact positive
+    research-net gate.
+13. In publish mode, commit and reread the historical private core, reconstruct
     the context through the committed-core loader, and require byte-equivalence
     with the staged context. In dry-run mode, do not move the core pointer.
-11. Rebuild the inputs against the authoritative staged-or-committed context
+14. Rebuild the inputs against the authoritative staged-or-committed context
     and verify economics are unchanged.
-12. Stage and validate the historical bundle and compute the exact pointer core
+15. Stage and validate the historical bundle and compute the exact pointer core
     without moving the pointer.
-13. Run connected verification over the complete seven-day inventory, every
+16. Run connected verification over the complete seven-day inventory, every
     newer replay-required scenario, the selected ten, raw run, core, staged
     bundle, and pointer core. Both modes construct and validate the exact
     would-be report and final report-hash-bound pointer bytes.
-14. In publish mode only, install and reread the immutable report, reread all
+17. In publish mode only, install and reread the immutable report, reread all
     verified inputs, and atomically publish the historical pointer. Dry-run
     installs no report and moves no pointer.
-15. In publish mode only, reread the historical API, run audit-only
+18. In publish mode only, reread the historical API, run audit-only
     `verify --bundle`, and run the dedicated release checker. Dry-run ends after
     proving staged parity and reports that publication checks were not run.
 

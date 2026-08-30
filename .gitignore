@@ -12,3 +12,6 @@ data/research/
 data/processed/
 data/local/
 var/
+out/
+cache/
+.historical-foundry/toolchains/

@@ -1113,7 +1113,7 @@ class BoundedRouteCostWireTests(unittest.TestCase):
         )
         for body, overrides in cases:
             with self.subTest(overrides=overrides), patch(
-                "scripts.route_cost_collector.json.loads",
+                "scripts.bounded_json.json.loads",
                 side_effect=AssertionError("JSON tree was materialized"),
             ) as parser:
                 with self.assertRaisesRegex(
@@ -1139,7 +1139,7 @@ class BoundedRouteCostWireTests(unittest.TestCase):
             node_limit=256,
         ))
         with patch(
-            "scripts.route_cost_collector.json.loads",
+            "scripts.bounded_json.json.loads",
             side_effect=AssertionError("overdeep JSON was materialized"),
         ) as parser, self.assertRaisesRegex(
             RouteCostCollectorError, "resource limit"
@@ -1242,7 +1242,7 @@ class BoundedRouteCostWireTests(unittest.TestCase):
         )
         for body in bodies:
             with self.subTest(body=body), patch(
-                "scripts.route_cost_collector.json.loads",
+                "scripts.bounded_json.json.loads",
                 side_effect=AssertionError("invalid escape was materialized"),
             ) as parser:
                 with self.assertRaisesRegex(
@@ -1287,7 +1287,7 @@ class BoundedRouteCostWireTests(unittest.TestCase):
         self.assertEqual(value, [__import__("decimal").Decimal("1e2")] * 10)
 
         with patch(
-            "scripts.route_cost_collector.json.loads",
+            "scripts.bounded_json.json.loads",
             side_effect=AssertionError("over-limit numbers were materialized"),
         ) as parser, self.assertRaisesRegex(
             RouteCostCollectorError, "resource limit"
