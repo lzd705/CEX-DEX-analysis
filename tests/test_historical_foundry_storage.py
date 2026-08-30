@@ -15262,7 +15262,7 @@ class HistoricalFoundryStorageTask4bMaximumIntegrationTests(
             "fees/00000001.json.gz", 268,
             "3d221de2ad977645a086c54ebd8b1f2e9363bc2c5b5ae571fe54030098bc8330",
         ),
-        "465f8580e21323a2b610f4bbcb416b353394460592d3c5670e685960d04c124c",
+        "2e7ba9c9e8b13155926a157f65d6fe48e577400d7301df7839028f381f6761f2",
     )
 
     @staticmethod
@@ -15956,6 +15956,34 @@ class HistoricalFoundryStorageTask4bMaximumIntegrationTests(
         evidence = self._small_materialization(split_reserve_root=False)
         self.assertEqual(evidence["context_issuance_assertions"], 1)
         self.assertEqual(evidence["common"], self._SMALL_COMMON_GOLDEN)
+
+
+class HistoricalFoundryScenarioStorageNativeTests(unittest.TestCase):
+    def test_task6_member_caps_and_authority_types_are_closed(self):
+        import scripts.historical_foundry_storage as storage
+
+        for role, limit in (
+            ("overlay", 8_388_608),
+            ("receipt", 8_388_608),
+            ("result", 8_388_608),
+            ("trace", 16_777_216),
+        ):
+            with self.subTest(role=role):
+                self.assertIsNone(
+                    storage._validate_historical_scenario_member_size(
+                        role=role, byte_count=limit
+                    )
+                )
+                with self.assertRaises(ValueError):
+                    storage._validate_historical_scenario_member_size(
+                        role=role, byte_count=limit + 1
+                    )
+        for authority in (
+            storage.ScenarioEvidenceSink,
+            storage.ValidatedHistoricalReplayLedger,
+        ):
+            with self.assertRaises((TypeError, RuntimeError)):
+                authority()
 
 
 if __name__ == "__main__":

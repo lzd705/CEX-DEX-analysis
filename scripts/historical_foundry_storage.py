@@ -84,6 +84,83 @@ def _require_historical_gzip_member_size(*, byte_count: int) -> int:
     return byte_count
 
 
+def _validate_historical_scenario_member_size(
+    *, role: str, byte_count: int
+) -> None:
+    limits = {
+        "overlay": 8_388_608,
+        "receipt": 8_388_608,
+        "trace": 16_777_216,
+        "result": 8_388_608,
+    }
+    if (
+        type(role) is not str
+        or role not in limits
+        or type(byte_count) is not int
+        or byte_count < 0
+        or byte_count > limits[role]
+    ):
+        raise ValueError("historical scenario member size is invalid")
+    return None
+
+
+def _validate_historical_cost_proof_rows(rows: Any) -> None:
+    specs = (
+        ("buy", "pool_swap_fee", "bounded_estimate", True, "30", "receipt", "positive"),
+        ("buy", "router_or_integrator_fee", "bounded_estimate", False, "0", "receipt", "zero"),
+        ("buy", "token_transfer_tax", "bounded_estimate", False, "0", "receipt", "zero"),
+        ("sell", "pool_swap_fee", "bounded_estimate", True, "30", "receipt", "positive"),
+        ("sell", "router_or_integrator_fee", "bounded_estimate", False, "0", "receipt", "zero"),
+        ("sell", "token_transfer_tax", "bounded_estimate", False, "0", "receipt", "zero"),
+        ("route", "network_gas", "assumed", False, None, "receipt", "nonnegative"),
+        ("route", "rebalancing_or_transfer", "not_applicable", False, None, "trace", "null"),
+        ("route", "mev_buffer", "assumed", False, "10", "policy", "nonnegative"),
+    )
+    if type(rows) is not list or len(rows) != len(specs):
+        raise ValueError("historical cost proof rows are invalid")
+
+    def canonical_nonnegative_decimal(value: Any) -> bool:
+        if type(value) is not str or not value:
+            return False
+        if value == "0":
+            return True
+        integer, separator, fraction = value.partition(".")
+        return (
+            bool(integer)
+            and (integer == "0" and bool(separator) or integer[0] != "0")
+            and integer.isdigit()
+            and (
+                not separator
+                or bool(fraction) and fraction.isdigit() and fraction[-1] != "0"
+            )
+        )
+
+    for row, spec in zip(rows, specs):
+        grain, component, status, embedded, rate, role, amount_kind = spec
+        if (
+            type(row) is not dict
+            or row.get("grain") != grain
+            or row.get("component") != component
+            or row.get("value_status") != status
+            or row.get("embedded") is not embedded
+            or row.get("rate_bps_exact") != rate
+            or row.get("proof_role") != role
+        ):
+            raise ValueError("historical cost proof rows are invalid")
+        amount = row.get("amount_usd_exact")
+        if (
+            (amount_kind == "null" and amount is not None)
+            or (amount_kind == "zero" and amount != "0")
+            or (
+                amount_kind in ("positive", "nonnegative")
+                and not canonical_nonnegative_decimal(amount)
+            )
+            or (amount_kind == "positive" and amount == "0")
+        ):
+            raise ValueError("historical cost proof rows are invalid")
+    return None
+
+
 def _plan_historical_typed_root_append(
     *,
     current_decoded_size: int,
@@ -139,6 +216,7 @@ def _initialize_historical_foundry_storage_types():
     captured_raw_chunk_append = _plan_historical_raw_chunk_append
     captured_capture_inventory_size = _require_historical_capture_inventory_size
     captured_gzip_member_size = _require_historical_gzip_member_size
+    captured_scenario_member_size = _validate_historical_scenario_member_size
     captured_typed_root_append = _plan_historical_typed_root_append
     captured_source_sha256 = hashlib.sha256
     constructor_provenance = object()
@@ -160,6 +238,15 @@ def _initialize_historical_foundry_storage_types():
         int, Tuple[object, Dict[str, Any]]
     ] = {}
     staging_lineage_token_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
+    scenario_transition_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
+    scenario_sink_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
+    replay_ledger_registry: Dict[
         int, Tuple[weakref.ReferenceType, Dict[str, Any]]
     ] = {}
     replay_source_registry: Dict[
@@ -321,6 +408,11 @@ def _initialize_historical_foundry_storage_types():
         _new_authority_base()
     )
     run_snapshot_base, run_snapshot_authorized = _new_authority_base()
+    scenario_transition_base, scenario_transition_authorized = (
+        _new_authority_base()
+    )
+    scenario_sink_base, scenario_sink_authorized = _new_authority_base()
+    replay_ledger_base, replay_ledger_authorized = _new_authority_base()
 
     def _prepare_handle(authority_class: type, record: Dict[str, Any]) -> Any:
         handle = object.__new__(authority_class)
@@ -2908,7 +3000,12 @@ def _initialize_historical_foundry_storage_types():
     ) -> Tuple[Dict[str, Any], str]:
         if type(relative_path) is not str or not relative_path:
             raise _InternalFailure()
-        if relative_path.startswith("scan/prefilter/"):
+        task6_directory = ledger.get("task6_member_directories", {}).get(
+            relative_path
+        )
+        if task6_directory is not None:
+            directory, basename = task6_directory
+        elif relative_path.startswith("scan/prefilter/"):
             basename = relative_path[len("scan/prefilter/"):]
             directory = ledger["role_directories"].get("prefilter")
         elif "/" in relative_path:
@@ -2940,6 +3037,20 @@ def _initialize_historical_foundry_storage_types():
         if size_kind == "gzip":
             try:
                 captured_gzip_member_size(byte_count=expected_size)
+            except ValueError:
+                raise _InternalFailure()
+        elif size_kind == "task6_trace":
+            try:
+                captured_scenario_member_size(
+                    role="trace", byte_count=expected_size
+                )
+            except ValueError:
+                raise _InternalFailure()
+        elif size_kind == "task6_json":
+            try:
+                captured_scenario_member_size(
+                    role="overlay", byte_count=expected_size
+                )
             except ValueError:
                 raise _InternalFailure()
         elif size_kind == "inventory":
@@ -3192,7 +3303,7 @@ def _initialize_historical_foundry_storage_types():
             role, basename = row["path"].split("/", 1)
             expected_role_members[role].add(basename)
         expected_role_members["scan"].add("capture_inventory.json")
-        if owner.get("capture_generation") == 2:
+        if owner.get("capture_generation") in (2, 3):
             expected_role_members["scan"].update((
                 "prefilter", "prefilter_inventory.json",
             ))
@@ -3200,6 +3311,8 @@ def _initialize_historical_foundry_storage_types():
             "policy.json", "authority.json", "toolchain.json",
             "rpc", "headers", "reserves", "prices", "fees", "scan",
         }
+        if owner.get("capture_generation") == 3:
+            staging_expected.add("foundry")
         if set(os.listdir(captures["staging"]["fd"])) != staging_expected:
             raise _InternalFailure()
         for role, expected in expected_role_members.items():
@@ -6585,6 +6698,7 @@ def _initialize_historical_foundry_storage_types():
             expected_state = {
                 1: "capture_frozen",
                 2: "prefilter_frozen",
+                3: "replay_frozen",
             }.get(generation)
             if (
                 owner.get("constructor") is not constructor_provenance
@@ -6682,6 +6796,593 @@ def _initialize_historical_foundry_storage_types():
         ):
             _raise_storage_error()
         return None
+
+    def _bind_historical_relay_lease_for_test(
+        *, staging: object, relay_lease: object
+    ) -> None:
+        """Test-only bridge for a zero-network relay lease.
+
+        Production moves the same authority through the claimed source
+        binding; offline tests cannot manufacture that connected lifecycle.
+        """
+        rpc = sys.modules.get("scripts.historical_foundry_rpc")
+        owner = _task4b_current_snapshot_owner(staging)
+        if (
+            owner.get("capture_generation") != 2
+            or owner.get("state") != "prefilter_frozen"
+            or owner.get("_task6_relay_lease") is not None
+            or owner.get("_task6_relay_lease_moved") is True
+        ):
+            _raise_storage_error()
+        if rpc is None:
+            _raise_storage_error()
+        try:
+            rpc._require_historical_relay_lease(relay_lease)
+        except (TypeError, ValueError):
+            _raise_storage_error()
+        owner["_task6_relay_lease"] = relay_lease
+        owner["_task6_relay_lease_moved"] = False
+        return None
+
+    def _bind_historical_relay_lease_from_production_spool(
+        *, spool: object, relay_lease: object
+    ) -> None:
+        rpc = sys.modules.get("scripts.historical_foundry_rpc")
+        owner = _live_record(
+            spool, _HistoricalWindowExchangeSpool, active_registry
+        )
+        if (
+            owner.get("lane") is not production_lane
+            or owner.get("source_bound") is not True
+            or owner.get("state") != "active"
+            or owner.get("_task6_relay_lease") is not None
+        ):
+            _raise_storage_error()
+        if rpc is None:
+            _raise_storage_error()
+        try:
+            rpc._require_historical_relay_lease(relay_lease)
+        except (TypeError, ValueError):
+            _raise_storage_error()
+        owner["_task6_relay_lease"] = relay_lease
+        owner["_task6_relay_lease_moved"] = False
+        return None
+
+    def _consume_historical_relay_lease_for_replay(
+        *, staging: object
+    ) -> object:
+        rpc = sys.modules.get("scripts.historical_foundry_rpc")
+        owner = _task4b_current_snapshot_owner(staging)
+        relay_lease = owner.get("_task6_relay_lease")
+        if (
+            owner.get("capture_generation") != 2
+            or owner.get("state") != "prefilter_frozen"
+            or owner.get("_task6_relay_lease_moved") is True
+        ):
+            _raise_storage_error()
+        if rpc is None:
+            _raise_storage_error()
+        try:
+            rpc._require_historical_relay_lease(relay_lease)
+        except (TypeError, ValueError):
+            _raise_storage_error()
+        owner["_task6_relay_lease"] = None
+        owner["_task6_relay_lease_moved"] = True
+        return relay_lease
+
+    class _HistoricalReplayScenarioTransition(scenario_transition_base):
+        __slots__ = ("__weakref__",)
+
+    scenario_transition_authorized[0] = _HistoricalReplayScenarioTransition
+
+    def _bind_historical_replay_scenario_transition(
+        *, staging: object, scenario_key: str
+    ) -> object:
+        owner = _task4b_current_snapshot_owner(staging)
+        if (
+            owner.get("capture_generation") != 2
+            or owner.get("state") != "prefilter_frozen"
+            or type(scenario_key) is not str
+            or not scenario_key
+            or "/" in scenario_key
+            or "\\" in scenario_key
+        ):
+            _raise_storage_error()
+        record = {
+            "constructor": constructor_provenance,
+            "lineage": owner.get("lineage"),
+            "owner_generation": owner.get("owner_generation"),
+            "scenario_key": scenario_key,
+            "consumed": False,
+        }
+        token = _prepare_handle(_HistoricalReplayScenarioTransition, record)
+        token_id = id(token)
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = scenario_transition_registry.get(token_id)
+            if current is not None and current[0] is reference:
+                scenario_transition_registry.pop(token_id, None)
+
+        reference = weakref.ref(token, retire)
+        scenario_transition_registry[token_id] = (reference, record)
+        return token
+
+    def _task6_transition_record(
+        token: object, staging: object, scenario_key: str
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        entry = scenario_transition_registry.get(id(token))
+        owner = _task4b_current_snapshot_owner(staging)
+        if (
+            type(token) is not _HistoricalReplayScenarioTransition
+            or entry is None
+            or entry[0]() is not token
+            or entry[1].get("constructor") is not constructor_provenance
+            or entry[1].get("consumed") is True
+            or entry[1].get("lineage") is not owner.get("lineage")
+            or entry[1].get("owner_generation")
+            != owner.get("owner_generation")
+            or entry[1].get("scenario_key") != scenario_key
+            or owner.get("capture_generation") != 2
+            or owner.get("state") != "prefilter_frozen"
+        ):
+            _raise_storage_error()
+        return owner, entry[1]
+
+    def _task6_exact_sha256(value: Any) -> bool:
+        return (
+            type(value) is str
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    def _task6_live_record(
+        value: object,
+        authority_class: type,
+        registry: Dict[
+            int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+        ],
+    ) -> Dict[str, Any]:
+        entry = registry.get(id(value))
+        if (
+            type(value) is not authority_class
+            or entry is None
+            or entry[0]() is not value
+        ):
+            _raise_storage_error()
+        return entry[1]
+
+    def _task6_register_weak(
+        value: object,
+        record: Dict[str, Any],
+        registry: Dict[
+            int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+        ],
+    ) -> None:
+        value_id = id(value)
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = registry.get(value_id)
+            if current is not None and current[0] is reference:
+                registry.pop(value_id, None)
+
+        reference = weakref.ref(value, retire)
+        registry[value_id] = (reference, record)
+        return None
+
+    def _task6_decode_trace(payload: bytes) -> Dict[str, Any]:
+        if type(payload) is not bytes:
+            raise _InternalFailure()
+        try:
+            buffer = io.BytesIO(payload)
+            with gzip.GzipFile(mode="rb", fileobj=buffer) as handle:
+                decoded = handle.read(67_108_865)
+                extra = handle.read(1)
+        except Exception:
+            raise _InternalFailure()
+        if len(decoded) > 67_108_864 or extra != b"":
+            raise _InternalFailure()
+        value = _task4b_decode_canonical_json(
+            decoded, expected_container=dict
+        )
+        deterministic = io.BytesIO()
+        with gzip.GzipFile(
+            filename="", mode="wb", compresslevel=9,
+            fileobj=deterministic, mtime=0,
+        ) as handle:
+            handle.write(decoded)
+        if deterministic.getvalue() != payload:
+            raise _InternalFailure()
+        return value
+
+    def _task6_validate_status_one_proof(
+        result: Dict[str, Any], receipt_sha256: str, trace_sha256: str
+    ) -> str:
+        proof = result.get("cost_proof_inputs")
+        proof_keys = {
+            "schema", "scenario_key", "policy_sha256", "receipt_sha256",
+            "trace_sha256", "adapter_proof_sha256", "rows",
+            "proof_inputs_hash",
+        }
+        row_keys = {
+            "grain", "component", "value_status", "embedded",
+            "amount_usd_exact", "rate_bps_exact", "proof_role",
+            "proof_sha256",
+        }
+        expected_order = (
+            ("buy", "pool_swap_fee"),
+            ("buy", "router_or_integrator_fee"),
+            ("buy", "token_transfer_tax"),
+            ("sell", "pool_swap_fee"),
+            ("sell", "router_or_integrator_fee"),
+            ("sell", "token_transfer_tax"),
+            ("route", "network_gas"),
+            ("route", "rebalancing_or_transfer"),
+            ("route", "mev_buffer"),
+        )
+        if (
+            type(proof) is not dict
+            or set(proof) != proof_keys
+            or proof.get("schema")
+            != "historical_foundry_cost_proof_inputs/v1"
+            or proof.get("scenario_key") != result.get("scenario_key")
+            or proof.get("receipt_sha256") != receipt_sha256
+            or proof.get("trace_sha256") != trace_sha256
+            or not _task6_exact_sha256(proof.get("policy_sha256"))
+            or not _task6_exact_sha256(proof.get("adapter_proof_sha256"))
+            or type(proof.get("rows")) is not list
+            or len(proof["rows"]) != 9
+        ):
+            raise _InternalFailure()
+        try:
+            _validate_historical_cost_proof_rows(proof["rows"])
+        except ValueError:
+            raise _InternalFailure()
+        for index, row in enumerate(proof["rows"]):
+            if (
+                type(row) is not dict
+                or set(row) != row_keys
+                or (row.get("grain"), row.get("component"))
+                != expected_order[index]
+                or type(row.get("embedded")) is not bool
+                or row.get("proof_role") not in ("receipt", "trace", "policy")
+                or not _task6_exact_sha256(row.get("proof_sha256"))
+            ):
+                raise _InternalFailure()
+            expected_hash = {
+                "receipt": receipt_sha256,
+                "trace": trace_sha256,
+                "policy": proof["policy_sha256"],
+            }[row["proof_role"]]
+            if row["proof_sha256"] != expected_hash:
+                raise _InternalFailure()
+        unhashed = dict(proof)
+        proof_hash = unhashed.pop("proof_inputs_hash")
+        expected_hash = hashlib.sha256(
+            b"historical_foundry_cost_proof_inputs/v1\0"
+            + _task4b_canonical_json_bytes(unhashed)
+        ).hexdigest()
+        if proof_hash != expected_hash:
+            raise _InternalFailure()
+        return proof_hash
+
+    def _task6_validate_quartet(
+        scenario_key: str, members: Dict[str, bytes]
+    ) -> Dict[str, Any]:
+        overlay = _task4b_decode_canonical_json(
+            members["overlay"], expected_container=dict
+        )
+        receipt = _task4b_decode_canonical_json(
+            members["receipt"], expected_container=dict
+        )
+        trace = _task6_decode_trace(members["trace"])
+        result = _task4b_decode_canonical_json(
+            members["result"], expected_container=dict
+        )
+        overlay_sha = hashlib.sha256(members["overlay"]).hexdigest()
+        receipt_sha = hashlib.sha256(members["receipt"]).hexdigest()
+        trace_sha = hashlib.sha256(members["trace"]).hexdigest()
+        if (
+            overlay.get("schema") != "historical_foundry_state_override/v1"
+            or receipt.get("schema") != "historical_foundry_receipt/v1"
+            or trace.get("schema") != "historical_foundry_trace/v1"
+            or result.get("schema")
+            != "historical_foundry_replay_result/v1"
+            or any(
+                value.get("scenario_key") != scenario_key
+                for value in (overlay, receipt, trace, result)
+            )
+            or result.get("overlay_sha256") != overlay_sha
+            or result.get("receipt_sha256") != receipt_sha
+            or result.get("trace_sha256") != trace_sha
+            or receipt.get("blockNumber")
+            != overlay.get("synthetic_block", {}).get("number")
+            or receipt.get("transactionIndex") != 0
+        ):
+            raise _InternalFailure()
+        status = receipt.get("status")
+        if result.get("status") != status or status not in (0, 1):
+            raise _InternalFailure()
+        if status == 1:
+            if (
+                result.get("classification") != "replay_success"
+                or trace.get("failed") is not False
+                or trace.get("gasprice_opcode_addresses") != []
+            ):
+                raise _InternalFailure()
+            proof_hash = _task6_validate_status_one_proof(
+                result, receipt_sha, trace_sha
+            )
+        else:
+            if (
+                result.get("classification") != "closed_revert"
+                or trace.get("failed") is not True
+                or "cost_proof_inputs" in result
+            ):
+                raise _InternalFailure()
+            proof_hash = None
+        block_number = overlay.get("block_number")
+        if type(block_number) is not int or block_number < 0:
+            raise _InternalFailure()
+        return {
+            "block_number": block_number,
+            "proof_inputs_hash": proof_hash,
+            "overlay_sha256": overlay_sha,
+            "receipt_sha256": receipt_sha,
+            "trace_sha256": trace_sha,
+            "result_sha256": hashlib.sha256(members["result"]).hexdigest(),
+        }
+
+    def _task6_freeze_audit(owner: Dict[str, Any]) -> None:
+        records = owner.get("_task6_scenario_members")
+        scenario_key = owner.get("_task6_scenario_key")
+        if type(records) is not dict or set(records) != {
+            "overlay", "receipt", "trace", "result"
+        }:
+            raise _InternalFailure()
+        members = {}
+        for role, row in records.items():
+            payload = _task4b_reread_capture_member(
+                owner["_task4b_staging"],
+                relative_path=row["path"],
+                expected_size=row["size"],
+                maximum_size=row["cap"],
+                size_kind=row["kind"],
+            )
+            if hashlib.sha256(payload).hexdigest() != row["sha256"]:
+                raise _InternalFailure()
+            members[role] = payload
+        rebuilt = _task6_validate_quartet(scenario_key, members)
+        if rebuilt != owner.get("_task6_quartet_projection"):
+            raise _InternalFailure()
+        return None
+
+    class ValidatedHistoricalReplayLedger(replay_ledger_base):
+        __slots__ = ("__weakref__",)
+
+        @property
+        def generation(self) -> int:
+            return _task6_live_record(
+                self, ValidatedHistoricalReplayLedger,
+                replay_ledger_registry,
+            )["generation"]
+
+        @property
+        def scenario_count(self) -> int:
+            return 1
+
+        @property
+        def scenario_key(self) -> str:
+            return _task6_live_record(
+                self, ValidatedHistoricalReplayLedger,
+                replay_ledger_registry,
+            )["scenario_key"]
+
+        @property
+        def proof_inputs_hash(self) -> Optional[str]:
+            return _task6_live_record(
+                self, ValidatedHistoricalReplayLedger,
+                replay_ledger_registry,
+            )["proof_inputs_hash"]
+
+        def staging_snapshot(self) -> "HistoricalRunStagingSnapshot":
+            return _task6_live_record(
+                self, ValidatedHistoricalReplayLedger,
+                replay_ledger_registry,
+            )["staging"]
+
+    replay_ledger_authorized[0] = ValidatedHistoricalReplayLedger
+
+    class ScenarioEvidenceSink(scenario_sink_base):
+        __slots__ = ("__weakref__",)
+
+        def write_member(
+            self, role: str, canonical_bytes: bytes
+        ) -> Mapping[str, Any]:
+            record = _task6_live_record(
+                self, ScenarioEvidenceSink, scenario_sink_registry
+            )
+            expected_roles = ("overlay", "receipt", "trace", "result")
+            members = record["members"]
+            expected = expected_roles[len(members)] if len(members) < 4 else None
+            if (
+                record.get("state") != "open"
+                or role != expected
+                or type(canonical_bytes) is not bytes
+                or not canonical_bytes
+            ):
+                raise ValueError("historical scenario evidence is invalid")
+            try:
+                captured_scenario_member_size(
+                    role=role, byte_count=len(canonical_bytes)
+                )
+                if role == "trace":
+                    _task6_decode_trace(canonical_bytes)
+                else:
+                    _task4b_decode_canonical_json(
+                        canonical_bytes, expected_container=dict
+                    )
+            except (ValueError, _InternalFailure):
+                raise ValueError("historical scenario evidence is invalid") from None
+            members[role] = bytes(canonical_bytes)
+            projection = MappingProxyType({
+                "role": role,
+                "byte_count": len(canonical_bytes),
+                "sha256": hashlib.sha256(canonical_bytes).hexdigest(),
+            })
+            if role != "result":
+                return projection
+            owner = record["owner"]
+            try:
+                quartet = _task6_validate_quartet(
+                    record["scenario_key"], members
+                )
+                owner["state"] = "replay_materializing"
+                ledger = owner["_task4b_staging"]
+                ledger["quota_owner_handle"] = record["staging"]
+                staging_directory = ledger["capture_directories"]["staging"]
+                foundry = _task4b_open_capture_directory(
+                    ledger, staging_directory["fd"], "foundry",
+                    allow_existing=False,
+                )
+                block_name = str(quartet["block_number"])
+                block = _task4b_open_capture_directory(
+                    ledger, foundry["fd"], block_name,
+                    allow_existing=False,
+                )
+                scenario = _task4b_open_capture_directory(
+                    ledger, block["fd"], record["scenario_key"],
+                    allow_existing=False,
+                )
+                filenames = {
+                    "overlay": "overlay.json",
+                    "receipt": "receipt.json",
+                    "trace": "trace.json.gz",
+                    "result": "result.json",
+                }
+                stored = {}
+                ledger.setdefault("task6_member_directories", {})
+                for member_role in expected_roles:
+                    payload = members[member_role]
+                    target = filenames[member_role]
+                    relative_path = "foundry/{}/{}/{}".format(
+                        block_name, record["scenario_key"], target
+                    )
+                    _task4b_write_capture_member(
+                        ledger, scenario, target, payload
+                    )
+                    ledger["task6_member_directories"][relative_path] = (
+                        scenario, target
+                    )
+                    stored[member_role] = {
+                        "path": relative_path,
+                        "size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "cap": (
+                            16_777_216 if member_role == "trace"
+                            else 8_388_608
+                        ),
+                        "kind": "task6_trace" if member_role == "trace" else "task6_json",
+                    }
+                owner["_task6_scenario_members"] = stored
+                owner["_task6_scenario_key"] = record["scenario_key"]
+                owner["_task6_quartet_projection"] = quartet
+                all_members = dict(owner["_task4b_snapshot_members"])
+                all_members.update({row["path"]: row for row in stored.values()})
+                owner["_task4b_snapshot_members"] = all_members
+                owner["capture_generation"] = 3
+                owner["state"] = "replay_frozen"
+                quota = _quota_record_for_owner(owner)
+                previous = owner["_task4b_snapshot_projection"]
+                owner["_task4b_snapshot_projection"] = {
+                    "schema": "historical_foundry_staging_snapshot_identity/v1",
+                    "stage": "replay_frozen",
+                    "generation": 3,
+                    "capture_inventory_sha256": previous["capture_inventory_sha256"],
+                    "scan_inventory_sha256": previous["scan_inventory_sha256"],
+                    "frozen_member_count": len(all_members),
+                    "frozen_physical_byte_count": sum(
+                        row["size"] for row in all_members.values()
+                    ),
+                    "quota_committed_physical_bytes": quota["committed_physical_bytes"],
+                    "quota_committed_member_count": quota["committed_members"],
+                    "prefilter_chunk_count": previous["prefilter_chunk_count"],
+                    "prefilter_row_count": previous["prefilter_row_count"],
+                    "prefilter_grid_digest": previous["prefilter_grid_digest"],
+                    "replay_scenario_count": 1,
+                    "replay_scenario_key": record["scenario_key"],
+                    "replay_proof_inputs_hash": quartet["proof_inputs_hash"],
+                }
+                _task4b_freeze_audit(owner["_task4b_frozen_record"])
+                _task5_freeze_audit(owner)
+                _task6_freeze_audit(owner)
+                old_snapshot = record["staging"]
+                owner_generation = owner["owner_generation"] + 1
+                owner["owner_generation"] = owner_generation
+                successor = _prepare_handle(HistoricalRunStagingSnapshot, owner)
+                owner["_task4b_snapshot_handle"] = successor
+                owner["_task4b_snapshot_owner_generation"] = owner_generation
+                staging_snapshot_registry[id(successor)] = (successor, owner)
+                _retire_nonowner_handle(
+                    old_snapshot, staging_snapshot_registry,
+                    staging_snapshot_tombstones,
+                )
+                ledger_record = {
+                    "scenario_key": record["scenario_key"],
+                    "generation": 3,
+                    "proof_inputs_hash": quartet["proof_inputs_hash"],
+                    "staging": successor,
+                }
+                validated = _prepare_handle(
+                    ValidatedHistoricalReplayLedger, ledger_record
+                )
+                _task6_register_weak(
+                    validated, ledger_record, replay_ledger_registry
+                )
+                record["ledger"] = validated
+                record["state"] = "committed"
+                return projection
+            except BaseException as error:
+                record["state"] = "failed"
+                control = error if not isinstance(error, Exception) else None
+                if owner.get("capture_generation") == 2:
+                    _task4b_terminalize_snapshot_failure(
+                        record["staging"], owner,
+                        "historical_window_spool_handoff_failed", control,
+                    )
+                if control is not None:
+                    raise control
+                raise ValueError("historical scenario evidence is invalid") from None
+
+        def validated_ledger(self) -> ValidatedHistoricalReplayLedger:
+            record = _task6_live_record(
+                self, ScenarioEvidenceSink, scenario_sink_registry
+            )
+            if record.get("state") != "committed":
+                raise ValueError("historical scenario ledger is unavailable")
+            return record["ledger"]
+
+    scenario_sink_authorized[0] = ScenarioEvidenceSink
+
+    def _open_historical_scenario_evidence_sink(
+        *, staging: object, scenario_token: object, scenario_key: str
+    ) -> ScenarioEvidenceSink:
+        owner, transition = _task6_transition_record(
+            scenario_token, staging, scenario_key
+        )
+        if owner.get("_task6_scenario_sink_opened") is True:
+            _raise_storage_error()
+        transition["consumed"] = True
+        owner["_task6_scenario_sink_opened"] = True
+        record = {
+            "owner": owner,
+            "staging": staging,
+            "scenario_key": scenario_key,
+            "members": {},
+            "state": "open",
+        }
+        sink = _prepare_handle(ScenarioEvidenceSink, record)
+        _task6_register_weak(sink, record, scenario_sink_registry)
+        return sink
 
     def _task4b_acknowledge_snapshot_delivery(
         snapshot: object, owner: Dict[str, Any]
@@ -7079,7 +7780,11 @@ def _initialize_historical_foundry_storage_types():
         def frozen_identity_projection(self) -> Mapping[str, Any]:
             owner = _task4b_current_snapshot_owner(self)
             projection = owner.get("_task4b_snapshot_projection")
-            expected_size = 8 if owner.get("capture_generation") == 1 else 12
+            expected_size = {
+                1: 8,
+                2: 12,
+                3: 15,
+            }.get(owner.get("capture_generation"))
             if type(projection) is not dict or len(projection) != expected_size:
                 _task4b_terminalize_snapshot_failure(
                     self, owner, "final_identity_drift"
@@ -7100,8 +7805,10 @@ def _initialize_historical_foundry_storage_types():
             owner = _task4b_current_snapshot_owner(self)
             try:
                 _task4b_freeze_audit(owner["_task4b_frozen_record"])
-                if owner.get("capture_generation") == 2:
+                if owner.get("capture_generation") in (2, 3):
                     _task5_freeze_audit(owner)
+                if owner.get("capture_generation") == 3:
+                    _task6_freeze_audit(owner)
                 _task4b_current_snapshot_owner(self)
                 return None
             except BaseException as error:
@@ -7294,7 +8001,11 @@ def _initialize_historical_foundry_storage_types():
             if owner_registry is not None else None
         )
         accepted_states = (
-            ("capture_materializing", "prefilter_materializing")
+            (
+                "capture_materializing",
+                "prefilter_materializing",
+                "replay_materializing",
+            )
             if expected_state == "capture_materializing"
             else (expected_state,)
         )
@@ -9793,12 +10504,20 @@ def _initialize_historical_foundry_storage_types():
             try:
                 if type(terminal) is not dict:
                     owner["_moved_terminal_state"] = terminal = {
-                        "phase": "capture_cleanup",
+                        "phase": "relay_cleanup",
                         "control": None,
                         "ordinary": False,
                     }
                     owner["state"] = "closing"
                 phase = terminal["phase"]
+                if phase == "relay_cleanup":
+                    relay_lease = owner.get("_task6_relay_lease")
+                    if relay_lease is not None:
+                        relay_lease.close()
+                        owner["_task6_relay_lease"] = None
+                        owner["_task6_relay_lease_moved"] = True
+                    terminal["phase"] = "capture_cleanup"
+                    continue
                 if phase == "capture_cleanup":
                     cleanup_control, cleanup_ordinary = (
                         _cleanup_task4b_capture_staging(owner)
@@ -10212,6 +10931,13 @@ def _initialize_historical_foundry_storage_types():
         _bind_historical_prefilter_staging_transition,
         _verify_historical_prefilter_staging_transition,
         _freeze_historical_prefilter_grid,
+        _bind_historical_relay_lease_for_test,
+        _bind_historical_relay_lease_from_production_spool,
+        _consume_historical_relay_lease_for_replay,
+        _bind_historical_replay_scenario_transition,
+        ScenarioEvidenceSink,
+        ValidatedHistoricalReplayLedger,
+        _open_historical_scenario_evidence_sink,
     )
 
 
@@ -10238,6 +10964,13 @@ def _initialize_historical_foundry_storage_types():
     _bind_historical_prefilter_staging_transition,
     _verify_historical_prefilter_staging_transition,
     _freeze_historical_prefilter_grid,
+    _bind_historical_relay_lease_for_test,
+    _bind_historical_relay_lease_from_production_spool,
+    _consume_historical_relay_lease_for_replay,
+    _bind_historical_replay_scenario_transition,
+    ScenarioEvidenceSink,
+    ValidatedHistoricalReplayLedger,
+    _open_historical_scenario_evidence_sink,
 ) = _initialize_historical_foundry_storage_types()
 del _initialize_historical_foundry_storage_types
 

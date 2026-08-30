@@ -796,7 +796,14 @@ def _initialize_production_historical_window_authorities():
     if _DECIMAL_LAYOUT_VERIFIED is not True:
         raise RuntimeError("historical Decimal layout did not stabilize")
 
-    scan_module = sys.modules[__name__]
+    scan_module = sys.modules.get(__name__)
+    if scan_module is None:
+        main_module = sys.modules.get("__main__")
+        if (
+            getattr(getattr(main_module, "__spec__", None), "name", None)
+            == "scripts.historical_foundry_scan"
+        ):
+            scan_module = main_module
     contracts_module = sys.modules.get(
         "scripts.historical_foundry_contracts"
     )
@@ -7590,6 +7597,7 @@ def _initialize_historical_prefilter_capabilities():
     issuer = object()
     window_registry: Dict[int, Tuple[Any, Dict[str, Any]]] = {}
     grid_registry: Dict[int, Tuple[Any, Dict[str, Any]]] = {}
+    scenario_registry: Dict[int, Tuple[Any, Dict[str, Any]]] = {}
 
     def register_capability(
         value: Any,
@@ -7752,6 +7760,43 @@ def _initialize_historical_prefilter_capabilities():
             raise TypeError(
                 "ValidatedHistoricalPrefilterGrid is not serializable"
             )
+
+    class ValidatedReplayScenario:
+        """Opaque exact-lineage scenario issued from one validated grid row."""
+
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            del cls, args, kwargs
+            raise ValueError("historical replay scenario is private")
+
+        def __init_subclass__(cls, **_kwargs: Any) -> None:
+            del cls
+            raise TypeError("ValidatedReplayScenario is sealed")
+
+        @property
+        def scenario_key(self) -> str:
+            return capability_record(
+                self, ValidatedReplayScenario, scenario_registry
+            )["row"]["scenario_key"]
+
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError("ValidatedReplayScenario is immutable")
+
+        def __repr__(self) -> str:
+            return "ValidatedReplayScenario(<redacted>)"
+
+        def __copy__(self) -> Any:
+            raise TypeError("ValidatedReplayScenario is not copyable")
+
+        def __deepcopy__(self, _memo: Any) -> Any:
+            raise TypeError("ValidatedReplayScenario is not copyable")
+
+        def __reduce__(self) -> Any:
+            raise TypeError("ValidatedReplayScenario is not serializable")
+
+        def __reduce_ex__(self, _protocol: int) -> Any:
+            raise TypeError("ValidatedReplayScenario is not serializable")
 
     def require_config(config: Any) -> HistoricalFoundryConfigSet:
         if type(config) is not HistoricalFoundryConfigSet:
@@ -8327,24 +8372,125 @@ def _initialize_historical_prefilter_capabilities():
             raise ValueError("historical prefilter capability differs")
         return iter(rows)
 
+    def _issue_validated_replay_scenario(
+        *,
+        staging: Any,
+        window: ValidatedHistoricalWindow,
+        grid: ValidatedHistoricalPrefilterGrid,
+        scenario_key: str,
+    ) -> ValidatedReplayScenario:
+        window_record = capability_record(
+            window, ValidatedHistoricalWindow, window_registry
+        )
+        grid_record = capability_record(
+            grid, ValidatedHistoricalPrefilterGrid, grid_registry
+        )
+        if (
+            type(scenario_key) is not str
+            or not scenario_key
+            or grid_record.get("window") is not window
+            or grid_record.get("snapshot") is not staging
+            or window_record.get("snapshot") is not staging
+            or grid_record.get("scan_inventory_sha256")
+            != window_record.get("scan_inventory_sha256")
+        ):
+            raise ValueError("historical replay scenario lineage differs")
+        staging.reread_frozen_members_unchanged()
+        matched = tuple(
+            row for row in grid_record["rows"]
+            if row.get("scenario_key") == scenario_key
+        )
+        if len(matched) != 1:
+            raise ValueError("historical replay scenario key is invalid")
+        row = _freeze_prefilter_value(
+            _detach_prefilter_value(matched[0])
+        )
+        import scripts.historical_foundry_storage as storage
+
+        storage_token = storage._bind_historical_replay_scenario_transition(
+            staging=staging, scenario_key=scenario_key
+        )
+        scenario = object.__new__(ValidatedReplayScenario)
+        register_capability(scenario, {
+            "issuer": issuer,
+            "snapshot": staging,
+            "window": window,
+            "grid": grid,
+            "row": row,
+            "scan_inventory_sha256": grid_record["scan_inventory_sha256"],
+            "grid_digest": grid_record["grid_digest"],
+            "storage_token": storage_token,
+        }, scenario_registry)
+        return scenario
+
+    def _validated_replay_scenario_projection(
+        *, scenario: ValidatedReplayScenario
+    ) -> Mapping[str, Any]:
+        record = capability_record(
+            scenario, ValidatedReplayScenario, scenario_registry
+        )
+        record["snapshot"].reread_frozen_members_unchanged()
+        return _detach_prefilter_value(record["row"])
+
+    def _consume_replay_scenario_storage_token(
+        *, scenario: ValidatedReplayScenario
+    ) -> object:
+        record = capability_record(
+            scenario, ValidatedReplayScenario, scenario_registry
+        )
+        token = record.get("storage_token")
+        if token is None or record.get("storage_token_consumed") is True:
+            raise ValueError("historical replay scenario storage authority is invalid")
+        record["storage_token_consumed"] = True
+        return token
+
+    def _validate_replay_scenario_for_context(
+        *,
+        scenario: ValidatedReplayScenario,
+        staging: Any,
+        window: ValidatedHistoricalWindow,
+        grid: ValidatedHistoricalPrefilterGrid,
+    ) -> Mapping[str, Any]:
+        record = capability_record(
+            scenario, ValidatedReplayScenario, scenario_registry
+        )
+        if (
+            record.get("snapshot") is not staging
+            or record.get("window") is not window
+            or record.get("grid") is not grid
+        ):
+            raise ValueError("historical replay scenario lineage differs")
+        staging.reread_frozen_members_unchanged()
+        return _detach_prefilter_value(record["row"])
+
     return (
         ValidatedHistoricalWindow,
         ValidatedHistoricalPrefilterGrid,
+        ValidatedReplayScenario,
         open_validated_historical_window,
         _iter_validated_historical_window_records,
         build_historical_prefilter_grid,
         validate_historical_prefilter_grid,
         _iter_validated_historical_prefilter_rows,
+        _issue_validated_replay_scenario,
+        _validated_replay_scenario_projection,
+        _consume_replay_scenario_storage_token,
+        _validate_replay_scenario_for_context,
     )
 
 
 (
     ValidatedHistoricalWindow,
     ValidatedHistoricalPrefilterGrid,
+    ValidatedReplayScenario,
     open_validated_historical_window,
     _iter_validated_historical_window_records,
     build_historical_prefilter_grid,
     validate_historical_prefilter_grid,
     _iter_validated_historical_prefilter_rows,
+    _issue_validated_replay_scenario,
+    _validated_replay_scenario_projection,
+    _consume_replay_scenario_storage_token,
+    _validate_replay_scenario_for_context,
 ) = _initialize_historical_prefilter_capabilities()
 del _initialize_historical_prefilter_capabilities

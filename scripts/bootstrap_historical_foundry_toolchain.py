@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import urllib.request
@@ -1074,6 +1075,246 @@ def _open_toolchain(expected: Mapping[str, str]) -> "ReviewedHistoricalToolchain
             os.close(fd)
 
 
+def _validate_historical_process_output_counts(
+    *, stdout_bytes: int, stderr_bytes: int
+) -> None:
+    if (
+        type(stdout_bytes) is not int
+        or type(stderr_bytes) is not int
+        or stdout_bytes < 0
+        or stderr_bytes < 0
+        or stdout_bytes + stderr_bytes > 65_536
+    ):
+        raise ValueError("historical process output limit exceeded")
+    return None
+
+
+def _initialize_historical_process_lease_type():
+    provenance = object()
+
+    class _HistoricalProcessLease:
+        __slots__ = (
+            "_process", "_cleanup", "_binary_sha256", "_selected_block",
+            "_hardfork", "_toolchain", "_output_threads",
+            "_output_totals", "_output_lock", "_output_overflow", "_closed",
+        )
+
+        def __init__(self, *, _provenance: object = None, **values: Any) -> None:
+            if _provenance is not provenance:
+                raise ValueError("historical process lease provenance is invalid")
+            for name in self.__slots__:
+                object.__setattr__(self, name, values[name])
+
+        def __repr__(self) -> str:
+            return "_HistoricalProcessLease(<sealed>)"
+
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError("historical process lease is immutable")
+
+        def __reduce__(self) -> Any:
+            raise TypeError("historical process lease is not serializable")
+
+        def redacted_argv_projection(self) -> Mapping[str, Any]:
+            if self._closed:
+                raise ValueError("historical process lease is closed")
+            return {
+                "schema": "historical_foundry_anvil_argv/v1",
+                "binary_sha256": self._binary_sha256,
+                "fixed_arguments": (
+                    "--chain-id", "1", "--host", "127.0.0.1",
+                    "--no-mining", "--no-cors", "--silent", "--order",
+                    "fifo", "--steps-tracing", "--retries", "0",
+                    "--timeout", "30000", "--no-storage-caching",
+                ),
+                "selected_block": self._selected_block,
+                "hardfork": self._hardfork,
+                "fork_url_kind": "loopback_relay",
+            }
+
+        def _assert_output_within_limit(self) -> None:
+            with self._output_lock:
+                stdout_bytes, stderr_bytes = self._output_totals
+                overflow = self._output_overflow.is_set()
+            if overflow:
+                raise ValueError("historical process output limit exceeded")
+            _validate_historical_process_output_counts(
+                stdout_bytes=stdout_bytes, stderr_bytes=stderr_bytes
+            )
+            return None
+
+        def close(self) -> None:
+            if self._closed:
+                return None
+            process = self._process
+            control = None
+            ordinary = False
+            timed_out = False
+            try:
+                process.terminate()
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    control = error
+                else:
+                    ordinary = True
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            except BaseException as error:
+                timed_out = True
+                if not isinstance(error, Exception) and control is None:
+                    control = error
+                elif isinstance(error, Exception):
+                    ordinary = True
+            if timed_out:
+                try:
+                    process.kill()
+                except BaseException as error:
+                    if not isinstance(error, Exception) and control is None:
+                        control = error
+                    elif isinstance(error, Exception):
+                        ordinary = True
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    ordinary = True
+                except BaseException as error:
+                    if not isinstance(error, Exception) and control is None:
+                        control = error
+                    elif isinstance(error, Exception):
+                        ordinary = True
+            for thread in self._output_threads:
+                try:
+                    thread.join(timeout=5.0)
+                    if thread.is_alive():
+                        ordinary = True
+                except BaseException as error:
+                    if not isinstance(error, Exception) and control is None:
+                        control = error
+                    elif isinstance(error, Exception):
+                        ordinary = True
+            for stream_name in ("stdout", "stderr"):
+                stream = getattr(process, stream_name, None)
+                closer = getattr(stream, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except BaseException as error:
+                        if not isinstance(error, Exception) and control is None:
+                            control = error
+                        elif isinstance(error, Exception):
+                            ordinary = True
+            try:
+                self._assert_output_within_limit()
+            except BaseException as error:
+                if not isinstance(error, Exception) and control is None:
+                    control = error
+                elif isinstance(error, Exception):
+                    ordinary = True
+            try:
+                self._cleanup()
+            except BaseException as error:
+                if not isinstance(error, Exception) and control is None:
+                    control = error
+                elif isinstance(error, Exception):
+                    ordinary = True
+            toolchain = self._toolchain
+            if toolchain is not None:
+                try:
+                    toolchain._assert_stable_binaries()
+                except BaseException as error:
+                    if not isinstance(error, Exception) and control is None:
+                        control = error
+                    elif isinstance(error, Exception):
+                        ordinary = True
+            object.__setattr__(self, "_process", None)
+            object.__setattr__(self, "_cleanup", None)
+            object.__setattr__(self, "_toolchain", None)
+            object.__setattr__(self, "_output_threads", ())
+            object.__setattr__(self, "_closed", True)
+            if control is not None:
+                raise control
+            if ordinary:
+                raise ValueError("historical process reap failed")
+            return None
+
+    def issue(
+        *,
+        process: Any,
+        cleanup: Any,
+        binary_sha256: str,
+        selected_block: int,
+        hardfork: str,
+        toolchain: Any = None,
+    ) -> _HistoricalProcessLease:
+        if (
+            not callable(cleanup)
+            or type(binary_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", binary_sha256) is None
+            or type(selected_block) is not int
+            or selected_block < 0
+            or type(hardfork) is not str
+            or not hardfork
+        ):
+            raise ValueError("historical process lease input is invalid")
+        for name in ("terminate", "kill", "wait"):
+            if not callable(getattr(process, name, None)):
+                raise ValueError("historical process handle is invalid")
+        output_totals = [0, 0]
+        output_lock = threading.Lock()
+        output_overflow = threading.Event()
+        output_threads = []
+
+        def drain(stream: Any, index: int) -> None:
+            try:
+                while True:
+                    chunk = stream.read(8_192)
+                    if chunk in (b"", None):
+                        break
+                    if type(chunk) is not bytes:
+                        output_overflow.set()
+                        break
+                    with output_lock:
+                        output_totals[index] += len(chunk)
+                        if sum(output_totals) > 65_536:
+                            output_overflow.set()
+            except BaseException:
+                output_overflow.set()
+
+        for index, name in enumerate(("stdout", "stderr")):
+            stream = getattr(process, name, None)
+            if stream is not None and callable(getattr(stream, "read", None)):
+                thread = threading.Thread(
+                    target=drain, args=(stream, index), daemon=True,
+                    name="historical-anvil-output-{}".format(name),
+                )
+                output_threads.append(thread)
+                thread.start()
+        return _HistoricalProcessLease(
+            _provenance=provenance,
+            _process=process,
+            _cleanup=cleanup,
+            _binary_sha256=binary_sha256,
+            _selected_block=selected_block,
+            _hardfork=hardfork,
+            _toolchain=toolchain,
+            _output_threads=tuple(output_threads),
+            _output_totals=output_totals,
+            _output_lock=output_lock,
+            _output_overflow=output_overflow,
+            _closed=False,
+        )
+
+    return _HistoricalProcessLease, issue
+
+
+(
+    _HistoricalProcessLease,
+    _issue_historical_process_lease_for_test,
+) = _initialize_historical_process_lease_type()
+del _initialize_historical_process_lease_type
+
+
 class ReviewedHistoricalToolchain:
     """Non-serializable held-descriptor capability for fixed invocations."""
 
@@ -1306,6 +1547,78 @@ class ReviewedHistoricalToolchain:
         if len(completed.stdout) > _MAX_PROCESS_OUTPUT or len(completed.stderr) > _MAX_PROCESS_OUTPUT:
             raise _error("toolchain_process_output_too_large")
         return completed
+
+    def _spawn_historical_anvil_process(
+        self,
+        *,
+        selected_block: int,
+        hardfork: str,
+        relay_port: int,
+        anvil_port: int,
+    ) -> _HistoricalProcessLease:
+        if (
+            self._closed
+            or type(selected_block) is not int
+            or selected_block < 0
+            or hardfork != _COMPILER_SETTINGS["fork_hardfork"]
+            or type(relay_port) is not int
+            or type(anvil_port) is not int
+            or not 1 <= relay_port <= 65_535
+            or not 1 <= anvil_port <= 65_535
+            or relay_port == anvil_port
+        ):
+            raise _error("toolchain_process_failed")
+        self._assert_stable_binaries()
+        anvil_fd, _metadata, anvil_sha256 = self._binaries["anvil"]
+        private_parent = _PROJECT_ROOT / ".historical-foundry"
+        work_directory = Path(tempfile.mkdtemp(
+            prefix="anvil-scenario-", dir=str(private_parent)
+        ))
+        os.chmod(str(work_directory), 0o700)
+        arguments = (
+            "anvil",
+            "--fork-url", "http://127.0.0.1:{}".format(relay_port),
+            "--fork-block-number", str(selected_block),
+            "--chain-id", "1",
+            "--hardfork", hardfork,
+            "--host", "127.0.0.1",
+            "--port", str(anvil_port),
+            "--no-mining", "--no-cors", "--silent", "--order", "fifo",
+            "--steps-tracing", "--retries", "0", "--timeout", "30000",
+            "--no-storage-caching",
+        )
+        environment = {
+            "HOME": str(_PROJECT_ROOT / ".historical-foundry" / "runtime-home"),
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
+        try:
+            process = subprocess.Popen(
+                arguments,
+                executable="/dev/fd/{}".format(anvil_fd),
+                cwd=str(work_directory),
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                pass_fds=(anvil_fd,),
+            )
+        except BaseException:
+            shutil.rmtree(str(work_directory))
+            raise
+
+        def cleanup() -> None:
+            shutil.rmtree(str(work_directory))
+
+        return _issue_historical_process_lease_for_test(
+            process=process,
+            cleanup=cleanup,
+            binary_sha256=anvil_sha256,
+            selected_block=selected_block,
+            hardfork=hardfork,
+            toolchain=self,
+        )
 
     def _verified_version(self, name: str) -> str:
         completed = self._invoke(name, ("--version",))

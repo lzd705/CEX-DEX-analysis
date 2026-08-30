@@ -1197,6 +1197,269 @@ _ARCHIVE_METHODS = (
 )
 _ARCHIVE_METHOD_SET = frozenset(_ARCHIVE_METHODS)
 
+_HISTORICAL_RELAY_METHODS = frozenset((
+    "eth_chainId",
+    "eth_getBlockByNumber",
+    "eth_getBlockByHash",
+    "eth_getCode",
+    "eth_getBalance",
+    "eth_getTransactionCount",
+    "eth_getStorageAt",
+    "eth_call",
+    "eth_getProof",
+))
+_HISTORICAL_RELAY_RESOURCE_LIMITS = {
+    "inbound_header_bytes": 65_536,
+    "inbound_body_bytes": 4_194_304,
+    "upstream_request_bytes": 4_194_304,
+    "upstream_header_bytes": 65_536,
+    "upstream_wire_bytes": 67_108_864,
+    "upstream_decoded_bytes": 67_108_864,
+    "downstream_header_bytes": 4_096,
+    "downstream_body_bytes": 67_108_864,
+    "cumulative_wire_bytes": 67_108_864,
+    "cumulative_decoded_bytes": 67_108_864,
+}
+
+
+def _validate_historical_relay_resource_counts(
+    *,
+    inbound_header_bytes: int,
+    inbound_body_bytes: int,
+    upstream_request_bytes: int,
+    upstream_header_bytes: int,
+    upstream_wire_bytes: int,
+    upstream_decoded_bytes: int,
+    downstream_header_bytes: int,
+    downstream_body_bytes: int,
+    cumulative_wire_bytes: int,
+    cumulative_decoded_bytes: int,
+    elapsed_seconds: float,
+) -> None:
+    values = locals()
+    for name, limit in _HISTORICAL_RELAY_RESOURCE_LIMITS.items():
+        value = values[name]
+        if type(value) is not int or value < 0 or value > limit:
+            raise ValueError("historical relay resource limit exceeded")
+    if (
+        type(elapsed_seconds) not in (int, float)
+        or not math.isfinite(float(elapsed_seconds))
+        or float(elapsed_seconds) < 0
+    ):
+        raise ValueError("historical relay clock is invalid")
+    if float(elapsed_seconds) >= 30.0:
+        raise TimeoutError("historical relay deadline expired")
+    return None
+
+
+def _initialize_historical_relay_lease_type():
+    provenance = object()
+
+    class _HistoricalRelayLease:
+        __slots__ = (
+            "_state", "_key", "_endpoint_bytes", "_endpoint_identity",
+            "_operation", "_clock", "_last_clock", "_connection_url",
+        )
+
+        def __init__(self, *, _provenance: object = None, **values: Any) -> None:
+            if _provenance is not provenance:
+                raise ValueError("historical relay lease provenance is invalid")
+            for name in self.__slots__:
+                object.__setattr__(self, name, values[name])
+
+        def __repr__(self) -> str:
+            return "_HistoricalRelayLease(<sealed>)"
+
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError("historical relay lease is immutable")
+
+        def __copy__(self) -> Any:
+            raise TypeError("historical relay lease is not copyable")
+
+        def __deepcopy__(self, _memo: Any) -> Any:
+            raise TypeError("historical relay lease is not copyable")
+
+        def __reduce__(self) -> Any:
+            raise TypeError("historical relay lease is not serializable")
+
+        def close(self) -> None:
+            if self._state == "closed":
+                return None
+            _erase_archive_key(self._key)
+            object.__setattr__(self, "_key", None)
+            object.__setattr__(self, "_endpoint_bytes", None)
+            object.__setattr__(self, "_endpoint_identity", None)
+            object.__setattr__(self, "_operation", None)
+            object.__setattr__(self, "_clock", None)
+            object.__setattr__(self, "_connection_url", None)
+            object.__setattr__(self, "_state", "closed")
+            return None
+
+    def issue(
+        *,
+        endpoint: str,
+        operation: Callable[[bytes, float], bytes],
+        monotonic: Callable[[], float],
+        entropy: Callable[[int], bytes],
+    ) -> _HistoricalRelayLease:
+        if not callable(operation) or not callable(monotonic) or not callable(entropy):
+            raise ValueError("historical relay lease input is invalid")
+        _projection, endpoint_bytes, connection_url = (
+            _canonicalize_archive_endpoint(endpoint)
+        )
+        started = _initial_clock_sample(monotonic)
+        if started is None:
+            raise ValueError("historical relay clock is invalid")
+        try:
+            key_bytes = entropy(32)
+        except Exception:
+            key_bytes = None
+        if type(key_bytes) is not bytes or len(key_bytes) != 32:
+            raise ValueError("historical relay entropy is invalid")
+        key = bytearray(key_bytes)
+        digest = hmac.new(key, endpoint_bytes, hashlib.sha256).hexdigest()
+        return _HistoricalRelayLease(
+            _provenance=provenance,
+            _state="active",
+            _key=key,
+            _endpoint_bytes=endpoint_bytes,
+            _endpoint_identity=_frozen_archive_value({
+                "schema": "historical_foundry_rpc_endpoint_identity/v1",
+                "scope": "single_run_nonreversible",
+                "endpoint_hmac_sha256": digest,
+            }),
+            _operation=operation,
+            _clock=monotonic,
+            _last_clock=started,
+            _connection_url=connection_url,
+        )
+
+    def issue_shared(
+        *, key: bytearray, endpoint_bytes: bytes,
+        endpoint_identity: Mapping[str, Any], connection_url: str,
+        operation: Callable[[bytes, float], bytes],
+        monotonic: Callable[[], float], last_clock: float,
+    ) -> _HistoricalRelayLease:
+        if (
+            type(key) is not bytearray
+            or len(key) != 32
+            or type(endpoint_bytes) is not bytes
+            or type(connection_url) is not str
+            or not callable(operation)
+            or not callable(monotonic)
+            or type(last_clock) is not float
+            or not hmac.compare_digest(
+                hmac.new(key, endpoint_bytes, hashlib.sha256).hexdigest(),
+                endpoint_identity.get("endpoint_hmac_sha256", ""),
+            )
+        ):
+            raise ValueError("historical relay shared authority is invalid")
+        return _HistoricalRelayLease(
+            _provenance=provenance,
+            _state="active",
+            _key=key,
+            _endpoint_bytes=endpoint_bytes,
+            _endpoint_identity=endpoint_identity,
+            _operation=operation,
+            _clock=monotonic,
+            _last_clock=last_clock,
+            _connection_url=connection_url,
+        )
+
+    def require(lease: Any) -> _HistoricalRelayLease:
+        if (
+            type(lease) is not _HistoricalRelayLease
+            or getattr(lease, "_state", None) != "active"
+        ):
+            raise ValueError("historical relay lease is invalid")
+        if (
+            type(lease._key) is not bytearray
+            or type(lease._endpoint_bytes) is not bytes
+            or not hmac.compare_digest(
+                hmac.new(
+                    lease._key, lease._endpoint_bytes, hashlib.sha256
+                ).hexdigest(),
+                lease._endpoint_identity["endpoint_hmac_sha256"],
+            )
+        ):
+            raise ValueError("historical relay endpoint identity differs")
+        return lease
+
+    return _HistoricalRelayLease, issue, issue_shared, require
+
+
+(
+    _HistoricalRelayLease,
+    _issue_historical_relay_lease_for_test,
+    _issue_historical_relay_lease_from_run,
+    _require_historical_relay_lease,
+) = _initialize_historical_relay_lease_type()
+del _initialize_historical_relay_lease_type
+
+
+def _relay_historical_archive_call(
+    *, relay_lease: _HistoricalRelayLease, canonical_request_bytes: bytes
+) -> bytes:
+    lease = _require_historical_relay_lease(relay_lease)
+    if (
+        type(canonical_request_bytes) is not bytes
+        or not canonical_request_bytes
+        or len(canonical_request_bytes) > 4_194_304
+    ):
+        raise ValueError("historical relay request is invalid")
+    try:
+        request = json.loads(canonical_request_bytes.decode("utf-8"))
+    except Exception:
+        raise ValueError("historical relay request is invalid") from None
+    if (
+        type(request) is not dict
+        or set(request) != {"id", "jsonrpc", "method", "params"}
+        or type(request["id"]) is not int
+        or request["id"] <= 0
+        or request["jsonrpc"] != "2.0"
+        or type(request["method"]) is not str
+        or request["method"] not in _HISTORICAL_RELAY_METHODS
+        or type(request["params"]) is not list
+        or _archive_canonical_bytes(request) != canonical_request_bytes
+    ):
+        raise ValueError("historical relay request is invalid")
+    _validate_archive_json_value(request)
+    started = _initial_clock_sample(lease._clock)
+    if started is None or started < lease._last_clock:
+        raise ValueError("historical relay clock is invalid")
+    object.__setattr__(lease, "_last_clock", started)
+    remaining = 30.0
+    try:
+        response_bytes = lease._operation(canonical_request_bytes, remaining)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        raise ValueError("historical relay upstream failed") from None
+    finished = _initial_clock_sample(lease._clock)
+    if finished is None or finished < started:
+        raise ValueError("historical relay clock is invalid")
+    object.__setattr__(lease, "_last_clock", finished)
+    if finished - started >= 30.0:
+        raise TimeoutError("historical relay deadline expired")
+    if type(response_bytes) is not bytes or len(response_bytes) > 67_108_864:
+        raise ValueError("historical relay response is invalid")
+    try:
+        response = json.loads(response_bytes.decode("utf-8"))
+    except Exception:
+        raise ValueError("historical relay response is invalid") from None
+    if (
+        type(response) is not dict
+        or set(response) not in (
+            {"id", "jsonrpc", "result"}, {"error", "id", "jsonrpc"}
+        )
+        or response.get("id") != request["id"]
+        or response.get("jsonrpc") != "2.0"
+        or _archive_canonical_bytes(response) != response_bytes
+    ):
+        raise ValueError("historical relay response is invalid")
+    _validate_archive_json_value(response)
+    return bytes(response_bytes)
+
 _PRODUCTION_SOURCE_MEMBERS = (
     ("source:atomic_publication", "scripts.atomic_publication", "scripts/atomic_publication.py"),
     ("source:bootstrap_historical_foundry_toolchain", "scripts.bootstrap_historical_foundry_toolchain", "scripts/bootstrap_historical_foundry_toolchain.py"),
@@ -1209,6 +1472,7 @@ _PRODUCTION_SOURCE_MEMBERS = (
     ("source:fetch_cex", "scripts.fetch_cex", "scripts/fetch_cex.py"),
     ("source:fetch_cex_depth", "scripts.fetch_cex_depth", "scripts/fetch_cex_depth.py"),
     ("source:historical_foundry_contracts", "scripts.historical_foundry_contracts", "scripts/historical_foundry_contracts.py"),
+    ("source:historical_foundry_anvil", None, "scripts/historical_foundry_anvil.py"),
     ("source:historical_foundry_rpc", "scripts.historical_foundry_rpc", "scripts/historical_foundry_rpc.py"),
     ("source:market_lifecycle_reviews", "scripts.market_lifecycle_reviews", "scripts/market_lifecycle_reviews.py"),
     ("source:publication_gate", "scripts.publication_gate", "scripts/publication_gate.py"),
@@ -1660,7 +1924,7 @@ def _initialize_production_archive_types():
             "_reserved_scope", "_logical_summaries", "_records",
             "_next_logical_batch_index", "_next_exchange_index",
             "_historical_window_lock", "_historical_window_consumer",
-            "_historical_window_close",
+            "_historical_window_close", "_relay_lease", "_relay_moved",
         )
 
         def __init__(self, *, _provenance: object = None, **values: Any) -> None:
@@ -1794,6 +2058,8 @@ def _initialize_production_archive_types():
         values.setdefault("_historical_window_lock", threading.RLock())
         values.setdefault("_historical_window_consumer", None)
         values.setdefault("_historical_window_close", None)
+        values.setdefault("_relay_lease", None)
+        values.setdefault("_relay_moved", False)
         return _ProductionArchiveRpcRunContext(_provenance=provenance, **values)
 
     def issue_scope(**values: Any) -> _ProductionArchiveRpcLogicalBatchScope:
@@ -3246,6 +3512,26 @@ def _initialize_production_historical_window_types(core_gate: Any):
                 digest.update(len(payload).to_bytes(8, "big"))
                 digest.update(payload)
             receipt_inventory_sha256 = digest.hexdigest()
+            relay_lease = context._relay_lease
+            if relay_lease is not None:
+                try:
+                    storage_module = importlib.import_module(
+                        "scripts.historical_foundry_storage"
+                    )
+                    storage_module._bind_historical_relay_lease_from_production_spool(
+                        spool=record["spool"], relay_lease=relay_lease
+                    )
+                    object.__setattr__(context, "_relay_moved", True)
+                except BaseException as error:
+                    terminalize_claim_context(context, "failed")
+                    record["state"] = "closed"
+                    record["phase"] = "closed"
+                    if not isinstance(error, Exception):
+                        raise
+                    _raise_archive_error((
+                        "authority_mismatch",
+                        "historical_window_spool_handoff_failed",
+                    ))
             object.__setattr__(context, "_historical_window_close", None)
             permit = object()
             core_gate["finalize"][id(context)] = (context, permit)
@@ -3930,7 +4216,16 @@ def _erase_archive_key(key: Any) -> None:
 
 def _cleanup_archive_context(context: Any, state: str) -> None:
     key = context._key
-    _erase_archive_key(key)
+    relay_lease = getattr(context, "_relay_lease", None)
+    relay_moved = getattr(context, "_relay_moved", False) is True
+    if relay_lease is not None and not relay_moved:
+        try:
+            relay_lease.close()
+        except BaseException:
+            _erase_archive_key(key)
+            raise
+    elif not relay_moved:
+        _erase_archive_key(key)
     preflight = context._preflight
     closer = getattr(preflight, "close", None)
     control = None
@@ -3950,6 +4245,8 @@ def _cleanup_archive_context(context: Any, state: str) -> None:
     object.__setattr__(context, "_opening_identity", None)
     object.__setattr__(context, "_active_scope", None)
     object.__setattr__(context, "_reserved_scope", None)
+    if type(context) is _ProductionArchiveRpcRunContext:
+        object.__setattr__(context, "_relay_lease", None)
     context._logical_summaries.clear()
     context._records.clear()
     object.__setattr__(context, "_state", state)
@@ -5651,12 +5948,48 @@ def _activate_production_archive_rpc_run(
         except urllib.error.HTTPError as error:
             return error
 
+    def relay_operation(body: bytes, timeout: float) -> bytes:
+        response = operation(body, timeout)
+        try:
+            status = getattr(response, "status", None)
+            headers = getattr(response, "headers", None)
+            items = tuple(headers.items()) if headers is not None else ()
+            header_bytes = sum(
+                len(str(name).encode("utf-8"))
+                + len(str(value).encode("utf-8")) + 4
+                for name, value in items
+            )
+            if status != 200 or header_bytes > 65_536:
+                raise ValueError("historical relay upstream response is invalid")
+            encoding = "" if headers is None else headers.get(
+                "Content-Encoding", ""
+            )
+            if str(encoding).strip().lower() not in ("", "identity"):
+                raise ValueError("historical relay upstream response is invalid")
+            payload = response.read(67_108_865)
+            if type(payload) is not bytes or len(payload) > 67_108_864:
+                raise ValueError("historical relay upstream response is invalid")
+            return payload
+        finally:
+            closer = getattr(response, "close", None)
+            if callable(closer):
+                closer()
+
     digest = hmac.new(key, endpoint_bytes, hashlib.sha256).hexdigest()
     endpoint_identity = {
         "schema": "historical_foundry_rpc_endpoint_identity/v1",
         "scope": "single_run_nonreversible",
         "endpoint_hmac_sha256": digest,
     }
+    relay_lease = _issue_historical_relay_lease_from_run(
+        key=key,
+        endpoint_bytes=endpoint_bytes,
+        endpoint_identity=_frozen_archive_value(endpoint_identity),
+        connection_url=connection_url,
+        operation=relay_operation,
+        monotonic=time.monotonic,
+        last_clock=started,
+    )
     return _issue_production_context(
         _state="active",
         _clock=time.monotonic,
@@ -5678,6 +6011,8 @@ def _activate_production_archive_rpc_run(
         _records=[],
         _next_logical_batch_index=1,
         _next_exchange_index=1,
+        _relay_lease=relay_lease,
+        _relay_moved=False,
     )
 
 

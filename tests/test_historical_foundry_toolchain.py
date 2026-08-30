@@ -1881,5 +1881,51 @@ class HistoricalFoundryKatFixtureTests(unittest.TestCase):
                 )
 
 
+class HistoricalFoundryAnvilProcessLeaseNativeTests(unittest.TestCase):
+    def test_task6_spawn_surface_and_test_lease_are_sealed(self):
+        self.assertIsNone(toolchain._validate_historical_process_output_counts(
+            stdout_bytes=32_768, stderr_bytes=32_768
+        ))
+        with self.assertRaises(ValueError):
+            toolchain._validate_historical_process_output_counts(
+                stdout_bytes=32_769, stderr_bytes=32_768
+            )
+        signature = inspect.signature(
+            toolchain.ReviewedHistoricalToolchain._spawn_historical_anvil_process
+        )
+        self.assertEqual(
+            tuple(signature.parameters),
+            ("self", "selected_block", "hardfork", "relay_port", "anvil_port"),
+        )
+
+        class Process:
+            returncode = None
+
+            def __init__(self):
+                self.calls = []
+
+            def terminate(self):
+                self.calls.append("term")
+
+            def kill(self):
+                self.calls.append("kill")
+
+            def wait(self, timeout):
+                self.calls.append(("wait", timeout))
+                self.returncode = 0
+                return 0
+
+        process = Process()
+        cleanup = mock.Mock()
+        lease = toolchain._issue_historical_process_lease_for_test(
+            process=process, cleanup=cleanup,
+            binary_sha256="1" * 64, selected_block=7, hardfork="osaka",
+        )
+        self.assertNotIn("object at", repr(lease))
+        self.assertEqual(lease.close(), None)
+        self.assertEqual(process.calls, ["term", ("wait", 5.0)])
+        cleanup.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

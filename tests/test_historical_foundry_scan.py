@@ -587,6 +587,7 @@ class _Task4bOfflineCapabilityFixture:
         self.reserve_attempts = []
         self.response_seed_count = None
         self.context_issuance_assertions = 0
+        self.context_key = None
 
     def mint(self):
         import scripts.historical_foundry_rpc as rpc
@@ -789,10 +790,10 @@ class _Task4bOfflineCapabilityFixture:
         if (
             self.context._key is not None
             or type(context_key) is not bytearray
-            or bytes(context_key) != b"\0" * 32
+            or bytes(context_key) != b"z" * 32
         ):
-            raise AssertionError("Task4b endpoint HMAC key was retained")
-        del context_key
+            raise AssertionError("Task6 endpoint HMAC authority was not retained")
+        self.context_key = context_key
         if self.split_reserve_root:
             if self.reserve_attempts[:3] != [
                 reserve_root, reserve_left, reserve_right,
@@ -809,6 +810,12 @@ class _Task4bOfflineCapabilityFixture:
             except BaseException:
                 pass
             self.capability = None
+        if (
+            self.context_key is not None
+            and bytes(self.context_key) != b"\0" * 32
+        ):
+            raise AssertionError("Task6 endpoint HMAC key was not erased")
+        self.context_key = None
         if self.preflight is not None and not self.preflight.closed:
             self.preflight.close()
         if self.temporary is not None:
@@ -9623,6 +9630,27 @@ class HistoricalPrefilterGridTests(unittest.TestCase):
             self._close_fixture(
                 fixture_a, capture_a, prefilter_a
             )
+
+
+class HistoricalFoundryScenarioIssuerNativeTests(unittest.TestCase):
+    def test_task6_scenario_issuer_has_only_exact_lineage_inputs(self):
+        import scripts.historical_foundry_scan as scan
+
+        signature = inspect.signature(scan._issue_validated_replay_scenario)
+        self.assertEqual(
+            tuple(signature.parameters),
+            ("staging", "window", "grid", "scenario_key"),
+        )
+        self.assertTrue(all(
+            parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            for parameter in signature.parameters.values()
+        ))
+        self.assertNotIn("row", signature.parameters)
+        with self.assertRaises((TypeError, ValueError)):
+            scan.ValidatedReplayScenario()
+        forged = object.__new__(scan.ValidatedReplayScenario)
+        with self.assertRaises(ValueError):
+            scan._validated_replay_scenario_projection(scenario=forged)
 
 
 if __name__ == "__main__":

@@ -4737,6 +4737,7 @@ class HistoricalFoundryRpcRunBoundaryTests(unittest.TestCase):
             ("source:fetch_cex", "scripts/fetch_cex.py"),
             ("source:fetch_cex_depth", "scripts/fetch_cex_depth.py"),
             ("source:historical_foundry_contracts", "scripts/historical_foundry_contracts.py"),
+            ("source:historical_foundry_anvil", "scripts/historical_foundry_anvil.py"),
             ("source:historical_foundry_rpc", "scripts/historical_foundry_rpc.py"),
             ("source:market_lifecycle_reviews", "scripts/market_lifecycle_reviews.py"),
             ("source:publication_gate", "scripts/publication_gate.py"),
@@ -6372,6 +6373,31 @@ class HistoricalFoundryRpcTests(unittest.TestCase):
             project_historical_anchor_capture(
                 self._plan(), SequenceAlias(_synthetic_responses())
             )
+
+
+class HistoricalFoundryRelayNativeTests(unittest.TestCase):
+    def test_task6_source_inventory_and_sealed_relay_boundary(self):
+        import scripts.historical_foundry_rpc as rpc
+
+        self.assertIn(
+            "source:historical_foundry_anvil",
+            tuple(row[0] for row in rpc._PRODUCTION_SOURCE_MEMBERS),
+        )
+        lease = rpc._issue_historical_relay_lease_for_test(
+            endpoint="https://fixture.invalid/archive",
+            operation=lambda _body, _remaining: (
+                b'{"id":1,"jsonrpc":"2.0","result":"0x1"}'
+            ),
+            monotonic=lambda: 0.0,
+            entropy=lambda size: b"q" * size,
+        )
+        self.assertIs(rpc._require_historical_relay_lease(lease), lease)
+        self.assertNotIn("fixture", repr(lease))
+        with self.assertRaises(ValueError):
+            rpc._require_historical_relay_lease(
+                object.__new__(type(lease))
+            )
+        lease.close()
 
 
 if __name__ == "__main__":
