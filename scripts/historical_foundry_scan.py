@@ -1,7 +1,9 @@
-"""Pure historical-window planning and semantic projection.
+"""Historical-window planning, semantic projection, and capture ingress.
 
-This module accepts only fixture mappings.  It performs no environment,
-filesystem, network, subprocess, storage, or publication operation.
+Existing planners and projectors remain pure.  The sole authenticated Task-4b
+ingress delegates held offline materialization to the exact canonical storage
+module.  Scan adds no environment, network, subprocess, or publication
+controller.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import hashlib
 import json
 import platform
 import re
+import sys
 import weakref
 from types import MappingProxyType
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -92,6 +95,7 @@ _ERROR_PAIRS = frozenset((
     ("authority_mismatch", "window_plan_invalid"),
     ("authority_mismatch", "request_ledger_invalid"),
     ("authority_mismatch", "fixture_input_invalid"),
+    ("authority_mismatch", "final_identity_drift"),
     ("anchor_changed", "final_anchor_mismatch"),
     ("block_coverage_incomplete", "lower_bound_invalid"),
     ("block_coverage_incomplete", "lower_bound_witness_invalid"),
@@ -479,6 +483,658 @@ def _initialize_production_historical_window_authorities():
     prefinalization_registry = {}
     reconciliation_registry = {}
     logical_root_registry = {}
+    capture_replay_event_registry = {}
+    capture_materialization_registry = {}
+    active_capture_materialization = contextvars.ContextVar(
+        "historical_foundry_active_capture_materialization",
+        default=None,
+    )
+    task4b_weakref_module = weakref
+    task4b_weakref_ref = weakref.ref
+    task4b_scan_local_names = (
+        "_materialize_historical_window_staging_snapshot",
+        "_ProductionHistoricalWindowCaptureReplayEvent",
+        "_bind_production_historical_window_capture_replay_source_from_bound_storage",
+        "_replay_production_historical_window_capture_from_bound_storage",
+        "_consume_production_historical_window_capture_replay_event_for_storage",
+    )
+    task4b_scan_local_originals = None
+    task4b_attestation_provenance = object()
+    task4b_runtime_sys = sys
+    task4b_scripts_package = sys.modules.get("scripts")
+    from scripts import historical_foundry_storage as task4b_storage_module
+    task4b_storage_consume = (
+        task4b_storage_module
+        .consume_production_historical_window_capability
+    )
+    task4b_storage_consume_code = task4b_storage_consume.__code__
+    task4b_storage_capability_class = (
+        task4b_storage_module._ProductionHistoricalWindowCapability
+    )
+    task4b_storage_consumed_view_class = (
+        task4b_storage_module
+        ._ConsumedProductionHistoricalWindowCapabilityView
+    )
+    task4b_storage_source_class = (
+        task4b_storage_module._HistoricalWindowCaptureReplaySource
+    )
+    task4b_storage_snapshot_class = (
+        task4b_storage_module.HistoricalRunStagingSnapshot
+    )
+    task4b_storage_view_materialize = (
+        task4b_storage_consumed_view_class
+        ._materialize_staging_snapshot_from_bound_scan
+    )
+    task4b_storage_view_materialize_code = (
+        task4b_storage_view_materialize.__code__
+    )
+    task4b_storage_view_close = task4b_storage_consumed_view_class.close
+    task4b_storage_view_close_code = task4b_storage_view_close.__code__
+    task4b_storage_snapshot_projection = (
+        task4b_storage_snapshot_class.frozen_identity_projection
+    )
+    task4b_storage_snapshot_projection_code = (
+        task4b_storage_snapshot_projection.__code__
+    )
+    task4b_storage_snapshot_close = task4b_storage_snapshot_class.close
+    task4b_storage_snapshot_close_code = (
+        task4b_storage_snapshot_close.__code__
+    )
+
+    task4b_storage_function_type = type(task4b_storage_consume)
+    task4b_storage_function_clones = {}
+    task4b_storage_cell_clones = {}
+
+    def task4b_new_storage_cell(value):
+        def cell_value():
+            return value
+
+        return cell_value.__closure__[0]
+
+    def task4b_clone_storage_function(function):
+        function_entry = task4b_storage_function_clones.get(id(function))
+        if function_entry is not None and function_entry[0] is function:
+            return function_entry[1]
+        original_closure = function.__closure__ or ()
+        cloned_cells = []
+        for original_cell in original_closure:
+            cell_entry = task4b_storage_cell_clones.get(id(original_cell))
+            if cell_entry is None or cell_entry[0] is not original_cell:
+                cell_entry = [
+                    original_cell,
+                    task4b_new_storage_cell(None),
+                    False,
+                ]
+                task4b_storage_cell_clones[id(original_cell)] = cell_entry
+            cloned_cells.append(cell_entry[1])
+        cloned = task4b_storage_function_type(
+            function.__code__,
+            function.__globals__,
+            function.__name__,
+            function.__defaults__,
+            tuple(cloned_cells) if cloned_cells else None,
+        )
+        cloned.__kwdefaults__ = (
+            dict(function.__kwdefaults__)
+            if type(function.__kwdefaults__) is dict else None
+        )
+        task4b_storage_function_clones[id(function)] = (function, cloned)
+        for original_cell in original_closure:
+            cell_entry = task4b_storage_cell_clones[id(original_cell)]
+            if not cell_entry[2]:
+                cell_entry[2] = True
+                original_value = original_cell.cell_contents
+                cloned_value = (
+                    task4b_clone_storage_function(original_value)
+                    if type(original_value) is task4b_storage_function_type
+                    else original_value
+                )
+                cell_entry[1].cell_contents = cloned_value
+        return cloned
+
+    task4b_storage_consume_runner = task4b_clone_storage_function(
+        task4b_storage_consume
+    )
+    task4b_storage_view_materialize_runner = (
+        task4b_clone_storage_function(task4b_storage_view_materialize)
+    )
+    task4b_storage_view_close_runner = task4b_clone_storage_function(
+        task4b_storage_view_close
+    )
+    task4b_storage_snapshot_projection_runner = (
+        task4b_clone_storage_function(task4b_storage_snapshot_projection)
+    )
+    task4b_storage_snapshot_close_runner = (
+        task4b_clone_storage_function(task4b_storage_snapshot_close)
+    )
+    task4b_storage_function_graph = tuple(
+        (
+            original,
+            original.__code__,
+            original.__globals__,
+            original.__defaults__,
+            original.__kwdefaults__,
+            (
+                tuple(sorted(original.__kwdefaults__.items()))
+                if type(original.__kwdefaults__) is dict else None
+            ),
+            original.__closure__ or (),
+            tuple(
+                cell.cell_contents
+                for cell in (original.__closure__ or ())
+            ),
+        )
+        for original, _cloned in task4b_storage_function_clones.values()
+    )
+    task4b_storage_runner_graph = tuple(
+        (
+            cloned,
+            cloned.__code__,
+            cloned.__globals__,
+            cloned.__defaults__,
+            cloned.__kwdefaults__,
+            (
+                tuple(sorted(cloned.__kwdefaults__.items()))
+                if type(cloned.__kwdefaults__) is dict else None
+            ),
+            cloned.__closure__ or (),
+            tuple(
+                cell.cell_contents
+                for cell in (cloned.__closure__ or ())
+            ),
+        )
+        for _original, cloned in task4b_storage_function_clones.values()
+    )
+    task4b_storage_function_clones = None
+    task4b_storage_cell_clones = None
+
+    def task4b_storage_function_graph_is_current(graph):
+        try:
+            for (
+                function,
+                code,
+                function_globals,
+                defaults,
+                kwdefaults,
+                kwdefault_items,
+                closure,
+                closure_values,
+            ) in graph:
+                current_closure = function.__closure__ or ()
+                if (
+                    function.__code__ is not code
+                    or function.__globals__ is not function_globals
+                    or function.__defaults__ is not defaults
+                    or function.__kwdefaults__ is not kwdefaults
+                    or (
+                        kwdefault_items is not None
+                        and (
+                            type(function.__kwdefaults__) is not dict
+                            or len(function.__kwdefaults__)
+                            != len(kwdefault_items)
+                            or any(
+                                key not in function.__kwdefaults__
+                                or function.__kwdefaults__[key] is not value
+                                for key, value in kwdefault_items
+                            )
+                        )
+                    )
+                    or len(current_closure) != len(closure)
+                    or any(
+                        current is not expected
+                        for current, expected in zip(
+                            current_closure, closure
+                        )
+                    )
+                    or len(closure) != len(closure_values)
+                    or any(
+                        cell.cell_contents is not expected
+                        for cell, expected in zip(
+                            closure, closure_values
+                        )
+                    )
+                ):
+                    return False
+        except BaseException:
+            return False
+        return True
+
+    def task4b_storage_original_graph_is_current():
+        return task4b_storage_function_graph_is_current(
+            task4b_storage_function_graph
+        )
+
+    def task4b_storage_runner_graph_is_current():
+        return task4b_storage_function_graph_is_current(
+            task4b_storage_runner_graph
+        )
+
+    def task4b_storage_identity_is_current(runtime_sys):
+        return (
+            task4b_storage_original_graph_is_current()
+            and task4b_storage_runner_graph_is_current()
+            and
+            sys is task4b_runtime_sys
+            and runtime_sys is task4b_runtime_sys
+            and runtime_sys.modules.get(
+                "scripts.historical_foundry_storage"
+            ) is task4b_storage_module
+            and getattr(
+                task4b_scripts_package,
+                "historical_foundry_storage",
+                None,
+            ) is task4b_storage_module
+            and getattr(
+                task4b_storage_module,
+                "consume_production_historical_window_capability",
+                None,
+            ) is task4b_storage_consume
+            and task4b_storage_consume.__code__
+            is task4b_storage_consume_code
+            and getattr(
+                task4b_storage_module,
+                "_ProductionHistoricalWindowCapability",
+                None,
+            ) is task4b_storage_capability_class
+            and getattr(
+                task4b_storage_module,
+                "_ConsumedProductionHistoricalWindowCapabilityView",
+                None,
+            ) is task4b_storage_consumed_view_class
+            and getattr(
+                task4b_storage_module,
+                "_HistoricalWindowCaptureReplaySource",
+                None,
+            ) is task4b_storage_source_class
+            and getattr(
+                task4b_storage_module,
+                "HistoricalRunStagingSnapshot",
+                None,
+            ) is task4b_storage_snapshot_class
+            and getattr(
+                task4b_storage_consumed_view_class,
+                "_materialize_staging_snapshot_from_bound_scan",
+                None,
+            ) is task4b_storage_view_materialize
+            and task4b_storage_view_materialize.__code__
+            is task4b_storage_view_materialize_code
+            and getattr(
+                task4b_storage_consumed_view_class, "close", None
+            ) is task4b_storage_view_close
+            and task4b_storage_view_close.__code__
+            is task4b_storage_view_close_code
+            and getattr(
+                task4b_storage_snapshot_class,
+                "frozen_identity_projection",
+                None,
+            ) is task4b_storage_snapshot_projection
+            and task4b_storage_snapshot_projection.__code__
+            is task4b_storage_snapshot_projection_code
+            and getattr(
+                task4b_storage_snapshot_class, "close", None
+            ) is task4b_storage_snapshot_close
+            and task4b_storage_snapshot_close.__code__
+            is task4b_storage_snapshot_close_code
+        )
+    if (
+        task4b_scripts_package is None
+        or task4b_runtime_sys.modules.get(
+            "scripts.historical_foundry_storage"
+        ) is not task4b_storage_module
+        or getattr(
+            task4b_scripts_package, "historical_foundry_storage", None
+        ) is not task4b_storage_module
+    ):
+        raise RuntimeError("historical storage module identity is unavailable")
+    _verify_decimal_layout()
+    if _DECIMAL_LAYOUT_VERIFIED is not True:
+        raise RuntimeError("historical Decimal layout did not stabilize")
+
+    scan_module = sys.modules[__name__]
+    contracts_module = sys.modules.get(
+        "scripts.historical_foundry_contracts"
+    )
+    route_module = sys.modules.get("scripts.route_cost_evidence")
+    task4b_canonical_modules = (
+        ("scan", "scripts.historical_foundry_scan", scan_module),
+        ("rpc", "scripts.historical_foundry_rpc", _transport_core),
+        (
+            "contracts", "scripts.historical_foundry_contracts",
+            contracts_module,
+        ),
+        ("route", "scripts.route_cost_evidence", route_module),
+    )
+    if any(
+        module is None or module.__name__ != canonical_name
+        for _role, canonical_name, module in task4b_canonical_modules
+    ):
+        raise RuntimeError("historical semantic module identity is unavailable")
+
+    def _task4b_module(role: str) -> Any:
+        for candidate_role, _canonical_name, module in task4b_canonical_modules:
+            if candidate_role == role:
+                return module
+        raise RuntimeError("historical semantic module role is invalid")
+
+    def _task4b_resolve(module: Any, qualified_name: str) -> Any:
+        value = module
+        for component in qualified_name.split("."):
+            value = getattr(value, component)
+        return value
+
+    contracts_callable_names = (
+        "_next_base_fee", "_nonnegative_int", "_positive_int",
+        "next_historical_base_fee",
+    )
+    rpc_callable_names = (
+        "_abi_string", "_address_argument", "_address_word",
+        "_allowance_calldata", "_anchor_bindings", "_anchor_projection",
+        "_balance_calldata", "_binding", "_build_closed_plan", "_call",
+        "_canonical_bytes", "_copy_json", "_derived_bindings",
+        "_derived_templates", "_feed_projection", "_fixed_templates",
+        "_guard_exact_json", "_hash32", "_hex_bytes", "_inventory",
+        "_latest_round_projection", "_materialize_historical_anchor_stage",
+        "_project_capture", "_quantity",
+        "_require_derived_authority_addresses", "_resolve_template",
+        "_resource_error", "_runtime_projection", "_stage_identity",
+        "_template", "_token_projection", "_typed_hash", "_uint_word",
+        "_validate_closed_plan", "_validate_historical_anchor_capture",
+        "_validate_success_rows", "_venue_projection", "_zero_word",
+        "build_factory_get_pair_calldata", "keccak256",
+        "project_historical_anchor_capture", "solidity_allowance_storage_key",
+        "solidity_balance_storage_key",
+    )
+    scan_callable_names = (
+        "_anchor_state_authority", "_build_historical_block_header_request",
+        "_cached_decimal_projection", "_canonical_hash_value",
+        "_canonical_json_bytes", "_captured_failure_pair",
+        "_coefficient_from_digits", "_decode_price_result",
+        "_descriptor_root_failure_pair", "_expected_descriptor", "_failure",
+        "_fee_quantity_list", "_frame", "_guard_historical_json_value",
+        "_header_descriptor_rows", "_header_from_inventory_row",
+        "_header_hash_at", "_header_root_count",
+        "_header_row_from_projection", "_hex_payload",
+        "_historical_json_int_token_bytes", "_inventory_hasher",
+        "_inventory_update", "_iterator_once", "_make_descriptor",
+        "_next_input", "_normalized_anchor_from_capture",
+        "_normalized_from_raw", "_parse_quantity",
+        "_preflight_historical_decimal_tuple",
+        "_project_complete_historical_window_root", "_project_fee_root",
+        "_project_final_anchor_root", "_project_header_root",
+        "_project_historical_block_header_success",
+        "_project_lower_observation", "_project_price_root",
+        "_project_reserve_root", "_ratio_decimal_token", "_require_hash32",
+        "_require_hash64", "_require_raw_json_containers", "_require_uint",
+        "_response_result", "_root_header_rows", "_state_descriptor_rows",
+        "_typed_hash", "_validate_anchor_capture",
+        "_validate_compact_observation", "_validate_descriptor",
+        "_validate_header_inventory", "_validate_historical_anchor_capture",
+        "_validate_lower_capture", "_validate_normalized_header",
+        "_validate_plan_shape", "_verify_decimal_layout",
+        "build_historical_window_request_plan",
+        "iter_historical_header_request_batches",
+        "iter_historical_state_request_batches", "next_historical_base_fee",
+        "project_historical_lower_bound_capture",
+    )
+    route_callable_names = (
+        "_abi_address_word", "_address", "_exact_int", "_keccak_f1600",
+        "_pad_address", "_pad_slot", "_rotate_left_64", "_uint256",
+        "build_factory_get_pair_calldata", "keccak256",
+        "solidity_allowance_storage_key", "solidity_balance_storage_key",
+    )
+    class_callable_bindings = (
+        ("scan", "Decimal"),
+        ("scan", "HistoricalWindowProjectionError"),
+        ("scan", "MappingProxyType"),
+        ("scan", "_ArchiveRpcError"),
+        ("scan", "_OneShotIterator"),
+        ("route", "RouteCostEvidenceError"),
+    )
+    module_attribute_callable_names = (
+        ("rpc", "hashlib", "sha256"),
+        ("rpc", "json", "dumps"),
+        ("rpc", "json", "loads"),
+        ("scan", "hashlib", "sha256"),
+        ("scan", "json", "dumps"),
+        ("scan", "platform", "python_implementation"),
+    )
+    rpc_constant_names = (
+        "_ADDRESS", "_AGGREGATOR", "_ALLOWANCE", "_ANCHOR_RESULT_FIELDS",
+        "_BALANCE_OF", "_CAPTURE_FIELDS", "_CAPTURE_SCHEMA", "_DECIMALS",
+        "_DESCRIPTION", "_EXECUTOR", "_FACTORY", "_FEED_PROXY",
+        "_FIXED_AUTHORITY_ADDRESSES", "_HASH32", "_HEX_BYTES",
+        "_INVENTORY_FIELDS", "_LATEST_ROUND", "_MAX_ABI_BYTES",
+        "_MAX_JSON_NODES", "_MAX_NESTING_DEPTH",
+        "_MAX_ORDINARY_STRING_BYTES", "_MAX_RUNTIME_BYTES",
+        "_MAX_SCALAR_BYTES", "_PARAMS_HASH_DOMAIN", "_PHASE",
+        "_PLAN_FIELDS", "_PLAN_SCHEMA", "_QUANTITY", "_REQUEST_HASH_DOMAIN",
+        "_RESPONSE_FIELDS", "_RESPONSE_HASH_DOMAIN", "_RESULT_HASH_DOMAIN",
+        "_SENDER", "_STAGE_FIELDS", "_TEMPLATE_FIELDS", "_TOKEN0",
+        "_TOKEN1", "_UNI", "_VENUES", "_WETH", "_WETH_GETTER",
+        "_WIRE_FIELDS",
+    )
+    scan_constant_names = (
+        "_ACTIVE_HEADER_VALIDATION", "_ADDRESS", "_ANCHOR_CAPTURE_DOMAIN",
+        "_DECIMAL_LAYOUT_VERIFIED", "_DESCRIPTOR_FIELDS", "_END_OF_INPUT",
+        "_ERROR_PAIRS", "_FEE_INVENTORY_DOMAIN", "_FINAL_ANCHOR_DOMAIN",
+        "_GET_RESERVES_SELECTOR", "_HASH32", "_HASH64",
+        "_HEADER_INVENTORY_DOMAIN", "_HEADER_INVENTORY_FIELDS",
+        "_HEADER_ROW_FIELDS", "_LATEST_ROUND_SELECTOR", "_LOOKBACK_SECONDS",
+        "_LOWER_CAPTURE_DOMAIN", "_LOWER_FIELDS", "_MAX_BLOCK_COUNT",
+        "_MAX_DEPTH", "_MAX_JSON_NODES", "_MAX_NUMERIC_TOKEN_BYTES",
+        "_MAX_RATIO_DECIMAL_OBJECT_BYTES", "_MAX_RATIO_TOKEN_BYTES",
+        "_MAX_SCALAR_BYTES", "_MAX_STRING_BYTES", "_MAX_UINT112",
+        "_MAX_UINT256", "_MAX_UINT64", "_MAX_UINT80",
+        "_NEGATIVE_JSON_INT_MAGNITUDE_EXCLUSIVE",
+        "_NONNEGATIVE_JSON_INT_EXCLUSIVE", "_NORMALIZED_HEADER_DOMAIN",
+        "_NORMALIZED_HEADER_FIELDS", "_OBSERVATION_FIELDS", "_PLAN_FIELDS",
+        "_PRICE_INVENTORY_DOMAIN", "_QUANTITY", "_RAW_HEADER_FIELDS",
+        "_REQUEST_DOMAIN", "_RESERVE_INVENTORY_DOMAIN", "_RESPONSE_DOMAIN",
+        "_RESULT_DOMAIN", "_ROOT_BATCH_POLICY", "_SUCCESS_FIELDS",
+        "_VENUE_ORDER", "_WIRE_FIELDS",
+    )
+    route_constant_names = (
+        "_ADDRESS", "_KECCAK_ROTATION", "_KECCAK_ROUND_CONSTANTS", "_MASK64",
+    )
+    regex_constant_names = frozenset((
+        ("rpc", "_ADDRESS"), ("rpc", "_HASH32"),
+        ("rpc", "_HEX_BYTES"), ("rpc", "_QUANTITY"),
+        ("scan", "_ADDRESS"), ("scan", "_HASH32"),
+        ("scan", "_HASH64"), ("scan", "_QUANTITY"),
+        ("route", "_ADDRESS"),
+    ))
+
+    def _task4b_constant_projection(role: str, name: str, value: Any) -> Any:
+        if (role, name) in regex_constant_names:
+            return ("regex", type(value), value.pattern, value.flags)
+        if (role, name) == ("scan", "_ROOT_BATCH_POLICY"):
+            if type(value) is not dict:
+                raise RuntimeError("historical semantic table is invalid")
+            return ("dict", dict, tuple(sorted(dict.items(value))))
+        if (role, name) == ("scan", "_ACTIVE_HEADER_VALIDATION"):
+            return ("contextvar", type(value))
+        if (role, name) == ("scan", "_END_OF_INPUT"):
+            return ("identity_only", type(value))
+        return ("value", type(value), value)
+
+    task4b_semantic_roots = (
+        ("rpc", "_materialize_historical_anchor_stage",
+         _transport_core._materialize_historical_anchor_stage),
+        ("rpc", "project_historical_anchor_capture",
+         _transport_core.project_historical_anchor_capture),
+        ("scan", "project_historical_lower_bound_capture",
+         project_historical_lower_bound_capture),
+        ("scan", "build_historical_window_request_plan",
+         build_historical_window_request_plan),
+        ("scan", "iter_historical_header_request_batches",
+         iter_historical_header_request_batches),
+        ("scan", "iter_historical_state_request_batches",
+         iter_historical_state_request_batches),
+        ("scan", "_project_complete_historical_window_root",
+         _project_complete_historical_window_root),
+    )
+    task4b_semantic_callables = tuple(
+        (role, name, _task4b_resolve(_task4b_module(role), name))
+        for role, names in (
+            ("contracts", contracts_callable_names),
+            ("rpc", rpc_callable_names),
+            ("scan", scan_callable_names),
+            ("route", route_callable_names),
+        )
+        for name in names
+    )
+    task4b_semantic_classes = tuple(
+        (role, name, _task4b_resolve(_task4b_module(role), name))
+        for role, name in class_callable_bindings
+    )
+    task4b_semantic_module_callables = tuple(
+        (
+            role, module_name, attribute_name,
+            _task4b_resolve(_task4b_module(role), module_name),
+            getattr(
+                _task4b_resolve(_task4b_module(role), module_name),
+                attribute_name,
+            ),
+        )
+        for role, module_name, attribute_name
+        in module_attribute_callable_names
+    )
+    task4b_semantic_constants = tuple(
+        (
+            role, name, _task4b_resolve(_task4b_module(role), name),
+            _task4b_constant_projection(
+                role, name, _task4b_resolve(_task4b_module(role), name)
+            ),
+        )
+        for role, names in (
+            ("rpc", rpc_constant_names),
+            ("scan", scan_constant_names),
+            ("route", route_constant_names),
+        )
+        for name in names
+    )
+    task4b_semantic_dependency_manifest = (
+        task4b_semantic_roots,
+        task4b_semantic_callables,
+        task4b_semantic_classes,
+        task4b_semantic_module_callables,
+        task4b_semantic_constants,
+    )
+    class_surface_names = (
+        ("scan", "_OneShotCursor"),
+        ("scan", "_OneShotCursor.__init__"),
+        ("scan", "_OneShotCursor.__iter__"),
+        ("scan", "_OneShotCursor.__next__"),
+        ("scan", "_OneShotIterator.__init__"),
+        ("scan", "_OneShotIterator.__iter__"),
+        ("scan", "_OneShotIterator.__next__"),
+        ("scan", "_OneShotIterator._advance"),
+        ("scan", "HistoricalWindowProjectionError.__init__"),
+    )
+    task4b_class_surfaces = tuple(
+        (role, name, _task4b_resolve(_task4b_module(role), name))
+        for role, name in class_surface_names
+    )
+    driver_only_callable_names = (
+        "project_historical_header_inventory",
+        "project_historical_window_projection",
+        "_validate_bound_inputs", "_coverage_pair",
+        "_validate_header_base_fee_chain", "_anchor_price_authority",
+        "_stage_range", "_request_stage_ranges",
+    )
+    task4b_driver_callable_anchors = tuple(
+        ("scan", name, _task4b_resolve(scan_module, name))
+        for name in driver_only_callable_names
+    )
+    task4b_driver_constant_anchors = (
+        (
+            "scan", "_CONTINUOUS_IDS_DOMAIN", _CONTINUOUS_IDS_DOMAIN,
+            _task4b_constant_projection(
+                "scan", "_CONTINUOUS_IDS_DOMAIN", _CONTINUOUS_IDS_DOMAIN
+            ),
+        ),
+    )
+    projection_error_original = HistoricalWindowProjectionError
+    archive_error_original = _ArchiveRpcError
+
+    def _task4b_final_identity_projection_error(
+    ) -> HistoricalWindowProjectionError:
+        error = RuntimeError.__new__(
+            projection_error_original,
+            "historical window projection failed",
+        )
+        object.__setattr__(error, "_reason_code", "authority_mismatch")
+        object.__setattr__(error, "_failure_kind", "final_identity_drift")
+        object.__setattr__(error, "_sealed", True)
+        return error
+
+    def _verify_task4b_semantic_dependency_manifest(
+        *, expected_header_validation: Any = None
+    ) -> None:
+        import sys as runtime_sys
+
+        closed_manifest = task4b_semantic_dependency_manifest
+        del closed_manifest
+        drifted = False
+        try:
+            for _role, canonical_name, original_module in task4b_canonical_modules:
+                if runtime_sys.modules.get(canonical_name) is not original_module:
+                    raise ValueError("historical semantic module identity drift")
+            for group in (
+                task4b_semantic_roots,
+                task4b_semantic_callables,
+                task4b_semantic_classes,
+                task4b_class_surfaces,
+                task4b_driver_callable_anchors[2:],
+            ):
+                for role, name, original in group:
+                    if _task4b_resolve(_task4b_module(role), name) is not original:
+                        raise ValueError("historical semantic callable drift")
+            for (
+                role, module_name, attribute_name,
+                original_module, original_attribute,
+            ) in task4b_semantic_module_callables:
+                current_module = _task4b_resolve(
+                    _task4b_module(role), module_name
+                )
+                if (
+                    current_module is not original_module
+                    or getattr(current_module, attribute_name)
+                    is not original_attribute
+                ):
+                    raise ValueError("historical semantic module callable drift")
+            for role, name, original, projection in (
+                task4b_semantic_constants + task4b_driver_constant_anchors
+            ):
+                current = _task4b_resolve(_task4b_module(role), name)
+                if (
+                    current is not original
+                    or _task4b_constant_projection(role, name, current)
+                    != projection
+                ):
+                    raise ValueError("historical semantic constant drift")
+            active_header_validation = _ACTIVE_HEADER_VALIDATION.get()
+            if expected_header_validation is None:
+                if active_header_validation is not None:
+                    raise ValueError("historical semantic context is active")
+            elif (
+                type(expected_header_validation) is not tuple
+                or len(expected_header_validation) != 2
+                or type(active_header_validation) is not tuple
+                or len(active_header_validation) != 2
+                or active_header_validation[0]
+                is not expected_header_validation[0]
+                or active_header_validation[1]
+                is not expected_header_validation[1]
+            ):
+                raise ValueError("historical semantic context differs")
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                raise
+            drifted = True
+        if drifted:
+            raise _task4b_final_identity_projection_error()
+        return None
 
     def _consume_scheduler_logical_root(
         *, claim: Any, spool: Any, logical_root: Any
@@ -672,6 +1328,15 @@ def _initialize_production_historical_window_authorities():
         "logical_batch_index", "request_ids", "request_count",
         "canonical_request_sha256", "response_ids",
         "predicted_success_exchange_index",
+    )
+    post_leaf_keys = (
+        "schema", "segment", "segment_local_index", "leaf_index",
+        "request_ids", "request_count", "canonical_request_sha256",
+        "response_ids", "exchange_index", "logical_batch_index",
+        "attempt_index", "request_byte_count", "decoded_byte_count",
+        "decoded_sha256", "wire_byte_count", "wire_sha256",
+        "wire_hash_authority", "spool_member_index", "spool_offset",
+        "spool_length", "spool_member_sha256",
     )
     pre_root_keys = {
         "historical_foundry_anchor_stage_pre_root_ledger/v1": (
@@ -1185,14 +1850,27 @@ def _initialize_production_historical_window_authorities():
                             if lower_capture is None:
                                 if anchor_capture is None:
                                     raise ValueError("historical anchor replay missing")
+                                lower_raw_end = object()
+                                lower_probe_raw.append(lower_raw_end)
+                                lower_witness_raw.append(lower_raw_end)
+                                lower_probe_raw.reverse()
+                                lower_witness_raw.reverse()
                                 lower_capture = project_historical_lower_bound_capture(
                                     anchor_capture=anchor_capture,
                                     lookback_seconds=pre_record[
                                         "lookback_seconds"
                                     ],
-                                    search_probes=iter(lower_probe_raw),
-                                    boundary_witness=iter(lower_witness_raw),
+                                    search_probes=iter(
+                                        lower_probe_raw.pop, lower_raw_end
+                                    ),
+                                    boundary_witness=iter(
+                                        lower_witness_raw.pop, lower_raw_end
+                                    ),
                                 )
+                                if lower_probe_raw or lower_witness_raw:
+                                    raise ValueError(
+                                        "historical lower replay did not drain"
+                                    )
                                 replay_plan = build_historical_window_request_plan(
                                     lower_bound_capture=lower_capture,
                                     anchor_capture=anchor_capture,
@@ -1534,6 +2212,45 @@ def _initialize_production_historical_window_authorities():
                 "authority_mismatch",
                 "historical_window_reconciliation_mismatch",
             )
+        record["state"] = "consumed_failed"
+        surface_drifted = False
+        current_scan_objects = ()
+        exported_scan_names = None
+        exported_scan_objects = None
+        try:
+            current_scan_objects = tuple(
+                _task4b_resolve(scan_module, name)
+                for name in task4b_scan_local_names
+            )
+            exported_scan_names = getattr(
+                scan_module, "_TASK4B_SCAN_LOCAL_SURFACE_NAMES"
+            )
+            exported_scan_objects = getattr(
+                scan_module, "_TASK4B_SCAN_LOCAL_SURFACE_OBJECTS"
+            )
+        except (AttributeError, TypeError):
+            surface_drifted = True
+        if (
+            surface_drifted
+            or sys.modules.get("scripts.historical_foundry_scan")
+            is not scan_module
+            or type(task4b_scan_local_originals) is not tuple
+            or len(task4b_scan_local_originals) != 5
+            or exported_scan_names != task4b_scan_local_names
+            or type(exported_scan_objects) is not tuple
+            or len(exported_scan_objects) != 5
+            or not all(
+                current is original is exported
+                for current, original, exported in zip(
+                    current_scan_objects,
+                    task4b_scan_local_originals,
+                    exported_scan_objects,
+                )
+            )
+        ):
+            raise _ArchiveRpcError(
+                "authority_mismatch", "final_identity_drift"
+            )
         binding = record.get("binding")
         if (
             type(binding) is not tuple
@@ -1598,7 +2315,10 @@ def _initialize_production_historical_window_authorities():
                 "historical_window_reconciliation_mismatch",
             )
         record["state"] = "consumed_by_mint"
-        return None
+        return (
+            task4b_attestation_provenance,
+            task4b_scan_local_originals,
+        )
 
     def _capture_production_historical_window_core(
         *, claim: Any, spool: Any, delivery_guard: List[Any]
@@ -1982,12 +2702,19 @@ def _initialize_production_historical_window_authorities():
             )
             for kind_index, block_number in enumerate(witness_numbers):
                 observe(block_number, "boundary_witness", kind_index)
+            lower_raw_end = object()
+            probe_raw.append(lower_raw_end)
+            witness_raw.append(lower_raw_end)
+            probe_raw.reverse()
+            witness_raw.reverse()
             lower_capture = project_historical_lower_bound_capture(
                 anchor_capture=anchor_capture,
                 lookback_seconds=lookback_seconds,
-                search_probes=iter(probe_raw),
-                boundary_witness=iter(witness_raw),
+                search_probes=iter(probe_raw.pop, lower_raw_end),
+                boundary_witness=iter(witness_raw.pop, lower_raw_end),
             )
+            if probe_raw or witness_raw:
+                raise ValueError("historical lower capture did not drain")
             plan = build_historical_window_request_plan(
                 lower_bound_capture=lower_capture,
                 anchor_capture=anchor_capture,
@@ -2253,6 +2980,2328 @@ def _initialize_production_historical_window_authorities():
             raise
         raise RuntimeError("unreachable historical window delivery state")
 
+    header_declaration = project_historical_header_inventory
+    window_declaration = project_historical_window_projection
+    driver_ack = object()
+    driver_expect_eof = object()
+    driver_eof = object()
+    task4b_driver_provenance = object()
+    task4b_active_driver = contextvars.ContextVar(
+        "historical_foundry_active_task4b_semantic_driver",
+        default=None,
+    )
+    task4b_materialize_anchor_stage = task4b_semantic_roots[0][2]
+    task4b_project_anchor_capture = task4b_semantic_roots[1][2]
+    task4b_project_lower_capture = task4b_semantic_roots[2][2]
+    task4b_build_window_plan = task4b_semantic_roots[3][2]
+    task4b_iter_header_batches = task4b_semantic_roots[4][2]
+    task4b_iter_state_batches = task4b_semantic_roots[5][2]
+    task4b_project_complete_root = task4b_semantic_roots[6][2]
+
+    def _task4b_driver_transaction(kind: str) -> Any:
+        transaction = task4b_active_driver.get()
+        if transaction is None:
+            return None
+        if (
+            type(transaction) is not dict
+            or transaction.get("provenance") is not task4b_driver_provenance
+            or transaction.get("state") != "constructing_" + kind
+            or transaction.get("kind") != kind
+            or type(transaction.get("record")) is not dict
+            or transaction["record"].get("state")
+            != "capture_replay_bound"
+        ):
+            _reject_task4b_capability()
+        transaction["state"] = "active_" + kind
+        return transaction
+
+    def _verify_task4b_driver_transaction(
+        transaction: Dict[str, Any], kind: str
+    ) -> None:
+        if (
+            type(transaction) is not dict
+            or task4b_active_driver.get() is not transaction
+            or transaction.get("provenance") is not task4b_driver_provenance
+            or transaction.get("state") != "active_" + kind
+            or transaction.get("kind") != kind
+            or type(transaction.get("record")) is not dict
+            or transaction["record"].get("state")
+            != "capture_replay_bound"
+        ):
+            _reject_task4b_capability()
+        return None
+
+    def _call_task4b_semantic_root(
+        function: Callable[..., Any],
+        *args: Any,
+        expected_header_validation: Any = None,
+        **kwargs: Any
+    ) -> Any:
+        _verify_task4b_semantic_dependency_manifest(
+            expected_header_validation=expected_header_validation
+        )
+        body_value = None
+        body_error = None
+        body_traceback = None
+        try:
+            body_value = function(*args, **kwargs)
+        except BaseException as error:
+            body_error = error
+            body_traceback = error.__traceback__
+        post_error = None
+        post_traceback = None
+        try:
+            _verify_task4b_semantic_dependency_manifest(
+                expected_header_validation=expected_header_validation
+            )
+        except BaseException as error:
+            post_error = error
+            post_traceback = error.__traceback__
+        if body_error is not None and not isinstance(body_error, Exception):
+            body_error.__context__ = None
+            body_error.__cause__ = None
+            raise body_error.with_traceback(body_traceback) from None
+        if post_error is not None and not isinstance(post_error, Exception):
+            post_error.__context__ = None
+            post_error.__cause__ = None
+            raise post_error.with_traceback(post_traceback) from None
+        if post_error is not None:
+            raise post_error.with_traceback(post_traceback) from None
+        if body_error is not None:
+            raise body_error.with_traceback(body_traceback) from None
+        _verify_task4b_semantic_dependency_manifest(
+            expected_header_validation=expected_header_validation
+        )
+        return body_value
+
+    def _new_task4b_exchange_replay(
+        *, source: Any
+    ) -> Iterator["_ProductionHistoricalWindowCaptureReplayEvent"]:
+        def verify_replay_ledgers(record: Dict[str, Any]) -> None:
+            replay_invalid = False
+            observed = None
+            try:
+                observed = reconciliation_replay_digests(
+                    record["post_root_ledger"],
+                    record["post_leaf_ledger"],
+                    record["compact_projection"],
+                )
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                replay_invalid = True
+            if replay_invalid:
+                raise _ArchiveRpcError(
+                    "authority_mismatch",
+                    "historical_window_reconciliation_mismatch",
+                )
+            if observed != record.get("replay_digests"):
+                raise _ArchiveRpcError(
+                    "authority_mismatch",
+                    "historical_window_reconciliation_mismatch",
+                )
+            return None
+
+        matches = []
+        for reconciliation_reference, candidate in tuple(
+            reconciliation_registry.values()
+        ):
+            source_reference = candidate.get("capture_source_ref")
+            if (
+                callable(source_reference)
+                and source_reference() is source
+            ):
+                matches.append((reconciliation_reference, candidate))
+        if len(matches) != 1:
+            _reject_task4b_capability()
+        reconciliation_reference, record = matches[0]
+        reconciliation = reconciliation_reference()
+        if (
+            type(reconciliation)
+            is not _ProductionHistoricalWindowReconciliation
+            or record.get("capture_reconciliation_ref")() is not reconciliation
+            or record.get("capture_view_ref")() is None
+        ):
+            _reject_task4b_capability()
+        _verify_task4b_scan_association_currentness(
+            reconciliation=reconciliation,
+            record=record,
+            expected_state="capture_replay_bound",
+        )
+        final_identity_error = False
+        try:
+            _verify_task4b_semantic_dependency_manifest()
+        except projection_error_original as error:
+            if (
+                error.reason_code == "authority_mismatch"
+                and error.failure_kind == "final_identity_drift"
+            ):
+                final_identity_error = True
+            else:
+                raise
+        if final_identity_error:
+            raise archive_error_original(
+                "authority_mismatch", "final_identity_drift"
+            ) from None
+        verify_replay_ledgers(record)
+        projection_invalid = False
+        try:
+            finalization = dict(record["finalization"])
+            compact_rows = finalization["successful_exchanges"]
+            post_leaves = record["post_leaf_ledger"]
+            post_roots = record["post_root_ledger"]
+        except (KeyError, TypeError, ValueError):
+            projection_invalid = True
+        if projection_invalid:
+            raise _ArchiveRpcError(
+                "authority_mismatch",
+                "historical_window_reconciliation_mismatch",
+            )
+        if (
+            type(compact_rows) is not tuple
+            or type(post_leaves) is not tuple
+            or type(post_roots) is not tuple
+            or not compact_rows
+            or len(compact_rows) != len(post_leaves)
+        ):
+            raise _ArchiveRpcError(
+                "authority_mismatch",
+                "historical_window_reconciliation_mismatch",
+            )
+        leaves_by_logical_batch = {}
+        for leaf in post_leaves:
+            logical_batch_index = (
+                leaf.get("logical_batch_index")
+                if type(leaf) is dict else None
+            )
+            if type(logical_batch_index) is not int:
+                raise _ArchiveRpcError(
+                    "authority_mismatch",
+                    "historical_window_reconciliation_mismatch",
+                )
+            leaves_by_logical_batch.setdefault(
+                logical_batch_index, []
+            ).append(leaf)
+        root_by_logical_batch = {}
+        for expected_logical_index, root in enumerate(post_roots, 1):
+            logical_batch_index = (
+                root.get("logical_batch_index")
+                if type(root) is dict else None
+            )
+            leaves = leaves_by_logical_batch.get(logical_batch_index)
+            intervals = (
+                root.get("observed_http_413_intervals", ())
+                if type(root) is dict else None
+            )
+            success_indices = (
+                root.get("success_exchange_indices")
+                if type(root) is dict else None
+            )
+            attempt_count = (
+                root.get("attempt_count")
+                if type(root) is dict else None
+            )
+            if (
+                type(logical_batch_index) is not int
+                or logical_batch_index <= 0
+                or logical_batch_index != expected_logical_index
+                or logical_batch_index in root_by_logical_batch
+                or type(leaves) is not list
+                or not leaves
+                or type(intervals) is not tuple
+                or type(success_indices) is not tuple
+                or type(attempt_count) is not int
+                or attempt_count <= 0
+                or root.get("leaf_count") != len(leaves)
+                or success_indices
+                != tuple(leaf.get("exchange_index") for leaf in leaves)
+                or tuple(leaf.get("leaf_index") for leaf in leaves)
+                != tuple(range(len(leaves)))
+                or any(
+                    type(interval) is not dict
+                    or tuple(interval) != (
+                        "attempt_index", "first_request_id",
+                        "last_request_id", "request_count",
+                    )
+                    for interval in intervals
+                )
+                or tuple(sorted(
+                    tuple(
+                        interval["attempt_index"]
+                        for interval in intervals
+                    )
+                    + tuple(
+                        leaf.get("attempt_index") for leaf in leaves
+                    )
+                )) != tuple(range(1, attempt_count + 1))
+            ):
+                raise _ArchiveRpcError(
+                    "authority_mismatch",
+                    "historical_window_reconciliation_mismatch",
+                )
+            root_by_logical_batch[logical_batch_index] = root
+        if len(leaves_by_logical_batch) != len(root_by_logical_batch):
+            raise _ArchiveRpcError(
+                "authority_mismatch",
+                "historical_window_reconciliation_mismatch",
+            )
+
+        def drive() -> Iterator[
+            "_ProductionHistoricalWindowCaptureReplayEvent"
+        ]:
+            completed = False
+            ordinary_failure = False
+            identity_drift = False
+            header_driver = None
+            window_driver = None
+            driver_token = None
+            transaction = {
+                "provenance": task4b_driver_provenance,
+                "state": "installing",
+                "kind": None,
+                "record": record,
+                "source": source,
+            }
+            compact_position = [0]
+
+            def root_role(root: Dict[str, Any]) -> str:
+                segment = root.get("segment")
+                if segment == "anchor_stage":
+                    return "anchor_stage"
+                if segment == "lower_observation":
+                    return "lower_observation"
+                if segment != "window_root":
+                    raise ValueError("historical capture root segment differs")
+                role = {
+                    "header": "headers",
+                    "reserve": "reserves",
+                    "price": "prices",
+                    "fee_history": "fees",
+                    "final_anchor": "final_anchor",
+                }.get(root.get("kind"))
+                if role is None:
+                    raise ValueError("historical capture root role differs")
+                return role
+
+            def emit(payload: Tuple[Any, ...]) -> Iterator[
+                "_ProductionHistoricalWindowCaptureReplayEvent"
+            ]:
+                _verify_task4b_scan_association_currentness(
+                    reconciliation=reconciliation,
+                    record=record,
+                    expected_state="capture_replay_bound",
+                )
+                _verify_task4b_semantic_dependency_manifest()
+                expected_event_index = record.get("next_event_index")
+                event = _issue_task4b_capture_replay_event(
+                    record=record, source=source, payload=payload
+                )
+                _verify_task4b_semantic_dependency_manifest()
+                yield event
+                if (
+                    capture_replay_event_registry.get(id(event)) is not None
+                    or record.get("live_event") is not None
+                    or record.get("event_issuer_state") != "ready"
+                    or record.get("next_event_index")
+                    != expected_event_index + 1
+                ):
+                    _reject_task4b_capability()
+                return None
+
+            def read_root(
+                stream: Iterator[Any], root: Dict[str, Any]
+            ) -> Iterator[Any]:
+                logical_batch_index = root["logical_batch_index"]
+                leaves = leaves_by_logical_batch.get(logical_batch_index)
+                success_indices = root.get("success_exchange_indices")
+                if (
+                    type(leaves) is not list
+                    or type(success_indices) is not tuple
+                    or success_indices
+                    != tuple(leaf.get("exchange_index") for leaf in leaves)
+                ):
+                    raise ValueError("historical capture root leaves differ")
+                if root["segment"] == "lower_observation":
+                    request_ids = (root.get("request_id"),)
+                    response_ids = (root.get("response_id"),)
+                    local_index = root.get("observation_index")
+                else:
+                    request_ids = root.get("request_ids")
+                    response_ids = root.get("response_ids", request_ids)
+                    local_index = (
+                        root.get("stage_index")
+                        if root["segment"] == "anchor_stage"
+                        else root.get("root_index")
+                    )
+                if (
+                    type(request_ids) is not tuple
+                    or not request_ids
+                    or type(response_ids) is not tuple
+                    or response_ids != request_ids
+                ):
+                    raise ValueError("historical capture root IDs differ")
+                requests_by_id = {}
+                responses_by_id = {}
+                for leaf_index, post_leaf in enumerate(leaves):
+                    position = compact_position[0]
+                    if position >= len(compact_rows) or position >= len(post_leaves):
+                        raise ValueError("historical capture exchange is missing")
+                    expected_compact = compact_rows[position]
+                    expected_leaf = post_leaves[position]
+                    try:
+                        supplied = next(stream)
+                    except StopIteration:
+                        raise ValueError(
+                            "historical capture source ended early"
+                        )
+                    if (
+                        type(supplied) is not tuple
+                        or len(supplied) != 3
+                        or type(supplied[0]) is not dict
+                        or type(supplied[1]) is not bytes
+                        or type(supplied[2]) is not bytes
+                        or type(expected_compact) is not dict
+                        or tuple(expected_compact) != receipt_keys
+                        or supplied[0] != expected_compact
+                        or tuple(supplied[0]) != receipt_keys
+                        or supplied[0].get("exchange_index") != position + 1
+                        or expected_leaf is not post_leaf
+                        or type(post_leaf) is not dict
+                        or tuple(post_leaf) != post_leaf_keys
+                        or post_leaf.get("schema")
+                        != "historical_foundry_leaf_ledger/v1"
+                        or post_leaf.get("logical_batch_index")
+                        != logical_batch_index
+                        or post_leaf.get("leaf_index") != leaf_index
+                        or post_leaf.get("segment") != root["segment"]
+                        or post_leaf.get("segment_local_index") != local_index
+                    ):
+                        raise ValueError(
+                            "historical capture exchange join differs"
+                        )
+                    compact, request_bytes, decoded_bytes = supplied
+                    for compact_key, leaf_key in (
+                        ("exchange_index", "exchange_index"),
+                        ("logical_batch_index", "logical_batch_index"),
+                        ("attempt_index", "attempt_index"),
+                        ("request_ids", "request_ids"),
+                        ("response_ids", "response_ids"),
+                        ("request_sha256", "canonical_request_sha256"),
+                        ("request_byte_count", "request_byte_count"),
+                        ("decoded_byte_count", "decoded_byte_count"),
+                        ("decoded_sha256", "decoded_sha256"),
+                        ("wire_byte_count", "wire_byte_count"),
+                        ("wire_sha256", "wire_sha256"),
+                        ("spool_member_index", "spool_member_index"),
+                        ("spool_offset", "spool_offset"),
+                        ("spool_length", "spool_length"),
+                        ("spool_member_sha256", "spool_member_sha256"),
+                    ):
+                        if compact[compact_key] != post_leaf[leaf_key]:
+                            raise ValueError(
+                                "historical capture leaf join differs"
+                            )
+                    if (
+                        success_indices[leaf_index]
+                        != compact["exchange_index"]
+                        or post_leaf["request_count"]
+                        != len(compact["request_ids"])
+                        or post_leaf["wire_hash_authority"]
+                        != "task2b_sealed_not_rehashed"
+                        or len(request_bytes)
+                        != compact["request_byte_count"]
+                        or hashlib.sha256(request_bytes).hexdigest()
+                        != compact["request_sha256"]
+                        or len(decoded_bytes)
+                        != compact["decoded_byte_count"]
+                        or hashlib.sha256(decoded_bytes).hexdigest()
+                        != compact["decoded_sha256"]
+                    ):
+                        raise ValueError(
+                            "historical capture physical leaf differs"
+                        )
+                    requests = bounded_reparse(request_bytes)
+                    responses = bounded_reparse(decoded_bytes)
+                    if (
+                        type(requests) is not list
+                        or type(responses) is not list
+                        or _transport_core._archive_canonical_bytes(requests)
+                        != request_bytes
+                        or tuple(row.get("id") for row in requests)
+                        != compact["request_ids"]
+                        or tuple(row.get("id") for row in responses)
+                        != compact["response_ids"]
+                        or len(requests) != len(responses)
+                        or set(compact["request_ids"])
+                        != set(compact["response_ids"])
+                    ):
+                        raise ValueError(
+                            "historical capture envelope differs"
+                        )
+                    for request in requests:
+                        request_id = request.get("id")
+                        if request_id in requests_by_id:
+                            raise ValueError(
+                                "historical capture request repeats"
+                            )
+                        requests_by_id[request_id] = request
+                    for response in responses:
+                        response_id = response.get("id")
+                        if response_id in responses_by_id:
+                            raise ValueError(
+                                "historical capture response repeats"
+                            )
+                        responses_by_id[response_id] = response
+                    payload = (
+                        "exchange", dict(compact), dict(post_leaf)
+                    )
+                    yield from emit(payload)
+                    compact_position[0] += 1
+                    del supplied, compact, request_bytes, decoded_bytes
+                    del requests, responses, payload
+                if (
+                    set(requests_by_id) != set(request_ids)
+                    or set(responses_by_id) != set(request_ids)
+                ):
+                    raise ValueError(
+                        "historical capture root response coverage differs"
+                    )
+                ordered_requests = tuple(
+                    requests_by_id[request_id] for request_id in request_ids
+                )
+                ordered_responses = tuple(
+                    responses_by_id[request_id] for request_id in request_ids
+                )
+                canonical_root = _transport_core._archive_canonical_bytes(
+                    list(ordered_requests)
+                )
+                if (
+                    len(canonical_root)
+                    != root.get("canonical_request_byte_count")
+                    or hashlib.sha256(canonical_root).hexdigest()
+                    != root.get("canonical_request_sha256")
+                ):
+                    raise ValueError(
+                        "historical capture root canonical request differs"
+                    )
+                return ordered_requests, ordered_responses
+
+            def root_payload(
+                post_root: Dict[str, Any], semantic_root: Any = None
+            ) -> Tuple[Any, ...]:
+                role = root_role(post_root)
+                if role in ("headers", "reserves", "prices", "fees"):
+                    if (
+                        type(semantic_root) is not dict
+                        or semantic_root.get("typed_role") != role
+                        or semantic_root.get("typed_row_count")
+                        != post_root.get("typed_row_count")
+                        or semantic_root.get("typed_logical_sha256")
+                        != post_root.get("typed_logical_sha256")
+                        or type(semantic_root.get("rows")) is not tuple
+                        or len(semantic_root["rows"])
+                        != semantic_root["typed_row_count"]
+                    ):
+                        raise ValueError(
+                            "historical capture semantic root differs"
+                        )
+                    canonical = json.dumps(
+                        list(semantic_root["rows"]),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    return (
+                        "root", dict(post_root), role, canonical,
+                        semantic_root["typed_row_count"],
+                        semantic_root["typed_logical_sha256"],
+                    )
+                if role == "final_anchor":
+                    if (
+                        type(semantic_root) is not dict
+                        or semantic_root.get("typed_role") != role
+                        or semantic_root.get("typed_row_count")
+                        != post_root.get("typed_row_count")
+                        or semantic_root.get("typed_logical_sha256")
+                        != post_root.get("typed_logical_sha256")
+                    ):
+                        raise ValueError(
+                            "historical capture final anchor differs"
+                        )
+                elif semantic_root is not None:
+                    raise ValueError(
+                        "historical capture bootstrap typed root differs"
+                    )
+                return ("root", dict(post_root), role, None, 0, None)
+
+            try:
+                if task4b_active_driver.get() is not None:
+                    _reject_task4b_capability()
+                driver_token = task4b_active_driver.set(transaction)
+                transaction["state"] = "active_bootstrap"
+                _verify_task4b_semantic_dependency_manifest()
+                verify_replay_ledgers(record)
+                _verify_task4b_scan_association_currentness(
+                    reconciliation=reconciliation,
+                    record=record,
+                    expected_state="capture_replay_bound",
+                )
+                pre_entry = prefinalization_registry.get(
+                    id(record.get("prefinalization"))
+                )
+                if (
+                    pre_entry is None
+                    or pre_entry[0]() is not record.get("prefinalization")
+                    or type(pre_entry[1]) is not dict
+                    or pre_entry[1].get("plan") is not record.get("plan")
+                ):
+                    raise ValueError(
+                        "historical capture prefinalization differs"
+                    )
+                pre_record = pre_entry[1]
+                anchor_plan = pre_record.get("anchor_plan")
+                plan = record.get("plan")
+                if type(anchor_plan) is not dict or type(plan) is not dict:
+                    raise ValueError("historical capture plan differs")
+                with source as entered_source:
+                    if entered_source is not source:
+                        _reject_task4b_capability()
+                    stream = iter(entered_source)
+                    anchor_responses = []
+                    anchor_roots = []
+                    root_position = 0
+                    for stage_index in range(3):
+                        if root_position >= len(post_roots):
+                            raise ValueError(
+                                "historical capture anchor root is missing"
+                            )
+                        post_root = post_roots[root_position]
+                        if (
+                            type(post_root) is not dict
+                            or post_root.get("segment") != "anchor_stage"
+                            or post_root.get("stage_index") != stage_index
+                        ):
+                            raise ValueError(
+                                "historical capture anchor root differs"
+                            )
+                        expected_requests = _call_task4b_semantic_root(
+                            task4b_materialize_anchor_stage,
+                            anchor_plan,
+                            stage_index,
+                            tuple(anchor_responses),
+                        )
+                        requests, responses = yield from read_root(
+                            stream, post_root
+                        )
+                        if requests != expected_requests:
+                            raise ValueError(
+                                "historical capture anchor requests differ"
+                            )
+                        anchor_responses.extend(responses)
+                        anchor_roots.append(post_root)
+                        if stage_index == 2:
+                            anchor_capture = _call_task4b_semantic_root(
+                                task4b_project_anchor_capture,
+                                anchor_plan,
+                                tuple(anchor_responses),
+                            )
+                            capture_digest = _typed_hash(
+                                _ANCHOR_CAPTURE_DOMAIN, anchor_capture
+                            )
+                            inventory = anchor_capture.get(
+                                "request_inventory"
+                            )
+                            if type(inventory) is not list or len(inventory) != 48:
+                                raise ValueError(
+                                    "historical capture anchor inventory differs"
+                                )
+                            for root_row, offsets in zip(
+                                anchor_roots,
+                                ((0, 2), (2, 39), (39, 48)),
+                            ):
+                                digest = _inventory_hasher(
+                                    b"historical_foundry_anchor_stage_inventory/v1"
+                                )
+                                for row in inventory[offsets[0]:offsets[1]]:
+                                    _inventory_update(digest, row)
+                                if (
+                                    root_row.get("anchor_capture_sha256")
+                                    != capture_digest
+                                    or root_row.get("stage_inventory_row_count")
+                                    != offsets[1] - offsets[0]
+                                    or root_row.get(
+                                        "stage_inventory_logical_sha256"
+                                    ) != digest.hexdigest()
+                                ):
+                                    raise ValueError(
+                                        "historical capture anchor ledger differs"
+                                    )
+                        yield from emit(root_payload(post_root))
+                        root_position += 1
+                        del requests, responses, expected_requests
+                    anchor_responses.clear()
+                    del anchor_responses, anchor_roots
+
+                    lower_probe_raw = []
+                    lower_witness_raw = []
+                    lower_roots = []
+                    while (
+                        root_position < len(post_roots)
+                        and post_roots[root_position].get("segment")
+                        == "lower_observation"
+                    ):
+                        post_root = post_roots[root_position]
+                        requests, responses = yield from read_root(
+                            stream, post_root
+                        )
+                        if len(requests) != 1 or len(responses) != 1:
+                            raise ValueError(
+                                "historical capture lower root differs"
+                            )
+                        raw = {
+                            "request": requests[0],
+                            "response": responses[0],
+                        }
+                        if post_root.get("observation_kind") == "search_probe":
+                            lower_probe_raw.append(raw)
+                        elif post_root.get("observation_kind") == "boundary_witness":
+                            lower_witness_raw.append(raw)
+                        else:
+                            raise ValueError(
+                                "historical capture lower kind differs"
+                            )
+                        lower_roots.append(post_root)
+                        yield from emit(root_payload(post_root))
+                        root_position += 1
+                        del requests, responses, raw
+                    if not lower_roots:
+                        raise ValueError(
+                            "historical capture lower proof is missing"
+                        )
+                    lower_raw_end = object()
+                    lower_probe_raw.append(lower_raw_end)
+                    lower_witness_raw.append(lower_raw_end)
+                    lower_probe_raw.reverse()
+                    lower_witness_raw.reverse()
+                    lower_capture = _call_task4b_semantic_root(
+                        task4b_project_lower_capture,
+                        anchor_capture=anchor_capture,
+                        lookback_seconds=pre_record.get("lookback_seconds"),
+                        search_probes=iter(
+                            lower_probe_raw.pop, lower_raw_end
+                        ),
+                        boundary_witness=iter(
+                            lower_witness_raw.pop, lower_raw_end
+                        ),
+                    )
+                    if lower_probe_raw or lower_witness_raw:
+                        raise ValueError(
+                            "historical capture lower proof did not drain"
+                        )
+                    replay_plan = _call_task4b_semantic_root(
+                        task4b_build_window_plan,
+                        lower_bound_capture=lower_capture,
+                        anchor_capture=anchor_capture,
+                    )
+                    if replay_plan != plan:
+                        raise ValueError(
+                            "historical capture replay plan differs"
+                        )
+                    compact_lower = tuple(
+                        lower_capture["search_probes"]
+                    ) + tuple(lower_capture["boundary_witness"])
+                    if len(compact_lower) != len(lower_roots):
+                        raise ValueError(
+                            "historical capture lower coverage differs"
+                        )
+                    for lower_root, compact in zip(
+                        lower_roots, compact_lower
+                    ):
+                        if (
+                            lower_root.get("request_sha256")
+                            != compact.get("request_sha256")
+                            or lower_root.get("result_sha256")
+                            != compact.get("result_sha256")
+                            or lower_root.get("response_sha256")
+                            != compact.get("response_sha256")
+                            or lower_root.get("lower_bound_capture_sha256")
+                            != replay_plan.get(
+                                "lower_bound_capture_sha256"
+                            )
+                        ):
+                            raise ValueError(
+                                "historical capture lower ledger differs"
+                            )
+                    lower_probe_raw.clear()
+                    lower_witness_raw.clear()
+                    del lower_probe_raw, lower_witness_raw, lower_roots
+                    del compact_lower
+
+                    transaction["kind"] = "header"
+                    transaction["state"] = "constructing_header"
+                    header_driver = new_header_driver(
+                        plan=replay_plan,
+                        anchor_capture=anchor_capture,
+                        lower_bound_capture=lower_capture,
+                    )
+                    if transaction.get("state") != "active_header":
+                        _reject_task4b_capability()
+                    request = next(header_driver)
+                    while (
+                        root_position < len(post_roots)
+                        and post_roots[root_position].get("segment")
+                        == "window_root"
+                        and post_roots[root_position].get("kind") == "header"
+                    ):
+                        post_root = post_roots[root_position]
+                        requests, responses = yield from read_root(
+                            stream, post_root
+                        )
+                        if (
+                            type(request) is not dict
+                            or request.get("requests") != requests
+                            or request.get("root_index")
+                            != post_root.get("root_index")
+                            or request.get("block_start")
+                            != post_root.get("block_start")
+                            or request.get("block_stop")
+                            != post_root.get("block_stop")
+                        ):
+                            raise ValueError(
+                                "historical capture header descriptor differs"
+                            )
+                        semantic_root = header_driver.send(
+                            (request, responses)
+                        )
+                        yield from emit(
+                            root_payload(post_root, semantic_root)
+                        )
+                        request = header_driver.send(driver_ack)
+                        root_position += 1
+                        del requests, responses, semantic_root
+                    if request is not driver_expect_eof:
+                        raise ValueError(
+                            "historical capture header coverage differs"
+                        )
+                    try:
+                        header_driver.send(driver_eof)
+                    except StopIteration as stopped:
+                        header_inventory = stopped.value
+                    else:
+                        raise ValueError(
+                            "historical capture header EOF differs"
+                        )
+
+                    transaction["kind"] = "window"
+                    transaction["state"] = "constructing_window"
+                    window_driver = new_window_driver(
+                        plan=replay_plan,
+                        anchor_capture=anchor_capture,
+                        lower_bound_capture=lower_capture,
+                        header_inventory=header_inventory,
+                    )
+                    if transaction.get("state") != "active_window":
+                        _reject_task4b_capability()
+                    request = next(window_driver)
+                    while root_position < len(post_roots):
+                        post_root = post_roots[root_position]
+                        if (
+                            post_root.get("segment") != "window_root"
+                            or post_root.get("kind") == "header"
+                        ):
+                            raise ValueError(
+                                "historical capture state root order differs"
+                            )
+                        requests, responses = yield from read_root(
+                            stream, post_root
+                        )
+                        if (
+                            type(request) is not dict
+                            or request.get("requests") != requests
+                            or request.get("root_index")
+                            != post_root.get("root_index")
+                            or request.get("kind") != post_root.get("kind")
+                            or request.get("block_start")
+                            != post_root.get("block_start")
+                            or request.get("block_stop")
+                            != post_root.get("block_stop")
+                        ):
+                            raise ValueError(
+                                "historical capture state descriptor differs"
+                            )
+                        semantic_root = window_driver.send(
+                            (request, responses)
+                        )
+                        yield from emit(
+                            root_payload(post_root, semantic_root)
+                        )
+                        request = window_driver.send(driver_ack)
+                        root_position += 1
+                        del requests, responses, semantic_root
+                    if request is not driver_expect_eof:
+                        raise ValueError(
+                            "historical capture state coverage differs"
+                        )
+                    try:
+                        window_driver.send(driver_eof)
+                    except StopIteration as stopped:
+                        compact_projection = stopped.value
+                    else:
+                        raise ValueError(
+                            "historical capture window EOF differs"
+                        )
+                    if compact_projection != record.get("compact_projection"):
+                        raise ValueError(
+                            "historical capture compact projection differs"
+                        )
+                    if compact_position[0] != len(compact_rows):
+                        raise ValueError(
+                            "historical capture exchange coverage differs"
+                        )
+                    try:
+                        next(stream)
+                    except StopIteration:
+                        pass
+                    else:
+                        raise ValueError(
+                            "historical capture source has extras"
+                        )
+                    _verify_task4b_scan_association_currentness(
+                        reconciliation=reconciliation,
+                        record=record,
+                        expected_state="capture_replay_bound",
+                    )
+                    verify_replay_ledgers(record)
+                    _verify_task4b_semantic_dependency_manifest()
+                    height = header_inventory.get("row_count")
+                    counts = (
+                        ("headers", height),
+                        ("reserves", 2 * height),
+                        ("prices", height),
+                        ("fees", height),
+                    )
+                    finish = (
+                        "finish", len(compact_rows), counts,
+                        record.get("prefinalization_digests"),
+                        record.get("replay_digests"),
+                    )
+                    yield from emit(finish)
+                transaction["state"] = "complete"
+                transaction["kind"] = None
+                record["event_issuer_state"] = "raw_complete"
+                record["raw_exchange_replay_complete"] = True
+                completed = True
+                return
+            except archive_error_original:
+                raise
+            except projection_error_original as error:
+                if (
+                    error.reason_code == "authority_mismatch"
+                    and error.failure_kind == "final_identity_drift"
+                ):
+                    identity_drift = True
+                else:
+                    ordinary_failure = True
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                ordinary_failure = True
+            finally:
+                for active_driver in (window_driver, header_driver):
+                    if active_driver is not None:
+                        active_driver.close()
+                if driver_token is not None:
+                    task4b_active_driver.reset(driver_token)
+                pending_event = record.get("live_event")
+                if pending_event is not None:
+                    event_entry = capture_replay_event_registry.get(
+                        id(pending_event)
+                    )
+                    if (
+                        event_entry is not None
+                        and event_entry[0] is pending_event
+                    ):
+                        event_entry[1]["state"] = "revoked"
+                        event_entry[1]["source"] = None
+                        event_entry[1]["association"] = None
+                        event_entry[1]["payload"] = None
+                        capture_replay_event_registry.pop(
+                            id(pending_event), None
+                        )
+                    if record.get("live_event") is pending_event:
+                        record["live_event"] = None
+                transaction["source"] = None
+                transaction["record"] = None
+                transaction["kind"] = None
+                if not completed:
+                    transaction["state"] = "failed"
+                    record["event_issuer_state"] = "failed"
+                    record["state"] = "consumed_failed"
+            if identity_drift:
+                raise archive_error_original(
+                    "authority_mismatch", "final_identity_drift"
+                ) from None
+            if ordinary_failure:
+                raise archive_error_original(
+                    "authority_mismatch",
+                    "historical_window_reconciliation_mismatch",
+                ) from None
+
+        return drive()
+
+    def new_header_driver(
+        *,
+        plan: Optional[Mapping[str, Any]] = None,
+        anchor_capture: Optional[Mapping[str, Any]] = None,
+        lower_bound_capture: Optional[Mapping[str, Any]] = None,
+        source: Any = None,
+    ) -> Iterator[Any]:
+        if source is not None:
+            if (
+                plan is not None
+                or anchor_capture is not None
+                or lower_bound_capture is not None
+            ):
+                _reject_task4b_capability()
+            return _new_task4b_exchange_replay(source=source)
+        authenticated_transaction = _task4b_driver_transaction("header")
+        declaration_anchor = header_declaration
+        del declaration_anchor
+        if authenticated_transaction is not None:
+            _verify_task4b_driver_transaction(
+                authenticated_transaction, "header"
+            )
+            _verify_task4b_semantic_dependency_manifest()
+        validated_plan, anchor, lower = _validate_bound_inputs(
+            plan, anchor_capture, lower_bound_capture
+        )
+        if authenticated_transaction is None:
+            expected_iterator = _header_descriptor_rows(validated_plan)
+        else:
+            expected_iterator = _call_task4b_semantic_root(
+                task4b_iter_header_batches, validated_plan
+            )
+        rows = []
+        digest = _inventory_hasher(_HEADER_INVENTORY_DOMAIN)
+        previous = None
+        if authenticated_transaction is not None:
+            _verify_task4b_semantic_dependency_manifest()
+
+        def drive() -> Iterator[Any]:
+            nonlocal previous
+            for expected in expected_iterator:
+                if authenticated_transaction is not None:
+                    _verify_task4b_driver_transaction(
+                        authenticated_transaction, "header"
+                    )
+                    _verify_task4b_semantic_dependency_manifest()
+                raw_pair = yield expected
+                root_failed = False
+                failure_pair = (
+                    "block_coverage_incomplete", "header_coverage_invalid"
+                )
+                try:
+                    if type(raw_pair) is not tuple or len(raw_pair) != 2:
+                        raise ValueError(
+                            "historical header batch result is invalid"
+                        )
+                    descriptor, responses = raw_pair
+                    if descriptor != expected:
+                        raise ValueError(
+                            "historical header descriptor order differs"
+                        )
+                    if authenticated_transaction is None:
+                        root = _project_complete_historical_window_root(
+                            plan=validated_plan,
+                            descriptor=descriptor,
+                            responses=responses,
+                            header_inventory=None,
+                        )
+                    else:
+                        root = _call_task4b_semantic_root(
+                            task4b_project_complete_root,
+                            plan=validated_plan,
+                            descriptor=descriptor,
+                            responses=responses,
+                            header_inventory=None,
+                        )
+                except projection_error_original as error:
+                    if (
+                        authenticated_transaction is not None
+                        and error.reason_code == "authority_mismatch"
+                        and error.failure_kind == "final_identity_drift"
+                    ):
+                        raise
+                    root_failed = True
+                    failure_pair = _captured_failure_pair(error, failure_pair)
+                except Exception:
+                    root_failed = True
+                if root_failed:
+                    raise _failure(*failure_pair)
+                for row in root["rows"]:
+                    header = _header_from_inventory_row(row)
+                    if previous is not None and (
+                        header["number"] != previous["number"] + 1
+                        or header["parent_hash"] != previous["hash"]
+                        or header["timestamp"] <= previous["timestamp"]
+                    ):
+                        raise _failure(
+                            "block_coverage_incomplete",
+                            "header_continuity_invalid",
+                        )
+                    rows.append(row)
+                    _inventory_update(digest, row)
+                    previous = header
+                if authenticated_transaction is not None:
+                    _verify_task4b_driver_transaction(
+                        authenticated_transaction, "header"
+                    )
+                    _verify_task4b_semantic_dependency_manifest()
+                acknowledgement = yield root
+                if acknowledgement is not driver_ack:
+                    raise _failure(*failure_pair)
+                del raw_pair, root
+
+            if authenticated_transaction is not None:
+                _verify_task4b_driver_transaction(
+                    authenticated_transaction, "header"
+                )
+                _verify_task4b_semantic_dependency_manifest()
+            eof = yield driver_expect_eof
+            if eof is not driver_eof:
+                raise _failure(
+                    "block_coverage_incomplete", "header_coverage_invalid"
+                )
+            lower_header = lower["boundary_witness"][-1]["header"]
+            if not rows or _header_from_inventory_row(rows[0]) != lower_header:
+                raise _failure(
+                    "block_coverage_incomplete", "header_coverage_invalid"
+                )
+            if _header_from_inventory_row(rows[-1]) != anchor:
+                raise _failure(
+                    "block_coverage_incomplete", "header_coverage_invalid"
+                )
+            for observation in lower["search_probes"]:
+                number = observation["block_number"]
+                if (
+                    validated_plan["lower_bound_number"]
+                    <= number
+                    <= validated_plan["anchor_number"]
+                    and _header_from_inventory_row(
+                        rows[number - validated_plan["lower_bound_number"]]
+                    )
+                    != observation["header"]
+                ):
+                    raise _failure(
+                        "block_coverage_incomplete", "header_coverage_invalid"
+                    )
+            inventory = {
+                "schema": "historical_foundry_header_inventory/v1",
+                "anchor_capture_sha256": validated_plan[
+                    "anchor_capture_sha256"
+                ],
+                "lower_bound_capture_sha256": validated_plan[
+                    "lower_bound_capture_sha256"
+                ],
+                "anchor_header_sha256": _typed_hash(
+                    _NORMALIZED_HEADER_DOMAIN, anchor
+                ),
+                "lower_header_sha256": _typed_hash(
+                    _NORMALIZED_HEADER_DOMAIN, lower_header
+                ),
+                "lower_bound_number": validated_plan["lower_bound_number"],
+                "anchor_number": validated_plan["anchor_number"],
+                "row_count": len(rows),
+                "rows": tuple(rows),
+                "logical_sha256": digest.hexdigest(),
+            }
+            _validate_header_inventory(
+                plan=validated_plan,
+                header_inventory=inventory,
+                anchor=anchor,
+                lower=lower,
+            )
+            if authenticated_transaction is not None:
+                _verify_task4b_driver_transaction(
+                    authenticated_transaction, "header"
+                )
+                _verify_task4b_semantic_dependency_manifest()
+            return inventory
+
+        return drive()
+
+    def new_window_driver(
+        *,
+        plan: Mapping[str, Any],
+        anchor_capture: Mapping[str, Any],
+        lower_bound_capture: Mapping[str, Any],
+        header_inventory: Mapping[str, Any],
+    ) -> Iterator[Any]:
+        authenticated_transaction = _task4b_driver_transaction("window")
+        declaration_anchor = window_declaration
+        del declaration_anchor
+        if authenticated_transaction is not None:
+            _verify_task4b_driver_transaction(
+                authenticated_transaction, "window"
+            )
+            _verify_task4b_semantic_dependency_manifest()
+        validated_plan, anchor, lower = _validate_bound_inputs(
+            plan, anchor_capture, lower_bound_capture
+        )
+        validated_inventory, header_rows = _validate_header_inventory(
+            plan=validated_plan,
+            header_inventory=header_inventory,
+            anchor=anchor,
+            lower=lower,
+        )
+        _validate_header_base_fee_chain(header_rows)
+        anchor_price = _anchor_price_authority(anchor_capture)
+        digests = {
+            "reserves": _inventory_hasher(_RESERVE_INVENTORY_DOMAIN),
+            "prices": _inventory_hasher(_PRICE_INVENTORY_DOMAIN),
+            "fees": _inventory_hasher(_FEE_INVENTORY_DOMAIN),
+        }
+        counts = {"reserves": 0, "prices": 0, "fees": 0}
+        final_header = None
+        previous_request_id = (
+            validated_plan["first_request_id"]
+            + validated_plan["block_count"]
+            - 1
+        )
+        if authenticated_transaction is not None:
+            _verify_task4b_semantic_dependency_manifest()
+
+        def drive() -> Iterator[Any]:
+            nonlocal final_header, previous_request_id
+            if authenticated_transaction is None:
+                expected_iterator = _state_descriptor_rows(
+                    validated_plan, header_rows
+                )
+                authenticated_validation = None
+            else:
+                _verify_task4b_driver_transaction(
+                    authenticated_transaction, "window"
+                )
+                expected_iterator = _call_task4b_semantic_root(
+                    task4b_iter_state_batches,
+                    plan=validated_plan,
+                    header_inventory=validated_inventory,
+                )
+                authenticated_validation = (
+                    expected_iterator._validated_header_token
+                )
+            for expected in expected_iterator:
+                pair = _coverage_pair(expected["kind"])
+                if authenticated_transaction is not None:
+                    _verify_task4b_driver_transaction(
+                        authenticated_transaction, "window"
+                    )
+                    _verify_task4b_semantic_dependency_manifest()
+                raw_pair = yield expected
+                root_failed = False
+                failure_pair = pair
+                try:
+                    if type(raw_pair) is not tuple or len(raw_pair) != 2:
+                        raise ValueError(
+                            "historical state batch result is invalid"
+                        )
+                    descriptor, responses = raw_pair
+                    if descriptor != expected:
+                        raise ValueError(
+                            "historical state descriptor order differs"
+                        )
+                    active_validation = (
+                        (validated_inventory, validated_plan)
+                        if authenticated_validation is None
+                        else authenticated_validation
+                    )
+                    validation_token = _ACTIVE_HEADER_VALIDATION.set(
+                        active_validation
+                    )
+                    try:
+                        if authenticated_transaction is not None:
+                            _verify_task4b_semantic_dependency_manifest(
+                                expected_header_validation=active_validation
+                            )
+                            root = _call_task4b_semantic_root(
+                                task4b_project_complete_root,
+                                plan=active_validation[1],
+                                descriptor=descriptor,
+                                responses=responses,
+                                header_inventory=active_validation[0],
+                                expected_header_validation=active_validation,
+                            )
+                        else:
+                            root = _project_complete_historical_window_root(
+                                plan=validated_plan,
+                                descriptor=descriptor,
+                                responses=responses,
+                                header_inventory=validated_inventory,
+                            )
+                        if authenticated_transaction is not None:
+                            _verify_task4b_semantic_dependency_manifest(
+                                expected_header_validation=active_validation
+                            )
+                    finally:
+                        _ACTIVE_HEADER_VALIDATION.reset(validation_token)
+                    if authenticated_transaction is not None:
+                        _verify_task4b_semantic_dependency_manifest()
+                    request_ids = root["request_ids"]
+                    if (
+                        not request_ids
+                        or request_ids[0] != previous_request_id + 1
+                        or request_ids
+                        != tuple(range(request_ids[0], request_ids[-1] + 1))
+                    ):
+                        raise ValueError(
+                            "historical state request ledger differs"
+                        )
+                    previous_request_id = request_ids[-1]
+                    role = root["typed_role"]
+                    if role in digests:
+                        for row in root["rows"]:
+                            _inventory_update(digests[role], row)
+                            counts[role] += 1
+                            if (
+                                role == "prices"
+                                and row["block_number"] == anchor["number"]
+                                and any(
+                                    row[key] != anchor_price[key]
+                                    for key in (
+                                        "round_id", "phase_id", "answer",
+                                        "started_at", "updated_at",
+                                        "answered_in_round",
+                                    )
+                                )
+                            ):
+                                raise _failure(
+                                    "price_snapshot_incomplete",
+                                    "price_round_invalid",
+                                )
+                    elif role == "final_anchor":
+                        if root["typed_row_count"] != 1:
+                            raise ValueError(
+                                "historical final anchor row count differs"
+                            )
+                        final_header = root["rows"][0]["header"]
+                    else:
+                        raise ValueError("historical typed role is invalid")
+                except projection_error_original as error:
+                    if (
+                        authenticated_transaction is not None
+                        and error.reason_code == "authority_mismatch"
+                        and error.failure_kind == "final_identity_drift"
+                    ):
+                        raise
+                    root_failed = True
+                    failure_pair = _captured_failure_pair(error, failure_pair)
+                except Exception:
+                    root_failed = True
+                if root_failed:
+                    raise _failure(*failure_pair)
+                if authenticated_transaction is not None:
+                    _verify_task4b_driver_transaction(
+                        authenticated_transaction, "window"
+                    )
+                    _verify_task4b_semantic_dependency_manifest()
+                acknowledgement = yield root
+                if acknowledgement is not driver_ack:
+                    raise _failure(*pair)
+                del raw_pair, root
+
+            if authenticated_transaction is not None:
+                _verify_task4b_driver_transaction(
+                    authenticated_transaction, "window"
+                )
+                _verify_task4b_semantic_dependency_manifest()
+            eof = yield driver_expect_eof
+            if eof is not driver_eof:
+                raise _failure(
+                    "authority_mismatch", "request_ledger_invalid"
+                )
+            if previous_request_id != validated_plan["last_request_id"]:
+                raise _failure(
+                    "authority_mismatch", "request_ledger_invalid"
+                )
+            if final_header != lower["anchor_header"]:
+                raise _failure("anchor_changed", "final_anchor_mismatch")
+            if (
+                counts["reserves"] != 2 * validated_plan["block_count"]
+                or counts["prices"] != validated_plan["block_count"]
+                or counts["fees"] != validated_plan["block_count"]
+            ):
+                raise _failure(
+                    "authority_mismatch", "request_ledger_invalid"
+                )
+            _validate_header_inventory(
+                plan=validated_plan,
+                header_inventory=header_inventory,
+                anchor=anchor,
+                lower=lower,
+            )
+            lower_number = validated_plan["lower_bound_number"]
+            anchor_number = validated_plan["anchor_number"]
+            predecessor = (
+                lower["boundary_witness"][0]["header"]
+                if lower_number > 0 else None
+            )
+            lower_header = lower["boundary_witness"][-1]["header"]
+            stage_ranges = _request_stage_ranges(validated_plan, lower)
+            continuous_value = {
+                "first_id": 1,
+                "last_id": validated_plan["last_request_id"],
+                "count": validated_plan["last_request_id"],
+            }
+            projection = {
+                "schema": "historical_foundry_window_projection/v1",
+                "authority": "fixture_only_nonauthorizing",
+                "chain_id": 1,
+                "anchor_capture_sha256": validated_plan[
+                    "anchor_capture_sha256"
+                ],
+                "lower_bound_capture_sha256": validated_plan[
+                    "lower_bound_capture_sha256"
+                ],
+                "range": {
+                    "lower_bound_number": lower_number,
+                    "anchor_number": anchor_number,
+                    "cutoff_timestamp": lower["cutoff_timestamp"],
+                    "block_count": validated_plan["block_count"],
+                },
+                "role_inventories": {
+                    "headers": {
+                        "row_count": validated_inventory["row_count"],
+                        "first_block": lower_number,
+                        "last_block": anchor_number,
+                        "logical_sha256": validated_inventory[
+                            "logical_sha256"
+                        ],
+                    },
+                    "reserves": {
+                        "row_count": counts["reserves"],
+                        "first_block": lower_number,
+                        "last_block": anchor_number,
+                        "logical_sha256": digests["reserves"].hexdigest(),
+                    },
+                    "prices": {
+                        "row_count": counts["prices"],
+                        "first_block": lower_number,
+                        "last_block": anchor_number,
+                        "logical_sha256": digests["prices"].hexdigest(),
+                    },
+                    "fees": {
+                        "row_count": counts["fees"],
+                        "first_block": lower_number,
+                        "last_block": anchor_number,
+                        "logical_sha256": digests["fees"].hexdigest(),
+                    },
+                },
+                "boundaries": {
+                    "predecessor_header": predecessor,
+                    "lower_header": lower_header,
+                    "anchor_header": anchor,
+                    "final_anchor_header": final_header,
+                },
+                "request_ledger": {
+                    "first_request_id": 1,
+                    "last_request_id": validated_plan["last_request_id"],
+                    "request_count": validated_plan["last_request_id"],
+                    "stage_ranges": stage_ranges,
+                    "continuous_ids_sha256": _typed_hash(
+                        _CONTINUOUS_IDS_DOMAIN, continuous_value
+                    ),
+                },
+                "coverage": {
+                    "header_count": validated_inventory["row_count"],
+                    "reserve_count": counts["reserves"],
+                    "price_count": counts["prices"],
+                    "fee_count": counts["fees"],
+                },
+            }
+            projection_failed = False
+            try:
+                _guard_historical_json_value(projection)
+            except Exception:
+                projection_failed = True
+            if projection_failed:
+                raise _failure(
+                    "authority_mismatch", "fixture_input_invalid"
+                )
+            if authenticated_transaction is not None:
+                _verify_task4b_driver_transaction(
+                    authenticated_transaction, "window"
+                )
+                _verify_task4b_semantic_dependency_manifest()
+            return projection
+
+        return drive()
+
+    def header_drain(
+        *,
+        plan: Mapping[str, Any],
+        anchor_capture: Mapping[str, Any],
+        lower_bound_capture: Mapping[str, Any],
+        batch_results: Iterable[
+            Tuple[Mapping[str, Any], Sequence[Mapping[str, Any]]]
+        ],
+    ) -> Mapping[str, Any]:
+        driver = new_header_driver(
+            plan=plan,
+            anchor_capture=anchor_capture,
+            lower_bound_capture=lower_bound_capture,
+        )
+        result_iterator = _iterator_once(
+            batch_results,
+            ("block_coverage_incomplete", "header_coverage_invalid"),
+        )
+        try:
+            request = next(driver)
+            while request is not driver_expect_eof:
+                raw_pair = _next_input(
+                    result_iterator,
+                    ("block_coverage_incomplete", "header_coverage_invalid"),
+                )
+                root = driver.send(raw_pair)
+                del raw_pair, root
+                request = driver.send(driver_ack)
+            if _next_input(
+                result_iterator,
+                ("block_coverage_incomplete", "header_coverage_invalid"),
+                allow_end=True,
+            ) is not _END_OF_INPUT:
+                raise _failure(
+                    "block_coverage_incomplete", "header_coverage_invalid"
+                )
+            try:
+                driver.send(driver_eof)
+            except StopIteration as completed:
+                return completed.value
+            raise _failure(
+                "block_coverage_incomplete", "header_coverage_invalid"
+            )
+        finally:
+            driver.close()
+
+    def window_drain(
+        *,
+        plan: Mapping[str, Any],
+        anchor_capture: Mapping[str, Any],
+        lower_bound_capture: Mapping[str, Any],
+        header_inventory: Mapping[str, Any],
+        batch_results: Iterable[
+            Tuple[Mapping[str, Any], Sequence[Mapping[str, Any]]]
+        ],
+    ) -> Mapping[str, Any]:
+        driver = new_window_driver(
+            plan=plan,
+            anchor_capture=anchor_capture,
+            lower_bound_capture=lower_bound_capture,
+            header_inventory=header_inventory,
+        )
+        result_iterator = _iterator_once(
+            batch_results,
+            ("authority_mismatch", "request_ledger_invalid"),
+        )
+        try:
+            request = next(driver)
+            while request is not driver_expect_eof:
+                raw_pair = _next_input(
+                    result_iterator,
+                    _coverage_pair(request["kind"]),
+                )
+                root = driver.send(raw_pair)
+                del raw_pair, root
+                request = driver.send(driver_ack)
+            if _next_input(
+                result_iterator,
+                ("authority_mismatch", "request_ledger_invalid"),
+                allow_end=True,
+            ) is not _END_OF_INPUT:
+                raise _failure(
+                    "authority_mismatch", "request_ledger_invalid"
+                )
+            try:
+                driver.send(driver_eof)
+            except StopIteration as completed:
+                return completed.value
+            raise _failure("authority_mismatch", "request_ledger_invalid")
+        finally:
+            driver.close()
+
+    def project_historical_header_inventory_wrapper(
+        *,
+        plan: Mapping[str, Any],
+        anchor_capture: Mapping[str, Any],
+        lower_bound_capture: Mapping[str, Any],
+        batch_results: Iterable[
+            Tuple[Mapping[str, Any], Sequence[Mapping[str, Any]]]
+        ],
+    ) -> Mapping[str, Any]:
+        return header_drain(
+            plan=plan,
+            anchor_capture=anchor_capture,
+            lower_bound_capture=lower_bound_capture,
+            batch_results=batch_results,
+        )
+
+    def project_historical_window_projection_wrapper(
+        *,
+        plan: Mapping[str, Any],
+        anchor_capture: Mapping[str, Any],
+        lower_bound_capture: Mapping[str, Any],
+        header_inventory: Mapping[str, Any],
+        batch_results: Iterable[
+            Tuple[Mapping[str, Any], Sequence[Mapping[str, Any]]]
+        ],
+    ) -> Mapping[str, Any]:
+        return window_drain(
+            plan=plan,
+            anchor_capture=anchor_capture,
+            lower_bound_capture=lower_bound_capture,
+            header_inventory=header_inventory,
+            batch_results=batch_results,
+        )
+
+    for wrapper, declaration, name in (
+        (
+            project_historical_header_inventory_wrapper,
+            header_declaration,
+            "project_historical_header_inventory",
+        ),
+        (
+            project_historical_window_projection_wrapper,
+            window_declaration,
+            "project_historical_window_projection",
+        ),
+    ):
+        wrapper.__name__ = name
+        wrapper.__qualname__ = name
+        wrapper.__module__ = __name__
+        wrapper.__annotations__ = dict(declaration.__annotations__)
+
+    def replay_surface(
+        *,
+        source: Any,
+    ) -> Iterator["_ProductionHistoricalWindowCaptureReplayEvent"]:
+        constructors = (new_header_driver, new_window_driver)
+        del constructors
+        return new_header_driver(source=source)
+
+    replay_surface.__name__ = (
+        "_replay_production_historical_window_capture_from_bound_storage"
+    )
+    replay_surface.__qualname__ = replay_surface.__name__
+    replay_surface.__module__ = __name__
+
+    def _reject_task4b_capability() -> None:
+        raise _ArchiveRpcError(
+            "authority_mismatch",
+            "historical_window_capability_invalid",
+        )
+
+    def _verify_task4b_scan_association_currentness(
+        *,
+        reconciliation: Any,
+        record: Dict[str, Any],
+        expected_state: str,
+    ) -> None:
+        drifted = False
+        try:
+            binding = record["binding"]
+            current_scan_objects = tuple(
+                _task4b_resolve(scan_module, name)
+                for name in task4b_scan_local_names
+            )
+            exported_scan_names = getattr(
+                scan_module, "_TASK4B_SCAN_LOCAL_SURFACE_NAMES"
+            )
+            exported_scan_objects = getattr(
+                scan_module, "_TASK4B_SCAN_LOCAL_SURFACE_OBJECTS"
+            )
+        except (AttributeError, KeyError, TypeError):
+            drifted = True
+            binding = None
+            current_scan_objects = ()
+            exported_scan_names = None
+            exported_scan_objects = None
+        if (
+            drifted
+            or sys.modules.get("scripts.historical_foundry_scan")
+            is not scan_module
+            or type(record) is not dict
+            or expected_state not in (
+                "consumed_by_mint", "capture_replay_bound"
+            )
+            or record.get("state") != expected_state
+            or type(binding) is not tuple
+            or len(binding) != 11
+            or reconciliation._binding_token
+            is not record.get("binding_token")
+            or record.get("claim") is not binding[0]
+            or record.get("prefinalization") is not binding[1]
+            or record.get("prefinalization_digests") is not binding[2]
+            or record.get("finalization") is not binding[3]
+            or record.get("sealed_spool") is not binding[4]
+            or record.get("frozen_pre_ledger") is not binding[5]
+            or record.get("plan") is not binding[6]
+            or record.get("compact_projection") is not binding[7]
+            or record.get("post_root_ledger") is not binding[8]
+            or record.get("post_leaf_ledger") is not binding[9]
+            or record.get("replay_digests") is not binding[10]
+            or type(task4b_scan_local_originals) is not tuple
+            or len(task4b_scan_local_originals) != 5
+            or exported_scan_names != task4b_scan_local_names
+            or type(exported_scan_objects) is not tuple
+            or len(exported_scan_objects) != 5
+            or not all(
+                current is original is exported
+                for current, original, exported in zip(
+                    current_scan_objects,
+                    task4b_scan_local_originals,
+                    exported_scan_objects,
+                )
+            )
+        ):
+            raise _ArchiveRpcError(
+                "authority_mismatch", "final_identity_drift"
+            )
+        return None
+
+    def _validate_task4b_capture_replay_payload(
+        payload: Any
+    ) -> bool:
+        if type(payload) is not tuple or not payload or type(payload[0]) is not str:
+            return False
+        tag = payload[0]
+        if tag == "exchange":
+            return (
+                len(payload) == 3
+                and type(payload[1]) is dict
+                and type(payload[2]) is dict
+                and tuple(payload[1]) == receipt_keys
+                and tuple(payload[2]) == post_leaf_keys
+            )
+        if tag == "root":
+            if (
+                len(payload) != 6
+                or type(payload[1]) is not dict
+                or type(payload[2]) is not str
+            ):
+                return False
+            root = payload[1]
+            role = payload[2]
+            segment = root.get("segment")
+            expected_role = None
+            if segment == "anchor_stage":
+                expected_role = "anchor_stage"
+            elif segment == "lower_observation":
+                expected_role = "lower_observation"
+            elif segment == "window_root":
+                expected_role = {
+                    "header": "headers",
+                    "reserve": "reserves",
+                    "price": "prices",
+                    "fee_history": "fees",
+                    "final_anchor": "final_anchor",
+                }.get(root.get("kind"))
+            if role != expected_role:
+                return False
+            success_indices = root.get("success_exchange_indices")
+            if (
+                type(root.get("logical_batch_index")) is not int
+                or root["logical_batch_index"] <= 0
+                or type(success_indices) is not tuple
+                or not success_indices
+                or any(type(index) is not int or index <= 0 for index in success_indices)
+                or root.get("leaf_count") != len(success_indices)
+            ):
+                return False
+            if role in ("headers", "reserves", "prices", "fees"):
+                return (
+                    type(payload[3]) is bytes
+                    and type(payload[4]) is int
+                    and payload[4] > 0
+                    and type(payload[5]) is str
+                    and _HASH64.fullmatch(payload[5]) is not None
+                    and root.get("typed_role") == role
+                    and root.get("typed_row_count") == payload[4]
+                    and root.get("typed_logical_sha256") == payload[5]
+                )
+            return (
+                payload[3] is None
+                and type(payload[4]) is int
+                and payload[4] == 0
+                and payload[5] is None
+            )
+        if tag != "finish" or len(payload) != 5:
+            return False
+        exchange_count, counts, pre_digests, replay_digests = payload[1:]
+        expected_roles = ("headers", "reserves", "prices", "fees")
+        if (
+            type(exchange_count) is not int
+            or exchange_count <= 0
+            or type(counts) is not tuple
+            or len(counts) != 4
+            or any(
+                type(pair) is not tuple
+                or len(pair) != 2
+                or type(pair[0]) is not str
+                or type(pair[1]) is not int
+                or pair[1] <= 0
+                for pair in counts
+            )
+            or tuple(pair[0] for pair in counts) != expected_roles
+            or counts[1][1] != 2 * counts[0][1]
+            or counts[2][1] != counts[0][1]
+            or counts[3][1] != counts[0][1]
+            or type(pre_digests) is not tuple
+            or len(pre_digests) != 5
+            or pre_digests[0]
+            != "historical_foundry_prefinalization_digest_binding/v1"
+            or any(
+                type(value) is not str or _HASH64.fullmatch(value) is None
+                for value in pre_digests[1:]
+            )
+            or type(replay_digests) is not tuple
+            or len(replay_digests) != 6
+            or replay_digests[0]
+            != "historical_foundry_reconciliation_digest_binding/v1"
+            or type(replay_digests[1]) is not int
+            or replay_digests[1] <= 0
+            or type(replay_digests[3]) is not int
+            or replay_digests[3] != exchange_count
+            or any(
+                type(replay_digests[index]) is not str
+                or _HASH64.fullmatch(replay_digests[index]) is None
+                for index in (2, 4, 5)
+            )
+        ):
+            return False
+        return True
+
+    def _issue_task4b_capture_replay_event(
+        *,
+        record: Dict[str, Any],
+        source: Any,
+        payload: Tuple[Any, ...],
+    ) -> "_ProductionHistoricalWindowCaptureReplayEvent":
+        event_index = record.get("next_event_index")
+        source_ref = record.get("capture_source_ref")
+        if (
+            record.get("state") != "capture_replay_bound"
+            or record.get("event_issuer")
+            is not _issue_task4b_capture_replay_event
+            or record.get("event_issuer_state") != "ready"
+            or type(event_index) is not int
+            or event_index < 0
+            or not callable(source_ref)
+            or source_ref() is not source
+            or not _validate_task4b_capture_replay_payload(payload)
+            or record.get("live_event") is not None
+            or capture_replay_event_registry
+        ):
+            _reject_task4b_capability()
+        event = object.__new__(
+            _ProductionHistoricalWindowCaptureReplayEvent
+        )
+        record["live_event"] = event
+        capture_replay_event_registry[id(event)] = (
+            event,
+            {
+                "state": "live",
+                "source": source,
+                "association": record,
+                "event_index": event_index,
+                "payload": payload,
+            },
+        )
+        record["event_issuer_state"] = "awaiting_consume"
+        return event
+
+    def _install_task4b_capture_replay_association(
+        *,
+        record: Dict[str, Any],
+        reconciliation: Any,
+        source: Any,
+        view: Any,
+    ) -> None:
+        if record.get("state") != "consumed_by_mint":
+            _reject_task4b_capability()
+        if (
+            weakref is not task4b_weakref_module
+            or getattr(task4b_weakref_module, "ref", None)
+            is not task4b_weakref_ref
+        ):
+            raise _ArchiveRpcError(
+                "authority_mismatch", "final_identity_drift"
+            )
+        association_names = (
+            "capture_source_ref",
+            "capture_view_ref",
+            "capture_reconciliation_ref",
+            "event_issuer",
+            "event_issuer_state",
+            "next_event_index",
+            "live_event",
+        )
+        try:
+            record["state"] = "capture_replay_binding"
+            record["capture_source_ref"] = task4b_weakref_ref(source)
+            record["capture_view_ref"] = task4b_weakref_ref(view)
+            record["capture_reconciliation_ref"] = task4b_weakref_ref(
+                reconciliation
+            )
+            record["event_issuer"] = _issue_task4b_capture_replay_event
+            record["event_issuer_state"] = "ready"
+            record["next_event_index"] = 0
+            record["live_event"] = None
+            record["state"] = "capture_replay_bound"
+        except BaseException:
+            for name in association_names:
+                record.pop(name, None)
+            record["state"] = "consumed_by_mint"
+            raise
+
+    def _bind_production_historical_window_capture_replay_source_from_bound_storage(
+        *,
+        reconciliation: Any,
+        source: Any,
+    ) -> None:
+        transaction_nonce = active_capture_materialization.get()
+        transaction_entry = capture_materialization_registry.get(
+            id(transaction_nonce)
+        )
+        if (
+            transaction_entry is None
+            or transaction_entry[0] is not transaction_nonce
+            or type(transaction_entry[1]) is not dict
+        ):
+            _reject_task4b_capability()
+        transaction = transaction_entry[1]
+        if (
+            transaction.get("provenance")
+            is not capture_materialization_registry
+            or transaction.get("nonce") is not transaction_nonce
+            or transaction.get("state") != "active"
+        ):
+            _reject_task4b_capability()
+        origin_token = transaction.get("token")
+        try:
+            active_capture_materialization.reset(origin_token)
+        except (TypeError, ValueError):
+            _reject_task4b_capability()
+        transaction["state"] = "rotating"
+        transaction["token"] = None
+        try:
+            rotated_token = active_capture_materialization.set(
+                transaction_nonce
+            )
+        except BaseException:
+            transaction["state"] = "failed"
+            raise
+        transaction["token"] = rotated_token
+        transaction["state"] = "binding"
+        view = transaction.get("view")
+        storage_module = transaction.get("storage_module")
+        source_class = transaction.get("source_class")
+        try:
+            storage_surface = getattr(
+                storage_module, "_TASK4B_STORAGE_LOCAL_SURFACE_OBJECTS"
+            )
+            bind_method = getattr(
+                source_class,
+                "_bind_reconciliation_from_bound_scan",
+            )
+        except (AttributeError, TypeError):
+            _reject_task4b_capability()
+        if (
+            sys.modules.get("scripts.historical_foundry_storage")
+            is not storage_module
+            or type(storage_surface) is not tuple
+            or len(storage_surface) != 21
+            or storage_surface[0] is not source_class
+            or storage_surface[2] is not bind_method
+            or type(source) is not source_class
+        ):
+            _reject_task4b_capability()
+        ordinary_bind_failure = False
+        try:
+            bind_method(
+                source,
+                expected_view=view,
+                expected_reconciliation=reconciliation,
+            )
+            if (
+                getattr(
+                    storage_module,
+                    "_TASK4B_STORAGE_LOCAL_SURFACE_OBJECTS",
+                    None,
+                )
+                is not storage_surface
+                or getattr(
+                    source_class,
+                    "_bind_reconciliation_from_bound_scan",
+                    None,
+                )
+                is not bind_method
+                or getattr(
+                    storage_module,
+                    "_HistoricalWindowCaptureReplaySource",
+                    None,
+                )
+                is not source_class
+            ):
+                raise _ArchiveRpcError(
+                    "authority_mismatch", "final_identity_drift"
+                )
+            if type(reconciliation) is not _ProductionHistoricalWindowReconciliation:
+                _reject_task4b_capability()
+            entry = reconciliation_registry.get(id(reconciliation))
+            if entry is None or entry[0]() is not reconciliation:
+                _reject_task4b_capability()
+            record = entry[1]
+            if record.get("state") != "consumed_by_mint":
+                _reject_task4b_capability()
+            _verify_task4b_scan_association_currentness(
+                reconciliation=reconciliation,
+                record=record,
+                expected_state="consumed_by_mint",
+            )
+            event_registry = capture_replay_event_registry
+            if event_registry:
+                _reject_task4b_capability()
+            _install_task4b_capture_replay_association(
+                record=record,
+                reconciliation=reconciliation,
+                source=source,
+                view=view,
+            )
+            transaction["state"] = "bound"
+            return None
+        except _ArchiveRpcError:
+            transaction["state"] = "failed"
+            raise
+        except BaseException as error:
+            transaction["state"] = "failed"
+            if not isinstance(error, Exception):
+                raise
+            ordinary_bind_failure = True
+            del error
+        if ordinary_bind_failure:
+            raise _ArchiveRpcError(
+                "authority_mismatch",
+                "historical_window_spool_handoff_failed",
+            ) from None
+
+    def _consume_production_historical_window_capture_replay_event_for_storage(
+        *,
+        event: Any,
+        expected_source: Any,
+        expected_event_index: int,
+    ) -> Tuple[Any, ...]:
+        if (
+            type(event) is not _ProductionHistoricalWindowCaptureReplayEvent
+            or type(expected_event_index) is not int
+            or expected_event_index < 0
+        ):
+            _reject_task4b_capability()
+        entry = capture_replay_event_registry.get(id(event))
+        if (
+            entry is None
+            or entry[0] is not event
+            or entry[1].get("state") != "live"
+            or entry[1].get("source") is not expected_source
+            or entry[1].get("event_index") != expected_event_index
+        ):
+            _reject_task4b_capability()
+        record = entry[1]
+        payload = record.get("payload")
+        association = record.get("association")
+        source_reference = (
+            association.get("capture_source_ref")
+            if type(association) is dict else None
+        )
+        if (
+            type(association) is not dict
+            or association.get("state") != "capture_replay_bound"
+            or association.get("event_issuer_state") != "awaiting_consume"
+            or association.get("next_event_index") != expected_event_index
+            or association.get("live_event") is not event
+            or not callable(source_reference)
+            or source_reference() is not expected_source
+        ):
+            _reject_task4b_capability()
+        if not _validate_task4b_capture_replay_payload(payload):
+            raise _ArchiveRpcError(
+                "authority_mismatch",
+                "historical_window_reconciliation_mismatch",
+            )
+        record["state"] = "consumed"
+        record["source"] = None
+        record["association"] = None
+        record["payload"] = None
+        capture_replay_event_registry.pop(id(event), None)
+        association["next_event_index"] = expected_event_index + 1
+        association["event_issuer_state"] = "ready"
+        association["live_event"] = None
+        return payload
+
+    def _materialize_historical_window_staging_snapshot(
+        *,
+        capability: "_ProductionHistoricalWindowCapability",
+    ) -> "HistoricalRunStagingSnapshot":
+        final_identity_error = False
+        manifest_control = None
+        manifest_control_traceback = None
+        try:
+            _verify_task4b_semantic_dependency_manifest()
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                manifest_control = error
+                manifest_control_traceback = error.__traceback__
+            elif (
+                type(error) is projection_error_original
+                and error.reason_code == "authority_mismatch"
+                and error.failure_kind == "final_identity_drift"
+            ):
+                final_identity_error = True
+            else:
+                raise
+            del error
+        import sys as runtime_sys
+        storage_identity_error = not task4b_storage_identity_is_current(
+            runtime_sys
+        )
+        if (
+            storage_identity_error
+            and type(capability) is not task4b_storage_capability_class
+        ):
+            raise _failure("authority_mismatch", "fixture_input_invalid")
+        if storage_identity_error:
+            final_identity_error = True
+        view = None
+        snapshot = None
+        body_error = None
+        body_traceback = None
+        transaction_nonce = None
+        transaction = None
+        try:
+            consume_authority = (
+                task4b_storage_consume_runner
+                if task4b_storage_runner_graph_is_current()
+                else (
+                    task4b_storage_consume
+                    if task4b_storage_original_graph_is_current()
+                    else None
+                )
+            )
+            if consume_authority is None:
+                raise archive_error_original(
+                    "authority_mismatch", "final_identity_drift"
+                ) from None
+            view = consume_authority(
+                capability=capability
+            )
+            consume_authority = None
+            if type(view) is not task4b_storage_consumed_view_class:
+                raise archive_error_original(
+                    "authority_mismatch", "final_identity_drift"
+                ) from None
+            if not task4b_storage_identity_is_current(runtime_sys):
+                final_identity_error = True
+            if manifest_control is not None:
+                raise manifest_control.with_traceback(
+                    manifest_control_traceback
+                )
+            if final_identity_error:
+                raise archive_error_original(
+                    "authority_mismatch", "final_identity_drift"
+                ) from None
+            if active_capture_materialization.get() is not None:
+                _reject_task4b_capability()
+            source_class = task4b_storage_source_class
+            transaction_nonce = object()
+            transaction = {
+                "provenance": capture_materialization_registry,
+                "nonce": transaction_nonce,
+                "state": "installing",
+                "token": None,
+                "view": view,
+                "storage_module": task4b_storage_module,
+                "source_class": source_class,
+            }
+            capture_materialization_registry[id(transaction_nonce)] = (
+                transaction_nonce, transaction
+            )
+            transaction["token"] = active_capture_materialization.set(
+                transaction_nonce
+            )
+            transaction["state"] = "active"
+            try:
+                materialize_authority = (
+                    task4b_storage_view_materialize_runner
+                    if task4b_storage_runner_graph_is_current()
+                    else (
+                        task4b_storage_view_materialize
+                        if task4b_storage_original_graph_is_current()
+                        else None
+                    )
+                )
+                if materialize_authority is None:
+                    raise archive_error_original(
+                        "authority_mismatch", "final_identity_drift"
+                    ) from None
+                materialized_snapshot = (
+                    materialize_authority(view)
+                )
+                materialize_authority = None
+                if type(materialized_snapshot) is not task4b_storage_snapshot_class:
+                    raise archive_error_original(
+                        "authority_mismatch", "final_identity_drift"
+                    ) from None
+                snapshot = materialized_snapshot
+                projection_authority = (
+                    task4b_storage_snapshot_projection_runner
+                    if task4b_storage_runner_graph_is_current()
+                    else (
+                        task4b_storage_snapshot_projection
+                        if task4b_storage_original_graph_is_current()
+                        else None
+                    )
+                )
+                if projection_authority is None:
+                    raise archive_error_original(
+                        "authority_mismatch", "final_identity_drift"
+                    ) from None
+                projection_authority(snapshot)
+                projection_authority = None
+                if not task4b_storage_identity_is_current(runtime_sys):
+                    raise archive_error_original(
+                        "authority_mismatch", "final_identity_drift"
+                    ) from None
+            finally:
+                entry = capture_materialization_registry.pop(
+                    id(transaction_nonce), None
+                )
+                transaction["state"] = "scrubbing"
+                transaction_token = transaction.get("token")
+                transaction["token"] = None
+                transaction["view"] = None
+                transaction["storage_module"] = None
+                transaction["source_class"] = None
+                transaction["nonce"] = None
+                transaction["provenance"] = None
+                if transaction_token is not None:
+                    active_capture_materialization.reset(transaction_token)
+                transaction["state"] = "closed"
+                del entry, transaction_token
+                transaction_nonce = None
+                transaction = None
+            return snapshot
+        except BaseException as observed_body_error:
+            body_error = observed_body_error
+            body_traceback = observed_body_error.__traceback__
+            del observed_body_error
+
+        if manifest_control is not None and body_error is not manifest_control:
+            body_error = manifest_control
+            body_traceback = manifest_control_traceback
+
+        if (
+            final_identity_error
+            and type(body_error) is _ArchiveRpcError
+            and body_error.reason_code == "authority_mismatch"
+            and body_error.failure_kind
+            == "historical_window_capability_invalid"
+        ):
+            body_error.__traceback__ = None
+            body_error = archive_error_original(
+                "authority_mismatch", "final_identity_drift"
+            )
+            body_traceback = None
+
+        if transaction is not None:
+            capture_materialization_registry.pop(
+                id(transaction_nonce), None
+            )
+            transaction["state"] = "scrubbing"
+            transaction_token = transaction.get("token")
+            transaction["token"] = None
+            transaction["view"] = None
+            transaction["storage_module"] = None
+            transaction["source_class"] = None
+            transaction["nonce"] = None
+            transaction["provenance"] = None
+            if transaction_token is not None:
+                active_capture_materialization.reset(transaction_token)
+            transaction["state"] = "closed"
+        if (
+            view is None
+            and isinstance(body_error, Exception)
+            and type(body_error) is not _ArchiveRpcError
+        ):
+            raise _ArchiveRpcError(
+                "authority_mismatch",
+                "historical_window_capability_invalid",
+            ) from None
+        close_control = None
+        close_traceback = None
+        if snapshot is not None or view is not None:
+            try:
+                if snapshot is not None:
+                    close_authority = (
+                        task4b_storage_snapshot_close_runner
+                        if task4b_storage_runner_graph_is_current()
+                        else (
+                            task4b_storage_snapshot_close
+                            if task4b_storage_original_graph_is_current()
+                            else None
+                        )
+                    )
+                else:
+                    close_authority = (
+                        task4b_storage_view_close_runner
+                        if task4b_storage_runner_graph_is_current()
+                        else (
+                            task4b_storage_view_close
+                            if task4b_storage_original_graph_is_current()
+                            else None
+                        )
+                    )
+                if close_authority is None:
+                    raise archive_error_original(
+                        "authority_mismatch", "final_identity_drift"
+                    ) from None
+                close_authority(
+                    snapshot if snapshot is not None else view
+                )
+                close_authority = None
+            except BaseException as observed_close_error:
+                if not isinstance(observed_close_error, Exception):
+                    close_control = observed_close_error
+                    close_traceback = observed_close_error.__traceback__
+                del observed_close_error
+        if isinstance(body_error, Exception) and close_control is not None:
+            raise close_control.with_traceback(close_traceback)
+        raise body_error.with_traceback(body_traceback)
+
+    for task4b_surface in (
+        _materialize_historical_window_staging_snapshot,
+        _bind_production_historical_window_capture_replay_source_from_bound_storage,
+        _consume_production_historical_window_capture_replay_event_for_storage,
+    ):
+        task4b_surface.__qualname__ = task4b_surface.__name__
+        task4b_surface.__module__ = __name__
+
+    task4b_scan_local_originals = (
+        _materialize_historical_window_staging_snapshot,
+        _ProductionHistoricalWindowCaptureReplayEvent,
+        _bind_production_historical_window_capture_replay_source_from_bound_storage,
+        replay_surface,
+        _consume_production_historical_window_capture_replay_event_for_storage,
+    )
+
     return (
         _ProductionHistoricalWindowPreFinalization,
         _ProductionHistoricalWindowReconciliation,
@@ -2260,18 +5309,13 @@ def _initialize_production_historical_window_authorities():
         reconcile,
         verify_reconciliation,
         capture,
+        project_historical_header_inventory_wrapper,
+        project_historical_window_projection_wrapper,
+        _materialize_historical_window_staging_snapshot,
+        _bind_production_historical_window_capture_replay_source_from_bound_storage,
+        replay_surface,
+        _consume_production_historical_window_capture_replay_event_for_storage,
     )
-
-
-(
-    _ProductionHistoricalWindowPreFinalization,
-    _ProductionHistoricalWindowReconciliation,
-    _verify_production_historical_window_prefinalization,
-    _reconcile_production_historical_window,
-    _verify_production_historical_window_reconciliation,
-    _capture_production_historical_window,
-) = _initialize_production_historical_window_authorities()
-del _initialize_production_historical_window_authorities
 
 
 def _canonical_hash_value(
@@ -2633,8 +5677,8 @@ def project_historical_lower_bound_capture(
             raw, block_number=mid, request_id=request_id,
             pair=("block_coverage_incomplete", "lower_bound_invalid"),
         )
-        compact_probes.append(compact)
         del raw
+        compact_probes.append(compact)
         if compact["header"]["timestamp"] >= cutoff:
             hi = mid
         else:
@@ -2659,11 +5703,12 @@ def project_historical_lower_bound_capture(
             witness_iterator,
             ("block_coverage_incomplete", "lower_bound_witness_invalid"),
         )
-        compact_witness.append(_project_lower_observation(
+        compact = _project_lower_observation(
             raw, block_number=number, request_id=request_id,
             pair=("block_coverage_incomplete", "lower_bound_witness_invalid"),
-        ))
+        )
         del raw
+        compact_witness.append(compact)
         request_id += 1
     if _next_input(
         witness_iterator,
@@ -4422,3 +7467,63 @@ def project_historical_window_projection(
     if projection_failed:
         raise _failure("authority_mismatch", "fixture_input_invalid")
     return projection
+
+
+class _ProductionHistoricalWindowCaptureReplayEvent:
+    __slots__ = ()
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+        del cls, args, kwargs
+        raise _failure("authority_mismatch", "fixture_input_invalid")
+
+    def __init_subclass__(cls, **_kwargs: Any) -> None:
+        del cls
+        raise TypeError("historical replay event is sealed")
+
+    def __repr__(self) -> str:
+        return "_ProductionHistoricalWindowCaptureReplayEvent(<redacted>)"
+
+    def __copy__(self) -> Any:
+        raise TypeError("historical replay event is not copyable")
+
+    def __deepcopy__(self, _memo: Any) -> Any:
+        raise TypeError("historical replay event is not copyable")
+
+    def __reduce__(self) -> Any:
+        raise TypeError("historical replay event is not serializable")
+
+    def __reduce_ex__(self, _protocol: int) -> Any:
+        raise TypeError("historical replay event is not serializable")
+
+
+(
+    _ProductionHistoricalWindowPreFinalization,
+    _ProductionHistoricalWindowReconciliation,
+    _verify_production_historical_window_prefinalization,
+    _reconcile_production_historical_window,
+    _verify_production_historical_window_reconciliation,
+    _capture_production_historical_window,
+    project_historical_header_inventory,
+    project_historical_window_projection,
+    _materialize_historical_window_staging_snapshot,
+    _bind_production_historical_window_capture_replay_source_from_bound_storage,
+    _replay_production_historical_window_capture_from_bound_storage,
+    _consume_production_historical_window_capture_replay_event_for_storage,
+) = _initialize_production_historical_window_authorities()
+del _initialize_production_historical_window_authorities
+
+
+_TASK4B_SCAN_LOCAL_SURFACE_NAMES = (
+    "_materialize_historical_window_staging_snapshot",
+    "_ProductionHistoricalWindowCaptureReplayEvent",
+    "_bind_production_historical_window_capture_replay_source_from_bound_storage",
+    "_replay_production_historical_window_capture_from_bound_storage",
+    "_consume_production_historical_window_capture_replay_event_for_storage",
+)
+_TASK4B_SCAN_LOCAL_SURFACE_OBJECTS = (
+    _materialize_historical_window_staging_snapshot,
+    _ProductionHistoricalWindowCaptureReplayEvent,
+    _bind_production_historical_window_capture_replay_source_from_bound_storage,
+    _replay_production_historical_window_capture_from_bound_storage,
+    _consume_production_historical_window_capture_replay_event_for_storage,
+)
