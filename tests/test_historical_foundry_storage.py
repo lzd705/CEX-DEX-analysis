@@ -11811,7 +11811,7 @@ class HistoricalFoundryStorageTask4bInventoryTests(unittest.TestCase):
             len({pair[0]["path"] for pair in quota_pairs}), 9
         )
         self.assertEqual(observed["snapshot_allocations"], 1)
-        self.assertEqual(observed["source_move_calls"], 6)
+        self.assertEqual(observed["source_move_calls"], 7)
         self.assertEqual(len(observed["spool_unlinks"]), 1)
         self.assertEqual(observed["data_entries"], ())
 
@@ -13163,6 +13163,7 @@ class HistoricalFoundryStorageTask4bSnapshotTests(unittest.TestCase):
                 (
                     ("ancestry", 0), ("ancestry", 1),
                     ("source", 0), ("source", 1), ("source", 2),
+                    ("source", 3),
                 ),
             )
             self.assertTrue(all(row["returned"] for row in moves))
@@ -13878,6 +13879,7 @@ class HistoricalFoundryStorageTask4bControlFlowTests(unittest.TestCase):
             (
                 ("ancestry", 0), ("ancestry", 1),
                 ("source", 0), ("source", 1), ("source", 2),
+                ("source", 3),
             ),
         )
 
@@ -15262,7 +15264,7 @@ class HistoricalFoundryStorageTask4bMaximumIntegrationTests(
             "fees/00000001.json.gz", 268,
             "3d221de2ad977645a086c54ebd8b1f2e9363bc2c5b5ae571fe54030098bc8330",
         ),
-        "2e7ba9c9e8b13155926a157f65d6fe48e577400d7301df7839028f381f6761f2",
+        "f634451adf3f3b32caf4a80db62cd657de5861252eb0e64abcd5f42d0cc235b1",
     )
 
     @staticmethod
@@ -15984,6 +15986,42 @@ class HistoricalFoundryScenarioStorageNativeTests(unittest.TestCase):
         ):
             with self.assertRaises((TypeError, RuntimeError)):
                 authority()
+
+    def test_task6_directory_commit_is_kernel_noreplace(self):
+        import scripts.historical_foundry_storage as storage
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.mkdir("source", 0o700, dir_fd=parent_fd)
+                os.mkdir("destination", 0o700, dir_fd=parent_fd)
+                source_before = os.stat(
+                    "source", dir_fd=parent_fd, follow_symlinks=False
+                )
+                destination_before = os.stat(
+                    "destination", dir_fd=parent_fd, follow_symlinks=False
+                )
+                with self.assertRaises(FileExistsError):
+                    storage._task6_rename_directory_noreplace(
+                        parent_fd=parent_fd, source_name="source",
+                        destination_name="destination",
+                    )
+                source_after = os.stat(
+                    "source", dir_fd=parent_fd, follow_symlinks=False
+                )
+                destination_after = os.stat(
+                    "destination", dir_fd=parent_fd, follow_symlinks=False
+                )
+                self.assertEqual(
+                    (source_after.st_dev, source_after.st_ino),
+                    (source_before.st_dev, source_before.st_ino),
+                )
+                self.assertEqual(
+                    (destination_after.st_dev, destination_after.st_ino),
+                    (destination_before.st_dev, destination_before.st_ino),
+                )
+            finally:
+                os.close(parent_fd)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import http.client
 import io
 import json
 import socket
+import sys
 import threading
 import time
 from types import MappingProxyType
@@ -31,6 +32,58 @@ from scripts.route_cost_evidence import (
     solidity_allowance_storage_key,
     solidity_balance_storage_key,
 )
+
+
+class HistoricalReplayError(RuntimeError):
+    __slots__ = ("_category",)
+
+    def __init__(self, category: str) -> None:
+        allowed = {
+            "fork_hardfork_unsupported", "fork_window_mixed",
+            "foundry_replay_failed", "candidate_unresolved", "authority",
+            "archive",
+        }
+        if category not in allowed:
+            category = "foundry_replay_failed"
+        RuntimeError.__init__(
+            self, "historical scenario replay failed: " + category
+        )
+        object.__setattr__(self, "_category", category)
+
+    @property
+    def category(self) -> str:
+        return self._category
+
+    def __repr__(self) -> str:
+        return "HistoricalReplayError({!r})".format(self._category)
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise AttributeError("HistoricalReplayError is immutable")
+
+    def __init_subclass__(cls, **_kwargs: Any) -> None:
+        raise TypeError("HistoricalReplayError is sealed")
+
+
+def _typed_historical_replay_error(error: Exception) -> HistoricalReplayError:
+    if type(error) is HistoricalReplayError:
+        return error
+    message = str(error).lower()
+    module_name = type(error).__module__
+    if "fork base differs" in message or message == "fork_window_mixed":
+        category = "fork_window_mixed"
+    elif message == "fork_hardfork_unsupported" or (
+        "hardfork" in message and "unsupported" in message
+    ):
+        category = "fork_hardfork_unsupported"
+    elif module_name == "scripts.historical_foundry_rpc":
+        category = "archive"
+    elif any(word in message for word in (
+        "authority", "lineage", "capability", "context is invalid",
+    )):
+        category = "authority"
+    else:
+        category = "foundry_replay_failed"
+    return HistoricalReplayError(category)
 
 
 def _freeze(value: Any) -> Any:
@@ -56,7 +109,8 @@ def _initialize_replay_context_type():
         __slots__ = (
             "_config", "_staging", "_window", "_grid", "_artifact",
             "_runtime", "_runtime_sha256", "_toolchain", "_relay_lease",
-            "_active_process_lease", "_closed",
+            "_active_process_lease", "_clock", "_run_deadline",
+            "_scenario_deadline", "_closed",
         )
 
         def __init__(self, *, _provenance: object = None, **values: Any) -> None:
@@ -140,6 +194,50 @@ def _require_context(context: Any) -> HistoricalReplayContext:
     return context
 
 
+def _remaining_historical_deadline(
+    *, run_deadline: float, scenario_deadline: float,
+    now: float, own_cap: float,
+) -> float:
+    values = (run_deadline, scenario_deadline, now, own_cap)
+    if any(
+        type(value) not in (int, float) or isinstance(value, bool)
+        for value in values
+    ) or own_cap <= 0:
+        raise ValueError("historical replay deadline is invalid")
+    remaining = min(own_cap, run_deadline - now, scenario_deadline - now)
+    if remaining <= 0:
+        raise TimeoutError("historical replay deadline expired")
+    return float(remaining)
+
+
+def _context_remaining(
+    context: HistoricalReplayContext, own_cap: float
+) -> float:
+    now = context._clock()
+    scenario_deadline = context._scenario_deadline
+    if scenario_deadline is None:
+        scenario_deadline = context._run_deadline
+    return _remaining_historical_deadline(
+        run_deadline=context._run_deadline,
+        scenario_deadline=scenario_deadline,
+        now=now, own_cap=own_cap,
+    )
+
+
+def _context_operation_remaining(
+    context: HistoricalReplayContext, *, operation_deadline: float,
+    own_cap: float,
+) -> float:
+    scenario_deadline = context._scenario_deadline
+    if scenario_deadline is None:
+        scenario_deadline = context._run_deadline
+    return _remaining_historical_deadline(
+        run_deadline=context._run_deadline,
+        scenario_deadline=min(scenario_deadline, operation_deadline),
+        now=context._clock(), own_cap=own_cap,
+    )
+
+
 def _validate_toolchain_identity(
     *, config: HistoricalFoundryConfigSet, toolchain: Any
 ) -> None:
@@ -184,6 +282,11 @@ def open_historical_replay_context(
     ):
         raise ValueError("historical replay capability is invalid")
     staging.reread_frozen_members_unchanged()
+    storage._verify_historical_replay_module_source(
+        staging=staging,
+        module_name="scripts.historical_foundry_anvil",
+        module=sys.modules[__name__],
+    )
     identity = staging.frozen_identity_projection()
     if (
         identity.get("stage") != "prefilter_frozen"
@@ -214,6 +317,7 @@ def open_historical_replay_context(
         raise ValueError("historical replay executor runtime differs")
     toolchain = None
     relay_lease = None
+    clock = time.monotonic
     try:
         toolchain = open_reviewed_historical_toolchain()
         _validate_toolchain_identity(config=config, toolchain=toolchain)
@@ -221,6 +325,14 @@ def open_historical_replay_context(
             staging=staging
         )
         rpc._require_historical_relay_lease(relay_lease)
+        clock = relay_lease._clock
+        opened_at = clock()
+        if (
+            type(opened_at) not in (int, float)
+            or isinstance(opened_at, bool)
+            or opened_at >= relay_lease._run_deadline
+        ):
+            raise TimeoutError("historical replay run deadline expired")
         return _issue_replay_context(
             _config=config,
             _staging=staging,
@@ -232,6 +344,9 @@ def open_historical_replay_context(
             _toolchain=toolchain,
             _relay_lease=relay_lease,
             _active_process_lease=None,
+            _clock=clock,
+            _run_deadline=relay_lease._run_deadline,
+            _scenario_deadline=None,
             _closed=False,
         )
     except BaseException:
@@ -374,17 +489,102 @@ def build_historical_state_override(
     return _detach(_freeze(value))
 
 
-def _start_historical_relay(*, context: HistoricalReplayContext) -> Any:
+def _close_historical_relay_server(
+    *, state: Mapping[str, Any], remaining: Any
+) -> None:
+    if not isinstance(state, Mapping) or not callable(remaining):
+        raise ValueError("historical relay server cleanup failed")
+
+    def budget(cap: float) -> float:
+        try:
+            value = remaining(cap)
+        except TimeoutError:
+            return 0.0
+        if (
+            type(value) not in (int, float)
+            or isinstance(value, bool)
+            or not 0 <= value <= cap
+        ):
+            raise ValueError("historical relay server cleanup failed")
+        return float(value)
+
+    server = state.get("server")
+    thread = state.get("thread")
+    lock = state.get("lock")
+    if lock is None:
+        handlers = tuple(state.get("handlers", ()))
+        requests = tuple(state.get("requests", ()))
+    else:
+        with lock:
+            handlers = tuple(state.get("handlers", ()))
+            requests = tuple(state.get("requests", ()))
+    if server is None or thread is None:
+        raise ValueError("historical relay server cleanup failed")
+    budget(5.0)
+    stopper = getattr(server, "request_stop", None)
+    if callable(stopper):
+        stopper()
+    else:
+        server.shutdown()
+    for request in requests:
+        budget(5.0)
+        try:
+            request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        request.close()
+    server.server_close()
+    thread.join(timeout=budget(5.0))
+    for handler in handlers:
+        handler.join(timeout=budget(5.0))
+    if thread.is_alive() or any(handler.is_alive() for handler in handlers):
+        raise ValueError("historical relay server cleanup failed")
+    return None
+
+
+def _start_historical_relay(
+    *, context: HistoricalReplayContext, scenario: Any
+) -> Any:
     checked = _require_context(context)
     import scripts.historical_foundry_rpc as rpc
 
-    relay_authority = rpc._require_historical_relay_lease(
-        checked._relay_lease
+    relay_authority = rpc._bind_historical_relay_scenario(
+        relay_lease=checked._relay_lease,
+        config=checked._config,
+        scenario=scenario,
+        absolute_deadline=(
+            checked._scenario_deadline
+            if checked._scenario_deadline is not None
+            else min(
+                checked._run_deadline,
+                checked._clock() + 120.0,
+            )
+        ),
     )
-    state: Dict[str, Any] = {"server": None, "thread": None, "closed": False}
+    state: Dict[str, Any] = {
+        "server": None, "thread": None, "closed": False,
+        "handlers": set(), "requests": set(), "lock": threading.Lock(),
+    }
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def setup(self) -> None:
+            super().setup()
+            self.request.settimeout(_context_remaining(checked, 30.0))
+            current = threading.current_thread()
+            current.name = "historical-foundry-relay-handler"
+            with state["lock"]:
+                state["handlers"].add(current)
+                state["requests"].add(self.request)
+
+        def finish(self) -> None:
+            try:
+                super().finish()
+            finally:
+                with state["lock"]:
+                    state["handlers"].discard(threading.current_thread())
+                    state["requests"].discard(self.request)
 
         def log_message(self, _format: str, *args: Any) -> None:
             del args
@@ -410,6 +610,7 @@ def _start_historical_relay(*, context: HistoricalReplayContext) -> Any:
                 length = int(raw_length)
                 if not 0 < length <= 4_194_304:
                     raise ValueError("historical relay inbound request is invalid")
+                self.request.settimeout(_context_remaining(checked, 30.0))
                 body = self.rfile.read(length)
                 if len(body) != length:
                     raise ValueError("historical relay inbound request is invalid")
@@ -418,6 +619,7 @@ def _start_historical_relay(*, context: HistoricalReplayContext) -> Any:
                     canonical_request_bytes=body,
                 )
                 elapsed = time.monotonic() - started
+                _context_remaining(checked, 30.0)
                 rpc._validate_historical_relay_resource_counts(
                     inbound_header_bytes=header_bytes,
                     inbound_body_bytes=len(body),
@@ -436,6 +638,7 @@ def _start_historical_relay(*, context: HistoricalReplayContext) -> Any:
                 self.send_header("Content-Length", str(len(response)))
                 self.send_header("Connection", "close")
                 self.end_headers()
+                self.request.settimeout(_context_remaining(checked, 30.0))
                 self.wfile.write(response)
                 self.wfile.flush()
             except BaseException:
@@ -446,8 +649,12 @@ def _start_historical_relay(*, context: HistoricalReplayContext) -> Any:
                     pass
 
     class Server(http.server.ThreadingHTTPServer):
-        daemon_threads = True
+        daemon_threads = False
+        block_on_close = False
         allow_reuse_address = False
+
+        def request_stop(self) -> None:
+            setattr(self, "_BaseServer__shutdown_request", True)
 
         def handle_error(self, _request: Any, _client_address: Any) -> None:
             return None
@@ -458,7 +665,7 @@ def _start_historical_relay(*, context: HistoricalReplayContext) -> Any:
         target=server.serve_forever,
         kwargs={"poll_interval": 0.05},
         name="historical-foundry-relay",
-        daemon=True,
+        daemon=False,
     )
     state.update({"server": server, "thread": thread})
     thread.start()
@@ -478,15 +685,45 @@ def _start_historical_relay(*, context: HistoricalReplayContext) -> Any:
         def close(self) -> None:
             if state["closed"]:
                 return None
+            try:
+                _close_historical_relay_server(
+                    state=state,
+                    remaining=lambda cap: _context_remaining(checked, cap),
+                )
+                relay_authority.close()
+            except BaseException:
+                raise
             state["closed"] = True
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=5.0)
-            if thread.is_alive():
-                raise ValueError("historical relay server cleanup failed")
             return None
 
     return RelayServerLease(port)
+
+
+def _bind_historical_final_anchor_relay(
+    *, context: HistoricalReplayContext, scenario: Any
+) -> Any:
+    """Bind a final reread facade without reacquiring endpoint authority."""
+    checked = _require_context(context)
+    import scripts.historical_foundry_rpc as rpc
+    import scripts.historical_foundry_scan as scan
+
+    scan._validate_replay_scenario_for_context(
+        scenario=scenario, staging=checked._staging,
+        window=checked._window, grid=checked._grid,
+    )
+    now = checked._clock()
+    absolute_deadline = min(checked._run_deadline, now + 120.0)
+    _remaining_historical_deadline(
+        run_deadline=checked._run_deadline,
+        scenario_deadline=absolute_deadline,
+        now=now, own_cap=120.0,
+    )
+    return rpc._bind_historical_relay_scenario(
+        relay_lease=checked._relay_lease,
+        config=checked._config,
+        scenario=scenario,
+        absolute_deadline=absolute_deadline,
+    )
 
 
 _HISTORICAL_LOCAL_RPC_METHODS = frozenset((
@@ -549,26 +786,164 @@ def _validate_historical_fork_base_header(
     return None
 
 
+def _validate_historical_pair_closure(
+    *, expected: Mapping[str, Any], before: Mapping[str, Any],
+    after: Mapping[str, Any]
+) -> Dict[str, Any]:
+    fields = (
+        "pair_address", "reserve_uni_raw", "reserve_weth_raw",
+        "pair_uni_balance_raw", "pair_weth_balance_raw",
+    )
+    if (
+        type(expected) is not dict
+        or type(before) is not dict
+        or type(after) is not dict
+        or tuple(expected) != ("uniswap_v2", "sushiswap_v2")
+        or tuple(before) != tuple(expected)
+        or tuple(after) != tuple(expected)
+    ):
+        raise ValueError("historical pair closure is invalid")
+    detached = {}
+    for venue_id in expected:
+        rows = (expected[venue_id], before[venue_id], after[venue_id])
+        if any(type(value) is not dict for value in rows):
+            raise ValueError("historical pair closure is invalid")
+        if any(tuple(value) != fields for value in rows):
+            raise ValueError("historical pair closure is invalid")
+        reference = rows[0]
+        if (
+            type(reference["pair_address"]) is not str
+            or any(
+                type(reference[name]) is not int or reference[name] < 0
+                for name in fields[1:]
+            )
+            or rows[1] != reference
+            or rows[2] != reference
+        ):
+            raise ValueError("historical pair closure differs")
+        detached[venue_id] = dict(reference)
+    return detached
+
+
+def _validate_historical_transaction_envelope(
+    *, raw_transaction: Mapping[str, Any],
+    expected_transaction: Mapping[str, Any], transaction_hash: str,
+    block_hash: str, block_number: int, transaction_index: int,
+    chain_id: int,
+) -> None:
+    if (
+        type(raw_transaction) is not dict
+        or type(expected_transaction) is not dict
+        or type(transaction_hash) is not str
+        or type(block_hash) is not str
+        or any(
+            type(value) is not int or value < 0
+            for value in (block_number, transaction_index, chain_id)
+        )
+    ):
+        raise ValueError("historical transaction envelope is invalid")
+    exact = {
+        "type": expected_transaction.get("type"),
+        "from": expected_transaction.get("from"),
+        "to": expected_transaction.get("to"),
+        "chainId": hex(chain_id),
+        "nonce": hex(expected_transaction.get("nonce", -1)),
+        "gas": hex(expected_transaction.get("gas", -1)),
+        "maxPriorityFeePerGas": hex(
+            expected_transaction.get("maxPriorityFeePerGas", -1)
+        ),
+        "maxFeePerGas": hex(expected_transaction.get("maxFeePerGas", -1)),
+        "value": hex(expected_transaction.get("value", -1)),
+        "input": expected_transaction.get("input"),
+        "accessList": expected_transaction.get("accessList"),
+        "hash": transaction_hash,
+        "blockHash": block_hash,
+        "blockNumber": hex(block_number),
+        "transactionIndex": hex(transaction_index),
+    }
+    if any(raw_transaction.get(name) != value for name, value in exact.items()):
+        raise ValueError("historical transaction envelope differs")
+    return None
+
+
+def _validate_historical_raw_trace(
+    *, raw_trace: Mapping[str, Any], expected_failed: bool
+) -> list:
+    if (
+        type(raw_trace) is not dict
+        or type(expected_failed) is not bool
+        or not {"gas", "failed", "returnValue", "structLogs"}.issubset(raw_trace)
+        or type(raw_trace["gas"]) is not int
+        or raw_trace["gas"] < 0
+        or type(raw_trace["failed"]) is not bool
+        or raw_trace["failed"] is not expected_failed
+        or type(raw_trace["returnValue"]) is not str
+        or type(raw_trace["structLogs"]) is not list
+    ):
+        raise ValueError("historical execution trace is invalid")
+    required = {
+        "pc": int, "op": str, "gas": int, "gasCost": int,
+        "depth": int, "stack": list, "memory": list, "storage": dict,
+    }
+    gasprice = []
+    previous_depth = None
+    for step in raw_trace["structLogs"]:
+        if type(step) is not dict or not set(required).issubset(step):
+            raise ValueError("historical execution trace is invalid")
+        for name, expected_type in required.items():
+            if type(step[name]) is not expected_type:
+                raise ValueError("historical execution trace is invalid")
+        if (
+            step["pc"] < 0 or step["gas"] < 0 or step["gasCost"] < 0
+            or step["depth"] < 1
+            or (
+                previous_depth is not None
+                and abs(step["depth"] - previous_depth) > 1
+            )
+        ):
+            raise ValueError("historical execution trace is invalid")
+        previous_depth = step["depth"]
+        if step["op"] == "GASPRICE":
+            gasprice.append("GASPRICE")
+    return gasprice
+
+
 def _extract_actual_first_leg_uni_raw(
     *, raw_receipt: Mapping[str, Any], uni_address: str,
-    executor_address: str,
+    executor_address: str, pair_address: str,
 ) -> int:
     if (
         type(raw_receipt) is not dict
         or type(uni_address) is not str
         or type(executor_address) is not str
+        or type(pair_address) is not str
     ):
         raise ValueError("historical receipt transfer evidence is invalid")
     topic = "0x" + keccak256(b"Transfer(address,address,uint256)").hex()
     recipient = "0x" + "0" * 24 + executor_address[2:].lower()
+    sender = "0x" + "0" * 24 + pair_address[2:].lower()
     amounts = []
     logs = raw_receipt.get("logs")
     if type(logs) is not list:
         raise ValueError("historical receipt transfer evidence is invalid")
+    previous_log_index = -1
     for row in logs:
+        if type(row) is not dict:
+            raise ValueError("historical receipt transfer evidence is invalid")
+        try:
+            log_index = int(row.get("logIndex", ""), 16)
+        except (TypeError, ValueError):
+            raise ValueError("historical receipt transfer evidence is invalid") from None
         if (
-            type(row) is not dict
-            or type(row.get("address")) is not str
+            log_index <= previous_log_index
+            or row.get("transactionIndex") != "0x0"
+            or type(row.get("removed")) is not bool
+            or row["removed"]
+        ):
+            raise ValueError("historical receipt transfer evidence is invalid")
+        previous_log_index = log_index
+        if (
+            type(row.get("address")) is not str
             or row["address"].lower() != uni_address.lower()
         ):
             continue
@@ -582,6 +957,8 @@ def _extract_actual_first_leg_uni_raw(
             or topics[2].lower() != recipient
         ):
             continue
+        if type(topics[1]) is not str or topics[1].lower() != sender:
+            raise ValueError("historical receipt transfer evidence is invalid")
         data = row.get("data")
         if (
             type(data) is not str
@@ -595,9 +972,9 @@ def _extract_actual_first_leg_uni_raw(
             raise ValueError(
                 "historical receipt transfer evidence is invalid"
             ) from None
-    if not amounts or any(value <= 0 for value in amounts):
+    if len(amounts) != 1 or amounts[0] <= 0:
         raise ValueError("historical receipt transfer evidence is invalid")
-    return sum(amounts)
+    return amounts[0]
 
 
 def _balance_of_calldata(owner: str) -> str:
@@ -622,15 +999,42 @@ def _parse_uint256_result(value: Any) -> int:
 
 
 def _normalized_failed_router_calls(
-    *, call_trace: Mapping[str, Any], router_order: tuple
+    *, call_trace: Mapping[str, Any], router_order: tuple,
+    root_sender: str, root_executor: str, root_input: str,
+    root_failed: bool,
 ) -> list:
-    if type(call_trace) is not dict:
+    if (
+        type(call_trace) is not dict
+        or type(router_order) is not tuple
+        or len(router_order) != 2
+        or any(type(value) is not str for value in router_order)
+        or any(
+            type(value) is not str
+            for value in (root_sender, root_executor, root_input)
+        )
+        or type(root_failed) is not bool
+    ):
         raise ValueError("historical call trace is invalid")
     allowed = {value.lower(): index for index, value in enumerate(router_order)}
     observed = []
 
-    def visit(node: Any) -> None:
-        if type(node) is not dict:
+    def visit(node: Any, *, path: list, expected_from: str) -> None:
+        required = {
+            "type", "from", "to", "input", "output", "value", "gas",
+            "gasUsed", "calls",
+        }
+        if (
+            type(node) is not dict
+            or not required.issubset(node)
+            or node["type"] not in ("CALL", "STATICCALL", "DELEGATECALL")
+            or type(node["from"]) is not str
+            or node["from"].lower() != expected_from.lower()
+            or type(node["to"]) is not str
+            or any(type(node[name]) is not str for name in (
+                "input", "output", "value", "gas", "gasUsed",
+            ))
+            or type(node["calls"]) is not list
+        ):
             raise ValueError("historical call trace is invalid")
         target = node.get("to")
         if type(target) is str and target.lower() in allowed and node.get("error"):
@@ -647,7 +1051,7 @@ def _normalized_failed_router_calls(
             except ValueError:
                 raise ValueError("historical call trace is invalid") from None
             observed.append({
-                "call_path": [allowed[target.lower()]],
+                "call_path": list(path),
                 "leg": (
                     "first_leg" if allowed[target.lower()] == 0
                     else "second_leg"
@@ -656,13 +1060,23 @@ def _normalized_failed_router_calls(
                 "revert_selector": "0x" + raw[:4].hex(),
                 "revert_data_sha256": hashlib.sha256(raw).hexdigest(),
             })
-        children = node.get("calls", [])
-        if type(children) is not list:
-            raise ValueError("historical call trace is invalid")
-        for child in children:
-            visit(child)
+        for child_index, child in enumerate(node["calls"]):
+            visit(child, path=path + [child_index], expected_from=node["to"])
 
-    visit(call_trace)
+    root_has_error = bool(call_trace.get("error"))
+    if (
+        call_trace.get("from", "").lower() != root_sender.lower()
+        or call_trace.get("to", "").lower() != root_executor.lower()
+        or call_trace.get("input", "").lower() != root_input.lower()
+        or root_has_error is not root_failed
+    ):
+        raise ValueError("historical call trace is invalid")
+    visit(call_trace, path=[], expected_from=root_sender)
+    router_paths = tuple(
+        (row["router"], tuple(row["call_path"])) for row in observed
+    )
+    if len(router_paths) != len(set(router_paths)) or len(observed) > 1:
+        raise ValueError("historical call trace is invalid")
     return observed
 
 
@@ -695,7 +1109,9 @@ def _execute_historical_local_rpc(
         raise ValueError("historical local RPC endpoint is invalid")
     next_id = [1]
 
-    def rpc_call(method: str, params: list) -> Any:
+    def rpc_call(
+        method: str, params: list, *, absolute_deadline: Any = None
+    ) -> Any:
         identifier = next_id[0]
         next_id[0] += 1
         request_bytes = _canonical_json({
@@ -703,12 +1119,26 @@ def _execute_historical_local_rpc(
             "method": method, "params": params,
         })
         started = time.monotonic()
+        clock_started = checked._clock()
+        call_deadline = min(
+            checked._run_deadline,
+            checked._scenario_deadline
+            if checked._scenario_deadline is not None
+            else checked._run_deadline,
+            clock_started + 30.0,
+            absolute_deadline
+            if type(absolute_deadline) in (int, float)
+            else checked._run_deadline,
+        )
         _validate_historical_local_rpc_call(
             method=method, request_byte_count=len(request_bytes),
             decoded_response_byte_count=0, elapsed_seconds=0.0,
         )
+        timeout = _context_operation_remaining(
+            checked, operation_deadline=call_deadline, own_cap=30.0
+        )
         connection = http.client.HTTPConnection(
-            "127.0.0.1", anvil_port, timeout=30.0
+            "127.0.0.1", anvil_port, timeout=timeout
         )
         try:
             connection.request(
@@ -719,6 +1149,10 @@ def _execute_historical_local_rpc(
                     "Connection": "close",
                 },
             )
+            if connection.sock is not None:
+                connection.sock.settimeout(_context_operation_remaining(
+                    checked, operation_deadline=call_deadline, own_cap=30.0
+                ))
             response = connection.getresponse()
             header_bytes = sum(
                 len(name.encode("latin-1"))
@@ -727,6 +1161,10 @@ def _execute_historical_local_rpc(
             )
             if response.status != 200 or header_bytes > 65_536:
                 raise ValueError("historical local RPC response is invalid")
+            if connection.sock is not None:
+                connection.sock.settimeout(_context_operation_remaining(
+                    checked, operation_deadline=call_deadline, own_cap=30.0
+                ))
             payload = response.read(67_108_865)
         finally:
             connection.close()
@@ -760,25 +1198,94 @@ def _execute_historical_local_rpc(
             raise ValueError("historical local RPC response is invalid")
         return decoded["result"]
 
-    readiness_deadline = time.monotonic() + 30.0
+    readiness_deadline = min(
+        checked._run_deadline,
+        checked._scenario_deadline
+        if checked._scenario_deadline is not None
+        else checked._run_deadline,
+        checked._clock() + 30.0,
+    )
     while True:
         process_lease = getattr(checked, "_active_process_lease", None)
         if process_lease is not None:
             process_lease._assert_output_within_limit()
         try:
-            if rpc_call("eth_chainId", []) == "0x1":
+            if rpc_call(
+                "eth_chainId", [], absolute_deadline=readiness_deadline
+            ) == "0x1":
                 break
         except Exception:
             pass
-        if time.monotonic() >= readiness_deadline:
+        try:
+            sleep_seconds = _context_operation_remaining(
+                checked, operation_deadline=readiness_deadline,
+                own_cap=0.05,
+            )
+        except TimeoutError:
             raise TimeoutError("historical Anvil readiness expired")
-        time.sleep(0.05)
+        time.sleep(sleep_seconds)
     selected = rpc_call(
         "eth_getBlockByNumber", [hex(override["block_number"]), False]
     )
     _validate_historical_fork_base_header(
         raw_header=selected, expected_header=row["header"]
     )
+    authority = checked._config.authority.value
+    tokens = {token["role"]: token for token in authority["tokens"]}
+
+    def read_pair_state() -> Dict[str, Any]:
+        observed = {}
+        ordered_roles = tuple(sorted(
+            ("uni", "weth"), key=lambda role: tokens[role]["address"]
+        ))
+        for venue_id in ("uniswap_v2", "sushiswap_v2"):
+            expected_reserves = row["reserves"][venue_id]
+            pair = expected_reserves["pair_address"]
+            raw_reserves = rpc_call("eth_call", [{
+                "to": pair, "data": "0x0902f1ac",
+            }, "latest"])
+            if (
+                type(raw_reserves) is not str
+                or not raw_reserves.startswith("0x")
+                or len(raw_reserves) != 194
+            ):
+                raise ValueError("historical pair closure is invalid")
+            try:
+                words = tuple(
+                    int(raw_reserves[2 + index * 64:2 + (index + 1) * 64], 16)
+                    for index in range(3)
+                )
+            except ValueError:
+                raise ValueError("historical pair closure is invalid") from None
+            reserve_by_role = dict(zip(ordered_roles, words[:2]))
+            balances = {}
+            for role in ("uni", "weth"):
+                balances[role] = _parse_uint256_result(rpc_call(
+                    "eth_call", [{
+                        "to": tokens[role]["address"],
+                        "data": _balance_of_calldata(pair),
+                    }, "latest"]
+                ))
+            observed[venue_id] = {
+                "pair_address": pair,
+                "reserve_uni_raw": reserve_by_role["uni"],
+                "reserve_weth_raw": reserve_by_role["weth"],
+                "pair_uni_balance_raw": balances["uni"],
+                "pair_weth_balance_raw": balances["weth"],
+            }
+        return observed
+
+    expected_pair_state = {
+        venue_id: {
+            "pair_address": row["reserves"][venue_id]["pair_address"],
+            "reserve_uni_raw": row["reserves"][venue_id]["reserve_uni_raw"],
+            "reserve_weth_raw": row["reserves"][venue_id]["reserve_weth_raw"],
+            "pair_uni_balance_raw": row["reserves"][venue_id]["reserve_uni_raw"],
+            "pair_weth_balance_raw": row["reserves"][venue_id]["reserve_weth_raw"],
+        }
+        for venue_id in ("uniswap_v2", "sushiswap_v2")
+    }
+    pair_state_before = read_pair_state()
     for address, account in override["accounts"].items():
         prior_balance = int(rpc_call("eth_getBalance", [address, "latest"]), 16)
         if "balance_delta" in account:
@@ -833,8 +1340,12 @@ def _execute_historical_local_rpc(
                 "eth_getStorageAt", [address, slot, "latest"]
             ), 16) != value:
                 raise ValueError("historical overlay storage readback differs")
-    authority = checked._config.authority.value
-    tokens = {token["role"]: token for token in authority["tokens"]}
+    pair_state_after = read_pair_state()
+    pair_closure = _validate_historical_pair_closure(
+        expected=expected_pair_state,
+        before=pair_state_before,
+        after=pair_state_after,
+    )
     executor = authority["executor"]["address"]
     balance_call = _balance_of_calldata(executor)
     initial_weth = _parse_uint256_result(rpc_call("eth_call", [{
@@ -893,8 +1404,6 @@ def _execute_historical_local_rpc(
         != override["synthetic_block"]["timestamp"]
         or int(child_block.get("baseFeePerGas", "-1"), 16)
         != override["synthetic_block"]["base_fee_per_gas"]
-        or raw_transaction.get("hash") != transaction_hash
-        or raw_transaction.get("input", "").lower() != tx["input"].lower()
     ):
         raise ValueError("historical receipt or trace is invalid")
     receipt = {
@@ -910,21 +1419,37 @@ def _execute_historical_local_rpc(
         "maxPriorityFeePerGas": tx["maxPriorityFeePerGas"],
         "transactionHash": raw_receipt["transactionHash"].lower(),
     }
-    gasprice_addresses = []
-    for step in raw_trace.get("structLogs", []):
-        if type(step) is dict and step.get("op") == "GASPRICE":
-            gasprice_addresses.append(override["transaction"]["to"])
+    _validate_historical_transaction_envelope(
+        raw_transaction=raw_transaction,
+        expected_transaction=tx,
+        transaction_hash=transaction_hash,
+        block_hash=receipt["blockHash"],
+        block_number=receipt["blockNumber"],
+        transaction_index=receipt["transactionIndex"],
+        chain_id=1,
+    )
+    gasprice_ops = _validate_historical_raw_trace(
+        raw_trace=raw_trace, expected_failed=receipt["status"] == 0
+    )
+    gasprice_addresses = [tx["to"] for _value in gasprice_ops]
     routers = {
         venue["venue_id"]: venue["router_address"]
         for venue in authority["venues"]
     }
+    first_venue = (
+        "uniswap_v2"
+        if row["direction"] == "uniswap_to_sushiswap"
+        else "sushiswap_v2"
+    )
     router_order = (
         (routers["uniswap_v2"], routers["sushiswap_v2"])
         if row["direction"] == "uniswap_to_sushiswap"
         else (routers["sushiswap_v2"], routers["uniswap_v2"])
     )
     failed_router_calls = _normalized_failed_router_calls(
-        call_trace=call_trace, router_order=router_order
+        call_trace=call_trace, router_order=router_order,
+        root_sender=tx["from"], root_executor=tx["to"],
+        root_input=tx["input"], root_failed=receipt["status"] == 0,
     )
     if receipt["status"] == 0:
         root_output = call_trace.get("output", raw_trace.get("returnValue"))
@@ -935,6 +1460,7 @@ def _execute_historical_local_rpc(
             raw_receipt=raw_receipt,
             uni_address=tokens["uni"]["address"],
             executor_address=executor,
+            pair_address=row["reserves"][first_venue]["pair_address"],
         )
         if actual_first_leg_uni != row["first_amount_out_raw"]:
             raise ValueError("historical first-leg token delta differs")
@@ -950,12 +1476,26 @@ def _execute_historical_local_rpc(
         "failed": raw_trace.get("failed") is True,
         "gasprice_opcode_addresses": sorted(set(gasprice_addresses)),
         "calls": failed_router_calls,
+        "fork_header": dict(row["header"]),
+        "pair_closure": pair_closure,
+        "balances": {
+            "initial_weth_raw": initial_weth,
+            "initial_uni_raw": initial_uni,
+            "final_weth_raw": final_weth,
+            "final_uni_raw": residual_uni,
+        },
+        "actual_deltas": {
+            "first_leg_uni_raw": actual_first_leg_uni,
+            "weth_raw": final_weth - initial_weth,
+            "residual_uni_raw": residual_uni,
+        },
     }
     return {
         "selected_state": {
             "block_number": override["block_number"],
             "block_hash": override["block_hash"],
             "state_root": override["state_root"],
+            "pair_closure": pair_closure,
         },
         "token_deltas": {
             "initial_weth_raw": initial_weth,
@@ -1009,7 +1549,7 @@ def _exact_terminating_decimal(numerator: int, denominator: int) -> str:
 
 def _build_cost_proof_inputs(
     *, context: HistoricalReplayContext, row: Mapping[str, Any],
-    receipt: Mapping[str, Any],
+    receipt: Mapping[str, Any], token_deltas: Mapping[str, Any],
     receipt_sha256: str, trace_sha256: str
 ) -> Dict[str, Any]:
     checked = _require_context(context)
@@ -1027,13 +1567,72 @@ def _build_cost_proof_inputs(
         or receipt["gasUsed"] < 0
         or type(receipt.get("effectiveGasPrice")) is not int
         or receipt["effectiveGasPrice"] < 0
+        or type(token_deltas) is not dict
+        or set(token_deltas) != {
+            "initial_weth_raw", "initial_uni_raw",
+            "actual_first_leg_uni_raw", "final_weth_raw",
+            "residual_uni_raw",
+        }
+        or any(type(value) is not int or value < 0 for value in token_deltas.values())
+        or token_deltas["initial_uni_raw"] != 0
+        or token_deltas["residual_uni_raw"] != 0
+        or token_deltas["initial_weth_raw"] != row.get("amount_weth_in_wei")
+        or token_deltas["actual_first_leg_uni_raw"]
+        != row.get("first_amount_out_raw")
+        or token_deltas["final_weth_raw"] != row.get("second_amount_out_raw")
     ):
         raise ValueError("historical cost proof input is invalid")
     scenario_key = row.get("scenario_key")
     if type(scenario_key) is not str or not scenario_key:
         raise ValueError("historical cost proof input is invalid")
-    pool_fee = _exact_terminating_decimal(
-        row["requested_notional_usd"] * 30, 10_000
+    amount_denominator = 10 ** (18 + row["price"]["feed_decimals"])
+    expected_amount_weth = (
+        row["requested_notional_usd"] * amount_denominator
+        // row["price"]["answer"]
+    )
+    if expected_amount_weth != token_deltas["initial_weth_raw"]:
+        raise ValueError("historical cost proof input is invalid")
+    formula = checked._config.authority.value["v2_formula"]
+    fee_numerator = formula.get("fee_numerator")
+    fee_denominator = formula.get("fee_denominator")
+    if (
+        type(fee_numerator) is not int
+        or type(fee_denominator) is not int
+        or not 0 < fee_numerator < fee_denominator
+    ):
+        raise ValueError("historical cost proof input is invalid")
+    fee_units = fee_denominator - fee_numerator
+    fee_bps_numerator = fee_units * 10_000
+    fee_bps, fee_bps_remainder = divmod(
+        fee_bps_numerator, fee_denominator
+    )
+    if fee_bps_remainder or fee_bps != 30:
+        raise ValueError("historical cost proof input is invalid")
+    first_pool_fee = _exact_terminating_decimal(
+        token_deltas["initial_weth_raw"] * row["price"]["answer"]
+        * fee_units,
+        amount_denominator * fee_denominator,
+    )
+    second_venue = (
+        "sushiswap_v2"
+        if row.get("direction") == "uniswap_to_sushiswap"
+        else "uniswap_v2"
+    )
+    second_reserves = row.get("reserves", {}).get(second_venue, {})
+    if (
+        not isinstance(second_reserves, Mapping)
+        or type(second_reserves.get("reserve_uni_raw")) is not int
+        or second_reserves["reserve_uni_raw"] <= 0
+        or type(second_reserves.get("reserve_weth_raw")) is not int
+        or second_reserves["reserve_weth_raw"] <= 0
+    ):
+        raise ValueError("historical cost proof input is invalid")
+    second_pool_fee = _exact_terminating_decimal(
+        token_deltas["actual_first_leg_uni_raw"]
+        * second_reserves["reserve_weth_raw"]
+        * row["price"]["answer"] * fee_units,
+        second_reserves["reserve_uni_raw"]
+        * amount_denominator * fee_denominator,
     )
     gas_amount = _exact_terminating_decimal(
         receipt["gasUsed"] * receipt["effectiveGasPrice"]
@@ -1048,10 +1647,10 @@ def _build_cost_proof_inputs(
         row["requested_notional_usd"] * mev_bps, 10_000
     )
     specs = (
-        ("buy", "pool_swap_fee", "bounded_estimate", True, pool_fee, "30", "receipt"),
+        ("buy", "pool_swap_fee", "bounded_estimate", True, first_pool_fee, str(fee_bps), "receipt"),
         ("buy", "router_or_integrator_fee", "bounded_estimate", False, "0", "0", "receipt"),
         ("buy", "token_transfer_tax", "bounded_estimate", False, "0", "0", "receipt"),
-        ("sell", "pool_swap_fee", "bounded_estimate", True, pool_fee, "30", "receipt"),
+        ("sell", "pool_swap_fee", "bounded_estimate", True, second_pool_fee, str(fee_bps), "receipt"),
         ("sell", "router_or_integrator_fee", "bounded_estimate", False, "0", "0", "receipt"),
         ("sell", "token_transfer_tax", "bounded_estimate", False, "0", "0", "receipt"),
         ("route", "network_gas", "assumed", False, gas_amount, None, "receipt"),
@@ -1113,6 +1712,35 @@ def _open_scenario_evidence_sink(
     )
 
 
+def _advance_historical_replay_context(
+    *, context: HistoricalReplayContext, ledger: Any
+) -> None:
+    if type(context) is not HistoricalReplayContext or context._closed:
+        raise ValueError("historical replay context is invalid")
+    checked = context
+    import scripts.historical_foundry_scan as scan
+
+    successor, window, grid = scan._advance_validated_replay_authorities(
+        ledger=ledger, window=checked._window, grid=checked._grid
+    )
+    object.__setattr__(checked, "_staging", successor)
+    object.__setattr__(checked, "_window", window)
+    object.__setattr__(checked, "_grid", grid)
+    return None
+
+
+def _issue_next_historical_replay_scenario(
+    *, context: HistoricalReplayContext, scenario_key: str
+) -> Any:
+    checked = _require_context(context)
+    import scripts.historical_foundry_scan as scan
+
+    return scan._issue_validated_replay_scenario(
+        staging=checked._staging, window=checked._window,
+        grid=checked._grid, scenario_key=scenario_key,
+    )
+
+
 def _classify_historical_revert(
     *,
     context: HistoricalReplayContext,
@@ -1168,7 +1796,7 @@ def _classify_historical_revert(
         return "unresolved"
     call = calls[0]
     exact_call = {
-        "call_path": [0],
+        "call_path": [0] if matrix["leg"] == "first_leg" else [1],
         "leg": matrix["leg"],
         "router": routers[venue_id],
         "revert_selector": matrix["revert_selector"],
@@ -1201,8 +1829,17 @@ def _classify_historical_outcome(
 def _replay_historical_scenario(
     *, context: HistoricalReplayContext, scenario: Any, sink: Any
 ) -> Mapping[str, Any]:
-    started = time.monotonic()
     checked = _require_context(context)
+    started = checked._clock()
+    _remaining_historical_deadline(
+        run_deadline=checked._run_deadline,
+        scenario_deadline=checked._run_deadline,
+        now=started, own_cap=120.0,
+    )
+    object.__setattr__(
+        checked, "_scenario_deadline",
+        min(checked._run_deadline, started + 120.0),
+    )
     import scripts.historical_foundry_storage as storage
 
     if type(sink) is not storage.ScenarioEvidenceSink:
@@ -1213,10 +1850,13 @@ def _replay_historical_scenario(
     relay = None
     process = None
     ordinary_failure = False
+    ordinary_error = None
     control = None
     try:
-        relay = _start_historical_relay(context=checked)
-        _validate_historical_scenario_elapsed(time.monotonic() - started)
+        relay = _start_historical_relay(
+            context=checked, scenario=scenario
+        )
+        _context_remaining(checked, 120.0)
         relay_port = getattr(relay, "port", None)
         anvil_port = _reserve_historical_anvil_port()
         if (
@@ -1239,7 +1879,7 @@ def _replay_historical_scenario(
             override=override, anvil_port=anvil_port,
         )
         process._assert_output_within_limit()
-        _validate_historical_scenario_elapsed(time.monotonic() - started)
+        _context_remaining(checked, 120.0)
         if type(outcome) is not dict:
             raise ValueError("historical local RPC result is invalid")
         receipt = _detach(outcome.get("receipt"))
@@ -1263,26 +1903,27 @@ def _replay_historical_scenario(
             receipt=receipt, trace=trace,
         )
         if classification == "unresolved":
-            raise ValueError("historical local RPC result is invalid")
+            raise HistoricalReplayError("candidate_unresolved")
         overlay_bytes = _canonical_json(override)
         receipt_bytes = _canonical_json(receipt)
         trace_bytes = _deterministic_gzip(_canonical_json(trace))
         receipt_sha = hashlib.sha256(receipt_bytes).hexdigest()
         trace_sha = hashlib.sha256(trace_bytes).hexdigest()
+        import scripts.historical_foundry_scan as scan
+
+        proof_row = scan._validate_replay_scenario_for_context(
+            scenario=scenario,
+            staging=checked._staging,
+            window=checked._window,
+            grid=checked._grid,
+        )
         proof = None
         if receipt["status"] == 1:
-            import scripts.historical_foundry_scan as scan
-
-            proof_row = scan._validate_replay_scenario_for_context(
-                scenario=scenario,
-                staging=checked._staging,
-                window=checked._window,
-                grid=checked._grid,
-            )
             proof = _build_cost_proof_inputs(
                 context=checked,
                 row=proof_row,
                 receipt=receipt,
+                token_deltas=token_deltas,
                 receipt_sha256=receipt_sha,
                 trace_sha256=trace_sha,
             )
@@ -1294,6 +1935,74 @@ def _replay_historical_scenario(
             "overlay_sha256": hashlib.sha256(overlay_bytes).hexdigest(),
             "receipt_sha256": receipt_sha,
             "trace_sha256": trace_sha,
+            "fork_header": trace["fork_header"],
+            "pair_closure": trace["pair_closure"],
+            "balances": trace["balances"],
+            "actual_deltas": trace["actual_deltas"],
+            "gas": {
+                "gas_used": receipt["gasUsed"],
+                "effective_gas_price": receipt["effectiveGasPrice"],
+                "gas_cost_wei": (
+                    receipt["gasUsed"] * receipt["effectiveGasPrice"]
+                ),
+            },
+            "receipt_closure": {
+                "status": receipt["status"],
+                "block_number": receipt["blockNumber"],
+                "block_hash": receipt["blockHash"],
+                "transaction_index": receipt["transactionIndex"],
+                "transaction_hash": receipt["transactionHash"],
+            },
+            "trace_closure": {
+                "failed": trace["failed"],
+                "gasprice_opcode_addresses": trace[
+                    "gasprice_opcode_addresses"
+                ],
+                "calls": trace["calls"],
+            },
+            "proof_authority": {
+                "policy_sha256": checked._config.policy.physical_sha256,
+                "authority_sha256": checked._config.authority.physical_sha256,
+                "toolchain_sha256": checked._config.toolchain.physical_sha256,
+                "adapter_proof_sha256": checked._artifact.verified_identity[
+                    "creation_bytecode_sha256"
+                ],
+                "executor_runtime_sha256": checked._runtime_sha256,
+                "requested_notional_usd": proof_row[
+                    "requested_notional_usd"
+                ],
+                "amount_weth_in_wei": proof_row["amount_weth_in_wei"],
+                "actual_first_leg_uni_raw": token_deltas[
+                    "actual_first_leg_uni_raw"
+                ],
+                "direction": proof_row["direction"],
+                "second_leg_pair_address": proof_row["reserves"][
+                    "sushiswap_v2"
+                    if proof_row["direction"] == "uniswap_to_sushiswap"
+                    else "uniswap_v2"
+                ]["pair_address"],
+                "second_leg_reserve_uni_raw": proof_row["reserves"][
+                    "sushiswap_v2"
+                    if proof_row["direction"] == "uniswap_to_sushiswap"
+                    else "uniswap_v2"
+                ]["reserve_uni_raw"],
+                "second_leg_reserve_weth_raw": proof_row["reserves"][
+                    "sushiswap_v2"
+                    if proof_row["direction"] == "uniswap_to_sushiswap"
+                    else "uniswap_v2"
+                ]["reserve_weth_raw"],
+                "eth_usd_answer": proof_row["price"]["answer"],
+                "feed_decimals": proof_row["price"]["feed_decimals"],
+                "v2_fee_numerator": checked._config.authority.value[
+                    "v2_formula"
+                ]["fee_numerator"],
+                "v2_fee_denominator": checked._config.authority.value[
+                    "v2_formula"
+                ]["fee_denominator"],
+                "acceptance_mev_bps": checked._config.policy.value[
+                    "fees"
+                ]["acceptance_mev_bps"],
+            },
         }
         if proof is not None:
             result["cost_proof_inputs"] = proof
@@ -1304,6 +2013,10 @@ def _replay_historical_scenario(
             ("result", _canonical_json(result)),
         ):
             sink.write_member(role=role, canonical_bytes=payload)
+        ledger = sink.validated_ledger()
+        _advance_historical_replay_context(
+            context=checked, ledger=ledger
+        )
         return MappingProxyType({
             "scenario_key": override["scenario_key"],
             "selected_state": selected_state,
@@ -1324,9 +2037,18 @@ def _replay_historical_scenario(
             control = error
         else:
             ordinary_failure = True
+            ordinary_error = _typed_historical_replay_error(error)
     finally:
         for lease in (process, relay):
-            closer = getattr(lease, "close", None)
+            closer = None
+            if lease is process:
+                bounded_closer = getattr(lease, "_close_with_budget", None)
+                if callable(bounded_closer):
+                    closer = lambda: bounded_closer(
+                        lambda cap: _context_remaining(checked, cap)
+                    )
+            if closer is None:
+                closer = getattr(lease, "close", None)
             if callable(closer):
                 try:
                     closer()
@@ -1335,17 +2057,24 @@ def _replay_historical_scenario(
                         control = error
                     elif isinstance(error, Exception):
                         ordinary_failure = True
+                        if ordinary_error is None:
+                            ordinary_error = _typed_historical_replay_error(error)
         object.__setattr__(checked, "_active_process_lease", None)
         try:
-            _validate_historical_scenario_elapsed(
-                time.monotonic() - started
-            )
+            _context_remaining(checked, 120.0)
         except BaseException as error:
             if not isinstance(error, Exception) and control is None:
                 control = error
             elif isinstance(error, Exception):
                 ordinary_failure = True
+                if ordinary_error is None:
+                    ordinary_error = _typed_historical_replay_error(error)
+        object.__setattr__(checked, "_scenario_deadline", None)
         if control is not None:
             raise control
         if ordinary_failure:
-            raise ValueError("historical scenario replay failed") from None
+            if ordinary_error is None:
+                ordinary_error = HistoricalReplayError(
+                    "foundry_replay_failed"
+                )
+            raise ordinary_error from None

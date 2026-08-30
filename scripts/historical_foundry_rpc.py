@@ -32,6 +32,7 @@ from scripts.bounded_json import (
     validate_bounded_json_response_headers,
 )
 from scripts.historical_foundry_contracts import (
+    HistoricalFoundryConfigSet,
     build_validated_executor_artifact,
     load_historical_foundry_config_set,
     validate_historical_foundry_authority,
@@ -1259,6 +1260,7 @@ def _initialize_historical_relay_lease_type():
         __slots__ = (
             "_state", "_key", "_endpoint_bytes", "_endpoint_identity",
             "_operation", "_clock", "_last_clock", "_connection_url",
+            "_run_deadline",
         )
 
         def __init__(self, *, _provenance: object = None, **values: Any) -> None:
@@ -1332,6 +1334,7 @@ def _initialize_historical_relay_lease_type():
             _clock=monotonic,
             _last_clock=started,
             _connection_url=connection_url,
+            _run_deadline=float(started) + 21_600.0,
         )
 
     def issue_shared(
@@ -1364,6 +1367,7 @@ def _initialize_historical_relay_lease_type():
             _clock=monotonic,
             _last_clock=last_clock,
             _connection_url=connection_url,
+            _run_deadline=float(last_clock) + 21_600.0,
         )
 
     def require(lease: Any) -> _HistoricalRelayLease:
@@ -1397,20 +1401,272 @@ def _initialize_historical_relay_lease_type():
 del _initialize_historical_relay_lease_type
 
 
+class _HistoricalBytesHeaders:
+    __slots__ = ()
+
+    @staticmethod
+    def raw_items() -> Tuple[Tuple[str, str], ...]:
+        return ()
+
+
+class _HistoricalBytesResponse:
+    __slots__ = ("headers", "_body", "_offset")
+
+    def __init__(self, body: bytes) -> None:
+        self.headers = _HistoricalBytesHeaders()
+        self._body = body
+        self._offset = 0
+
+    def read(self, size: int) -> bytes:
+        start = self._offset
+        stop = min(len(self._body), start + size)
+        self._offset = stop
+        return self._body[start:stop]
+
+
+def _decode_historical_relay_json(body: bytes, *, limit: int) -> Any:
+    if type(body) is not bytes or not body or len(body) > limit:
+        raise ValueError("historical relay JSON is invalid")
+    try:
+        return decode_bounded_json_response(
+            _HistoricalBytesResponse(body),
+            header_limit=65_536,
+            wire_limit=limit,
+            decoded_limit=limit,
+            scalar_limit=8_388_608,
+            node_limit=1_048_576,
+            ordinary_string_limit=262_144,
+            require_canonical=True,
+        )
+    except BoundedJsonError:
+        raise ValueError("historical relay JSON is invalid") from None
+
+
+def _historical_relay_block_tag(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType({
+        "blockHash": row["block_hash"], "requireCanonical": True,
+    })
+
+
+def _build_historical_relay_scenario_authority(
+    *, config: HistoricalFoundryConfigSet, row: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    authority = config.authority.value
+    tokens = {value["role"]: value for value in authority["tokens"]}
+    venues = {value["venue_id"]: value for value in authority["venues"]}
+    pairs = {
+        venue_id: row["reserves"][venue_id]["pair_address"]
+        for venue_id in ("uniswap_v2", "sushiswap_v2")
+    }
+    addresses = {
+        authority["executor"]["address"], authority["sender"]["address"],
+        authority["price_feed"]["proxy_address"],
+    }
+    addresses.update(value["address"] for value in tokens.values())
+    for venue in venues.values():
+        addresses.add(venue["router_address"])
+        addresses.add(venue["factory_address"])
+    addresses.update(pairs.values())
+
+    calls = set()
+    executor = authority["executor"]["address"]
+    owners = (executor,) + tuple(pairs.values())
+    for token in tokens.values():
+        for owner in owners:
+            calls.add((
+                token["address"],
+                "0x" + token["balance_descriptor"]["getter_selector"][2:]
+                + owner[2:].rjust(64, "0"),
+            ))
+    for venue in venues.values():
+        calls.add((venue["router_address"], venue["factory_selector"]))
+        calls.add((venue["router_address"], venue["weth_selector"]))
+        pair_data = (
+            venue["pair_getter_selector"]
+            + tokens["uni"]["address"][2:].rjust(64, "0")
+            + tokens["weth"]["address"][2:].rjust(64, "0")
+        )
+        calls.add((venue["factory_address"], pair_data))
+    for pair in pairs.values():
+        calls.add((pair, "0x0902f1ac"))
+    for selector in (
+        authority["price_feed"]["latest_round_selector"],
+        authority["price_feed"]["aggregator_selector"],
+        authority["price_feed"]["phase_selector"],
+        "0x313ce567", "0x7284e416",
+    ):
+        calls.add((authority["price_feed"]["proxy_address"], selector))
+    return MappingProxyType({
+        "block_number": row["block_number"],
+        "block_hash": row["block_hash"],
+        "block_tag": _historical_relay_block_tag(row),
+        "addresses": frozenset(addresses),
+        "calls": frozenset(calls),
+    })
+
+
+def _initialize_historical_relay_scenario_facade_type():
+    provenance = object()
+
+    class _HistoricalRelayScenarioFacade:
+        __slots__ = ("_lease", "_authority", "_scenario_deadline", "_state")
+
+        def __init__(self, *, _provenance: object = None, **values: Any) -> None:
+            if _provenance is not provenance:
+                raise ValueError("historical relay facade provenance is invalid")
+            for name in self.__slots__:
+                object.__setattr__(self, name, values[name])
+
+        def __repr__(self) -> str:
+            return "_HistoricalRelayScenarioFacade(<sealed>)"
+
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError("historical relay facade is immutable")
+
+        def __reduce__(self) -> Any:
+            raise TypeError("historical relay facade is not serializable")
+
+        def close(self) -> None:
+            object.__setattr__(self, "_state", "closed")
+
+    def issue(
+        *, relay_lease: _HistoricalRelayLease,
+        authority: Mapping[str, Any],
+        absolute_deadline: float,
+    ) -> _HistoricalRelayScenarioFacade:
+        _require_historical_relay_lease(relay_lease)
+        if not isinstance(authority, Mapping):
+            raise ValueError("historical relay scenario authority is invalid")
+        now = relay_lease._clock()
+        if (
+            type(now) not in (int, float)
+            or type(absolute_deadline) not in (int, float)
+            or isinstance(absolute_deadline, bool)
+            or now >= absolute_deadline
+            or absolute_deadline > relay_lease._run_deadline
+        ):
+            raise TimeoutError("historical relay run deadline expired")
+        return _HistoricalRelayScenarioFacade(
+            _provenance=provenance, _lease=relay_lease,
+            _authority=authority,
+            _scenario_deadline=float(absolute_deadline),
+            _state="active",
+        )
+
+    def require(value: Any) -> _HistoricalRelayScenarioFacade:
+        if (
+            type(value) is not _HistoricalRelayScenarioFacade
+            or value._state != "active"
+        ):
+            raise ValueError("historical relay facade is invalid")
+        _require_historical_relay_lease(value._lease)
+        return value
+
+    return _HistoricalRelayScenarioFacade, issue, require
+
+
+(
+    _HistoricalRelayScenarioFacade,
+    _issue_historical_relay_scenario_facade,
+    _require_historical_relay_scenario_facade,
+) = _initialize_historical_relay_scenario_facade_type()
+del _initialize_historical_relay_scenario_facade_type
+
+
+def _bind_historical_relay_scenario(
+    *, relay_lease: _HistoricalRelayLease,
+    config: HistoricalFoundryConfigSet, scenario: Any,
+    absolute_deadline: float,
+) -> _HistoricalRelayScenarioFacade:
+    import scripts.historical_foundry_scan as scan
+
+    if type(config) is not HistoricalFoundryConfigSet:
+        raise ValueError("historical relay scenario authority is invalid")
+    row = scan._validated_replay_scenario_projection(scenario=scenario)
+    scenario_authority = _build_historical_relay_scenario_authority(
+        config=config, row=row
+    )
+    return _issue_historical_relay_scenario_facade(
+        relay_lease=relay_lease, authority=scenario_authority,
+        absolute_deadline=absolute_deadline,
+    )
+
+
+def _validate_historical_relay_scenario_request(
+    *, authority: Mapping[str, Any], request: Mapping[str, Any]
+) -> None:
+    method = request["method"]
+    params = request["params"]
+    block_tag = dict(authority["block_tag"])
+    exact_block = hex(authority["block_number"])
+    if method == "eth_chainId":
+        valid = params == []
+    elif method == "eth_getBlockByNumber":
+        valid = params == [exact_block, False]
+    elif method == "eth_getBlockByHash":
+        valid = params == [authority["block_hash"], False]
+    elif method in (
+        "eth_getCode", "eth_getBalance", "eth_getTransactionCount",
+    ):
+        valid = (
+            len(params) == 2
+            and type(params[0]) is str
+            and params[0].lower() in authority["addresses"]
+            and params[1] in (exact_block, block_tag)
+        )
+    elif method == "eth_getStorageAt":
+        valid = (
+            len(params) == 3
+            and type(params[0]) is str
+            and params[0].lower() in authority["addresses"]
+            and type(params[1]) is str
+            and re.fullmatch(r"0x[0-9a-f]{64}", params[1]) is not None
+            and params[2] in (exact_block, block_tag)
+        )
+    elif method == "eth_call":
+        valid = (
+            len(params) == 2
+            and type(params[0]) is dict
+            and set(params[0]) == {"to", "data"}
+            and (params[0]["to"].lower(), params[0]["data"].lower())
+            in authority["calls"]
+            and params[1] in (exact_block, block_tag)
+        )
+    elif method == "eth_getProof":
+        valid = (
+            len(params) == 3
+            and type(params[0]) is str
+            and params[0].lower() in authority["addresses"]
+            and type(params[1]) is list
+            and all(
+                type(slot) is str
+                and re.fullmatch(r"0x[0-9a-f]{64}", slot) is not None
+                for slot in params[1]
+            )
+            and params[2] in (exact_block, block_tag)
+        )
+    else:
+        valid = False
+    if not valid:
+        raise ValueError("historical relay request is outside scenario")
+    return None
+
+
 def _relay_historical_archive_call(
-    *, relay_lease: _HistoricalRelayLease, canonical_request_bytes: bytes
+    *, relay_lease: _HistoricalRelayScenarioFacade,
+    canonical_request_bytes: bytes
 ) -> bytes:
-    lease = _require_historical_relay_lease(relay_lease)
+    facade = _require_historical_relay_scenario_facade(relay_lease)
+    lease = facade._lease
     if (
         type(canonical_request_bytes) is not bytes
         or not canonical_request_bytes
         or len(canonical_request_bytes) > 4_194_304
     ):
         raise ValueError("historical relay request is invalid")
-    try:
-        request = json.loads(canonical_request_bytes.decode("utf-8"))
-    except Exception:
-        raise ValueError("historical relay request is invalid") from None
+    request = _decode_historical_relay_json(
+        canonical_request_bytes, limit=4_194_304
+    )
     if (
         type(request) is not dict
         or set(request) != {"id", "jsonrpc", "method", "params"}
@@ -1424,11 +1680,19 @@ def _relay_historical_archive_call(
     ):
         raise ValueError("historical relay request is invalid")
     _validate_archive_json_value(request)
+    _validate_historical_relay_scenario_request(
+        authority=facade._authority, request=request
+    )
     started = _initial_clock_sample(lease._clock)
     if started is None or started < lease._last_clock:
         raise ValueError("historical relay clock is invalid")
     object.__setattr__(lease, "_last_clock", started)
-    remaining = 30.0
+    remaining = min(
+        30.0, lease._run_deadline - started,
+        facade._scenario_deadline - started,
+    )
+    if remaining <= 0:
+        raise TimeoutError("historical relay deadline expired")
     try:
         response_bytes = lease._operation(canonical_request_bytes, remaining)
     except (KeyboardInterrupt, SystemExit):
@@ -1443,10 +1707,9 @@ def _relay_historical_archive_call(
         raise TimeoutError("historical relay deadline expired")
     if type(response_bytes) is not bytes or len(response_bytes) > 67_108_864:
         raise ValueError("historical relay response is invalid")
-    try:
-        response = json.loads(response_bytes.decode("utf-8"))
-    except Exception:
-        raise ValueError("historical relay response is invalid") from None
+    response = _decode_historical_relay_json(
+        response_bytes, limit=67_108_864
+    )
     if (
         type(response) is not dict
         or set(response) not in (
@@ -2667,7 +2930,7 @@ def _initialize_production_historical_window_types(core_gate: Any):
                     key, duplicated, parent_index, name, identity,
                 ))
             source_rows = []
-            for role in ("rpc", "scan", "storage"):
+            for role in ("rpc", "scan", "storage", "anvil"):
                 row = sources.files["source:historical_foundry_" + role]
                 fd, _parent_fd, name, relative, _module_name = row[:5]
                 identity, payload, digest = row[5], row[6], row[7]

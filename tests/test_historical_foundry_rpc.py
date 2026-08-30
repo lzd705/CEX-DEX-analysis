@@ -6393,6 +6393,29 @@ class HistoricalFoundryRelayNativeTests(unittest.TestCase):
         )
         self.assertIs(rpc._require_historical_relay_lease(lease), lease)
         self.assertNotIn("fixture", repr(lease))
+        block_hash = "0x" + "4" * 64
+        facade = rpc._issue_historical_relay_scenario_facade(
+            relay_lease=lease,
+            authority={
+                "block_number": 1, "block_hash": block_hash,
+                "block_tag": {"blockHash": block_hash, "requireCanonical": True},
+                "addresses": frozenset(), "calls": frozenset(),
+            },
+            absolute_deadline=120.0,
+        )
+        request = b'{"id":1,"jsonrpc":"2.0","method":"eth_chainId","params":[]}'
+        self.assertEqual(
+            rpc._relay_historical_archive_call(
+                relay_lease=facade, canonical_request_bytes=request
+            ),
+            b'{"id":1,"jsonrpc":"2.0","result":"0x1"}',
+        )
+        with self.assertRaises(ValueError):
+            rpc._relay_historical_archive_call(
+                relay_lease=facade,
+                canonical_request_bytes=b'[{"id":1,"jsonrpc":"2.0","method":"eth_chainId","params":[]}]',
+            )
+        facade.close()
         with self.assertRaises(ValueError):
             rpc._require_historical_relay_lease(
                 object.__new__(type(lease))

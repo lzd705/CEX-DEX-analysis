@@ -1922,8 +1922,8 @@ class HistoricalFoundryAnvilProcessLeaseNativeTests(unittest.TestCase):
             binary_sha256="1" * 64, selected_block=7, hardfork="osaka",
         )
         self.assertNotIn("object at", repr(lease))
-        self.assertEqual(lease.close(), None)
-        self.assertEqual(process.calls, ["term", ("wait", 5.0)])
+        self.assertEqual(lease._close_with_budget(lambda cap: min(cap, 2.0)), None)
+        self.assertEqual(process.calls, ["term", ("wait", 2.0)])
         cleanup.assert_called_once_with()
 
 

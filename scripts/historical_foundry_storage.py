@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping as MappingABC
+import ctypes
+import errno
 import gzip
 import hashlib
 import io
@@ -15,6 +17,56 @@ import weakref
 
 
 _HISTORICAL_WINDOW_MODULE_GENERATION = object()
+
+
+def _task6_commit_checkpoint(_phase: str) -> None:
+    return None
+
+
+def _task6_rename_directory_noreplace(
+    *, parent_fd: int, source_name: str, destination_name: str
+) -> None:
+    if (
+        type(parent_fd) is not int
+        or not stat.S_ISDIR(os.fstat(parent_fd).st_mode)
+        or any(
+            type(name) is not str
+            or not name
+            or name in (".", "..")
+            or "/" in name
+            or "\0" in name
+            for name in (source_name, destination_name)
+        )
+    ):
+        raise ValueError("historical scenario directory rename is invalid")
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        operation = getattr(library, "renameatx_np", None)
+        flag = 0x00000004
+    elif sys.platform.startswith("linux"):
+        operation = getattr(library, "renameat2", None)
+        flag = 1
+    else:
+        operation = None
+        flag = 0
+    if operation is None:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename unsupported")
+    operation.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    operation.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = operation(
+        parent_fd, os.fsencode(source_name),
+        parent_fd, os.fsencode(destination_name), flag,
+    )
+    if result == 0:
+        return None
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(error_number, "historical scenario exists")
+    raise OSError(error_number, "historical scenario rename failed")
 
 
 class HistoricalFoundryStorageError(RuntimeError):
@@ -3303,7 +3355,9 @@ def _initialize_historical_foundry_storage_types():
             role, basename = row["path"].split("/", 1)
             expected_role_members[role].add(basename)
         expected_role_members["scan"].add("capture_inventory.json")
-        if owner.get("capture_generation") in (2, 3):
+        if type(owner.get("capture_generation")) is int and owner.get(
+            "capture_generation"
+        ) >= 2:
             expected_role_members["scan"].update((
                 "prefilter", "prefilter_inventory.json",
             ))
@@ -3311,7 +3365,9 @@ def _initialize_historical_foundry_storage_types():
             "policy.json", "authority.json", "toolchain.json",
             "rpc", "headers", "reserves", "prices", "fees", "scan",
         }
-        if owner.get("capture_generation") == 3:
+        if type(owner.get("capture_generation")) is int and owner.get(
+            "capture_generation"
+        ) >= 3:
             staging_expected.add("foundry")
         if set(os.listdir(captures["staging"]["fd"])) != staging_expected:
             raise _InternalFailure()
@@ -5310,7 +5366,7 @@ def _initialize_historical_foundry_storage_types():
                 expected_bytes, expected_size, expected_sha256,
             ) = metadata
             if (
-                role not in ("rpc", "scan", "storage")
+                role not in ("rpc", "scan", "storage", "anvil")
                 or type(fd) is not int
                 or type(parent_index) is not int
                 or not 0 <= parent_index < len(ancestry_fds)
@@ -5384,6 +5440,70 @@ def _initialize_historical_foundry_storage_types():
         authority["checker"] = None
         authority["close_state"] = "done"
         return first_control, ordinary
+
+    def _verify_historical_replay_module_source(
+        *, staging: object, module_name: str, module: Any
+    ) -> None:
+        owner = _task4b_current_snapshot_owner(staging)
+        authority = owner.get("_task4b_snapshot_source_authority")
+        try:
+            _task4b_verify_snapshot_source_authority(authority)
+            if module_name != "scripts.historical_foundry_anvil":
+                raise _BoundSourceIdentityDrift()
+            spec = getattr(module, "__spec__", None)
+            origin = getattr(spec, "origin", None)
+            file_name = getattr(module, "__file__", None)
+            if (
+                sys.modules.get(module_name) is not module
+                or getattr(spec, "name", None) != module_name
+                or type(origin) is not str
+                or type(file_name) is not str
+            ):
+                raise _BoundSourceIdentityDrift()
+            origin_path = Path(origin).resolve(strict=True)
+            file_path = Path(file_name).resolve(strict=True)
+            if origin_path != file_path:
+                raise _BoundSourceIdentityDrift()
+            slots = tuple(authority.get("source_slots", ()))
+            matches = tuple(
+                slot for slot in slots
+                if type(slot) is dict
+                and type(slot.get("metadata")) is tuple
+                and slot["metadata"][0] == "anvil"
+            )
+            if len(matches) != 1:
+                raise _BoundSourceIdentityDrift()
+            metadata = matches[0]["metadata"]
+            fd = matches[0].get("fd")
+            (
+                role, _parent_index, name, relative, identity,
+                expected_bytes, expected_size, expected_sha256,
+            ) = metadata
+            if (
+                role != "anvil"
+                or name != "historical_foundry_anvil.py"
+                or relative != "scripts/historical_foundry_anvil.py"
+                or type(fd) is not int
+                or _bound_source_file_identity(os.stat(
+                    str(origin_path), follow_symlinks=False
+                )) != identity
+                or _bound_source_file_identity(os.fstat(fd)) != identity
+            ):
+                raise _BoundSourceIdentityDrift()
+            observed = _read_bound_source_fd(fd, expected_size)
+            if (
+                observed != expected_bytes
+                or hashlib.sha256(observed).hexdigest() != expected_sha256
+            ):
+                raise _BoundSourceIdentityDrift()
+            _task4b_current_snapshot_owner(staging)
+            return None
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                raise
+            raise ValueError(
+                "historical replay module source differs"
+            ) from None
 
     def _task4b_snapshot_members(
         owner: Dict[str, Any], source_record: Dict[str, Any]
@@ -6695,11 +6815,13 @@ def _initialize_historical_foundry_storage_types():
         control = None
         try:
             generation = owner.get("capture_generation")
-            expected_state = {
-                1: "capture_frozen",
-                2: "prefilter_frozen",
-                3: "replay_frozen",
-            }.get(generation)
+            expected_state = (
+                "capture_frozen" if generation == 1
+                else "prefilter_frozen" if generation == 2
+                else "replay_frozen"
+                if type(generation) is int and generation >= 3
+                else None
+            )
             if (
                 owner.get("constructor") is not constructor_provenance
                 or expected_state is None
@@ -6808,8 +6930,9 @@ def _initialize_historical_foundry_storage_types():
         rpc = sys.modules.get("scripts.historical_foundry_rpc")
         owner = _task4b_current_snapshot_owner(staging)
         if (
-            owner.get("capture_generation") != 2
-            or owner.get("state") != "prefilter_frozen"
+            type(owner.get("capture_generation")) is not int
+            or owner.get("capture_generation") < 2
+            or owner.get("state") not in ("prefilter_frozen", "replay_frozen")
             or owner.get("_task6_relay_lease") is not None
             or owner.get("_task6_relay_lease_moved") is True
         ):
@@ -6855,8 +6978,9 @@ def _initialize_historical_foundry_storage_types():
         owner = _task4b_current_snapshot_owner(staging)
         relay_lease = owner.get("_task6_relay_lease")
         if (
-            owner.get("capture_generation") != 2
-            or owner.get("state") != "prefilter_frozen"
+            type(owner.get("capture_generation")) is not int
+            or owner.get("capture_generation") < 2
+            or owner.get("state") not in ("prefilter_frozen", "replay_frozen")
             or owner.get("_task6_relay_lease_moved") is True
         ):
             _raise_storage_error()
@@ -6880,8 +7004,9 @@ def _initialize_historical_foundry_storage_types():
     ) -> object:
         owner = _task4b_current_snapshot_owner(staging)
         if (
-            owner.get("capture_generation") != 2
-            or owner.get("state") != "prefilter_frozen"
+            type(owner.get("capture_generation")) is not int
+            or owner.get("capture_generation") < 2
+            or owner.get("state") not in ("prefilter_frozen", "replay_frozen")
             or type(scenario_key) is not str
             or not scenario_key
             or "/" in scenario_key
@@ -6922,8 +7047,9 @@ def _initialize_historical_foundry_storage_types():
             or entry[1].get("owner_generation")
             != owner.get("owner_generation")
             or entry[1].get("scenario_key") != scenario_key
-            or owner.get("capture_generation") != 2
-            or owner.get("state") != "prefilter_frozen"
+            or type(owner.get("capture_generation")) is not int
+            or owner.get("capture_generation") < 2
+            or owner.get("state") not in ("prefilter_frozen", "replay_frozen")
         ):
             _raise_storage_error()
         return owner, entry[1]
@@ -7065,8 +7191,54 @@ def _initialize_historical_foundry_storage_types():
             raise _InternalFailure()
         return proof_hash
 
+    def _task6_exact_decimal(numerator: int, denominator: int) -> str:
+        if (
+            type(numerator) is not int or numerator < 0
+            or type(denominator) is not int or denominator <= 0
+        ):
+            raise _InternalFailure()
+        integer, remainder = divmod(numerator, denominator)
+        digits = []
+        while remainder and len(digits) <= 4_096:
+            remainder *= 10
+            digit, remainder = divmod(remainder, denominator)
+            digits.append(str(digit))
+        if remainder:
+            raise _InternalFailure()
+        if not digits:
+            return str(integer)
+        return "{}.{}".format(integer, "".join(digits).rstrip("0"))
+
+    def _task6_current_config_values(
+        owner: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        ledger = owner.get("_task4b_staging")
+        rows = ledger.get("config_rows") if type(ledger) is dict else None
+        if type(rows) is not tuple:
+            raise _InternalFailure()
+        values = {}
+        digests = {}
+        for row in rows:
+            if type(row) is not dict or row.get("role") not in (
+                "policy", "authority", "toolchain"
+            ):
+                raise _InternalFailure()
+            payload = _task4b_reread_capture_member(
+                ledger, relative_path=row["path"],
+                expected_size=row["byte_count"], maximum_size=1_048_576,
+                size_kind="config",
+            )
+            if hashlib.sha256(payload).hexdigest() != row["sha256"]:
+                raise _InternalFailure()
+            values[row["role"]] = _task4b_decode_canonical_config(payload)
+            digests[row["role"]] = row["sha256"]
+        if set(values) != {"policy", "authority", "toolchain"}:
+            raise _InternalFailure()
+        return values, digests
+
     def _task6_validate_quartet(
-        scenario_key: str, members: Dict[str, bytes]
+        scenario_key: str, members: Dict[str, bytes],
+        owner: Dict[str, Any],
     ) -> Dict[str, Any]:
         overlay = _task4b_decode_canonical_json(
             members["overlay"], expected_container=dict
@@ -7081,6 +7253,15 @@ def _initialize_historical_foundry_storage_types():
         overlay_sha = hashlib.sha256(members["overlay"]).hexdigest()
         receipt_sha = hashlib.sha256(members["receipt"]).hexdigest()
         trace_sha = hashlib.sha256(members["trace"]).hexdigest()
+        _inventory, rows = _task5_rebuild_prefilter(owner)
+        matched = tuple(
+            row for row in rows
+            if type(row) is dict and row.get("scenario_key") == scenario_key
+        )
+        if len(matched) != 1:
+            raise _InternalFailure()
+        scenario = matched[0]
+        config_values, config_digests = _task6_current_config_values(owner)
         if (
             overlay.get("schema") != "historical_foundry_state_override/v1"
             or receipt.get("schema") != "historical_foundry_receipt/v1"
@@ -7097,6 +7278,12 @@ def _initialize_historical_foundry_storage_types():
             or receipt.get("blockNumber")
             != overlay.get("synthetic_block", {}).get("number")
             or receipt.get("transactionIndex") != 0
+            or result.get("fork_header") != scenario.get("header")
+            or trace.get("fork_header") != scenario.get("header")
+            or result.get("fork_header") != trace.get("fork_header")
+            or result.get("pair_closure") != trace.get("pair_closure")
+            or result.get("balances") != trace.get("balances")
+            or result.get("actual_deltas") != trace.get("actual_deltas")
         ):
             raise _InternalFailure()
         status = receipt.get("status")
@@ -7120,6 +7307,128 @@ def _initialize_historical_foundry_storage_types():
             ):
                 raise _InternalFailure()
             proof_hash = None
+        balances = result.get("balances")
+        deltas = result.get("actual_deltas")
+        gas = result.get("gas")
+        receipt_closure = result.get("receipt_closure")
+        trace_closure = result.get("trace_closure")
+        proof_authority = result.get("proof_authority")
+        expected_pairs = {
+            venue_id: {
+                "pair_address": scenario["reserves"][venue_id]["pair_address"],
+                "reserve_uni_raw": scenario["reserves"][venue_id]["reserve_uni_raw"],
+                "reserve_weth_raw": scenario["reserves"][venue_id]["reserve_weth_raw"],
+                "pair_uni_balance_raw": scenario["reserves"][venue_id]["reserve_uni_raw"],
+                "pair_weth_balance_raw": scenario["reserves"][venue_id]["reserve_weth_raw"],
+            }
+            for venue_id in ("uniswap_v2", "sushiswap_v2")
+        }
+        artifact = config_values["toolchain"].get("executor_build", {})
+        formula = config_values["authority"].get("v2_formula", {})
+        mev_bps = config_values["policy"].get("fees", {}).get(
+            "acceptance_mev_bps"
+        )
+        expected_balances = {
+            "initial_weth_raw": scenario["amount_weth_in_wei"],
+            "initial_uni_raw": 0,
+            "final_weth_raw": scenario["second_amount_out_raw"],
+            "final_uni_raw": 0,
+        }
+        expected_deltas = {
+            "first_leg_uni_raw": scenario["first_amount_out_raw"],
+            "weth_raw": (
+                scenario["second_amount_out_raw"]
+                - scenario["amount_weth_in_wei"]
+            ),
+            "residual_uni_raw": 0,
+        }
+        expected_gas = {
+            "gas_used": receipt.get("gasUsed"),
+            "effective_gas_price": receipt.get("effectiveGasPrice"),
+            "gas_cost_wei": (
+                receipt.get("gasUsed", -1) * receipt.get("effectiveGasPrice", -1)
+            ),
+        }
+        expected_receipt_closure = {
+            "status": receipt.get("status"),
+            "block_number": receipt.get("blockNumber"),
+            "block_hash": receipt.get("blockHash"),
+            "transaction_index": receipt.get("transactionIndex"),
+            "transaction_hash": receipt.get("transactionHash"),
+        }
+        expected_trace_closure = {
+            "failed": trace.get("failed"),
+            "gasprice_opcode_addresses": trace.get("gasprice_opcode_addresses"),
+            "calls": trace.get("calls"),
+        }
+        second_venue = (
+            "sushiswap_v2"
+            if scenario.get("direction") == "uniswap_to_sushiswap"
+            else "uniswap_v2"
+        )
+        second_reserves = scenario["reserves"][second_venue]
+        expected_proof_authority = {
+            "policy_sha256": config_digests["policy"],
+            "authority_sha256": config_digests["authority"],
+            "toolchain_sha256": config_digests["toolchain"],
+            "adapter_proof_sha256": artifact.get("creation_bytecode_sha256"),
+            "executor_runtime_sha256": artifact.get("deployed_runtime_sha256"),
+            "requested_notional_usd": scenario["requested_notional_usd"],
+            "amount_weth_in_wei": scenario["amount_weth_in_wei"],
+            "actual_first_leg_uni_raw": scenario["first_amount_out_raw"],
+            "direction": scenario["direction"],
+            "second_leg_pair_address": second_reserves["pair_address"],
+            "second_leg_reserve_uni_raw": second_reserves["reserve_uni_raw"],
+            "second_leg_reserve_weth_raw": second_reserves["reserve_weth_raw"],
+            "eth_usd_answer": scenario["price"]["answer"],
+            "feed_decimals": scenario["price"]["feed_decimals"],
+            "v2_fee_numerator": formula.get("fee_numerator"),
+            "v2_fee_denominator": formula.get("fee_denominator"),
+            "acceptance_mev_bps": mev_bps,
+        }
+        if (
+            result.get("pair_closure") != expected_pairs
+            or balances != expected_balances
+            or deltas != expected_deltas
+            or gas != expected_gas
+            or receipt_closure != expected_receipt_closure
+            or trace_closure != expected_trace_closure
+            or proof_authority != expected_proof_authority
+        ):
+            raise _InternalFailure()
+        if status == 1:
+            denominator = 10 ** (18 + scenario["price"]["feed_decimals"])
+            fee_units = formula["fee_denominator"] - formula["fee_numerator"]
+            expected_first_pool = _task6_exact_decimal(
+                scenario["amount_weth_in_wei"] * scenario["price"]["answer"]
+                * fee_units,
+                denominator * formula["fee_denominator"],
+            )
+            expected_second_pool = _task6_exact_decimal(
+                scenario["first_amount_out_raw"]
+                * second_reserves["reserve_weth_raw"]
+                * scenario["price"]["answer"] * fee_units,
+                second_reserves["reserve_uni_raw"]
+                * denominator * formula["fee_denominator"],
+            )
+            expected_network = _task6_exact_decimal(
+                receipt["gasUsed"] * receipt["effectiveGasPrice"]
+                * scenario["price"]["answer"], denominator,
+            )
+            expected_mev = _task6_exact_decimal(
+                scenario["requested_notional_usd"] * int(mev_bps), 10_000
+            )
+            proof = result["cost_proof_inputs"]
+            if (
+                proof["policy_sha256"] != config_digests["policy"]
+                or proof["adapter_proof_sha256"]
+                != artifact.get("creation_bytecode_sha256")
+                or proof["rows"][0]["amount_usd_exact"] != expected_first_pool
+                or proof["rows"][3]["amount_usd_exact"] != expected_second_pool
+                or proof["rows"][6]["amount_usd_exact"] != expected_network
+                or proof["rows"][8]["amount_usd_exact"] != expected_mev
+            ):
+                raise _InternalFailure()
         block_number = overlay.get("block_number")
         if type(block_number) is not int or block_number < 0:
             raise _InternalFailure()
@@ -7133,28 +7442,50 @@ def _initialize_historical_foundry_storage_types():
         }
 
     def _task6_freeze_audit(owner: Dict[str, Any]) -> None:
-        records = owner.get("_task6_scenario_members")
-        scenario_key = owner.get("_task6_scenario_key")
-        if type(records) is not dict or set(records) != {
-            "overlay", "receipt", "trace", "result"
-        }:
+        scenarios = owner.get("_task6_scenarios")
+        if type(scenarios) is not dict or not scenarios:
             raise _InternalFailure()
-        members = {}
-        for role, row in records.items():
-            payload = _task4b_reread_capture_member(
-                owner["_task4b_staging"],
-                relative_path=row["path"],
-                expected_size=row["size"],
-                maximum_size=row["cap"],
-                size_kind=row["kind"],
-            )
-            if hashlib.sha256(payload).hexdigest() != row["sha256"]:
+        for scenario_key, scenario_record in scenarios.items():
+            records = scenario_record.get("members")
+            if type(records) is not dict or set(records) != {
+                "overlay", "receipt", "trace", "result"
+            }:
                 raise _InternalFailure()
-            members[role] = payload
-        rebuilt = _task6_validate_quartet(scenario_key, members)
-        if rebuilt != owner.get("_task6_quartet_projection"):
-            raise _InternalFailure()
+            members = {}
+            for role, row in records.items():
+                payload = _task4b_reread_capture_member(
+                    owner["_task4b_staging"],
+                    relative_path=row["path"],
+                    expected_size=row["size"],
+                    maximum_size=row["cap"],
+                    size_kind=row["kind"],
+                )
+                if hashlib.sha256(payload).hexdigest() != row["sha256"]:
+                    raise _InternalFailure()
+                members[role] = payload
+            rebuilt = _task6_validate_quartet(scenario_key, members, owner)
+            if rebuilt != scenario_record.get("projection"):
+                raise _InternalFailure()
         return None
+
+    def _validate_historical_quartet_for_test(
+        *, staging: object, scenario_key: str,
+        members: Mapping[str, bytes],
+    ) -> Mapping[str, Any]:
+        owner = _task4b_current_snapshot_owner(staging)
+        if (
+            type(scenario_key) is not str
+            or type(members) is not dict
+            or set(members) != {"overlay", "receipt", "trace", "result"}
+            or any(type(value) is not bytes for value in members.values())
+        ):
+            raise ValueError("historical scenario evidence is invalid")
+        try:
+            return MappingProxyType(_task6_validate_quartet(
+                scenario_key, dict(members), owner
+            ))
+        except _InternalFailure:
+            raise ValueError("historical scenario evidence is invalid") from None
 
     class ValidatedHistoricalReplayLedger(replay_ledger_base):
         __slots__ = ("__weakref__",)
@@ -7168,7 +7499,10 @@ def _initialize_historical_foundry_storage_types():
 
         @property
         def scenario_count(self) -> int:
-            return 1
+            return _task6_live_record(
+                self, ValidatedHistoricalReplayLedger,
+                replay_ledger_registry,
+            )["scenario_count"]
 
         @property
         def scenario_key(self) -> str:
@@ -7234,23 +7568,29 @@ def _initialize_historical_foundry_storage_types():
             owner = record["owner"]
             try:
                 quartet = _task6_validate_quartet(
-                    record["scenario_key"], members
+                    record["scenario_key"], members, owner
                 )
                 owner["state"] = "replay_materializing"
                 ledger = owner["_task4b_staging"]
                 ledger["quota_owner_handle"] = record["staging"]
+                _task4b_freeze_audit(owner["_task4b_frozen_record"])
+                _task5_freeze_audit(owner)
                 staging_directory = ledger["capture_directories"]["staging"]
                 foundry = _task4b_open_capture_directory(
                     ledger, staging_directory["fd"], "foundry",
-                    allow_existing=False,
+                    allow_existing=True,
                 )
                 block_name = str(quartet["block_number"])
                 block = _task4b_open_capture_directory(
                     ledger, foundry["fd"], block_name,
-                    allow_existing=False,
+                    allow_existing=True,
                 )
+                entropy = os.urandom(16)
+                if type(entropy) is not bytes or len(entropy) != 16:
+                    raise _InternalFailure()
+                private_name = ".scenario-" + entropy.hex()
                 scenario = _task4b_open_capture_directory(
-                    ledger, block["fd"], record["scenario_key"],
+                    ledger, block["fd"], private_name,
                     allow_existing=False,
                 )
                 filenames = {
@@ -7262,6 +7602,7 @@ def _initialize_historical_foundry_storage_types():
                 stored = {}
                 ledger.setdefault("task6_member_directories", {})
                 for member_role in expected_roles:
+                    _task6_commit_checkpoint("write_" + member_role)
                     payload = members[member_role]
                     target = filenames[member_role]
                     relative_path = "foundry/{}/{}/{}".format(
@@ -7283,20 +7624,65 @@ def _initialize_historical_foundry_storage_types():
                         ),
                         "kind": "task6_trace" if member_role == "trace" else "task6_json",
                     }
-                owner["_task6_scenario_members"] = stored
-                owner["_task6_scenario_key"] = record["scenario_key"]
-                owner["_task6_quartet_projection"] = quartet
+                reread_members = {}
+                for member_role in expected_roles:
+                    _task6_commit_checkpoint("reread_" + member_role)
+                    row = stored[member_role]
+                    payload = _task4b_reread_capture_member(
+                        ledger, relative_path=row["path"],
+                        expected_size=row["size"], maximum_size=row["cap"],
+                        size_kind=row["kind"],
+                    )
+                    if hashlib.sha256(payload).hexdigest() != row["sha256"]:
+                        raise _InternalFailure()
+                    reread_members[member_role] = payload
+                _task6_commit_checkpoint("closure_audit")
+                reread_quartet = _task6_validate_quartet(
+                    record["scenario_key"], reread_members, owner
+                )
+                if reread_quartet != quartet:
+                    raise _InternalFailure()
+                try:
+                    os.stat(
+                        record["scenario_key"], dir_fd=block["fd"],
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise _InternalFailure()
+                _task6_commit_checkpoint("pre_rename")
+                _task6_rename_directory_noreplace(
+                    parent_fd=block["fd"], source_name=private_name,
+                    destination_name=record["scenario_key"],
+                )
+                scenario["name"] = record["scenario_key"]
+                scenario["identity"] = _metadata_snapshot(os.fstat(
+                    scenario["fd"]
+                ))
+                os.fsync(block["fd"])
+                _task6_commit_checkpoint("post_rename")
+                scenarios = owner.setdefault("_task6_scenarios", {})
+                if (
+                    type(scenarios) is not dict
+                    or record["scenario_key"] in scenarios
+                ):
+                    raise _InternalFailure()
+                scenarios[record["scenario_key"]] = {
+                    "members": stored, "projection": quartet,
+                }
                 all_members = dict(owner["_task4b_snapshot_members"])
                 all_members.update({row["path"]: row for row in stored.values()})
                 owner["_task4b_snapshot_members"] = all_members
-                owner["capture_generation"] = 3
+                next_generation = owner["capture_generation"] + 1
+                owner["capture_generation"] = next_generation
                 owner["state"] = "replay_frozen"
                 quota = _quota_record_for_owner(owner)
                 previous = owner["_task4b_snapshot_projection"]
                 owner["_task4b_snapshot_projection"] = {
                     "schema": "historical_foundry_staging_snapshot_identity/v1",
                     "stage": "replay_frozen",
-                    "generation": 3,
+                    "generation": next_generation,
                     "capture_inventory_sha256": previous["capture_inventory_sha256"],
                     "scan_inventory_sha256": previous["scan_inventory_sha256"],
                     "frozen_member_count": len(all_members),
@@ -7308,7 +7694,7 @@ def _initialize_historical_foundry_storage_types():
                     "prefilter_chunk_count": previous["prefilter_chunk_count"],
                     "prefilter_row_count": previous["prefilter_row_count"],
                     "prefilter_grid_digest": previous["prefilter_grid_digest"],
-                    "replay_scenario_count": 1,
+                    "replay_scenario_count": len(scenarios),
                     "replay_scenario_key": record["scenario_key"],
                     "replay_proof_inputs_hash": quartet["proof_inputs_hash"],
                 }
@@ -7328,9 +7714,12 @@ def _initialize_historical_foundry_storage_types():
                 )
                 ledger_record = {
                     "scenario_key": record["scenario_key"],
-                    "generation": 3,
+                    "generation": next_generation,
                     "proof_inputs_hash": quartet["proof_inputs_hash"],
                     "staging": successor,
+                    "previous_staging": old_snapshot,
+                    "scenario_count": len(scenarios),
+                    "successor_consumed": False,
                 }
                 validated = _prepare_handle(
                     ValidatedHistoricalReplayLedger, ledger_record
@@ -7344,11 +7733,10 @@ def _initialize_historical_foundry_storage_types():
             except BaseException as error:
                 record["state"] = "failed"
                 control = error if not isinstance(error, Exception) else None
-                if owner.get("capture_generation") == 2:
-                    _task4b_terminalize_snapshot_failure(
-                        record["staging"], owner,
-                        "historical_window_spool_handoff_failed", control,
-                    )
+                _task4b_terminalize_snapshot_failure(
+                    record["staging"], owner,
+                    "historical_window_spool_handoff_failed", control,
+                )
                 if control is not None:
                     raise control
                 raise ValueError("historical scenario evidence is invalid") from None
@@ -7363,16 +7751,34 @@ def _initialize_historical_foundry_storage_types():
 
     scenario_sink_authorized[0] = ScenarioEvidenceSink
 
+    def _consume_historical_replay_successor(
+        *, ledger: object, previous_staging: object
+    ) -> object:
+        record = _task6_live_record(
+            ledger, ValidatedHistoricalReplayLedger,
+            replay_ledger_registry,
+        )
+        if (
+            record.get("previous_staging") is not previous_staging
+            or record.get("successor_consumed") is True
+        ):
+            _raise_storage_error()
+        successor = record.get("staging")
+        _task4b_current_snapshot_owner(successor)
+        record["successor_consumed"] = True
+        return successor
+
     def _open_historical_scenario_evidence_sink(
         *, staging: object, scenario_token: object, scenario_key: str
     ) -> ScenarioEvidenceSink:
         owner, transition = _task6_transition_record(
             scenario_token, staging, scenario_key
         )
-        if owner.get("_task6_scenario_sink_opened") is True:
+        opened = owner.setdefault("_task6_opened_scenario_keys", set())
+        if type(opened) is not set or scenario_key in opened:
             _raise_storage_error()
         transition["consumed"] = True
-        owner["_task6_scenario_sink_opened"] = True
+        opened.add(scenario_key)
         record = {
             "owner": owner,
             "staging": staging,
@@ -7780,11 +8186,12 @@ def _initialize_historical_foundry_storage_types():
         def frozen_identity_projection(self) -> Mapping[str, Any]:
             owner = _task4b_current_snapshot_owner(self)
             projection = owner.get("_task4b_snapshot_projection")
-            expected_size = {
-                1: 8,
-                2: 12,
-                3: 15,
-            }.get(owner.get("capture_generation"))
+            generation = owner.get("capture_generation")
+            expected_size = (
+                8 if generation == 1 else 12 if generation == 2
+                else 15 if type(generation) is int and generation >= 3
+                else None
+            )
             if type(projection) is not dict or len(projection) != expected_size:
                 _task4b_terminalize_snapshot_failure(
                     self, owner, "final_identity_drift"
@@ -7805,9 +8212,13 @@ def _initialize_historical_foundry_storage_types():
             owner = _task4b_current_snapshot_owner(self)
             try:
                 _task4b_freeze_audit(owner["_task4b_frozen_record"])
-                if owner.get("capture_generation") in (2, 3):
+                if type(owner.get("capture_generation")) is int and owner.get(
+                    "capture_generation"
+                ) >= 2:
                     _task5_freeze_audit(owner)
-                if owner.get("capture_generation") == 3:
+                if type(owner.get("capture_generation")) is int and owner.get(
+                    "capture_generation"
+                ) >= 3:
                     _task6_freeze_audit(owner)
                 _task4b_current_snapshot_owner(self)
                 return None
@@ -8964,7 +9375,7 @@ def _initialize_historical_foundry_storage_types():
                 or type(ancestry_rows) is not tuple
                 or type(source_rows) is not tuple
                 or tuple(row[0] for row in source_rows)
-                != ("rpc", "scan", "storage")
+                != ("rpc", "scan", "storage", "anvil")
             ):
                 raise _BoundSourceIdentityDrift()
             for row in module_rows:
@@ -8981,7 +9392,7 @@ def _initialize_historical_foundry_storage_types():
                 except AttributeError:
                     raise _BoundSourceIdentityDrift()
                 if (
-                    role not in ("rpc", "scan", "storage")
+                    role not in ("rpc", "scan", "storage", "anvil")
                     or type(canonical_name) is not str
                     or type(actual_key) is not str
                     or sys.modules.get(actual_key) is not module
@@ -9030,7 +9441,7 @@ def _initialize_historical_foundry_storage_types():
                     expected_bytes, expected_size, expected_sha256,
                 ) = row
                 if (
-                    role not in ("rpc", "scan", "storage")
+                    role not in ("rpc", "scan", "storage", "anvil")
                     or type(fd) is not int
                     or type(parent_index) is not int
                     or not 0 <= parent_index < len(ancestry_fds)
@@ -9203,7 +9614,7 @@ def _initialize_historical_foundry_storage_types():
                 or type(payload[2]) is not tuple
                 or type(payload[3]) is not tuple
                 or tuple(row[0] for row in payload[2])
-                != ("rpc", "scan", "storage")
+                != ("rpc", "scan", "storage", "anvil")
                 or tuple(row[0] for row in payload[3])
                 != ("rpc", "scan", "storage")
                 or payload[3][0][3] is not bound_rpc_module
@@ -10938,6 +11349,9 @@ def _initialize_historical_foundry_storage_types():
         ScenarioEvidenceSink,
         ValidatedHistoricalReplayLedger,
         _open_historical_scenario_evidence_sink,
+        _verify_historical_replay_module_source,
+        _validate_historical_quartet_for_test,
+        _consume_historical_replay_successor,
     )
 
 
@@ -10971,6 +11385,9 @@ def _initialize_historical_foundry_storage_types():
     ScenarioEvidenceSink,
     ValidatedHistoricalReplayLedger,
     _open_historical_scenario_evidence_sink,
+    _verify_historical_replay_module_source,
+    _validate_historical_quartet_for_test,
+    _consume_historical_replay_successor,
 ) = _initialize_historical_foundry_storage_types()
 del _initialize_historical_foundry_storage_types
 

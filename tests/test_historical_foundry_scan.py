@@ -9651,6 +9651,12 @@ class HistoricalFoundryScenarioIssuerNativeTests(unittest.TestCase):
         forged = object.__new__(scan.ValidatedReplayScenario)
         with self.assertRaises(ValueError):
             scan._validated_replay_scenario_projection(scenario=forged)
+        successor = inspect.signature(scan._advance_validated_replay_authorities)
+        self.assertEqual(tuple(successor.parameters), ("ledger", "window", "grid"))
+        self.assertTrue(all(
+            parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            for parameter in successor.parameters.values()
+        ))
 
 
 if __name__ == "__main__":

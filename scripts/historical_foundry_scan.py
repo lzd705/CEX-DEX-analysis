@@ -8463,6 +8463,38 @@ def _initialize_historical_prefilter_capabilities():
         staging.reread_frozen_members_unchanged()
         return _detach_prefilter_value(record["row"])
 
+    def _advance_validated_replay_authorities(
+        *, ledger: Any, window: ValidatedHistoricalWindow,
+        grid: ValidatedHistoricalPrefilterGrid,
+    ) -> tuple:
+        window_record = capability_record(
+            window, ValidatedHistoricalWindow, window_registry
+        )
+        grid_record = capability_record(
+            grid, ValidatedHistoricalPrefilterGrid, grid_registry
+        )
+        previous = window_record.get("snapshot")
+        if (
+            grid_record.get("snapshot") is not previous
+            or grid_record.get("window") is not window
+        ):
+            raise ValueError("historical replay successor lineage differs")
+        import scripts.historical_foundry_storage as storage
+
+        successor = storage._consume_historical_replay_successor(
+            ledger=ledger, previous_staging=previous
+        )
+        next_window = object.__new__(ValidatedHistoricalWindow)
+        next_window_record = dict(window_record)
+        next_window_record["snapshot"] = successor
+        register_capability(next_window, next_window_record, window_registry)
+        next_grid = object.__new__(ValidatedHistoricalPrefilterGrid)
+        next_grid_record = dict(grid_record)
+        next_grid_record["snapshot"] = successor
+        next_grid_record["window"] = next_window
+        register_capability(next_grid, next_grid_record, grid_registry)
+        return successor, next_window, next_grid
+
     return (
         ValidatedHistoricalWindow,
         ValidatedHistoricalPrefilterGrid,
@@ -8476,6 +8508,7 @@ def _initialize_historical_prefilter_capabilities():
         _validated_replay_scenario_projection,
         _consume_replay_scenario_storage_token,
         _validate_replay_scenario_for_context,
+        _advance_validated_replay_authorities,
     )
 
 
@@ -8492,5 +8525,6 @@ def _initialize_historical_prefilter_capabilities():
     _validated_replay_scenario_projection,
     _consume_replay_scenario_storage_token,
     _validate_replay_scenario_for_context,
+    _advance_validated_replay_authorities,
 ) = _initialize_historical_prefilter_capabilities()
 del _initialize_historical_prefilter_capabilities

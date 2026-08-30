@@ -1143,13 +1143,34 @@ def _initialize_historical_process_lease_type():
             return None
 
         def close(self) -> None:
+            return self._close_with_budget(lambda cap: cap)
+
+        def _close_with_budget(self, remaining: Any) -> None:
             if self._closed:
                 return None
+            if not callable(remaining):
+                raise ValueError("historical process deadline is invalid")
+
+            def timeout(cap: float) -> float:
+                try:
+                    value = remaining(cap)
+                except TimeoutError:
+                    return 0.0
+                if (
+                    type(value) not in (int, float)
+                    or isinstance(value, bool)
+                    or not 0 <= value <= cap
+                ):
+                    raise ValueError("historical process deadline is invalid")
+                return float(value)
+
             process = self._process
             control = None
             ordinary = False
             timed_out = False
+            reaped = False
             try:
+                timeout(5.0)
                 process.terminate()
             except BaseException as error:
                 if not isinstance(error, Exception):
@@ -1157,7 +1178,8 @@ def _initialize_historical_process_lease_type():
                 else:
                     ordinary = True
             try:
-                process.wait(timeout=5.0)
+                process.wait(timeout=timeout(5.0))
+                reaped = True
             except subprocess.TimeoutExpired:
                 timed_out = True
             except BaseException as error:
@@ -1168,6 +1190,7 @@ def _initialize_historical_process_lease_type():
                     ordinary = True
             if timed_out:
                 try:
+                    timeout(5.0)
                     process.kill()
                 except BaseException as error:
                     if not isinstance(error, Exception) and control is None:
@@ -1175,7 +1198,8 @@ def _initialize_historical_process_lease_type():
                     elif isinstance(error, Exception):
                         ordinary = True
                 try:
-                    process.wait(timeout=5.0)
+                    process.wait(timeout=timeout(5.0))
+                    reaped = True
                 except subprocess.TimeoutExpired:
                     ordinary = True
                 except BaseException as error:
@@ -1185,9 +1209,7 @@ def _initialize_historical_process_lease_type():
                         ordinary = True
             for thread in self._output_threads:
                 try:
-                    thread.join(timeout=5.0)
-                    if thread.is_alive():
-                        ordinary = True
+                    thread.join(timeout=timeout(5.0))
                 except BaseException as error:
                     if not isinstance(error, Exception) and control is None:
                         control = error
@@ -1198,12 +1220,23 @@ def _initialize_historical_process_lease_type():
                 closer = getattr(stream, "close", None)
                 if callable(closer):
                     try:
+                        timeout(5.0)
                         closer()
                     except BaseException as error:
                         if not isinstance(error, Exception) and control is None:
                             control = error
                         elif isinstance(error, Exception):
                             ordinary = True
+            for thread in self._output_threads:
+                try:
+                    thread.join(timeout=timeout(5.0))
+                    if thread.is_alive():
+                        ordinary = True
+                except BaseException as error:
+                    if not isinstance(error, Exception) and control is None:
+                        control = error
+                    elif isinstance(error, Exception):
+                        ordinary = True
             try:
                 self._assert_output_within_limit()
             except BaseException as error:
@@ -1211,27 +1244,30 @@ def _initialize_historical_process_lease_type():
                     control = error
                 elif isinstance(error, Exception):
                     ordinary = True
-            try:
-                self._cleanup()
-            except BaseException as error:
-                if not isinstance(error, Exception) and control is None:
-                    control = error
-                elif isinstance(error, Exception):
-                    ordinary = True
-            toolchain = self._toolchain
-            if toolchain is not None:
+            if reaped:
                 try:
-                    toolchain._assert_stable_binaries()
+                    self._cleanup()
                 except BaseException as error:
                     if not isinstance(error, Exception) and control is None:
                         control = error
                     elif isinstance(error, Exception):
                         ordinary = True
-            object.__setattr__(self, "_process", None)
-            object.__setattr__(self, "_cleanup", None)
-            object.__setattr__(self, "_toolchain", None)
-            object.__setattr__(self, "_output_threads", ())
-            object.__setattr__(self, "_closed", True)
+                toolchain = self._toolchain
+                if toolchain is not None:
+                    try:
+                        toolchain._assert_stable_binaries()
+                    except BaseException as error:
+                        if not isinstance(error, Exception) and control is None:
+                            control = error
+                        elif isinstance(error, Exception):
+                            ordinary = True
+                object.__setattr__(self, "_process", None)
+                object.__setattr__(self, "_cleanup", None)
+                object.__setattr__(self, "_toolchain", None)
+                object.__setattr__(self, "_output_threads", ())
+                object.__setattr__(self, "_closed", True)
+            else:
+                ordinary = True
             if control is not None:
                 raise control
             if ordinary:
