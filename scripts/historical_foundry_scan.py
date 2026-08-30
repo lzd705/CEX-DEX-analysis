@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 import contextvars
+from fractions import Fraction
+import gzip
 import hashlib
 import json
 import platform
@@ -19,7 +21,11 @@ import weakref
 from types import MappingProxyType
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from scripts.historical_foundry_contracts import next_historical_base_fee
+from scripts.historical_foundry_contracts import (
+    HistoricalFoundryConfigSet,
+    next_historical_base_fee,
+    project_historical_prefilter_math,
+)
 import scripts.historical_foundry_rpc as _transport_core
 from scripts.historical_foundry_rpc import (
     _ArchiveRpcError,
@@ -5322,7 +5328,7 @@ def _canonical_hash_value(
     value: Any,
     decimal_cache: Optional[Mapping[int, Tuple[Any, ...]]] = None,
 ) -> Any:
-    if type(value) is dict:
+    if type(value) in (dict, MappingProxyType):
         return {
             key: _canonical_hash_value(nested, decimal_cache)
             for key, nested in value.items()
@@ -7527,3 +7533,799 @@ _TASK4B_SCAN_LOCAL_SURFACE_OBJECTS = (
     _replay_production_historical_window_capture_from_bound_storage,
     _consume_production_historical_window_capture_replay_event_for_storage,
 )
+
+
+_PREFILTER_GRID_DOMAIN = b"historical_foundry_prefilter_grid/v1"
+_PREFILTER_COVERAGE_DOMAIN = b"historical_foundry_window_coverage/v1"
+_PREFILTER_DIRECTIONS = (
+    "uniswap_to_sushiswap", "sushiswap_to_uniswap",
+)
+_PREFILTER_VENUES = ("uniswap_v2", "sushiswap_v2")
+
+
+def _detach_prefilter_value(value: Any) -> Any:
+    if type(value) in (dict, MappingProxyType):
+        return {
+            key: _detach_prefilter_value(nested)
+            for key, nested in value.items()
+        }
+    if type(value) in (list, tuple):
+        return [_detach_prefilter_value(nested) for nested in value]
+    return value
+
+
+def _freeze_prefilter_value(value: Any) -> Any:
+    if type(value) is dict:
+        return MappingProxyType({
+            key: _freeze_prefilter_value(nested)
+            for key, nested in value.items()
+        })
+    if type(value) in (list, tuple):
+        return tuple(_freeze_prefilter_value(nested) for nested in value)
+    return value
+
+
+def _prefilter_grid_digest(rows: Sequence[Mapping[str, Any]]) -> str:
+    digest = _inventory_hasher(_PREFILTER_GRID_DOMAIN)
+    for row in rows:
+        _inventory_update(digest, row)
+    return digest.hexdigest()
+
+
+def _exact_fraction_projection(display: str) -> Mapping[str, Any]:
+    if type(display) is not str or not display:
+        raise ValueError("historical prefilter fraction is invalid")
+    try:
+        exact = Fraction(display)
+    except (ValueError, ZeroDivisionError):
+        raise ValueError("historical prefilter fraction is invalid") from None
+    return MappingProxyType({
+        "numerator": exact.numerator,
+        "denominator": exact.denominator,
+        "display": display,
+    })
+
+
+def _initialize_historical_prefilter_capabilities():
+    issuer = object()
+    window_registry: Dict[int, Tuple[Any, Dict[str, Any]]] = {}
+    grid_registry: Dict[int, Tuple[Any, Dict[str, Any]]] = {}
+
+    def register_capability(
+        value: Any,
+        record: Dict[str, Any],
+        registry: Dict[int, Tuple[Any, Dict[str, Any]]],
+    ) -> None:
+        key = id(value)
+
+        def retire(reference: Any) -> None:
+            entry = registry.get(key)
+            if entry is not None and entry[0] is reference:
+                registry.pop(key, None)
+
+        reference = weakref.ref(value, retire)
+        registry[key] = (reference, record)
+
+    def capability_record(
+        value: Any,
+        expected_type: type,
+        registry: Dict[int, Tuple[Any, Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        entry = registry.get(id(value))
+        if (
+            type(value) is not expected_type
+            or entry is None
+            or entry[0]() is not value
+            or entry[1].get("issuer") is not issuer
+        ):
+            raise ValueError("historical prefilter capability is invalid")
+        return entry[1]
+
+    class ValidatedHistoricalWindow:
+        """Opaque descriptor-held exact historical coverage capability."""
+
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            del cls, args, kwargs
+            raise ValueError("historical window capability is private")
+
+        def __init_subclass__(cls, **_kwargs: Any) -> None:
+            del cls
+            raise TypeError("ValidatedHistoricalWindow is sealed")
+
+        @property
+        def scan_inventory_sha256(self) -> str:
+            return capability_record(
+                self, ValidatedHistoricalWindow, window_registry
+            )["scan_inventory_sha256"]
+
+        @property
+        def lower_bound_number(self) -> int:
+            return capability_record(
+                self, ValidatedHistoricalWindow, window_registry
+            )["lower_bound_number"]
+
+        @property
+        def anchor_number(self) -> int:
+            return capability_record(
+                self, ValidatedHistoricalWindow, window_registry
+            )["anchor_number"]
+
+        @property
+        def block_count(self) -> int:
+            return capability_record(
+                self, ValidatedHistoricalWindow, window_registry
+            )["block_count"]
+
+        @property
+        def coverage_digest(self) -> str:
+            return capability_record(
+                self, ValidatedHistoricalWindow, window_registry
+            )["coverage_digest"]
+
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError("ValidatedHistoricalWindow is immutable")
+
+        def __repr__(self) -> str:
+            return "ValidatedHistoricalWindow(<redacted>)"
+
+        def __copy__(self) -> Any:
+            raise TypeError("ValidatedHistoricalWindow is not copyable")
+
+        def __deepcopy__(self, _memo: Any) -> Any:
+            raise TypeError("ValidatedHistoricalWindow is not copyable")
+
+        def __reduce__(self) -> Any:
+            raise TypeError("ValidatedHistoricalWindow is not serializable")
+
+        def __reduce_ex__(self, _protocol: int) -> Any:
+            raise TypeError("ValidatedHistoricalWindow is not serializable")
+
+    class ValidatedHistoricalPrefilterGrid:
+        """Opaque descriptor-held recomputed prefilter-grid capability."""
+
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            del cls, args, kwargs
+            raise ValueError("historical prefilter grid capability is private")
+
+        def __init_subclass__(cls, **_kwargs: Any) -> None:
+            del cls
+            raise TypeError("ValidatedHistoricalPrefilterGrid is sealed")
+
+        @property
+        def scan_inventory_sha256(self) -> str:
+            return capability_record(
+                self, ValidatedHistoricalPrefilterGrid, grid_registry
+            )["scan_inventory_sha256"]
+
+        @property
+        def row_count(self) -> int:
+            return capability_record(
+                self, ValidatedHistoricalPrefilterGrid, grid_registry
+            )["row_count"]
+
+        @property
+        def safe_excluded_count(self) -> int:
+            return capability_record(
+                self, ValidatedHistoricalPrefilterGrid, grid_registry
+            )["safe_excluded_count"]
+
+        @property
+        def replay_required_count(self) -> int:
+            return capability_record(
+                self, ValidatedHistoricalPrefilterGrid, grid_registry
+            )["replay_required_count"]
+
+        @property
+        def grid_digest(self) -> str:
+            return capability_record(
+                self, ValidatedHistoricalPrefilterGrid, grid_registry
+            )["grid_digest"]
+
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError(
+                "ValidatedHistoricalPrefilterGrid is immutable"
+            )
+
+        def __repr__(self) -> str:
+            return "ValidatedHistoricalPrefilterGrid(<redacted>)"
+
+        def __copy__(self) -> Any:
+            raise TypeError(
+                "ValidatedHistoricalPrefilterGrid is not copyable"
+            )
+
+        def __deepcopy__(self, _memo: Any) -> Any:
+            raise TypeError(
+                "ValidatedHistoricalPrefilterGrid is not copyable"
+            )
+
+        def __reduce__(self) -> Any:
+            raise TypeError(
+                "ValidatedHistoricalPrefilterGrid is not serializable"
+            )
+
+        def __reduce_ex__(self, _protocol: int) -> Any:
+            raise TypeError(
+                "ValidatedHistoricalPrefilterGrid is not serializable"
+            )
+
+    def require_config(config: Any) -> HistoricalFoundryConfigSet:
+        if type(config) is not HistoricalFoundryConfigSet:
+            raise ValueError("historical config capability is invalid")
+        if (
+            tuple(config.policy.value["directions"]) != _PREFILTER_DIRECTIONS
+            or tuple(int(value) for value in config.policy.value[
+                "requested_notionals_usd"
+            ]) != (1000, 5000, 10000, 50000, 100000)
+            or tuple(row["venue_id"] for row in config.authority.value[
+                "venues"
+            ]) != _PREFILTER_VENUES
+        ):
+            raise ValueError("historical prefilter config differs")
+        return config
+
+    def read_typed_rows(
+        staging: Any,
+        inventory: Mapping[str, Any],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        typed_chunks = inventory.get("typed_chunks")
+        if type(typed_chunks) is not list or not typed_chunks:
+            raise ValueError("historical capture inventory is invalid")
+        rows_by_role = {role: [] for role in (
+            "headers", "reserves", "prices", "fees",
+        )}
+        next_index = {role: 1 for role in rows_by_role}
+        for descriptor in typed_chunks:
+            role = descriptor.get("role") if type(descriptor) is dict else None
+            if (
+                role not in rows_by_role
+                or descriptor.get("chunk_index") != next_index[role]
+                or descriptor.get("path")
+                != role + "/{:08d}.json.gz".format(next_index[role])
+                or type(descriptor.get("gzip_sha256")) is not str
+                or _HASH64.fullmatch(descriptor["gzip_sha256"]) is None
+                or type(descriptor.get("gzip_byte_count")) is not int
+                or type(descriptor.get("decoded_byte_count")) is not int
+                or type(descriptor.get("decoded_sha256")) is not str
+                or type(descriptor.get("row_count")) is not int
+            ):
+                raise ValueError("historical typed descriptor is invalid")
+            physical = staging.read_frozen_member(
+                descriptor["path"],
+                expected_sha256=descriptor["gzip_sha256"],
+                max_bytes=16_842_752,
+            )
+            try:
+                decoded = gzip.decompress(physical)
+                chunk_rows = json.loads(decoded.decode("utf-8"))
+            except Exception:
+                raise ValueError("historical typed member is invalid") from None
+            if (
+                type(chunk_rows) is not list
+                or len(chunk_rows) != descriptor["row_count"]
+                or len(decoded) != descriptor["decoded_byte_count"]
+                or hashlib.sha256(decoded).hexdigest()
+                != descriptor["decoded_sha256"]
+                or _canonical_json_bytes(chunk_rows) != decoded
+            ):
+                raise ValueError("historical typed member differs")
+            rows_by_role[role].extend(chunk_rows)
+            next_index[role] += 1
+        return rows_by_role
+
+    def validate_coverage(
+        *,
+        config: HistoricalFoundryConfigSet,
+        staging: Any,
+    ) -> Dict[str, Any]:
+        import scripts.historical_foundry_storage as storage
+
+        if type(staging) is not storage.HistoricalRunStagingSnapshot:
+            raise ValueError("historical staging capability is invalid")
+        staging.reread_frozen_members_unchanged()
+        identity = staging.frozen_identity_projection()
+        if (
+            type(identity) is not dict
+            or identity.get("schema")
+            != "historical_foundry_staging_snapshot_identity/v1"
+            or identity.get("stage") not in (
+                "capture_frozen", "prefilter_frozen",
+            )
+            or identity.get("generation") not in (1, 2)
+            or type(identity.get("capture_inventory_sha256")) is not str
+            or _HASH64.fullmatch(identity["capture_inventory_sha256"]) is None
+        ):
+            raise ValueError("historical staging identity is invalid")
+        capture_bytes = staging.read_frozen_member(
+            "scan/capture_inventory.json",
+            expected_sha256=identity["capture_inventory_sha256"],
+            max_bytes=16_777_216,
+        )
+        try:
+            inventory = json.loads(capture_bytes.decode("utf-8"))
+        except Exception:
+            raise ValueError("historical capture inventory is invalid") from None
+        if (
+            type(inventory) is not dict
+            or inventory.get("schema")
+            != "historical_foundry_capture_inventory/v1"
+            or _canonical_json_bytes(inventory) != capture_bytes
+        ):
+            raise ValueError("historical capture inventory differs")
+        expected_configs = (
+            ("policy", config.policy),
+            ("authority", config.authority),
+            ("toolchain", config.toolchain),
+        )
+        config_rows = inventory.get("configs")
+        if (
+            type(config_rows) is not list
+            or len(config_rows) != 3
+            or any(
+                config_rows[index].get("role") != role
+                or config_rows[index].get("sha256")
+                != loaded.physical_sha256
+                or staging.read_frozen_member(
+                    config_rows[index]["path"],
+                    expected_sha256=loaded.physical_sha256,
+                    max_bytes=1_048_576,
+                ) != loaded.physical_bytes
+                for index, (role, loaded) in enumerate(expected_configs)
+            )
+        ):
+            raise ValueError("historical capture config binding differs")
+        range_row = inventory.get("range")
+        if type(range_row) is not dict or tuple(range_row) != (
+            "anchor_number", "block_count", "cutoff_timestamp",
+            "lower_bound_number",
+        ):
+            raise ValueError("historical capture range is invalid")
+        lower = range_row.get("lower_bound_number")
+        anchor = range_row.get("anchor_number")
+        block_count = range_row.get("block_count")
+        if (
+            type(lower) is not int
+            or type(anchor) is not int
+            or type(block_count) is not int
+            or lower < 0
+            or anchor < lower
+            or block_count != anchor - lower + 1
+        ):
+            raise ValueError("historical capture denominator differs")
+        rows = read_typed_rows(staging, inventory)
+        headers = rows["headers"]
+        reserves = rows["reserves"]
+        prices = rows["prices"]
+        fees = rows["fees"]
+        expected_blocks = list(range(lower, anchor + 1))
+        if (
+            [row.get("number") for row in headers] != expected_blocks
+            or [row.get("block_number") for row in prices] != expected_blocks
+            or [row.get("block_number") for row in fees] != expected_blocks
+            or [row.get("block_number") for row in reserves]
+            != [number for number in expected_blocks for _venue in range(2)]
+        ):
+            raise ValueError("historical capture coverage has gaps")
+        records = []
+        prior_header = None
+        authority = config.authority.value
+        price_feed = authority["price_feed"]
+        for index, block_number in enumerate(expected_blocks):
+            header = headers[index]
+            block_reserves = reserves[index * 2:index * 2 + 2]
+            price = prices[index]
+            fee = fees[index]
+            if (
+                tuple(row.get("venue_id") for row in block_reserves)
+                != _PREFILTER_VENUES
+                or any(row.get("block_hash") != header.get("hash")
+                       for row in block_reserves)
+                or price.get("block_hash") != header.get("hash")
+                or price.get("proxy_address")
+                != price_feed["proxy_address"]
+                or price.get("answer", 0) <= 0
+                or price.get("updated_at", -1) > header.get("timestamp", -1)
+                or header.get("timestamp", -1) - price.get("updated_at", -1)
+                > config.policy.value["max_eth_usd_age_seconds"]
+                or fee.get("base_fee_per_gas")
+                != header.get("base_fee_per_gas")
+                or fee.get("next_base_fee_per_gas")
+                != next_historical_base_fee(
+                    parent_base_fee=header.get("base_fee_per_gas"),
+                    parent_gas_used=header.get("gas_used"),
+                    parent_gas_limit=header.get("gas_limit"),
+                )
+                or (
+                    prior_header is not None
+                    and (
+                        header.get("number") != prior_header.get("number") + 1
+                        or header.get("parent_hash") != prior_header.get("hash")
+                    )
+                )
+            ):
+                raise ValueError("historical capture record binding differs")
+            records.append(_freeze_prefilter_value({
+                "header": header,
+                "reserves": block_reserves,
+                "price": price,
+                "fee": fee,
+            }))
+            prior_header = header
+        coverage_value = {
+            "capture_inventory_sha256": identity[
+                "capture_inventory_sha256"
+            ],
+            "range": range_row,
+            "headers": headers,
+            "reserves": reserves,
+            "prices": prices,
+            "fees": fees,
+        }
+        return {
+            "snapshot": staging,
+            "scan_inventory_sha256": identity.get(
+                "scan_inventory_sha256",
+                identity["capture_inventory_sha256"],
+            ),
+            "capture_inventory_sha256": identity[
+                "capture_inventory_sha256"
+            ],
+            "lower_bound_number": lower,
+            "anchor_number": anchor,
+            "block_count": block_count,
+            "coverage_digest": _typed_hash(
+                _PREFILTER_COVERAGE_DOMAIN, coverage_value
+            ),
+            "records": tuple(records),
+        }
+
+    def issue_window(record: Dict[str, Any]) -> ValidatedHistoricalWindow:
+        window = object.__new__(ValidatedHistoricalWindow)
+        record["issuer"] = issuer
+        register_capability(window, record, window_registry)
+        return window
+
+    def open_validated_historical_window(
+        *,
+        config: HistoricalFoundryConfigSet,
+        staging: Any,
+    ) -> ValidatedHistoricalWindow:
+        return issue_window(validate_coverage(
+            config=require_config(config), staging=staging
+        ))
+
+    def _iter_validated_historical_window_records(
+        *, window: ValidatedHistoricalWindow
+    ):
+        record = capability_record(
+            window, ValidatedHistoricalWindow, window_registry
+        )
+        record["snapshot"].reread_frozen_members_unchanged()
+        records = record["records"]
+        if type(records) is not tuple or len(records) != record["block_count"]:
+            raise ValueError("historical window capability differs")
+        return iter(records)
+
+    def build_historical_prefilter_grid(
+        *,
+        config: HistoricalFoundryConfigSet,
+        window: ValidatedHistoricalWindow,
+    ) -> Tuple[Mapping[str, Any], ...]:
+        checked_config = require_config(config)
+        record = capability_record(
+            window, ValidatedHistoricalWindow, window_registry
+        )
+        record["snapshot"].reread_frozen_members_unchanged()
+        policy = checked_config.policy.value
+        authority = checked_config.authority.value
+        feed_decimals = authority["price_feed"]["decimals"]
+        notionals = tuple(int(value) for value in policy[
+            "requested_notionals_usd"
+        ])
+        window_projection = {
+            "lower_bound_number": record["lower_bound_number"],
+            "anchor_number": record["anchor_number"],
+            "block_count": record["block_count"],
+            "scenario_denominator": record["block_count"] * 10,
+        }
+        result = []
+        records = tuple(_iter_validated_historical_window_records(
+            window=window
+        ))
+        for captured in reversed(records):
+            header = captured["header"]
+            reserves_by_venue = {
+                row["venue_id"]: row for row in captured["reserves"]
+            }
+            price = captured["price"]
+            fee = captured["fee"]
+            reserve_projection = {
+                venue: {
+                    "pair_address": reserves_by_venue[venue]["pair_address"],
+                    "reserve_uni_raw": reserves_by_venue[venue]["reserve0"],
+                    "reserve_weth_raw": reserves_by_venue[venue]["reserve1"],
+                    "pair_timestamp": reserves_by_venue[venue]["pair_timestamp"],
+                }
+                for venue in _PREFILTER_VENUES
+            }
+            for direction in _PREFILTER_DIRECTIONS:
+                first_venue, second_venue = (
+                    _PREFILTER_VENUES
+                    if direction == "uniswap_to_sushiswap"
+                    else tuple(reversed(_PREFILTER_VENUES))
+                )
+                first_reserves = reserves_by_venue[first_venue]
+                second_reserves = reserves_by_venue[second_venue]
+                for notional in notionals:
+                    projected = project_historical_prefilter_math(
+                        requested_notional_usd=notional,
+                        direction=direction,
+                        first_reserves=(
+                            first_reserves["reserve0"],
+                            first_reserves["reserve1"],
+                        ),
+                        second_reserves=(
+                            second_reserves["reserve0"],
+                            second_reserves["reserve1"],
+                        ),
+                        eth_usd_answer=price["answer"],
+                        feed_decimals=feed_decimals,
+                        parent_base_fee=header["base_fee_per_gas"],
+                        parent_gas_used=header["gas_used"],
+                        parent_gas_limit=header["gas_limit"],
+                        acceptance_mev_bps=policy["fees"][
+                            "acceptance_mev_bps"
+                        ],
+                    )
+                    if projected["child_base_fee_wei"] != fee[
+                        "next_base_fee_per_gas"
+                    ]:
+                        raise ValueError(
+                            "historical fee projection differs"
+                        )
+                    row = {
+                        "schema": "historical_foundry_prefilter_row/v1",
+                        "scenario_key": "{}:{}:{}".format(
+                            header["number"], direction, notional
+                        ),
+                        "route_key": first_venue + ":" + second_venue,
+                        "coverage_digest": record["coverage_digest"],
+                        "window": window_projection,
+                        "block_number": header["number"],
+                        "block_hash": header["hash"],
+                        "direction": direction,
+                        "requested_notional_usd": notional,
+                        "header": {
+                            key: header[key] for key in (
+                                "number", "hash", "parent_hash", "state_root",
+                                "timestamp", "gas_limit", "gas_used",
+                                "base_fee_per_gas",
+                            )
+                        },
+                        "reserves": reserve_projection,
+                        "price": {
+                            **{
+                                key: price[key] for key in (
+                                    "proxy_address", "round_id", "phase_id",
+                                    "answer", "started_at", "updated_at",
+                                    "answered_in_round", "valid_until",
+                                )
+                            },
+                            "feed_decimals": feed_decimals,
+                        },
+                        "fee": {
+                            key: fee[key] for key in (
+                                "base_fee_per_gas", "next_base_fee_per_gas",
+                                "p50_priority_fee_per_gas",
+                                "p90_priority_fee_per_gas",
+                            )
+                        },
+                        "amount_weth_in_wei": projected["amount_weth_in_wei"],
+                        "first_amount_out_raw": projected["first_amount_out_raw"],
+                        "second_amount_out_raw": projected["second_amount_out_raw"],
+                        "gross_profit_weth_wei": projected[
+                            "gross_profit_weth_wei"
+                        ],
+                        "gross_edge_usd": _exact_fraction_projection(
+                            projected["gross_edge_usd"]
+                        ),
+                        "child_base_fee_wei": projected["child_base_fee_wei"],
+                        "prefilter_gas_cost_usd": _exact_fraction_projection(
+                            projected["prefilter_gas_cost_usd"]
+                        ),
+                        "prefilter_mev_buffer_usd": _exact_fraction_projection(
+                            projected["prefilter_mev_buffer_usd"]
+                        ),
+                        "prefilter_policy_net_upper_bound_usd": (
+                            _exact_fraction_projection(projected[
+                                "prefilter_policy_net_upper_bound_usd"
+                            ])
+                        ),
+                        "decision": projected["decision"],
+                        "reason": projected["reason"],
+                    }
+                    result.append(_freeze_prefilter_value(row))
+        if len(result) != record["block_count"] * 10:
+            raise ValueError("historical prefilter denominator differs")
+        return tuple(result)
+
+    def validate_historical_prefilter_grid(
+        *,
+        config: HistoricalFoundryConfigSet,
+        window: ValidatedHistoricalWindow,
+        staging: Any,
+    ) -> ValidatedHistoricalPrefilterGrid:
+        checked_config = require_config(config)
+        original = capability_record(
+            window, ValidatedHistoricalWindow, window_registry
+        )
+        fresh = validate_coverage(config=checked_config, staging=staging)
+        for key in (
+            "capture_inventory_sha256", "lower_bound_number",
+            "anchor_number", "block_count", "coverage_digest",
+        ):
+            if original[key] != fresh[key]:
+                raise ValueError("historical window capability differs")
+        identity = staging.frozen_identity_projection()
+        if (
+            identity.get("stage") != "prefilter_frozen"
+            or identity.get("generation") != 2
+            or type(identity.get("scan_inventory_sha256")) is not str
+            or _HASH64.fullmatch(identity["scan_inventory_sha256"]) is None
+        ):
+            raise ValueError("historical prefilter staging is invalid")
+        inventory_bytes = staging.read_frozen_member(
+            "scan/prefilter_inventory.json",
+            expected_sha256=identity["scan_inventory_sha256"],
+            max_bytes=16_777_216,
+        )
+        try:
+            inventory = json.loads(inventory_bytes.decode("utf-8"))
+        except Exception:
+            raise ValueError("historical scan inventory is invalid") from None
+        expected_window = {
+            "lower_bound_number": fresh["lower_bound_number"],
+            "anchor_number": fresh["anchor_number"],
+            "block_count": fresh["block_count"],
+            "scenario_denominator": fresh["block_count"] * 10,
+        }
+        denominator = fresh["block_count"] * 10
+        chunks = inventory.get("prefilter_chunks")
+        if (
+            type(inventory) is not dict
+            or _canonical_json_bytes(inventory) != inventory_bytes
+            or inventory.get("schema")
+            != "historical_foundry_scan_inventory/v1"
+            or inventory.get("capture_inventory_sha256")
+            != fresh["capture_inventory_sha256"]
+            or inventory.get("range") != expected_window
+            or inventory.get("scenario_denominator") != denominator
+            or inventory.get("row_count") != denominator
+            or type(chunks) is not list
+            or not chunks
+        ):
+            raise ValueError("historical scan inventory differs")
+        stored_rows = []
+        for expected_index, descriptor in enumerate(chunks, 1):
+            if (
+                type(descriptor) is not dict
+                or descriptor.get("chunk_index") != expected_index
+                or descriptor.get("path")
+                != "scan/prefilter/{:08d}.json.gz".format(expected_index)
+            ):
+                raise ValueError("historical prefilter chunk differs")
+            physical = staging.read_frozen_member(
+                descriptor["path"],
+                expected_sha256=descriptor["gzip_sha256"],
+                max_bytes=16_842_752,
+            )
+            try:
+                decoded = gzip.decompress(physical)
+                chunk_rows = json.loads(decoded.decode("utf-8"))
+            except Exception:
+                raise ValueError("historical prefilter chunk is invalid") from None
+            if (
+                type(chunk_rows) is not list
+                or len(chunk_rows) != descriptor.get("row_count")
+                or len(decoded) != descriptor.get("decoded_byte_count")
+                or hashlib.sha256(decoded).hexdigest()
+                != descriptor.get("decoded_sha256")
+                or len(physical) != descriptor.get("gzip_byte_count")
+                or hashlib.sha256(physical).hexdigest()
+                != descriptor.get("gzip_sha256")
+                or _canonical_json_bytes(chunk_rows) != decoded
+            ):
+                raise ValueError("historical prefilter chunk differs")
+            stored_rows.extend(chunk_rows)
+        fresh_window = issue_window(fresh)
+        expected_rows = build_historical_prefilter_grid(
+            config=checked_config, window=fresh_window
+        )
+        detached_expected = tuple(
+            _detach_prefilter_value(row) for row in expected_rows
+        )
+        if (
+            stored_rows != list(detached_expected)
+            or len(stored_rows) != denominator
+            or inventory.get("grid_digest")
+            != _prefilter_grid_digest(stored_rows)
+            or inventory.get("grid_digest")
+            != _prefilter_grid_digest(expected_rows)
+        ):
+            raise ValueError("historical prefilter recomputation differs")
+        safe_count = sum(
+            row["decision"] == "safe_excluded" for row in stored_rows
+        )
+        replay_count = sum(
+            row["decision"] == "replay_required" for row in stored_rows
+        )
+        if (
+            safe_count + replay_count != denominator
+            or inventory.get("safe_excluded_count") != safe_count
+            or inventory.get("replay_required_count") != replay_count
+            or identity.get("prefilter_row_count") != denominator
+            or identity.get("prefilter_grid_digest")
+            != inventory["grid_digest"]
+        ):
+            raise ValueError("historical prefilter decision counts differ")
+        original.update({
+            "snapshot": staging,
+            "scan_inventory_sha256": identity["scan_inventory_sha256"],
+            "records": fresh["records"],
+        })
+        grid = object.__new__(ValidatedHistoricalPrefilterGrid)
+        grid_record = {
+            "issuer": issuer,
+            "snapshot": staging,
+            "window": window,
+            "rows": expected_rows,
+            "scan_inventory_sha256": identity["scan_inventory_sha256"],
+            "row_count": denominator,
+            "safe_excluded_count": safe_count,
+            "replay_required_count": replay_count,
+            "grid_digest": inventory["grid_digest"],
+        }
+        register_capability(grid, grid_record, grid_registry)
+        return grid
+
+    def _iter_validated_historical_prefilter_rows(
+        *, grid: ValidatedHistoricalPrefilterGrid
+    ):
+        record = capability_record(
+            grid, ValidatedHistoricalPrefilterGrid, grid_registry
+        )
+        record["snapshot"].reread_frozen_members_unchanged()
+        rows = record["rows"]
+        if (
+            type(rows) is not tuple
+            or len(rows) != record["row_count"]
+            or _prefilter_grid_digest(rows) != record["grid_digest"]
+        ):
+            raise ValueError("historical prefilter capability differs")
+        return iter(rows)
+
+    return (
+        ValidatedHistoricalWindow,
+        ValidatedHistoricalPrefilterGrid,
+        open_validated_historical_window,
+        _iter_validated_historical_window_records,
+        build_historical_prefilter_grid,
+        validate_historical_prefilter_grid,
+        _iter_validated_historical_prefilter_rows,
+    )
+
+
+(
+    ValidatedHistoricalWindow,
+    ValidatedHistoricalPrefilterGrid,
+    open_validated_historical_window,
+    _iter_validated_historical_window_records,
+    build_historical_prefilter_grid,
+    validate_historical_prefilter_grid,
+    _iter_validated_historical_prefilter_rows,
+) = _initialize_historical_prefilter_capabilities()
+del _initialize_historical_prefilter_capabilities

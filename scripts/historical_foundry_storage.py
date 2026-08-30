@@ -254,6 +254,7 @@ def _initialize_historical_foundry_storage_types():
         "prices": b"historical_foundry_price_inventory/v1",
         "fees": b"historical_foundry_fee_inventory/v1",
     }
+    task5_prefilter_domain = b"historical_foundry_prefilter_grid/v1"
     task4b_post_leaf_keys = (
         "schema", "segment", "segment_local_index", "leaf_index",
         "request_ids", "request_count", "canonical_request_sha256",
@@ -2896,7 +2897,10 @@ def _initialize_historical_foundry_storage_types():
     ) -> Tuple[Dict[str, Any], str]:
         if type(relative_path) is not str or not relative_path:
             raise _InternalFailure()
-        if "/" in relative_path:
+        if relative_path.startswith("scan/prefilter/"):
+            basename = relative_path[len("scan/prefilter/"):]
+            directory = ledger["role_directories"].get("prefilter")
+        elif "/" in relative_path:
             role, basename = relative_path.split("/", 1)
             directory = ledger["role_directories"].get(role)
         else:
@@ -3177,6 +3181,10 @@ def _initialize_historical_foundry_storage_types():
             role, basename = row["path"].split("/", 1)
             expected_role_members[role].add(basename)
         expected_role_members["scan"].add("capture_inventory.json")
+        if owner.get("capture_generation") == 2:
+            expected_role_members["scan"].update((
+                "prefilter", "prefilter_inventory.json",
+            ))
         staging_expected = {
             "policy.json", "authority.json", "toolchain.json",
             "rpc", "headers", "reserves", "prices", "fees", "scan",
@@ -6562,10 +6570,15 @@ def _initialize_historical_foundry_storage_types():
         drifted = False
         control = None
         try:
+            generation = owner.get("capture_generation")
+            expected_state = {
+                1: "capture_frozen",
+                2: "prefilter_frozen",
+            }.get(generation)
             if (
                 owner.get("constructor") is not constructor_provenance
-                or owner.get("state") != "capture_frozen"
-                or owner.get("capture_generation") != 1
+                or expected_state is None
+                or owner.get("state") != expected_state
                 or owner.get("_task4b_snapshot_handle") is not snapshot
                 or owner.get("_task4b_snapshot_owner_generation")
                 != owner.get("owner_generation")
@@ -6619,6 +6632,307 @@ def _initialize_historical_foundry_storage_types():
             view, consumed_view_registry, consumed_view_tombstones
         )
         return None
+
+    def _task5_detach_json(value: Any) -> Any:
+        if isinstance(value, MappingABC):
+            return {
+                key: _task5_detach_json(nested)
+                for key, nested in value.items()
+            }
+        if type(value) in (list, tuple):
+            return [_task5_detach_json(nested) for nested in value]
+        if value is None or type(value) in (bool, int, str):
+            return value
+        raise _InternalFailure()
+
+    def _task5_grid_digest(rows: Any) -> str:
+        if type(rows) not in (list, tuple) or not rows:
+            raise _InternalFailure()
+        digest = hashlib.sha256()
+        digest.update(task5_prefilter_domain)
+        digest.update(b"\0")
+        for row in rows:
+            payload = _task4b_canonical_json_bytes(row)
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+        return digest.hexdigest()
+
+    def _task5_rebuild_prefilter(
+        owner: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        ledger = owner.get("_task4b_staging")
+        chunks = owner.get("_task5_prefilter_chunks")
+        inventory_size = owner.get("_task5_inventory_byte_count")
+        if (
+            type(ledger) is not dict
+            or type(chunks) is not tuple
+            or not chunks
+            or type(inventory_size) is not int
+            or inventory_size <= 0
+        ):
+            raise _InternalFailure()
+        rebuilt_chunks = []
+        rows = []
+        for expected_index, chunk in enumerate(chunks, 1):
+            if (
+                type(chunk) is not dict
+                or chunk.get("chunk_index") != expected_index
+                or chunk.get("path")
+                != "scan/prefilter/{:08d}.json.gz".format(expected_index)
+            ):
+                raise _InternalFailure()
+            physical = _task4b_reread_capture_member(
+                ledger,
+                relative_path=chunk["path"],
+                expected_size=chunk["gzip_byte_count"],
+                maximum_size=16_842_752,
+                size_kind="gzip",
+            )
+            if hashlib.sha256(physical).hexdigest() != chunk["gzip_sha256"]:
+                raise _InternalFailure()
+            decoded = _task4b_decode_gzip(physical)
+            decoded_rows = _task4b_decode_canonical_json(
+                decoded, expected_container=list
+            )
+            if (
+                not decoded_rows
+                or len(decoded_rows) != chunk["row_count"]
+                or len(decoded) != chunk["decoded_byte_count"]
+                or hashlib.sha256(decoded).hexdigest()
+                != chunk["decoded_sha256"]
+            ):
+                raise _InternalFailure()
+            rebuilt = {
+                "path": chunk["path"],
+                "chunk_index": expected_index,
+                "row_count": len(decoded_rows),
+                "decoded_byte_count": len(decoded),
+                "decoded_sha256": hashlib.sha256(decoded).hexdigest(),
+                "gzip_byte_count": len(physical),
+                "gzip_sha256": hashlib.sha256(physical).hexdigest(),
+            }
+            rebuilt_chunks.append(rebuilt)
+            rows.extend(decoded_rows)
+        inventory_bytes = _task4b_reread_capture_member(
+            ledger,
+            relative_path="scan/prefilter_inventory.json",
+            expected_size=inventory_size,
+            maximum_size=16_777_216,
+            size_kind="inventory",
+        )
+        inventory = _task4b_decode_canonical_json(
+            inventory_bytes, expected_container=dict
+        )
+        if (
+            inventory.get("schema")
+            != "historical_foundry_scan_inventory/v1"
+            or inventory.get("capture_inventory_sha256")
+            != owner["_task4b_snapshot_projection"][
+                "capture_inventory_sha256"
+            ]
+            or inventory.get("prefilter_chunks") != rebuilt_chunks
+            or inventory.get("row_count") != len(rows)
+            or inventory.get("grid_digest") != _task5_grid_digest(rows)
+            or inventory.get("safe_excluded_count")
+            != sum(row.get("decision") == "safe_excluded" for row in rows)
+            or inventory.get("replay_required_count")
+            != sum(row.get("decision") == "replay_required" for row in rows)
+        ):
+            raise _InternalFailure()
+        return inventory, rows
+
+    def _task5_freeze_audit(owner: Dict[str, Any]) -> None:
+        ledger = owner.get("_task4b_staging")
+        roles = ledger.get("role_directories") if type(ledger) is dict else None
+        prefilter = roles.get("prefilter") if type(roles) is dict else None
+        chunks = owner.get("_task5_prefilter_chunks")
+        if type(prefilter) is not dict or type(chunks) is not tuple:
+            raise _InternalFailure()
+        _task4b_verify_capture_directory(prefilter)
+        os.fsync(prefilter["fd"])
+        _task4b_verify_capture_directory(roles["scan"])
+        os.fsync(roles["scan"]["fd"])
+        expected = {
+            row["path"].rsplit("/", 1)[1] for row in chunks
+        }
+        if set(os.listdir(prefilter["fd"])) != expected:
+            raise _InternalFailure()
+        inventory, rows = _task5_rebuild_prefilter(owner)
+        inventory_bytes = _task4b_reread_capture_member(
+            ledger,
+            relative_path="scan/prefilter_inventory.json",
+            expected_size=owner["_task5_inventory_byte_count"],
+            maximum_size=16_777_216,
+            size_kind="inventory",
+        )
+        if (
+            _task4b_canonical_json_bytes(inventory) != inventory_bytes
+            or hashlib.sha256(inventory_bytes).hexdigest()
+            != owner["_task4b_snapshot_projection"][
+                "scan_inventory_sha256"
+            ]
+            or len(rows)
+            != owner["_task4b_snapshot_projection"]["prefilter_row_count"]
+            or inventory["grid_digest"]
+            != owner["_task4b_snapshot_projection"]["prefilter_grid_digest"]
+        ):
+            raise _InternalFailure()
+        return None
+
+    def _freeze_historical_prefilter_grid(
+        *,
+        staging: "HistoricalRunStagingSnapshot",
+        rows: Tuple[Mapping[str, Any], ...],
+    ) -> "HistoricalRunStagingSnapshot":
+        owner = _task4b_current_snapshot_owner(staging)
+        if (
+            owner.get("capture_generation") != 1
+            or owner.get("state") != "capture_frozen"
+            or type(rows) is not tuple
+            or not rows
+        ):
+            _raise_storage_error()
+        owner["state"] = "prefilter_materializing"
+        owner["_task4b_staging"]["quota_owner_handle"] = staging
+        detached = tuple(_task5_detach_json(row) for row in rows)
+        row_payloads = tuple(
+            _task4b_canonical_json_bytes(row) for row in detached
+        )
+        if any(len(payload) + 2 > 16_777_216 for payload in row_payloads):
+            _raise_storage_error()
+        ledger = owner["_task4b_staging"]
+        scan_directory = ledger["role_directories"]["scan"]
+        prefilter_directory = _task4b_open_capture_directory(
+            ledger,
+            scan_directory["fd"],
+            "prefilter",
+            allow_existing=False,
+        )
+        ledger["role_directories"]["prefilter"] = prefilter_directory
+        chunks = []
+        pending = []
+        pending_size = 2
+
+        def flush_pending() -> None:
+            nonlocal pending, pending_size
+            if not pending:
+                return None
+            decoded = b"[" + b",".join(pending) + b"]"
+            if len(decoded) != pending_size:
+                raise _InternalFailure()
+            physical = _task4b_encode_gzip(decoded)
+            chunk_index = len(chunks) + 1
+            target = "{:08d}.json.gz".format(chunk_index)
+            _task4b_write_capture_member(
+                ledger, prefilter_directory, target, physical
+            )
+            chunks.append({
+                "path": "scan/prefilter/" + target,
+                "chunk_index": chunk_index,
+                "row_count": len(pending),
+                "decoded_byte_count": len(decoded),
+                "decoded_sha256": hashlib.sha256(decoded).hexdigest(),
+                "gzip_byte_count": len(physical),
+                "gzip_sha256": hashlib.sha256(physical).hexdigest(),
+            })
+            pending = []
+            pending_size = 2
+            return None
+
+        for payload in row_payloads:
+            candidate_size = pending_size + len(payload) + (1 if pending else 0)
+            if candidate_size > 16_777_216:
+                flush_pending()
+            pending.append(payload)
+            pending_size += len(payload) + (1 if len(pending) > 1 else 0)
+        flush_pending()
+        decision_counts = {
+            decision: sum(
+                row.get("decision") == decision for row in detached
+            )
+            for decision in ("safe_excluded", "replay_required")
+        }
+        first_window = detached[0].get("window")
+        inventory = {
+            "schema": "historical_foundry_scan_inventory/v1",
+            "capture_inventory_sha256": owner[
+                "_task4b_snapshot_projection"
+            ]["capture_inventory_sha256"],
+            "range": first_window,
+            "scenario_denominator": len(detached),
+            "row_count": len(detached),
+            "safe_excluded_count": decision_counts["safe_excluded"],
+            "replay_required_count": decision_counts["replay_required"],
+            "grid_digest": _task5_grid_digest(detached),
+            "prefilter_chunks": chunks,
+        }
+        inventory_bytes = _task4b_canonical_json_bytes(inventory)
+        try:
+            captured_capture_inventory_size(byte_count=len(inventory_bytes))
+        except ValueError:
+            _raise_storage_error()
+        _task4b_write_capture_member(
+            ledger,
+            scan_directory,
+            "prefilter_inventory.json",
+            inventory_bytes,
+        )
+        owner["_task5_prefilter_chunks"] = tuple(chunks)
+        owner["_task5_inventory_byte_count"] = len(inventory_bytes)
+        members = dict(owner["_task4b_snapshot_members"])
+        for row in chunks:
+            members[row["path"]] = {
+                "size": row["gzip_byte_count"],
+                "sha256": row["gzip_sha256"],
+                "cap": 16_842_752,
+                "kind": "gzip",
+            }
+        scan_inventory_sha256 = hashlib.sha256(inventory_bytes).hexdigest()
+        members["scan/prefilter_inventory.json"] = {
+            "size": len(inventory_bytes),
+            "sha256": scan_inventory_sha256,
+            "cap": 16_777_216,
+            "kind": "inventory",
+        }
+        owner["_task4b_snapshot_members"] = members
+        owner["capture_generation"] = 2
+        owner["state"] = "prefilter_frozen"
+        quota = _quota_record_for_owner(owner)
+        owner["_task4b_snapshot_projection"] = {
+            "schema": "historical_foundry_staging_snapshot_identity/v1",
+            "stage": "prefilter_frozen",
+            "generation": 2,
+            "capture_inventory_sha256": inventory[
+                "capture_inventory_sha256"
+            ],
+            "scan_inventory_sha256": scan_inventory_sha256,
+            "frozen_member_count": len(members),
+            "frozen_physical_byte_count": sum(
+                row["size"] for row in members.values()
+            ),
+            "quota_committed_physical_bytes": quota[
+                "committed_physical_bytes"
+            ],
+            "quota_committed_member_count": quota["committed_members"],
+            "prefilter_chunk_count": len(chunks),
+            "prefilter_row_count": len(detached),
+            "prefilter_grid_digest": inventory["grid_digest"],
+        }
+        _task4b_freeze_audit(owner["_task4b_frozen_record"])
+        _task5_freeze_audit(owner)
+        old_snapshot = staging
+        owner_generation = owner["owner_generation"] + 1
+        owner["owner_generation"] = owner_generation
+        next_snapshot = _prepare_handle(HistoricalRunStagingSnapshot, owner)
+        owner["_task4b_snapshot_handle"] = next_snapshot
+        owner["_task4b_snapshot_owner_generation"] = owner_generation
+        staging_snapshot_registry[id(next_snapshot)] = (next_snapshot, owner)
+        _retire_nonowner_handle(
+            old_snapshot,
+            staging_snapshot_registry,
+            staging_snapshot_tombstones,
+        )
+        return next_snapshot
 
     class HistoricalRunStagingSnapshot(staging_snapshot_base):
         __slots__ = ("__weakref__",)
@@ -6690,7 +7004,8 @@ def _initialize_historical_foundry_storage_types():
         def frozen_identity_projection(self) -> Mapping[str, Any]:
             owner = _task4b_current_snapshot_owner(self)
             projection = owner.get("_task4b_snapshot_projection")
-            if type(projection) is not dict or len(projection) != 8:
+            expected_size = 8 if owner.get("capture_generation") == 1 else 12
+            if type(projection) is not dict or len(projection) != expected_size:
                 _task4b_terminalize_snapshot_failure(
                     self, owner, "final_identity_drift"
                 )
@@ -6710,6 +7025,8 @@ def _initialize_historical_foundry_storage_types():
             owner = _task4b_current_snapshot_owner(self)
             try:
                 _task4b_freeze_audit(owner["_task4b_frozen_record"])
+                if owner.get("capture_generation") == 2:
+                    _task5_freeze_audit(owner)
                 _task4b_current_snapshot_owner(self)
                 return None
             except BaseException as error:
@@ -6901,10 +7218,15 @@ def _initialize_historical_foundry_storage_types():
             owner_registry.get(id(owner_handle))
             if owner_registry is not None else None
         )
+        accepted_states = (
+            ("capture_materializing", "prefilter_materializing")
+            if expected_state == "capture_materializing"
+            else (expected_state,)
+        )
         if (
             current is None
             or current[0] is not owner_handle
-            or current[1].get("state") != expected_state
+            or current[1].get("state") not in accepted_states
             or current[1].get("lineage") is not ledger.get("lineage")
         ):
             raise _InternalFailure()
@@ -9812,6 +10134,7 @@ def _initialize_historical_foundry_storage_types():
         _issue_historical_window_exchange_transfer_for_test,
         _get_historical_window_run_quota_for_test,
         _project_historical_window_exchange_spool_for_test,
+        _freeze_historical_prefilter_grid,
     )
 
 
@@ -9835,6 +10158,7 @@ def _initialize_historical_foundry_storage_types():
     _issue_historical_window_exchange_transfer_for_test,
     _get_historical_window_run_quota_for_test,
     _project_historical_window_exchange_spool_for_test,
+    _freeze_historical_prefilter_grid,
 ) = _initialize_historical_foundry_storage_types()
 del _initialize_historical_foundry_storage_types
 

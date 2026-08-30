@@ -569,11 +569,13 @@ class _Task4bOfflineCapabilityFixture:
         *,
         context_factory=_small_context,
         split_reserve_root=True,
-        record_calls=True
+        record_calls=True,
+        reserve_by_target=None,
     ):
         self.context_factory = context_factory
         self.split_reserve_root = split_reserve_root
         self.record_calls = record_calls
+        self.reserve_by_target = reserve_by_target
         self.temporary = None
         self.data_dir = None
         self.capability = None
@@ -664,8 +666,15 @@ class _Task4bOfflineCapabilityFixture:
                 ) - 1
                 target = request["params"][0]["to"].lower()
                 if target in (PAIR_UNISWAP, PAIR_SUSHI):
+                    reserves = (
+                        fixture.reserve_by_target.get(target)
+                        if fixture.reserve_by_target is not None
+                        else None
+                    )
+                    if reserves is None:
+                        reserves = (number + 1, number + 2)
                     result = _reserve_result(
-                        number + 1, number + 2, number
+                        reserves[0], reserves[1], number
                     )
                 elif target == FEED_PROXY:
                     result = _price_result(
@@ -9187,6 +9196,373 @@ class HistoricalFoundryScanTask4bSurfaceTests(unittest.TestCase):
                 "historical_window_capability_invalid",
             ),
         )
+
+
+class HistoricalPrefilterGridTests(unittest.TestCase):
+    """Task-5 ingress, exact-grid, persistence, and reread contract."""
+
+    _ROW_KEYS = (
+        "schema", "scenario_key", "route_key", "coverage_digest",
+        "window", "block_number", "block_hash", "direction",
+        "requested_notional_usd", "header", "reserves", "price", "fee",
+        "amount_weth_in_wei", "first_amount_out_raw",
+        "second_amount_out_raw", "gross_profit_weth_wei",
+        "gross_edge_usd", "child_base_fee_wei",
+        "prefilter_gas_cost_usd", "prefilter_mev_buffer_usd",
+        "prefilter_policy_net_upper_bound_usd", "decision", "reason",
+    )
+
+    @staticmethod
+    def _task5_api():
+        import scripts.historical_foundry_scan as scan
+
+        names = (
+            "ValidatedHistoricalWindow",
+            "ValidatedHistoricalPrefilterGrid",
+            "open_validated_historical_window",
+            "build_historical_prefilter_grid",
+            "validate_historical_prefilter_grid",
+        )
+        missing = tuple(name for name in names if not hasattr(scan, name))
+        if missing:
+            raise AssertionError(
+                "Task-5 prefilter API is missing: {}".format(
+                    ", ".join(missing)
+                )
+            )
+        return tuple(getattr(scan, name) for name in names)
+
+    @staticmethod
+    def _new_fixture():
+        unit = 10 ** 18
+        return _Task4bOfflineCapabilityFixture(
+            split_reserve_root=False,
+            record_calls=False,
+            reserve_by_target={
+                PAIR_UNISWAP: (4000 * unit, 1000 * unit),
+                PAIR_SUSHI: (1000 * unit, 1000 * unit),
+            },
+        )
+
+    @staticmethod
+    def _capture_snapshot(fixture):
+        import scripts.historical_foundry_scan as scan
+
+        capability = fixture.mint()
+        snapshot = scan._materialize_historical_window_staging_snapshot(
+            capability=capability
+        )
+        fixture.capability = None
+        return snapshot
+
+    @staticmethod
+    def _detach(value):
+        if type(value) in (dict, types.MappingProxyType):
+            return {
+                key: HistoricalPrefilterGridTests._detach(nested)
+                for key, nested in value.items()
+            }
+        if type(value) in (list, tuple):
+            return [
+                HistoricalPrefilterGridTests._detach(nested)
+                for nested in value
+            ]
+        return value
+
+    @staticmethod
+    def _close_fixture(fixture, *snapshots):
+        for snapshot in reversed(snapshots):
+            if snapshot is not None:
+                try:
+                    snapshot.close()
+                except BaseException:
+                    pass
+        fixture.close()
+
+    def test_public_capabilities_are_opaque_and_signatures_accept_no_rows(self):
+        import scripts.historical_foundry_scan as scan
+
+        (
+            window_type,
+            grid_type,
+            open_window,
+            build_grid,
+            validate_grid,
+        ) = self._task5_api()
+        expected = (
+            (open_window, ("config", "staging")),
+            (build_grid, ("config", "window")),
+            (validate_grid, ("config", "window", "staging")),
+        )
+        for function, names in expected:
+            with self.subTest(function=function.__name__):
+                signature = inspect.signature(function)
+                self.assertEqual(tuple(signature.parameters), names)
+                self.assertTrue(all(
+                    parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                    for parameter in signature.parameters.values()
+                ))
+        for capability_type in (window_type, grid_type):
+            with self.subTest(capability=capability_type.__name__):
+                self.assertFalse(hasattr(capability_type, "_record"))
+                with self.assertRaises((TypeError, ValueError)):
+                    capability_type()
+                forged = object.__new__(capability_type)
+                self.assertFalse(hasattr(forged, "__dict__"))
+                self.assertNotIn("object at", repr(forged))
+                with self.assertRaises(TypeError):
+                    copy.copy(forged)
+                with self.assertRaises(TypeError):
+                    copy.deepcopy(forged)
+                with self.assertRaises(TypeError):
+                    pickle.dumps(forged)
+        self.assertNotIn("rows", inspect.signature(validate_grid).parameters)
+        self.assertFalse(hasattr(scan, "open_historical_window_from_path"))
+
+    def test_full_grid_uses_phase1_math_then_persists_freezes_and_rereads(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        (
+            window_type,
+            grid_type,
+            open_window,
+            build_grid,
+            validate_grid,
+        ) = self._task5_api()
+        fixture = self._new_fixture()
+        capture = prefilter = None
+        try:
+            capture = self._capture_snapshot(fixture)
+            capture_identity = capture.frozen_identity_projection()
+            config = load_historical_foundry_config_set()
+            window = open_window(config=config, staging=capture)
+            self.assertIs(type(window), window_type)
+            self.assertEqual(window.lower_bound_number, 1)
+            self.assertEqual(window.anchor_number, 2)
+            self.assertEqual(window.block_count, 2)
+            self.assertRegex(window.scan_inventory_sha256, r"^[0-9a-f]{64}$")
+            self.assertRegex(window.coverage_digest, r"^[0-9a-f]{64}$")
+            with self.assertRaises(AttributeError):
+                window.block_count = 3
+            self.assertTrue(
+                hasattr(scan, "_iter_validated_historical_window_records")
+            )
+            captured_records = tuple(
+                scan._iter_validated_historical_window_records(window=window)
+            )
+            self.assertEqual(
+                tuple(row["header"]["number"] for row in captured_records),
+                (1, 2),
+            )
+            self.assertEqual(
+                tuple(inspect.signature(
+                    scan._iter_validated_historical_window_records
+                ).parameters),
+                ("window",),
+            )
+            forged_window = object.__new__(window_type)
+            with self.assertRaises(ValueError):
+                tuple(scan._iter_validated_historical_window_records(
+                    window=forged_window
+                ))
+
+            rows = build_grid(config=config, window=window)
+            self.assertIs(type(rows), tuple)
+            self.assertEqual(len(rows), 20)
+            self.assertEqual(
+                [
+                    (
+                        row["block_number"], row["direction"],
+                        row["requested_notional_usd"],
+                    )
+                    for row in rows
+                ],
+                [
+                    (block, direction, notional)
+                    for block in (2, 1)
+                    for direction in (
+                        "uniswap_to_sushiswap",
+                        "sushiswap_to_uniswap",
+                    )
+                    for notional in (1000, 5000, 10000, 50000, 100000)
+                ],
+            )
+            first = rows[0]
+            self.assertEqual(tuple(first), self._ROW_KEYS)
+            self.assertEqual(
+                first["scenario_key"],
+                "2:uniswap_to_sushiswap:1000",
+            )
+            self.assertEqual(
+                first["route_key"], "uniswap_v2:sushiswap_v2"
+            )
+            self.assertEqual(first["amount_weth_in_wei"], 333333333333333333)
+            self.assertEqual(first["first_amount_out_raw"], 1328891698325589794)
+            self.assertEqual(first["second_amount_out_raw"], 1323151972535702977)
+            self.assertEqual(first["gross_profit_weth_wei"], 989818639202369644)
+            self.assertEqual(
+                first["gross_edge_usd"],
+                types.MappingProxyType({
+                    "numerator": 742363979401777233,
+                    "denominator": 250000000000000,
+                    "display": "2969.455917607108932",
+                }),
+            )
+            self.assertEqual(
+                first["prefilter_mev_buffer_usd"],
+                types.MappingProxyType({
+                    "numerator": 1, "denominator": 1, "display": "1",
+                }),
+            )
+            self.assertEqual(first["child_base_fee_wei"], 0)
+            self.assertEqual(first["decision"], "replay_required")
+            self.assertIsNone(first["reason"])
+            self.assertEqual(
+                sum(row["decision"] == "replay_required" for row in rows),
+                10,
+            )
+            with self.assertRaises(TypeError):
+                first["decision"] = "safe_excluded"
+
+            self.assertTrue(
+                hasattr(storage, "_freeze_historical_prefilter_grid")
+            )
+            prefilter = storage._freeze_historical_prefilter_grid(
+                staging=capture,
+                rows=rows,
+            )
+            self.assertIs(type(prefilter), storage.HistoricalRunStagingSnapshot)
+            self.assertIsNot(prefilter, capture)
+            identity = prefilter.frozen_identity_projection()
+            self.assertEqual(identity["stage"], "prefilter_frozen")
+            self.assertEqual(identity["generation"], 2)
+            self.assertEqual(identity["prefilter_row_count"], 20)
+            self.assertGreaterEqual(identity["prefilter_chunk_count"], 1)
+            self.assertRegex(identity["scan_inventory_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                identity["frozen_physical_byte_count"]
+                - capture_identity["frozen_physical_byte_count"],
+                identity["quota_committed_physical_bytes"]
+                - capture_identity["quota_committed_physical_bytes"],
+            )
+            self.assertEqual(
+                identity["frozen_member_count"]
+                - capture_identity["frozen_member_count"],
+                identity["quota_committed_member_count"]
+                - capture_identity["quota_committed_member_count"],
+            )
+            prefilter.reread_frozen_members_unchanged()
+
+            grid = validate_grid(
+                config=config,
+                window=window,
+                staging=prefilter,
+            )
+            self.assertIs(type(grid), grid_type)
+            self.assertEqual(grid.scan_inventory_sha256, identity["scan_inventory_sha256"])
+            self.assertEqual(grid.row_count, 20)
+            self.assertEqual(grid.safe_excluded_count, 10)
+            self.assertEqual(grid.replay_required_count, 10)
+            self.assertRegex(grid.grid_digest, r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                grid.safe_excluded_count + grid.replay_required_count,
+                window.block_count * 10,
+            )
+            with self.assertRaises(AttributeError):
+                grid.row_count = 0
+            self.assertEqual(
+                build_grid(config=config, window=window), rows
+            )
+            self.assertTrue(
+                hasattr(scan, "_iter_validated_historical_prefilter_rows")
+            )
+            ordered_rows = tuple(
+                scan._iter_validated_historical_prefilter_rows(grid=grid)
+            )
+            self.assertEqual(ordered_rows, rows)
+            self.assertEqual(
+                tuple(inspect.signature(
+                    scan._iter_validated_historical_prefilter_rows
+                ).parameters),
+                ("grid",),
+            )
+            self.assertIs(
+                inspect.signature(
+                    scan._iter_validated_historical_prefilter_rows
+                ).parameters["grid"].kind,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+            forged = object.__new__(grid_type)
+            with self.assertRaises(ValueError):
+                tuple(scan._iter_validated_historical_prefilter_rows(
+                    grid=forged
+                ))
+        finally:
+            self._close_fixture(fixture, capture, prefilter)
+
+    def test_rehashed_stored_grid_forgery_is_recomputed_and_rejected(self):
+        import scripts.historical_foundry_storage as storage
+
+        _, _, open_window, build_grid, validate_grid = self._task5_api()
+
+        def mutate_nested(row, outer, inner, value):
+            row[outer][inner] = value
+
+        mutations = (
+            ("decision", lambda row: row.__setitem__("decision", "safe_excluded")),
+            ("output", lambda row: row.__setitem__(
+                "first_amount_out_raw", row["first_amount_out_raw"] + 1
+            )),
+            ("rate", lambda row: mutate_nested(
+                row, "prefilter_mev_buffer_usd", "numerator", 2
+            )),
+            ("reserve", lambda row: mutate_nested(
+                row["reserves"], "uniswap_v2", "reserve_uni_raw",
+                row["reserves"]["uniswap_v2"]["reserve_uni_raw"] + 1,
+            )),
+            ("price", lambda row: mutate_nested(
+                row, "price", "answer",
+                row["price"]["answer"] + 1,
+            )),
+            ("block", lambda row: row.__setitem__("block_number", 3)),
+            ("reason", lambda row: row.__setitem__(
+                "reason", "first_leg_zero_output"
+            )),
+            ("range", lambda row: mutate_nested(
+                row, "window", "lower_bound_number", 0
+            )),
+            ("denominator", lambda row: mutate_nested(
+                row, "window", "scenario_denominator", 19
+            )),
+            ("digest", lambda row: row.__setitem__(
+                "coverage_digest", "0" * 64
+            )),
+        )
+        for axis, mutate in mutations:
+            with self.subTest(axis=axis):
+                fixture = self._new_fixture()
+                capture = prefilter = None
+                try:
+                    capture = self._capture_snapshot(fixture)
+                    config = load_historical_foundry_config_set()
+                    window = open_window(config=config, staging=capture)
+                    rows = [self._detach(row) for row in build_grid(
+                        config=config, window=window
+                    )]
+                    mutate(rows[0])
+                    prefilter = storage._freeze_historical_prefilter_grid(
+                        staging=capture,
+                        rows=tuple(rows),
+                    )
+                    with self.assertRaises(ValueError):
+                        validate_grid(
+                            config=config,
+                            window=window,
+                            staging=prefilter,
+                        )
+                finally:
+                    self._close_fixture(fixture, capture, prefilter)
 
 
 if __name__ == "__main__":
