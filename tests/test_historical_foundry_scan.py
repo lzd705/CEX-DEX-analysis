@@ -2880,6 +2880,7 @@ class HistoricalFoundryScanTask3bIntegratedTests(unittest.TestCase):
             "capability_registry",
             "consumed_view_registry",
             "staging_snapshot_registry",
+            "staging_lineage_token_registry",
             "replay_source_registry",
             "binding_registry",
             "task4b_checker_registry",
@@ -9563,6 +9564,65 @@ class HistoricalPrefilterGridTests(unittest.TestCase):
                         )
                 finally:
                     self._close_fixture(fixture, capture, prefilter)
+
+    def test_validation_rejects_byte_identical_different_staging_lineage(self):
+        import scripts.historical_foundry_storage as storage
+
+        _, grid_type, open_window, build_grid, validate_grid = self._task5_api()
+        fixture_a = self._new_fixture()
+        fixture_b = self._new_fixture()
+        capture_a = capture_b = prefilter_a = prefilter_b = None
+        try:
+            capture_a = self._capture_snapshot(fixture_a)
+            capture_b = self._capture_snapshot(fixture_b)
+            self.assertEqual(
+                capture_a.frozen_identity_projection(),
+                capture_b.frozen_identity_projection(),
+            )
+            config = load_historical_foundry_config_set()
+            window_a = open_window(config=config, staging=capture_a)
+            window_b = open_window(config=config, staging=capture_b)
+            rows_a = build_grid(config=config, window=window_a)
+            rows_b = build_grid(config=config, window=window_b)
+            self.assertEqual(rows_a, rows_b)
+            prefilter_a = storage._freeze_historical_prefilter_grid(
+                staging=capture_a,
+                rows=rows_a,
+            )
+            prefilter_b = storage._freeze_historical_prefilter_grid(
+                staging=capture_b,
+                rows=rows_b,
+            )
+            self.assertEqual(
+                prefilter_a.frozen_identity_projection(),
+                prefilter_b.frozen_identity_projection(),
+            )
+
+            grid_a = validate_grid(
+                config=config,
+                window=window_a,
+                staging=prefilter_a,
+            )
+            self.assertIs(type(grid_a), grid_type)
+            with self.assertRaises(ValueError):
+                validate_grid(
+                    config=config,
+                    window=window_a,
+                    staging=prefilter_b,
+                )
+            self.assertIsNone(prefilter_b.close())
+            prefilter_b = None
+            self.assertEqual(
+                build_grid(config=config, window=window_a),
+                rows_a,
+            )
+        finally:
+            self._close_fixture(
+                fixture_b, capture_b, prefilter_b
+            )
+            self._close_fixture(
+                fixture_a, capture_a, prefilter_a
+            )
 
 
 if __name__ == "__main__":

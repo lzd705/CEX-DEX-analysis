@@ -7994,9 +7994,17 @@ def _initialize_historical_prefilter_capabilities():
         config: HistoricalFoundryConfigSet,
         staging: Any,
     ) -> ValidatedHistoricalWindow:
-        return issue_window(validate_coverage(
+        import scripts.historical_foundry_storage as storage
+
+        record = validate_coverage(
             config=require_config(config), staging=staging
-        ))
+        )
+        record["lineage_token"] = (
+            storage._bind_historical_prefilter_staging_transition(
+                staging=staging
+            )
+        )
+        return issue_window(record)
 
     def _iter_validated_historical_window_records(
         *, window: ValidatedHistoricalWindow
@@ -8163,6 +8171,17 @@ def _initialize_historical_prefilter_capabilities():
         original = capability_record(
             window, ValidatedHistoricalWindow, window_registry
         )
+        import scripts.historical_foundry_storage as storage
+
+        try:
+            storage._verify_historical_prefilter_staging_transition(
+                lineage_token=original["lineage_token"],
+                staging=staging,
+            )
+        except storage.HistoricalFoundryStorageError:
+            raise ValueError(
+                "historical staging lineage differs"
+            ) from None
         fresh = validate_coverage(config=checked_config, staging=staging)
         for key in (
             "capture_inventory_sha256", "lower_bound_number",

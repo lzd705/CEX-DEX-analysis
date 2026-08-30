@@ -159,6 +159,9 @@ def _initialize_historical_foundry_storage_types():
     staging_snapshot_registry: Dict[
         int, Tuple[object, Dict[str, Any]]
     ] = {}
+    staging_lineage_token_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
     replay_source_registry: Dict[
         int, Tuple[object, Dict[str, Any]]
     ] = {}
@@ -314,6 +317,9 @@ def _initialize_historical_foundry_storage_types():
     sealed_base, sealed_authorized = _new_authority_base()
     replay_source_base, replay_source_authorized = _new_authority_base()
     staging_snapshot_base, staging_snapshot_authorized = _new_authority_base()
+    staging_lineage_token_base, staging_lineage_token_authorized = (
+        _new_authority_base()
+    )
     run_snapshot_base, run_snapshot_authorized = _new_authority_base()
 
     def _prepare_handle(authority_class: type, record: Dict[str, Any]) -> Any:
@@ -874,6 +880,11 @@ def _initialize_historical_foundry_storage_types():
                         )
                         continue
                     registry.pop(handle_id, None)
+        for token_id, (_reference, candidate) in tuple(
+            staging_lineage_token_registry.items()
+        ):
+            if candidate.get("lineage") is lineage:
+                staging_lineage_token_registry.pop(token_id, None)
         record["capture_replay_source"] = None
         record.pop("_task4b_raw_chunks", None)
         record.pop("_task4b_raw_exchange_records", None)
@@ -6608,6 +6619,70 @@ def _initialize_historical_foundry_storage_types():
             )
         return owner
 
+    class _HistoricalRunStagingLineageToken(staging_lineage_token_base):
+        __slots__ = ("__weakref__",)
+
+    staging_lineage_token_authorized[0] = (
+        _HistoricalRunStagingLineageToken
+    )
+
+    def _bind_historical_prefilter_staging_transition(
+        *, staging: object
+    ) -> object:
+        owner = _task4b_current_snapshot_owner(staging)
+        lineage = owner.get("lineage")
+        owner_generation = owner.get("owner_generation")
+        if (
+            lineage is None
+            or owner.get("capture_generation") != 1
+            or owner.get("state") != "capture_frozen"
+            or type(owner_generation) is not int
+        ):
+            _raise_storage_error()
+        record = {
+            "constructor": constructor_provenance,
+            "lineage": lineage,
+            "source_capture_generation": 1,
+            "source_owner_generation": owner_generation,
+        }
+        token = _prepare_handle(
+            _HistoricalRunStagingLineageToken, record
+        )
+        token_id = id(token)
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = staging_lineage_token_registry.get(token_id)
+            if current is not None and current[0] is reference:
+                staging_lineage_token_registry.pop(token_id, None)
+
+        reference = weakref.ref(token, retire)
+        staging_lineage_token_registry[token_id] = (reference, record)
+        return token
+
+    def _verify_historical_prefilter_staging_transition(
+        *, lineage_token: object, staging: object
+    ) -> None:
+        entry = staging_lineage_token_registry.get(id(lineage_token))
+        if (
+            type(lineage_token) is not _HistoricalRunStagingLineageToken
+            or entry is None
+            or entry[0]() is not lineage_token
+            or entry[1].get("constructor") is not constructor_provenance
+        ):
+            _raise_storage_error()
+        owner = _task4b_current_snapshot_owner(staging)
+        token_record = entry[1]
+        if (
+            token_record.get("lineage") is not owner.get("lineage")
+            or token_record.get("source_capture_generation") != 1
+            or owner.get("capture_generation") != 2
+            or owner.get("state") != "prefilter_frozen"
+            or owner.get("owner_generation")
+            != token_record.get("source_owner_generation") + 1
+        ):
+            _raise_storage_error()
+        return None
+
     def _task4b_acknowledge_snapshot_delivery(
         snapshot: object, owner: Dict[str, Any]
     ) -> None:
@@ -10134,6 +10209,8 @@ def _initialize_historical_foundry_storage_types():
         _issue_historical_window_exchange_transfer_for_test,
         _get_historical_window_run_quota_for_test,
         _project_historical_window_exchange_spool_for_test,
+        _bind_historical_prefilter_staging_transition,
+        _verify_historical_prefilter_staging_transition,
         _freeze_historical_prefilter_grid,
     )
 
@@ -10158,6 +10235,8 @@ def _initialize_historical_foundry_storage_types():
     _issue_historical_window_exchange_transfer_for_test,
     _get_historical_window_run_quota_for_test,
     _project_historical_window_exchange_spool_for_test,
+    _bind_historical_prefilter_staging_transition,
+    _verify_historical_prefilter_staging_transition,
     _freeze_historical_prefilter_grid,
 ) = _initialize_historical_foundry_storage_types()
 del _initialize_historical_foundry_storage_types
