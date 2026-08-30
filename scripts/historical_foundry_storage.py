@@ -301,6 +301,7 @@ def _initialize_historical_foundry_storage_types():
     replay_ledger_registry: Dict[
         int, Tuple[weakref.ReferenceType, Dict[str, Any]]
     ] = {}
+    task6_transaction_registry: Dict[int, Dict[str, Any]] = {}
     replay_source_registry: Dict[
         int, Tuple[object, Dict[str, Any]]
     ] = {}
@@ -6812,14 +6813,15 @@ def _initialize_historical_foundry_storage_types():
             _raise_storage_error()
         owner = entry[1]
         if (
-            type(owner.get("_task6_transaction")) is dict
+            id(owner) in task6_transaction_registry
+            or type(owner.get("_task6_transaction")) is dict
             or owner.get("_task6_journal_authority")
         ):
             try:
-                if type(owner.get("_task6_transaction")) is dict:
-                    _task6_rollback_transaction(owner)
-                else:
-                    _task6_recover_disk_journal(owner)
+                transaction = _task6_v2_transaction(owner)
+                if transaction is None:
+                    raise _InternalFailure()
+                _task6_resolve_v2_transaction(owner)
             except BaseException as error:
                 if not isinstance(error, Exception):
                     raise
@@ -7373,6 +7375,7 @@ def _initialize_historical_foundry_storage_types():
             raise _InternalFailure()
         scenario = matched[0]
         config_values, config_digests = _task6_current_config_values(owner)
+        artifact = config_values["toolchain"].get("executor_build", {})
         struct_log_storage, raw_trace_closure = _task6_validate_struct_trace(
             trace, config_values["toolchain"]
         )
@@ -7446,8 +7449,26 @@ def _initialize_historical_foundry_storage_types():
                 if matrix.get("leg") == "first_leg"
                 else second_venue
             )
+            path_key = (
+                matrix.get("prefilter_reason"), matrix.get("leg"),
+                matrix.get("revert_selector"),
+                matrix.get("revert_data_sha256"),
+            )
+            reviewed_paths = {
+                (
+                    "first_leg_zero_output", "first_leg", "0x08c379a0",
+                    "6798eb314455c46925e230068a2e4849cf2340aefa7480b4aece1cdc6ae36ba7",
+                ): [2],
+                (
+                    "second_leg_zero_liquidity", "second_leg", "0x08c379a0",
+                    "9de19b1bd02b49383b079e33eb28592b7125d02f86cad8e24358a74830d1fe0b",
+                ): [5],
+            }
+            expected_path = reviewed_paths.get(path_key)
+            if expected_path is None:
+                raise _InternalFailure()
             expected_call = {
-                "call_path": [0] if matrix.get("leg") == "first_leg" else [1],
+                "call_path": list(expected_path),
                 "leg": matrix.get("leg"),
                 "router": venues.get(expected_venue),
                 "revert_selector": matrix.get("revert_selector"),
@@ -7506,7 +7527,6 @@ def _initialize_historical_foundry_storage_types():
             for venue_id in ("uniswap_v2", "sushiswap_v2")
         ):
             raise _InternalFailure()
-        artifact = config_values["toolchain"].get("executor_build", {})
         formula = config_values["authority"].get("v2_formula", {})
         mev_bps = config_values["policy"].get("fees", {}).get(
             "acceptance_mev_bps"
@@ -7562,6 +7582,12 @@ def _initialize_historical_foundry_storage_types():
             "policy_sha256": config_digests["policy"],
             "authority_sha256": config_digests["authority"],
             "toolchain_sha256": config_digests["toolchain"],
+            "executor_source_tree_sha256": artifact.get(
+                "source_tree_sha256"
+            ),
+            "executor_constructor_args_sha256": artifact.get(
+                "constructor_args_sha256"
+            ),
             "anvil_binary_sha256": struct_log_storage[
                 "anvil_binary_sha256"
             ],
@@ -7570,6 +7596,12 @@ def _initialize_historical_foundry_storage_types():
             ],
             "adapter_proof_sha256": artifact.get("creation_bytecode_sha256"),
             "executor_runtime_sha256": artifact.get("deployed_runtime_sha256"),
+            "executor_immutable_references_sha256": artifact.get(
+                "immutable_references_sha256"
+            ),
+            "executor_artifact_manifest_sha256": artifact.get(
+                "artifact_manifest_sha256"
+            ),
             "requested_notional_usd": scenario["requested_notional_usd"],
             "amount_weth_in_wei": scenario["amount_weth_in_wei"],
             "actual_first_leg_uni_raw": (
@@ -7682,43 +7714,254 @@ def _initialize_historical_foundry_storage_types():
             raise _InternalFailure()
         quota_registry[id(quota)] = (quota, dict(quota_snapshot))
 
-    def _task6_rollback_transaction(owner: Dict[str, Any]) -> None:
-        transaction = owner.get("_task6_transaction")
-        if type(transaction) is not dict:
-            return None
-        if (
-            transaction.get("lineage") is not owner.get("lineage")
-            or transaction.get("owner") is not owner
-        ):
-            raise _InternalFailure()
-        _task6_commit_checkpoint("rollback")
-        ledger = owner.get("_task4b_staging")
-        block = transaction.get("block")
-        scenario = transaction.get("scenario")
-        if (
-            type(ledger) is not dict
-            or type(block) is not dict
-            or type(scenario) is not dict
-        ):
-            raise _InternalFailure()
-        private_name = transaction["private_name"]
-        formal_name = transaction["scenario_key"]
-        current_name = scenario.get("name")
-        if current_name == formal_name:
-            _task6_rename_directory_noreplace(
-                parent_fd=block["fd"], source_name=formal_name,
-                destination_name=private_name,
+
+    def _task6_clone_mutable(value: Any) -> Any:
+        if type(value) is dict:
+            return {
+                key: _task6_clone_mutable(nested)
+                for key, nested in value.items()
+            }
+        if type(value) is list:
+            return [_task6_clone_mutable(nested) for nested in value]
+        if type(value) is tuple:
+            return tuple(_task6_clone_mutable(nested) for nested in value)
+        if type(value) is set:
+            return {_task6_clone_mutable(nested) for nested in value}
+        return value
+
+    def _task6_journal_projection(value: Any) -> Any:
+        if type(value) is dict:
+            return {
+                key: _task6_journal_projection(nested)
+                for key, nested in value.items()
+            }
+        if type(value) in (list, tuple):
+            return [_task6_journal_projection(nested) for nested in value]
+        if type(value) is set:
+            return sorted(_task6_journal_projection(nested) for nested in value)
+        if value is None or type(value) in (bool, int, str):
+            return value
+        raise _InternalFailure()
+
+    def _task6_raw_journal_write(
+        *, parent_fd: int, name: str, payload: bytes
+    ) -> None:
+        _require_relative_basename(name)
+        flags = (
+            os.O_RDWR | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
+        fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        try:
+            offset = 0
+            while offset < len(payload):
+                count = os.write(fd, payload[offset:])
+                if count <= 0:
+                    raise _InternalFailure()
+                offset += count
+            os.fsync(fd)
+            details = os.fstat(fd)
+            path_details = os.stat(
+                name, dir_fd=parent_fd, follow_symlinks=False
             )
-            scenario["name"] = private_name
-            scenario["identity"] = _metadata_snapshot(os.fstat(
-                scenario["fd"]
-            ))
-            os.fsync(block["fd"])
-        elif current_name != private_name:
-            raise _InternalFailure()
-        for entry in reversed(transaction.get("files", ())):
-            if type(entry) is not dict:
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or stat.S_IMODE(details.st_mode) != 0o600
+                or details.st_nlink != 1
+                or _metadata_snapshot(details) != _metadata_snapshot(path_details)
+                or os.pread(fd, len(payload) + 1, 0) != payload
+            ):
                 raise _InternalFailure()
+        finally:
+            os.close(fd)
+        os.fsync(parent_fd)
+        return None
+
+    def _task6_raw_journal_read(
+        *, parent_fd: int, name: str, expected_size: int,
+        expected_sha256: str,
+    ) -> bytes:
+        _require_relative_basename(name)
+        fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            details = os.fstat(fd)
+            path_details = os.stat(
+                name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            payload = os.pread(fd, expected_size + 1, 0)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or stat.S_IMODE(details.st_mode) != 0o600
+                or details.st_nlink != 1
+                or _metadata_snapshot(details) != _metadata_snapshot(path_details)
+                or len(payload) != expected_size
+                or hashlib.sha256(payload).hexdigest() != expected_sha256
+            ):
+                raise _InternalFailure()
+            return payload
+        finally:
+            os.close(fd)
+
+    def _task6_v2_transaction(owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        transaction = task6_transaction_registry.get(id(owner))
+        if transaction is not None:
+            if (
+                type(transaction) is not dict
+                or transaction.get("owner") is not owner
+                or transaction.get("lineage") is not owner.get("lineage")
+            ):
+                raise _InternalFailure()
+            return transaction
+        attached = owner.get("_task6_transaction")
+        if type(attached) is dict and attached.get("schema") == (
+            "historical_foundry_replay_transaction/v2"
+        ):
+            task6_transaction_registry[id(owner)] = attached
+            return attached
+        authorities = owner.get("_task6_journal_authority")
+        if type(authorities) is dict and len(authorities) == 1:
+            authority = next(iter(authorities.values()))
+            if (
+                type(authority) is dict
+                and authority.get("schema")
+                == "historical_foundry_replay_transaction/v2"
+            ):
+                recovered = authority.get("rollback_authority")
+                if (
+                    type(recovered) is not dict
+                    or recovered.get("owner") is not owner
+                    or recovered.get("lineage") is not owner.get("lineage")
+                ):
+                    raise _InternalFailure()
+                root_fd = recovered["journal_parent_fd"]
+                prepare_name = recovered["prepare_name"]
+                committed_name = recovered["committed_name"]
+                names = []
+                for candidate in (prepare_name, committed_name):
+                    try:
+                        payload = _task6_raw_journal_read(
+                            parent_fd=root_fd, name=candidate,
+                            expected_size=authority["size"],
+                            expected_sha256=authority["sha256"],
+                        )
+                    except FileNotFoundError:
+                        continue
+                    names.append((candidate, payload))
+                if len(names) != 1:
+                    raise _InternalFailure()
+                document = _task4b_decode_canonical_json(
+                    names[0][1], expected_container=dict
+                )
+                if (
+                    document.get("schema")
+                    != "historical_foundry_replay_transaction/v2"
+                    or document.get("transaction_id")
+                    != recovered.get("transaction_id")
+                    or document != recovered.get("journal_document")
+                ):
+                    raise _InternalFailure()
+                recovered["state"] = (
+                    "COMMIT_DURABLE"
+                    if names[0][0] == committed_name else "PREPARED"
+                )
+                owner["_task6_transaction"] = recovered
+                task6_transaction_registry[id(owner)] = recovered
+                return recovered
+        return None
+
+    def _task6_remove_v2_journal(transaction: Dict[str, Any]) -> None:
+        parent_fd = transaction["journal_parent_fd"]
+        removed = False
+        for name in (
+            transaction["prepare_name"], transaction["committed_name"]
+        ):
+            try:
+                os.unlink(name, dir_fd=parent_fd)
+                removed = True
+            except FileNotFoundError:
+                pass
+        if removed:
+            os.fsync(parent_fd)
+        return None
+
+    def _task6_rollback_v2(transaction: Dict[str, Any]) -> None:
+        owner = transaction["owner"]
+        if transaction.get("rollback_complete") is True:
+            return None
+        if transaction.get("state") in (
+            "COMMIT_DURABLE", "COMPLETING", "COMMITTED"
+        ):
+            raise _InternalFailure()
+        transaction["state"] = "ROLLBACK"
+        _task6_commit_checkpoint("rollback")
+        ledger_record = transaction.get("ledger_record")
+        ledger_handle = transaction.get("ledger_handle")
+        if ledger_handle is not None:
+            replay_ledger_registry.pop(id(ledger_handle), None)
+        successor = transaction.get("successor")
+        if successor is not None:
+            staging_snapshot_registry.pop(id(successor), None)
+            staging_snapshot_tombstones.pop(id(successor), None)
+        sink_record = transaction["sink_record"]
+        sink_record.clear()
+        sink_record.update({
+            key: (
+                _task6_clone_mutable(value)
+                if key in ("members", "state", "ledger") else value
+            )
+            for key, value in transaction[
+                "predecessor_sink_record"
+            ].items()
+        })
+        ledger = owner["_task4b_staging"]
+        scenario = transaction.get("scenario")
+        block = transaction.get("block")
+        if type(scenario) is dict and type(block) is dict:
+            held_identity = _metadata_snapshot(os.fstat(scenario["fd"]))
+
+            def installed_identity(name: str) -> Optional[Tuple[int, ...]]:
+                try:
+                    details = os.stat(
+                        name, dir_fd=block["fd"], follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    return None
+                return _metadata_snapshot(details)
+
+            private_identity = installed_identity(
+                transaction["private_name"]
+            )
+            formal_identity = installed_identity(
+                transaction["scenario_key"]
+            )
+            if (
+                formal_identity == held_identity
+                and private_identity is None
+            ):
+                _task6_rename_directory_noreplace(
+                    parent_fd=block["fd"],
+                    source_name=transaction["scenario_key"],
+                    destination_name=transaction["private_name"],
+                )
+                transaction["formal_installed"] = False
+                scenario["name"] = transaction["private_name"]
+                scenario["identity"] = held_identity
+                os.fsync(block["fd"])
+            elif not (
+                private_identity == held_identity
+                and formal_identity is None
+            ):
+                raise _InternalFailure()
+            else:
+                transaction["formal_installed"] = False
+                scenario["name"] = transaction["private_name"]
+                scenario["identity"] = held_identity
+        for entry in reversed(tuple(transaction.get("files", ()))):
             try:
                 os.unlink(entry["name"], dir_fd=entry["parent_fd"])
             except FileNotFoundError:
@@ -7726,220 +7969,514 @@ def _initialize_historical_foundry_storage_types():
             os.fsync(entry["parent_fd"])
             if entry in ledger["files"]:
                 ledger["files"].remove(entry)
-        _task4b_close_fd_slot(ledger, scenario)
-        try:
-            os.rmdir(private_name, dir_fd=block["fd"])
-        except FileNotFoundError:
-            pass
-        os.fsync(block["fd"])
-        if scenario in ledger["directories"]:
-            ledger["directories"].remove(scenario)
-        for directory in transaction.get("parent_directories", ()):
-            if type(directory) is not dict:
-                raise _InternalFailure()
-            if not directory.get("created"):
-                continue
+        for directory in reversed(tuple(transaction.get("opened_directories", ()))):
             _task4b_close_fd_slot(ledger, directory)
-            try:
-                os.rmdir(
-                    directory["name"], dir_fd=directory["parent_fd"]
-                )
-            except FileNotFoundError:
-                pass
-            os.fsync(directory["parent_fd"])
+            if directory.get("created"):
+                try:
+                    os.rmdir(
+                        directory["name"], dir_fd=directory["parent_fd"]
+                    )
+                except FileNotFoundError:
+                    pass
+                os.fsync(directory["parent_fd"])
             if directory in ledger["directories"]:
                 ledger["directories"].remove(directory)
-        for relative_path in transaction.get("mapped_paths", ()):
+        for relative_path in tuple(transaction.get("mapped_paths", ())):
             ledger.get("task6_member_directories", {}).pop(
                 relative_path, None
             )
         _task6_install_quota_snapshot(
             owner, transaction["predecessor_quota"]
         )
-        predecessor_values = transaction.get("predecessor_values")
-        if type(predecessor_values) is not dict:
-            raise _InternalFailure()
-        for name, prior in predecessor_values.items():
-            if (
-                type(prior) is not tuple
-                or len(prior) != 2
-                or type(prior[0]) is not bool
-            ):
-                raise _InternalFailure()
+        for name, prior in transaction["predecessor_owner_values"].items():
             if prior[0]:
-                owner[name] = prior[1]
+                owner[name] = _task6_clone_mutable(prior[1])
             else:
                 owner.pop(name, None)
+        quota_owner_prior = transaction.get("predecessor_quota_owner_handle")
+        if type(quota_owner_prior) is tuple and len(quota_owner_prior) == 2:
+            if quota_owner_prior[0]:
+                ledger["quota_owner_handle"] = quota_owner_prior[1]
+            else:
+                ledger.pop("quota_owner_handle", None)
+        _task6_remove_v2_journal(transaction)
         owner.pop("_task6_transaction", None)
         authorities = owner.get("_task6_journal_authority")
         if type(authorities) is dict:
-            authorities.pop(transaction.get("transaction_id"), None)
+            authorities.pop(transaction["transaction_id"], None)
+            if not authorities:
+                owner.pop("_task6_journal_authority", None)
+        task6_transaction_registry.pop(id(owner), None)
+        transaction["rollback_complete"] = True
+        _task6_commit_checkpoint("after_rollback")
+        del ledger_record
         return None
 
-    def _task6_recover_disk_journal(owner: Dict[str, Any]) -> None:
-        authorities = owner.get("_task6_journal_authority")
-        if authorities is None:
+    def _task6_complete_v2(transaction: Dict[str, Any]) -> None:
+        owner = transaction["owner"]
+        if transaction.get("state") == "COMMITTED":
             return None
-        if type(authorities) is not dict or len(authorities) != 1:
-            raise _InternalFailure()
-        transaction_id, authority = next(iter(authorities.items()))
-        if (
-            type(transaction_id) is not str
-            or len(transaction_id) != 32
-            or any(character not in "0123456789abcdef" for character in transaction_id)
-            or type(authority) is not dict
-            or authority.get("lineage") is not owner.get("lineage")
+        if transaction.get("state") not in (
+            "COMMIT_DURABLE", "COMPLETING"
         ):
             raise _InternalFailure()
-        ledger = owner.get("_task4b_staging")
-        journal_name = ".transaction-" + transaction_id + ".json"
-        matches = tuple(
-            (path, value)
-            for path, value in ledger.get(
-                "task6_member_directories", {}
-            ).items()
-            if path.endswith("/" + journal_name)
-        ) if type(ledger) is dict else ()
-        if len(matches) != 1:
-            raise _InternalFailure()
-        journal_path, (block, basename) = matches[0]
-        if basename != journal_name or type(block) is not dict:
-            raise _InternalFailure()
-        payload = _task4b_reread_capture_member(
-            ledger, relative_path=journal_path,
-            expected_size=authority.get("size"), maximum_size=8_388_608,
-            size_kind="task6_json",
+        transaction["state"] = "COMPLETING"
+        old_snapshot = transaction["old_snapshot"]
+        if not transaction.get("old_retired"):
+            _retire_nonowner_handle(
+                old_snapshot, staging_snapshot_registry,
+                staging_snapshot_tombstones,
+            )
+            transaction["old_retired"] = True
+            _task6_commit_checkpoint("after_old_snapshot_retire")
+        _task6_freeze_audit(owner)
+        sink_record = transaction["sink_record"]
+        sink_record["members"]["result"] = transaction["result_payload"]
+        _task6_commit_checkpoint("after_sink_result_install")
+        sink_record["ledger"] = transaction["ledger_handle"]
+        _task6_commit_checkpoint("after_sink_ledger_install")
+        sink_record["state"] = "committed"
+        _task6_commit_checkpoint("after_sink_commit")
+        _task6_remove_v2_journal(transaction)
+        owner.pop("_task6_transaction", None)
+        authorities = owner.get("_task6_journal_authority")
+        if type(authorities) is dict:
+            authorities.pop(transaction["transaction_id"], None)
+            if not authorities:
+                owner.pop("_task6_journal_authority", None)
+        task6_transaction_registry.pop(id(owner), None)
+        transaction["state"] = "COMMITTED"
+        return None
+
+    def _task6_resolve_v2_transaction(owner: Dict[str, Any]) -> None:
+        transaction = _task6_v2_transaction(owner)
+        if transaction is None:
+            return None
+        if transaction.get("state") in (
+            "COMMIT_DURABLE", "COMPLETING", "COMMITTED"
+        ):
+            _task6_complete_v2(transaction)
+        else:
+            _task6_rollback_v2(transaction)
+        return None
+
+    def _task6_commit_quartet_v2(
+        *, record: Dict[str, Any], candidate_members: Dict[str, bytes],
+        quartet: Dict[str, Any], result_payload: bytes,
+    ) -> Mapping[str, Any]:
+        owner = record["owner"]
+        ledger = owner["_task4b_staging"]
+        predecessor_quota = _task6_clone_mutable(
+            _quota_record_for_owner(owner)
         )
-        if hashlib.sha256(payload).hexdigest() != authority.get("sha256"):
+        if predecessor_quota.get("reservation") is not None:
             raise _InternalFailure()
-        journal = _task4b_decode_canonical_json(
-            payload, expected_container=dict
+        predecessor_names = (
+            "_task6_scenarios", "_task4b_snapshot_members",
+            "capture_generation", "state", "_task4b_snapshot_projection",
+            "_task4b_snapshot_handle", "_task4b_snapshot_owner_generation",
+            "owner_generation", "_task6_opened_scenario_keys",
         )
-        expected_keys = {
-            "schema", "transaction_id", "scenario_key", "block_number",
-            "block_directory_created", "foundry_directory_created",
-            "predecessor_generation", "predecessor_owner_generation",
-            "predecessor_quota_physical_bytes",
-            "predecessor_quota_members", "capture_inventory_sha256",
-            "scan_inventory_sha256", "members",
+        predecessor_owner_values = {
+            name: (
+                name in owner,
+                _task6_clone_mutable(owner.get(name)),
+            )
+            for name in predecessor_names
         }
-        projection = owner.get("_task4b_snapshot_projection")
-        foundry_matches = tuple(
-            row for row in ledger.get("directories", ())
-            if type(row) is dict and row.get("name") == "foundry"
-            and row.get("fd") == block.get("parent_fd")
-        ) if type(ledger) is dict else ()
+        predecessor_sink_record = {
+            key: (
+                _task6_clone_mutable(value)
+                if key in ("members", "state", "ledger") else value
+            )
+            for key, value in record.items()
+        }
+        generation = owner["capture_generation"]
         if (
-            set(journal) != expected_keys
-            or journal.get("schema")
-            != "historical_foundry_replay_transaction/v1"
-            or journal.get("transaction_id") != transaction_id
-            or type(projection) is not dict
-            or journal.get("capture_inventory_sha256")
-            != projection.get("capture_inventory_sha256")
-            or journal.get("scan_inventory_sha256")
-            != projection.get("scan_inventory_sha256")
-            or journal.get("predecessor_generation") != 2
-            or journal.get("predecessor_owner_generation")
-            != owner.get("owner_generation")
-            or type(journal.get("block_directory_created")) is not bool
-            or type(journal.get("foundry_directory_created")) is not bool
-            or journal["block_directory_created"]
-            is not bool(block.get("created"))
-            or len(foundry_matches) != 1
-            or journal["foundry_directory_created"]
-            is not bool(foundry_matches[0].get("created"))
+            type(generation) is not int or generation < 2
+            or owner.get("state") not in ("prefilter_frozen", "replay_frozen")
         ):
             raise _InternalFailure()
-        members = journal.get("members")
-        if (
-            type(members) is not list
-            or tuple(row.get("role") for row in members if type(row) is dict)
-            != ("overlay", "receipt", "trace", "result")
-        ):
-            raise _InternalFailure()
-        scenario_key = journal.get("scenario_key")
-        scenario_matches = tuple(
-            row for row in ledger.get("directories", ())
-            if type(row) is dict and row.get("name") == scenario_key
-            and row.get("parent_fd") == block.get("fd")
-        )
-        if len(scenario_matches) != 1:
-            raise _InternalFailure()
-        scenario = scenario_matches[0]
-        stored_paths = []
-        expected_names = {
+        next_generation = generation + 1
+        next_owner_generation = owner["owner_generation"] + 1
+        block_name = str(quartet["block_number"])
+        filenames = {
             "overlay": "overlay.json", "receipt": "receipt.json",
             "trace": "trace.json.gz", "result": "result.json",
         }
-        for member in members:
-            if set(member) != {"role", "sha256", "size"}:
-                raise _InternalFailure()
-            relative_path = "foundry/{}/{}/{}".format(
-                journal["block_number"], scenario_key,
-                expected_names[member["role"]],
-            )
-            value = _task4b_reread_capture_member(
-                ledger, relative_path=relative_path,
-                expected_size=member["size"], maximum_size=(
-                    16_777_216 if member["role"] == "trace" else 8_388_608
-                ), size_kind=(
-                    "task6_trace" if member["role"] == "trace"
-                    else "task6_json"
+        stored = {}
+        for role in ("overlay", "receipt", "trace", "result"):
+            payload = candidate_members[role]
+            stored[role] = {
+                "path": "foundry/{}/{}/{}".format(
+                    block_name, record["scenario_key"], filenames[role]
                 ),
-            )
-            if hashlib.sha256(value).hexdigest() != member["sha256"]:
-                raise _InternalFailure()
-            stored_paths.append(relative_path)
-        predecessor_quota = dict(_quota_record_for_owner(owner))
-        predecessor_quota["committed_physical_bytes"] = journal[
-            "predecessor_quota_physical_bytes"
-        ]
-        predecessor_quota["committed_members"] = journal[
-            "predecessor_quota_members"
-        ]
-        predecessor_quota["provisional_physical_bytes"] = 0
-        predecessor_quota["provisional_members"] = 0
-        predecessor_quota["reservation"] = None
-        files = [
-            row for row in ledger.get("files", ())
-            if type(row) is dict and (
-                row.get("parent_fd") == scenario.get("fd")
-                or row.get("name") == journal_name
-                and row.get("parent_fd") == block.get("fd")
-            )
-        ]
-        owner["_task6_transaction"] = {
-            "owner": owner, "lineage": owner["lineage"],
-            "transaction_id": transaction_id,
-            "scenario_key": scenario_key,
-            "private_name": ".scenario-" + transaction_id,
-            "block": block, "scenario": scenario, "files": files,
-            "mapped_paths": stored_paths + [journal_path],
-            "parent_directories": (block, foundry_matches[0]),
-            "predecessor_quota": predecessor_quota,
-            "predecessor_state": "prefilter_frozen",
-            "predecessor_values": {
-                "capture_generation": (True, 2),
-                "owner_generation": (
-                    True, journal["predecessor_owner_generation"]
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "cap": 16_777_216 if role == "trace" else 8_388_608,
+                "kind": "task6_trace" if role == "trace" else "task6_json",
+            }
+        target_members = _task6_clone_mutable(
+            owner["_task4b_snapshot_members"]
+        )
+        target_members.update(_task6_clone_mutable({
+            row["path"]: row for row in stored.values()
+        }))
+        target_scenarios = _task6_clone_mutable(
+            owner.get("_task6_scenarios", {})
+        )
+        if record["scenario_key"] in target_scenarios:
+            raise _InternalFailure()
+        target_scenarios[record["scenario_key"]] = {
+            "members": _task6_clone_mutable(stored),
+            "projection": _task6_clone_mutable(quartet),
+        }
+        target_quota = _task6_clone_mutable(predecessor_quota)
+        target_quota["committed_physical_bytes"] += sum(
+            len(candidate_members[role])
+            for role in ("overlay", "receipt", "trace", "result")
+        )
+        target_quota["committed_members"] += 4
+        target_quota["provisional_physical_bytes"] = 0
+        target_quota["provisional_members"] = 0
+        target_quota["reservation"] = None
+        previous_projection = owner["_task4b_snapshot_projection"]
+        target_projection = {
+            "schema": "historical_foundry_staging_snapshot_identity/v1",
+            "stage": "replay_frozen", "generation": next_generation,
+            "capture_inventory_sha256": previous_projection[
+                "capture_inventory_sha256"
+            ],
+            "scan_inventory_sha256": previous_projection[
+                "scan_inventory_sha256"
+            ],
+            "frozen_member_count": len(target_members),
+            "frozen_physical_byte_count": sum(
+                row["size"] for row in target_members.values()
+            ),
+            "quota_committed_physical_bytes": target_quota[
+                "committed_physical_bytes"
+            ],
+            "quota_committed_member_count": target_quota[
+                "committed_members"
+            ],
+            "prefilter_chunk_count": previous_projection[
+                "prefilter_chunk_count"
+            ],
+            "prefilter_row_count": previous_projection[
+                "prefilter_row_count"
+            ],
+            "prefilter_grid_digest": previous_projection[
+                "prefilter_grid_digest"
+            ],
+            "replay_scenario_count": len(target_scenarios),
+            "replay_scenario_key": record["scenario_key"],
+            "replay_proof_inputs_hash": quartet["proof_inputs_hash"],
+        }
+        successor = _prepare_handle(HistoricalRunStagingSnapshot, owner)
+        ledger_record = {
+            "scenario_key": record["scenario_key"],
+            "generation": next_generation,
+            "proof_inputs_hash": quartet["proof_inputs_hash"],
+            "staging": successor,
+            "previous_staging": record["staging"],
+            "scenario_count": len(target_scenarios),
+            "successor_consumed": False,
+            "owner": owner,
+        }
+        validated = _prepare_handle(
+            ValidatedHistoricalReplayLedger, ledger_record
+        )
+        entropy = os.urandom(16)
+        if type(entropy) is not bytes or len(entropy) != 16:
+            raise _InternalFailure()
+        transaction_id = entropy.hex()
+        prepare_name = ".transaction-{}.PREPARE.json".format(transaction_id)
+        committed_name = ".transaction-{}.COMMITTED.json".format(
+            transaction_id
+        )
+        journal_parent_fd = ledger["capture_directories"]["replay"]["fd"]
+        journal_document = {
+            "schema": "historical_foundry_replay_transaction/v2",
+            "state": "PREPARED", "transaction_id": transaction_id,
+            "scenario_key": record["scenario_key"],
+            "block_number": quartet["block_number"],
+            "capture_inventory_sha256": previous_projection[
+                "capture_inventory_sha256"
+            ],
+            "scan_inventory_sha256": previous_projection[
+                "scan_inventory_sha256"
+            ],
+            "members": [
+                {
+                    "role": role, "size": stored[role]["size"],
+                    "sha256": stored[role]["sha256"],
+                }
+                for role in ("overlay", "receipt", "trace", "result")
+            ],
+            "predecessor": {
+                "generation": generation,
+                "state": owner["state"],
+                "owner_generation": owner["owner_generation"],
+                "projection": _task6_journal_projection(
+                    previous_projection
                 ),
-                "state": (True, "prefilter_frozen"),
+                "members": _task6_journal_projection(
+                    owner["_task4b_snapshot_members"]
+                ),
+                "scenarios": _task6_journal_projection(
+                    owner.get("_task6_scenarios", {})
+                ),
+                "quota": {
+                    key: predecessor_quota[key]
+                    for key in (
+                        "committed_physical_bytes", "committed_members",
+                        "provisional_physical_bytes", "provisional_members",
+                    )
+                },
+                "opened_scenario_keys": sorted(owner.get(
+                    "_task6_opened_scenario_keys", set()
+                )),
+            },
+            "target": {
+                "generation": next_generation,
+                "state": "replay_frozen",
+                "owner_generation": next_owner_generation,
+                "projection": _task6_journal_projection(target_projection),
+                "members": _task6_journal_projection(target_members),
+                "scenarios": _task6_journal_projection(target_scenarios),
+                "quota": {
+                    key: target_quota[key]
+                    for key in (
+                        "committed_physical_bytes", "committed_members",
+                        "provisional_physical_bytes", "provisional_members",
+                    )
+                },
+                "opened_scenario_keys": sorted(owner.get(
+                    "_task6_opened_scenario_keys", set()
+                )),
             },
         }
-        _task6_rollback_transaction(owner)
-        matching_sinks = tuple(
-            record for _, record in scenario_sink_registry.values()
-            if type(record) is dict
-            and record.get("owner") is owner
-            and record.get("scenario_key") == scenario_key
-            and record.get("state") == "recovering"
-        )
-        if len(matching_sinks) != 1:
-            raise _InternalFailure()
-        matching_sinks[0].get("members", {}).pop("result", None)
-        matching_sinks[0]["state"] = "open"
-        return None
+        journal_document["predecessor"]["quota"]["reservation"] = None
+        journal_document["target"]["quota"]["reservation"] = None
+        journal_payload = _task4b_canonical_json_bytes(journal_document)
+        transaction = {
+            "schema": "historical_foundry_replay_transaction/v2",
+            "state": "OPEN", "owner": owner,
+            "lineage": owner["lineage"],
+            "transaction_id": transaction_id,
+            "scenario_key": record["scenario_key"],
+            "private_name": ".scenario-" + transaction_id,
+            "prepare_name": prepare_name,
+            "committed_name": committed_name,
+            "journal_parent_fd": journal_parent_fd,
+            "journal_document": journal_document,
+            "journal_payload": journal_payload,
+            "predecessor_quota": predecessor_quota,
+            "predecessor_owner_values": predecessor_owner_values,
+            "predecessor_sink_record": predecessor_sink_record,
+            "sink_record": record, "result_payload": result_payload,
+            "candidate_members": candidate_members,
+            "target_quota": target_quota,
+            "target_members": target_members,
+            "target_scenarios": target_scenarios,
+            "target_projection": target_projection,
+            "next_generation": next_generation,
+            "next_owner_generation": next_owner_generation,
+            "successor": successor, "ledger_handle": validated,
+            "ledger_record": ledger_record,
+            "old_snapshot": record["staging"], "old_retired": False,
+            "stored": stored, "files": [], "mapped_paths": [],
+            "opened_directories": [],
+            "predecessor_quota_owner_handle": (
+                "quota_owner_handle" in ledger,
+                ledger.get("quota_owner_handle"),
+            ),
+        }
+        task6_transaction_registry[id(owner)] = transaction
+        try:
+            transaction["state"] = "PREPARING"
+            _task6_raw_journal_write(
+                parent_fd=journal_parent_fd, name=prepare_name,
+                payload=journal_payload,
+            )
+            transaction["state"] = "PREPARED"
+            _task6_commit_checkpoint("after_prepare_fsync")
+            owner["_task6_transaction"] = transaction
+            _task6_commit_checkpoint("after_owner_transaction_install")
+            if "_task6_journal_authority" in owner:
+                raise _InternalFailure()
+            owner["_task6_journal_authority"] = {
+                transaction_id: {
+                    "schema": "historical_foundry_replay_transaction/v2",
+                    "lineage": owner["lineage"],
+                    "sha256": hashlib.sha256(journal_payload).hexdigest(),
+                    "size": len(journal_payload),
+                    "rollback_authority": transaction,
+                }
+            }
+            _task6_commit_checkpoint("after_journal_authority_install")
+            transaction["state"] = "MUTATING"
+            owner["state"] = "replay_materializing"
+            _task6_commit_checkpoint("after_owner_materializing")
+            ledger["quota_owner_handle"] = record["staging"]
+            _task6_commit_checkpoint("after_quota_owner_install")
+            staging_directory = ledger["capture_directories"]["staging"]
+            foundry = _task4b_open_capture_directory(
+                ledger, staging_directory["fd"], "foundry",
+                allow_existing=True,
+            )
+            transaction["opened_directories"].append(foundry)
+            transaction["foundry"] = foundry
+            _task6_commit_checkpoint("after_foundry_directory_open")
+            block = _task4b_open_capture_directory(
+                ledger, foundry["fd"], block_name, allow_existing=True
+            )
+            transaction["opened_directories"].append(block)
+            transaction["block"] = block
+            _task6_commit_checkpoint("after_block_directory_open")
+            scenario = _task4b_open_capture_directory(
+                ledger, block["fd"], transaction["private_name"],
+                allow_existing=False,
+            )
+            transaction["opened_directories"].append(scenario)
+            transaction["scenario"] = scenario
+            _task6_commit_checkpoint("after_scenario_directory_create")
+            ledger.setdefault("task6_member_directories", {})
+            _task6_commit_checkpoint("after_member_directory_map_install")
+            reread_members = {}
+            for role in ("overlay", "receipt", "trace", "result"):
+                payload = candidate_members[role]
+                target = filenames[role]
+                _task4b_write_capture_member(
+                    ledger, scenario, target, payload
+                )
+                entry = ledger["files"][-1]
+                transaction["files"].append(entry)
+                _task6_commit_checkpoint("after_member_file_" + role)
+                path = stored[role]["path"]
+                ledger["task6_member_directories"][path] = (
+                    scenario, target
+                )
+                transaction["mapped_paths"].append(path)
+                _task6_commit_checkpoint("after_member_map_" + role)
+                observed = _task4b_reread_capture_member(
+                    ledger, relative_path=path,
+                    expected_size=stored[role]["size"],
+                    maximum_size=stored[role]["cap"],
+                    size_kind=stored[role]["kind"],
+                )
+                if hashlib.sha256(observed).hexdigest() != stored[role]["sha256"]:
+                    raise _InternalFailure()
+                reread_members[role] = observed
+            if _task6_validate_quartet(
+                record["scenario_key"], reread_members, owner
+            ) != quartet:
+                raise _InternalFailure()
+            try:
+                os.stat(
+                    record["scenario_key"], dir_fd=block["fd"],
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise _InternalFailure()
+            _task6_rename_directory_noreplace(
+                parent_fd=block["fd"],
+                source_name=transaction["private_name"],
+                destination_name=record["scenario_key"],
+            )
+            transaction["formal_installed"] = True
+            _task6_commit_checkpoint("after_formal_directory_rename")
+            scenario["name"] = record["scenario_key"]
+            _task6_commit_checkpoint("after_formal_directory_name_install")
+            scenario["identity"] = _metadata_snapshot(os.fstat(scenario["fd"]))
+            _task6_commit_checkpoint("after_formal_directory_identity_install")
+            os.fsync(block["fd"])
+            _task6_commit_checkpoint("after_formal_quartet_install")
+            _task6_install_quota_snapshot(owner, target_quota)
+            _task6_commit_checkpoint("after_quota_install")
+            owner["_task6_scenarios"] = _task6_clone_mutable(target_scenarios)
+            _task6_commit_checkpoint("after_owner_scenarios_install")
+            owner["_task4b_snapshot_members"] = _task6_clone_mutable(
+                target_members
+            )
+            _task6_commit_checkpoint("after_owner_members_install")
+            owner["capture_generation"] = next_generation
+            _task6_commit_checkpoint("after_owner_generation_install")
+            owner["state"] = "replay_frozen"
+            _task6_commit_checkpoint("after_owner_state_install")
+            owner["_task4b_snapshot_projection"] = _task6_clone_mutable(
+                target_projection
+            )
+            _task6_commit_checkpoint("after_owner_projection_install")
+            _task4b_freeze_audit(owner["_task4b_frozen_record"])
+            _task5_freeze_audit(owner)
+            _task6_freeze_audit(owner)
+            owner["owner_generation"] = next_owner_generation
+            _task6_commit_checkpoint("after_owner_generation_counter_install")
+            owner["_task4b_snapshot_handle"] = successor
+            _task6_commit_checkpoint("after_owner_snapshot_handle_install")
+            owner["_task4b_snapshot_owner_generation"] = next_owner_generation
+            _task6_commit_checkpoint("after_owner_successor_install")
+            staging_snapshot_registry[id(successor)] = (successor, owner)
+            _task6_commit_checkpoint("after_successor_registry_install")
+            _task6_register_weak(
+                validated, ledger_record, replay_ledger_registry
+            )
+            _task6_commit_checkpoint("after_ledger_registry_install")
+            record["state"] = "target_ready"
+            _task6_commit_checkpoint("after_sink_state_target_ready")
+            record["ledger"] = validated
+            _task6_commit_checkpoint("after_sink_target_ready")
+            transaction["state"] = "TARGET_READY"
+            if (
+                owner.get("_task4b_snapshot_handle") is not successor
+                or staging_snapshot_registry.get(id(successor))
+                != (successor, owner)
+                or replay_ledger_registry.get(id(validated), (None,))[0]()
+                is not validated
+                or record.get("state") != "target_ready"
+                or record.get("ledger") is not validated
+                or _quota_record_for_owner(owner) != target_quota
+            ):
+                raise _InternalFailure()
+            _task6_freeze_audit(owner)
+            _task6_commit_checkpoint("after_target_audit")
+            _task6_rename_directory_noreplace(
+                parent_fd=journal_parent_fd,
+                source_name=prepare_name,
+                destination_name=committed_name,
+            )
+            _task6_commit_checkpoint("after_commit_marker_rename")
+            os.fsync(journal_parent_fd)
+            transaction["state"] = "COMMIT_DURABLE"
+            _task6_commit_checkpoint("after_commit_marker_fsync")
+            _task6_complete_v2(transaction)
+            return MappingProxyType({
+                "role": "result", "byte_count": len(result_payload),
+                "sha256": hashlib.sha256(result_payload).hexdigest(),
+            })
+        except BaseException as original_error:
+            cleanup_error = None
+            try:
+                if transaction.get("state") in (
+                    "COMMIT_DURABLE", "COMPLETING", "COMMITTED"
+                ):
+                    _task6_complete_v2(transaction)
+                else:
+                    _task6_rollback_v2(transaction)
+            except BaseException as observed_cleanup_error:
+                cleanup_error = observed_cleanup_error
+            if not isinstance(original_error, Exception):
+                raise original_error
+            if (
+                cleanup_error is not None
+                and not isinstance(cleanup_error, Exception)
+            ):
+                raise cleanup_error
+            raise original_error
 
     def _validate_historical_quartet_for_test(
         *, staging: object, scenario_key: str,
@@ -7964,16 +8501,30 @@ def _initialize_historical_foundry_storage_types():
         staging: object,
     ) -> None:
         entry = staging_snapshot_registry.get(id(staging))
+        owner = entry[1] if entry is not None else None
+        if owner is None:
+            matches = [
+                transaction
+                for transaction in task6_transaction_registry.values()
+                if transaction.get("old_snapshot") is staging
+            ]
+            if len(matches) == 1:
+                owner = matches[0].get("owner")
+        transaction = (
+            owner.get("_task6_transaction")
+            if type(owner) is dict else None
+        )
         if (
             type(staging) is not HistoricalRunStagingSnapshot
-            or entry is None
-            or entry[0] is not staging
-            or type(entry[1].get("_task6_transaction")) is not dict
-            or not entry[1].get("_task6_journal_authority")
+            or type(owner) is not dict
+            or type(transaction) is not dict
+            or transaction.get("schema")
+            != "historical_foundry_replay_transaction/v2"
+            or not owner.get("_task6_journal_authority")
         ):
             raise ValueError("historical transaction registry is unavailable")
-        entry[1].pop("_task6_transaction", None)
-        entry[1]["state"] = "replay_recovery"
+        task6_transaction_registry.pop(id(owner), None)
+        owner.pop("_task6_transaction", None)
         return None
 
     class ValidatedHistoricalReplayLedger(replay_ledger_base):
@@ -8024,6 +8575,20 @@ def _initialize_historical_foundry_storage_types():
             record = _task6_live_record(
                 self, ScenarioEvidenceSink, scenario_sink_registry
             )
+            owner = record["owner"]
+            if (
+                id(owner) in task6_transaction_registry
+                or type(owner.get("_task6_transaction")) is dict
+                or owner.get("_task6_journal_authority")
+            ):
+                try:
+                    _task6_resolve_v2_transaction(owner)
+                except BaseException as error:
+                    if not isinstance(error, Exception):
+                        raise
+                    raise ValueError(
+                        "historical scenario evidence is unavailable"
+                    ) from None
             expected_roles = ("overlay", "receipt", "trace", "result")
             members = record["members"]
             expected = expected_roles[len(members)] if len(members) < 4 else None
@@ -8054,317 +8619,45 @@ def _initialize_historical_foundry_storage_types():
             })
             if role != "result":
                 return projection
-            owner = record["owner"]
+            candidate_members = dict(members)
+            members.pop("result", None)
             try:
                 quartet = _task6_validate_quartet(
-                    record["scenario_key"], members, owner
+                    record["scenario_key"], candidate_members, owner
                 )
-                predecessor_quota = dict(_quota_record_for_owner(owner))
-                predecessor_values = {
-                    name: (name in owner, owner.get(name))
-                    for name in (
-                        "_task6_scenarios", "_task4b_snapshot_members",
-                        "capture_generation", "state",
-                        "_task4b_snapshot_projection",
-                        "_task4b_snapshot_handle",
-                        "_task4b_snapshot_owner_generation",
-                        "owner_generation",
-                    )
-                }
-                owner["state"] = "replay_materializing"
-                ledger = owner["_task4b_staging"]
-                ledger["quota_owner_handle"] = record["staging"]
-                _task4b_freeze_audit(owner["_task4b_frozen_record"])
-                _task5_freeze_audit(owner)
-                staging_directory = ledger["capture_directories"]["staging"]
-                foundry = _task4b_open_capture_directory(
-                    ledger, staging_directory["fd"], "foundry",
-                    allow_existing=True,
+                return _task6_commit_quartet_v2(
+                    record=record, candidate_members=candidate_members,
+                    quartet=quartet, result_payload=canonical_bytes,
                 )
-                block_name = str(quartet["block_number"])
-                block = _task4b_open_capture_directory(
-                    ledger, foundry["fd"], block_name,
-                    allow_existing=True,
-                )
-                entropy = os.urandom(16)
-                if type(entropy) is not bytes or len(entropy) != 16:
-                    raise _InternalFailure()
-                private_name = ".scenario-" + entropy.hex()
-                scenario = _task4b_open_capture_directory(
-                    ledger, block["fd"], private_name,
-                    allow_existing=False,
-                )
-                transaction = {
-                    "owner": owner,
-                    "lineage": owner["lineage"],
-                    "scenario_key": record["scenario_key"],
-                    "private_name": private_name,
-                    "block": block,
-                    "scenario": scenario,
-                    "parent_directories": (block, foundry),
-                    "files": [],
-                    "mapped_paths": [],
-                    "predecessor_quota": predecessor_quota,
-                    "predecessor_state": predecessor_values["state"][1],
-                    "predecessor_values": predecessor_values,
-                }
-                owner["_task6_transaction"] = transaction
-                filenames = {
-                    "overlay": "overlay.json",
-                    "receipt": "receipt.json",
-                    "trace": "trace.json.gz",
-                    "result": "result.json",
-                }
-                stored = {}
-                ledger.setdefault("task6_member_directories", {})
-                for member_role in expected_roles:
-                    _task6_commit_checkpoint("write_" + member_role)
-                    payload = members[member_role]
-                    target = filenames[member_role]
-                    relative_path = "foundry/{}/{}/{}".format(
-                        block_name, record["scenario_key"], target
-                    )
-                    _task4b_write_capture_member(
-                        ledger, scenario, target, payload
-                    )
-                    transaction["files"].append(ledger["files"][-1])
-                    ledger["task6_member_directories"][relative_path] = (
-                        scenario, target
-                    )
-                    transaction["mapped_paths"].append(relative_path)
-                    stored[member_role] = {
-                        "path": relative_path,
-                        "size": len(payload),
-                        "sha256": hashlib.sha256(payload).hexdigest(),
-                        "cap": (
-                            16_777_216 if member_role == "trace"
-                            else 8_388_608
-                        ),
-                        "kind": "task6_trace" if member_role == "trace" else "task6_json",
-                    }
-                reread_members = {}
-                for member_role in expected_roles:
-                    _task6_commit_checkpoint("reread_" + member_role)
-                    row = stored[member_role]
-                    payload = _task4b_reread_capture_member(
-                        ledger, relative_path=row["path"],
-                        expected_size=row["size"], maximum_size=row["cap"],
-                        size_kind=row["kind"],
-                    )
-                    if hashlib.sha256(payload).hexdigest() != row["sha256"]:
-                        raise _InternalFailure()
-                    reread_members[member_role] = payload
-                _task6_commit_checkpoint("closure_audit")
-                reread_quartet = _task6_validate_quartet(
-                    record["scenario_key"], reread_members, owner
-                )
-                if reread_quartet != quartet:
-                    raise _InternalFailure()
-                transaction_id = entropy.hex()
-                journal_name = ".transaction-" + transaction_id + ".json"
-                journal_path = "foundry/{}/{}".format(
-                    block_name, journal_name
-                )
-                journal_payload = _task4b_canonical_json_bytes({
-                    "schema": "historical_foundry_replay_transaction/v1",
-                    "transaction_id": transaction_id,
-                    "scenario_key": record["scenario_key"],
-                    "block_number": quartet["block_number"],
-                    "block_directory_created": bool(block.get("created")),
-                    "foundry_directory_created": bool(foundry.get("created")),
-                    "predecessor_generation": owner["capture_generation"],
-                    "predecessor_owner_generation": owner["owner_generation"],
-                    "predecessor_quota_physical_bytes": predecessor_quota[
-                        "committed_physical_bytes"
-                    ],
-                    "predecessor_quota_members": predecessor_quota[
-                        "committed_members"
-                    ],
-                    "capture_inventory_sha256": owner[
-                        "_task4b_snapshot_projection"
-                    ]["capture_inventory_sha256"],
-                    "scan_inventory_sha256": owner[
-                        "_task4b_snapshot_projection"
-                    ]["scan_inventory_sha256"],
-                    "members": [
-                        {
-                            "role": member_role,
-                            "sha256": stored[member_role]["sha256"],
-                            "size": stored[member_role]["size"],
-                        }
-                        for member_role in expected_roles
-                    ],
-                })
-                transaction["transaction_id"] = transaction_id
-                authorities = owner.setdefault(
-                    "_task6_journal_authority", {}
-                )
-                if type(authorities) is not dict or authorities:
-                    raise _InternalFailure()
-                authorities[transaction_id] = {
-                    "lineage": owner["lineage"],
-                    "sha256": hashlib.sha256(journal_payload).hexdigest(),
-                    "size": len(journal_payload),
-                }
-                _task6_commit_checkpoint("journal_write")
-                _task4b_write_capture_member(
-                    ledger, block, journal_name, journal_payload
-                )
-                journal_entry = ledger["files"][-1]
-                transaction["files"].append(journal_entry)
-                transaction["journal_entry"] = journal_entry
-                transaction["journal_path"] = journal_path
-                transaction["journal_payload"] = journal_payload
-                ledger["task6_member_directories"][journal_path] = (
-                    block, journal_name
-                )
-                transaction["mapped_paths"].append(journal_path)
-                observed_journal = _task4b_reread_capture_member(
-                    ledger, relative_path=journal_path,
-                    expected_size=len(journal_payload),
-                    maximum_size=8_388_608, size_kind="task6_json",
-                )
-                if observed_journal != journal_payload:
-                    raise _InternalFailure()
-                target_quota = dict(predecessor_quota)
-                target_quota["committed_physical_bytes"] += sum(
-                    len(members[member_role]) for member_role in expected_roles
-                )
-                target_quota["committed_members"] += len(expected_roles)
-                target_quota["provisional_physical_bytes"] = 0
-                target_quota["provisional_members"] = 0
-                target_quota["reservation"] = None
-                transaction["target_quota"] = target_quota
-                _task6_install_quota_snapshot(owner, target_quota)
-                _task6_commit_checkpoint("owner_prepare")
-                _task6_commit_checkpoint("successor_prepare")
-                _task6_commit_checkpoint("ledger_prepare")
-                try:
-                    os.stat(
-                        record["scenario_key"], dir_fd=block["fd"],
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    pass
-                else:
-                    raise _InternalFailure()
-                _task6_commit_checkpoint("pre_rename")
-                _task6_rename_directory_noreplace(
-                    parent_fd=block["fd"], source_name=private_name,
-                    destination_name=record["scenario_key"],
-                )
-                scenario["name"] = record["scenario_key"]
-                scenario["identity"] = _metadata_snapshot(os.fstat(
-                    scenario["fd"]
-                ))
-                os.fsync(block["fd"])
-                _task6_commit_checkpoint("post_rename")
-                _task6_commit_checkpoint("post_rename_fsync")
-                _task6_commit_checkpoint("journal_cleanup")
-                os.unlink(journal_name, dir_fd=block["fd"])
-                os.fsync(block["fd"])
-                if journal_entry in ledger["files"]:
-                    ledger["files"].remove(journal_entry)
-                ledger["task6_member_directories"].pop(journal_path, None)
-                transaction["files"].remove(journal_entry)
-                transaction["mapped_paths"].remove(journal_path)
-                _task6_install_quota_snapshot(owner, target_quota)
-                scenarios = owner.setdefault("_task6_scenarios", {})
-                if (
-                    type(scenarios) is not dict
-                    or record["scenario_key"] in scenarios
-                ):
-                    raise _InternalFailure()
-                scenarios[record["scenario_key"]] = {
-                    "members": stored, "projection": quartet,
-                }
-                all_members = dict(owner["_task4b_snapshot_members"])
-                all_members.update({row["path"]: row for row in stored.values()})
-                owner["_task4b_snapshot_members"] = all_members
-                next_generation = owner["capture_generation"] + 1
-                owner["capture_generation"] = next_generation
-                owner["state"] = "replay_frozen"
-                quota = _quota_record_for_owner(owner)
-                previous = owner["_task4b_snapshot_projection"]
-                owner["_task4b_snapshot_projection"] = {
-                    "schema": "historical_foundry_staging_snapshot_identity/v1",
-                    "stage": "replay_frozen",
-                    "generation": next_generation,
-                    "capture_inventory_sha256": previous["capture_inventory_sha256"],
-                    "scan_inventory_sha256": previous["scan_inventory_sha256"],
-                    "frozen_member_count": len(all_members),
-                    "frozen_physical_byte_count": sum(
-                        row["size"] for row in all_members.values()
-                    ),
-                    "quota_committed_physical_bytes": quota["committed_physical_bytes"],
-                    "quota_committed_member_count": quota["committed_members"],
-                    "prefilter_chunk_count": previous["prefilter_chunk_count"],
-                    "prefilter_row_count": previous["prefilter_row_count"],
-                    "prefilter_grid_digest": previous["prefilter_grid_digest"],
-                    "replay_scenario_count": len(scenarios),
-                    "replay_scenario_key": record["scenario_key"],
-                    "replay_proof_inputs_hash": quartet["proof_inputs_hash"],
-                }
-                _task4b_freeze_audit(owner["_task4b_frozen_record"])
-                _task5_freeze_audit(owner)
-                _task6_freeze_audit(owner)
-                old_snapshot = record["staging"]
-                owner_generation = owner["owner_generation"] + 1
-                owner["owner_generation"] = owner_generation
-                successor = _prepare_handle(HistoricalRunStagingSnapshot, owner)
-                owner["_task4b_snapshot_handle"] = successor
-                owner["_task4b_snapshot_owner_generation"] = owner_generation
-                staging_snapshot_registry[id(successor)] = (successor, owner)
-                _retire_nonowner_handle(
-                    old_snapshot, staging_snapshot_registry,
-                    staging_snapshot_tombstones,
-                )
-                ledger_record = {
-                    "scenario_key": record["scenario_key"],
-                    "generation": next_generation,
-                    "proof_inputs_hash": quartet["proof_inputs_hash"],
-                    "staging": successor,
-                    "previous_staging": old_snapshot,
-                    "scenario_count": len(scenarios),
-                    "successor_consumed": False,
-                }
-                validated = _prepare_handle(
-                    ValidatedHistoricalReplayLedger, ledger_record
-                )
-                _task6_register_weak(
-                    validated, ledger_record, replay_ledger_registry
-                )
-                record["ledger"] = validated
-                record["state"] = "committed"
-                owner.pop("_task6_transaction", None)
-                authorities.pop(transaction_id, None)
-                return projection
             except BaseException as error:
-                control = error if not isinstance(error, Exception) else None
-                if type(owner.get("_task6_transaction")) is dict:
-                    try:
-                        _task6_rollback_transaction(owner)
-                    except BaseException as cleanup_error:
-                        record["state"] = "recovering"
-                        owner["state"] = "replay_recovery"
-                        if (
-                            not isinstance(cleanup_error, Exception)
-                            and control is None
-                        ):
-                            control = cleanup_error
-                    else:
-                        members.pop("result", None)
-                        record["state"] = "open"
-                else:
-                    record["state"] = "failed"
-                if control is not None:
-                    raise control
-                raise ValueError("historical scenario evidence is invalid") from None
+                if not isinstance(error, Exception):
+                    raise
+                if record.get("state") not in (
+                    "open", "committed", "target_ready"
+                ):
+                    record["state"] = "recovering"
+                raise ValueError(
+                    "historical scenario evidence is invalid"
+                ) from None
 
         def validated_ledger(self) -> ValidatedHistoricalReplayLedger:
             record = _task6_live_record(
                 self, ScenarioEvidenceSink, scenario_sink_registry
             )
+            owner = record["owner"]
+            if (
+                id(owner) in task6_transaction_registry
+                or type(owner.get("_task6_transaction")) is dict
+                or owner.get("_task6_journal_authority")
+            ):
+                try:
+                    _task6_resolve_v2_transaction(owner)
+                except BaseException as error:
+                    if not isinstance(error, Exception):
+                        raise
+                    raise ValueError(
+                        "historical scenario ledger is unavailable"
+                    ) from None
             if record.get("state") != "committed":
                 raise ValueError("historical scenario ledger is unavailable")
             return record["ledger"]

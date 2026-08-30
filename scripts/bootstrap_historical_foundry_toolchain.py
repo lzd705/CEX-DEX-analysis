@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ctypes
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import ssl
 import stat
 import subprocess
@@ -22,6 +24,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import urllib.request
@@ -1097,7 +1100,8 @@ def _initialize_historical_process_lease_type():
             "_process", "_cleanup", "_binary_sha256", "_selected_block",
             "_hardfork", "_toolchain", "_output_threads",
             "_output_totals", "_output_capture", "_output_lock",
-            "_output_overflow", "_reaped", "_closed",
+            "_output_overflow", "_output_control", "_launch_identity",
+            "_owner_registry", "_reaped", "_closed",
         )
 
         def __init__(self, *, _provenance: object = None, **values: Any) -> None:
@@ -1134,6 +1138,13 @@ def _initialize_historical_process_lease_type():
                 "hardfork": self._hardfork,
                 "fork_url_kind": "loopback_relay",
             }
+
+        def verified_launch_identity_projection(self) -> Mapping[str, Any]:
+            if self._closed or type(self._launch_identity) is not dict:
+                raise ValueError("historical process identity is unavailable")
+            return json.loads(
+                _canonical_json_bytes(self._launch_identity).decode("utf-8")
+            )
 
         def _assert_output_within_limit(self) -> None:
             with self._output_lock:
@@ -1255,7 +1266,12 @@ def _initialize_historical_process_lease_type():
                     control = error
                 elif isinstance(error, Exception):
                     ordinary = True
-            if reaped:
+            threads_quiescent = all(
+                not thread.is_alive() for thread in self._output_threads
+            )
+            with self._output_lock:
+                output_control = self._output_control[0]
+            if reaped and threads_quiescent:
                 release_ok = True
                 toolchain = self._toolchain
                 if toolchain is not None:
@@ -1277,6 +1293,9 @@ def _initialize_historical_process_lease_type():
                         elif isinstance(error, Exception):
                             ordinary = True
                 if release_ok:
+                    owner_registry = self._owner_registry
+                    if owner_registry is not None:
+                        owner_registry.pop(id(self), None)
                     object.__setattr__(self, "_process", None)
                     object.__setattr__(self, "_cleanup", None)
                     object.__setattr__(self, "_toolchain", None)
@@ -1284,6 +1303,8 @@ def _initialize_historical_process_lease_type():
                     object.__setattr__(self, "_closed", True)
             else:
                 ordinary = True
+            if output_control is not None and control is None:
+                control = output_control
             if control is not None:
                 raise control
             if ordinary:
@@ -1298,6 +1319,8 @@ def _initialize_historical_process_lease_type():
         selected_block: int,
         hardfork: str,
         toolchain: Any = None,
+        launch_identity: Any = None,
+        owner_registry: Any = None,
     ) -> _HistoricalProcessLease:
         if (
             not callable(cleanup)
@@ -1316,6 +1339,7 @@ def _initialize_historical_process_lease_type():
         output_capture = [bytearray(), bytearray()]
         output_lock = threading.Lock()
         output_overflow = threading.Event()
+        output_control = [None]
         output_threads = []
 
         def drain(stream: Any, index: int) -> None:
@@ -1338,7 +1362,11 @@ def _initialize_historical_process_lease_type():
                             )
                         if sum(output_totals) > 65_536:
                             output_overflow.set()
-            except BaseException:
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    with output_lock:
+                        if output_control[0] is None:
+                            output_control[0] = error
                 output_overflow.set()
 
         for index, name in enumerate(("stdout", "stderr")):
@@ -1350,7 +1378,7 @@ def _initialize_historical_process_lease_type():
                 )
                 output_threads.append(thread)
                 thread.start()
-        return _HistoricalProcessLease(
+        lease = _HistoricalProcessLease(
             _provenance=provenance,
             _process=process,
             _cleanup=cleanup,
@@ -1363,9 +1391,17 @@ def _initialize_historical_process_lease_type():
             _output_capture=output_capture,
             _output_lock=output_lock,
             _output_overflow=output_overflow,
+            _output_control=output_control,
+            _launch_identity=launch_identity,
+            _owner_registry=owner_registry,
             _reaped=False,
             _closed=False,
         )
+        if owner_registry is not None:
+            if type(owner_registry) is not dict:
+                raise ValueError("historical process registry is invalid")
+            owner_registry[id(lease)] = lease
+        return lease
 
     return _HistoricalProcessLease, issue
 
@@ -1375,6 +1411,380 @@ def _initialize_historical_process_lease_type():
     _issue_historical_process_lease_for_test,
 ) = _initialize_historical_process_lease_type()
 del _initialize_historical_process_lease_type
+
+
+_DARWIN_EXPECTED_ANVIL_CDHASH = (
+    "561b69d0257e574c3438465eb55cf4cef6852abc"
+)
+_DARWIN_POSIX_SPAWN_START_SUSPENDED = 0x0080
+_DARWIN_POSIX_SPAWN_CLOEXEC_DEFAULT = 0x4000
+
+
+class _DarwinSpawnedProcess:
+    __slots__ = ("pid", "stdout", "stderr", "returncode")
+
+    def __init__(self, pid: int, stdout: Any, stderr: Any) -> None:
+        self.pid = pid
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = None
+
+    def _record_status(self, status: int) -> int:
+        if os.WIFEXITED(status):
+            self.returncode = os.WEXITSTATUS(status)
+        elif os.WIFSIGNALED(status):
+            self.returncode = -os.WTERMSIG(status)
+        else:
+            raise _error("toolchain_process_failed")
+        return self.returncode
+
+    def poll(self) -> Optional[int]:
+        if self.returncode is not None:
+            return self.returncode
+        observed, status = os.waitpid(self.pid, os.WNOHANG)
+        if observed == 0:
+            return None
+        if observed != self.pid:
+            raise _error("toolchain_process_failed")
+        return self._record_status(status)
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        if timeout is None:
+            observed, status = os.waitpid(self.pid, 0)
+            if observed != self.pid:
+                raise _error("toolchain_process_failed")
+            return self._record_status(status)
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            observed, status = os.waitpid(self.pid, os.WNOHANG)
+            if observed == self.pid:
+                return self._record_status(status)
+            if observed != 0:
+                raise _error("toolchain_process_failed")
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("anvil", timeout)
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+
+    def terminate(self) -> None:
+        os.kill(self.pid, signal.SIGTERM)
+
+    def kill(self) -> None:
+        os.kill(self.pid, signal.SIGKILL)
+
+
+class _PendingHistoricalSpawnLease:
+    __slots__ = ("_state", "_cleanup", "_registry", "_closed")
+
+    def __init__(
+        self, *, state: Dict[str, Any], cleanup: Any,
+        registry: Dict[int, Any],
+    ) -> None:
+        self._state = state
+        self._cleanup = cleanup
+        self._registry = registry
+        self._closed = False
+        registry[id(self)] = self
+
+    def disarm(self) -> None:
+        self._registry.pop(id(self), None)
+        self._closed = True
+
+    def close(self) -> None:
+        if self._closed:
+            return None
+        process = self._state.get("process")
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5.0)
+            self._state["reaped"] = True
+        pid = self._state.get("pid")
+        if pid is not None and not self._state.get("reaped"):
+            os.kill(pid, signal.SIGKILL)
+            observed, _status = os.waitpid(pid, 0)
+            if observed != pid:
+                raise _error("toolchain_process_reap_failed")
+            self._state["reaped"] = True
+        self._cleanup()
+        self._registry.pop(id(self), None)
+        self._closed = True
+        return None
+
+
+class _DarwinVinfoStat(ctypes.Structure):
+    _fields_ = (
+        ("vst_dev", ctypes.c_uint32),
+        ("vst_mode", ctypes.c_uint16),
+        ("vst_nlink", ctypes.c_uint16),
+        ("vst_ino", ctypes.c_uint64),
+        ("vst_uid", ctypes.c_uint32),
+        ("vst_gid", ctypes.c_uint32),
+        ("vst_atime", ctypes.c_int64),
+        ("vst_atimensec", ctypes.c_int64),
+        ("vst_mtime", ctypes.c_int64),
+        ("vst_mtimensec", ctypes.c_int64),
+        ("vst_ctime", ctypes.c_int64),
+        ("vst_ctimensec", ctypes.c_int64),
+        ("vst_birthtime", ctypes.c_int64),
+        ("vst_birthtimensec", ctypes.c_int64),
+        ("vst_size", ctypes.c_int64),
+        ("vst_blocks", ctypes.c_int64),
+        ("vst_blksize", ctypes.c_int32),
+        ("vst_flags", ctypes.c_uint32),
+        ("vst_gen", ctypes.c_uint32),
+        ("vst_rdev", ctypes.c_uint32),
+        ("vst_qspare", ctypes.c_int64 * 2),
+    )
+
+
+class _DarwinVnodeInfo(ctypes.Structure):
+    _fields_ = (
+        ("vi_stat", _DarwinVinfoStat),
+        ("vi_type", ctypes.c_int),
+        ("vi_pad", ctypes.c_int),
+        ("vi_fsid", ctypes.c_int32 * 2),
+    )
+
+
+class _DarwinVnodeInfoPath(ctypes.Structure):
+    _fields_ = (
+        ("vip_vi", _DarwinVnodeInfo),
+        ("vip_path", ctypes.c_char * 1024),
+    )
+
+
+class _DarwinProcRegionInfo(ctypes.Structure):
+    _fields_ = (
+        ("pri_protection", ctypes.c_uint32),
+        ("pri_max_protection", ctypes.c_uint32),
+        ("pri_inheritance", ctypes.c_uint32),
+        ("pri_flags", ctypes.c_uint32),
+        ("pri_offset", ctypes.c_uint64),
+        ("pri_behavior", ctypes.c_uint32),
+        ("pri_user_wired_count", ctypes.c_uint32),
+        ("pri_user_tag", ctypes.c_uint32),
+        ("pri_pages_resident", ctypes.c_uint32),
+        ("pri_pages_shared_now_private", ctypes.c_uint32),
+        ("pri_pages_swapped_out", ctypes.c_uint32),
+        ("pri_pages_dirtied", ctypes.c_uint32),
+        ("pri_ref_count", ctypes.c_uint32),
+        ("pri_shadow_depth", ctypes.c_uint32),
+        ("pri_share_mode", ctypes.c_uint32),
+        ("pri_private_pages_resident", ctypes.c_uint32),
+        ("pri_shared_pages_resident", ctypes.c_uint32),
+        ("pri_obj_id", ctypes.c_uint32),
+        ("pri_depth", ctypes.c_uint32),
+        ("pri_address", ctypes.c_uint64),
+        ("pri_size", ctypes.c_uint64),
+    )
+
+
+class _DarwinProcRegionWithPathInfo(ctypes.Structure):
+    _fields_ = (
+        ("prp_prinfo", _DarwinProcRegionInfo),
+        ("prp_vip", _DarwinVnodeInfoPath),
+    )
+
+
+def _darwin_verified_launch_identity(
+    *, pid: int, executable_fd: int, binary_sha256: str
+) -> Dict[str, Any]:
+    if sys.platform != "darwin":
+        raise _error("toolchain_process_identity_unsupported")
+    library = ctypes.CDLL(None, use_errno=True)
+    cdhash = (ctypes.c_ubyte * 20)()
+    csops = library.csops
+    csops.argtypes = (
+        ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t,
+    )
+    csops.restype = ctypes.c_int
+    if csops(pid, 5, ctypes.byref(cdhash), 20) != 0:
+        raise _error("toolchain_process_identity_mismatch")
+    observed_cdhash = bytes(cdhash).hex()
+    if observed_cdhash != _DARWIN_EXPECTED_ANVIL_CDHASH:
+        raise _error("toolchain_process_identity_mismatch")
+    region = _DarwinProcRegionWithPathInfo()
+    proc_pidinfo = library.proc_pidinfo
+    proc_pidinfo.argtypes = (
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ctypes.c_void_p, ctypes.c_int,
+    )
+    proc_pidinfo.restype = ctypes.c_int
+    observed_size = proc_pidinfo(
+        pid, 8, 0, ctypes.byref(region), ctypes.sizeof(region)
+    )
+    descriptor = os.fstat(executable_fd)
+    region_stat = region.prp_vip.vip_vi.vi_stat
+    if (
+        observed_size != ctypes.sizeof(region)
+        or int(region_stat.vst_dev) != int(descriptor.st_dev)
+        or int(region_stat.vst_ino) != int(descriptor.st_ino)
+        or _hash_fd(executable_fd) != binary_sha256
+    ):
+        raise _error("toolchain_process_identity_mismatch")
+    return {
+        "schema": "historical_foundry_anvil_launch_identity/v1",
+        "binary_sha256": binary_sha256,
+        "cdhash": observed_cdhash,
+        "main_image_matches_materialized_inode": True,
+        "resumed_after_identity_verification": True,
+    }
+
+
+def _darwin_spawn_suspended(
+    *, executable_path: str, work_directory: str,
+    arguments: Tuple[str, ...], environment: Mapping[str, str],
+    executable_fd: int, binary_sha256: str,
+    spawn_state: Dict[str, Any],
+) -> Tuple[_DarwinSpawnedProcess, Dict[str, Any]]:
+    if sys.platform != "darwin":
+        raise _error("toolchain_process_identity_unsupported")
+    library = ctypes.CDLL(None, use_errno=True)
+    attr = ctypes.c_void_p()
+    actions = ctypes.c_void_p()
+    stdout_read = stdout_write = stderr_read = stderr_write = None
+    devnull = None
+    pid = ctypes.c_int(0)
+    spawned = False
+    resumed = False
+    try:
+        if library.posix_spawnattr_init(ctypes.byref(attr)) != 0:
+            raise _error("toolchain_process_failed")
+        spawn_state["attr"] = attr
+        if library.posix_spawn_file_actions_init(
+            ctypes.byref(actions)
+        ) != 0:
+            raise _error("toolchain_process_failed")
+        spawn_state["actions"] = actions
+        flags = ctypes.c_short(
+            _DARWIN_POSIX_SPAWN_START_SUSPENDED
+            | _DARWIN_POSIX_SPAWN_CLOEXEC_DEFAULT
+        )
+        if library.posix_spawnattr_setflags(
+            ctypes.byref(attr), flags
+        ) != 0:
+            raise _error("toolchain_process_failed")
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        spawn_state["pipes"] = (
+            stdout_read, stdout_write, stderr_read, stderr_write, devnull
+        )
+        for source, target in (
+            (devnull, 0), (stdout_write, 1), (stderr_write, 2)
+        ):
+            if library.posix_spawn_file_actions_adddup2(
+                ctypes.byref(actions), source, target
+            ) != 0:
+                raise _error("toolchain_process_failed")
+        for descriptor in (stdout_read, stderr_read):
+            if library.posix_spawn_file_actions_addclose(
+                ctypes.byref(actions), descriptor
+            ) != 0:
+                raise _error("toolchain_process_failed")
+        addchdir = library.posix_spawn_file_actions_addchdir_np
+        addchdir.argtypes = (
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p
+        )
+        addchdir.restype = ctypes.c_int
+        if addchdir(
+            ctypes.byref(actions), os.fsencode(work_directory)
+        ) != 0:
+            raise _error("toolchain_process_failed")
+        encoded_arguments = tuple(os.fsencode(value) for value in arguments)
+        argv = (ctypes.c_char_p * (len(encoded_arguments) + 1))(
+            *encoded_arguments, None
+        )
+        encoded_environment = tuple(
+            os.fsencode(key + "=" + value)
+            for key, value in sorted(environment.items())
+        )
+        envp = (ctypes.c_char_p * (len(encoded_environment) + 1))(
+            *encoded_environment, None
+        )
+        spawn = library.posix_spawn
+        spawn.argtypes = (
+            ctypes.POINTER(ctypes.c_int), ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_char_p),
+        )
+        spawn.restype = ctypes.c_int
+        result = spawn(
+            ctypes.byref(pid), os.fsencode(executable_path),
+            ctypes.byref(actions), ctypes.byref(attr), argv, envp,
+        )
+        if result != 0 or pid.value <= 0:
+            raise _error("toolchain_process_failed")
+        spawned = True
+        spawn_state["pid"] = pid.value
+        os.close(stdout_write)
+        stdout_write = None
+        os.close(stderr_write)
+        stderr_write = None
+        os.close(devnull)
+        devnull = None
+        stopped_pid, status = os.waitpid(
+            pid.value, os.WUNTRACED | os.WNOHANG
+        )
+        deadline = time.monotonic() + 5.0
+        while stopped_pid == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+            stopped_pid, status = os.waitpid(
+                pid.value, os.WUNTRACED | os.WNOHANG
+            )
+        if (
+            stopped_pid != pid.value
+            or not os.WIFSTOPPED(status)
+            or not (
+                os.WSTOPSIG(status) == signal.SIGSTOP
+                or status == 0x7f
+            )
+        ):
+            raise _error("toolchain_process_identity_mismatch")
+        identity = _darwin_verified_launch_identity(
+            pid=pid.value, executable_fd=executable_fd,
+            binary_sha256=binary_sha256,
+        )
+        stdout = os.fdopen(stdout_read, "rb", buffering=0)
+        stdout_read = None
+        stderr = os.fdopen(stderr_read, "rb", buffering=0)
+        stderr_read = None
+        process = _DarwinSpawnedProcess(pid.value, stdout, stderr)
+        spawn_state["process"] = process
+        os.kill(pid.value, signal.SIGCONT)
+        resumed = True
+        return process, identity
+    except BaseException:
+        if spawned and not resumed:
+            try:
+                os.kill(pid.value, signal.SIGKILL)
+                observed, _status = os.waitpid(pid.value, 0)
+                if observed != pid.value:
+                    raise _error("toolchain_process_reap_failed")
+                spawn_state["reaped"] = True
+            except BaseException:
+                raise
+        raise
+    finally:
+        if attr.value:
+            library.posix_spawnattr_destroy(ctypes.byref(attr))
+            spawn_state["attr_destroyed"] = True
+        if actions.value:
+            library.posix_spawn_file_actions_destroy(
+                ctypes.byref(actions)
+            )
+            spawn_state["actions_destroyed"] = True
+        for descriptor in (
+            stdout_read, stdout_write, stderr_read, stderr_write, devnull
+        ):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 class ReviewedHistoricalToolchain:
@@ -1387,6 +1797,7 @@ class ReviewedHistoricalToolchain:
         "_identity",
         "_closed",
         "_close_state",
+        "_process_leases",
     )
 
     def __init__(
@@ -1402,6 +1813,7 @@ class ReviewedHistoricalToolchain:
         self._binaries = dict(binaries)
         self._identity = _candidate_identity(expected, None)
         self._closed = False
+        self._process_leases = {}
         self._close_state = {
             "phase": "binaries",
             "binaries": [fd for fd, _metadata, _digest in self._binaries.values()],
@@ -1464,6 +1876,25 @@ class ReviewedHistoricalToolchain:
     def _close(self) -> None:
         if self._closed:
             return
+        process_control = None
+        process_ordinary = False
+        for lease in tuple(self._process_leases.values()):
+            try:
+                lease.close()
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    if process_control is None:
+                        process_control = error
+                else:
+                    process_ordinary = True
+        if self._process_leases:
+            if process_control is not None:
+                raise process_control
+            raise _error("toolchain_process_reap_failed") from None
+        if process_control is not None:
+            raise process_control
+        if process_ordinary:
+            raise _error("toolchain_process_reap_failed") from None
         state = self._close_state
         while state["phase"] != "closed":
             try:
@@ -1667,6 +2098,47 @@ class ReviewedHistoricalToolchain:
         retained_work_fd = None
         retained_executable_fd = None
         executable_identity = None
+        launch_identity = None
+        cleanup_state = {"unlinked": False, "fds_closed": False}
+        spawn_state: Dict[str, Any] = {
+            "pid": None, "process": None, "reaped": False,
+        }
+        pending = None
+
+        def cleanup() -> None:
+            if cleanup_state["fds_closed"]:
+                try:
+                    os.rmdir(str(work_directory))
+                except FileNotFoundError:
+                    pass
+                return None
+            descriptor = os.fstat(retained_executable_fd)
+            if (
+                not stat.S_ISREG(descriptor.st_mode)
+                or (descriptor.st_dev, descriptor.st_ino)
+                != executable_identity
+                or _hash_fd(retained_executable_fd) != anvil_sha256
+            ):
+                raise _error("toolchain_binary_changed")
+            if not cleanup_state["unlinked"]:
+                path_descriptor = os.stat(
+                    executable_name, dir_fd=retained_work_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    (path_descriptor.st_dev, path_descriptor.st_ino)
+                    != executable_identity
+                ):
+                    raise _error("toolchain_binary_changed")
+                os.unlink(executable_name, dir_fd=retained_work_fd)
+                cleanup_state["unlinked"] = True
+            os.fsync(retained_work_fd)
+            os.close(retained_executable_fd)
+            os.close(retained_work_fd)
+            cleanup_state["fds_closed"] = True
+            os.rmdir(str(work_directory))
+            return None
+
         try:
             work_fd = os.open(
                 str(work_directory),
@@ -1707,45 +2179,46 @@ class ReviewedHistoricalToolchain:
             ):
                 raise _error("toolchain_binary_changed")
             os.fsync(work_fd)
-            process = subprocess.Popen(
-                arguments,
-                executable="./" + executable_name,
-                cwd=str(work_directory),
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=True,
-                pass_fds=(anvil_fd,),
+            retained_work_fd = work_fd
+            retained_executable_fd = executable_fd
+            work_fd = None
+            executable_fd = None
+            pending = _PendingHistoricalSpawnLease(
+                state=spawn_state, cleanup=cleanup,
+                registry=self._process_leases,
+            )
+            process, launch_identity = _darwin_spawn_suspended(
+                executable_path=str(work_directory / executable_name),
+                work_directory=str(work_directory),
+                arguments=arguments,
+                environment=environment,
+                executable_fd=retained_executable_fd,
+                binary_sha256=anvil_sha256,
+                spawn_state=spawn_state,
             )
             path_after = os.stat(
-                executable_name, dir_fd=work_fd, follow_symlinks=False
+                executable_name, dir_fd=retained_work_fd,
+                follow_symlinks=False
             )
-            descriptor_after = os.fstat(executable_fd)
+            descriptor_after = os.fstat(retained_executable_fd)
             if (
                 (path_after.st_dev, path_after.st_ino)
                 != executable_identity
                 or (descriptor_after.st_dev, descriptor_after.st_ino)
                 != executable_identity
-                or _hash_fd(executable_fd) != anvil_sha256
+                or _hash_fd(retained_executable_fd) != anvil_sha256
             ):
                 process.terminate()
                 process.wait(timeout=5)
                 process = None
                 raise _error("toolchain_binary_changed")
-            # macOS may keep the pathname as part of executable provenance;
-            # the private directory is removed only after the child is reaped.
-            retained_work_fd = work_fd
-            retained_executable_fd = executable_fd
-            work_fd = None
-            executable_fd = None
-        except BaseException:
-            if process is not None and process.poll() is None:
+        except BaseException as original_error:
+            cleanup_error = None
+            if pending is not None:
                 try:
-                    process.kill()
-                    process.wait(timeout=5)
-                except BaseException:
-                    pass
+                    pending.close()
+                except BaseException as observed_cleanup_error:
+                    cleanup_error = observed_cleanup_error
             if work_fd is not None:
                 try:
                     os.unlink(executable_name, dir_fd=work_fd)
@@ -1756,57 +2229,36 @@ class ReviewedHistoricalToolchain:
                 os.rmdir(str(work_directory))
             except FileNotFoundError:
                 pass
-            raise
+            if not isinstance(original_error, Exception):
+                raise original_error
+            if (
+                cleanup_error is not None
+                and not isinstance(cleanup_error, Exception)
+            ):
+                raise cleanup_error
+            raise original_error
         finally:
             if executable_fd is not None:
                 os.close(executable_fd)
             if work_fd is not None:
                 os.close(work_fd)
 
-        cleanup_state = {"unlinked": False, "fds_closed": False}
-
-        def cleanup() -> None:
-            if cleanup_state["fds_closed"]:
-                try:
-                    os.rmdir(str(work_directory))
-                except FileNotFoundError:
-                    pass
-                return None
-            descriptor = os.fstat(retained_executable_fd)
-            if (
-                not stat.S_ISREG(descriptor.st_mode)
-                or (descriptor.st_dev, descriptor.st_ino)
-                != executable_identity
-                or _hash_fd(retained_executable_fd) != anvil_sha256
-            ):
-                raise _error("toolchain_binary_changed")
-            if not cleanup_state["unlinked"]:
-                path_descriptor = os.stat(
-                    executable_name, dir_fd=retained_work_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    (path_descriptor.st_dev, path_descriptor.st_ino)
-                    != executable_identity
-                ):
-                    raise _error("toolchain_binary_changed")
-                os.unlink(executable_name, dir_fd=retained_work_fd)
-                cleanup_state["unlinked"] = True
-            os.fsync(retained_work_fd)
-            os.close(retained_executable_fd)
-            os.close(retained_work_fd)
-            cleanup_state["fds_closed"] = True
-            os.rmdir(str(work_directory))
-            return None
-
-        return _issue_historical_process_lease_for_test(
-            process=process,
-            cleanup=cleanup,
-            binary_sha256=anvil_sha256,
-            selected_block=selected_block,
-            hardfork=hardfork,
-            toolchain=self,
-        )
+        try:
+            lease = _issue_historical_process_lease_for_test(
+                process=process,
+                cleanup=cleanup,
+                binary_sha256=anvil_sha256,
+                selected_block=selected_block,
+                hardfork=hardfork,
+                toolchain=self,
+                launch_identity=launch_identity,
+                owner_registry=self._process_leases,
+            )
+        except BaseException:
+            pending.close()
+            raise
+        pending.disarm()
+        return lease
 
     def _verified_version(self, name: str) -> str:
         completed = self._invoke(name, ("--version",))

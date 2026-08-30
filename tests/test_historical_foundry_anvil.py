@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pickle
+import signal
 import socket
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import time
 import types
 import unittest
 from decimal import Decimal, localcontext
+from types import MappingProxyType
 from unittest import mock
 
 from scripts.historical_foundry_contracts import (
@@ -720,6 +722,64 @@ class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
         self.assertTrue(all(row["daemon"] is False for row in created))
         lease.close()
 
+    def test_drainer_control_is_rethrown_by_identity_after_bounded_cleanup(self):
+        import scripts.bootstrap_historical_foundry_toolchain as toolchain
+
+        control = KeyboardInterrupt()
+
+        class Stream:
+            def read(self, _size):
+                raise control
+
+            def close(self):
+                return None
+
+        process = _Process([0])
+        process.stdout = Stream()
+        process.stderr = io.BytesIO(b"")
+        cleanup = mock.Mock()
+        lease = toolchain._issue_historical_process_lease_for_test(
+            process=process, cleanup=cleanup,
+            binary_sha256="9" * 64, selected_block=123,
+            hardfork="osaka",
+        )
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            lease.close()
+        self.assertIs(raised.exception, control)
+        cleanup.assert_called_once_with()
+        self.assertTrue(lease._closed)
+
+    def test_reaped_child_with_live_drainer_retains_every_cleanup_reference(self):
+        import scripts.bootstrap_historical_foundry_toolchain as toolchain
+
+        class Thread:
+            alive = True
+
+            def join(self, timeout):
+                del timeout
+
+            def is_alive(self):
+                return self.alive
+
+        thread = Thread()
+        process = _Process([0])
+        cleanup = mock.Mock()
+        lease = toolchain._issue_historical_process_lease_for_test(
+            process=process, cleanup=cleanup,
+            binary_sha256="a" * 64, selected_block=123,
+            hardfork="osaka",
+        )
+        object.__setattr__(lease, "_output_threads", (thread,))
+        with self.assertRaises(ValueError):
+            lease.close()
+        cleanup.assert_not_called()
+        self.assertIs(lease._process, process)
+        self.assertIs(lease._cleanup, cleanup)
+        self.assertFalse(lease._closed)
+        thread.alive = False
+        self.assertIsNone(lease.close())
+        cleanup.assert_called_once_with()
+
     def test_process_reap_uses_remaining_absolute_budget_for_each_block(self):
         import scripts.bootstrap_historical_foundry_toolchain as toolchain
 
@@ -755,13 +815,15 @@ class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
             with mock.patch.object(
                 toolchain.tempfile, "mkdtemp",
                 return_value=symlink_directory,
-            ), mock.patch.object(toolchain.subprocess, "Popen") as popen:
+            ), mock.patch.object(
+                toolchain, "_darwin_spawn_suspended"
+            ) as spawn:
                 with self.assertRaises(Exception) as raised:
                     reviewed._spawn_historical_anvil_process(
                         selected_block=1, hardfork="osaka",
                         relay_port=31001, anvil_port=31002,
                     )
-                popen.assert_not_called()
+                spawn.assert_not_called()
             self.assertFalse(
                 os.path.exists(symlink_directory), repr(raised.exception)
             )
@@ -785,13 +847,21 @@ class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
             process = mock.Mock()
             process.poll.return_value = None
             process.wait.return_value = 0
+            identity = {
+                "schema": "historical_foundry_anvil_launch_identity/v1",
+                "binary_sha256": "5c9f9aad323062b1c0421a63595741430acaea150da3611e38c45071e4cf4e28",
+                "cdhash": "561b69d0257e574c3438465eb55cf4cef6852abc",
+                "main_image_matches_materialized_inode": True,
+                "resumed_after_identity_verification": True,
+            }
             with mock.patch.object(
                 toolchain.tempfile, "mkdtemp",
                 return_value=substitution_directory,
             ), mock.patch.object(
                 toolchain.os, "stat", side_effect=substituted_stat,
             ), mock.patch.object(
-                toolchain.subprocess, "Popen", return_value=process,
+                toolchain, "_darwin_spawn_suspended",
+                return_value=(process, identity),
             ):
                 with self.assertRaises(Exception):
                     reviewed._spawn_historical_anvil_process(
@@ -808,7 +878,8 @@ class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
             }
             reaped = _Process([0])
             with mock.patch.object(
-                toolchain.subprocess, "Popen", return_value=reaped,
+                toolchain, "_darwin_spawn_suspended",
+                return_value=(reaped, identity),
             ):
                 lease = reviewed._spawn_historical_anvil_process(
                     selected_block=1, hardfork="osaka",
@@ -839,6 +910,83 @@ class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
             os.rename(held, executable)
             self.assertIsNone(lease.close())
             self.assertFalse(os.path.exists(materialized_directory))
+        finally:
+            reviewed._close()
+
+    def test_production_spawn_uses_suspended_darwin_identity_gate_and_no_popen(self):
+        import scripts.bootstrap_historical_foundry_toolchain as toolchain
+
+        source = inspect.getsource(
+            toolchain.ReviewedHistoricalToolchain._spawn_historical_anvil_process
+        )
+        self.assertNotIn("Popen", source)
+        self.assertEqual(toolchain._DARWIN_POSIX_SPAWN_START_SUSPENDED, 0x0080)
+        self.assertEqual(toolchain._DARWIN_POSIX_SPAWN_CLOEXEC_DEFAULT, 0x4000)
+        self.assertEqual(
+            toolchain._DARWIN_EXPECTED_ANVIL_CDHASH,
+            "561b69d0257e574c3438465eb55cf4cef6852abc",
+        )
+
+    def test_identity_failure_never_resumes_and_emergency_lease_reaps(self):
+        import scripts.bootstrap_historical_foundry_toolchain as toolchain
+
+        reviewed = toolchain.open_reviewed_historical_toolchain()
+        observed_signals = []
+        original_kill = toolchain.os.kill
+
+        def observe_kill(pid, selected_signal):
+            observed_signals.append(selected_signal)
+            return original_kill(pid, selected_signal)
+
+        try:
+            with mock.patch.object(
+                toolchain, "_darwin_verified_launch_identity",
+                side_effect=toolchain.HistoricalFoundryToolchainError(
+                    "toolchain_process_identity_mismatch"
+                ),
+            ), mock.patch.object(
+                toolchain.os, "kill", side_effect=observe_kill,
+            ):
+                with self.assertRaises(
+                    toolchain.HistoricalFoundryToolchainError
+                ):
+                    reviewed._spawn_historical_anvil_process(
+                        selected_block=1, hardfork="osaka",
+                        relay_port=31101, anvil_port=31102,
+                    )
+            self.assertNotIn(signal.SIGCONT, observed_signals)
+            self.assertIn(signal.SIGKILL, observed_signals)
+            self.assertEqual(reviewed._process_leases, {})
+        finally:
+            reviewed._close()
+
+    def test_pending_emergency_lease_is_registered_before_spawn_call(self):
+        import scripts.bootstrap_historical_foundry_toolchain as toolchain
+
+        reviewed = toolchain.open_reviewed_historical_toolchain()
+        observed = []
+
+        def fail_inside_spawn(**_values):
+            leases = tuple(reviewed._process_leases.values())
+            self.assertEqual(len(leases), 1)
+            self.assertIsInstance(
+                leases[0], toolchain._PendingHistoricalSpawnLease
+            )
+            observed.append(True)
+            raise OSError("injected posix_spawn failure")
+
+        try:
+            with mock.patch.object(
+                toolchain, "_darwin_spawn_suspended",
+                side_effect=fail_inside_spawn,
+            ):
+                with self.assertRaises(Exception):
+                    reviewed._spawn_historical_anvil_process(
+                        selected_block=1, hardfork="osaka",
+                        relay_port=31103, anvil_port=31104,
+                    )
+            self.assertEqual(observed, [True])
+            self.assertEqual(reviewed._process_leases, {})
         finally:
             reviewed._close()
 
@@ -1434,6 +1582,60 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         finally:
             object.__setattr__(self.artifact, "_deployed_runtime", runtime)
 
+    def test_relay_handler_control_is_rethrown_by_context_owner_after_cleanup(self):
+        anvil = self._open_context()
+        closed_authorities = []
+
+        class Authority:
+            def close(self):
+                closed_authorities.append(self)
+
+        class ServerBase:
+            def __init__(self, _address, _handler):
+                self.server_address = ("127.0.0.1", 1)
+
+            def serve_forever(self, **_kwargs):
+                return None
+
+        class Thread:
+            def start(self):
+                return None
+
+        control = KeyboardInterrupt("private endpoint and path")
+        with mock.patch.object(
+            anvil.http.server, "ThreadingHTTPServer", ServerBase
+        ), mock.patch.object(
+            anvil.threading, "Thread", return_value=Thread()
+        ), mock.patch.object(
+            anvil, "_close_historical_relay_server", return_value=None
+        ), mock.patch(
+            "scripts.historical_foundry_rpc._bind_historical_relay_scenario",
+            side_effect=lambda **_kwargs: Authority(),
+        ):
+            ordinary = anvil._start_historical_relay(
+                context=self.context, scenario=self.scenario
+            )
+            ordinary._record_handler_failure_for_test(
+                RuntimeError("private endpoint and path")
+            )
+            self.assertEqual(
+                ordinary._diagnostics_for_test(),
+                (("handler_error", "ordinary"),),
+            )
+            ordinary.close()
+            relay = anvil._start_historical_relay(
+                context=self.context, scenario=self.scenario
+            )
+            object.__setattr__(self.context, "_active_relay_lease", relay)
+            relay._record_handler_failure_for_test(control)
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.context.close()
+        self.assertIs(raised.exception, control)
+        self.assertTrue(relay._is_closed())
+        self.assertIsNone(self.context._active_relay_lease)
+        self.assertTrue(self.context._closed)
+        self.assertEqual(len(closed_authorities), 2)
+
     @staticmethod
     def _canonical(value):
         return json.dumps(
@@ -1674,6 +1876,12 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                 "policy_sha256": self.config.policy.physical_sha256,
                 "authority_sha256": self.config.authority.physical_sha256,
                 "toolchain_sha256": self.config.toolchain.physical_sha256,
+                "executor_source_tree_sha256": self.artifact.verified_identity[
+                    "source_tree_sha256"
+                ],
+                "executor_constructor_args_sha256": self.artifact.verified_identity[
+                    "constructor_args_sha256"
+                ],
                 "anvil_binary_sha256": trace["struct_log_storage"][
                     "anvil_binary_sha256"
                 ],
@@ -1685,6 +1893,12 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                 ],
                 "executor_runtime_sha256": self.artifact.verified_identity[
                     "deployed_runtime_sha256"
+                ],
+                "executor_immutable_references_sha256": self.artifact.verified_identity[
+                    "immutable_references_sha256"
+                ],
+                "executor_artifact_manifest_sha256": self.artifact.verified_identity[
+                    "artifact_manifest_sha256"
                 ],
                 "requested_notional_usd": row["requested_notional_usd"],
                 "amount_weth_in_wei": row["amount_weth_in_wei"],
@@ -1861,7 +2075,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                         role=role, byte_count=limit + 1
                     )
 
-    def test_quartet_post_rename_failure_restores_exact_retryable_predecessor(self):
+    def test_quartet_precommit_rename_failure_restores_exact_retryable_predecessor(self):
         import scripts.historical_foundry_anvil as anvil
         import scripts.historical_foundry_storage as storage
 
@@ -1880,7 +2094,14 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
 
         def fail_after_rename(phase):
             observed.append(phase)
-            if phase == "post_rename":
+            if phase == "after_formal_directory_rename":
+                self.assertEqual(
+                    len(storage.task6_transaction_registry), 1
+                )
+                transaction = next(iter(
+                    storage.task6_transaction_registry.values()
+                ))
+                transaction["formal_installed"] = False
                 raise OSError("injected post-rename boundary")
 
         with mock.patch.object(
@@ -1891,7 +2112,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                 sink.write_member(
                     role=quartet[3][0], canonical_bytes=quartet[3][1]
                 )
-        self.assertIn("post_rename", observed)
+        self.assertIn("after_formal_directory_rename", observed)
         self.assertEqual(
             list(self.fixture.data_dir.rglob(self.scenario.scenario_key)), []
         )
@@ -1904,15 +2125,88 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         self.assertEqual(sink.validated_ledger().generation, 3)
         self.prefilter = sink.validated_ledger().staging_snapshot()
 
+    def test_quartet_rename_return_before_hint_is_recovered_from_disk_identity(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_storage as storage
+
+        self._open_context()
+        override = anvil.build_historical_state_override(
+            context=self.context, scenario=self.scenario
+        )
+        sink = anvil._open_scenario_evidence_sink(
+            context=self.context, scenario=self.scenario
+        )
+        quartet = self._quartet(override)
+        for role, payload in quartet[:3]:
+            sink.write_member(role=role, canonical_bytes=payload)
+        predecessor = self.prefilter.frozen_identity_projection()
+        original = storage._task6_rename_directory_noreplace
+        returned = [False]
+
+        def fail_after_formal_rename(**values):
+            original(**values)
+            if values["destination_name"] == self.scenario.scenario_key:
+                returned[0] = True
+                raise OSError("injected after rename syscall return")
+
+        with mock.patch.object(
+            storage, "_task6_rename_directory_noreplace",
+            side_effect=fail_after_formal_rename,
+        ):
+            with self.assertRaises(Exception):
+                sink.write_member(
+                    role=quartet[3][0], canonical_bytes=quartet[3][1]
+                )
+        self.assertTrue(returned[0])
+        self.assertEqual(
+            self.prefilter.frozen_identity_projection(), predecessor
+        )
+        self.assertEqual(
+            list(self.fixture.data_dir.rglob(self.scenario.scenario_key)), []
+        )
+        sink.write_member(
+            role=quartet[3][0], canonical_bytes=quartet[3][1]
+        )
+        self.prefilter = sink.validated_ledger().staging_snapshot()
+
     def test_quartet_journal_recovers_every_publication_boundary(self):
         import scripts.historical_foundry_anvil as anvil
         import scripts.historical_foundry_scan as scan
         import scripts.historical_foundry_storage as storage
 
         phases = (
-            "journal_write", "owner_prepare", "successor_prepare",
-            "ledger_prepare", "pre_rename", "post_rename",
-            "post_rename_fsync", "journal_cleanup",
+            "after_prepare_fsync",
+            "after_owner_transaction_install",
+            "after_journal_authority_install",
+            "after_owner_materializing",
+            "after_quota_owner_install",
+            "after_foundry_directory_open",
+            "after_block_directory_open",
+            "after_scenario_directory_create",
+            "after_member_directory_map_install",
+            "after_member_file_overlay", "after_member_map_overlay",
+            "after_member_file_receipt", "after_member_map_receipt",
+            "after_member_file_trace", "after_member_map_trace",
+            "after_member_file_result", "after_member_map_result",
+            "after_formal_directory_rename",
+            "after_formal_directory_name_install",
+            "after_formal_directory_identity_install",
+            "after_formal_quartet_install",
+            "after_quota_install",
+            "after_owner_scenarios_install",
+            "after_owner_members_install",
+            "after_owner_generation_install",
+            "after_owner_state_install",
+            "after_owner_projection_install",
+            "after_owner_generation_counter_install",
+            "after_owner_snapshot_handle_install",
+            "after_owner_successor_install",
+            "after_successor_registry_install",
+            "after_ledger_registry_install",
+            "after_sink_state_target_ready",
+            "after_sink_target_ready",
+            "after_target_audit",
+            "after_commit_marker_rename",
         )
         for phase in phases:
             fixture = scan_fixtures.HistoricalPrefilterGridTests._new_fixture()
@@ -1987,6 +2281,154 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                         fixture, capture, prefilter
                     )
 
+    def test_journal_v2_prepare_is_durable_before_first_domain_mutation(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_storage as storage
+
+        self._open_context()
+        override = anvil.build_historical_state_override(
+            context=self.context, scenario=self.scenario
+        )
+        sink = anvil._open_scenario_evidence_sink(
+            context=self.context, scenario=self.scenario
+        )
+        quartet = self._quartet(override)
+        for role, payload in quartet[:3]:
+            sink.write_member(role=role, canonical_bytes=payload)
+        predecessor = self.prefilter.frozen_identity_projection()
+        observed = []
+
+        def stop_after_prepare(phase):
+            observed.append(phase)
+            if phase != "after_prepare_fsync":
+                return
+            journals = list(
+                self.fixture.data_dir.rglob(".transaction-*.PREPARE.json")
+            )
+            self.assertEqual(len(journals), 1)
+            document = json.loads(journals[0].read_bytes())
+            self.assertEqual(
+                document["schema"],
+                "historical_foundry_replay_transaction/v2",
+            )
+            self.assertEqual(document["state"], "PREPARED")
+            self.assertEqual(document["predecessor"]["generation"], 2)
+            self.assertEqual(document["target"]["generation"], 3)
+            self.assertEqual(
+                set(document["predecessor"]),
+                {
+                    "generation", "state", "owner_generation",
+                    "projection", "members", "scenarios", "quota",
+                    "opened_scenario_keys",
+                },
+            )
+            self.assertEqual(
+                set(document["target"]), set(document["predecessor"])
+            )
+            self.assertEqual(
+                set(document["predecessor"]["quota"]),
+                {
+                    "committed_physical_bytes", "committed_members",
+                    "provisional_physical_bytes", "provisional_members",
+                    "reservation",
+                },
+            )
+            self.assertIsNone(
+                document["predecessor"]["quota"]["reservation"]
+            )
+            self.assertIsNone(document["target"]["quota"]["reservation"])
+            self.assertEqual(
+                document["predecessor"]["projection"], predecessor
+            )
+            self.assertEqual(
+                self.prefilter.frozen_identity_projection(), predecessor
+            )
+            self.assertEqual(
+                list(self.fixture.data_dir.rglob(self.scenario.scenario_key)),
+                [],
+            )
+            raise OSError("injected after durable prepare")
+
+        with mock.patch.object(
+            storage, "_task6_commit_checkpoint", side_effect=stop_after_prepare
+        ):
+            with self.assertRaises(Exception):
+                sink.write_member(
+                    role=quartet[3][0], canonical_bytes=quartet[3][1]
+                )
+        self.assertIn("after_prepare_fsync", observed)
+        self.assertEqual(
+            self.prefilter.frozen_identity_projection(), predecessor
+        )
+        self.assertEqual(
+            list(self.fixture.data_dir.rglob(self.scenario.scenario_key)), []
+        )
+        sink.write_member(
+            role=quartet[3][0], canonical_bytes=quartet[3][1]
+        )
+        self.prefilter = sink.validated_ledger().staging_snapshot()
+
+    def test_gen3_post_ledger_mutation_rolls_back_every_owner_and_handle(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_storage as storage
+
+        self._open_context()
+        first_override = anvil.build_historical_state_override(
+            context=self.context, scenario=self.scenario
+        )
+        first_sink = anvil._open_scenario_evidence_sink(
+            context=self.context, scenario=self.scenario
+        )
+        for role, payload in self._quartet(first_override):
+            first_sink.write_member(role=role, canonical_bytes=payload)
+        first_ledger = first_sink.validated_ledger()
+        self.assertIsNone(anvil._advance_historical_replay_context(
+            context=self.context, ledger=first_ledger
+        ))
+        self.prefilter = first_ledger.staging_snapshot()
+        predecessor = self.prefilter.frozen_identity_projection()
+        self.assertEqual(predecessor["generation"], 3)
+
+        second = anvil._issue_next_historical_replay_scenario(
+            context=self.context, scenario_key=self.rows[1]["scenario_key"]
+        )
+        second_override = anvil.build_historical_state_override(
+            context=self.context, scenario=second
+        )
+        second_sink = anvil._open_scenario_evidence_sink(
+            context=self.context, scenario=second
+        )
+        quartet = self._quartet(second_override, row=self.rows[1])
+        for role, payload in quartet[:3]:
+            second_sink.write_member(role=role, canonical_bytes=payload)
+        observed = []
+
+        def fail_after_real_ledger_mutation(phase):
+            observed.append(phase)
+            if phase == "after_ledger_registry_install":
+                raise OSError("injected after ledger registry mutation")
+
+        with mock.patch.object(
+            storage, "_task6_commit_checkpoint",
+            side_effect=fail_after_real_ledger_mutation,
+        ):
+            with self.assertRaises(Exception):
+                second_sink.write_member(
+                    role=quartet[3][0], canonical_bytes=quartet[3][1]
+                )
+        self.assertIn("after_ledger_registry_install", observed)
+        self.assertEqual(
+            self.prefilter.frozen_identity_projection(), predecessor
+        )
+        self.assertEqual(
+            list(self.fixture.data_dir.rglob(second.scenario_key)), []
+        )
+        second_sink.write_member(
+            role=quartet[3][0], canonical_bytes=quartet[3][1]
+        )
+        self.assertEqual(second_sink.validated_ledger().generation, 4)
+        self.prefilter = second_sink.validated_ledger().staging_snapshot()
+
     def test_quartet_failed_rollback_retains_journal_and_blocks_consumers(self):
         import scripts.historical_foundry_anvil as anvil
         import scripts.historical_foundry_storage as storage
@@ -2005,7 +2447,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         failed_publication = [False]
 
         def fail_publication_and_rollback(phase):
-            if phase == "post_rename":
+            if phase == "after_formal_quartet_install":
                 failed_publication[0] = True
                 raise OSError("injected publication failure")
             if phase == "rollback" and failed_publication[0]:
@@ -2030,7 +2472,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
             list(self.fixture.data_dir.rglob(self.scenario.scenario_key)), []
         )
 
-    def _retain_post_rename_transaction(self):
+    def _retain_precommit_transaction(self):
         import scripts.historical_foundry_anvil as anvil
         import scripts.historical_foundry_storage as storage
 
@@ -2048,7 +2490,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         publication_failed = [False]
 
         def retain_journal(phase):
-            if phase == "post_rename":
+            if phase == "after_formal_quartet_install":
                 publication_failed[0] = True
                 raise OSError("injected publication failure")
             if phase == "rollback" and publication_failed[0]:
@@ -2061,7 +2503,9 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                 sink.write_member(
                     role=quartet[3][0], canonical_bytes=quartet[3][1]
                 )
-        journals = list(self.fixture.data_dir.rglob(".transaction-*.json"))
+        journals = list(
+            self.fixture.data_dir.rglob(".transaction-*.PREPARE.json")
+        )
         self.assertEqual(len(journals), 1)
         storage._drop_historical_quartet_transaction_memory_for_test(
             self.prefilter
@@ -2070,7 +2514,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
 
     def test_quartet_disk_journal_recovers_after_transaction_registry_loss(self):
         sink, quartet, predecessor, journal = (
-            self._retain_post_rename_transaction()
+            self._retain_precommit_transaction()
         )
         self.assertTrue(journal.is_file())
         self.assertEqual(
@@ -2085,6 +2529,137 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         )
         self.assertEqual(sink.validated_ledger().generation, 3)
         self.prefilter = sink.validated_ledger().staging_snapshot()
+
+    def test_committed_journal_completes_after_transaction_registry_loss(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_storage as storage
+
+        self._open_context()
+        override = anvil.build_historical_state_override(
+            context=self.context, scenario=self.scenario
+        )
+        sink = anvil._open_scenario_evidence_sink(
+            context=self.context, scenario=self.scenario
+        )
+        quartet = self._quartet(override)
+        for role, payload in quartet[:3]:
+            sink.write_member(role=role, canonical_bytes=payload)
+        commit_seen = [False]
+
+        def retain_committed_journal(phase):
+            if phase == "after_commit_marker_fsync":
+                commit_seen[0] = True
+                raise OSError("injected after durable commit")
+            if phase == "after_old_snapshot_retire" and commit_seen[0]:
+                raise OSError("injected completion failure")
+
+        with mock.patch.object(
+            storage, "_task6_commit_checkpoint",
+            side_effect=retain_committed_journal,
+        ):
+            with self.assertRaises(Exception):
+                sink.write_member(
+                    role=quartet[3][0], canonical_bytes=quartet[3][1]
+                )
+        journals = list(
+            self.fixture.data_dir.rglob(".transaction-*.COMMITTED.json")
+        )
+        self.assertEqual(len(journals), 1)
+        storage._drop_historical_quartet_transaction_memory_for_test(
+            self.prefilter
+        )
+        self.assertEqual(sink.validated_ledger().generation, 3)
+        successor = sink.validated_ledger().staging_snapshot()
+        self.assertFalse(journals[0].exists())
+        self.assertEqual(
+            successor.frozen_identity_projection()["generation"], 3
+        )
+        self.prefilter = successor
+
+    def test_every_postcommit_boundary_completes_without_rollback(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        phases = (
+            "after_commit_marker_fsync",
+            "after_old_snapshot_retire",
+            "after_sink_result_install",
+            "after_sink_ledger_install",
+            "after_sink_commit",
+        )
+        for selected in phases:
+            fixture = scan_fixtures.HistoricalPrefilterGridTests._new_fixture()
+            capture = prefilter = context = None
+            with self.subTest(phase=selected):
+                try:
+                    config, capture, prefilter, window, grid, rows = (
+                        HistoricalFoundryScenarioAuthorityTests._prepared(
+                            fixture
+                        )
+                    )
+                    scenario = scan._issue_validated_replay_scenario(
+                        staging=prefilter, window=window, grid=grid,
+                        scenario_key=rows[0]["scenario_key"],
+                    )
+                    context = anvil.open_historical_replay_context(
+                        config=config, staging=prefilter, window=window,
+                        grid=grid,
+                        executor_artifact=build_validated_executor_artifact(
+                            config
+                        ),
+                    )
+                    helper = HistoricalFoundryOverlayTests(
+                        "test_overlay_known_answer_and_sender_funding_are_internal"
+                    )
+                    helper.config = config
+                    helper.artifact = context._artifact
+                    helper.rows = rows
+                    override = anvil.build_historical_state_override(
+                        context=context, scenario=scenario
+                    )
+                    quartet = helper._quartet(override)
+                    sink = anvil._open_scenario_evidence_sink(
+                        context=context, scenario=scenario
+                    )
+                    for role, payload in quartet[:3]:
+                        sink.write_member(role=role, canonical_bytes=payload)
+                    failed = [False]
+
+                    def fail_once_after_commit(phase):
+                        if phase == selected and not failed[0]:
+                            failed[0] = True
+                            raise OSError("injected committed completion failure")
+
+                    with mock.patch.object(
+                        storage, "_task6_commit_checkpoint",
+                        side_effect=fail_once_after_commit,
+                    ):
+                        with self.assertRaises(Exception):
+                            sink.write_member(
+                                role=quartet[3][0],
+                                canonical_bytes=quartet[3][1],
+                            )
+                    self.assertTrue(failed[0])
+                    ledger = sink.validated_ledger()
+                    self.assertEqual(ledger.generation, 3)
+                    self.assertEqual(
+                        len(list(fixture.data_dir.rglob(
+                            scenario.scenario_key
+                        ))),
+                        1,
+                    )
+                    self.assertEqual(
+                        list(fixture.data_dir.rglob(".transaction-*.json")),
+                        [],
+                    )
+                    prefilter = ledger.staging_snapshot()
+                finally:
+                    if context is not None:
+                        context.close()
+                    scan_fixtures.HistoricalPrefilterGridTests._close_fixture(
+                        fixture, capture, prefilter
+                    )
 
     def test_quartet_disk_journal_tamper_fails_closed_without_cross_delete(self):
         mutation_names = (
@@ -2134,7 +2709,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                     publication_failed = [False]
 
                     def retain_journal(phase):
-                        if phase == "post_rename":
+                        if phase == "after_formal_quartet_install":
                             publication_failed[0] = True
                             raise OSError("injected publication failure")
                         if phase == "rollback" and publication_failed[0]:
@@ -2150,7 +2725,9 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                                 canonical_bytes=quartet[3][1],
                             )
                     journal = next(
-                        fixture.data_dir.rglob(".transaction-*.json")
+                        fixture.data_dir.rglob(
+                            ".transaction-*.PREPARE.json"
+                        )
                     )
                     original = journal.read_bytes()
                     document = json.loads(original)
@@ -2162,9 +2739,11 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                         elif axis == "member_digest":
                             document["members"][0]["sha256"] = "0" * 64
                         elif axis == "predecessor_quota":
-                            document["predecessor_quota_physical_bytes"] += 1
+                            document["predecessor"]["quota"][
+                                "committed_physical_bytes"
+                            ] += 1
                         else:
-                            document["predecessor_generation"] = 3
+                            document["predecessor"]["generation"] = 3
                         mutated = json.dumps(
                             document, sort_keys=True, separators=(",", ":")
                         ).encode("utf-8") + b"\n"
@@ -2266,6 +2845,10 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
             ("trace", lambda value: value["trace_closure"].__setitem__("failed", True)),
             ("policy", lambda value: value["proof_authority"].__setitem__("policy_sha256", "0" * 64)),
             ("artifact", lambda value: value["proof_authority"].__setitem__("adapter_proof_sha256", "0" * 64)),
+            ("artifact_source", lambda value: value["proof_authority"].__setitem__("executor_source_tree_sha256", "0" * 64)),
+            ("artifact_constructor", lambda value: value["proof_authority"].__setitem__("executor_constructor_args_sha256", "0" * 64)),
+            ("artifact_immutable", lambda value: value["proof_authority"].__setitem__("executor_immutable_references_sha256", "0" * 64)),
+            ("artifact_manifest", lambda value: value["proof_authority"].__setitem__("executor_artifact_manifest_sha256", "0" * 64)),
             ("fee", lambda value: value["proof_authority"].__setitem__("v2_fee_numerator", 996)),
             ("notional", lambda value: value["proof_authority"].__setitem__("requested_notional_usd", value["proof_authority"]["requested_notional_usd"] + 1)),
             ("leg_input", lambda value: value["proof_authority"].__setitem__("actual_first_leg_uni_raw", value["proof_authority"]["actual_first_leg_uni_raw"] + 1)),
@@ -2415,7 +2998,7 @@ class HistoricalFoundryClosedRevertTests(unittest.TestCase):
             outer = "0x" + keccak256(b"ExternalCallFailed()")[:4].hex()
             receipt = {"status": 0, "revert_data": outer}
             inner = {
-                "call_path": [0],
+                "call_path": [2],
                 "leg": "first_leg",
                 "router": router,
                 "revert_selector": matrix["revert_selector"],
@@ -2443,6 +3026,7 @@ class HistoricalFoundryClosedRevertTests(unittest.TestCase):
                 "router": (inner, dict(inner, router="0x" + "0" * 40)),
                 "leg": (inner, dict(inner, leg="second_leg")),
                 "call_path": (inner, dict(inner, call_path=[1])),
+                "extra_preceding_call": (inner, dict(inner, call_path=[3])),
             }
             for axis, (original, changed) in mutations.items():
                 with self.subTest(axis=axis):
@@ -2458,6 +3042,26 @@ class HistoricalFoundryClosedRevertTests(unittest.TestCase):
                         ),
                         "unresolved",
                     )
+            original_identity = context._artifact._verified_identity
+            changed_identity = dict(context._artifact.verified_identity)
+            changed_identity["source_tree_sha256"] = "0" * 64
+            object.__setattr__(
+                context._artifact,
+                "_verified_identity",
+                MappingProxyType(changed_identity),
+            )
+            try:
+                self.assertEqual(
+                    anvil._classify_historical_revert(
+                        context=context, scenario=scenario,
+                        receipt=receipt, trace=trace,
+                    ),
+                    "unresolved",
+                )
+            finally:
+                object.__setattr__(
+                    context._artifact, "_verified_identity", original_identity
+                )
             second_leg = next(
                 candidate for candidate in rows
                 if candidate["reason"] == "second_leg_zero_output"
@@ -2563,7 +3167,7 @@ class HistoricalFoundryClosedRevertTests(unittest.TestCase):
                 if venue["venue_id"] == "uniswap_v2"
             )
             call = {
-                "call_path": [0],
+                "call_path": [2],
                 "leg": "first_leg",
                 "router": router,
                 "revert_selector": matrix["revert_selector"],
@@ -2674,6 +3278,136 @@ class HistoricalFoundryClosedRevertTests(unittest.TestCase):
 
 
 class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
+    def test_cleanup_failure_before_freeze_leaves_zero_evidence_and_successor(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+
+        for axis in ("late_output", "relay_handler"):
+            fixture = scan_fixtures.HistoricalPrefilterGridTests._new_fixture()
+            capture = prefilter = context = None
+            with self.subTest(axis=axis):
+                try:
+                    config, capture, prefilter, window, grid, rows = (
+                        HistoricalFoundryScenarioAuthorityTests._prepared(
+                            fixture
+                        )
+                    )
+                    scenario = scan._issue_validated_replay_scenario(
+                        staging=prefilter, window=window, grid=grid,
+                        scenario_key=rows[0]["scenario_key"],
+                    )
+                    context = anvil.open_historical_replay_context(
+                        config=config, staging=prefilter, window=window,
+                        grid=grid,
+                        executor_artifact=build_validated_executor_artifact(
+                            config
+                        ),
+                    )
+                    override = anvil.build_historical_state_override(
+                        context=context, scenario=scenario
+                    )
+                    helper = HistoricalFoundryOverlayTests(
+                        "test_overlay_known_answer_and_sender_funding_are_internal"
+                    )
+                    helper.config = config
+                    helper.artifact = context._artifact
+                    helper.rows = rows
+                    quartet = dict(helper._quartet(override))
+                    receipt = json.loads(quartet["receipt"])
+                    trace = json.loads(gzip.decompress(quartet["trace"]))
+                    frozen_result = json.loads(quartet["result"])
+                    outcome = {
+                        "receipt": receipt, "trace": trace,
+                        "selected_state": {"closed": True},
+                        "token_deltas": {
+                            "initial_weth_raw": frozen_result["balances"][
+                                "initial_weth_raw"
+                            ],
+                            "initial_uni_raw": frozen_result["balances"][
+                                "initial_uni_raw"
+                            ],
+                            "actual_first_leg_uni_raw": frozen_result[
+                                "actual_deltas"
+                            ]["first_leg_uni_raw"],
+                            "final_weth_raw": frozen_result["balances"][
+                                "final_weth_raw"
+                            ],
+                            "residual_uni_raw": frozen_result[
+                                "actual_deltas"
+                            ]["residual_uni_raw"],
+                        },
+                    }
+
+                    class Process:
+                        _closed = False
+
+                        def __init__(self):
+                            self.attempts = 0
+
+                        def _assert_output_within_limit(self):
+                            return None
+
+                        def _close_with_budget(self, remaining):
+                            remaining(5.0)
+                            self.attempts += 1
+                            self._closed = True
+                            if axis == "late_output" and self.attempts == 1:
+                                raise ValueError("late output plus one")
+
+                    class Relay:
+                        port = 31201
+
+                        def __init__(self):
+                            self.attempts = 0
+                            self.closed = False
+
+                        def close(self):
+                            self.attempts += 1
+                            if axis == "relay_handler" and self.attempts == 1:
+                                raise ValueError("handler remains alive")
+                            self.closed = True
+
+                        def _is_closed(self):
+                            return self.closed
+
+                    process = Process()
+                    relay = Relay()
+                    sink = anvil._open_scenario_evidence_sink(
+                        context=context, scenario=scenario
+                    )
+                    with mock.patch.object(
+                        type(context._toolchain),
+                        "_spawn_historical_anvil_process",
+                        return_value=process,
+                    ), mock.patch.object(
+                        anvil, "_start_historical_relay",
+                        return_value=relay,
+                    ), mock.patch.object(
+                        anvil, "_reserve_historical_anvil_port",
+                        return_value=31202,
+                    ), mock.patch.object(
+                        anvil, "_execute_historical_local_rpc",
+                        return_value=outcome,
+                    ):
+                        with self.assertRaises(anvil.HistoricalReplayError):
+                            anvil._replay_historical_scenario(
+                                context=context, scenario=scenario, sink=sink
+                            )
+                    self.assertEqual(
+                        prefilter.frozen_identity_projection()["generation"], 2
+                    )
+                    with self.assertRaises(ValueError):
+                        sink.validated_ledger()
+                    self.assertEqual(
+                        list(fixture.data_dir.rglob(scenario.scenario_key)), []
+                    )
+                finally:
+                    if context is not None:
+                        context.close()
+                    scan_fixtures.HistoricalPrefilterGridTests._close_fixture(
+                        fixture, capture, prefilter
+                    )
+
     def test_context_retains_unreaped_process_and_live_relay_until_retry(self):
         import scripts.historical_foundry_anvil as anvil
 
@@ -3450,7 +4184,7 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
                 self.assertNotIn("/tmp", rendered)
                 self.assertNotIn("--fork-url", rendered)
 
-    def test_two_repeats_use_independent_real_local_rpc_processes(self):
+    def test_two_status_one_repeats_and_fresh_status_zero_use_real_anvil(self):
         import scripts.bootstrap_historical_foundry_toolchain as toolchain
         import scripts.historical_foundry_anvil as anvil
         import scripts.historical_foundry_rpc as rpc
@@ -3493,6 +4227,7 @@ contract FixtureRouter {
     function swapExactTokensForTokens(uint256 amountIn,uint256,address[] calldata path,address recipient,uint256)
         external returns(uint256[] memory amounts) {
         require(path.length==2);
+        require(amountOut!=0,"UniswapV2: INSUFFICIENT_OUTPUT_AMOUNT");
         require(T(path[0]).transferFrom(msg.sender,pair,amountIn));
         require(T(path[1]).transferFrom(pair,recipient,amountOut));
         amounts=new uint256[](2); amounts[0]=amountIn; amounts[1]=amountOut;
@@ -3530,6 +4265,7 @@ contract FixturePair {
         }
         projections = []
         processes = []
+        launch_identities = []
 
         def realistic_anvil_context():
             headers = {
@@ -3553,14 +4289,18 @@ contract FixturePair {
             )
             return headers, capture, lower, plan
 
-        for repeat in range(2):
+        for repeat in range(3):
+            closed_revert = repeat == 2
             unit = 10 ** 18
             fixture = scan_fixtures._Task4bOfflineCapabilityFixture(
                 context_factory=realistic_anvil_context,
                 split_reserve_root=False,
                 record_calls=False,
                 reserve_by_target={
-                    scan_fixtures.PAIR_UNISWAP: (4000 * unit, 1000 * unit),
+                    scan_fixtures.PAIR_UNISWAP: (
+                        (1, 10 ** 30) if closed_revert
+                        else (4000 * unit, 1000 * unit)
+                    ),
                     scan_fixtures.PAIR_SUSHI: (1000 * unit, 1000 * unit),
                 },
             )
@@ -3570,6 +4310,10 @@ contract FixturePair {
             try:
                 config, capture, prefilter, window, grid, rows = (
                     HistoricalFoundryScenarioAuthorityTests._prepared(fixture)
+                )
+                self.assertEqual(
+                    rows[0].get("reason"),
+                    "first_leg_zero_output" if closed_revert else None,
                 )
                 scenario = scan._issue_validated_replay_scenario(
                     staging=prefilter, window=window, grid=grid,
@@ -3759,8 +4503,39 @@ contract FixturePair {
                     lease = context._active_process_lease
                     process = lease._process
                     processes.append(process)
+                    launch_identity = lease.verified_launch_identity_projection()
+                    self.assertEqual(
+                        launch_identity,
+                        {
+                            "schema": "historical_foundry_anvil_launch_identity/v1",
+                            "binary_sha256": (
+                                "5c9f9aad323062b1c0421a63595741430acaea150"
+                                "da3611e38c45071e4cf4e28"
+                            ),
+                            "cdhash": (
+                                "561b69d0257e574c3438465eb55cf4cef6852abc"
+                            ),
+                            "main_image_matches_materialized_inode": True,
+                            "resumed_after_identity_verification": True,
+                        },
+                    )
+                    launch_identities.append(launch_identity)
                     try:
-                        return original_execute(**arguments)
+                        observed_outcome = original_execute(**arguments)
+                        if closed_revert:
+                            diagnostics.append((
+                                "closed_revert_outcome",
+                                {
+                                    "receipt": observed_outcome.get("receipt"),
+                                    "calls": observed_outcome.get(
+                                        "trace", {}
+                                    ).get("calls"),
+                                    "failed": observed_outcome.get(
+                                        "trace", {}
+                                    ).get("failed"),
+                                },
+                            ))
+                        return observed_outcome
                     except BaseException:
                         diagnostics.append((
                             "anvil_output_poll_{}".format(process.poll()),
@@ -3909,8 +4684,12 @@ contract FixturePair {
                     fixture, capture, prefilter
                 )
         self.assertEqual(projections[0], projections[1])
+        self.assertEqual(len(launch_identities), 3)
         self.assertIsNot(processes[0], processes[1])
         self.assertNotEqual(processes[0].pid, processes[1].pid)
+        self.assertEqual(projections[2]["classification"], "closed_revert")
+        self.assertIsNone(projections[2]["proof_inputs_hash"])
+        self.assertEqual(len({process.pid for process in processes}), 3)
         self.assertTrue(all(process.poll() is not None for process in processes))
         for projection in projections:
             self.assertNotIn("path", projection)

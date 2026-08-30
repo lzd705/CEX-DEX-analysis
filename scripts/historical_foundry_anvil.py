@@ -612,8 +612,21 @@ def _start_historical_relay(
     state: Dict[str, Any] = {
         "server": None, "thread": None, "closed": False,
         "handlers": set(), "requests": set(), "lock": threading.Lock(),
-        "diagnostics": [],
+        "diagnostics": [], "control": None,
     }
+
+    def record_handler_failure(error: BaseException) -> None:
+        with state["lock"]:
+            if (
+                not isinstance(error, Exception)
+                and state["control"] is None
+            ):
+                state["control"] = error
+            else:
+                state["diagnostics"].append((
+                    "handler_error", "ordinary"
+                ))
+        return None
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -691,15 +704,15 @@ def _start_historical_relay(
                 self.wfile.write(response)
                 self.wfile.flush()
             except BaseException as error:
-                with state["lock"]:
-                    state["diagnostics"].append((
-                        type(error).__name__, str(error)[:512]
-                    ))
+                record_handler_failure(error)
+                if not isinstance(error, Exception):
+                    server.request_stop()
                 self.close_connection = True
-                try:
-                    self.send_error(400)
-                except BaseException:
-                    pass
+                if isinstance(error, Exception):
+                    try:
+                        self.send_error(400)
+                    except BaseException:
+                        pass
 
     class Server(http.server.ThreadingHTTPServer):
         daemon_threads = False
@@ -747,6 +760,11 @@ def _start_historical_relay(
             except BaseException:
                 raise
             state["closed"] = True
+            with state["lock"]:
+                saved_control = state["control"]
+                state["control"] = None
+            if saved_control is not None:
+                raise saved_control
             return None
 
         def _is_closed(self) -> bool:
@@ -755,6 +773,11 @@ def _start_historical_relay(
         def _diagnostics_for_test(self) -> Any:
             with state["lock"]:
                 return tuple(state["diagnostics"])
+
+        def _record_handler_failure_for_test(
+            self, error: BaseException
+        ) -> None:
+            record_handler_failure(error)
 
     return RelayServerLease(port)
 
@@ -2027,6 +2050,46 @@ def _issue_next_historical_replay_scenario(
     )
 
 
+def _sealed_executor_router_call_path(
+    *, context: HistoricalReplayContext, matrix: Mapping[str, Any]
+) -> Any:
+    """Bind executor call positions to the reviewed build and policy authority."""
+    checked = _require_context(context)
+    expected_build = checked._config.toolchain.value["executor_build"]
+    observed_build = checked._artifact.verified_identity
+    if (
+        any(
+            observed_build.get(name) != expected
+            for name, expected in expected_build.items()
+        )
+        or observed_build.get("policy_physical_sha256")
+        != checked._config.policy.physical_sha256
+        or observed_build.get("authority_physical_sha256")
+        != checked._config.authority.physical_sha256
+        or observed_build.get("toolchain_physical_sha256")
+        != checked._config.toolchain.physical_sha256
+        or checked._runtime_sha256
+        != expected_build.get("deployed_runtime_sha256")
+    ):
+        return None
+    key = (
+        matrix.get("prefilter_reason"), matrix.get("leg"),
+        matrix.get("revert_selector"), matrix.get("revert_data_sha256"),
+    )
+    reviewed_paths = {
+        (
+            "first_leg_zero_output", "first_leg", "0x08c379a0",
+            "6798eb314455c46925e230068a2e4849cf2340aefa7480b4aece1cdc6ae36ba7",
+        ): [2],
+        (
+            "second_leg_zero_liquidity", "second_leg", "0x08c379a0",
+            "9de19b1bd02b49383b079e33eb28592b7125d02f86cad8e24358a74830d1fe0b",
+        ): [5],
+    }
+    path = reviewed_paths.get(key)
+    return None if path is None else list(path)
+
+
 def _classify_historical_revert(
     *,
     context: HistoricalReplayContext,
@@ -2081,8 +2144,13 @@ def _classify_historical_revert(
     ):
         return "unresolved"
     call = calls[0]
+    expected_path = _sealed_executor_router_call_path(
+        context=checked, matrix=matrix
+    )
+    if expected_path is None:
+        return "unresolved"
     exact_call = {
-        "call_path": [0] if matrix["leg"] == "first_leg" else [1],
+        "call_path": expected_path,
         "leg": matrix["leg"],
         "router": routers[venue_id],
         "revert_selector": matrix["revert_selector"],
@@ -2253,6 +2321,12 @@ def _replay_historical_scenario_untyped(
                 "policy_sha256": checked._config.policy.physical_sha256,
                 "authority_sha256": checked._config.authority.physical_sha256,
                 "toolchain_sha256": checked._config.toolchain.physical_sha256,
+                "executor_source_tree_sha256": checked._artifact.verified_identity[
+                    "source_tree_sha256"
+                ],
+                "executor_constructor_args_sha256": checked._artifact.verified_identity[
+                    "constructor_args_sha256"
+                ],
                 "anvil_binary_sha256": trace["struct_log_storage"][
                     "anvil_binary_sha256"
                 ],
@@ -2263,6 +2337,12 @@ def _replay_historical_scenario_untyped(
                     "creation_bytecode_sha256"
                 ],
                 "executor_runtime_sha256": checked._runtime_sha256,
+                "executor_immutable_references_sha256": checked._artifact.verified_identity[
+                    "immutable_references_sha256"
+                ],
+                "executor_artifact_manifest_sha256": checked._artifact.verified_identity[
+                    "artifact_manifest_sha256"
+                ],
                 "requested_notional_usd": proof_row[
                     "requested_notional_usd"
                 ],
@@ -2301,6 +2381,20 @@ def _replay_historical_scenario_untyped(
         }
         if proof is not None:
             result["cost_proof_inputs"] = proof
+        process._close_with_budget(
+            lambda cap: _context_remaining(checked, cap)
+        )
+        if getattr(process, "_closed", False) is not True:
+            raise ValueError("historical process reap failed")
+        object.__setattr__(checked, "_active_process_lease", None)
+        process = None
+        relay.close()
+        closed_check = getattr(relay, "_is_closed", None)
+        if not callable(closed_check) or closed_check() is not True:
+            raise ValueError("historical relay cleanup failed")
+        object.__setattr__(checked, "_active_relay_lease", None)
+        relay = None
+        _context_remaining(checked, 120.0)
         for role, payload in (
             ("overlay", overlay_bytes),
             ("receipt", receipt_bytes),
