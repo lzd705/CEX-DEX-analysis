@@ -13,6 +13,7 @@ import http.server
 import http.client
 import io
 import json
+import re
 import socket
 import sys
 import threading
@@ -58,29 +59,43 @@ class HistoricalReplayError(RuntimeError):
         return "HistoricalReplayError({!r})".format(self._category)
 
     def __setattr__(self, _name: str, _value: Any) -> None:
+        if _name in (
+            "__traceback__", "__cause__", "__context__",
+            "__suppress_context__",
+        ):
+            RuntimeError.__setattr__(self, _name, _value)
+            return None
         raise AttributeError("HistoricalReplayError is immutable")
 
     def __init_subclass__(cls, **_kwargs: Any) -> None:
         raise TypeError("HistoricalReplayError is sealed")
 
 
+class _HistoricalReplayBoundaryError(Exception):
+    __slots__ = ("category",)
+
+    def __init__(self, category: str) -> None:
+        self.category = category
+        Exception.__init__(self, category)
+
+
 def _typed_historical_replay_error(error: Exception) -> HistoricalReplayError:
     if type(error) is HistoricalReplayError:
         return error
-    message = str(error).lower()
+    if type(error) is _HistoricalReplayBoundaryError:
+        return HistoricalReplayError(error.category)
+    message = str(error)
     module_name = type(error).__module__
-    if "fork base differs" in message or message == "fork_window_mixed":
+    if message in ("historical fork base differs", "fork_window_mixed"):
         category = "fork_window_mixed"
-    elif message == "fork_hardfork_unsupported" or (
-        "hardfork" in message and "unsupported" in message
-    ):
+    elif message == "fork_hardfork_unsupported":
         category = "fork_hardfork_unsupported"
-    elif module_name == "scripts.historical_foundry_rpc":
+    elif (
+        module_name == "scripts.historical_foundry_rpc"
+        and hasattr(error, "reason_code")
+        and hasattr(error, "failure_kind")
+    ):
         category = "archive"
-    elif any(word in message for word in (
-        "authority", "lineage", "capability", "context is invalid",
-    )):
-        category = "authority"
     else:
         category = "foundry_replay_failed"
     return HistoricalReplayError(category)
@@ -109,7 +124,7 @@ def _initialize_replay_context_type():
         __slots__ = (
             "_config", "_staging", "_window", "_grid", "_artifact",
             "_runtime", "_runtime_sha256", "_toolchain", "_relay_lease",
-            "_active_process_lease", "_clock", "_run_deadline",
+            "_active_process_lease", "_active_relay_lease", "_clock", "_run_deadline",
             "_scenario_deadline", "_closed",
         )
 
@@ -139,6 +154,38 @@ def _initialize_replay_context_type():
                 return None
             control = None
             ordinary = False
+            process = self._active_process_lease
+            active_relay = self._active_relay_lease
+            if process is not None:
+                try:
+                    process._close_with_budget(
+                        lambda cap: _context_remaining(self, cap)
+                    )
+                except BaseException as error:
+                    if not isinstance(error, Exception):
+                        control = error
+                    else:
+                        ordinary = True
+                if getattr(process, "_closed", False) is True:
+                    object.__setattr__(self, "_active_process_lease", None)
+            if active_relay is not None:
+                try:
+                    active_relay.close()
+                except BaseException as error:
+                    if not isinstance(error, Exception) and control is None:
+                        control = error
+                    elif isinstance(error, Exception):
+                        ordinary = True
+                closed_check = getattr(active_relay, "_is_closed", None)
+                if callable(closed_check) and closed_check() is True:
+                    object.__setattr__(self, "_active_relay_lease", None)
+            if (
+                self._active_process_lease is not None
+                or self._active_relay_lease is not None
+            ):
+                if control is not None:
+                    raise control
+                raise ValueError("historical replay context cleanup failed")
             relay = self._relay_lease
             toolchain = self._toolchain
             for value in (relay, toolchain):
@@ -344,6 +391,7 @@ def open_historical_replay_context(
             _toolchain=toolchain,
             _relay_lease=relay_lease,
             _active_process_lease=None,
+            _active_relay_lease=None,
             _clock=clock,
             _run_deadline=relay_lease._run_deadline,
             _scenario_deadline=None,
@@ -564,6 +612,7 @@ def _start_historical_relay(
     state: Dict[str, Any] = {
         "server": None, "thread": None, "closed": False,
         "handlers": set(), "requests": set(), "lock": threading.Lock(),
+        "diagnostics": [],
     }
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -641,7 +690,11 @@ def _start_historical_relay(
                 self.request.settimeout(_context_remaining(checked, 30.0))
                 self.wfile.write(response)
                 self.wfile.flush()
-            except BaseException:
+            except BaseException as error:
+                with state["lock"]:
+                    state["diagnostics"].append((
+                        type(error).__name__, str(error)[:512]
+                    ))
                 self.close_connection = True
                 try:
                     self.send_error(400)
@@ -696,6 +749,13 @@ def _start_historical_relay(
             state["closed"] = True
             return None
 
+        def _is_closed(self) -> bool:
+            return state["closed"] is True
+
+        def _diagnostics_for_test(self) -> Any:
+            with state["lock"]:
+                return tuple(state["diagnostics"])
+
     return RelayServerLease(port)
 
 
@@ -732,11 +792,62 @@ _HISTORICAL_LOCAL_RPC_METHODS = frozenset((
     "anvil_setBalance", "anvil_setNonce", "anvil_setCode",
     "anvil_setStorageAt", "eth_getBalance", "eth_getTransactionCount",
     "eth_getCode", "eth_getStorageAt", "evm_setNextBlockTimestamp",
+    "anvil_setCoinbase",
     "anvil_setNextBlockBaseFeePerGas", "eth_sendTransaction",
     "anvil_mine", "eth_getTransactionReceipt", "debug_traceTransaction",
     "eth_call", "evm_setAutomine", "anvil_impersonateAccount",
     "anvil_stopImpersonatingAccount",
 ))
+
+
+def _validate_historical_local_coinbase_initialization(
+    *, params: Any, expected_executor: str,
+    already_initialized: bool, read_started: bool,
+) -> None:
+    if (
+        type(expected_executor) is not str
+        or re.fullmatch(r"0x[0-9a-f]{40}", expected_executor) is None
+        or type(already_initialized) is not bool
+        or type(read_started) is not bool
+        or params != [expected_executor]
+        or already_initialized
+        or read_started
+    ):
+        raise ValueError("historical local coinbase initialization is invalid")
+    return None
+
+
+def _validate_historical_local_read_request(
+    *, request: Any, expected_executor: str,
+) -> Dict[str, str]:
+    if (
+        type(request) is not dict
+        or set(request) != {"from", "to", "data"}
+        or type(expected_executor) is not str
+        or re.fullmatch(r"0x[0-9a-f]{40}", expected_executor) is None
+        or request.get("from") != expected_executor
+        or type(request.get("to")) is not str
+        or re.fullmatch(r"0x[0-9a-f]{40}", request["to"]) is None
+        or type(request.get("data")) is not str
+        or re.fullmatch(r"0x(?:[0-9a-f]{2})*", request["data"]) is None
+    ):
+        raise ValueError("historical local read request is invalid")
+    return dict(request)
+
+
+def _historical_struct_trace_config() -> Dict[str, bool]:
+    return {
+        "disableStack": False,
+        "disableStorage": False,
+        "enableMemory": True,
+        "enableReturnData": True,
+    }
+
+
+def _validate_historical_struct_trace_config(value: Any) -> None:
+    if type(value) is not dict or value != _historical_struct_trace_config():
+        raise ValueError("historical struct trace configuration is invalid")
+    return None
 
 
 def _validate_historical_local_rpc_call(
@@ -757,6 +868,38 @@ def _validate_historical_local_rpc_call(
     if elapsed_seconds >= 30:
         raise TimeoutError("historical local RPC deadline exceeded")
     return None
+
+
+def _decode_historical_local_rpc_response(
+    *, payload: bytes, identifier: int
+) -> Any:
+    import scripts.historical_foundry_rpc as rpc
+
+    if type(identifier) is not int or identifier < 0:
+        raise ValueError("historical local RPC response is invalid")
+    try:
+        decoded = rpc._decode_historical_relay_json(
+            payload, limit=67_108_864, require_canonical=False
+        )
+    except ValueError:
+        raise ValueError("historical local RPC response is invalid") from None
+    if (
+        type(decoded) is not dict
+        or set(decoded) != {"id", "jsonrpc", "result"}
+        or decoded.get("id") != identifier
+        or decoded.get("jsonrpc") != "2.0"
+    ):
+        raise ValueError("historical local RPC response is invalid")
+    canonical = rpc._archive_canonical_bytes(decoded)
+    try:
+        canonical_decoded = rpc._decode_historical_relay_json(
+            canonical, limit=67_108_864
+        )
+    except ValueError:
+        raise ValueError("historical local RPC response is invalid") from None
+    if canonical_decoded != decoded:
+        raise ValueError("historical local RPC response is invalid")
+    return canonical_decoded["result"]
 
 
 def _validate_historical_scenario_elapsed(elapsed_seconds: float) -> None:
@@ -790,7 +933,10 @@ def _validate_historical_pair_closure(
     *, expected: Mapping[str, Any], before: Mapping[str, Any],
     after: Mapping[str, Any]
 ) -> Dict[str, Any]:
-    fields = (
+    authority_fields = (
+        "pair_address", "reserve_uni_raw", "reserve_weth_raw",
+    )
+    observed_fields = (
         "pair_address", "reserve_uni_raw", "reserve_weth_raw",
         "pair_uni_balance_raw", "pair_weth_balance_raw",
     )
@@ -808,17 +954,25 @@ def _validate_historical_pair_closure(
         rows = (expected[venue_id], before[venue_id], after[venue_id])
         if any(type(value) is not dict for value in rows):
             raise ValueError("historical pair closure is invalid")
-        if any(tuple(value) != fields for value in rows):
+        if (
+            tuple(rows[0]) != authority_fields
+            or tuple(rows[1]) != observed_fields
+            or tuple(rows[2]) != observed_fields
+        ):
             raise ValueError("historical pair closure is invalid")
-        reference = rows[0]
+        authority = rows[0]
+        reference = rows[1]
         if (
             type(reference["pair_address"]) is not str
             or any(
                 type(reference[name]) is not int or reference[name] < 0
-                for name in fields[1:]
+                for name in observed_fields[1:]
             )
-            or rows[1] != reference
             or rows[2] != reference
+            or any(
+                reference[name] != authority[name]
+                for name in authority_fields
+            )
         ):
             raise ValueError("historical pair closure differs")
         detached[venue_id] = dict(reference)
@@ -866,12 +1020,64 @@ def _validate_historical_transaction_envelope(
     return None
 
 
+def _validate_historical_child_transaction_closure(
+    *, raw_child_block: Mapping[str, Any], raw_receipt: Mapping[str, Any],
+    raw_transaction: Mapping[str, Any], submitted_transaction_hash: str,
+    base_block_number: int, base_block_hash: str,
+) -> str:
+    def exact_hash(value: Any) -> bool:
+        return (
+            type(value) is str and len(value) == 66
+            and value.startswith("0x")
+            and all(character in "0123456789abcdef" for character in value[2:])
+        )
+
+    if (
+        type(raw_child_block) is not dict
+        or type(raw_receipt) is not dict
+        or type(raw_transaction) is not dict
+        or type(base_block_number) is not int
+        or base_block_number < 0
+        or not exact_hash(base_block_hash)
+        or not exact_hash(submitted_transaction_hash)
+    ):
+        raise ValueError("historical child transaction closure is invalid")
+    child_number = base_block_number + 1
+    child_hash = raw_child_block.get("hash")
+    exact = (
+        raw_child_block.get("number") == hex(child_number)
+        and exact_hash(child_hash)
+        and raw_child_block.get("parentHash") == base_block_hash
+        and raw_child_block.get("transactions")
+        == [submitted_transaction_hash]
+        and raw_receipt.get("transactionHash")
+        == submitted_transaction_hash
+        and raw_receipt.get("blockHash") == child_hash
+        and raw_receipt.get("blockNumber") == hex(child_number)
+        and raw_receipt.get("transactionIndex") == "0x0"
+        and raw_transaction.get("hash") == submitted_transaction_hash
+        and raw_transaction.get("blockHash") == child_hash
+        and raw_transaction.get("blockNumber") == hex(child_number)
+        and raw_transaction.get("transactionIndex") == "0x0"
+    )
+    if not exact:
+        raise ValueError("historical child transaction closure differs")
+    return child_hash
+
+
 def _validate_historical_raw_trace(
-    *, raw_trace: Mapping[str, Any], expected_failed: bool
-) -> list:
+    *, raw_trace: Mapping[str, Any], expected_failed: bool,
+    anvil_binary_sha256: str, trace_config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    reviewed_anvil_sha256 = (
+        "5c9f9aad323062b1c0421a63595741430acaea150da3611e38c45071e4cf4e28"
+    )
     if (
         type(raw_trace) is not dict
         or type(expected_failed) is not bool
+        or anvil_binary_sha256 != reviewed_anvil_sha256
+        or type(trace_config) is not dict
+        or trace_config != _historical_struct_trace_config()
         or not {"gas", "failed", "returnValue", "structLogs"}.issubset(raw_trace)
         or type(raw_trace["gas"]) is not int
         or raw_trace["gas"] < 0
@@ -883,9 +1089,12 @@ def _validate_historical_raw_trace(
         raise ValueError("historical execution trace is invalid")
     required = {
         "pc": int, "op": str, "gas": int, "gasCost": int,
-        "depth": int, "stack": list, "memory": list, "storage": dict,
+        "depth": int, "stack": list, "memory": list,
+        "refund": int, "returnData": str,
     }
     gasprice = []
+    storage_omitted = 0
+    storage_explicit = 0
     previous_depth = None
     for step in raw_trace["structLogs"]:
         if type(step) is not dict or not set(required).issubset(step):
@@ -893,9 +1102,25 @@ def _validate_historical_raw_trace(
         for name, expected_type in required.items():
             if type(step[name]) is not expected_type:
                 raise ValueError("historical execution trace is invalid")
+        if "storage" not in step:
+            storage_omitted += 1
+        else:
+            storage = step["storage"]
+            if type(storage) is not dict or any(
+                type(slot) is not str
+                or re.fullmatch(r"0x[0-9a-f]{64}", slot) is None
+                or type(value) is not str
+                or re.fullmatch(r"0x[0-9a-f]{64}", value) is None
+                for slot, value in storage.items()
+            ):
+                raise ValueError("historical execution trace is invalid")
+            storage_explicit += 1
         if (
             step["pc"] < 0 or step["gas"] < 0 or step["gasCost"] < 0
+            or step["refund"] < 0
             or step["depth"] < 1
+            or not step["returnData"].startswith("0x")
+            or len(step["returnData"]) % 2 != 0
             or (
                 previous_depth is not None
                 and abs(step["depth"] - previous_depth) > 1
@@ -905,7 +1130,16 @@ def _validate_historical_raw_trace(
         previous_depth = step["depth"]
         if step["op"] == "GASPRICE":
             gasprice.append("GASPRICE")
-    return gasprice
+    return {
+        "schema": "historical_foundry_sparse_storage_trace/v1",
+        "anvil_binary_sha256": reviewed_anvil_sha256,
+        "trace_config_sha256": hashlib.sha256(
+            _canonical_json(dict(trace_config))
+        ).hexdigest(),
+        "storage_omitted_step_count": storage_omitted,
+        "storage_explicit_step_count": storage_explicit,
+        "gasprice_operations": gasprice,
+    }
 
 
 def _extract_actual_first_leg_uni_raw(
@@ -1001,8 +1235,12 @@ def _parse_uint256_result(value: Any) -> int:
 def _normalized_failed_router_calls(
     *, call_trace: Mapping[str, Any], router_order: tuple,
     root_sender: str, root_executor: str, root_input: str,
-    root_failed: bool,
+    root_failed: bool, anvil_binary_sha256: str,
+    call_trace_config: Mapping[str, Any],
 ) -> list:
+    reviewed_anvil_sha256 = (
+        "5c9f9aad323062b1c0421a63595741430acaea150da3611e38c45071e4cf4e28"
+    )
     if (
         type(call_trace) is not dict
         or type(router_order) is not tuple
@@ -1013,6 +1251,9 @@ def _normalized_failed_router_calls(
             for value in (root_sender, root_executor, root_input)
         )
         or type(root_failed) is not bool
+        or anvil_binary_sha256 != reviewed_anvil_sha256
+        or type(call_trace_config) is not dict
+        or call_trace_config != {"tracer": "callTracer"}
     ):
         raise ValueError("historical call trace is invalid")
     allowed = {value.lower(): index for index, value in enumerate(router_order)}
@@ -1020,20 +1261,31 @@ def _normalized_failed_router_calls(
 
     def visit(node: Any, *, path: list, expected_from: str) -> None:
         required = {
-            "type", "from", "to", "input", "output", "value", "gas",
-            "gasUsed", "calls",
+            "type", "from", "to", "input", "output", "gas", "gasUsed",
         }
         if (
             type(node) is not dict
             or not required.issubset(node)
-            or node["type"] not in ("CALL", "STATICCALL", "DELEGATECALL")
+            or node["type"] not in (
+                "CALL", "CALLCODE", "STATICCALL", "DELEGATECALL"
+            )
             or type(node["from"]) is not str
             or node["from"].lower() != expected_from.lower()
             or type(node["to"]) is not str
             or any(type(node[name]) is not str for name in (
-                "input", "output", "value", "gas", "gasUsed",
+                "input", "output", "gas", "gasUsed",
             ))
-            or type(node["calls"]) is not list
+            or (
+                node["type"] in ("CALL", "CALLCODE")
+                and type(node.get("value")) is not str
+            )
+            or (
+                node["type"] in ("STATICCALL", "DELEGATECALL")
+                and "value" in node and node["value"] != "0x0"
+            )
+            or (
+                "calls" in node and type(node["calls"]) is not list
+            )
         ):
             raise ValueError("historical call trace is invalid")
         target = node.get("to")
@@ -1060,12 +1312,14 @@ def _normalized_failed_router_calls(
                 "revert_selector": "0x" + raw[:4].hex(),
                 "revert_data_sha256": hashlib.sha256(raw).hexdigest(),
             })
-        for child_index, child in enumerate(node["calls"]):
+        for child_index, child in enumerate(node.get("calls", ())):
             visit(child, path=path + [child_index], expected_from=node["to"])
 
     root_has_error = bool(call_trace.get("error"))
     if (
-        call_trace.get("from", "").lower() != root_sender.lower()
+        not {"value", "calls"}.issubset(call_trace)
+        or call_trace.get("type") != "CALL"
+        or call_trace.get("from", "").lower() != root_sender.lower()
         or call_trace.get("to", "").lower() != root_executor.lower()
         or call_trace.get("input", "").lower() != root_input.lower()
         or root_has_error is not root_failed
@@ -1168,35 +1422,18 @@ def _execute_historical_local_rpc(
             payload = response.read(67_108_865)
         finally:
             connection.close()
+        _context_operation_remaining(
+            checked, operation_deadline=call_deadline, own_cap=30.0
+        )
         elapsed = time.monotonic() - started
         _validate_historical_local_rpc_call(
             method=method, request_byte_count=len(request_bytes),
             decoded_response_byte_count=len(payload),
             elapsed_seconds=elapsed,
         )
-        def unique_object(pairs: list) -> dict:
-            result = {}
-            for key, value in pairs:
-                if key in result:
-                    raise ValueError("duplicate JSON member")
-                result[key] = value
-            return result
-
-        try:
-            decoded = json.loads(
-                payload.decode("utf-8"), object_pairs_hook=unique_object
-            )
-        except Exception:
-            raise ValueError("historical local RPC response is invalid") from None
-        if (
-            type(decoded) is not dict
-            or decoded.get("id") != identifier
-            or decoded.get("jsonrpc") != "2.0"
-            or "error" in decoded
-            or set(decoded) != {"id", "jsonrpc", "result"}
-        ):
-            raise ValueError("historical local RPC response is invalid")
-        return decoded["result"]
+        return _decode_historical_local_rpc_response(
+            payload=payload, identifier=identifier
+        )
 
     readiness_deadline = min(
         checked._run_deadline,
@@ -1232,8 +1469,23 @@ def _execute_historical_local_rpc(
     )
     authority = checked._config.authority.value
     tokens = {token["role"]: token for token in authority["tokens"]}
+    executor = authority["executor"]["address"]
+    coinbase_initialized = False
+    read_started = False
+    coinbase_params = [executor]
+    _validate_historical_local_coinbase_initialization(
+        params=coinbase_params, expected_executor=executor,
+        already_initialized=coinbase_initialized, read_started=read_started,
+    )
+    if rpc_call("anvil_setCoinbase", coinbase_params) is not None:
+        raise ValueError("historical local coinbase initialization is invalid")
+    coinbase_initialized = True
 
     def read_pair_state() -> Dict[str, Any]:
+        nonlocal read_started
+        if not coinbase_initialized:
+            raise ValueError("historical local coinbase initialization is invalid")
+        read_started = True
         observed = {}
         ordered_roles = tuple(sorted(
             ("uni", "weth"), key=lambda role: tokens[role]["address"]
@@ -1241,9 +1493,9 @@ def _execute_historical_local_rpc(
         for venue_id in ("uniswap_v2", "sushiswap_v2"):
             expected_reserves = row["reserves"][venue_id]
             pair = expected_reserves["pair_address"]
-            raw_reserves = rpc_call("eth_call", [{
-                "to": pair, "data": "0x0902f1ac",
-            }, "latest"])
+            raw_reserves = rpc_call("eth_call", [_validate_historical_local_read_request(request={
+                "from": executor, "to": pair, "data": "0x0902f1ac",
+            }, expected_executor=executor), "latest"])
             if (
                 type(raw_reserves) is not str
                 or not raw_reserves.startswith("0x")
@@ -1261,10 +1513,11 @@ def _execute_historical_local_rpc(
             balances = {}
             for role in ("uni", "weth"):
                 balances[role] = _parse_uint256_result(rpc_call(
-                    "eth_call", [{
+                    "eth_call", [_validate_historical_local_read_request(request={
+                        "from": executor,
                         "to": tokens[role]["address"],
                         "data": _balance_of_calldata(pair),
-                    }, "latest"]
+                    }, expected_executor=executor), "latest"]
                 ))
             observed[venue_id] = {
                 "pair_address": pair,
@@ -1280,12 +1533,18 @@ def _execute_historical_local_rpc(
             "pair_address": row["reserves"][venue_id]["pair_address"],
             "reserve_uni_raw": row["reserves"][venue_id]["reserve_uni_raw"],
             "reserve_weth_raw": row["reserves"][venue_id]["reserve_weth_raw"],
-            "pair_uni_balance_raw": row["reserves"][venue_id]["reserve_uni_raw"],
-            "pair_weth_balance_raw": row["reserves"][venue_id]["reserve_weth_raw"],
         }
         for venue_id in ("uniswap_v2", "sushiswap_v2")
     }
     pair_state_before = read_pair_state()
+    override["pair_balance_baseline"] = {
+        venue_id: {
+            "pair_address": value["pair_address"],
+            "pair_uni_balance_raw": value["pair_uni_balance_raw"],
+            "pair_weth_balance_raw": value["pair_weth_balance_raw"],
+        }
+        for venue_id, value in pair_state_before.items()
+    }
     for address, account in override["accounts"].items():
         prior_balance = int(rpc_call("eth_getBalance", [address, "latest"]), 16)
         if "balance_delta" in account:
@@ -1346,14 +1605,15 @@ def _execute_historical_local_rpc(
         before=pair_state_before,
         after=pair_state_after,
     )
-    executor = authority["executor"]["address"]
     balance_call = _balance_of_calldata(executor)
-    initial_weth = _parse_uint256_result(rpc_call("eth_call", [{
-        "to": tokens["weth"]["address"], "data": balance_call,
-    }, "latest"]))
-    initial_uni = _parse_uint256_result(rpc_call("eth_call", [{
-        "to": tokens["uni"]["address"], "data": balance_call,
-    }, "latest"]))
+    initial_weth = _parse_uint256_result(rpc_call("eth_call", [_validate_historical_local_read_request(request={
+        "from": executor, "to": tokens["weth"]["address"],
+        "data": balance_call,
+    }, expected_executor=executor), "latest"]))
+    initial_uni = _parse_uint256_result(rpc_call("eth_call", [_validate_historical_local_read_request(request={
+        "from": executor, "to": tokens["uni"]["address"],
+        "data": balance_call,
+    }, expected_executor=executor), "latest"]))
     if initial_weth != row["amount_weth_in_wei"] or initial_uni != 0:
         raise ValueError("historical overlay token getter differs")
     override["getter_readback"] = {
@@ -1383,8 +1643,10 @@ def _execute_historical_local_rpc(
     raw_receipt = rpc_call(
         "eth_getTransactionReceipt", [transaction_hash]
     )
+    struct_trace_config = _historical_struct_trace_config()
+    _validate_historical_struct_trace_config(struct_trace_config)
     raw_trace = rpc_call(
-        "debug_traceTransaction", [transaction_hash, {}]
+        "debug_traceTransaction", [transaction_hash, struct_trace_config]
     )
     call_trace = rpc_call(
         "debug_traceTransaction", [transaction_hash, {"tracer": "callTracer"}]
@@ -1392,6 +1654,13 @@ def _execute_historical_local_rpc(
     raw_transaction = rpc_call("eth_getTransactionByHash", [transaction_hash])
     child_block = rpc_call(
         "eth_getBlockByNumber", [hex(override["synthetic_block"]["number"]), False]
+    )
+    _validate_historical_child_transaction_closure(
+        raw_child_block=child_block, raw_receipt=raw_receipt,
+        raw_transaction=raw_transaction,
+        submitted_transaction_hash=transaction_hash,
+        base_block_number=override["block_number"],
+        base_block_hash=override["block_hash"],
     )
     if (
         type(raw_receipt) is not dict
@@ -1428,9 +1697,12 @@ def _execute_historical_local_rpc(
         transaction_index=receipt["transactionIndex"],
         chain_id=1,
     )
-    gasprice_ops = _validate_historical_raw_trace(
-        raw_trace=raw_trace, expected_failed=receipt["status"] == 0
+    raw_trace_closure = _validate_historical_raw_trace(
+        raw_trace=raw_trace, expected_failed=receipt["status"] == 0,
+        anvil_binary_sha256=checked._active_process_lease._binary_sha256,
+        trace_config=struct_trace_config,
     )
+    gasprice_ops = raw_trace_closure["gasprice_operations"]
     gasprice_addresses = [tx["to"] for _value in gasprice_ops]
     routers = {
         venue["venue_id"]: venue["router_address"]
@@ -1450,6 +1722,8 @@ def _execute_historical_local_rpc(
         call_trace=call_trace, router_order=router_order,
         root_sender=tx["from"], root_executor=tx["to"],
         root_input=tx["input"], root_failed=receipt["status"] == 0,
+        anvil_binary_sha256=checked._active_process_lease._binary_sha256,
+        call_trace_config={"tracer": "callTracer"},
     )
     if receipt["status"] == 0:
         root_output = call_trace.get("output", raw_trace.get("returnValue"))
@@ -1464,17 +1738,29 @@ def _execute_historical_local_rpc(
         )
         if actual_first_leg_uni != row["first_amount_out_raw"]:
             raise ValueError("historical first-leg token delta differs")
-    final_weth = _parse_uint256_result(rpc_call("eth_call", [{
-        "to": tokens["weth"]["address"], "data": balance_call,
-    }, "latest"]))
-    residual_uni = _parse_uint256_result(rpc_call("eth_call", [{
-        "to": tokens["uni"]["address"], "data": balance_call,
-    }, "latest"]))
+    final_weth = _parse_uint256_result(rpc_call("eth_call", [_validate_historical_local_read_request(request={
+        "from": executor, "to": tokens["weth"]["address"],
+        "data": balance_call,
+    }, expected_executor=executor), "latest"]))
+    residual_uni = _parse_uint256_result(rpc_call("eth_call", [_validate_historical_local_read_request(request={
+        "from": executor, "to": tokens["uni"]["address"],
+        "data": balance_call,
+    }, expected_executor=executor), "latest"]))
     trace = {
         "schema": "historical_foundry_trace/v1",
         "scenario_key": override["scenario_key"],
         "failed": raw_trace.get("failed") is True,
         "gasprice_opcode_addresses": sorted(set(gasprice_addresses)),
+        "struct_log_storage": {
+            key: value for key, value in raw_trace_closure.items()
+            if key != "gasprice_operations"
+        },
+        "struct_logs": raw_trace["structLogs"],
+        "raw_trace_closure": {
+            "gas": raw_trace["gas"],
+            "failed": raw_trace["failed"],
+            "return_value": raw_trace["returnValue"],
+        },
         "calls": failed_router_calls,
         "fork_header": dict(row["header"]),
         "pair_closure": pair_closure,
@@ -1826,7 +2112,7 @@ def _classify_historical_outcome(
     return "unresolved"
 
 
-def _replay_historical_scenario(
+def _replay_historical_scenario_untyped(
     *, context: HistoricalReplayContext, scenario: Any, sink: Any
 ) -> Mapping[str, Any]:
     checked = _require_context(context)
@@ -1856,6 +2142,7 @@ def _replay_historical_scenario(
         relay = _start_historical_relay(
             context=checked, scenario=scenario
         )
+        object.__setattr__(checked, "_active_relay_lease", relay)
         _context_remaining(checked, 120.0)
         relay_port = getattr(relay, "port", None)
         anvil_port = _reserve_historical_anvil_port()
@@ -1959,11 +2246,19 @@ def _replay_historical_scenario(
                     "gasprice_opcode_addresses"
                 ],
                 "calls": trace["calls"],
+                "raw_trace_closure": trace["raw_trace_closure"],
+                "struct_log_storage": trace["struct_log_storage"],
             },
             "proof_authority": {
                 "policy_sha256": checked._config.policy.physical_sha256,
                 "authority_sha256": checked._config.authority.physical_sha256,
                 "toolchain_sha256": checked._config.toolchain.physical_sha256,
+                "anvil_binary_sha256": trace["struct_log_storage"][
+                    "anvil_binary_sha256"
+                ],
+                "trace_config_sha256": trace["struct_log_storage"][
+                    "trace_config_sha256"
+                ],
                 "adapter_proof_sha256": checked._artifact.verified_identity[
                     "creation_bytecode_sha256"
                 ],
@@ -2027,6 +2322,12 @@ def _replay_historical_scenario(
             "executor_runtime_sha256": checked._runtime_sha256,
             "receipt_sha256": receipt_sha,
             "trace_sha256": trace_sha,
+            "trace_storage_omitted_step_count": trace[
+                "struct_log_storage"
+            ]["storage_omitted_step_count"],
+            "trace_storage_explicit_step_count": trace[
+                "struct_log_storage"
+            ]["storage_explicit_step_count"],
             "classification": classification,
             "proof_inputs_hash": (
                 proof["proof_inputs_hash"] if proof is not None else None
@@ -2059,7 +2360,12 @@ def _replay_historical_scenario(
                         ordinary_failure = True
                         if ordinary_error is None:
                             ordinary_error = _typed_historical_replay_error(error)
-        object.__setattr__(checked, "_active_process_lease", None)
+            if lease is process and getattr(lease, "_closed", False) is True:
+                object.__setattr__(checked, "_active_process_lease", None)
+            if lease is relay:
+                closed_check = getattr(lease, "_is_closed", None)
+                if callable(closed_check) and closed_check() is True:
+                    object.__setattr__(checked, "_active_relay_lease", None)
         try:
             _context_remaining(checked, 120.0)
         except BaseException as error:
@@ -2078,3 +2384,33 @@ def _replay_historical_scenario(
                     "foundry_replay_failed"
                 )
             raise ordinary_error from None
+
+
+def _replay_historical_scenario(
+    *, context: HistoricalReplayContext, scenario: Any, sink: Any
+) -> Mapping[str, Any]:
+    try:
+        checked = _require_context(context)
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        if type(sink) is not storage.ScenarioEvidenceSink:
+            raise _HistoricalReplayBoundaryError("authority")
+        scan._validate_replay_scenario_for_context(
+            scenario=scenario, staging=checked._staging,
+            window=checked._window, grid=checked._grid,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except _HistoricalReplayBoundaryError as error:
+        raise HistoricalReplayError(error.category) from None
+    except Exception:
+        raise HistoricalReplayError("authority") from None
+    try:
+        return _replay_historical_scenario_untyped(
+            context=checked, scenario=scenario, sink=sink
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as error:
+        raise _typed_historical_replay_error(error) from None

@@ -1096,7 +1096,8 @@ def _initialize_historical_process_lease_type():
         __slots__ = (
             "_process", "_cleanup", "_binary_sha256", "_selected_block",
             "_hardfork", "_toolchain", "_output_threads",
-            "_output_totals", "_output_lock", "_output_overflow", "_closed",
+            "_output_totals", "_output_capture", "_output_lock",
+            "_output_overflow", "_reaped", "_closed",
         )
 
         def __init__(self, *, _provenance: object = None, **values: Any) -> None:
@@ -1121,7 +1122,10 @@ def _initialize_historical_process_lease_type():
                 "schema": "historical_foundry_anvil_argv/v1",
                 "binary_sha256": self._binary_sha256,
                 "fixed_arguments": (
-                    "--chain-id", "1", "--host", "127.0.0.1",
+                    "--chain-id", "1", "--fork-chain-id", "1",
+                    "--accounts", "0", "--gas-price", "0",
+                    "--disable-default-create2-deployer",
+                    "--host", "127.0.0.1",
                     "--no-mining", "--no-cors", "--silent", "--order",
                     "fifo", "--steps-tracing", "--retries", "0",
                     "--timeout", "30000", "--no-storage-caching",
@@ -1141,6 +1145,10 @@ def _initialize_historical_process_lease_type():
                 stdout_bytes=stdout_bytes, stderr_bytes=stderr_bytes
             )
             return None
+
+        def _captured_output_for_test(self) -> Tuple[bytes, bytes]:
+            with self._output_lock:
+                return tuple(bytes(value) for value in self._output_capture)
 
         def close(self) -> None:
             return self._close_with_budget(lambda cap: cap)
@@ -1168,45 +1176,48 @@ def _initialize_historical_process_lease_type():
             control = None
             ordinary = False
             timed_out = False
-            reaped = False
-            try:
-                timeout(5.0)
-                process.terminate()
-            except BaseException as error:
-                if not isinstance(error, Exception):
-                    control = error
-                else:
-                    ordinary = True
-            try:
-                process.wait(timeout=timeout(5.0))
-                reaped = True
-            except subprocess.TimeoutExpired:
-                timed_out = True
-            except BaseException as error:
-                timed_out = True
-                if not isinstance(error, Exception) and control is None:
-                    control = error
-                elif isinstance(error, Exception):
-                    ordinary = True
-            if timed_out:
+            reaped = self._reaped
+            if not reaped:
                 try:
                     timeout(5.0)
-                    process.kill()
+                    process.terminate()
                 except BaseException as error:
-                    if not isinstance(error, Exception) and control is None:
+                    if not isinstance(error, Exception):
                         control = error
-                    elif isinstance(error, Exception):
+                    else:
                         ordinary = True
                 try:
                     process.wait(timeout=timeout(5.0))
                     reaped = True
                 except subprocess.TimeoutExpired:
-                    ordinary = True
+                    timed_out = True
                 except BaseException as error:
+                    timed_out = True
                     if not isinstance(error, Exception) and control is None:
                         control = error
                     elif isinstance(error, Exception):
                         ordinary = True
+                if timed_out:
+                    try:
+                        timeout(5.0)
+                        process.kill()
+                    except BaseException as error:
+                        if not isinstance(error, Exception) and control is None:
+                            control = error
+                        elif isinstance(error, Exception):
+                            ordinary = True
+                    try:
+                        process.wait(timeout=timeout(5.0))
+                        reaped = True
+                    except subprocess.TimeoutExpired:
+                        ordinary = True
+                    except BaseException as error:
+                        if not isinstance(error, Exception) and control is None:
+                            control = error
+                        elif isinstance(error, Exception):
+                            ordinary = True
+                if reaped:
+                    object.__setattr__(self, "_reaped", True)
             for thread in self._output_threads:
                 try:
                     thread.join(timeout=timeout(5.0))
@@ -1245,27 +1256,32 @@ def _initialize_historical_process_lease_type():
                 elif isinstance(error, Exception):
                     ordinary = True
             if reaped:
-                try:
-                    self._cleanup()
-                except BaseException as error:
-                    if not isinstance(error, Exception) and control is None:
-                        control = error
-                    elif isinstance(error, Exception):
-                        ordinary = True
+                release_ok = True
                 toolchain = self._toolchain
                 if toolchain is not None:
                     try:
                         toolchain._assert_stable_binaries()
                     except BaseException as error:
+                        release_ok = False
                         if not isinstance(error, Exception) and control is None:
                             control = error
                         elif isinstance(error, Exception):
                             ordinary = True
-                object.__setattr__(self, "_process", None)
-                object.__setattr__(self, "_cleanup", None)
-                object.__setattr__(self, "_toolchain", None)
-                object.__setattr__(self, "_output_threads", ())
-                object.__setattr__(self, "_closed", True)
+                if release_ok:
+                    try:
+                        self._cleanup()
+                    except BaseException as error:
+                        release_ok = False
+                        if not isinstance(error, Exception) and control is None:
+                            control = error
+                        elif isinstance(error, Exception):
+                            ordinary = True
+                if release_ok:
+                    object.__setattr__(self, "_process", None)
+                    object.__setattr__(self, "_cleanup", None)
+                    object.__setattr__(self, "_toolchain", None)
+                    object.__setattr__(self, "_output_threads", ())
+                    object.__setattr__(self, "_closed", True)
             else:
                 ordinary = True
             if control is not None:
@@ -1297,6 +1313,7 @@ def _initialize_historical_process_lease_type():
             if not callable(getattr(process, name, None)):
                 raise ValueError("historical process handle is invalid")
         output_totals = [0, 0]
+        output_capture = [bytearray(), bytearray()]
         output_lock = threading.Lock()
         output_overflow = threading.Event()
         output_threads = []
@@ -1312,6 +1329,13 @@ def _initialize_historical_process_lease_type():
                         break
                     with output_lock:
                         output_totals[index] += len(chunk)
+                        remaining_capture = 65_536 - sum(
+                            len(value) for value in output_capture
+                        )
+                        if remaining_capture > 0:
+                            output_capture[index].extend(
+                                chunk[:remaining_capture]
+                            )
                         if sum(output_totals) > 65_536:
                             output_overflow.set()
             except BaseException:
@@ -1321,7 +1345,7 @@ def _initialize_historical_process_lease_type():
             stream = getattr(process, name, None)
             if stream is not None and callable(getattr(stream, "read", None)):
                 thread = threading.Thread(
-                    target=drain, args=(stream, index), daemon=True,
+                    target=drain, args=(stream, index), daemon=False,
                     name="historical-anvil-output-{}".format(name),
                 )
                 output_threads.append(thread)
@@ -1336,8 +1360,10 @@ def _initialize_historical_process_lease_type():
             _toolchain=toolchain,
             _output_threads=tuple(output_threads),
             _output_totals=output_totals,
+            _output_capture=output_capture,
             _output_lock=output_lock,
             _output_overflow=output_overflow,
+            _reaped=False,
             _closed=False,
         )
 
@@ -1606,9 +1632,9 @@ class ReviewedHistoricalToolchain:
             raise _error("toolchain_process_failed")
         self._assert_stable_binaries()
         anvil_fd, _metadata, anvil_sha256 = self._binaries["anvil"]
-        private_parent = _PROJECT_ROOT / ".historical-foundry"
+        private_parent = _PROJECT_ROOT
         work_directory = Path(tempfile.mkdtemp(
-            prefix="anvil-scenario-", dir=str(private_parent)
+            prefix=".historical-anvil-scenario-", dir=str(private_parent)
         ))
         os.chmod(str(work_directory), 0o700)
         arguments = (
@@ -1616,6 +1642,10 @@ class ReviewedHistoricalToolchain:
             "--fork-url", "http://127.0.0.1:{}".format(relay_port),
             "--fork-block-number", str(selected_block),
             "--chain-id", "1",
+            "--fork-chain-id", "1",
+            "--accounts", "0",
+            "--gas-price", "0",
+            "--disable-default-create2-deployer",
             "--hardfork", hardfork,
             "--host", "127.0.0.1",
             "--port", str(anvil_port),
@@ -1627,11 +1657,59 @@ class ReviewedHistoricalToolchain:
             "HOME": str(_PROJECT_ROOT / ".historical-foundry" / "runtime-home"),
             "LANG": "C",
             "LC_ALL": "C",
+            "NO_PROXY": "127.0.0.1",
+            "no_proxy": "127.0.0.1",
         }
+        work_fd = None
+        executable_fd = None
+        process = None
+        executable_name = ".reviewed-anvil"
+        retained_work_fd = None
+        retained_executable_fd = None
+        executable_identity = None
         try:
+            work_fd = os.open(
+                str(work_directory),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            executable_fd = os.open(
+                executable_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o700,
+                dir_fd=work_fd,
+            )
+            offset = 0
+            while True:
+                chunk = os.pread(anvil_fd, 1_048_576, offset)
+                if not chunk:
+                    break
+                written = 0
+                while written < len(chunk):
+                    count = os.write(executable_fd, chunk[written:])
+                    if count <= 0:
+                        raise OSError("reviewed Anvil copy failed")
+                    written += count
+                offset += len(chunk)
+            os.fchmod(executable_fd, 0o700)
+            os.fsync(executable_fd)
+            if _hash_fd(executable_fd) != anvil_sha256:
+                raise _error("toolchain_binary_changed")
+            descriptor = os.fstat(executable_fd)
+            path_descriptor = os.stat(
+                executable_name, dir_fd=work_fd, follow_symlinks=False
+            )
+            executable_identity = (descriptor.st_dev, descriptor.st_ino)
+            if (
+                not stat.S_ISREG(descriptor.st_mode)
+                or (path_descriptor.st_dev, path_descriptor.st_ino)
+                != executable_identity
+            ):
+                raise _error("toolchain_binary_changed")
+            os.fsync(work_fd)
             process = subprocess.Popen(
                 arguments,
-                executable="/dev/fd/{}".format(anvil_fd),
+                executable="./" + executable_name,
                 cwd=str(work_directory),
                 env=environment,
                 stdin=subprocess.DEVNULL,
@@ -1640,12 +1718,86 @@ class ReviewedHistoricalToolchain:
                 close_fds=True,
                 pass_fds=(anvil_fd,),
             )
+            path_after = os.stat(
+                executable_name, dir_fd=work_fd, follow_symlinks=False
+            )
+            descriptor_after = os.fstat(executable_fd)
+            if (
+                (path_after.st_dev, path_after.st_ino)
+                != executable_identity
+                or (descriptor_after.st_dev, descriptor_after.st_ino)
+                != executable_identity
+                or _hash_fd(executable_fd) != anvil_sha256
+            ):
+                process.terminate()
+                process.wait(timeout=5)
+                process = None
+                raise _error("toolchain_binary_changed")
+            # macOS may keep the pathname as part of executable provenance;
+            # the private directory is removed only after the child is reaped.
+            retained_work_fd = work_fd
+            retained_executable_fd = executable_fd
+            work_fd = None
+            executable_fd = None
         except BaseException:
-            shutil.rmtree(str(work_directory))
+            if process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except BaseException:
+                    pass
+            if work_fd is not None:
+                try:
+                    os.unlink(executable_name, dir_fd=work_fd)
+                    os.fsync(work_fd)
+                except FileNotFoundError:
+                    pass
+            try:
+                os.rmdir(str(work_directory))
+            except FileNotFoundError:
+                pass
             raise
+        finally:
+            if executable_fd is not None:
+                os.close(executable_fd)
+            if work_fd is not None:
+                os.close(work_fd)
+
+        cleanup_state = {"unlinked": False, "fds_closed": False}
 
         def cleanup() -> None:
-            shutil.rmtree(str(work_directory))
+            if cleanup_state["fds_closed"]:
+                try:
+                    os.rmdir(str(work_directory))
+                except FileNotFoundError:
+                    pass
+                return None
+            descriptor = os.fstat(retained_executable_fd)
+            if (
+                not stat.S_ISREG(descriptor.st_mode)
+                or (descriptor.st_dev, descriptor.st_ino)
+                != executable_identity
+                or _hash_fd(retained_executable_fd) != anvil_sha256
+            ):
+                raise _error("toolchain_binary_changed")
+            if not cleanup_state["unlinked"]:
+                path_descriptor = os.stat(
+                    executable_name, dir_fd=retained_work_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    (path_descriptor.st_dev, path_descriptor.st_ino)
+                    != executable_identity
+                ):
+                    raise _error("toolchain_binary_changed")
+                os.unlink(executable_name, dir_fd=retained_work_fd)
+                cleanup_state["unlinked"] = True
+            os.fsync(retained_work_fd)
+            os.close(retained_executable_fd)
+            os.close(retained_work_fd)
+            cleanup_state["fds_closed"] = True
+            os.rmdir(str(work_directory))
+            return None
 
         return _issue_historical_process_lease_for_test(
             process=process,

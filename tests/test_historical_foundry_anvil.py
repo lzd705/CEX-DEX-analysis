@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from decimal import Decimal, localcontext
@@ -48,10 +49,36 @@ class HistoricalFoundryRelayTests(unittest.TestCase):
         import scripts.historical_foundry_rpc as rpc
 
         calls = []
+        block_hash = "0x" + "44" * 32
+        fork_header = {
+            "number": 1, "hash": block_hash,
+            "parent_hash": "0x" + "43" * 32,
+            "state_root": "0x" + "45" * 32,
+            "timestamp": 2, "gas_limit": 30_000_000,
+            "gas_used": 15_000_000, "base_fee_per_gas": 7,
+        }
+        raw_block = {
+            "number": "0x1", "hash": block_hash,
+            "parentHash": fork_header["parent_hash"],
+            "stateRoot": fork_header["state_root"],
+            "timestamp": "0x2", "gasLimit": hex(30_000_000),
+            "gasUsed": hex(15_000_000), "baseFeePerGas": "0x7",
+            "transactions": [],
+        }
 
         def operation(body, remaining):
             calls.append((body, remaining))
-            return b'{"id":7,"jsonrpc":"2.0","result":"0x1"}'
+            request = json.loads(body)
+            result = (
+                raw_block if request["method"] in (
+                    "eth_getBlockByNumber", "eth_getBlockByHash"
+                ) else "0x1"
+            )
+            if request["method"] == "eth_chainId":
+                return b'{"jsonrpc":"2.0", "result":"0x1", "id":7}'
+            return json.dumps({
+                "id": 7, "jsonrpc": "2.0", "result": result,
+            }, sort_keys=True, separators=(",", ":")).encode("ascii")
 
         lease = rpc._issue_historical_relay_lease_for_test(
             endpoint="https://fixture.invalid/archive?key=secret",
@@ -62,12 +89,12 @@ class HistoricalFoundryRelayTests(unittest.TestCase):
         address = "0x" + "11" * 20
         slot = "0x" + "22" * 32
         calldata = "0x" + "33" * 4
-        block_hash = "0x" + "44" * 32
         facade = rpc._issue_historical_relay_scenario_facade(
             relay_lease=lease,
             authority={
                 "block_number": 1,
                 "block_hash": block_hash,
+                "fork_header": fork_header,
                 "block_tag": {
                     "blockHash": block_hash,
                     "requireCanonical": True,
@@ -97,13 +124,16 @@ class HistoricalFoundryRelayTests(unittest.TestCase):
                         "id": 7, "jsonrpc": "2.0", "method": method,
                         "params": params,
                     }, sort_keys=True, separators=(",", ":")).encode("ascii")
-                    self.assertEqual(
-                        rpc._relay_historical_archive_call(
+                    response = rpc._relay_historical_archive_call(
                             relay_lease=facade,
                             canonical_request_bytes=request,
-                        ),
-                        b'{"id":7,"jsonrpc":"2.0","result":"0x1"}',
-                    )
+                        )
+                    self.assertEqual(json.loads(response)["id"], 7)
+                    if method == "eth_chainId":
+                        self.assertEqual(
+                            response,
+                            b'{"id":7,"jsonrpc":"2.0","result":"0x1"}',
+                        )
             for body in (
                 b'[{"id":1,"jsonrpc":"2.0","method":"eth_chainId","params":[]}]',
                 b'{"id":true,"jsonrpc":"2.0","method":"eth_chainId","params":[]}',
@@ -165,6 +195,49 @@ class HistoricalFoundryRelayTests(unittest.TestCase):
                     rpc._validate_historical_relay_resource_counts(
                         **limits, elapsed_seconds=elapsed
                     )
+
+    def test_upstream_response_after_absolute_deadline_is_rejected(self):
+        import scripts.historical_foundry_rpc as rpc
+
+        request = (
+            b'{"id":1,"jsonrpc":"2.0","method":"eth_chainId",'
+            b'"params":[]}'
+        )
+        for axis, clock_values, scenario_deadline in (
+            ("scenario_equal", [0.0, 1.0, 119.0, 120.0], 120.0),
+            ("run_equal", [0.0, 1.0, 21_599.0, 21_600.0], 21_600.0),
+        ):
+            with self.subTest(axis=axis):
+                lease = rpc._issue_historical_relay_lease_for_test(
+                    endpoint="https://fixture.invalid/hidden",
+                    operation=lambda _body, _remaining: (
+                        b'{"id":1,"jsonrpc":"2.0","result":"0x1"}'
+                    ),
+                    monotonic=_Clock(clock_values),
+                    entropy=lambda size: b"k" * size,
+                )
+                facade = rpc._issue_historical_relay_scenario_facade(
+                    relay_lease=lease,
+                    authority={
+                        "block_number": 1,
+                        "block_hash": "0x" + "1" * 64,
+                        "block_tag": {
+                            "blockHash": "0x" + "1" * 64,
+                            "requireCanonical": True,
+                        },
+                        "addresses": frozenset(), "calls": frozenset(),
+                    },
+                    absolute_deadline=scenario_deadline,
+                )
+                try:
+                    with self.assertRaises(TimeoutError):
+                        rpc._relay_historical_archive_call(
+                            relay_lease=facade,
+                            canonical_request_bytes=request,
+                        )
+                finally:
+                    facade.close()
+                    lease.close()
 
 
 class _Process:
@@ -349,6 +422,84 @@ def _serve_historical_anvil_fixture() -> None:
     http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
+def _serve_historical_archive_fixture() -> None:
+    """Serve the fixed fork state used by the real reviewed-Anvil KAT."""
+    port = int(sys.argv[1])
+    with open(sys.argv[2], "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    def word(value):
+        return "0x" + int(value).to_bytes(32, "big").hex()
+
+    def result(method, params):
+        if method == "eth_chainId":
+            return "0x1"
+        if method in ("eth_getBlockByNumber", "eth_getBlockByHash"):
+            return config["block"]
+        if method == "eth_getCode":
+            return config["codes"].get(params[0].lower(), "0x")
+        if method in ("eth_getBalance", "eth_getTransactionCount"):
+            return "0x0"
+        if method == "eth_getStorageAt":
+            return config["storage"].get(
+                params[0].lower() + ":" + params[1].lower(), word(0)
+            )
+        if method == "eth_call":
+            target = params[0]["to"].lower()
+            data = params[0]["data"].lower()
+            pair = config["pairs"].get(target)
+            if pair is not None and data == "0x0902f1ac":
+                return "0x" + "".join(
+                    int(value).to_bytes(32, "big").hex()
+                    for value in (
+                        pair["reserve0"], pair["reserve1"],
+                        pair["timestamp"],
+                    )
+                )
+            if data.startswith("0x70a08231") and len(data) == 74:
+                owner = "0x" + data[-40:]
+                return word(config["balances"].get(
+                    target + ":" + owner, 0
+                ))
+            return word(0)
+        raise RuntimeError("unsupported archive fixture method")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, _format, *args):
+            del args
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(
+                int(self.headers["Content-Length"])
+            ))
+            with open(config["log_path"], "a", encoding="utf-8") as log:
+                log.write(json.dumps(request, sort_keys=True) + "\n")
+            try:
+                payload = {
+                    "id": request["id"], "jsonrpc": "2.0",
+                    "result": result(request["method"], request["params"]),
+                }
+            except Exception:
+                payload = {
+                    "error": {"code": -32000, "message": "fixture failed"},
+                    "id": request.get("id"), "jsonrpc": "2.0",
+                }
+            body = json.dumps(
+                payload, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+
+    http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+
+
 class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
     """R6.3: reviewed toolchain owns spawn through exact bounded reap."""
 
@@ -399,6 +550,18 @@ class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
                     projection["schema"], "historical_foundry_anvil_argv/v1"
                 )
                 self.assertEqual(projection["fork_url_kind"], "loopback_relay")
+                self.assertEqual(
+                    projection["fixed_arguments"],
+                    (
+                        "--chain-id", "1", "--fork-chain-id", "1",
+                        "--accounts", "0", "--gas-price", "0",
+                        "--disable-default-create2-deployer",
+                        "--host", "127.0.0.1", "--no-mining", "--no-cors",
+                        "--silent", "--order", "fifo", "--steps-tracing",
+                        "--retries", "0", "--timeout", "30000",
+                        "--no-storage-caching",
+                    ),
+                )
                 self.assertNotIn("port", repr(projection).lower())
                 self.assertNotIn("http", repr(projection).lower())
                 self.assertEqual(lease.close(), None)
@@ -472,6 +635,27 @@ class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
             lease.close()
         cleanup_controlled.assert_called_once_with()
 
+    def test_reaped_child_retains_cleanup_authority_until_retry_succeeds(self):
+        import scripts.bootstrap_historical_foundry_toolchain as toolchain
+
+        process = _Process([0])
+        cleanup = mock.Mock(side_effect=(ValueError("identity drift"), None))
+        lease = toolchain._issue_historical_process_lease_for_test(
+            process=process, cleanup=cleanup,
+            binary_sha256="7" * 64, selected_block=123,
+            hardfork="osaka",
+        )
+        with self.assertRaises(ValueError):
+            lease.close()
+        self.assertFalse(lease._closed)
+        self.assertIs(lease._process, process)
+        self.assertIs(lease._cleanup, cleanup)
+        self.assertEqual(process.calls, [("terminate",), ("wait", 5.0)])
+        self.assertIsNone(lease.close())
+        self.assertTrue(lease._closed)
+        self.assertEqual(process.calls, [("terminate",), ("wait", 5.0)])
+        self.assertEqual(cleanup.call_count, 2)
+
     def test_blocked_drainer_is_joined_again_after_pipe_close(self):
         import scripts.bootstrap_historical_foundry_toolchain as toolchain
 
@@ -504,6 +688,38 @@ class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
         self.assertIsNone(lease.close())
         self.assertEqual(thread.joins, [5.0, 5.0])
 
+    def test_process_output_drainers_are_tracked_non_daemon_threads(self):
+        import scripts.bootstrap_historical_foundry_toolchain as toolchain
+
+        created = []
+
+        class Thread:
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+                self.daemon = kwargs.get("daemon")
+
+            def start(self):
+                return None
+
+            def join(self, timeout):
+                del timeout
+
+            def is_alive(self):
+                return False
+
+        process = _Process([0])
+        process.stdout = io.BytesIO(b"")
+        process.stderr = io.BytesIO(b"")
+        with mock.patch.object(toolchain.threading, "Thread", Thread):
+            lease = toolchain._issue_historical_process_lease_for_test(
+                process=process, cleanup=mock.Mock(),
+                binary_sha256="8" * 64, selected_block=123,
+                hardfork="osaka",
+            )
+        self.assertEqual(len(created), 2)
+        self.assertTrue(all(row["daemon"] is False for row in created))
+        lease.close()
+
     def test_process_reap_uses_remaining_absolute_budget_for_each_block(self):
         import scripts.bootstrap_historical_foundry_toolchain as toolchain
 
@@ -523,6 +739,108 @@ class HistoricalFoundryProcessLeaseTests(unittest.TestCase):
             ("terminate",), ("wait", 2.0),
             ("kill",), ("wait", 0.5),
         ])
+
+    def test_private_materialization_rejects_symlink_and_post_spawn_substitution(self):
+        import scripts.bootstrap_historical_foundry_toolchain as toolchain
+
+        reviewed = toolchain.open_reviewed_historical_toolchain()
+        private_parent = os.getcwd()
+        try:
+            symlink_directory = tempfile.mkdtemp(
+                prefix="materialization-symlink-", dir=private_parent
+            )
+            os.symlink("/bin/true", os.path.join(
+                symlink_directory, ".reviewed-anvil"
+            ))
+            with mock.patch.object(
+                toolchain.tempfile, "mkdtemp",
+                return_value=symlink_directory,
+            ), mock.patch.object(toolchain.subprocess, "Popen") as popen:
+                with self.assertRaises(Exception) as raised:
+                    reviewed._spawn_historical_anvil_process(
+                        selected_block=1, hardfork="osaka",
+                        relay_port=31001, anvil_port=31002,
+                    )
+                popen.assert_not_called()
+            self.assertFalse(
+                os.path.exists(symlink_directory), repr(raised.exception)
+            )
+
+            substitution_directory = tempfile.mkdtemp(
+                prefix="materialization-substitution-", dir=private_parent
+            )
+            real_stat = toolchain.os.stat
+            executable_stats = []
+
+            def substituted_stat(path, *args, **kwargs):
+                observed = real_stat(path, *args, **kwargs)
+                if path == ".reviewed-anvil":
+                    executable_stats.append(observed)
+                    if len(executable_stats) == 2:
+                        values = list(observed)
+                        values[1] += 1
+                        return os.stat_result(values)
+                return observed
+
+            process = mock.Mock()
+            process.poll.return_value = None
+            process.wait.return_value = 0
+            with mock.patch.object(
+                toolchain.tempfile, "mkdtemp",
+                return_value=substitution_directory,
+            ), mock.patch.object(
+                toolchain.os, "stat", side_effect=substituted_stat,
+            ), mock.patch.object(
+                toolchain.subprocess, "Popen", return_value=process,
+            ):
+                with self.assertRaises(Exception):
+                    reviewed._spawn_historical_anvil_process(
+                        selected_block=1, hardfork="osaka",
+                        relay_port=31003, anvil_port=31004,
+                    )
+            process.terminate.assert_called_once_with()
+            process.wait.assert_called_once()
+            self.assertFalse(os.path.exists(substitution_directory))
+
+            before = {
+                name for name in os.listdir(private_parent)
+                if name.startswith(".historical-anvil-scenario-")
+            }
+            reaped = _Process([0])
+            with mock.patch.object(
+                toolchain.subprocess, "Popen", return_value=reaped,
+            ):
+                lease = reviewed._spawn_historical_anvil_process(
+                    selected_block=1, hardfork="osaka",
+                    relay_port=31005, anvil_port=31006,
+                )
+            after = {
+                name for name in os.listdir(private_parent)
+                if name.startswith(".historical-anvil-scenario-")
+            }
+            created = after - before
+            self.assertEqual(len(created), 1)
+            materialized_directory = os.path.join(
+                private_parent, created.pop()
+            )
+            executable = os.path.join(
+                materialized_directory, ".reviewed-anvil"
+            )
+            held = os.path.join(materialized_directory, ".held-anvil")
+            os.rename(executable, held)
+            with open(executable, "wb") as handle:
+                handle.write(b"substituted")
+            os.chmod(executable, 0o700)
+            with self.assertRaises(ValueError):
+                lease.close()
+            self.assertFalse(lease._closed)
+            self.assertTrue(os.path.isdir(materialized_directory))
+            os.unlink(executable)
+            os.rename(held, executable)
+            self.assertIsNone(lease.close())
+            self.assertFalse(os.path.exists(materialized_directory))
+        finally:
+            reviewed._close()
 
 
 class HistoricalFoundryScenarioAuthorityTests(unittest.TestCase):
@@ -692,11 +1010,32 @@ class HistoricalFoundryScenarioAuthorityTests(unittest.TestCase):
                 scenario_key=row["scenario_key"],
             )
 
+            raw_block = {
+                "number": hex(row["header"]["number"]),
+                "hash": row["header"]["hash"],
+                "parentHash": row["header"]["parent_hash"],
+                "stateRoot": row["header"]["state_root"],
+                "timestamp": hex(row["header"]["timestamp"]),
+                "gasLimit": hex(row["header"]["gas_limit"]),
+                "gasUsed": hex(row["header"]["gas_used"]),
+                "baseFeePerGas": hex(row["header"]["base_fee_per_gas"]),
+                "transactions": [],
+            }
+            self.assertEqual(
+                scan._normalized_from_raw(raw_block), dict(row["header"])
+            )
+
             def operation(body, _remaining):
                 calls.append(body)
-                identifier = json.loads(body.decode("utf-8"))["id"]
+                request = json.loads(body.decode("utf-8"))
+                identifier = request["id"]
+                result = (
+                    raw_block if request["method"] in (
+                        "eth_getBlockByNumber", "eth_getBlockByHash"
+                    ) else "0x1"
+                )
                 return json.dumps({
-                    "id": identifier, "jsonrpc": "2.0", "result": "0x1",
+                    "id": identifier, "jsonrpc": "2.0", "result": result,
                 }, sort_keys=True, separators=(",", ":")).encode("ascii")
 
             lease = rpc._issue_historical_relay_lease_for_test(
@@ -716,12 +1055,19 @@ class HistoricalFoundryScenarioAuthorityTests(unittest.TestCase):
             token = config.authority.value["tokens"][0]["address"]
             executor = config.authority.value["executor"]["address"]
             calldata = anvil._balance_of_calldata(executor)
+            pair = row["reserves"]["uniswap_v2"]["pair_address"]
+            osaka_history_storage = (
+                "0x0000f90827f1c53a10cb7a02335b175320002935"
+            )
 
             valid = (
                 ("eth_chainId", []),
                 ("eth_getBlockByNumber", [hex(row["block_number"]), False]),
+                ("eth_getBlockByNumber", [hex(row["block_number"]), True]),
                 ("eth_getBlockByHash", [row["block_hash"], False]),
                 ("eth_getCode", [token, tag]),
+                ("eth_getCode", [osaka_history_storage, hex(row["block_number"])]),
+                ("eth_getStorageAt", [pair, "0x0", hex(row["block_number"])]),
                 ("eth_call", [{"to": token, "data": calldata}, tag]),
             )
             for identifier, (method, params) in enumerate(valid, 1):
@@ -732,6 +1078,66 @@ class HistoricalFoundryScenarioAuthorityTests(unittest.TestCase):
                 rpc._relay_historical_archive_call(
                     relay_lease=facade, canonical_request_bytes=body
                 )
+            anvil_wire_body = (
+                b'{"method":"eth_chainId","params":[],"id":0,'
+                b'"jsonrpc":"2.0"}'
+            )
+            rpc._relay_historical_archive_call(
+                relay_lease=facade, canonical_request_bytes=anvil_wire_body
+            )
+            self.assertEqual(
+                calls[-1],
+                b'{"id":0,"jsonrpc":"2.0","method":"eth_chainId",'
+                b'"params":[]}',
+            )
+            full_transaction = {
+                "hash": "0x" + "12" * 32,
+                "blockHash": row["block_hash"],
+                "blockNumber": hex(row["block_number"]),
+                "transactionIndex": "0x0",
+            }
+            full_block = dict(raw_block, transactions=[full_transaction])
+            full_request = {
+                "id": 40, "jsonrpc": "2.0",
+                "method": "eth_getBlockByNumber",
+                "params": [hex(row["block_number"]), True],
+            }
+            rpc._validate_historical_relay_response(
+                authority=facade._authority, request=full_request,
+                response={"id": 40, "jsonrpc": "2.0", "result": full_block},
+            )
+            for axis, mutate in (
+                ("block_hash", lambda value: value.__setitem__(
+                    "hash", "0x" + "00" * 32
+                )),
+                ("tx_block", lambda value: value["transactions"][0].__setitem__(
+                    "blockHash", "0x" + "00" * 32
+                )),
+                ("tx_number", lambda value: value["transactions"][0].__setitem__(
+                    "blockNumber", "0x0"
+                )),
+                ("tx_index", lambda value: value["transactions"][0].__setitem__(
+                    "transactionIndex", "0x1"
+                )),
+                ("tx_hash", lambda value: value["transactions"][0].__setitem__(
+                    "hash", "0x1"
+                )),
+                ("duplicate", lambda value: value["transactions"].append(
+                    copy.deepcopy(value["transactions"][0])
+                )),
+            ):
+                changed = copy.deepcopy(full_block)
+                mutate(changed)
+                with self.subTest(response_axis=axis):
+                    with self.assertRaises(ValueError):
+                        rpc._validate_historical_relay_response(
+                            authority=facade._authority,
+                            request=full_request,
+                            response={
+                                "id": 40, "jsonrpc": "2.0",
+                                "result": changed,
+                            },
+                        )
             accepted = len(calls)
             invalid = (
                 {"id": 20, "jsonrpc": "2.0", "method": "eth_getBlockByNumber", "params": [hex(row["block_number"] - 1), False]},
@@ -739,6 +1145,7 @@ class HistoricalFoundryScenarioAuthorityTests(unittest.TestCase):
                 {"id": 22, "jsonrpc": "2.0", "method": "eth_getCode", "params": ["0x" + "00" * 20, tag]},
                 {"id": 23, "jsonrpc": "2.0", "method": "eth_call", "params": [{"to": token, "data": "0x00000000"}, tag]},
                 {"id": 24, "jsonrpc": "2.0", "method": "eth_chainId", "params": [1]},
+                {"id": 25, "jsonrpc": "2.0", "method": "eth_getStorageAt", "params": [pair, "0x00", hex(row["block_number"])]},
             )
             bad_bodies = [
                 json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
@@ -747,7 +1154,11 @@ class HistoricalFoundryScenarioAuthorityTests(unittest.TestCase):
             bad_bodies.extend((
                 b'[{"id":25,"jsonrpc":"2.0","method":"eth_chainId","params":[]}]',
                 b'{"id":26,"id":27,"jsonrpc":"2.0","method":"eth_chainId","params":[]}',
-                b'{"id":0,"jsonrpc":"2.0","method":"eth_chainId","params":[]}',
+                b'{"id":-1,"jsonrpc":"2.0","method":"eth_chainId","params":[]}',
+                b'{"id":true,"jsonrpc":"2.0","method":"eth_chainId","params":[]}',
+                b'{"id":0.0,"jsonrpc":"2.0","method":"eth_chainId","params":[]}',
+                b'{"id":"0","jsonrpc":"2.0","method":"eth_chainId","params":[]}',
+                b'{"id":null,"jsonrpc":"2.0","method":"eth_chainId","params":[]}',
                 b"{" + b"x" * 4_194_304,
             ))
             for body in bad_bodies:
@@ -1114,14 +1525,14 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         ).hexdigest()
         return proof
 
-    def _quartet(self, override, row=None):
+    def _quartet(self, override, row=None, *, revert_call=None):
         row = self.rows[0] if row is None else row
         scenario_key = override["scenario_key"]
-        overlay_bytes = self._canonical(override)
+        reverted = revert_call is not None
         receipt = {
             "schema": "historical_foundry_receipt/v1",
             "scenario_key": scenario_key,
-            "status": 1,
+            "status": 0 if reverted else 1,
             "blockNumber": override["synthetic_block"]["number"],
             "blockHash": "0x" + "b" * 64,
             "transactionIndex": 0,
@@ -1129,13 +1540,53 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
             "effectiveGasPrice": 7,
             "transactionHash": "0x" + "c" * 64,
         }
+        if reverted:
+            receipt["revert_data"] = "0x" + keccak256(
+                b"ExternalCallFailed()"
+            )[:4].hex()
         receipt_bytes = self._canonical(receipt)
         trace = {
             "schema": "historical_foundry_trace/v1",
             "scenario_key": scenario_key,
-            "failed": False,
+            "failed": reverted,
             "gasprice_opcode_addresses": [],
-            "calls": [],
+            "calls": [dict(revert_call)] if reverted else [],
+        }
+        trace_config = {
+            "disableStack": False,
+            "disableStorage": False,
+            "enableMemory": True,
+            "enableReturnData": True,
+        }
+        trace["struct_logs"] = [
+            {
+                "pc": 0, "op": "PUSH1", "gas": 100,
+                "gasCost": 3, "depth": 1, "stack": [], "memory": [],
+                "refund": 0, "returnData": "0x",
+            },
+            {
+                "pc": 2, "op": "STOP", "gas": 97,
+                "gasCost": 0, "depth": 1, "stack": [], "memory": [],
+                "refund": 0, "returnData": "0x",
+                "storage": {},
+            },
+        ]
+        trace["raw_trace_closure"] = {
+            "gas": receipt["gasUsed"],
+            "failed": reverted,
+            "return_value": "0xdeadbeef" if reverted else "0x",
+        }
+        trace["struct_log_storage"] = {
+            "schema": "historical_foundry_sparse_storage_trace/v1",
+            "anvil_binary_sha256": next(
+                value["sha256"] for value in self.config.toolchain.value["binaries"]
+                if value["name"] == "anvil"
+            ),
+            "trace_config_sha256": hashlib.sha256(
+                self._canonical(trace_config)
+            ).hexdigest(),
+            "storage_omitted_step_count": 1,
+            "storage_explicit_step_count": 1,
         }
         pair_closure = {
             venue_id: {
@@ -1146,6 +1597,15 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                 "pair_weth_balance_raw": row["reserves"][venue_id]["reserve_weth_raw"],
             } for venue_id in ("uniswap_v2", "sushiswap_v2")
         }
+        override["pair_balance_baseline"] = {
+            venue_id: {
+                "pair_address": value["pair_address"],
+                "pair_uni_balance_raw": value["pair_uni_balance_raw"],
+                "pair_weth_balance_raw": value["pair_weth_balance_raw"],
+            }
+            for venue_id, value in pair_closure.items()
+        }
+        overlay_bytes = self._canonical(override)
         second_venue = (
             "sushiswap_v2"
             if row["direction"] == "uniswap_to_sushiswap"
@@ -1155,12 +1615,18 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         balances = {
             "initial_weth_raw": row["amount_weth_in_wei"],
             "initial_uni_raw": 0,
-            "final_weth_raw": row["second_amount_out_raw"],
+            "final_weth_raw": (
+                row["amount_weth_in_wei"]
+                if reverted else row["second_amount_out_raw"]
+            ),
             "final_uni_raw": 0,
         }
         actual_deltas = {
-            "first_leg_uni_raw": row["first_amount_out_raw"],
-            "weth_raw": row["second_amount_out_raw"] - row["amount_weth_in_wei"],
+            "first_leg_uni_raw": 0 if reverted else row["first_amount_out_raw"],
+            "weth_raw": (
+                0 if reverted else row["second_amount_out_raw"]
+                - row["amount_weth_in_wei"]
+            ),
             "residual_uni_raw": 0,
         }
         trace.update({
@@ -1176,8 +1642,8 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         result = {
             "schema": "historical_foundry_replay_result/v1",
             "scenario_key": scenario_key,
-            "status": 1,
-            "classification": "replay_success",
+            "status": receipt["status"],
+            "classification": "closed_revert" if reverted else "replay_success",
             "overlay_sha256": hashlib.sha256(overlay_bytes).hexdigest(),
             "receipt_sha256": receipt_sha,
             "trace_sha256": trace_sha,
@@ -1201,11 +1667,19 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                 "failed": trace["failed"],
                 "gasprice_opcode_addresses": trace["gasprice_opcode_addresses"],
                 "calls": trace["calls"],
+                "raw_trace_closure": trace["raw_trace_closure"],
+                "struct_log_storage": trace["struct_log_storage"],
             },
             "proof_authority": {
                 "policy_sha256": self.config.policy.physical_sha256,
                 "authority_sha256": self.config.authority.physical_sha256,
                 "toolchain_sha256": self.config.toolchain.physical_sha256,
+                "anvil_binary_sha256": trace["struct_log_storage"][
+                    "anvil_binary_sha256"
+                ],
+                "trace_config_sha256": trace["struct_log_storage"][
+                    "trace_config_sha256"
+                ],
                 "adapter_proof_sha256": self.artifact.verified_identity[
                     "creation_bytecode_sha256"
                 ],
@@ -1214,7 +1688,9 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                 ],
                 "requested_notional_usd": row["requested_notional_usd"],
                 "amount_weth_in_wei": row["amount_weth_in_wei"],
-                "actual_first_leg_uni_raw": row["first_amount_out_raw"],
+                "actual_first_leg_uni_raw": (
+                    0 if reverted else row["first_amount_out_raw"]
+                ),
                 "direction": row["direction"],
                 "second_leg_pair_address": second_reserves["pair_address"],
                 "second_leg_reserve_uni_raw": second_reserves["reserve_uni_raw"],
@@ -1225,10 +1701,11 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                 "v2_fee_denominator": 1000,
                 "acceptance_mev_bps": "10",
             },
-            "cost_proof_inputs": self._proof(
-                scenario_key, receipt_sha, trace_sha, receipt, row=row
-            ),
         }
+        if not reverted:
+            result["cost_proof_inputs"] = self._proof(
+                scenario_key, receipt_sha, trace_sha, receipt, row=row
+            )
         return (
             ("overlay", overlay_bytes),
             ("receipt", receipt_bytes),
@@ -1384,7 +1861,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                         role=role, byte_count=limit + 1
                     )
 
-    def test_quartet_failure_before_single_rename_exposes_no_formal_scenario(self):
+    def test_quartet_post_rename_failure_restores_exact_retryable_predecessor(self):
         import scripts.historical_foundry_anvil as anvil
         import scripts.historical_foundry_storage as storage
 
@@ -1398,29 +1875,371 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         quartet = self._quartet(override)
         for role, payload in quartet[:3]:
             sink.write_member(role=role, canonical_bytes=payload)
+        predecessor = self.prefilter.frozen_identity_projection()
         observed = []
 
-        def fail_before_rename(phase):
+        def fail_after_rename(phase):
             observed.append(phase)
-            if phase == "pre_rename":
-                self.assertEqual(
-                    list(self.fixture.data_dir.rglob(self.scenario.scenario_key)),
-                    [],
-                )
-                raise OSError("injected rename boundary")
+            if phase == "post_rename":
+                raise OSError("injected post-rename boundary")
 
         with mock.patch.object(
             storage, "_task6_commit_checkpoint",
-            side_effect=fail_before_rename,
+            side_effect=fail_after_rename,
         ):
             with self.assertRaises(Exception):
                 sink.write_member(
                     role=quartet[3][0], canonical_bytes=quartet[3][1]
                 )
-        self.assertIn("pre_rename", observed)
+        self.assertIn("post_rename", observed)
         self.assertEqual(
             list(self.fixture.data_dir.rglob(self.scenario.scenario_key)), []
         )
+        self.assertEqual(
+            self.prefilter.frozen_identity_projection(), predecessor
+        )
+        sink.write_member(
+            role=quartet[3][0], canonical_bytes=quartet[3][1]
+        )
+        self.assertEqual(sink.validated_ledger().generation, 3)
+        self.prefilter = sink.validated_ledger().staging_snapshot()
+
+    def test_quartet_journal_recovers_every_publication_boundary(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        phases = (
+            "journal_write", "owner_prepare", "successor_prepare",
+            "ledger_prepare", "pre_rename", "post_rename",
+            "post_rename_fsync", "journal_cleanup",
+        )
+        for phase in phases:
+            fixture = scan_fixtures.HistoricalPrefilterGridTests._new_fixture()
+            capture = prefilter = context = None
+            with self.subTest(phase=phase):
+                try:
+                    config, capture, prefilter, window, grid, rows = (
+                        HistoricalFoundryScenarioAuthorityTests._prepared(
+                            fixture
+                        )
+                    )
+                    scenario = scan._issue_validated_replay_scenario(
+                        staging=prefilter, window=window, grid=grid,
+                        scenario_key=rows[0]["scenario_key"],
+                    )
+                    context = anvil.open_historical_replay_context(
+                        config=config, staging=prefilter, window=window,
+                        grid=grid,
+                        executor_artifact=build_validated_executor_artifact(
+                            config
+                        ),
+                    )
+                    helper = HistoricalFoundryOverlayTests(
+                        "test_overlay_known_answer_and_sender_funding_are_internal"
+                    )
+                    helper.config = config
+                    helper.artifact = context._artifact
+                    helper.rows = rows
+                    override = anvil.build_historical_state_override(
+                        context=context, scenario=scenario
+                    )
+                    quartet = helper._quartet(override)
+                    sink = anvil._open_scenario_evidence_sink(
+                        context=context, scenario=scenario
+                    )
+                    for role, payload in quartet[:3]:
+                        sink.write_member(
+                            role=role, canonical_bytes=payload
+                        )
+                    predecessor = prefilter.frozen_identity_projection()
+
+                    def fail_selected(observed):
+                        if observed == phase:
+                            raise OSError("injected transaction boundary")
+
+                    with mock.patch.object(
+                        storage, "_task6_commit_checkpoint",
+                        side_effect=fail_selected,
+                    ):
+                        with self.assertRaises(Exception):
+                            sink.write_member(
+                                role=quartet[3][0],
+                                canonical_bytes=quartet[3][1],
+                            )
+                    self.assertEqual(
+                        prefilter.frozen_identity_projection(), predecessor
+                    )
+                    self.assertEqual(
+                        list(fixture.data_dir.rglob(scenario.scenario_key)),
+                        [],
+                    )
+                    sink.write_member(
+                        role=quartet[3][0],
+                        canonical_bytes=quartet[3][1],
+                    )
+                    self.assertEqual(sink.validated_ledger().generation, 3)
+                    prefilter = sink.validated_ledger().staging_snapshot()
+                finally:
+                    if context is not None:
+                        context.close()
+                    scan_fixtures.HistoricalPrefilterGridTests._close_fixture(
+                        fixture, capture, prefilter
+                    )
+
+    def test_quartet_failed_rollback_retains_journal_and_blocks_consumers(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_storage as storage
+
+        self._open_context()
+        override = anvil.build_historical_state_override(
+            context=self.context, scenario=self.scenario
+        )
+        sink = anvil._open_scenario_evidence_sink(
+            context=self.context, scenario=self.scenario
+        )
+        quartet = self._quartet(override)
+        for role, payload in quartet[:3]:
+            sink.write_member(role=role, canonical_bytes=payload)
+        predecessor = self.prefilter.frozen_identity_projection()
+        failed_publication = [False]
+
+        def fail_publication_and_rollback(phase):
+            if phase == "post_rename":
+                failed_publication[0] = True
+                raise OSError("injected publication failure")
+            if phase == "rollback" and failed_publication[0]:
+                raise OSError("injected rollback failure")
+
+        with mock.patch.object(
+            storage, "_task6_commit_checkpoint",
+            side_effect=fail_publication_and_rollback,
+        ):
+            with self.assertRaises(Exception):
+                sink.write_member(
+                    role=quartet[3][0], canonical_bytes=quartet[3][1]
+                )
+            with self.assertRaises(Exception):
+                self.prefilter.frozen_identity_projection()
+            with self.assertRaises(Exception):
+                sink.validated_ledger()
+        self.assertEqual(
+            self.prefilter.frozen_identity_projection(), predecessor
+        )
+        self.assertEqual(
+            list(self.fixture.data_dir.rglob(self.scenario.scenario_key)), []
+        )
+
+    def _retain_post_rename_transaction(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_storage as storage
+
+        self._open_context()
+        override = anvil.build_historical_state_override(
+            context=self.context, scenario=self.scenario
+        )
+        sink = anvil._open_scenario_evidence_sink(
+            context=self.context, scenario=self.scenario
+        )
+        quartet = self._quartet(override)
+        for role, payload in quartet[:3]:
+            sink.write_member(role=role, canonical_bytes=payload)
+        predecessor = self.prefilter.frozen_identity_projection()
+        publication_failed = [False]
+
+        def retain_journal(phase):
+            if phase == "post_rename":
+                publication_failed[0] = True
+                raise OSError("injected publication failure")
+            if phase == "rollback" and publication_failed[0]:
+                raise OSError("injected rollback failure")
+
+        with mock.patch.object(
+            storage, "_task6_commit_checkpoint", side_effect=retain_journal
+        ):
+            with self.assertRaises(Exception):
+                sink.write_member(
+                    role=quartet[3][0], canonical_bytes=quartet[3][1]
+                )
+        journals = list(self.fixture.data_dir.rglob(".transaction-*.json"))
+        self.assertEqual(len(journals), 1)
+        storage._drop_historical_quartet_transaction_memory_for_test(
+            self.prefilter
+        )
+        return sink, quartet, predecessor, journals[0]
+
+    def test_quartet_disk_journal_recovers_after_transaction_registry_loss(self):
+        sink, quartet, predecessor, journal = (
+            self._retain_post_rename_transaction()
+        )
+        self.assertTrue(journal.is_file())
+        self.assertEqual(
+            self.prefilter.frozen_identity_projection(), predecessor
+        )
+        self.assertFalse(journal.exists())
+        self.assertEqual(
+            list(self.fixture.data_dir.rglob(self.scenario.scenario_key)), []
+        )
+        sink.write_member(
+            role=quartet[3][0], canonical_bytes=quartet[3][1]
+        )
+        self.assertEqual(sink.validated_ledger().generation, 3)
+        self.prefilter = sink.validated_ledger().staging_snapshot()
+
+    def test_quartet_disk_journal_tamper_fails_closed_without_cross_delete(self):
+        mutation_names = (
+            "raw_byte", "transaction_id", "member_digest",
+            "predecessor_quota", "predecessor_generation",
+        )
+        for axis in mutation_names:
+            fixture = scan_fixtures.HistoricalPrefilterGridTests._new_fixture()
+            capture = prefilter = context = None
+            with self.subTest(axis=axis):
+                try:
+                    import scripts.historical_foundry_anvil as anvil
+                    import scripts.historical_foundry_scan as scan
+                    import scripts.historical_foundry_storage as storage
+
+                    config, capture, prefilter, window, grid, rows = (
+                        HistoricalFoundryScenarioAuthorityTests._prepared(
+                            fixture
+                        )
+                    )
+                    scenario = scan._issue_validated_replay_scenario(
+                        staging=prefilter, window=window, grid=grid,
+                        scenario_key=rows[0]["scenario_key"],
+                    )
+                    context = anvil.open_historical_replay_context(
+                        config=config, staging=prefilter, window=window,
+                        grid=grid,
+                        executor_artifact=build_validated_executor_artifact(
+                            config
+                        ),
+                    )
+                    helper = HistoricalFoundryOverlayTests(
+                        "test_overlay_known_answer_and_sender_funding_are_internal"
+                    )
+                    helper.config = config
+                    helper.artifact = context._artifact
+                    helper.rows = rows
+                    override = anvil.build_historical_state_override(
+                        context=context, scenario=scenario
+                    )
+                    quartet = helper._quartet(override)
+                    sink = anvil._open_scenario_evidence_sink(
+                        context=context, scenario=scenario
+                    )
+                    for role, payload in quartet[:3]:
+                        sink.write_member(role=role, canonical_bytes=payload)
+                    publication_failed = [False]
+
+                    def retain_journal(phase):
+                        if phase == "post_rename":
+                            publication_failed[0] = True
+                            raise OSError("injected publication failure")
+                        if phase == "rollback" and publication_failed[0]:
+                            raise OSError("injected rollback failure")
+
+                    with mock.patch.object(
+                        storage, "_task6_commit_checkpoint",
+                        side_effect=retain_journal,
+                    ):
+                        with self.assertRaises(Exception):
+                            sink.write_member(
+                                role=quartet[3][0],
+                                canonical_bytes=quartet[3][1],
+                            )
+                    journal = next(
+                        fixture.data_dir.rglob(".transaction-*.json")
+                    )
+                    original = journal.read_bytes()
+                    document = json.loads(original)
+                    if axis == "raw_byte":
+                        mutated = original[:-2] + b"0}"
+                    else:
+                        if axis == "transaction_id":
+                            document["transaction_id"] = "0" * 32
+                        elif axis == "member_digest":
+                            document["members"][0]["sha256"] = "0" * 64
+                        elif axis == "predecessor_quota":
+                            document["predecessor_quota_physical_bytes"] += 1
+                        else:
+                            document["predecessor_generation"] = 3
+                        mutated = json.dumps(
+                            document, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8") + b"\n"
+                    storage._drop_historical_quartet_transaction_memory_for_test(
+                        prefilter
+                    )
+                    sentinel = journal.parent / "unrelated-scenario"
+                    sentinel.mkdir()
+                    (sentinel / "sentinel").write_bytes(b"unrelated")
+                    journal.write_bytes(mutated)
+                    with self.assertRaises(Exception):
+                        prefilter.frozen_identity_projection()
+                    self.assertTrue((sentinel / "sentinel").is_file())
+                    self.assertTrue(journal.is_file())
+                finally:
+                    if context is not None:
+                        context.close()
+                    scan_fixtures.HistoricalPrefilterGridTests._close_fixture(
+                        fixture, capture, prefilter
+                    )
+
+    def test_replay_boundary_types_and_sanitizes_all_ordinary_validation(self):
+        import scripts.historical_foundry_anvil as anvil
+
+        self._open_context()
+        sink = anvil._open_scenario_evidence_sink(
+            context=self.context, scenario=self.scenario
+        )
+        cases = (
+            ("context", object(), self.scenario, sink, "authority"),
+            ("sink", self.context, self.scenario, object(), "authority"),
+            ("scenario", self.context, object(), sink, "authority"),
+        )
+        for axis, context, scenario, selected_sink, category in cases:
+            with self.subTest(axis=axis):
+                with self.assertRaises(anvil.HistoricalReplayError) as raised:
+                    anvil._replay_historical_scenario(
+                        context=context, scenario=scenario, sink=selected_sink
+                    )
+                self.assertEqual(raised.exception.category, category)
+        for error in (
+            RuntimeError("secret endpoint /tmp/private --fork-url"),
+            ValueError("secret argv /Users/private/key"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(
+                    anvil, "build_historical_state_override",
+                    side_effect=error,
+                ):
+                    with self.assertRaises(
+                        anvil.HistoricalReplayError
+                    ) as raised:
+                        anvil._replay_historical_scenario(
+                            context=self.context, scenario=self.scenario,
+                            sink=sink,
+                        )
+                self.assertEqual(
+                    raised.exception.category, "foundry_replay_failed"
+                )
+                rendered = repr(raised.exception) + str(raised.exception)
+                self.assertNotIn("secret", rendered)
+                self.assertNotIn("/tmp", rendered)
+                self.assertNotIn("/Users", rendered)
+                self.assertNotIn("--fork-url", rendered)
+        for control in (KeyboardInterrupt(), SystemExit()):
+            with self.subTest(control=type(control).__name__):
+                with mock.patch.object(
+                    anvil, "build_historical_state_override",
+                    side_effect=control,
+                ):
+                    with self.assertRaises(type(control)):
+                        anvil._replay_historical_scenario(
+                            context=self.context, scenario=self.scenario,
+                            sink=sink,
+                        )
 
     def test_storage_recomputes_result_closure_and_proof_authority(self):
         import scripts.historical_foundry_anvil as anvil
@@ -1663,38 +2482,311 @@ class HistoricalFoundryClosedRevertTests(unittest.TestCase):
                 fixture, capture, prefilter
             )
 
+    def test_protocol_system_addresses_are_exact_hardfork_authority(self):
+        import scripts.historical_foundry_rpc as rpc
+
+        address = "0x0000f90827f1c53a10cb7a02335b175320002935"
+        self.assertEqual(
+            rpc._historical_protocol_system_addresses(hardfork="osaka"),
+            frozenset((address,)),
+        )
+        for hardfork in ("prague", "cancun", "", None):
+            with self.subTest(hardfork=hardfork):
+                self.assertEqual(
+                    rpc._historical_protocol_system_addresses(
+                        hardfork=hardfork
+                    ),
+                    frozenset(),
+                )
+
+    def test_local_view_call_requires_sealed_executor_and_no_value(self):
+        import scripts.historical_foundry_anvil as anvil
+
+        executor = "0x" + "11" * 20
+        target = "0x" + "22" * 20
+        request = {"from": executor, "to": target, "data": "0x0902f1ac"}
+        self.assertEqual(
+            anvil._validate_historical_local_read_request(
+                request=request, expected_executor=executor
+            ),
+            request,
+        )
+        for axis, changed in (
+            ("missing_from", {"to": target, "data": "0x0902f1ac"}),
+            ("wrong_from", dict(request, **{"from": "0x" + "33" * 20})),
+            ("value", dict(request, value="0x0")),
+            ("caller_field", dict(request, caller=executor)),
+        ):
+            with self.subTest(axis=axis):
+                with self.assertRaises(ValueError):
+                    anvil._validate_historical_local_read_request(
+                        request=changed, expected_executor=executor
+                    )
+
+    def test_status_zero_quartet_freezes_only_exact_atomic_rollback(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        unit = 10 ** 18
+        fixture = scan_fixtures._Task4bOfflineCapabilityFixture(
+            split_reserve_root=False,
+            record_calls=False,
+            reserve_by_target={
+                scan_fixtures.PAIR_UNISWAP: (0, unit),
+                scan_fixtures.PAIR_SUSHI: (unit, unit),
+            },
+        )
+        capture = prefilter = context = None
+        try:
+            config, capture, prefilter, window, grid, rows = (
+                HistoricalFoundryScenarioAuthorityTests._prepared(fixture)
+            )
+            row = rows[0]
+            self.assertEqual(row["reason"], "first_leg_zero_output")
+            scenario = scan._issue_validated_replay_scenario(
+                staging=prefilter, window=window, grid=grid,
+                scenario_key=row["scenario_key"],
+            )
+            artifact = build_validated_executor_artifact(config)
+            context = anvil.open_historical_replay_context(
+                config=config, staging=prefilter, window=window, grid=grid,
+                executor_artifact=artifact,
+            )
+            override = anvil.build_historical_state_override(
+                context=context, scenario=scenario
+            )
+            matrix = config.policy.value["closed_revert_matrix"][0]
+            router = next(
+                venue["router_address"]
+                for venue in config.authority.value["venues"]
+                if venue["venue_id"] == "uniswap_v2"
+            )
+            call = {
+                "call_path": [0],
+                "leg": "first_leg",
+                "router": router,
+                "revert_selector": matrix["revert_selector"],
+                "revert_data_sha256": matrix["revert_data_sha256"],
+            }
+            helper = HistoricalFoundryOverlayTests(
+                "test_overlay_known_answer_and_sender_funding_are_internal"
+            )
+            helper.config = config
+            helper.artifact = artifact
+            helper.rows = rows
+            quartet = helper._quartet(
+                override, row=row, revert_call=call
+            )
+            members = dict(quartet)
+            projection = storage._validate_historical_quartet_for_test(
+                staging=prefilter, scenario_key=row["scenario_key"],
+                members=members,
+            )
+            self.assertIsNone(projection["proof_inputs_hash"])
+            for axis, section, field in (
+                ("final_weth", "balances", "final_weth_raw"),
+                ("final_uni", "balances", "final_uni_raw"),
+                ("first_leg", "actual_deltas", "first_leg_uni_raw"),
+                ("weth_delta", "actual_deltas", "weth_raw"),
+                ("residual", "actual_deltas", "residual_uni_raw"),
+            ):
+                changed = json.loads(members["result"])
+                changed[section][field] += 1
+                changed_members = dict(members)
+                changed_members["result"] = helper._canonical(changed)
+                with self.subTest(axis=axis):
+                    with self.assertRaises(ValueError):
+                        storage._validate_historical_quartet_for_test(
+                            staging=prefilter,
+                            scenario_key=row["scenario_key"],
+                            members=changed_members,
+                        )
+            for axis, mutate in (
+                ("omitted_count", lambda value: value["struct_log_storage"].__setitem__(
+                    "storage_omitted_step_count", 2
+                )),
+                ("explicit_count", lambda value: value["struct_log_storage"].__setitem__(
+                    "storage_explicit_step_count", 2
+                )),
+                ("anvil_sha", lambda value: value["struct_log_storage"].__setitem__(
+                    "anvil_binary_sha256", "0" * 64
+                )),
+                ("trace_config", lambda value: value["struct_log_storage"].__setitem__(
+                    "trace_config_sha256", "0" * 64
+                )),
+                ("missing_other_field", lambda value: value["struct_logs"][0].pop(
+                    "refund"
+                )),
+                ("explicit_storage", lambda value: value["struct_logs"][1].__setitem__(
+                    "storage", {"0x1": "0x" + "00" * 32}
+                )),
+                ("raw_failed", lambda value: value["raw_trace_closure"].__setitem__(
+                    "failed", False
+                )),
+            ):
+                changed_trace = json.loads(gzip.decompress(members["trace"]))
+                mutate(changed_trace)
+                changed_trace_bytes = gzip.compress(
+                    helper._canonical(changed_trace), mtime=0
+                )
+                changed_result = json.loads(members["result"])
+                changed_result["trace_sha256"] = hashlib.sha256(
+                    changed_trace_bytes
+                ).hexdigest()
+                changed_result["trace_closure"]["raw_trace_closure"] = (
+                    changed_trace["raw_trace_closure"]
+                )
+                changed_result["trace_closure"]["struct_log_storage"] = (
+                    changed_trace["struct_log_storage"]
+                )
+                changed_result["proof_authority"]["anvil_binary_sha256"] = (
+                    changed_trace["struct_log_storage"]["anvil_binary_sha256"]
+                )
+                changed_result["proof_authority"]["trace_config_sha256"] = (
+                    changed_trace["struct_log_storage"]["trace_config_sha256"]
+                )
+                changed_members = dict(members)
+                changed_members["trace"] = changed_trace_bytes
+                changed_members["result"] = helper._canonical(changed_result)
+                with self.subTest(trace_axis=axis):
+                    with self.assertRaises(ValueError):
+                        storage._validate_historical_quartet_for_test(
+                            staging=prefilter,
+                            scenario_key=row["scenario_key"],
+                            members=changed_members,
+                        )
+            sink = anvil._open_scenario_evidence_sink(
+                context=context, scenario=scenario
+            )
+            for role, payload in quartet:
+                sink.write_member(role=role, canonical_bytes=payload)
+            self.assertEqual(sink.validated_ledger().scenario_key, row[
+                "scenario_key"
+            ])
+            prefilter = sink.validated_ledger().staging_snapshot()
+        finally:
+            if context is not None:
+                context.close()
+            scan_fixtures.HistoricalPrefilterGridTests._close_fixture(
+                fixture, capture, prefilter
+            )
+
 
 class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
+    def test_context_retains_unreaped_process_and_live_relay_until_retry(self):
+        import scripts.historical_foundry_anvil as anvil
+
+        class BaseLease:
+            def __init__(self):
+                self.closes = 0
+
+            def close(self):
+                self.closes += 1
+
+            _close = close
+
+        class ProcessLease:
+            def __init__(self):
+                self.attempts = 0
+                self._closed = False
+
+            def _close_with_budget(self, remaining):
+                self.attempts += 1
+                self.asserted_budget = remaining(5.0)
+                if self.attempts == 1:
+                    raise ValueError("kill/wait left child alive")
+                self._closed = True
+
+        class RelayLease:
+            def __init__(self):
+                self.attempts = 0
+                self.closed = False
+
+            def close(self):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise ValueError("handler remains alive")
+                self.closed = True
+
+            def _is_closed(self):
+                return self.closed
+
+        for axis in ("process", "relay"):
+            with self.subTest(axis=axis):
+                base_relay = BaseLease()
+                toolchain = BaseLease()
+                process = ProcessLease() if axis == "process" else None
+                relay = RelayLease() if axis == "relay" else None
+                context = anvil._issue_replay_context(
+                    _config=None, _staging=None, _window=None, _grid=None,
+                    _artifact=None, _runtime=b"runtime",
+                    _runtime_sha256="1" * 64, _toolchain=toolchain,
+                    _relay_lease=base_relay,
+                    _active_process_lease=process,
+                    _active_relay_lease=relay,
+                    _clock=lambda: 10.0, _run_deadline=10.0,
+                    _scenario_deadline=10.0, _closed=False,
+                )
+                with self.assertRaises(ValueError):
+                    context.close()
+                self.assertFalse(context._closed)
+                self.assertIs(context._active_process_lease, process)
+                self.assertIs(context._active_relay_lease, relay)
+                self.assertEqual(base_relay.closes, 0)
+                self.assertEqual(toolchain.closes, 0)
+                object.__setattr__(context, "_run_deadline", 20.0)
+                object.__setattr__(context, "_scenario_deadline", 20.0)
+                context.close()
+                self.assertTrue(context._closed)
+                self.assertIsNone(context._active_process_lease)
+                self.assertIsNone(context._active_relay_lease)
+                self.assertEqual(base_relay.closes, 1)
+                self.assertEqual(toolchain.closes, 1)
+
     def test_pair_closure_and_full_type2_envelope_reject_one_field_drift(self):
         import scripts.historical_foundry_anvil as anvil
 
-        pair_state = {
+        reserve_authority = {
             "uniswap_v2": {
                 "pair_address": "0x" + "11" * 20,
                 "reserve_uni_raw": 10,
                 "reserve_weth_raw": 20,
-                "pair_uni_balance_raw": 10,
-                "pair_weth_balance_raw": 20,
             },
             "sushiswap_v2": {
                 "pair_address": "0x" + "22" * 20,
                 "reserve_uni_raw": 30,
                 "reserve_weth_raw": 40,
-                "pair_uni_balance_raw": 30,
-                "pair_weth_balance_raw": 40,
             },
+        }
+        pair_state = {
+            "uniswap_v2": dict(
+                reserve_authority["uniswap_v2"],
+                pair_uni_balance_raw=17,
+                pair_weth_balance_raw=29,
+            ),
+            "sushiswap_v2": dict(
+                reserve_authority["sushiswap_v2"],
+                pair_uni_balance_raw=41,
+                pair_weth_balance_raw=53,
+            ),
         }
         self.assertEqual(
             anvil._validate_historical_pair_closure(
-                expected=pair_state, before=pair_state, after=pair_state
+                expected=reserve_authority, before=pair_state,
+                after=pair_state,
             ),
             pair_state,
         )
-        for phase in ("before", "after"):
+        for phase in ("expected", "after"):
             changed = copy.deepcopy(pair_state)
-            changed["uniswap_v2"]["pair_uni_balance_raw"] += 1
+            if phase == "expected":
+                changed = copy.deepcopy(reserve_authority)
+                changed["uniswap_v2"]["reserve_uni_raw"] += 1
+            else:
+                changed["uniswap_v2"]["pair_uni_balance_raw"] += 1
             arguments = {
-                "expected": pair_state, "before": pair_state,
+                "expected": reserve_authority, "before": pair_state,
                 "after": pair_state,
             }
             arguments[phase] = changed
@@ -1758,34 +2850,91 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
             "structLogs": [{
                 "pc": 0, "op": "PUSH1", "gas": 100, "gasCost": 3,
                 "depth": 1, "stack": [], "memory": [], "storage": {},
+                "refund": 0, "returnData": "0x",
             }],
+        }
+        trace_authority = {
+            "anvil_binary_sha256": (
+                "5c9f9aad323062b1c0421a63595741430acaea150da3611e38c45071e4cf4e28"
+            ),
+            "trace_config": anvil._historical_struct_trace_config(),
+        }
+        complete = anvil._validate_historical_raw_trace(
+            raw_trace=raw_trace, expected_failed=False, **trace_authority
+        )
+        self.assertEqual(complete["gasprice_operations"], [])
+        self.assertEqual(complete["storage_explicit_step_count"], 1)
+        self.assertEqual(complete["storage_omitted_step_count"], 0)
+        prefixed_storage = copy.deepcopy(raw_trace)
+        prefixed_storage["structLogs"][0]["storage"] = {
+            "0x" + "01" * 32: "0x" + "02" * 32,
         }
         self.assertEqual(
             anvil._validate_historical_raw_trace(
-                raw_trace=raw_trace, expected_failed=False
-            ),
-            [],
+                raw_trace=prefixed_storage, expected_failed=False,
+                **trace_authority
+            )["storage_explicit_step_count"],
+            1,
         )
+        for invalid_storage in (
+            {"0x1": "0x" + "02" * 32},
+            {"0x" + "01" * 32: "0x2"},
+            {"0X" + "01" * 32: "0x" + "02" * 32},
+        ):
+            changed = copy.deepcopy(raw_trace)
+            changed["structLogs"][0]["storage"] = invalid_storage
+            with self.subTest(invalid_storage=invalid_storage):
+                with self.assertRaises(ValueError):
+                    anvil._validate_historical_raw_trace(
+                        raw_trace=changed, expected_failed=False,
+                        **trace_authority
+                    )
         for missing in ("gas", "failed", "returnValue", "structLogs"):
             changed = dict(raw_trace); changed.pop(missing)
             with self.subTest(missing_trace=missing):
                 with self.assertRaises(ValueError):
                     anvil._validate_historical_raw_trace(
-                        raw_trace=changed, expected_failed=False
+                        raw_trace=changed, expected_failed=False,
+                        **trace_authority
                     )
-        for missing in ("pc", "op", "gas", "gasCost", "depth", "stack", "memory", "storage"):
+        for missing in (
+            "pc", "op", "gas", "gasCost", "depth", "stack", "memory",
+            "refund", "returnData", "storage",
+        ):
             changed = copy.deepcopy(raw_trace)
             changed["structLogs"][0].pop(missing)
             with self.subTest(missing_step=missing):
+                if missing == "storage":
+                    sparse = anvil._validate_historical_raw_trace(
+                        raw_trace=changed, expected_failed=False,
+                        **trace_authority
+                    )
+                    self.assertEqual(
+                        sparse["storage_omitted_step_count"], 1
+                    )
+                else:
+                    with self.assertRaises(ValueError):
+                        anvil._validate_historical_raw_trace(
+                            raw_trace=changed, expected_failed=False,
+                            **trace_authority
+                        )
+        sparse = copy.deepcopy(raw_trace)
+        sparse["structLogs"][0].pop("storage")
+        for axis, authority_value in (
+            ("wrong_binary", dict(trace_authority, anvil_binary_sha256="0" * 64)),
+            ("wrong_config", dict(trace_authority, trace_config={})),
+        ):
+            with self.subTest(axis=axis):
                 with self.assertRaises(ValueError):
                     anvil._validate_historical_raw_trace(
-                        raw_trace=changed, expected_failed=False
+                        raw_trace=sparse, expected_failed=False,
+                        **authority_value
                     )
         changed = copy.deepcopy(raw_trace)
         changed["structLogs"][0]["op"] = "GASPRICE"
         self.assertEqual(anvil._validate_historical_raw_trace(
-            raw_trace=changed, expected_failed=False
-        ), ["GASPRICE"])
+            raw_trace=changed, expected_failed=False, **trace_authority
+        )["gasprice_operations"], ["GASPRICE"])
 
         transfer_topic = "0x" + keccak256(
             b"Transfer(address,address,uint256)"
@@ -1842,13 +2991,80 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
                 "error": "execution reverted", "calls": [],
             }],
         }
+        call_trace_authority = {
+            "anvil_binary_sha256": trace_authority["anvil_binary_sha256"],
+            "call_trace_config": {"tracer": "callTracer"},
+        }
         normalized = anvil._normalized_failed_router_calls(
             call_trace=call_trace,
             router_order=(first_router, second_router),
             root_sender=sender, root_executor=executor,
             root_input=calldata, root_failed=True,
+            **call_trace_authority
         )
         self.assertEqual(normalized[0]["call_path"], [0])
+        successful_sparse_leaf = {
+            "type": "CALL", "from": sender, "to": executor,
+            "input": calldata, "output": "0x", "value": "0x0",
+            "gas": "0x100", "gasUsed": "0x80", "calls": [{
+                "type": "STATICCALL", "from": executor, "to": pair,
+                "input": "0x0902f1ac", "output": "0x" + "00" * 96,
+                "gas": "0x80", "gasUsed": "0x40",
+            }],
+        }
+        self.assertEqual(anvil._normalized_failed_router_calls(
+            call_trace=successful_sparse_leaf,
+            router_order=(first_router, second_router),
+            root_sender=sender, root_executor=executor,
+            root_input=calldata, root_failed=False,
+            **call_trace_authority
+        ), [])
+        for axis, mutate in (
+            ("call_missing_value", lambda value: value["calls"][0].update(
+                {"type": "CALL"}
+            )),
+            ("wrong_type", lambda value: value["calls"][0].update(
+                {"type": "CREATE"}
+            )),
+            ("static_nonzero_value", lambda value: value["calls"][0].update(
+                {"value": "0x1"}
+            )),
+        ):
+            changed = copy.deepcopy(successful_sparse_leaf)
+            mutate(changed)
+            with self.subTest(sparse_child_axis=axis):
+                with self.assertRaises(ValueError):
+                    anvil._normalized_failed_router_calls(
+                        call_trace=changed,
+                        router_order=(first_router, second_router),
+                        root_sender=sender, root_executor=executor,
+                        root_input=calldata, root_failed=False,
+                        **call_trace_authority
+                    )
+        for missing_root in ("value", "calls"):
+            changed = copy.deepcopy(successful_sparse_leaf)
+            changed.pop(missing_root)
+            with self.subTest(missing_root=missing_root):
+                with self.assertRaises(ValueError):
+                    anvil._normalized_failed_router_calls(
+                        call_trace=changed,
+                        router_order=(first_router, second_router),
+                        root_sender=sender, root_executor=executor,
+                        root_input=calldata, root_failed=False,
+                        **call_trace_authority
+                    )
+        for wrong_authority in (
+            dict(call_trace_authority, anvil_binary_sha256="0" * 64),
+            dict(call_trace_authority, call_trace_config={}),
+        ):
+            with self.assertRaises(ValueError):
+                anvil._normalized_failed_router_calls(
+                    call_trace=successful_sparse_leaf,
+                    router_order=(first_router, second_router),
+                    root_sender=sender, root_executor=executor,
+                    root_input=calldata, root_failed=False,
+                    **wrong_authority
+                )
         nested = copy.deepcopy(call_trace)
         nested_child = copy.deepcopy(call_trace["calls"][0])
         nested_child["from"] = "0x" + "70" * 20
@@ -1861,6 +3077,7 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
             call_trace=nested, router_order=(first_router, second_router),
             root_sender=sender, root_executor=executor,
             root_input=calldata, root_failed=True,
+            **call_trace_authority
         )[0]["call_path"], [0, 0])
         for axis, mutate in (
             ("root_sender", lambda value: value.__setitem__("from", pair)),
@@ -1876,6 +3093,7 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
                         router_order=(first_router, second_router),
                         root_sender=sender, root_executor=executor,
                         root_input=calldata, root_failed=True,
+                        **call_trace_authority
                     )
 
     def test_status_one_proof_row_semantics_are_closed(self):
@@ -2014,6 +3232,7 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
             "anvil_setBalance", "anvil_setNonce", "anvil_setCode",
             "anvil_setStorageAt", "eth_getBalance", "eth_getTransactionCount",
             "eth_getCode", "eth_getStorageAt", "evm_setNextBlockTimestamp",
+            "anvil_setCoinbase",
             "anvil_setNextBlockBaseFeePerGas", "eth_sendTransaction",
             "anvil_mine", "eth_getTransactionReceipt", "debug_traceTransaction",
             "eth_call", "evm_setAutomine", "anvil_impersonateAccount",
@@ -2049,6 +3268,140 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
                 decoded_response_byte_count=1, elapsed_seconds=0.0,
             )
 
+    def test_local_coinbase_initialization_is_exact_once_and_precedes_reads(self):
+        import scripts.historical_foundry_anvil as anvil
+
+        executor = "0x" + "12" * 20
+        self.assertIsNone(
+            anvil._validate_historical_local_coinbase_initialization(
+                params=[executor], expected_executor=executor,
+                already_initialized=False, read_started=False,
+            )
+        )
+        for axis, params, already, read_started in (
+            ("missing", [], False, False),
+            ("wrong", ["0x" + "34" * 20], False, False),
+            ("caller_extra", [executor, "0x" + "56" * 20], False, False),
+            ("second", [executor], True, False),
+            ("late", [executor], False, True),
+        ):
+            with self.subTest(axis=axis):
+                with self.assertRaises(ValueError):
+                    anvil._validate_historical_local_coinbase_initialization(
+                        params=params, expected_executor=executor,
+                        already_initialized=already, read_started=read_started,
+                    )
+
+    def test_struct_trace_request_configuration_is_fixed_and_complete(self):
+        import scripts.historical_foundry_anvil as anvil
+
+        expected = {
+            "disableStack": False,
+            "disableStorage": False,
+            "enableMemory": True,
+            "enableReturnData": True,
+        }
+        self.assertEqual(anvil._historical_struct_trace_config(), expected)
+        self.assertIsNone(
+            anvil._validate_historical_struct_trace_config(expected)
+        )
+        invalid = ({}, {key: value for key, value in expected.items() if key != "enableMemory"})
+        invalid += tuple(
+            dict(expected, **{key: not value}) for key, value in expected.items()
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    anvil._validate_historical_struct_trace_config(value)
+
+    def test_local_rpc_uses_bounded_decoder_and_canonicalizes_before_semantics(self):
+        import scripts.historical_foundry_anvil as anvil
+
+        for valid in (
+            b'{"id":7,"jsonrpc":"2.0","result":"0x1"}',
+            b'{"jsonrpc":"2.0", "id":7, "result":"0x1"}',
+        ):
+            self.assertEqual(
+                anvil._decode_historical_local_rpc_response(
+                    payload=valid, identifier=7
+                ),
+                "0x1",
+            )
+        cases = {
+            "oversize": b"x" * 67_108_865,
+            "deep": (
+                b'{"id":7,"jsonrpc":"2.0","result":'
+                + b"[" * 130 + b"0" + b"]" * 130 + b"}"
+            ),
+            "wide": (
+                b'{"id":7,"jsonrpc":"2.0","result":['
+                + b"0," * 1_048_576 + b"0]}"
+            ),
+            "long_string": (
+                b'{"id":7,"jsonrpc":"2.0","result":"'
+                + b"x" * 262_145 + b'"}'
+            ),
+            "duplicate": b'{"id":7,"id":7,"jsonrpc":"2.0","result":0}',
+        }
+        for axis, payload in cases.items():
+            with self.subTest(axis=axis):
+                with self.assertRaises(ValueError):
+                    anvil._decode_historical_local_rpc_response(
+                        payload=payload, identifier=7
+                    )
+
+    def test_child_receipt_and_raw_transaction_identity_closure(self):
+        import scripts.historical_foundry_anvil as anvil
+
+        base_hash = "0x" + "1" * 64
+        child_hash = "0x" + "2" * 64
+        transaction_hash = "0x" + "3" * 64
+        child = {
+            "number": "0x65", "hash": child_hash,
+            "parentHash": base_hash, "transactions": [transaction_hash],
+        }
+        receipt = {
+            "transactionHash": transaction_hash,
+            "blockHash": child_hash, "blockNumber": "0x65",
+            "transactionIndex": "0x0",
+        }
+        transaction = {
+            "hash": transaction_hash, "blockHash": child_hash,
+            "blockNumber": "0x65", "transactionIndex": "0x0",
+        }
+        arguments = {
+            "raw_child_block": child, "raw_receipt": receipt,
+            "raw_transaction": transaction,
+            "submitted_transaction_hash": transaction_hash,
+            "base_block_number": 100, "base_block_hash": base_hash,
+        }
+        self.assertEqual(
+            anvil._validate_historical_child_transaction_closure(**arguments),
+            child_hash,
+        )
+        axes = (
+            ("child_number", "raw_child_block", "number", "0x66"),
+            ("child_hash", "raw_child_block", "hash", "0x" + "4" * 64),
+            ("parent_hash", "raw_child_block", "parentHash", "0x" + "4" * 64),
+            ("child_transactions", "raw_child_block", "transactions", []),
+            ("receipt_hash", "raw_receipt", "transactionHash", "0x" + "4" * 64),
+            ("receipt_block_hash", "raw_receipt", "blockHash", "0x" + "4" * 64),
+            ("receipt_number", "raw_receipt", "blockNumber", "0x66"),
+            ("receipt_index", "raw_receipt", "transactionIndex", "0x1"),
+            ("raw_hash", "raw_transaction", "hash", "0x" + "4" * 64),
+            ("raw_block_hash", "raw_transaction", "blockHash", "0x" + "4" * 64),
+            ("raw_number", "raw_transaction", "blockNumber", "0x66"),
+            ("raw_index", "raw_transaction", "transactionIndex", "0x1"),
+        )
+        for axis, container, field, value in axes:
+            changed = copy.deepcopy(arguments)
+            changed[container][field] = value
+            with self.subTest(axis=axis):
+                with self.assertRaises(ValueError):
+                    anvil._validate_historical_child_transaction_closure(
+                        **changed
+                    )
+
     def test_run_and_scenario_absolute_deadlines_bound_every_own_cap(self):
         import scripts.historical_foundry_anvil as anvil
 
@@ -2082,7 +3435,7 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
             (ValueError("historical fork base differs"), "fork_window_mixed"),
             (toolchain._error("fork_window_mixed"), "fork_window_mixed"),
             (toolchain._error("fork_hardfork_unsupported"), "fork_hardfork_unsupported"),
-            (ValueError("historical scenario lineage differs"), "authority"),
+            (anvil._HistoricalReplayBoundaryError("authority"), "authority"),
             (rpc._archive_error(("archive_state_unavailable", "transport_unavailable")), "archive"),
             (TimeoutError("secret endpoint /tmp/private --fork-url"), "foundry_replay_failed"),
             (RuntimeError("secret endpoint /tmp/private --fork-url"), "foundry_replay_failed"),
@@ -2100,15 +3453,120 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
     def test_two_repeats_use_independent_real_local_rpc_processes(self):
         import scripts.bootstrap_historical_foundry_toolchain as toolchain
         import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_rpc as rpc
         import scripts.historical_foundry_scan as scan
 
+        source = r'''
+pragma solidity 0.8.36;
+interface T { function transferFrom(address,address,uint256) external returns (bool); }
+contract UniToken {
+    uint256 p0; uint256 p1; uint256 p2;
+    mapping(address => mapping(address => uint256)) public allowance;
+    mapping(address => uint256) public balanceOf;
+    event Transfer(address indexed from,address indexed to,uint256 value);
+    function transferFrom(address from,address to,uint256 value) external returns(bool) {
+        uint256 approved=allowance[from][msg.sender];
+        if(approved!=type(uint256).max) allowance[from][msg.sender]=approved-value;
+        balanceOf[from]-=value; balanceOf[to]+=value; emit Transfer(from,to,value); return true;
+    }
+}
+contract WethToken {
+    uint256 p0; uint256 p1; uint256 p2;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    event Transfer(address indexed from,address indexed to,uint256 value);
+    function transferFrom(address from,address to,uint256 value) external returns(bool) {
+        uint256 approved=allowance[from][msg.sender];
+        if(approved!=type(uint256).max) allowance[from][msg.sender]=approved-value;
+        balanceOf[from]-=value; balanceOf[to]+=value; emit Transfer(from,to,value); return true;
+    }
+}
+contract FixtureRouter {
+    address constant UNI=0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984;
+    address constant WETH_TOKEN=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address constant UNI_ROUTER=0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address constant UNI_FACTORY=0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address constant SUSHI_FACTORY=0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+    uint256 public amountOut; address public pair;
+    function factory() external view returns(address) { return address(this)==UNI_ROUTER?UNI_FACTORY:SUSHI_FACTORY; }
+    function WETH() external pure returns(address) { return WETH_TOKEN; }
+    function swapExactTokensForTokens(uint256 amountIn,uint256,address[] calldata path,address recipient,uint256)
+        external returns(uint256[] memory amounts) {
+        require(path.length==2);
+        require(T(path[0]).transferFrom(msg.sender,pair,amountIn));
+        require(T(path[1]).transferFrom(pair,recipient,amountOut));
+        amounts=new uint256[](2); amounts[0]=amountIn; amounts[1]=amountOut;
+    }
+}
+contract FixturePair {
+    uint256 r0; uint256 r1; uint256 ts;
+    function getReserves() external view returns(uint112,uint112,uint32) {
+        return (uint112(r0),uint112(r1),uint32(ts));
+    }
+}
+'''
+        standard_input = {
+            "language": "Solidity",
+            "sources": {"Fixture.sol": {"content": source}},
+            "settings": {
+                "optimizer": {"enabled": True, "runs": 200},
+                "outputSelection": {
+                    "*": {"*": ["evm.deployedBytecode.object"]}
+                },
+            },
+        }
+        compiler = toolchain._sealed_solc_argument()
+        compiled = subprocess.run(
+            [compiler, "--standard-json"],
+            input=json.dumps(standard_input).encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=True, timeout=30,
+        )
+        output = json.loads(compiled.stdout[compiled.stdout.find(b"{"):])
+        contracts = output["contracts"]["Fixture.sol"]
+        runtimes = {
+            name: "0x" + contracts[name]["evm"]["deployedBytecode"]["object"]
+            for name in ("UniToken", "WethToken", "FixtureRouter", "FixturePair")
+        }
         projections = []
         processes = []
 
+        def realistic_anvil_context():
+            headers = {
+                0: scan_fixtures._normalized_header(
+                    0, 24, gas_limit=30_000_000, gas_used=15_000_000
+                ),
+                1: scan_fixtures._normalized_header(
+                    1, 25, gas_limit=30_000_000, gas_used=15_000_000
+                ),
+                2: scan_fixtures._normalized_header(
+                    2, 604_825,
+                    gas_limit=30_000_000, gas_used=15_000_000,
+                ),
+            }
+            capture = scan_fixtures._capture_for_header(headers[2])
+            lower = scan_fixtures._lower_capture(
+                capture, headers.__getitem__
+            )
+            plan = scan_fixtures.build_historical_window_request_plan(
+                lower_bound_capture=lower, anchor_capture=capture
+            )
+            return headers, capture, lower, plan
+
         for repeat in range(2):
-            fixture = scan_fixtures.HistoricalPrefilterGridTests._new_fixture()
+            unit = 10 ** 18
+            fixture = scan_fixtures._Task4bOfflineCapabilityFixture(
+                context_factory=realistic_anvil_context,
+                split_reserve_root=False,
+                record_calls=False,
+                reserve_by_target={
+                    scan_fixtures.PAIR_UNISWAP: (4000 * unit, 1000 * unit),
+                    scan_fixtures.PAIR_SUSHI: (1000 * unit, 1000 * unit),
+                },
+            )
             capture = prefilter = context = successor = None
             fixture_directory = tempfile.TemporaryDirectory()
+            archive_process = None
             try:
                 config, capture, prefilter, window, grid, rows = (
                     HistoricalFoundryScenarioAuthorityTests._prepared(fixture)
@@ -2133,88 +3591,296 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
                     ("uni", "weth"), key=lambda role: tokens[role]["address"]
                 )
                 pairs = {}
+                storage_values = {}
+                balance_values = {}
+                codes = {
+                    tokens["uni"]["address"]: runtimes["UniToken"],
+                    tokens["weth"]["address"]: runtimes["WethToken"],
+                }
                 for venue_id in ("uniswap_v2", "sushiswap_v2"):
                     reserve = rows[0]["reserves"][venue_id]
                     by_role = {
                         "uni": reserve["reserve_uni_raw"],
                         "weth": reserve["reserve_weth_raw"],
                     }
+                    pair = reserve["pair_address"]
                     pairs[reserve["pair_address"]] = {
-                        "word0": by_role[ordered_roles[0]],
-                        "word1": by_role[ordered_roles[1]],
+                        "reserve0": by_role[ordered_roles[0]],
+                        "reserve1": by_role[ordered_roles[1]],
                         "timestamp": reserve["pair_timestamp"],
-                        "uni": by_role["uni"], "weth": by_role["weth"],
                     }
+                    codes[pair] = runtimes["FixturePair"]
+                    for slot, value in enumerate((
+                        by_role[ordered_roles[0]],
+                        by_role[ordered_roles[1]], reserve["pair_timestamp"],
+                    )):
+                        storage_values[
+                            pair + ":" + "0x" + slot.to_bytes(32, "big").hex()
+                        ] = "0x" + value.to_bytes(32, "big").hex()
+                    for role in ("uni", "weth"):
+                        balance_values[
+                            tokens[role]["address"] + ":" + pair
+                        ] = by_role[role]
+                        key = solidity_balance_storage_key(
+                            pair, tokens[role]["balance_descriptor"]["slot"]
+                        )
+                        storage_values[
+                            tokens[role]["address"] + ":" + key
+                        ] = "0x" + by_role[role].to_bytes(32, "big").hex()
                 first_venue = (
                     "uniswap_v2" if rows[0]["direction"] == "uniswap_to_sushiswap"
                     else "sushiswap_v2"
                 )
+                second_venue = (
+                    "sushiswap_v2" if first_venue == "uniswap_v2"
+                    else "uniswap_v2"
+                )
+                venues = {row["venue_id"]: row for row in authority["venues"]}
+                for venue_id, amount_out in (
+                    (first_venue, rows[0]["first_amount_out_raw"]),
+                    (second_venue, rows[0]["second_amount_out_raw"]),
+                ):
+                    router = venues[venue_id]["router_address"]
+                    pair = rows[0]["reserves"][venue_id]["pair_address"]
+                    codes[router] = runtimes["FixtureRouter"]
+                    storage_values[
+                        router + ":" + "0x" + (0).to_bytes(32, "big").hex()
+                    ] = "0x" + amount_out.to_bytes(32, "big").hex()
+                    storage_values[
+                        router + ":" + "0x" + (1).to_bytes(32, "big").hex()
+                    ] = "0x" + int(pair, 16).to_bytes(32, "big").hex()
+                max_uint = (1 << 256) - 1
+                for role, venue_id in (
+                    ("uni", first_venue), ("weth", second_venue),
+                ):
+                    pair = rows[0]["reserves"][venue_id]["pair_address"]
+                    router = venues[venue_id]["router_address"]
+                    key = solidity_allowance_storage_key(
+                        pair, router,
+                        tokens[role]["allowance_descriptor"]["slot"],
+                    )
+                    storage_values[
+                        tokens[role]["address"] + ":" + key
+                    ] = "0x" + max_uint.to_bytes(32, "big").hex()
+                header = rows[0]["header"]
+                block = {
+                    "number": hex(header["number"]), "hash": header["hash"],
+                    "parentHash": header["parent_hash"],
+                    "stateRoot": header["state_root"],
+                    "timestamp": hex(header["timestamp"]),
+                    "gasLimit": hex(header["gas_limit"]),
+                    "gasUsed": hex(header["gas_used"]),
+                    "baseFeePerGas": hex(header["base_fee_per_gas"]),
+                    "difficulty": "0x0", "totalDifficulty": "0x0",
+                    "extraData": "0x", "logsBloom": "0x" + "0" * 512,
+                    "miner": authority["executor"]["address"],
+                    "nonce": "0x" + "0" * 16,
+                    "mixHash": "0x" + "0" * 64,
+                    "receiptsRoot": "0x" + "0" * 64,
+                    "sha3Uncles": "0x" + "0" * 64,
+                    "transactionsRoot": "0x" + "0" * 64,
+                    "transactions": [], "uncles": [],
+                }
                 fixture_config = {
-                    "header": dict(rows[0]["header"]),
-                    "synthetic_number": override["synthetic_block"]["number"],
-                    "synthetic_timestamp": override["synthetic_block"]["timestamp"],
-                    "synthetic_base_fee": override["synthetic_block"]["base_fee_per_gas"],
-                    "child_hash": "0x" + "b" * 64,
-                    "transaction_hash": "0x" + "c" * 64,
-                    "gas_used": 123456, "effective_gas_price": 1,
-                    "transaction": dict(override["transaction"]),
+                    "block": block, "codes": codes,
+                    "storage": storage_values, "balances": balance_values,
                     "pairs": pairs,
-                    "token_roles": {
-                        tokens["uni"]["address"]: "uni",
-                        tokens["weth"]["address"]: "weth",
-                    },
-                    "executor": authority["executor"]["address"],
-                    "uni": tokens["uni"]["address"],
-                    "initial_weth": rows[0]["amount_weth_in_wei"],
-                    "first_uni": rows[0]["first_amount_out_raw"],
-                    "final_weth": rows[0]["second_amount_out_raw"],
-                    "residual_uni": 0,
-                    "first_pair": rows[0]["reserves"][first_venue]["pair_address"],
-                    "transfer_topic": "0x" + keccak256(
-                        b"Transfer(address,address,uint256)"
-                    ).hex(),
+                    "log_path": os.path.join(
+                        fixture_directory.name, "archive-requests.jsonl"
+                    ),
                 }
                 config_path = os.path.join(fixture_directory.name, "fixture.json")
                 with open(config_path, "w", encoding="utf-8") as handle:
                     json.dump(fixture_config, handle, sort_keys=True)
+                archive_port = anvil._reserve_historical_anvil_port()
+                archive_process = subprocess.Popen(
+                    [
+                        sys.executable, "-c",
+                        "from tests.test_historical_foundry_anvil import "
+                        "_serve_historical_archive_fixture as serve; serve()",
+                        str(archive_port), config_path,
+                    ],
+                    cwd=os.getcwd(), stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env={"LANG": "C", "LC_ALL": "C"},
+                )
 
-                def spawn(*, selected_block, hardfork, relay_port, anvil_port):
-                    del relay_port
-                    process = subprocess.Popen(
-                        [
-                            sys.executable, "-c",
-                            "from tests.test_historical_foundry_anvil import "
-                            "_serve_historical_anvil_fixture as serve; serve()",
-                            str(anvil_port), config_path,
-                        ],
-                        cwd=os.getcwd(), stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        env={"LANG": "C", "LC_ALL": "C"},
+                def local_archive(body, timeout):
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1", archive_port, timeout=timeout
                     )
-                    processes.append(process)
-                    return toolchain._issue_historical_process_lease_for_test(
-                        process=process, cleanup=mock.Mock(),
-                        binary_sha256="9" * 64,
-                        selected_block=selected_block, hardfork=hardfork,
-                    )
+                    try:
+                        connection.request(
+                            "POST", "/", body=body,
+                            headers={"Content-Type": "application/json"},
+                        )
+                        response = connection.getresponse()
+                        if response.status != 200:
+                            raise ValueError("archive fixture failed")
+                        return response.read(67_108_865)
+                    finally:
+                        connection.close()
+
+                object.__setattr__(
+                    context._relay_lease, "_operation", local_archive
+                )
+                live_started = time.monotonic()
+                object.__setattr__(
+                    context._relay_lease, "_clock", time.monotonic
+                )
+                object.__setattr__(
+                    context._relay_lease, "_last_clock", live_started
+                )
+                object.__setattr__(
+                    context._relay_lease, "_run_deadline",
+                    live_started + 21_600.0,
+                )
+                object.__setattr__(context, "_clock", time.monotonic)
+                object.__setattr__(
+                    context, "_run_deadline", live_started + 21_600.0
+                )
 
                 original_getaddrinfo = socket.getaddrinfo
+                original_execute = anvil._execute_historical_local_rpc
+                original_decode = anvil._decode_historical_local_rpc_response
+                original_canonical_json = anvil._canonical_json
+                original_raw_trace_validator = anvil._validate_historical_raw_trace
+                original_call_trace_validator = anvil._normalized_failed_router_calls
+                original_typed = anvil._typed_historical_replay_error
+                original_relay_call = rpc._relay_historical_archive_call
+                diagnostics = []
 
                 def loopback_only(host, *args, **kwargs):
                     if host != "127.0.0.1":
                         raise AssertionError("external network forbidden")
                     return original_getaddrinfo(host, *args, **kwargs)
 
+                def observe_real_process(**arguments):
+                    lease = context._active_process_lease
+                    process = lease._process
+                    processes.append(process)
+                    try:
+                        return original_execute(**arguments)
+                    except BaseException:
+                        diagnostics.append((
+                            "anvil_output_poll_{}".format(process.poll()),
+                            tuple(
+                                value.decode("utf-8", "replace")
+                                for value in lease._captured_output_for_test()
+                            ),
+                        ))
+                        diagnostics.append((
+                            "relay_server",
+                            context._active_relay_lease._diagnostics_for_test(),
+                        ))
+                        raise
+
+                def observe_local_response(**arguments):
+                    try:
+                        return original_decode(**arguments)
+                    except BaseException as error:
+                        diagnostics.append((
+                            "local_response", arguments["payload"][:4096],
+                            type(error).__name__, str(error),
+                        ))
+                        raise
+
+                def observe_local_request(value):
+                    encoded = original_canonical_json(value)
+                    if (
+                        type(value) is dict
+                        and value.get("method") in anvil._HISTORICAL_LOCAL_RPC_METHODS
+                    ):
+                        diagnostics.append((
+                            "local_request", value.get("id"),
+                            value.get("method"), value.get("params"),
+                        ))
+                    return encoded
+
+                def observe_raw_trace(**arguments):
+                    try:
+                        return original_raw_trace_validator(**arguments)
+                    except BaseException as error:
+                        raw = arguments.get("raw_trace")
+                        logs = raw.get("structLogs") if type(raw) is dict else None
+                        shapes = {}
+                        if type(logs) is list:
+                            for step in logs:
+                                shape = tuple(step) if type(step) is dict else (type(step).__name__,)
+                                shapes[shape] = shapes.get(shape, 0) + 1
+                        diagnostics.append((
+                            "raw_trace_shape",
+                            tuple(raw) if type(raw) is dict else type(raw).__name__,
+                            tuple(shapes.items()),
+                            next((step.get("storage") for step in logs if type(step) is dict and "storage" in step), None) if type(logs) is list else None,
+                            type(error).__name__, str(error),
+                        ))
+                        raise
+
+                def observe_call_trace(**arguments):
+                    try:
+                        return original_call_trace_validator(**arguments)
+                    except BaseException as error:
+                        diagnostics.append((
+                            "call_trace_shape", arguments.get("call_trace"),
+                            type(error).__name__, str(error),
+                        ))
+                        raise
+
+                def record_error(error):
+                    diagnostics.append((type(error).__name__, str(error)))
+                    return original_typed(error)
+
+                def record_relay(**arguments):
+                    try:
+                        return original_relay_call(**arguments)
+                    except BaseException as error:
+                        diagnostics.append((
+                            "relay_request",
+                            arguments["canonical_request_bytes"][:512],
+                            type(error).__name__, str(error),
+                        ))
+                        raise
+
                 with mock.patch.object(
-                    type(context._toolchain),
-                    "_spawn_historical_anvil_process",
-                    side_effect=spawn,
+                    anvil, "_execute_historical_local_rpc",
+                    side_effect=observe_real_process,
+                ), mock.patch.object(
+                    anvil, "_decode_historical_local_rpc_response",
+                    side_effect=observe_local_response,
+                ), mock.patch.object(
+                    anvil, "_canonical_json",
+                    side_effect=observe_local_request,
+                ), mock.patch.object(
+                    anvil, "_validate_historical_raw_trace",
+                    side_effect=observe_raw_trace,
+                ), mock.patch.object(
+                    anvil, "_normalized_failed_router_calls",
+                    side_effect=observe_call_trace,
+                ), mock.patch.object(
+                    anvil, "_typed_historical_replay_error",
+                    side_effect=record_error,
+                ), mock.patch.object(
+                    rpc, "_relay_historical_archive_call",
+                    side_effect=record_relay,
                 ), mock.patch.object(
                     socket, "getaddrinfo", side_effect=loopback_only
                 ), mock.patch.dict(os.environ, {}, clear=True):
-                    projections.append(anvil._replay_historical_scenario(
-                        context=context, scenario=scenario, sink=sink
-                    ))
+                    try:
+                        projections.append(anvil._replay_historical_scenario(
+                            context=context, scenario=scenario, sink=sink
+                        ))
+                    except anvil.HistoricalReplayError:
+                        if os.path.exists(fixture_config["log_path"]):
+                            with open(
+                                fixture_config["log_path"], "r",
+                                encoding="utf-8",
+                            ) as log:
+                                diagnostics.append(("archive", log.read()))
+                        self.fail("diagnostics={!r}".format([
+                            item for item in diagnostics
+                            if item[0] not in ("local_request", "archive")
+                        ]))
                 ledger = sink.validated_ledger()
                 self.assertEqual(ledger.generation, 3)
                 successor = ledger.staging_snapshot()
@@ -2223,6 +3889,21 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
                     context.close()
                 if successor is not None:
                     successor.close()
+                if archive_process is not None:
+                    archive_process.terminate()
+                    try:
+                        archive_output = archive_process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        archive_process.kill()
+                        archive_output = archive_process.communicate(timeout=5)
+                    self.assertLessEqual(
+                        sum(len(value) for value in archive_output), 65_536
+                    )
+                    for stream in (
+                        archive_process.stdout, archive_process.stderr
+                    ):
+                        if stream is not None:
+                            stream.close()
                 fixture_directory.cleanup()
                 scan_fixtures.HistoricalPrefilterGridTests._close_fixture(
                     fixture, capture, prefilter
@@ -2234,7 +3915,13 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
         for projection in projections:
             self.assertNotIn("path", projection)
             self.assertNotIn("endpoint", repr(projection).lower())
-            self.assertEqual(projection["gas_used"], 123456)
+            self.assertGreater(projection["gas_used"], 0)
+            self.assertGreater(
+                projection["trace_storage_omitted_step_count"], 0
+            )
+            self.assertGreater(
+                projection["trace_storage_explicit_step_count"], 0
+            )
 
 
 if __name__ == "__main__":

@@ -15264,7 +15264,7 @@ class HistoricalFoundryStorageTask4bMaximumIntegrationTests(
             "fees/00000001.json.gz", 268,
             "3d221de2ad977645a086c54ebd8b1f2e9363bc2c5b5ae571fe54030098bc8330",
         ),
-        "f634451adf3f3b32caf4a80db62cd657de5861252eb0e64abcd5f42d0cc235b1",
+        "934f181462e23364addbb4ae3f9f1c60ea3c7e476c5ae9ebc596c3c9bbbfc8b9",
     )
 
     @staticmethod
