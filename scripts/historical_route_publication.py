@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, NoReturn
-import gzip
 import fcntl
 import hashlib
 import json
@@ -16,6 +15,7 @@ import os
 import re
 import stat
 import weakref
+import zlib
 
 from scripts.historical_foundry_contracts import (
     HistoricalFoundryConfigSet,
@@ -53,6 +53,7 @@ _CORE_FILES = frozenset((
 _NOTIONALS = [1000, 5000, 10000, 50000, 100000]
 _VENUES = ("uniswap_v2", "sushiswap_v2")
 _MAX_MEMBER_BYTES = 8_388_608
+_MAX_DECODED_MEMBER_BYTES = 16_777_216
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -81,6 +82,16 @@ def _snapshot_matches(current: Any, expected: Any) -> bool:
         and _route_publication._stable_file_metadata(current[1])
         == _route_publication._stable_file_metadata(expected[1])
     )
+
+
+def _close_descriptors_robustly(*descriptors: Any) -> None:
+    """Attempt every owned close without reversing an established result."""
+    for descriptor in descriptors:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _install_pointer_cas(
@@ -213,6 +224,52 @@ def _decode_canonical_object(value: bytes, label: str) -> Dict[str, Any]:
             "{} is not canonical".format(label)
         )
     return decoded
+
+
+def _decompress_single_gzip_member_bounded(
+    value: bytes, *, expected_size: int,
+) -> bytes:
+    if (
+        type(value) is not bytes
+        or type(expected_size) is not int
+        or not 0 < expected_size <= _MAX_DECODED_MEMBER_BYTES
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical gzip decoded size is invalid"
+        )
+    inflater = zlib.decompressobj(zlib.MAX_WBITS | 16)
+    decoded = bytearray()
+    pending = value
+    try:
+        while pending and not inflater.eof:
+            remaining = expected_size + 1 - len(decoded)
+            if remaining <= 0:
+                raise HistoricalRoutePublicationError(
+                    "historical gzip member exceeds its decoded bound"
+                )
+            previous_size = len(pending)
+            chunk = inflater.decompress(pending, remaining)
+            decoded.extend(chunk)
+            pending = inflater.unconsumed_tail
+            if pending and len(pending) >= previous_size and not chunk:
+                raise HistoricalRoutePublicationError(
+                    "historical gzip member made no bounded progress"
+                )
+    except zlib.error as error:
+        raise HistoricalRoutePublicationError(
+            "historical gzip member is invalid"
+        ) from error
+    if (
+        len(decoded) != expected_size
+        or not inflater.eof
+        or pending
+        or inflater.unconsumed_tail
+        or inflater.unused_data
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical gzip member differs"
+        )
+    return bytes(decoded)
 
 
 def _build_run_evidence_from_source(
@@ -414,13 +471,43 @@ def _build_run_evidence_from_source(
             "historical anchor header inventory is invalid"
         )
     header_descriptor = header_descriptors[0]
+    header_path = header_descriptor.get("path")
+    if (
+        set(header_descriptor) != {
+            "role", "chunk_index", "path", "block_start", "block_stop",
+            "row_count", "decoded_byte_count", "decoded_sha256",
+            "gzip_byte_count", "gzip_sha256",
+        }
+        or type(header_path) is not str
+        or type(header_descriptor.get("decoded_byte_count")) is not int
+        or not 0 < header_descriptor["decoded_byte_count"]
+        <= _MAX_DECODED_MEMBER_BYTES
+        or type(header_descriptor.get("decoded_sha256")) is not str
+        or re.fullmatch(
+            r"[0-9a-f]{64}", header_descriptor["decoded_sha256"]
+        ) is None
+        or members.get(header_path) != {
+            "path": header_path,
+            "byte_count": header_descriptor.get("gzip_byte_count"),
+            "sha256": header_descriptor.get("gzip_sha256"),
+        }
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical anchor header descriptor is invalid"
+        )
     header_gzip = _read_source_member(
-        source, members, header_descriptor["path"]
+        source, members, header_path
     )
     try:
-        header_bytes = gzip.decompress(header_gzip)
+        header_bytes = _decompress_single_gzip_member_bounded(
+            header_gzip,
+            expected_size=header_descriptor["decoded_byte_count"],
+        )
         header_rows = json.loads(header_bytes)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (
+        HistoricalRoutePublicationError, UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
         raise HistoricalRoutePublicationError(
             "historical anchor header bytes are invalid"
         ) from error
@@ -749,6 +836,29 @@ def _validate_historical_cohort(
         row["route_id"] for row in derived["core"]["routes"]
     }
     generation = cohort["candidate_source_generation"]
+    evidence = derived["evidence"]
+    expected_generation = _sha(_canonical_bytes({
+        "schema": "historical_route_candidate_generation/v1",
+        "run_id": evidence["run_id"],
+        "manifest_sha256": evidence["manifest_sha256"],
+        "selection_sha256": evidence["selection_sha256"],
+        "policy_sha256": evidence["policy_sha256"],
+        "authority_sha256": evidence["authority_sha256"],
+    }))
+    if (
+        generation != expected_generation
+        or cohort.get("collection_input_generation")
+        != derived["core"]["universe_sha256"]
+        or cohort.get("source_state") != {
+            "candidate_source_generation": expected_generation,
+            "collection_input_generation": derived["core"][
+                "universe_sha256"
+            ],
+        }
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical route cohort generation lineage differs"
+        )
     for route in cohort["routes"]:
         try:
             _route_publication._validate_route_candidate(
@@ -782,9 +892,17 @@ def _validate_historical_cohort(
             "historical route market inventory differs"
         )
     selected = derived["evidence"]["selection"]
+    expected_leg_fields = {
+        "leg_id", "market_id", "market_type", "token_symbol", "status",
+        "available", "reason_code", "state_observed_at", "snapshot_id",
+        "source_endpoint", "raw_response_sha256", "fixed_block_number",
+        "fixed_block_timestamp",
+    }
     for row in cohort["legs"]:
         if (
-            row.get("fixed_block_number") != str(selected["block_number"])
+            type(row) is not dict
+            or set(row) != expected_leg_fields
+            or row.get("fixed_block_number") != str(selected["block_number"])
             or row.get("fixed_block_timestamp")
             != selected["block_timestamp"]
             or row.get("state_observed_at") != selected["block_timestamp"]
@@ -794,10 +912,17 @@ def _validate_historical_cohort(
                 "historical route fixed-block lineage differs"
             )
     routes_by_id = {row["route_id"]: row for row in cohort["routes"]}
+    timing_ids = []
     for row in cohort["route_rows"]:
         route = routes_by_id.get(row.get("route_id"))
         if (
-            route is None or any(row.get(key) != value for key, value in route.items())
+            type(row) is not dict
+            or route is None
+            or set(row) != set(_route_publication._ROUTE_FIELDS) | {
+                "validated_at", "skew_seconds", "timing_status",
+                "reason_code",
+            }
+            or any(row.get(key) != value for key, value in route.items())
             or row.get("validated_at") != selected["block_timestamp"]
             or row.get("skew_seconds") != "0"
             or row.get("timing_status") != "within_sla"
@@ -806,6 +931,15 @@ def _validate_historical_cohort(
             raise HistoricalRoutePublicationError(
                 "historical route timing lineage differs"
             )
+        timing_ids.append(row["route_id"])
+    if (
+        len(routes_by_id) != len(cohort["routes"])
+        or len(set(timing_ids)) != len(timing_ids)
+        or set(timing_ids) != expected_routes
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical route timing inventory differs"
+        )
     without_hashes = {
         key: value for key, value in cohort.items()
         if key not in {"route_cohort_id", "fingerprint"}
@@ -971,7 +1105,8 @@ def _context_projection(
 
 def _issue_context(
     *, source: object, projection: Mapping[str, Any], owns_source: bool,
-    stage_record: Any = None, published_record: Any = None,
+    stage_record: Any = None, stage_owner: Any = None,
+    published_record: Any = None,
 ) -> "HistoricalReplayBuildContext":
     value = object.__new__(HistoricalReplayBuildContext)
     value_id = id(value)
@@ -981,7 +1116,8 @@ def _issue_context(
         "projection_bytes": projection_bytes,
         "projection_sha256": _sha(projection_bytes),
         "owns_source": owns_source,
-        "stage_record": stage_record, "published_record": published_record,
+        "stage_record": stage_record, "stage_owner": stage_owner,
+        "published_record": published_record,
     }
     if stage_record is not None:
         stage_record["borrow_count"] += 1
@@ -1001,6 +1137,7 @@ def _issue_context(
                     except Exception:
                         pass
                 retired["source"] = None
+                retired["stage_owner"] = None
     _CONTEXT_REGISTRY[value_id] = (weakref.ref(value, retire), record)
     return value
 
@@ -1100,6 +1237,7 @@ class HistoricalReplayBuildContext:
         if stage_record is not None:
             stage_record["borrow_count"] -= 1
         record["source"] = None
+        record["stage_owner"] = None
         _CONTEXT_REGISTRY.pop(id(self), None)
         return None
 
@@ -1703,7 +1841,7 @@ def load_validated_historical_replay_core_at(
     _validate_held_stage(record)
     return _issue_context(
         source=record["source"], projection=record["projection"],
-        owns_source=False, stage_record=record,
+        owns_source=False, stage_record=record, stage_owner=staged_core,
     )
 
 
@@ -1855,10 +1993,7 @@ def publish_historical_replay_core(
             "historical replay core publication failed"
         ) from error
     finally:
-        if bundles_fd is not None:
-            os.close(bundles_fd)
-        if core_fd is not None:
-            os.close(core_fd)
+        _close_descriptors_robustly(bundles_fd, core_fd)
 
 
 def load_latest_historical_replay_core(

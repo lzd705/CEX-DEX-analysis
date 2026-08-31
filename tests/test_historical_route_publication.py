@@ -7,6 +7,8 @@ import inspect
 import json
 import pickle
 import gc
+import gzip
+import hashlib
 from pathlib import Path
 import shutil
 import unittest
@@ -188,6 +190,55 @@ class HistoricalCorePublicationTests(unittest.TestCase):
                 finalized.close()
         finally:
             HistoricalCandidateSelectionTests._close_replay_fixture(run)
+
+    @staticmethod
+    def _rehash_attacker_cohort(cohort):
+        def canonical(value):
+            return json.dumps(
+                value, allow_nan=False, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+        without_hashes = {
+            key: value for key, value in cohort.items()
+            if key not in {"route_cohort_id", "fingerprint"}
+        }
+        cohort["route_cohort_id"] = "cohort:" + hashlib.sha256(
+            canonical(without_hashes)
+        ).hexdigest()
+        cohort["fingerprint"] = hashlib.sha256(canonical({
+            **without_hashes,
+            "route_cohort_id": cohort["route_cohort_id"],
+        })).hexdigest()
+        return cohort
+
+    def _assert_rehashed_historical_cohort_attack_rejected(self, attack):
+        import scripts.historical_route_publication as publication
+
+        run, finalized, lease, _identity = self._open_real_task7_lease()
+        stage = None
+        try:
+            stage = publication.stage_historical_replay_core(
+                data_dir=run["fixture"].data_dir, config=run["config"],
+                publication_lease=lease,
+            )
+            lease = None
+            record = publication._stage_record(stage)
+            cohort = json.loads(json.dumps(record["derived"]["cohort"]))
+            attack(cohort)
+            self._rehash_attacker_cohort(cohort)
+            with self.assertRaises(
+                publication.HistoricalRoutePublicationError
+            ):
+                publication._validate_historical_cohort(
+                    cohort=cohort, derived=record["derived"]
+                )
+        finally:
+            if stage is not None:
+                stage.close()
+            if lease is not None:
+                lease.close()
+            self._close_real_task7_run(run, finalized)
 
     def test_real_task7_lease_stages_publishes_and_reopens_isolated_core(self):
         import scripts.historical_foundry_storage as storage
@@ -466,6 +517,74 @@ class HistoricalCorePublicationTests(unittest.TestCase):
             if run is not None:
                 self._close_real_task7_run(run, finalized)
 
+    def test_staged_context_retains_stage_owner_after_caller_drops_handle(self):
+        import scripts.historical_route_publication as publication
+
+        run, finalized, lease, _identity = self._open_real_task7_lease()
+        stage = context = None
+        try:
+            stage = publication.stage_historical_replay_core(
+                data_dir=run["fixture"].data_dir, config=run["config"],
+                publication_lease=lease,
+            )
+            lease = None
+            stage_record = publication._stage_record(stage)
+            stage_path = stage_record["stage_path"]
+            stage_reference = weakref.ref(stage)
+            context = publication.load_validated_historical_replay_core_at(
+                staged_core=stage
+            )
+            expected = dict(context.identity_projection())
+            stage = None
+            gc.collect()
+            self.assertIsNotNone(stage_reference())
+            self.assertTrue(stage_path.exists())
+            self.assertEqual(
+                dict(publication._require_historical_replay_build_context(
+                    context=context
+                )),
+                expected,
+            )
+            context.close()
+            context = None
+            gc.collect()
+            self.assertIsNone(stage_reference())
+            self.assertFalse(stage_path.exists())
+            finalized.close()
+            finalized = None
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except publication.HistoricalRoutePublicationError:
+                    pass
+            if stage is not None:
+                stage.close()
+            if lease is not None:
+                lease.close()
+            self._close_real_task7_run(run, finalized)
+
+    def test_bounded_gzip_rejects_high_ratio_bomb_and_extra_stream_data(self):
+        import scripts.historical_route_publication as publication
+
+        decoded_cap = 16_777_216
+        bomb = gzip.compress(b"x" * (decoded_cap + 1), compresslevel=9)
+        self.assertLess(len(bomb), 32_768)
+        with self.assertRaises(publication.HistoricalRoutePublicationError):
+            publication._decompress_single_gzip_member_bounded(
+                bomb, expected_size=decoded_cap + 1
+            )
+
+        member = gzip.compress(b"ok", compresslevel=9)
+        for forged in (member + b"trailing", member + member):
+            with self.subTest(length=len(forged)):
+                with self.assertRaises(
+                    publication.HistoricalRoutePublicationError
+                ):
+                    publication._decompress_single_gzip_member_bounded(
+                        forged, expected_size=2
+                    )
+
     def test_staged_loader_rejects_symlinked_member_and_stage_can_clean_up(self):
         import scripts.historical_route_publication as publication
 
@@ -639,6 +758,95 @@ class HistoricalCorePublicationTests(unittest.TestCase):
                 except Exception:
                     pass
             self._close_real_task7_run(run, finalized)
+
+    def test_post_commit_descriptor_close_failure_does_not_reverse_success(self):
+        import scripts.historical_route_publication as publication
+
+        run, finalized, lease, _identity = self._open_real_task7_lease()
+        stage = published = latest = None
+        try:
+            stage = publication.stage_historical_replay_core(
+                data_dir=run["fixture"].data_dir, config=run["config"],
+                publication_lease=lease,
+            )
+            lease = None
+            stage_id = id(stage)
+            pointer = (
+                run["fixture"].data_dir / "routes" / "historical"
+                / "core" / "latest.json"
+            )
+            real_close = publication.os.close
+            committed_fds = []
+            injected = [False]
+
+            def close_with_one_post_commit_failure(descriptor):
+                real_close(descriptor)
+                if (
+                    stage_id not in publication._STAGE_REGISTRY
+                    and pointer.exists()
+                ):
+                    committed_fds.append(descriptor)
+                    if not injected[0]:
+                        injected[0] = True
+                        raise OSError("controlled post-commit close failure")
+
+            with mock.patch.object(
+                publication.os, "close",
+                side_effect=close_with_one_post_commit_failure,
+            ):
+                published = publication.publish_historical_replay_core(
+                    data_dir=run["fixture"].data_dir, staged_core=stage
+                )
+            stage = None
+            self.assertTrue(pointer.exists())
+            self.assertTrue(injected[0])
+            self.assertEqual(len(committed_fds), 2)
+            for descriptor in committed_fds:
+                with self.assertRaises(OSError):
+                    publication.os.fstat(descriptor)
+            published.reread_unchanged()
+            latest = publication.load_latest_historical_replay_core(
+                data_dir=run["fixture"].data_dir
+            )
+            self.assertEqual(
+                dict(latest.identity_projection()),
+                dict(published.identity_projection()),
+            )
+        finally:
+            if latest is not None:
+                latest.close()
+            if published is not None:
+                published.close()
+            if stage is not None:
+                try:
+                    stage.close()
+                except publication.HistoricalRoutePublicationError:
+                    pass
+            if lease is not None:
+                lease.close()
+            self._close_real_task7_run(run, finalized)
+
+    def test_historical_cohort_rejects_rehashed_timing_extra_field(self):
+        self._assert_rehashed_historical_cohort_attack_rejected(
+            lambda cohort: cohort["route_rows"][0].__setitem__(
+                "attacker_extra", "accepted-by-open-validator"
+            )
+        )
+
+    def test_historical_cohort_rejects_rehashed_source_state_mismatch(self):
+        self._assert_rehashed_historical_cohort_attack_rejected(
+            lambda cohort: cohort["source_state"].__setitem__(
+                "candidate_source_generation", "f" * 64
+            )
+        )
+
+    def test_historical_cohort_rejects_rehashed_duplicate_timing_route(self):
+        def duplicate_first_timing_route(cohort):
+            cohort["route_rows"][1] = dict(cohort["route_rows"][0])
+
+        self._assert_rehashed_historical_cohort_attack_rejected(
+            duplicate_first_timing_route
+        )
 
     def test_same_byte_stage_directory_replacement_is_rejected(self):
         import scripts.historical_route_publication as publication
