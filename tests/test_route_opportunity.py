@@ -7,6 +7,8 @@ from dataclasses import replace
 from decimal import Decimal, localcontext
 import hashlib
 import json
+from typing import Optional
+from unittest.mock import patch
 
 import scripts.route_opportunity as route_opportunity
 from scripts.execution_cost_components import cost_component_row
@@ -24,7 +26,6 @@ from scripts.route_opportunity import (
 )
 from scripts.route_quantity import CommonTarget, FeeSemantics, MarketRules
 from scripts.route_quantity import V2PoolState, quote_v2_pool_quantity
-from tests.test_route_cost_topology import historical_rows
 
 
 COHORT_ID = "cohort:" + "c" * 64
@@ -216,14 +217,20 @@ def v2_leg(
     target: CommonTarget,
     chain: str = "eth",
     cohort_now: str = COHORT_NOW,
+    pool_address: Optional[str] = None,
+    dex: str = "uniswap_v2",
+    fee_proof_sha256: str = "a" * 64,
+    raw_response_sha256: Optional[str] = None,
 ):
     chain_id = {"eth": 1, "arb": 42161}[chain]
-    pool = POOL if chain == "eth" else "0x4444444444444444444444444444444444444444"
-    market_id = f"dex:{chain}:uniswap_v2:{pool}:AAVE"
+    pool = pool_address or (
+        POOL if chain == "eth" else "0x4444444444444444444444444444444444444444"
+    )
+    market_id = f"dex:{chain}:{dex}:{pool}:AAVE"
     state = V2PoolState(
         chain=chain,
         chain_id=chain_id,
-        dex="uniswap_v2",
+        dex=dex,
         pool_address=pool,
         token0_address=TOKEN_ADDRESS,
         token1_address=QUOTE_ADDRESS,
@@ -236,12 +243,15 @@ def v2_leg(
         fee_numerator=9_970,
         fee_denominator=10_000,
         fee_formula=V2_FEE_FORMULA,
-        fee_proof_sha256="a" * 64,
+        fee_proof_sha256=fee_proof_sha256,
         block_number=123,
         block_hash="0x" + "b" * 64,
         block_header_sha256="c" * 64,
         observed_at=state_observed_at,
-        raw_response_sha256=("d" if chain == "eth" else "e") * 64,
+        raw_response_sha256=(
+            raw_response_sha256
+            or (("d" if chain == "eth" else "e") * 64)
+        ),
     )
     rules = MarketRules(
         market_id=market_id,
@@ -631,6 +641,134 @@ def mev_scenario_row(kwargs, *, value_status, amount_usd=None, reason_code=None)
     )
 
 
+def atomic_v2_fixture():
+    target = dex_target()
+    buy_quote, buy_evidence, buy_leg, buy_usd, buy_state = v2_leg(
+        direction="buy",
+        state_observed_at="2026-08-01T12:00:00Z",
+        target=target,
+    )
+    sell_quote, sell_evidence, sell_leg, sell_usd, sell_state = v2_leg(
+        direction="sell",
+        state_observed_at="2026-08-01T12:01:00Z",
+        target=target,
+        pool_address="0x4444444444444444444444444444444444444444",
+        dex="sushiswap_v2",
+        fee_proof_sha256="5" * 64,
+        raw_response_sha256="e" * 64,
+    )
+    identity = {
+        "token_symbol": "AAVE",
+        "buy_market_id": buy_quote.market_id,
+        "sell_market_id": sell_quote.market_id,
+        "route_mode": "atomic_onchain",
+    }
+    route = {
+        **identity,
+        "route_id": canonical_route_id(identity),
+        "route_class": "candidate",
+        "settlement_reason": None,
+    }
+    mode = {
+        "route_id": route["route_id"],
+        "route_mode": route["route_mode"],
+        "classification": "mode_evidence_eligible",
+        "mode_evidence_eligible": True,
+        "reason_code": None,
+        "reason_codes": [],
+        "inventory_profile_hash": None,
+        "maximum_proved_capacity_quantity": str(target.quantity),
+    }
+    opportunity_id = route_opportunity_id(route["route_id"], Decimal("10000"))
+    costs = dex_leg_costs(
+        route=route,
+        opportunity_id=opportunity_id,
+        target=target,
+        leg="buy",
+        state=buy_state,
+    )
+    costs.extend(dex_leg_costs(
+        route=route,
+        opportunity_id=opportunity_id,
+        target=target,
+        leg="sell",
+        state=sell_state,
+    ))
+    costs.append(cost_component_row(
+        cohort_id=COHORT_ID,
+        opportunity_id=opportunity_id,
+        leg="route",
+        market_id="",
+        direction="route",
+        requested_notional_usd=Decimal("10000"),
+        target_token_quantity=target.quantity,
+        component_type="rebalancing_or_transfer",
+        value_status="not_applicable",
+        amount_usd=None,
+        rate_bps=None,
+        basis="atomic route proves no intermediate transfer",
+        strict_eligible=True,
+        observed_at=None,
+        valid_until=None,
+        source="validated route topology",
+        source_record_sha256=None,
+    ))
+    kwargs = {
+        "cohort_id": COHORT_ID,
+        "route": route,
+        "requested_notional_usd": Decimal("10000"),
+        "common_target": target,
+        "buy_leg": buy_leg,
+        "sell_leg": sell_leg,
+        "buy_quote": buy_quote,
+        "sell_quote": sell_quote,
+        "buy_quote_evidence": buy_evidence,
+        "sell_quote_evidence": sell_evidence,
+        "buy_usd_projection": buy_usd,
+        "sell_usd_projection": sell_usd,
+        "cost_components": costs,
+        "mode_evidence": mode,
+        "now": NOW,
+    }
+    kwargs["cost_components"].append(mev_scenario_row(
+        kwargs,
+        value_status="assumed",
+        amount_usd=Decimal("5"),
+    ))
+    return kwargs
+
+
+def collapsed_atomic_gas_costs(kwargs):
+    costs = [
+        row for row in kwargs["cost_components"]
+        if not (
+            row["leg"] in {"buy", "sell"}
+            and row["component_type"] == "network_gas"
+        )
+    ]
+    exemplar = kwargs["cost_components"][0]
+    costs.append(cost_component_row(
+        cohort_id=exemplar["cohort_id"],
+        opportunity_id=exemplar["opportunity_id"],
+        leg="route",
+        market_id="",
+        direction="route",
+        requested_notional_usd=exemplar["requested_notional_usd"],
+        target_token_quantity=exemplar["target_token_quantity"],
+        component_type="network_gas",
+        value_status="quoted",
+        amount_usd=Decimal("4"),
+        rate_bps=Decimal("4"),
+        basis="one atomic route gas quote covering both swap legs",
+        strict_eligible=True,
+        observed_at="2026-08-01T12:01:00Z",
+        valid_until=VALID_UNTIL,
+        source="validated atomic route gas quote",
+        source_record_sha256="8" * 64,
+    ))
+    return sorted(costs, key=lambda row: (row["leg"], row["component_type"]))
+
+
 class CommonQuantityTests(unittest.TestCase):
     def test_known_answer_uses_one_common_lattice_quantity(self):
         buy = market_rules("cex:binance:AAVE/USDT", source_hash="1" * 64)
@@ -666,17 +804,75 @@ class CommonQuantityTests(unittest.TestCase):
 
 
 class RouteOpportunityTests(unittest.TestCase):
-    def test_live_builder_rejects_historical_atomic_nine_row_topology(self):
-        kwargs = strict_fixture()
-        self.assertEqual(len(historical_rows()), 9)
+    def test_live_builder_rejects_collapsed_atomic_nine_row_topology(self):
+        kwargs = atomic_v2_fixture()
+        collapsed_costs = collapsed_atomic_gas_costs(kwargs)
+        collapsed_keys = frozenset(
+            (row["leg"], row["component_type"])
+            for row in collapsed_costs
+        )
+        live_keys = route_opportunity.live_complete_cost_component_keys(
+            kwargs["route"]
+        )
+        self.assertEqual(len(live_keys), 10)
+        self.assertEqual(len(collapsed_costs), 9)
+        self.assertEqual(len(collapsed_keys), 9)
+        self.assertEqual(
+            live_keys - collapsed_keys,
+            frozenset({
+                ("buy", "network_gas"),
+                ("sell", "network_gas"),
+            }),
+        )
+        self.assertEqual(
+            collapsed_keys - live_keys,
+            frozenset({("route", "network_gas")}),
+        )
+        self.assertEqual(
+            sum(
+                Decimal(row["amount_usd"])
+                for row in kwargs["cost_components"]
+                if row["component_type"] == "network_gas"
+            ),
+            Decimal(next(
+                row["amount_usd"]
+                for row in collapsed_costs
+                if row["component_type"] == "network_gas"
+            )),
+        )
 
-        with self.assertRaisesRegex(
-            ValueError,
-            "amount_usd and rate_bps do not recompute",
-        ):
-            build_route_opportunity(
-                **{**kwargs, "cost_components": historical_rows()}
+        with patch(
+            "scripts.route_opportunity.live_complete_cost_component_keys",
+            wraps=route_opportunity.live_complete_cost_component_keys,
+        ) as topology:
+            with self.assertRaisesRegex(
+                ValueError,
+                "cost component is incompatible with route topology",
+            ):
+                build_route_opportunity(
+                    **{**kwargs, "cost_components": collapsed_costs}
+                )
+
+        topology.assert_called_once()
+        self.assertEqual(
+            topology.call_args.args[0]["route_id"],
+            kwargs["route"]["route_id"],
+        )
+
+        with patch(
+            "scripts.route_opportunity.live_complete_cost_component_keys",
+            return_value=collapsed_keys,
+        ) as mutant:
+            result = build_route_opportunity(
+                **{**kwargs, "cost_components": collapsed_costs}
             )
+
+        mutant.assert_called_once()
+        self.assertEqual(
+            mutant.call_args.args[0]["route_id"],
+            kwargs["route"]["route_id"],
+        )
+        self.assertEqual(result["opportunity_id"], collapsed_costs[0]["opportunity_id"])
 
     def test_public_reason_registry_covers_every_mode_reason(self):
         expected_mode_reasons = frozenset().union(

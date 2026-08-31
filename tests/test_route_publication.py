@@ -54,8 +54,12 @@ from scripts.route_inventory import (
 from scripts.route_cost_evidence import (
     build_unavailable_route_cost_evidence_manifest,
 )
-from tests.test_route_opportunity import cex_leg, route_and_mode
-from tests.test_route_cost_topology import historical_rows
+from tests.test_route_opportunity import (
+    atomic_v2_fixture,
+    cex_leg,
+    collapsed_atomic_gas_costs,
+    route_and_mode,
+)
 import scripts.route_publication as route_publication
 
 
@@ -78,6 +82,143 @@ def _rehash_opportunity(row):
         separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
     return normalized
+
+
+def _atomic_cost_rows(bundle, opportunity, *, collapse_route_gas=False):
+    fixture = atomic_v2_fixture()
+    templates = (
+        collapsed_atomic_gas_costs(fixture)
+        if collapse_route_gas
+        else fixture["cost_components"]
+    )
+    notional = Decimal(opportunity["requested_notional_usd"])
+    rows = []
+    for template in templates:
+        leg = template["leg"]
+        rate = template["rate_bps"]
+        rows.append(cost_component_row(
+            cohort_id=bundle["route_cohort_id"],
+            opportunity_id=opportunity["opportunity_id"],
+            leg=leg,
+            market_id=(
+                opportunity[leg + "_market_id"]
+                if leg in {"buy", "sell"}
+                else ""
+            ),
+            direction=template["direction"],
+            requested_notional_usd=notional,
+            target_token_quantity=Decimal(
+                opportunity["target_token_quantity"]
+            ),
+            component_type=template["component_type"],
+            value_status=template["value_status"],
+            amount_usd=(
+                notional * Decimal(rate) / Decimal("10000")
+                if rate is not None
+                else None
+            ),
+            rate_bps=rate,
+            basis=template["basis"],
+            strict_eligible=template["strict_eligible"],
+            embedded_in_leg_quote=template["embedded_in_leg_quote"],
+            observed_at=template["observed_at"],
+            valid_until=template["valid_until"],
+            source=template["source"],
+            source_record_sha256=template["source_record_sha256"],
+            reason_code=template["reason_code"],
+        ))
+    return sorted(rows, key=lambda row: (
+        row["opportunity_id"], row["leg"], row["component_type"]
+    ))
+
+
+def _atomic_complete_bundle(complete):
+    bundle = copy.deepcopy(complete)
+    route = dict(bundle["routes"][0])
+    route.update({
+        "token_symbol": "AAVE",
+        "buy_market_id": (
+            "dex:eth:uniswap_v2:"
+            "0x3333333333333333333333333333333333333333:AAVE"
+        ),
+        "sell_market_id": (
+            "dex:eth:sushiswap_v2:"
+            "0x4444444444444444444444444444444444444444:AAVE"
+        ),
+        "route_mode": "atomic_onchain",
+        "route_class": "candidate",
+        "settlement_reason": None,
+    })
+    route["route_id"] = route_publication.canonical_route_id(route)
+    bundle["routes"] = [route]
+    bundle["legs"] = sorted([
+        {
+            "available": True,
+            "fixed_block_number": "123",
+            "fixed_block_timestamp": "2026-08-01T11:59:59Z",
+            "leg_id": market_id,
+            "market_id": market_id,
+            "market_type": "dex",
+            "raw_response_sha256": raw_hash,
+            "reason_code": "observed",
+            "snapshot_id": bundle["core_context"]["raw_evidence_run_id"],
+            "source_endpoint": "https://rpc.example/eth",
+            "state_observed_at": observed_at,
+            "status": "observed",
+            "token_symbol": "AAVE",
+        }
+        for market_id, raw_hash, observed_at in (
+            (route["buy_market_id"], "1" * 64, "2026-08-01T12:00:00Z"),
+            (route["sell_market_id"], "2" * 64, "2026-08-01T12:01:00Z"),
+        )
+    ], key=lambda row: row["market_id"])
+
+    opportunities = []
+    costs = []
+    for original in bundle["opportunities"]:
+        opportunity = dict(original)
+        opportunity.update({
+            "route_id": route["route_id"],
+            "opportunity_id": route_opportunity_id(
+                route["route_id"], opportunity["requested_notional_usd"]
+            ),
+            "token_symbol": route["token_symbol"],
+            "buy_market_id": route["buy_market_id"],
+            "sell_market_id": route["sell_market_id"],
+            "route_mode": route["route_mode"],
+            "opportunity_class": "research_estimate",
+            "primary_reason": "cost_component_estimated",
+            "reason_codes": ["cost_component_estimated"],
+            "strict_eligible": False,
+            "strict_ready_for_publication": False,
+            "publication_attestation_sha256": None,
+            "reflected_or_embedded_component_keys": [
+                "buy:pool_swap_fee", "sell:pool_swap_fee"
+            ],
+        })
+        scenario_costs = _atomic_cost_rows(bundle, opportunity)
+        opportunity["cost_component_set_sha256"] = (
+            route_publication._canonical_cost_set_sha256(scenario_costs)
+        )
+        opportunity = _rehash_opportunity(opportunity)
+        opportunities.append(opportunity)
+        costs.extend(scenario_costs)
+    bundle["opportunities"] = sorted(
+        opportunities,
+        key=lambda row: (
+            row["route_id"], Decimal(row["requested_notional_usd"])
+        ),
+    )
+    bundle["cost_components"] = sorted(costs, key=lambda row: (
+        row["opportunity_id"], row["leg"], row["component_type"]
+    ))
+    bundle["input_generations"]["cost_component_generation"] = (
+        route_publication._canonical_input_sha256(bundle["cost_components"])
+    )
+    bundle["input_generations"]["classified_opportunity_generation"] = (
+        route_publication._canonical_input_sha256(bundle["opportunities"])
+    )
+    return bundle
 
 
 def _route(token_symbol, buy_market_id, sell_market_id):
@@ -1860,7 +2001,7 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
                 with self.assertRaises(ValueError):
                     route_publication._validate_complete_logical_bundle(candidate)
 
-    def test_live_publication_rejects_historical_atomic_nine_row_topology(self):
+    def test_live_publication_rejects_collapsed_atomic_nine_row_topology(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"
         fixture = _task7_cex_inputs(
             self.root, raw_root,
@@ -1876,18 +2017,93 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
             inventory_profile_path=fixture["inventory_profile_path"],
             opportunity_inputs=fixture["opportunity_inputs"],
         )
-        candidate = copy.deepcopy(complete)
-        candidate["cost_components"] = historical_rows()
+        route_publication._validate_complete_logical_bundle(complete)
+        candidate = _atomic_complete_bundle(complete)
+        route_publication._validate_complete_logical_bundle(candidate)
+
+        opportunity = dict(candidate["opportunities"][0])
+        scenario_id = opportunity["opportunity_id"]
+        collapsed_costs = _atomic_cost_rows(
+            candidate,
+            opportunity,
+            collapse_route_gas=True,
+        )
+        collapsed_keys = frozenset(
+            (row["leg"], row["component_type"])
+            for row in collapsed_costs
+        )
+        live_keys = route_publication.live_complete_cost_component_keys(
+            candidate["routes"][0]
+        )
+        self.assertEqual(len(live_keys), 10)
+        self.assertEqual(len(collapsed_costs), 9)
+        self.assertEqual(len(collapsed_keys), 9)
+        self.assertEqual(
+            live_keys - collapsed_keys,
+            frozenset({
+                ("buy", "network_gas"),
+                ("sell", "network_gas"),
+            }),
+        )
+        self.assertEqual(
+            collapsed_keys - live_keys,
+            frozenset({("route", "network_gas")}),
+        )
+
+        candidate["cost_components"] = [
+            row for row in candidate["cost_components"]
+            if row["opportunity_id"] != scenario_id
+        ] + collapsed_costs
         candidate["cost_components"].sort(key=lambda row: (
             row["opportunity_id"], row["leg"], row["component_type"]
         ))
-        self.assertEqual(len(candidate["cost_components"]), 9)
+        opportunity["cost_component_set_sha256"] = (
+            route_publication._canonical_cost_set_sha256(collapsed_costs)
+        )
+        candidate["opportunities"][0] = _rehash_opportunity(opportunity)
+        candidate["input_generations"]["cost_component_generation"] = (
+            route_publication._canonical_input_sha256(
+                candidate["cost_components"]
+            )
+        )
+        candidate["input_generations"]["classified_opportunity_generation"] = (
+            route_publication._canonical_input_sha256(
+                candidate["opportunities"]
+            )
+        )
 
-        with self.assertRaisesRegex(
-            route_publication.RoutePublicationError,
-            "complete cost inventory is invalid",
-        ):
-            route_publication._validate_complete_logical_bundle(candidate)
+        live_helper = route_publication.live_complete_cost_component_keys
+        with patch(
+            "scripts.route_publication.live_complete_cost_component_keys",
+            wraps=live_helper,
+        ) as topology:
+            with self.assertRaisesRegex(
+                route_publication.RoutePublicationError,
+                "route opportunity cost binding is invalid",
+            ):
+                route_publication._validate_complete_logical_bundle(candidate)
+
+        topology.assert_called_once_with(candidate["routes"][0])
+
+        helper_calls = 0
+
+        def accept_one_collapsed_scenario(route):
+            nonlocal helper_calls
+            helper_calls += 1
+            if helper_calls == 1:
+                return collapsed_keys
+            return live_helper(route)
+
+        with patch(
+            "scripts.route_publication.live_complete_cost_component_keys",
+            side_effect=accept_one_collapsed_scenario,
+        ) as mutant:
+            validated = route_publication._validate_complete_logical_bundle(
+                candidate
+            )
+
+        self.assertEqual(mutant.call_count, 5)
+        self.assertEqual(validated["cost_components"], candidate["cost_components"])
 
     def test_sqlite_csv_divergence_and_incomplete_public_pointer_are_rejected(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"
