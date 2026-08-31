@@ -59,6 +59,7 @@ try:
         MAX_ROUTE_SKEW_SECONDS,
         ROUTE_OPPORTUNITY_REASON_CODES,
     )
+    from scripts.route_cost_topology import live_complete_cost_component_keys
     from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
     from scripts.event_facts import effective_datetime_interval
     from scripts.static_asset_contract import PUBLIC_STATIC_ASSET_FILENAMES
@@ -82,6 +83,9 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
         MAX_ROUTE_AGE_SECONDS,
         MAX_ROUTE_SKEW_SECONDS,
         ROUTE_OPPORTUNITY_REASON_CODES,
+    )
+    from route_cost_topology import (  # type: ignore[no-redef]
+        live_complete_cost_component_keys,
     )
     from timestamp_contract import (  # type: ignore[no-redef]
         exact_rfc3339_epoch_seconds,
@@ -841,24 +845,13 @@ def _route_ratio_fields(edge: Fraction, buy_cost: Fraction) -> tuple[str, str, s
     )
 
 
-def _route_expected_component_keys(
-    route: Mapping[str, Any],
-) -> set[tuple[str, str]]:
-    expected = {("route", "rebalancing_or_transfer")}
-    for leg in ("buy", "sell"):
-        market_id = str(route.get(leg + "_market_id", ""))
-        if market_id.startswith("cex:"):
-            expected.add((leg, "venue_taker_fee"))
-        elif market_id.startswith("dex:"):
-            expected.update({
-                (leg, "pool_swap_fee"),
-                (leg, "network_gas"),
-                (leg, "router_or_integrator_fee"),
-                (leg, "token_transfer_tax"),
-            })
-        else:
-            raise ReleaseCheckError("route market type is unsupported")
-    return expected
+def _release_live_cost_component_keys(
+    route: Mapping[str, Any], error_message: str
+) -> frozenset[tuple[str, str]]:
+    try:
+        return live_complete_cost_component_keys(route)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReleaseCheckError(error_message) from error
 
 
 def _route_cost_is_current(
@@ -992,7 +985,10 @@ def _route_cost_inventory(
             for row in component_rows
             if row.get("component_type") != "mev_buffer"
         }
-        expected = _route_expected_component_keys(route)
+        expected = set(_release_live_cost_component_keys(
+            route, "route market type is unsupported"
+        ))
+        expected.discard(("route", "mev_buffer"))
         if expected - actual:
             raise ReleaseCheckError("missing cost component is not publishable")
         if actual - expected:
@@ -1238,7 +1234,10 @@ def _validate_route_opportunity_row(
     ) or reflected_values != sorted(set(reflected_values)):
         raise ReleaseCheckError("reflected cost inventory is invalid")
     reflected = set(reflected_values)
-    required_keys = _route_expected_component_keys(route)
+    required_keys = set(_release_live_cost_component_keys(
+        route, "route market type is unsupported"
+    ))
+    required_keys.discard(("route", "mev_buffer"))
     by_key = {
         (str(item.get("leg")), str(item.get("component_type"))): item
         for item in component_rows
@@ -2468,32 +2467,6 @@ def _validate_opportunity_source_links(
     )
 
 
-def _opportunity_expected_component_keys(
-    row: Mapping[str, Any],
-) -> set[tuple[str, str]]:
-    expected = {("route", "rebalancing_or_transfer")}
-    has_dex = False
-    for leg in ("buy", "sell"):
-        market_id = str(row.get(leg + "_market_id") or "")
-        if market_id.startswith("cex:"):
-            expected.add((leg, "venue_taker_fee"))
-        elif market_id.startswith("dex:"):
-            has_dex = True
-            expected.update({
-                (leg, "pool_swap_fee"),
-                (leg, "network_gas"),
-                (leg, "router_or_integrator_fee"),
-                (leg, "token_transfer_tax"),
-            })
-        else:
-            raise ReleaseCheckError(
-                "Opportunity cost component market type is unsupported"
-            )
-    if has_dex:
-        expected.add(("route", "mev_buffer"))
-    return expected
-
-
 def _opportunity_rounded_seconds(value: Decimal) -> Decimal:
     """Reproduce freshness.py's float total_seconds + round(..., 6)."""
 
@@ -2854,7 +2827,9 @@ def _validate_opportunity_route(row: Any, *, metadata: Mapping[str, Any]) -> Non
         )
 
     require(
-        observed_component_keys == _opportunity_expected_component_keys(row),
+        observed_component_keys == _release_live_cost_component_keys(
+            row, "Opportunity cost component market type is unsupported"
+        ),
         "Opportunity cost component topology differs from the route",
     )
     if status == "available":

@@ -34,6 +34,7 @@ from scripts.route_opportunity import (
     ROUTE_OPPORTUNITY_MODES,
     ROUTE_OPPORTUNITY_REASON_CODES,
 )
+from scripts.route_cost_topology import live_complete_cost_component_keys
 from scripts.timestamp_contract import parse_rfc3339_utc
 
 
@@ -481,35 +482,14 @@ def _rounded_ratio(value: Fraction, places: int = 8) -> Fraction:
     return Fraction(quotient * sign, scale)
 
 
-def _expected_component_keys(row: Mapping[str, Any]) -> set:
-    expected = {("route", "rebalancing_or_transfer")}
-    has_dex = False
-    for leg in ("buy", "sell"):
-        market_id = row.get(leg + "_market_id")
-        if not isinstance(market_id, str):
-            raise OpportunityBundleInvalid()
-        if market_id.startswith("cex:"):
-            expected.add((leg, "venue_taker_fee"))
-        elif market_id.startswith("dex:"):
-            has_dex = True
-            expected.update({
-                (leg, "pool_swap_fee"),
-                (leg, "network_gas"),
-                (leg, "router_or_integrator_fee"),
-                (leg, "token_transfer_tax"),
-            })
-        else:
-            raise OpportunityBundleInvalid()
-    if has_dex:
-        expected.add(("route", "mev_buffer"))
-    return expected
-
-
 def _validate_component_inventory(
     row: Mapping[str, Any],
     component_rows: Sequence[Mapping[str, Any]],
 ) -> None:
-    expected = _expected_component_keys(row)
+    try:
+        expected = live_complete_cost_component_keys(row)
+    except (KeyError, TypeError, ValueError) as error:
+        raise OpportunityBundleInvalid() from error
     observed = set()
     row_notional = _bundle_fraction(
         row.get("requested_notional_usd"),

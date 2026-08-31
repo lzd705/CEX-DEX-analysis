@@ -26,6 +26,7 @@ try:
     )
     from scripts.fetch_cex_depth import route_quantity_quote_for_book
     from scripts.route_cohort import canonical_route_id
+    from scripts.route_cost_topology import live_complete_cost_component_keys
     from scripts.route_quantity import (
         CommonTarget,
         FeeSemantics,
@@ -46,6 +47,9 @@ except ModuleNotFoundError:
     )
     from fetch_cex_depth import route_quantity_quote_for_book  # type: ignore
     from route_cohort import canonical_route_id  # type: ignore
+    from route_cost_topology import (  # type: ignore
+        live_complete_cost_component_keys,
+    )
     from route_quantity import (  # type: ignore
         CommonTarget,
         FeeSemantics,
@@ -844,27 +848,6 @@ def _validated_quote_evidence(
     return False, False, None, None, core_hash
 
 
-def _expected_component_keys(route: Mapping[str, Any]) -> set[Tuple[str, str]]:
-    expected = {("route", "rebalancing_or_transfer")}
-    for leg, market_id in (
-        ("buy", route["buy_market_id"]),
-        ("sell", route["sell_market_id"]),
-    ):
-        market_type, _chain = _market_type_and_chain(market_id)
-        if market_type == "cex":
-            expected.add((leg, "venue_taker_fee"))
-        else:
-            expected.update(
-                {
-                    (leg, "pool_swap_fee"),
-                    (leg, "network_gas"),
-                    (leg, "router_or_integrator_fee"),
-                    (leg, "token_transfer_tax"),
-                }
-            )
-    return expected
-
-
 def _component_current(row: Mapping[str, Any], now_epoch: Fraction) -> bool:
     if (
         row.get("value_status") == "not_applicable"
@@ -945,7 +928,8 @@ def _analyze_cost_components(
         _market_type_and_chain(market_id)[0] == "dex"
         for market_id in (route["buy_market_id"], route["sell_market_id"])
     )
-    expected_keys = _expected_component_keys(route)
+    expected_keys = set(live_complete_cost_component_keys(route))
+    expected_keys.discard(("route", "mev_buffer"))
     rows_by_key: Dict[Tuple[str, str], Mapping[str, Any]] = {}
     component_reasons: List[str] = []
     for row in inventory:

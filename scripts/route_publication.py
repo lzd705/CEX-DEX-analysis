@@ -72,6 +72,7 @@ try:
         build_route_opportunity,
         route_opportunity_id,
     )
+    from scripts.route_cost_topology import live_complete_cost_component_keys
     from scripts.route_quantity import FeeSemantics, MarketRules, QuantityQuote
     from scripts.route_shadow_inputs import (
         TYPED_SOURCE_MANIFEST_FIELDS,
@@ -136,6 +137,9 @@ except ModuleNotFoundError:
         _publication_binding_sha256,
         build_route_opportunity,
         route_opportunity_id,
+    )
+    from route_cost_topology import (  # type: ignore[no-redef]
+        live_complete_cost_component_keys,
     )
     from route_quantity import (  # type: ignore[no-redef]
         FeeSemantics,
@@ -3953,28 +3957,6 @@ def _parse_market_rules_source(
         raise RoutePublicationError("typed market-rules source is invalid") from error
 
 
-def _expected_component_keys_for_complete_route(
-    route: Mapping[str, Any],
-) -> set[Tuple[str, str]]:
-    expected = {("route", "rebalancing_or_transfer")}
-    for leg in ("buy", "sell"):
-        market_id = str(route[leg + "_market_id"])
-        if market_id.startswith("cex:"):
-            expected.add((leg, "venue_taker_fee"))
-        elif market_id.startswith("dex:"):
-            expected.update({
-                (leg, "pool_swap_fee"),
-                (leg, "network_gas"),
-                (leg, "router_or_integrator_fee"),
-                (leg, "token_transfer_tax"),
-            })
-        else:
-            raise RoutePublicationError("complete route market type is invalid")
-    if any(str(route[key]).startswith("dex:") for key in ("buy_market_id", "sell_market_id")):
-        expected.add(("route", "mev_buffer"))
-    return expected
-
-
 def _canonical_cost_set_sha256(rows: Sequence[Mapping[str, Any]]) -> str:
     canonical = sorted(
         (dict(row) for row in rows),
@@ -4062,7 +4044,7 @@ def _validated_prepublication_input(
     except (TypeError, ValueError) as error:
         raise RoutePublicationError("opportunity cost inventory is invalid") from error
     keys = {(str(row["leg"]), str(row["component_type"])) for row in costs}
-    expected_keys = _expected_component_keys_for_complete_route(route)
+    expected_keys = live_complete_cost_component_keys(route)
     if len(keys) != len(costs) or keys != expected_keys:
         raise RoutePublicationError("opportunity cost component set is not exact")
     if classified.get("cost_component_set_sha256") != _canonical_cost_set_sha256(costs):
@@ -5080,7 +5062,7 @@ def _validate_complete_logical_bundle(bundle: Any) -> Dict[str, Any]:
         component_rows = costs_by_opportunity.get(opportunity_id, [])
         if (
             {(item["leg"], item["component_type"]) for item in component_rows}
-            != _expected_component_keys_for_complete_route(route)
+            != live_complete_cost_component_keys(route)
             or row.get("cost_component_set_sha256")
             != _canonical_cost_set_sha256(component_rows)
         ):

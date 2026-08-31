@@ -1774,9 +1774,11 @@ class RouteOpportunityReleaseGateTest(unittest.TestCase):
             and item["leg"] == "route"
         )
         pool_components = []
-        for leg, component_type in release_checker._route_expected_component_keys(
-            pool_route
-        ):
+        pool_component_keys = set(
+            release_checker.live_complete_cost_component_keys(pool_route)
+        )
+        pool_component_keys.discard(("route", "mev_buffer"))
+        for leg, component_type in pool_component_keys:
             component = copy.deepcopy(
                 route_component if leg == "route" else fee
             )

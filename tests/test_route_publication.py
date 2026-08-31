@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -704,6 +705,64 @@ def _task7_cex_inputs(core_root, raw_root, source_root, private_root):
     }
 
 
+_LIVE_COMPLETE_BUNDLE_GOLDEN_BY_RUNTIME = {
+    (3, 8, 10): {
+        "core_manifest_sha256": (
+            "ae09cedcea54e8509e71abeb561d51ca707155d6dc70b3758094190ada3222cc"
+        ),
+        "artifacts": {
+            "cost_components.csv": (
+                19269,
+                "af3c06ccfc6f614ae5945a68a7f599f97bafc6b97925ab5449feead0783146fd",
+            ),
+            "manifest.json": (
+                3239,
+                "482f7050c7f965750fffc07b23f9df75231ee75bb9467b3cdf520e2e1513617d",
+            ),
+            "route_cohort.sqlite3": (
+                135168,
+                "b94743b68f6d87dcf4b231257ab08cf48cb5ffebe257e3ab3be451f613fa9537",
+            ),
+            "route_legs.csv": (
+                1683,
+                "477324f07f1106dc0932ab35d5fe1f456a0e741b49c54d86d262d4182b8995c8",
+            ),
+            "route_opportunities.csv": (
+                23563,
+                "1c8f97875ee1215f2d1a517ec3b07372ec1ea536a6919a6bc5d18e458c8ace6d",
+            ),
+        },
+    },
+    (3, 13, 5): {
+        "core_manifest_sha256": (
+            "5a3344f9f68bfded5cc12b178970ac78d190be99787f5a55f15df64ad5ff2f93"
+        ),
+        "artifacts": {
+            "cost_components.csv": (
+                19269,
+                "af3c06ccfc6f614ae5945a68a7f599f97bafc6b97925ab5449feead0783146fd",
+            ),
+            "manifest.json": (
+                3239,
+                "a5bec61af07c36e4ccb0c40642a958e8fb31b046f8e223347b7fe12863957334",
+            ),
+            "route_cohort.sqlite3": (
+                135168,
+                "f3ff7e6914c2159277ccb9aa1aef5e8d1302fb3e125c3f74ecf04bcd464efc8a",
+            ),
+            "route_legs.csv": (
+                1683,
+                "477324f07f1106dc0932ab35d5fe1f456a0e741b49c54d86d262d4182b8995c8",
+            ),
+            "route_opportunities.csv": (
+                23563,
+                "1f2cd8c28e28781ed0eb223ad0d4b1cac91e01149da68fda251f00af6f714702",
+            ),
+        },
+    },
+}
+
+
 def _refresh_database_hash_in_manifest(bundle):
     database = bundle / "route_cohort.sqlite3"
     manifest_path = bundle / "manifest.json"
@@ -910,6 +969,37 @@ class RoutePublicationInterfaceTests(unittest.TestCase):
 
 
 class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
+    def test_live_complete_bundle_bytes_match_prefactor_golden(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root,
+            raw_root,
+            Path(self.temporary.name) / "typed-sources",
+            Path(self.temporary.name) / "private-profiles",
+        )
+        bundle = route_publication.build_complete_route_bundle(
+            core_root=self.root,
+            raw_root=raw_root,
+            source_root=fixture["source_root"],
+            fee_profile_path=fixture["fee_profile_path"],
+            fee_profile_id=fixture["fee_profile_id"],
+            inventory_profile_path=fixture["inventory_profile_path"],
+            opportunity_inputs=fixture["opportunity_inputs"],
+        )
+        artifacts, _manifest = route_publication._complete_artifact_bytes(bundle)
+        golden = _LIVE_COMPLETE_BUNDLE_GOLDEN_BY_RUNTIME[sys.version_info[:3]]
+
+        self.assertEqual(
+            bundle["core_manifest_sha256"], golden["core_manifest_sha256"]
+        )
+        self.assertEqual(
+            {
+                name: (len(payload), hashlib.sha256(payload).hexdigest())
+                for name, payload in sorted(artifacts.items())
+            },
+            golden["artifacts"],
+        )
+
     def test_complete_sqlite_reader_supports_legacy_sqlite_catalog_name(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"
         fixture = _task7_cex_inputs(
