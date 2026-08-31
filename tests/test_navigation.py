@@ -28,6 +28,77 @@ def run_navigation_javascript(source: str):
 
 
 class MarketMonitorNavigationTest(unittest.TestCase):
+    def test_opportunity_scope_defaults_to_current_and_historical_round_trips(self):
+        result = run_navigation_javascript(
+            """
+const current = navigation.parseRoute("/opportunities", "?token=UNI");
+const explicitCurrent = navigation.parseRoute(
+  "/opportunities", "?opportunity_scope=current&token=UNI"
+);
+const historical = navigation.parseRoute(
+  "/opportunities", "?opportunity_scope=historical&token=UNI"
+);
+const historicalPath = navigation.buildOpportunitiesPath(historical.filters);
+const currentPath = navigation.buildOpportunitiesPath({
+  ...explicitCurrent.filters,
+  opportunityScope: "current",
+});
+console.log(JSON.stringify({
+  current,
+  explicitCurrent,
+  historical,
+  historicalPath,
+  currentPath,
+}));
+"""
+        )
+
+        self.assertEqual(result["current"], {
+            "kind": "opportunities",
+            "filters": {"token": "UNI"},
+        })
+        self.assertEqual(result["explicitCurrent"], result["current"])
+        self.assertEqual(
+            result["historical"]["filters"]["opportunityScope"],
+            "historical",
+        )
+        self.assertIn("opportunity_scope=historical", result["historicalPath"])
+        self.assertNotIn("opportunity_scope", result["currentPath"])
+
+    def test_invalid_or_duplicate_opportunity_scope_is_explicitly_rejected(self):
+        result = run_navigation_javascript(
+            """
+const invalid = navigation.parseRoute(
+  "/opportunities", "?opportunity_scope=future&token=UNI"
+);
+const duplicate = navigation.parseRoute(
+  "/opportunities",
+  "?opportunity_scope=current&opportunity_scope=historical&token=UNI",
+);
+let buildError = null;
+try {
+  navigation.buildOpportunitiesPath({ opportunityScope: "future" });
+} catch (error) {
+  buildError = error.message;
+}
+console.log(JSON.stringify({ invalid, duplicate, buildError }));
+"""
+        )
+
+        expected_error = {
+            "code": "invalid_opportunity_scope",
+            "field": "opportunity_scope",
+        }
+        self.assertEqual(
+            result["invalid"]["validationErrors"],
+            [{**expected_error, "value": "future"}],
+        )
+        self.assertEqual(
+            result["duplicate"]["validationErrors"],
+            [{**expected_error, "value": "duplicate"}],
+        )
+        self.assertIn("scope", result["buildError"].lower())
+
     def test_opportunity_volume_sort_round_trips(self):
         result = run_navigation_javascript(
             """

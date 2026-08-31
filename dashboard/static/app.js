@@ -2350,6 +2350,178 @@ function opportunityRowMarkup(route) {
   </tr>`;
 }
 
+function historicalOpportunityDecimal(value) {
+  if (typeof value !== "string" || !/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value)) {
+    return null;
+  }
+  return value;
+}
+
+function historicalOpportunityRowMarkup(route, generation, replayId) {
+  const opportunityId = String(route.opportunity_id);
+  const routeId = String(route.route_id);
+  const token = String(route.token_symbol);
+  const direction = String(route.direction);
+  const notional = String(route.requested_notional_usd);
+  const blockNumber = String(route.selected_block_number);
+  const policyNet = String(route.policy_net_edge_usd);
+  const researchNet = String(route.research_net_edge_usd);
+  const receipt = String(route.receipt_sha256);
+  const trace = String(route.trace_sha256);
+  const blockHash = String(route.selected_block_hash);
+  const blockTime = formatOpportunityTimestamp(route.selected_block_timestamp);
+  const baselineNet = String(route.baseline_net_edge_usd);
+  const stress25 = String(route.stress_25_net_edge_usd);
+  const stress50 = String(route.stress_50_net_edge_usd);
+  const verified = route.foundry_verified === true;
+  const stressLabel = route.stress_robust === true ? "Stress robust" : "Stress sensitive";
+  return `<tr data-opportunity-id="${escapeHtml(opportunityId)}"
+      data-api-generation="${escapeHtml(generation)}"
+      data-replay-id="${escapeHtml(replayId)}"
+      data-block-number="${escapeHtml(blockNumber)}"
+      data-direction="${escapeHtml(direction)}"
+      data-notional-usd="${escapeHtml(notional)}"
+      data-foundry-verified="${String(verified)}"
+      data-policy-net-edge-usd="${escapeHtml(policyNet)}"
+      data-research-net-edge-usd="${escapeHtml(researchNet)}"
+      data-receipt-sha256="${escapeHtml(receipt)}"
+      data-trace-sha256="${escapeHtml(trace)}">
+    <td data-label="Token"><strong>${escapeHtml(token)}</strong></td>
+    <td data-label="Route"><span class="opportunity-route-id">${escapeHtml(routeId)}</span><span class="metric-note">${escapeHtml(route.buy_market_id)} → ${escapeHtml(route.sell_market_id)}</span></td>
+    <td data-label="Direction">${escapeHtml(direction)}</td>
+    <td data-label="Notional">${escapeHtml(formatRawUsd(notional))}</td>
+    <td data-label="Replay block"><strong>${escapeHtml(blockNumber)}</strong><span class="metric-note">${escapeHtml(blockHash)}</span><span class="metric-note">${escapeHtml(blockTime)}</span></td>
+    <td data-label="Net result at replay block"><strong>${escapeHtml(formatRawUsd(researchNet))}</strong><span class="metric-note">Policy baseline ${escapeHtml(formatRawUsd(policyNet))}</span><span class="metric-note">Receipt baseline ${escapeHtml(formatRawUsd(baselineNet))}</span></td>
+    <td data-label="State age at replay">${escapeHtml(formatOpportunitySeconds(route.state_age_seconds))} s</td>
+    <td data-label="Foundry evidence"><strong>${verified ? "Foundry verified" : "Foundry unverified"}</strong><span class="metric-note">Gas ${escapeHtml(rawVolume.format(route.gas_used))}</span><span class="metric-note">Receipt ${escapeHtml(receipt)}</span><span class="metric-note">Trace ${escapeHtml(trace)}</span><span class="metric-note">${escapeHtml(route.executor_model)}</span></td>
+    <td data-label="Stress outcome"><strong>${escapeHtml(stressLabel)}</strong><span class="metric-note">Stress 25 bps ${escapeHtml(formatRawUsd(stress25))}</span><span class="metric-note">Stress 50 bps ${escapeHtml(formatRawUsd(stress50))}</span></td>
+  </tr>`;
+}
+
+function opportunityScope(filters = {}) {
+  return filters?.opportunityScope === "historical" ? "historical" : "current";
+}
+
+function syncOpportunityScopePresentation(scope) {
+  const historical = scope === "historical";
+  document.querySelectorAll("[data-opportunity-scope]").forEach((button) => {
+    const active = button.dataset.opportunityScope === scope;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  const currentContext = byId("opportunity-current-context");
+  const historicalContext = byId("opportunity-historical-context");
+  if (currentContext) currentContext.hidden = historical;
+  if (historicalContext) historicalContext.hidden = !historical;
+}
+
+function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) {
+  const metadata = payload?.metadata;
+  const routes = Array.isArray(payload?.routes) ? payload.routes : null;
+  if (
+    !metadata
+    || metadata.contract_version !== "opportunity_historical_summary/v1"
+    || metadata.temporal_scope !== "historical_replay"
+    || metadata.execution_claim
+      !== "historical_counterfactual_state_override_next_block"
+    || !/^[0-9a-f]{64}$/.test(metadata.data_generation || "")
+    || !/^replay:[0-9a-f]{64}$/.test(metadata.replay_id || "")
+    || !Number.isSafeInteger(metadata.selected_block_number)
+    || metadata.selected_block_number < 0
+    || !metadata.coverage
+    || metadata.coverage.scenario_count !== 10
+    || routes === null
+    || metadata.coverage.returned_count !== routes.length
+    || !opportunityResponseFiltersMatch(payload?.filters, requestedFilters)
+  ) return false;
+  const identities = new Set();
+  return routes.every((route) => {
+    const opportunityId = route?.opportunity_id;
+    const valid = (
+      typeof opportunityId === "string"
+      && opportunityId.length > 0
+      && !identities.has(opportunityId)
+      && typeof route.route_id === "string"
+      && route.route_id.length > 0
+      && typeof route.token_symbol === "string"
+      && route.token_symbol.length > 0
+      && typeof route.buy_market_id === "string"
+      && typeof route.sell_market_id === "string"
+      && route.route_mode
+        === "historical_counterfactual_state_override_next_block"
+      && route.opportunity_class === "research_estimate"
+      && route.availability?.status === "available"
+      && ["uniswap_to_sushiswap", "sushiswap_to_uniswap"].includes(route.direction)
+      && ["1000", "5000", "10000", "50000", "100000"].includes(
+        String(route.requested_notional_usd),
+      )
+      && route.selected_block_number === metadata.selected_block_number
+      && /^0x[0-9a-f]{64}$/.test(route.selected_block_hash || "")
+      && typeof route.selected_block_timestamp === "string"
+      && Number.isFinite(Date.parse(route.selected_block_timestamp))
+      && typeof route.state_age_seconds === "number"
+      && Number.isFinite(route.state_age_seconds)
+      && route.state_age_seconds >= 0
+      && route.foundry_verified === true
+      && Number.isSafeInteger(route.gas_used)
+      && route.gas_used >= 0
+      && /^[0-9a-f]{64}$/.test(route.receipt_sha256 || "")
+      && /^[0-9a-f]{64}$/.test(route.trace_sha256 || "")
+      && route.executor_model === "prefunded_predeployed_preapproved"
+      && historicalOpportunityDecimal(route.policy_net_edge_usd) !== null
+      && historicalOpportunityDecimal(route.research_net_edge_usd) !== null
+      && historicalOpportunityDecimal(route.baseline_net_edge_usd) !== null
+      && historicalOpportunityDecimal(route.stress_25_net_edge_usd) !== null
+      && historicalOpportunityDecimal(route.stress_50_net_edge_usd) !== null
+      && typeof route.stress_robust === "boolean"
+    );
+    if (valid) identities.add(opportunityId);
+    return valid;
+  });
+}
+
+function renderHistoricalOpportunities(payload) {
+  app.opportunities = payload;
+  const metadata = payload.metadata;
+  const routes = payload.routes;
+  const root = byId("historical-opportunity-inventory");
+  syncOpportunityScopePresentation("historical");
+  byId("opportunities-view")?.setAttribute("aria-busy", "false");
+  hideStatus(byId("opportunity-loading"));
+  hideStatus(byId("opportunity-bundle-unavailable"));
+  hideError(byId("opportunity-error"));
+  ["strict", "estimate", "unavailable"].forEach((name) => {
+    byId(`${name}-opportunities`).hidden = true;
+    byId(`${name}-opportunity-body`).innerHTML = "";
+  });
+  root.hidden = false;
+  root.setAttribute("data-api-generation", metadata.data_generation);
+  root.setAttribute("data-replay-id", metadata.replay_id);
+  root.setAttribute("data-scenario-count", String(metadata.coverage.scenario_count));
+  root.setAttribute(
+    "data-selected-block-number", String(metadata.selected_block_number),
+  );
+  byId("historical-opportunity-body").innerHTML = routes.map((route) => (
+    historicalOpportunityRowMarkup(
+      route, metadata.data_generation, metadata.replay_id,
+    )
+  )).join("");
+  byId("historical-opportunity-count").textContent = (
+    `${routes.length} ${routes.length === 1 ? "scenario" : "scenarios"}`
+  );
+  byId("historical-opportunity-empty").hidden = routes.length > 0;
+  const badge = byId("opportunity-cohort-status");
+  badge.textContent = `Block ${metadata.selected_block_number}`;
+  badge.setAttribute("title", metadata.replay_id);
+  badge.setAttribute("aria-label", `Historical replay ${metadata.replay_id}`);
+  showStatus(
+    byId("opportunity-status"),
+    `${routes.length} Historical Foundry replay scenarios match the current filters.`,
+    routes.length ? "success" : "warning",
+  );
+  if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
+}
+
 function opportunityInventoryVisibility(filters = {}) {
   const opportunityClass = filters.opportunity_class || "all";
   const availability = filters.availability || "all";
@@ -2377,8 +2549,27 @@ function renderOpportunityInventory(name, routes, visible) {
   empty.hidden = !visible || routes.length > 0;
 }
 
+function clearHistoricalOpportunityInventory() {
+  const root = byId("historical-opportunity-inventory");
+  if (root) {
+    root.hidden = true;
+    root.setAttribute("data-api-generation", "");
+    root.setAttribute("data-replay-id", "");
+    root.setAttribute("data-scenario-count", "");
+    root.setAttribute("data-selected-block-number", "");
+  }
+  const body = byId("historical-opportunity-body");
+  if (body) body.innerHTML = "";
+  const count = byId("historical-opportunity-count");
+  if (count) count.textContent = "Unavailable";
+  const empty = byId("historical-opportunity-empty");
+  if (empty) empty.hidden = true;
+}
+
 function renderOpportunities(payload) {
   app.opportunities = payload;
+  syncOpportunityScopePresentation("current");
+  clearHistoricalOpportunityInventory();
   const venueOptions = Array.isArray(payload?.metadata?.available_venues)
     ? payload.metadata.available_venues.filter((venue) => (
         typeof venue === "string" && venue.length
@@ -2470,7 +2661,7 @@ function defaultOpportunityDirection(sort) {
 
 function normalizedOpportunityFilters(filters = {}) {
   const sort = filters.sort || "net_edge_usd";
-  return {
+  const normalized = {
     token: filters.token || "",
     venue: filters.venue || "",
     notionalUsd: filters.notionalUsd || "",
@@ -2482,10 +2673,15 @@ function normalizedOpportunityFilters(filters = {}) {
       ? filters.dir
       : defaultOpportunityDirection(sort),
   };
+  if (opportunityScope(filters) === "historical") {
+    normalized.opportunityScope = "historical";
+  }
+  return normalized;
 }
 
 function hydrateOpportunityControls(route) {
   const filters = normalizedOpportunityFilters(route?.filters || {});
+  syncOpportunityScopePresentation(opportunityScope(filters));
   const values = {
     "opportunity-token": filters.token,
     "opportunity-venue": filters.venue,
@@ -2534,6 +2730,7 @@ function setOpportunityFilterValidation(errors = []) {
 
 function opportunityFiltersFromControls() {
   return normalizedOpportunityFilters({
+    opportunityScope: opportunityScope(app.route?.filters || {}),
     token: byId("opportunity-token")?.value.trim().toUpperCase() || "",
     venue: byId("opportunity-venue")?.value.trim().toLowerCase() || "",
     notionalUsd: byId("opportunity-notional")?.value || "",
@@ -2564,6 +2761,7 @@ function clearOpportunityFilterResult(errors) {
     byId(`${name}-opportunity-empty`).hidden = true;
     byId(`${name}-opportunity-count`).textContent = "Unavailable";
   });
+  clearHistoricalOpportunityInventory();
 }
 
 function opportunityRequestKey(filters) {
@@ -2773,16 +2971,22 @@ function clearOpportunityResult(message) {
     byId(`${name}-opportunity-empty`).hidden = true;
     byId(`${name}-opportunity-count`).textContent = "Unavailable";
   });
+  clearHistoricalOpportunityInventory();
 }
 
 async function loadOpportunities(filters = app.route?.filters || {}) {
   const normalized = normalizedOpportunityFilters(filters);
+  const scope = opportunityScope(normalized);
   const requestKey = opportunityRequestKey(normalized);
   const requestId = invalidateOpportunityRequest();
   const controller = new AbortController();
   app.opportunityController = controller;
   const pageUrl = new URL(requestKey, "https://dashboard.invalid");
-  const apiUrl = `/api/markets/opportunities${pageUrl.search}`;
+  pageUrl.searchParams.delete("opportunity_scope");
+  const apiPath = scope === "historical"
+    ? "/api/markets/opportunities/historical"
+    : "/api/markets/opportunities";
+  const apiUrl = `${apiPath}${pageUrl.search}`;
   byId("opportunities-view")?.setAttribute("aria-busy", "true");
   hideError(byId("opportunity-error"));
   showStatus(byId("opportunity-loading"), "Loading synchronized route opportunities…");
@@ -2804,12 +3008,16 @@ async function loadOpportunities(filters = app.route?.filters || {}) {
     ) {
       throw new Error("The opportunity response failed its compact payload contract.");
     }
-    if (!opportunityResponseMatchesRequest(payload, normalized)) {
+    const responseMatches = scope === "historical"
+      ? historicalOpportunityResponseMatchesRequest(payload, normalized)
+      : opportunityResponseMatchesRequest(payload, normalized);
+    if (!responseMatches) {
       throw new Error(
         "The opportunity response failed its request-bound payload contract.",
       );
     }
-    renderOpportunities(payload);
+    if (scope === "historical") renderHistoricalOpportunities(payload);
+    else renderOpportunities(payload);
     return true;
   } catch (error) {
     if (error.name === "AbortError" || !opportunityRequestIsOwned(requestId, requestKey)) {
@@ -7272,6 +7480,15 @@ function bindOpportunityFilterEvents() {
   });
   ["opportunity-token", "opportunity-venue"].forEach((id) => {
     byId(id).addEventListener("input", () => setOpportunityFilterValidation([]));
+  });
+  document.querySelectorAll("[data-opportunity-scope]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const filters = opportunityFiltersFromControls();
+      filters.opportunityScope = button.dataset.opportunityScope === "historical"
+        ? "historical"
+        : "current";
+      navigateTo(navigation.buildOpportunitiesPath(filters));
+    });
   });
 }
 

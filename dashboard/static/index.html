@@ -904,7 +904,11 @@
             <span class="eyebrow">Synchronized route research</span>
             <h2 id="opportunities-title">Route Opportunities</h2>
             <p>Rank synchronized routes only after route timing, execution, cost, capacity, and evidence gates are applied.</p>
-            <div class="module-context" aria-label="Opportunity classification legend">
+            <div class="segmented-control opportunity-scope-control" role="group" aria-label="Opportunity time scope">
+              <button type="button" data-opportunity-scope="current" class="active" aria-pressed="true">Current</button>
+              <button type="button" data-opportunity-scope="historical" aria-pressed="false">Historical Replay</button>
+            </div>
+            <div id="opportunity-current-context" class="module-context" aria-label="Opportunity classification legend">
               <span class="module-chip opportunity-class-chip strict">Strict executable candidate</span>
               <span class="module-chip opportunity-class-chip estimate">Research estimate</span>
               <span class="module-chip opportunity-class-chip unavailable">Unavailable route</span>
@@ -918,6 +922,10 @@
                   <p>Daily Price Gap remains a separate same-UTC-date close comparison; it is not an executable route.</p>
                 </div>
               </details>
+            </div>
+            <div id="opportunity-historical-context" class="module-context historical-opportunity-context" hidden>
+              <span class="module-chip opportunity-class-chip estimate">Historical Foundry Replay</span>
+              <p>Historical Foundry Replay. Fixed-block counterfactual simulation under a hash-bound state override modelling a prefunded, predeployed, preapproved executor. Successful values are research estimates at the displayed Ethereum block; they are not current and are not executable candidates.</p>
             </div>
           </div>
           <div id="opportunity-cohort-status" class="contract-badge">Cohort not loaded</div>
@@ -1003,6 +1011,33 @@
         <div id="opportunity-bundle-unavailable" class="status-banner opportunity-unavailable-state" role="status" aria-live="polite" hidden></div>
 
         <div class="opportunity-inventories">
+          <section
+            id="historical-opportunity-inventory"
+            class="opportunity-inventory historical-opportunity-inventory"
+            aria-labelledby="historical-opportunity-title"
+            data-api-generation=""
+            data-replay-id=""
+            data-scenario-count=""
+            data-selected-block-number=""
+            hidden
+          >
+            <div class="opportunity-section-heading">
+              <div>
+                <h3 id="historical-opportunity-title">Historical Foundry Replays</h3>
+                <p>Fixed-block, Foundry-verified counterfactual research scenarios.</p>
+              </div>
+              <span id="historical-opportunity-count" class="contract-badge">0 scenarios</span>
+            </div>
+            <div id="historical-opportunity-empty" class="status-banner opportunity-empty" hidden>No historical replay scenarios match the current filters.</div>
+            <div class="opportunity-table-scroll" role="region" aria-label="Historical Foundry replay scenarios" tabindex="0">
+              <table class="opportunity-table historical-opportunity-table">
+                <caption>Historical Foundry replay research estimates at one selected Ethereum block.</caption>
+                <thead><tr><th scope="col">Token</th><th scope="col">Route</th><th scope="col">Direction</th><th scope="col">Notional</th><th scope="col">Replay block</th><th scope="col">Net result at replay block</th><th scope="col">State age at replay</th><th scope="col">Foundry evidence</th><th scope="col">Stress outcome</th></tr></thead>
+                <tbody id="historical-opportunity-body"></tbody>
+              </table>
+            </div>
+          </section>
+
           <section id="strict-opportunities" class="opportunity-inventory" aria-labelledby="strict-opportunities-title">
             <div class="opportunity-section-heading">
               <div>

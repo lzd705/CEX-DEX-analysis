@@ -113,6 +113,7 @@
     "route_id",
   ]);
   const OPPORTUNITY_DIRECTIONS = new Set(["asc", "desc"]);
+  const OPPORTUNITY_SCOPES = new Set(["current", "historical"]);
   const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
   function stringValue(value) {
@@ -251,6 +252,8 @@
 
   function parseOpportunities(params) {
     const filters = {};
+    const scopeValues = params.getAll("opportunity_scope");
+    const scope = scopeValues.length === 1 ? scopeValues[0] : null;
     const tokenInput = firstParam(params, ["token"]);
     const venueInput = firstParam(params, ["venue"]);
     const filterValidation = validateOpportunityFilters({
@@ -264,6 +267,18 @@
     const sort = firstParam(params, ["sort"]);
     const direction = firstParam(params, ["dir"]);
     Object.assign(filters, filterValidation.normalized);
+    const scopeErrors = [];
+    if (scopeValues.length > 1) {
+      scopeErrors.push(validationError(
+        "invalid_opportunity_scope", "opportunity_scope", "duplicate",
+      ));
+    } else if (scope !== null && !OPPORTUNITY_SCOPES.has(scope)) {
+      scopeErrors.push(validationError(
+        "invalid_opportunity_scope", "opportunity_scope", scope,
+      ));
+    } else if (scope === "historical") {
+      filters.opportunityScope = "historical";
+    }
     if (notional !== null) filters.notionalUsd = notional;
     if (opportunityClass !== null && OPPORTUNITY_CLASSES.has(opportunityClass)) {
       filters.opportunityClass = opportunityClass;
@@ -279,7 +294,8 @@
       filters.dir = direction;
     }
     const route = { kind: "opportunities", filters };
-    if (!filterValidation.valid) route.validationErrors = filterValidation.errors;
+    const validationErrors = [...scopeErrors, ...filterValidation.errors];
+    if (validationErrors.length) route.validationErrors = validationErrors;
     return route;
   }
 
@@ -412,6 +428,13 @@
     const token = validation.normalized.token || null;
     const venue = validation.normalized.venue || null;
     const notional = collectedNotional(filters.notionalUsd ?? filters.notional);
+    const opportunityScope = filters.opportunityScope ?? "current";
+    if (!OPPORTUNITY_SCOPES.has(opportunityScope)) {
+      throw new TypeError("Opportunity scope is invalid");
+    }
+    if (opportunityScope === "historical") {
+      params.set("opportunity_scope", "historical");
+    }
     if (token !== null) params.set("token", token);
     if (venue !== null) params.set("venue", venue);
     if (notional !== null) params.set("notional", String(notional));
