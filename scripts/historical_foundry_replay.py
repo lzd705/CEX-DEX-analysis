@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import date, datetime, timedelta, timezone
+import weakref
+from collections.abc import Mapping as MappingABC
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from types import MappingProxyType
 from typing import Any, Dict, Mapping
@@ -29,7 +31,7 @@ _EXECUTION_CLAIM = "historical_counterfactual_state_override_next_block"
 _RUN_FIELDS = frozenset((
     "schema", "run_id", "snapshot_run_id", "manifest_sha256",
     "policy_sha256", "authority_sha256",
-    "toolchain_sha256", "selection", "selection_sha256", "eth_usd",
+    "toolchain_sha256", "scan_inventory_sha256", "selection", "selection_sha256",
     "scenarios", "typed_members", "evidence_sha256",
 ))
 _SELECTION_FIELDS = frozenset((
@@ -45,12 +47,69 @@ _PAYLOAD_FIELDS = frozenset((
     "raw_response_sha256", "state_id",
 ))
 _DESCRIPTOR_FIELDS = frozenset((
-    "market_id", "role", "adapter_id", "content_schema", "filename", "size",
-    "sha256", "logical_generation",
+    "market_id", "role", "adapter_id", "content_schema", "path", "filename",
+    "byte_count", "sha256", "logical_generation",
+))
+_USD_PAYLOAD_FIELDS = frozenset((
+    "schema", "market_id", "venue_id", "chain_id", "block_number",
+    "block_hash", "proxy_address", "round_id", "phase_id", "answer",
+    "decimals", "started_at", "updated_at", "answered_in_round",
+    "valid_until", "scan_inventory_sha256",
 ))
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _RUN_ID = re.compile(r"run:[0-9a-f]{64}\Z")
 _ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z")
+_VALIDATED_RUN_ISSUER = object()
+_VALIDATED_RUN_REGISTRY = {}
+
+
+class _ValidatedHistoricalRun(MappingABC):
+    __slots__ = ("__weakref__",)
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+        del cls, args, kwargs
+        raise ValueError("validated historical run construction is private")
+
+    def __getitem__(self, key: str) -> Any:
+        return _validated_run_projection(self)[key]
+
+    def __iter__(self):
+        return iter(_validated_run_projection(self))
+
+    def __len__(self) -> int:
+        return len(_validated_run_projection(self))
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise AttributeError("validated historical run is immutable")
+
+    def __repr__(self) -> str:
+        return "ValidatedHistoricalRun(<redacted>)"
+
+    def __reduce_ex__(self, _protocol: int) -> Any:
+        raise TypeError("validated historical run is not serializable")
+
+
+def _validated_run_projection(value: Any) -> Mapping[str, Any]:
+    entry = _VALIDATED_RUN_REGISTRY.get(id(value))
+    if (type(value) is not _ValidatedHistoricalRun or entry is None
+            or entry[0]() is not value
+            or entry[1].get("issuer") is not _VALIDATED_RUN_ISSUER):
+        raise ValueError("validated historical run capability is invalid")
+    return entry[1]["projection"]
+
+
+def _issue_validated_run(projection: Mapping[str, Any]) -> _ValidatedHistoricalRun:
+    value = object.__new__(_ValidatedHistoricalRun)
+    value_id = id(value)
+    record = {"issuer": _VALIDATED_RUN_ISSUER, "projection": projection}
+
+    def retire(reference: weakref.ReferenceType) -> None:
+        current = _VALIDATED_RUN_REGISTRY.get(value_id)
+        if current is not None and current[0] is reference:
+            _VALIDATED_RUN_REGISTRY.pop(value_id, None)
+
+    _VALIDATED_RUN_REGISTRY[value_id] = (weakref.ref(value, retire), record)
+    return value
 
 
 def _plain(value: Any) -> Any:
@@ -78,6 +137,12 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def _typed_digest(domain: str, value: Any) -> str:
+    return hashlib.sha256(
+        domain.encode("ascii") + b"\0" + _canonical_bytes(value)
+    ).hexdigest()
+
+
 def _exact_fields(value: Any, expected: frozenset, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or frozenset(value) != expected:
         raise ValueError("{} fields are invalid".format(label))
@@ -91,9 +156,11 @@ def _hash(value: Any, label: str) -> str:
 
 
 def _positive_decimal(value: Any, label: str) -> Decimal:
+    if isinstance(value, (bool, float)) or not isinstance(value, (Decimal, int, str)):
+        raise ValueError("{} is invalid".format(label))
     try:
-        result = Decimal(str(value))
-    except (InvalidOperation, ValueError):
+        result = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError):
         raise ValueError("{} is invalid".format(label))
     if not result.is_finite() or result <= 0:
         raise ValueError("{} is invalid".format(label))
@@ -107,42 +174,77 @@ def _timestamp(value: Any) -> datetime:
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         raise ValueError("anchor timestamp is invalid")
-    if result.tzinfo is None or result.utcoffset() != timedelta(0):
+    if (result.tzinfo is None or result.utcoffset() != timedelta(0)
+            or result.microsecond != 0
+            or value != result.astimezone(timezone.utc).isoformat(
+                timespec="seconds"
+            ).replace("+00:00", "Z")):
         raise ValueError("anchor timestamp is invalid")
     return result.astimezone(timezone.utc)
 
 
+def _uint_text(value: Any, label: str, *, minimum: int = 0,
+               maximum: Any = None) -> int:
+    if (not isinstance(value, str)
+            or re.fullmatch(r"0|[1-9][0-9]*", value) is None):
+        raise ValueError("{} is invalid".format(label))
+    result = int(value)
+    if result < minimum or (maximum is not None and result > maximum):
+        raise ValueError("{} is invalid".format(label))
+    return result
+
+
+def _market_id(selected: Mapping[str, Any], dex: str) -> str:
+    return "dex:eth:{}:{}:UNI".format(
+        dex, selected["venues"][dex]["pair_address"]
+    )
+
+
+def _market_key(market_id: str) -> str:
+    return _typed_digest(
+        "historical_foundry_market_key/v1", {"market_id": market_id}
+    )
+
+
+def _decode_typed_member(member: Any, *, label: str):
+    _exact_fields(member, frozenset(("descriptor", "payload_hex")), label)
+    descriptor = _exact_fields(
+        member["descriptor"], _DESCRIPTOR_FIELDS, "{} descriptor".format(label)
+    )
+    payload_hex = member["payload_hex"]
+    if (not isinstance(payload_hex, str) or not payload_hex
+            or re.fullmatch(r"(?:[0-9a-f]{2})+", payload_hex) is None):
+        raise ValueError("{} bytes are invalid".format(label))
+    try:
+        payload_bytes = bytes.fromhex(payload_hex)
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("{} bytes are invalid".format(label))
+    if payload_hex != payload_bytes.hex() or _canonical_bytes(payload) != payload_bytes:
+        raise ValueError("{} payload is not canonical".format(label))
+    return descriptor, payload_bytes, payload
+
+
 def _validate_typed_member(member: Any, *, config: HistoricalFoundryConfigSet,
                            dex: str, selected: Mapping[str, Any]) -> Mapping[str, Any]:
-    _exact_fields(member, frozenset(("descriptor", "payload_hex")), "typed member")
-    descriptor = _exact_fields(member["descriptor"], _DESCRIPTOR_FIELDS, "typed descriptor")
-    if not isinstance(member["payload_hex"], str):
-        raise ValueError("typed member bytes are invalid")
-    try:
-        payload_bytes = bytes.fromhex(member["payload_hex"])
-    except ValueError:
-        raise ValueError("typed member bytes are invalid")
+    descriptor, payload_bytes, payload = _decode_typed_member(
+        member, label="typed member"
+    )
     pair = selected["venues"][dex]["pair_address"]
-    expected_market = "dex:eth:{}:{}:UNI".format(dex, pair)
-    if (descriptor["market_id"] != expected_market
-            or descriptor["role"] != "dex_pool_state"
-            or descriptor["adapter_id"] != "route_quantity_quote_for_v2_pool/v1"
-            or descriptor["content_schema"] != "route_v2_pool_state/v1"
-            or type(descriptor["size"]) is not int
-            or descriptor["size"] != len(payload_bytes)
-            or descriptor["sha256"] != hashlib.sha256(payload_bytes).hexdigest()):
-        raise ValueError("typed descriptor identity differs")
-    try:
-        payload = json.loads(payload_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise ValueError("typed payload is invalid")
+    expected_market = _market_id(selected, dex)
     _exact_fields(payload, _PAYLOAD_FIELDS, "typed payload")
-    if _canonical_bytes(payload) != payload_bytes:
-        raise ValueError("typed payload is not canonical")
     venue = selected["venues"][dex]
-    fee_proof = _digest({"schema": "historical_v2_fee_identity/v1",
-                         "authority_sha256": config.authority.physical_sha256,
-                         "dex": dex, "fee_numerator": 997, "fee_denominator": 1000})
+    fee_identity = {
+        "schema": "historical_foundry_v2_fee_identity/v1",
+        "authority_sha256": config.authority.physical_sha256,
+        "venue_id": dex,
+        "fee_numerator": 997,
+        "fee_denominator": 1000,
+        "fee_bps": 30,
+    }
+    fee_proof = _typed_digest(
+        "historical_foundry_v2_fee_identity/v1", fee_identity
+    )
     expected = {
         "schema": "route_v2_pool_state/v1", "chain": "eth", "chain_id": "1",
         "dex": dex, "pool_address": pair, "token0_address": _UNI,
@@ -174,40 +276,85 @@ def _validate_typed_member(member: Any, *, config: HistoricalFoundryConfigSet,
         state = V2PoolState(**constructor)
     except (TypeError, ValueError) as error:
         raise ValueError("typed V2 state is invalid") from error
-    if (payload["state_id"] != state.state_id
-            or descriptor["logical_generation"] != state.state_id.split(":", 1)[1]):
+    physical = hashlib.sha256(payload_bytes).hexdigest()
+    expected_descriptor = {
+        "market_id": expected_market,
+        "role": "dex_pool_state",
+        "adapter_id": "route_quantity_quote_for_v2_pool/v1",
+        "content_schema": "route_v2_pool_state/v1",
+        "path": "typed/{}/dex_pool_state.json".format(
+            _market_key(expected_market)
+        ),
+        "filename": "dex_pool_state.json",
+        "byte_count": len(payload_bytes),
+        "sha256": physical,
+        "logical_generation": state.state_id.split(":", 1)[1],
+    }
+    if payload["state_id"] != state.state_id or descriptor != expected_descriptor:
         raise ValueError("typed V2 state binding differs")
     return payload
 
 
-def _validate_usd_member(member: Any, *, dex: str, selected: Mapping[str, Any],
-                         eth_usd: Decimal) -> Mapping[str, Any]:
-    _exact_fields(member, frozenset(("descriptor", "payload_hex")), "USD member")
-    descriptor = _exact_fields(member["descriptor"], _DESCRIPTOR_FIELDS, "USD descriptor")
-    try:
-        raw = bytes.fromhex(member["payload_hex"])
-        payload = json.loads(raw.decode("utf-8"))
-    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-        raise ValueError("USD member bytes are invalid")
-    pair = selected["venues"][dex]["pair_address"]
-    market = "dex:eth:{}:{}:UNI".format(dex, pair)
-    expected = {"schema": "route_dex_usd_price_context/v1", "market_id": market,
-                "block_number": str(selected["block_number"]),
-                "block_hash": selected["block_hash"],
-                "observed_at": selected["block_timestamp"],
-                "eth_usd": str(eth_usd),
-                "uni_usd_method": "reserve_implied_uni_weth"}
-    if payload != expected or _canonical_bytes(payload) != raw:
-        raise ValueError("USD context differs")
+def _validate_usd_member(member: Any, *, config: HistoricalFoundryConfigSet,
+                         dex: str, selected: Mapping[str, Any],
+                         scan_inventory_sha256: str):
+    descriptor, raw, payload = _decode_typed_member(member, label="USD member")
+    _exact_fields(payload, _USD_PAYLOAD_FIELDS, "USD payload")
+    market = _market_id(selected, dex)
+    authority = config.authority.value["price_feed"]
+    expected_identity = {
+        "schema": "route_dex_usd_price_context/v1",
+        "market_id": market,
+        "venue_id": dex,
+        "chain_id": "1",
+        "block_number": str(selected["block_number"]),
+        "block_hash": selected["block_hash"],
+        "proxy_address": authority["proxy_address"],
+        "decimals": str(authority["decimals"]),
+        "scan_inventory_sha256": scan_inventory_sha256,
+    }
+    for field, expected in expected_identity.items():
+        if payload[field] != expected:
+            raise ValueError("USD context differs")
+    round_id = _uint_text(payload["round_id"], "USD round", minimum=1,
+                          maximum=(1 << 80) - 1)
+    phase_id = _uint_text(payload["phase_id"], "USD phase", minimum=1)
+    answer = _uint_text(payload["answer"], "USD answer", minimum=1)
+    decimals = _uint_text(payload["decimals"], "USD decimals", maximum=255)
+    started_at = _uint_text(payload["started_at"], "USD started_at", minimum=1)
+    updated_at = _uint_text(payload["updated_at"], "USD updated_at", minimum=1)
+    answered = _uint_text(payload["answered_in_round"], "USD answered round",
+                          minimum=1, maximum=(1 << 80) - 1)
+    valid_until = _uint_text(payload["valid_until"], "USD valid_until", minimum=1)
+    block_time = _timestamp(selected["block_timestamp"])
+    block_epoch = int(block_time.timestamp())
+    max_age = config.policy.value["max_eth_usd_age_seconds"]
+    if (phase_id != round_id >> 64 or round_id & ((1 << 64) - 1) == 0
+            or answered < round_id or answered >> 64 != phase_id
+            or answered & ((1 << 64) - 1) == 0
+            or started_at > updated_at or updated_at > block_epoch
+            or block_epoch - updated_at > max_age
+            or valid_until != updated_at + max_age + 1):
+        raise ValueError("USD round binding differs")
+    eth_usd = Decimal((0, tuple(int(character) for character in str(answer)),
+                       -decimals))
     physical = hashlib.sha256(raw).hexdigest()
-    if (descriptor != {"market_id": market, "role": "dex_usd_price_context",
-                       "adapter_id": "historical_reserve_implied_usd_context/v1",
-                       "content_schema": "route_dex_usd_price_context/v1",
-                       "filename": "{}-dex_usd_price_context.json".format(dex),
-                       "size": len(raw), "sha256": physical,
-                       "logical_generation": physical}):
+    expected_descriptor = {
+        "market_id": market,
+        "role": "dex_usd_price_context",
+        "adapter_id": "route_dex_usd_price_context/v1",
+        "content_schema": "route_dex_usd_price_context/v1",
+        "path": "typed/{}/dex_usd_price_context.json".format(
+            _market_key(market)
+        ),
+        "filename": "dex_usd_price_context.json",
+        "byte_count": len(raw),
+        "sha256": physical,
+        "logical_generation": physical,
+    }
+    if descriptor != expected_descriptor:
         raise ValueError("USD descriptor identity differs")
-    return payload
+    return payload, eth_usd
 
 
 def validate_selected_historical_run(*, config: HistoricalFoundryConfigSet,
@@ -220,7 +367,8 @@ def validate_selected_historical_run(*, config: HistoricalFoundryConfigSet,
         raise ValueError("historical run schema is invalid")
     if (not isinstance(value["run_id"], str) or _RUN_ID.fullmatch(value["run_id"]) is None
             or value["snapshot_run_id"] != value["run_id"]
-            or _SHA.fullmatch(str(value["manifest_sha256"])) is None):
+            or _hash(value["manifest_sha256"], "manifest hash")
+            != value["manifest_sha256"]):
         raise ValueError("historical run id is invalid")
     for field, expected in (("policy_sha256", config.policy.physical_sha256),
                             ("authority_sha256", config.authority.physical_sha256),
@@ -231,8 +379,12 @@ def validate_selected_historical_run(*, config: HistoricalFoundryConfigSet,
     if _hash(value["evidence_sha256"], "evidence hash") != _digest(unsigned):
         raise ValueError("historical evidence hash differs")
     selected = _exact_fields(value["selection"], _SELECTION_FIELDS, "selection")
-    if value["selection_sha256"] != _digest(selected):
+    if (_hash(value["selection_sha256"], "selection hash")
+            != _digest(selected)):
         raise ValueError("selection hash differs")
+    scan_inventory_sha256 = _hash(
+        value["scan_inventory_sha256"], "scan inventory hash"
+    )
     anchor_time = _timestamp(selected["anchor_timestamp"])
     block_time = _timestamp(selected["block_timestamp"])
     lookback = config.policy.value["lookback_seconds"]
@@ -242,7 +394,8 @@ def validate_selected_historical_run(*, config: HistoricalFoundryConfigSet,
         raise ValueError("selected block differs")
     if (not isinstance(selected["block_hash"], str)
             or re.fullmatch(r"0x[0-9a-f]{64}", selected["block_hash"]) is None
-            or _SHA.fullmatch(str(selected["block_header_sha256"])) is None):
+            or _hash(selected["block_header_sha256"], "block header hash")
+            != selected["block_header_sha256"]):
         raise ValueError("selected block identity differs")
     _exact_fields(selected["venues"], frozenset(_VENUES), "selected venues")
     for dex in _VENUES:
@@ -253,7 +406,8 @@ def validate_selected_historical_run(*, config: HistoricalFoundryConfigSet,
                 or type(venue["reserve_uni_raw"]) is not int or type(venue["reserve_weth_raw"]) is not int
                 or type(venue["reserve_timestamp_last_raw"]) is not int
                 or not 0 <= venue["reserve_timestamp_last_raw"] < 2 ** 32
-                or _SHA.fullmatch(str(venue["raw_response_sha256"])) is None
+                or _hash(venue["raw_response_sha256"], "reserve response hash")
+                != venue["raw_response_sha256"]
                 or min(venue["reserve_uni_raw"], venue["reserve_weth_raw"]) <= 0):
             raise ValueError("selected venue differs")
     if not isinstance(selected["routes"], list) or len(selected["routes"]) != 2:
@@ -266,11 +420,24 @@ def validate_selected_historical_run(*, config: HistoricalFoundryConfigSet,
         raise ValueError("selected routes differ")
     if not isinstance(value["typed_members"], list) or len(value["typed_members"]) != 4:
         raise ValueError("typed members are invalid")
-    eth_usd = _positive_decimal(value["eth_usd"], "ETH/USD")
     payloads = []
+    price_payloads = []
+    eth_usd_values = []
     for index, dex in enumerate(_VENUES):
         payloads.append(_validate_typed_member(value["typed_members"][index * 2], config=config, dex=dex, selected=selected))
-        payloads.append(_validate_usd_member(value["typed_members"][index * 2 + 1], dex=dex, selected=selected, eth_usd=eth_usd))
+        price_payload, eth_usd = _validate_usd_member(
+            value["typed_members"][index * 2 + 1], config=config, dex=dex,
+            selected=selected, scan_inventory_sha256=scan_inventory_sha256,
+        )
+        payloads.append(price_payload)
+        price_payloads.append({
+            key: item for key, item in price_payload.items()
+            if key not in {"market_id", "venue_id"}
+        })
+        eth_usd_values.append(eth_usd)
+    if (price_payloads[0] != price_payloads[1]
+            or eth_usd_values[0] != eth_usd_values[1]):
+        raise ValueError("USD market contexts differ")
     scenarios = value["scenarios"]
     expected_pairs = {(route["route_id"], n) for route in expected_routes
                       for n in (1000, 5000, 10000, 50000, 100000)}
@@ -279,13 +446,17 @@ def validate_selected_historical_run(*, config: HistoricalFoundryConfigSet,
         raise ValueError("historical scenarios are invalid")
     for scenario in scenarios:
         _exact_fields(scenario, frozenset(("route_id", "requested_notional_usd", "receipt_status")), "scenario")
-        if scenario["receipt_status"] != 1:
+        if (type(scenario["receipt_status"]) is not int
+                or scenario["receipt_status"] != 1
+                or type(scenario["requested_notional_usd"]) is not int):
             raise ValueError("historical scenario is not proved")
         actual.add((scenario["route_id"], scenario["requested_notional_usd"]))
     if actual != expected_pairs:
         raise ValueError("historical scenarios differ")
-    normalized = dict(_plain(value)); normalized["typed_payloads"] = payloads
-    return _freeze(normalized)
+    normalized = dict(_plain(value))
+    normalized["typed_payloads"] = payloads
+    normalized["eth_usd"] = decimal_text(eth_usd_values[0])
+    return _issue_validated_run(_freeze(normalized))
 
 
 def _market_projection(validated: Mapping[str, Any], dex: str) -> Dict[str, Any]:
@@ -330,19 +501,26 @@ def _market_projection(validated: Mapping[str, Any], dex: str) -> Dict[str, Any]
 
 def build_historical_research_universe(*, config: HistoricalFoundryConfigSet,
                                        validated_run: Mapping[str, Any]) -> Mapping[str, Any]:
-    if not isinstance(config, HistoricalFoundryConfigSet) or validated_run.get("policy_sha256") != config.policy.physical_sha256:
+    if type(config) is not HistoricalFoundryConfigSet:
         raise ValueError("validated run/config binding differs")
-    anchor = _timestamp(validated_run["selection"]["anchor_timestamp"]).date()
+    validated = _validated_run_projection(validated_run)
+    if any(
+        validated["{}_sha256".format(role)]
+        != getattr(config, role).physical_sha256
+        for role in ("policy", "authority", "toolchain")
+    ):
+        raise ValueError("validated run/config binding differs")
+    anchor = _timestamp(validated["selection"]["anchor_timestamp"]).date()
     result = {
         "schema": "historical_research_universe/v1",
         "temporal_scope": "historical_replay", "execution_claim": _EXECUTION_CLAIM,
-        "run_id": validated_run["run_id"],
-        "selection_sha256": validated_run["selection_sha256"],
+        "run_id": validated["run_id"],
+        "selection_sha256": validated["selection_sha256"],
         "provenance_window": {"start_date": str(anchor - timedelta(days=29)),
                               "end_date": str(anchor), "calendar_days": 30,
                               "measured_volume_coverage": False},
-        "markets": [_market_projection(validated_run, dex) for dex in _VENUES],
-        "routes": _plain(validated_run["selection"]["routes"]),
+        "markets": [_market_projection(validated, dex) for dex in _VENUES],
+        "routes": _plain(validated["selection"]["routes"]),
     }
     return _freeze(result)
 
@@ -350,13 +528,14 @@ def build_historical_research_universe(*, config: HistoricalFoundryConfigSet,
 def build_historical_core_projection(*, config: HistoricalFoundryConfigSet,
                                      validated_run: Mapping[str, Any],
                                      universe: Mapping[str, Any]) -> Mapping[str, Any]:
+    validated = _validated_run_projection(validated_run)
     rebuilt = build_historical_research_universe(config=config, validated_run=validated_run)
     if _canonical_bytes(rebuilt) != _canonical_bytes(universe):
         raise ValueError("historical universe binding differs")
     return _freeze({
         "schema": "historical_core_projection/v1",
         "temporal_scope": "historical_replay", "execution_claim": _EXECUTION_CLAIM,
-        "run_id": validated_run["run_id"], "universe_sha256": _digest(universe),
+        "run_id": validated["run_id"], "universe_sha256": _digest(universe),
         "markets": _plain(universe["markets"]), "routes": _plain(universe["routes"]),
-        "typed_members": _plain(validated_run["typed_members"]),
+        "typed_members": _plain(validated["typed_members"]),
     })
