@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import unittest
+import weakref
 from contextlib import ExitStack
 from decimal import Decimal, localcontext
 from unittest import mock
@@ -24,7 +25,8 @@ WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 UNI_POOL = "0xd3d2e2692501a5c9ca623199d38826e513033a17"
 SUSHI_POOL = "0xdafd66636e2561b0284edde37e42d192f2844d40"
 BLOCK_HASH = "0x" + "a" * 64
-HEADER_SHA = "b" * 64
+PARENT_HASH = "0x" + "b" * 64
+STATE_ROOT = "0x" + "c" * 64
 RAW_SHA = "d" * 64
 SCAN_SHA = "e" * 64
 BLOCK_TIME = "2024-01-01T00:00:00Z"
@@ -59,6 +61,19 @@ def digest(value):
 
 def typed_digest(domain, value):
     return hashlib.sha256(domain.encode("ascii") + b"\0" + canonical_bytes(value)).hexdigest()
+
+
+TASK7_SELECTED_BLOCK = {
+    "number": 20_000_000,
+    "hash": BLOCK_HASH,
+    "parent_hash": PARENT_HASH,
+    "state_root": STATE_ROOT,
+    "timestamp": BLOCK_TIMESTAMP,
+    "gas_limit": 30_000_000,
+    "gas_used": 15_000_000,
+    "base_fee_per_gas": 20_000_000_000,
+}
+HEADER_SHA = digest(TASK7_SELECTED_BLOCK)
 
 
 def market_key(market_id):
@@ -164,6 +179,158 @@ def usd_member(dex, pool):
     }
 
 
+def task7_selection_value():
+    selected_scenarios = []
+    for direction in ("uniswap_to_sushiswap", "sushiswap_to_uniswap"):
+        for notional in (1000, 5000, 10000, 50000, 100000):
+            prefix = "{}:{}".format(direction, notional)
+            outcome = (
+                1 if not selected_scenarios
+                else 0 if len(selected_scenarios) == 1
+                else -1
+            )
+            selected_scenarios.append({
+                "scenario_key": "20000000:" + prefix,
+                "block_number": 20_000_000,
+                "status": 1,
+                "classification": "replay_success",
+                "gas_used": 100_000,
+                "effective_gas_price": 20_000_000_000,
+                "weth_delta_raw": outcome * 10 ** 16,
+                "proof_inputs_hash": hashlib.sha256(
+                    ("proof:" + prefix).encode("ascii")
+                ).hexdigest(),
+                "overlay_sha256": hashlib.sha256(
+                    ("overlay:" + prefix).encode("ascii")
+                ).hexdigest(),
+                "receipt_sha256": hashlib.sha256(
+                    ("receipt:" + prefix).encode("ascii")
+                ).hexdigest(),
+                "trace_sha256": hashlib.sha256(
+                    ("trace:" + prefix).encode("ascii")
+                ).hexdigest(),
+                "result_sha256": hashlib.sha256(
+                    ("result:" + prefix).encode("ascii")
+                ).hexdigest(),
+                "economics": {
+                    "gross_edge_usd": {
+                        "numerator": outcome, "denominator": 1,
+                        "display": str(outcome),
+                    },
+                    "gas_cost_usd": {
+                        "numerator": 0, "denominator": 1, "display": "0",
+                    },
+                    "mev_buffer_usd": {
+                        "numerator": 0, "denominator": 1, "display": "0",
+                    },
+                    "policy_net_edge_usd": {
+                        "numerator": outcome, "denominator": 1,
+                        "display": str(outcome),
+                    },
+                },
+                "direction": direction,
+                "requested_notional_usd": notional,
+            })
+    return {
+        "schema": "historical_foundry_selection/v1",
+        "status": "found_publishable_profitable_block",
+        "staging_inventory_sha256": SCAN_SHA,
+        "prefilter_grid_digest": "7" * 64,
+        "candidate_block_count": 1,
+        "scenario_denominator": 10,
+        "initial_replay_required_count": 5,
+        "selected_block": dict(TASK7_SELECTED_BLOCK),
+        "selected_scenario_count": 10,
+        "selected_scenarios": selected_scenarios,
+        "candidate_states": [{
+            "block_number": 20_000_000,
+            "state": "selected",
+            "transitions": [
+                "candidate", "replaying_required", "tentative_positive",
+                "completing_full_ten", "selected",
+            ],
+            "scenario_count": 10,
+        }],
+        "unresolved_candidate_count": 0,
+    }
+
+
+def task7_typed_manifest_value(evidence):
+    markets = []
+    global_members = []
+    for index, dex in enumerate(("uniswap_v2", "sushiswap_v2")):
+        venue = evidence["selection"]["venues"][dex]
+        member_rows = []
+        for member_index, role in (
+            (index * 2, "dex_pool_state"),
+            (index * 2 + 1, "dex_usd_price_context"),
+        ):
+            descriptor_value = evidence["typed_members"][member_index]["descriptor"]
+            row = {
+                "role": role,
+                "path": descriptor_value["path"],
+                "byte_count": descriptor_value["byte_count"],
+                "sha256": descriptor_value["sha256"],
+            }
+            member_rows.append(row)
+            global_members.append({
+                key: row[key] for key in ("path", "byte_count", "sha256")
+            })
+        market = descriptor_value["market_id"]
+        markets.append({
+            "market_id": market,
+            "market_key": market_key(market),
+            "venue_id": dex,
+            "pair_address": venue["pair_address"],
+            "factory_pair_forward": venue["factory_pair_forward"],
+            "factory_pair_reverse": venue["factory_pair_reverse"],
+            "members": member_rows,
+        })
+    return {
+        "schema": "historical_foundry_typed_manifest/v1",
+        "selection_status": "found_publishable_profitable_block",
+        "selected_block": dict(TASK7_SELECTED_BLOCK),
+        "market_count": 2,
+        "markets": markets,
+        "member_count": 4,
+        "members": sorted(global_members, key=lambda row: row["path"]),
+    }
+
+
+def replace_task7_run_preimage(
+    evidence, *, selection_value=None, typed_manifest_value=None,
+    selection_bytes=None, typed_manifest_bytes=None,
+):
+    if selection_bytes is None:
+        if selection_value is None:
+            selection_value = json.loads(bytes.fromhex(
+                evidence["task7_selection_hex"]
+            ).decode("utf-8"))
+        selection_bytes = canonical_bytes(selection_value)
+    if typed_manifest_bytes is None:
+        if typed_manifest_value is None:
+            typed_manifest_value = json.loads(bytes.fromhex(
+                evidence["task7_typed_manifest_hex"]
+            ).decode("utf-8"))
+        typed_manifest_bytes = canonical_bytes(typed_manifest_value)
+    evidence["task7_selection_hex"] = selection_bytes.hex()
+    evidence["task7_typed_manifest_hex"] = typed_manifest_bytes.hex()
+    run_id = "run:" + hashlib.sha256(
+        b"historical_foundry_run_id/v1\0"
+        + selection_bytes + typed_manifest_bytes
+    ).hexdigest()
+    evidence["run_id"] = run_id
+    evidence["snapshot_run_id"] = run_id
+
+
+def install_task7_run_preimage(evidence):
+    replace_task7_run_preimage(
+        evidence,
+        selection_value=task7_selection_value(),
+        typed_manifest_value=task7_typed_manifest_value(evidence),
+    )
+
+
 def fixture(config):
     venues = {
         "uniswap_v2": {"pair_address": UNI_POOL, "factory_pair_forward": UNI_POOL,
@@ -214,6 +381,7 @@ def fixture(config):
             usd_member("sushiswap_v2", SUSHI_POOL),
         ],
     }
+    install_task7_run_preimage(evidence)
     evidence["evidence_sha256"] = digest(evidence)
     return evidence
 
@@ -252,6 +420,105 @@ class HistoricalResearchUniverseTests(unittest.TestCase):
             self.assertEqual(price["answer"], str(PRICE_ANSWER))
             self.assertEqual(price["decimals"], str(PRICE_DECIMALS))
             self.assertEqual(price["scan_inventory_sha256"], SCAN_SHA)
+
+    def test_task7_run_id_preimage_rejects_resealed_run_alias(self):
+        value = fixture(self.config)
+        value["run_id"] = "run:" + "2" * 64
+        value["snapshot_run_id"] = value["run_id"]
+        reseal(value)
+        with self.assertRaises(ValueError):
+            validate_selected_historical_run(
+                config=self.config, run_evidence=value)
+
+    def test_task7_selection_must_be_canonical_and_cross_bound(self):
+        mutations = (
+            ("selected_block", lambda selected: selected["selected_block"].__setitem__(
+                "number", selected["selected_block"]["number"] + 1)),
+            ("scan_inventory", lambda selected: selected.__setitem__(
+                "staging_inventory_sha256", "8" * 64)),
+            ("scenario_status", lambda selected: selected[
+                "selected_scenarios"
+            ][0].__setitem__("status", 0)),
+        )
+        for label, mutate in mutations:
+            value = fixture(self.config)
+            selected = json.loads(bytes.fromhex(
+                value["task7_selection_hex"]
+            ).decode("utf-8"))
+            mutate(selected)
+            replace_task7_run_preimage(value, selection_value=selected)
+            reseal(value)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_selected_historical_run(
+                    config=self.config, run_evidence=value)
+
+        value = fixture(self.config)
+        selected = json.loads(bytes.fromhex(
+            value["task7_selection_hex"]
+        ).decode("utf-8"))
+        noncanonical = json.dumps(selected, sort_keys=True).encode("utf-8")
+        replace_task7_run_preimage(value, selection_bytes=noncanonical)
+        reseal(value)
+        with self.assertRaises(ValueError):
+            validate_selected_historical_run(
+                config=self.config, run_evidence=value)
+
+    def test_task7_selection_accepts_mixed_verified_economics_but_requires_positive(self):
+        value = fixture(self.config)
+        selected = json.loads(bytes.fromhex(
+            value["task7_selection_hex"]
+        ).decode("utf-8"))
+        nets = [
+            row["economics"]["policy_net_edge_usd"]["numerator"]
+            for row in selected["selected_scenarios"]
+        ]
+        self.assertEqual(set(nets), {-1, 0, 1})
+        validate_selected_historical_run(
+            config=self.config, run_evidence=value)
+
+        for row in selected["selected_scenarios"]:
+            row["economics"]["policy_net_edge_usd"] = {
+                "numerator": 0, "denominator": 1, "display": "0",
+            }
+        replace_task7_run_preimage(value, selection_value=selected)
+        reseal(value)
+        with self.assertRaises(ValueError):
+            validate_selected_historical_run(
+                config=self.config, run_evidence=value)
+
+    def test_task7_typed_manifest_is_closed_after_full_preimage_rehash(self):
+        def mutate_selected_block(manifest):
+            manifest["selected_block"]["number"] += 1
+
+        def mutate_factory(manifest):
+            manifest["markets"][0]["factory_pair_forward"] = "0x" + "1" * 40
+
+        def mutate_market_order(manifest):
+            manifest["markets"].reverse()
+
+        def mutate_member_hash(manifest):
+            manifest["markets"][0]["members"][0]["sha256"] = "0" * 64
+
+        def mutate_extra_field(manifest):
+            manifest["caller_note"] = "accepted"
+
+        for label, mutate in (
+            ("selected_block", mutate_selected_block),
+            ("factory", mutate_factory),
+            ("market_order", mutate_market_order),
+            ("member_hash", mutate_member_hash),
+            ("extra_field", mutate_extra_field),
+        ):
+            value = fixture(self.config)
+            manifest = json.loads(bytes.fromhex(
+                value["task7_typed_manifest_hex"]
+            ).decode("utf-8"))
+            mutate(manifest)
+            replace_task7_run_preimage(value, typed_manifest_value=manifest)
+            reseal(value)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_selected_historical_run(
+                    config=self.config, run_evidence=value)
 
     def test_builds_exact_two_market_two_route_historical_universe(self):
         validated = self.validated()
@@ -316,12 +583,57 @@ class HistoricalResearchUniverseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_historical_core_projection(
                 config=self.config, validated_run=forged, universe=universe)
-        import scripts.historical_foundry_replay as module
-
-        forged_capability = object.__new__(module._ValidatedHistoricalRun)
+        forged_capability = object.__new__(type(validated))
         with self.assertRaises(ValueError):
             build_historical_research_universe(
                 config=self.config, validated_run=forged_capability)
+
+    def test_module_registry_injection_cannot_mint_builder_capability(self):
+        """A module-visible issuer/registry must not authorize a forged object."""
+        import scripts.historical_foundry_replay as module
+
+        validated = self.validated()
+        universe = build_historical_research_universe(
+            config=self.config, validated_run=validated)
+        forged = object.__new__(type(validated))
+        missing = object()
+        prior_issuer = getattr(module, "_VALIDATED_RUN_ISSUER", missing)
+        prior_registry = getattr(module, "_VALIDATED_RUN_REGISTRY", missing)
+        injected_issuer = (
+            prior_issuer if prior_issuer is not missing else object()
+        )
+        injected_registry = (
+            prior_registry if isinstance(prior_registry, dict) else {}
+        )
+        if prior_issuer is missing:
+            module._VALIDATED_RUN_ISSUER = injected_issuer
+        if prior_registry is missing:
+            module._VALIDATED_RUN_REGISTRY = injected_registry
+        injected_registry[id(forged)] = (
+            weakref.ref(forged),
+            {"issuer": injected_issuer, "projection": validated},
+        )
+        try:
+            with self.assertRaises(ValueError):
+                build_historical_research_universe(
+                    config=self.config, validated_run=forged)
+            with self.assertRaises(ValueError):
+                build_historical_core_projection(
+                    config=self.config, validated_run=forged,
+                    universe=universe,
+                )
+        finally:
+            injected_registry.pop(id(forged), None)
+            if prior_issuer is missing:
+                del module._VALIDATED_RUN_ISSUER
+            if prior_registry is missing:
+                del module._VALIDATED_RUN_REGISTRY
+        for name in (
+            "_ValidatedHistoricalRun", "_issue_validated_run",
+            "_VALIDATED_RUN_ISSUER", "_VALIDATED_RUN_REGISTRY",
+            "_initialize_validated_historical_run_capability",
+        ):
+            self.assertFalse(hasattr(module, name), name)
 
     def test_descriptor_paths_and_exact_scalar_types_are_closed(self):
         mutations = [
@@ -360,7 +672,7 @@ class HistoricalResearchUniverseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_selected_historical_run(config=self.config, run_evidence=value)
 
-    def test_factory_derived_pair_is_not_hardcoded(self):
+    def test_self_consistent_alternative_pair_is_rejected_after_full_rehash(self):
         value = fixture(self.config)
         new_pool = "0x" + "1" * 40
         venue = value["selection"]["venues"]["uniswap_v2"]
@@ -387,13 +699,11 @@ class HistoricalResearchUniverseTests(unittest.TestCase):
             100 * 10 ** 18, 10_000 * 10 ** 18,
         )
         value["typed_members"][1] = usd_member("uniswap_v2", new_pool)
+        install_task7_run_preimage(value)
         reseal(value, selection_changed=True)
-        validated = validate_selected_historical_run(
-            config=self.config, run_evidence=value)
-        self.assertEqual(
-            validated["selection"]["venues"]["uniswap_v2"]["pair_address"],
-            new_pool,
-        )
+        with self.assertRaises(ValueError):
+            validate_selected_historical_run(
+                config=self.config, run_evidence=value)
 
     def test_pure_bridge_performs_no_io(self):
         value = fixture(self.config)

@@ -32,7 +32,8 @@ _RUN_FIELDS = frozenset((
     "schema", "run_id", "snapshot_run_id", "manifest_sha256",
     "policy_sha256", "authority_sha256",
     "toolchain_sha256", "scan_inventory_sha256", "selection", "selection_sha256",
-    "scenarios", "typed_members", "evidence_sha256",
+    "scenarios", "typed_members", "task7_selection_hex",
+    "task7_typed_manifest_hex", "evidence_sha256",
 ))
 _SELECTION_FIELDS = frozenset((
     "anchor_timestamp", "block_timestamp", "block_number", "block_hash", "block_header_sha256",
@@ -59,57 +60,312 @@ _USD_PAYLOAD_FIELDS = frozenset((
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _RUN_ID = re.compile(r"run:[0-9a-f]{64}\Z")
 _ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z")
-_VALIDATED_RUN_ISSUER = object()
-_VALIDATED_RUN_REGISTRY = {}
+_UNISWAP_V2_UNI_WETH_PAIR = "0xd3d2e2692501a5c9ca623199d38826e513033a17"
+_SUSHISWAP_V2_UNI_WETH_PAIR = "0xdafd66636e2561b0284edde37e42d192f2844d40"
+_PAIR_BY_VENUE = MappingProxyType({
+    "uniswap_v2": _UNISWAP_V2_UNI_WETH_PAIR,
+    "sushiswap_v2": _SUSHISWAP_V2_UNI_WETH_PAIR,
+})
+_TASK7_RUN_ID_DOMAIN = b"historical_foundry_run_id/v1\0"
+_TASK7_SELECTION_FIELDS = frozenset((
+    "schema", "status", "staging_inventory_sha256", "prefilter_grid_digest",
+    "candidate_block_count", "scenario_denominator",
+    "initial_replay_required_count", "selected_block",
+    "selected_scenario_count", "selected_scenarios", "candidate_states",
+    "unresolved_candidate_count",
+))
+_TASK7_BLOCK_FIELDS = frozenset((
+    "number", "hash", "parent_hash", "state_root", "timestamp",
+    "gas_limit", "gas_used", "base_fee_per_gas",
+))
+_TASK7_SCENARIO_FIELDS = frozenset((
+    "scenario_key", "block_number", "status", "classification", "gas_used",
+    "effective_gas_price", "weth_delta_raw", "proof_inputs_hash",
+    "overlay_sha256", "receipt_sha256", "trace_sha256", "result_sha256",
+    "economics", "direction", "requested_notional_usd",
+))
+_TASK7_CANDIDATE_STATE_FIELDS = frozenset((
+    "block_number", "state", "transitions", "scenario_count",
+))
+_TASK7_TYPED_MANIFEST_FIELDS = frozenset((
+    "schema", "selection_status", "selected_block", "market_count",
+    "markets", "member_count", "members",
+))
+_TASK7_MARKET_FIELDS = frozenset((
+    "market_id", "market_key", "venue_id", "pair_address",
+    "factory_pair_forward", "factory_pair_reverse", "members",
+))
+_TASK7_MARKET_MEMBER_FIELDS = frozenset((
+    "role", "path", "byte_count", "sha256",
+))
+_TASK7_GLOBAL_MEMBER_FIELDS = frozenset((
+    "path", "byte_count", "sha256",
+))
+_TASK7_ECONOMICS_FIELDS = frozenset((
+    "gross_edge_usd", "gas_cost_usd", "mev_buffer_usd",
+    "policy_net_edge_usd",
+))
+_TASK7_FRACTION_FIELDS = frozenset((
+    "numerator", "denominator", "display",
+))
 
 
-class _ValidatedHistoricalRun(MappingABC):
-    __slots__ = ("__weakref__",)
+def _initialize_validated_historical_run_capability():
+    issuer = object()
+    registry = {}
 
-    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
-        del cls, args, kwargs
-        raise ValueError("validated historical run construction is private")
+    class ValidatedHistoricalRun(MappingABC):
+        __slots__ = ("__weakref__",)
 
-    def __getitem__(self, key: str) -> Any:
-        return _validated_run_projection(self)[key]
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            del cls, args, kwargs
+            raise ValueError("validated historical run construction is private")
 
-    def __iter__(self):
-        return iter(_validated_run_projection(self))
+        def __getitem__(self, key: str) -> Any:
+            return require_projection(self)[key]
 
-    def __len__(self) -> int:
-        return len(_validated_run_projection(self))
+        def __iter__(self):
+            return iter(require_projection(self))
 
-    def __setattr__(self, _name: str, _value: Any) -> None:
-        raise AttributeError("validated historical run is immutable")
+        def __len__(self) -> int:
+            return len(require_projection(self))
 
-    def __repr__(self) -> str:
-        return "ValidatedHistoricalRun(<redacted>)"
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError("validated historical run is immutable")
 
-    def __reduce_ex__(self, _protocol: int) -> Any:
-        raise TypeError("validated historical run is not serializable")
+        def __repr__(self) -> str:
+            return "ValidatedHistoricalRun(<redacted>)"
 
+        def __reduce_ex__(self, _protocol: int) -> Any:
+            raise TypeError("validated historical run is not serializable")
 
-def _validated_run_projection(value: Any) -> Mapping[str, Any]:
-    entry = _VALIDATED_RUN_REGISTRY.get(id(value))
-    if (type(value) is not _ValidatedHistoricalRun or entry is None
+    def require_projection(value: Any) -> Mapping[str, Any]:
+        entry = registry.get(id(value))
+        if (
+            type(value) is not ValidatedHistoricalRun
+            or entry is None
             or entry[0]() is not value
-            or entry[1].get("issuer") is not _VALIDATED_RUN_ISSUER):
-        raise ValueError("validated historical run capability is invalid")
-    return entry[1]["projection"]
+            or entry[1].get("issuer") is not issuer
+        ):
+            raise ValueError("validated historical run capability is invalid")
+        return entry[1]["projection"]
+
+    def issue(projection: Mapping[str, Any]) -> Any:
+        value = object.__new__(ValidatedHistoricalRun)
+        value_id = id(value)
+        record = {"issuer": issuer, "projection": projection}
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = registry.get(value_id)
+            if current is not None and current[0] is reference:
+                registry.pop(value_id, None)
+
+        registry[value_id] = (weakref.ref(value, retire), record)
+        return value
+
+    def validate_selected_historical_run(
+        *, config: HistoricalFoundryConfigSet,
+        run_evidence: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Validate one already-reread closed input; Task 7 owns root authenticity."""
+        if not isinstance(config, HistoricalFoundryConfigSet):
+            raise ValueError("historical config capability is invalid")
+        value = _exact_fields(run_evidence, _RUN_FIELDS, "historical run")
+        if value["schema"] != "historical_foundry_selected_run_closed/v1":
+            raise ValueError("historical run schema is invalid")
+        if (
+            not isinstance(value["run_id"], str)
+            or _RUN_ID.fullmatch(value["run_id"]) is None
+            or value["snapshot_run_id"] != value["run_id"]
+            or _hash(value["manifest_sha256"], "manifest hash")
+            != value["manifest_sha256"]
+        ):
+            raise ValueError("historical run id is invalid")
+        for field, expected in (
+            ("policy_sha256", config.policy.physical_sha256),
+            ("authority_sha256", config.authority.physical_sha256),
+            ("toolchain_sha256", config.toolchain.physical_sha256),
+        ):
+            if value[field] != expected:
+                raise ValueError("historical config binding differs")
+        unsigned = {
+            key: item for key, item in value.items() if key != "evidence_sha256"
+        }
+        if _hash(value["evidence_sha256"], "evidence hash") != _digest(unsigned):
+            raise ValueError("historical evidence hash differs")
+        task7_selection_bytes, task7_selection = (
+            _decode_task7_canonical_document(
+                value["task7_selection_hex"], "Task-7 selection"
+            )
+        )
+        task7_typed_manifest_bytes, task7_typed_manifest = (
+            _decode_task7_canonical_document(
+                value["task7_typed_manifest_hex"], "Task-7 typed manifest"
+            )
+        )
+        expected_run_id = "run:" + hashlib.sha256(
+            _TASK7_RUN_ID_DOMAIN
+            + task7_selection_bytes
+            + task7_typed_manifest_bytes
+        ).hexdigest()
+        if (
+            value["run_id"] != expected_run_id
+            or value["snapshot_run_id"] != expected_run_id
+        ):
+            raise ValueError("historical run preimage differs")
+        selected = _exact_fields(
+            value["selection"], _SELECTION_FIELDS, "selection"
+        )
+        if _hash(value["selection_sha256"], "selection hash") != _digest(selected):
+            raise ValueError("selection hash differs")
+        scan_inventory_sha256 = _hash(
+            value["scan_inventory_sha256"], "scan inventory hash"
+        )
+        anchor_time = _timestamp(selected["anchor_timestamp"])
+        block_time = _timestamp(selected["block_timestamp"])
+        lookback = config.policy.value["lookback_seconds"]
+        if not anchor_time - timedelta(seconds=lookback) <= block_time <= anchor_time:
+            raise ValueError("selected block is outside the policy window")
+        if type(selected["block_number"]) is not int or selected["block_number"] <= 0:
+            raise ValueError("selected block differs")
+        if (
+            not isinstance(selected["block_hash"], str)
+            or re.fullmatch(r"0x[0-9a-f]{64}", selected["block_hash"]) is None
+            or _hash(selected["block_header_sha256"], "block header hash")
+            != selected["block_header_sha256"]
+        ):
+            raise ValueError("selected block identity differs")
+        _exact_fields(selected["venues"], frozenset(_VENUES), "selected venues")
+        for dex in _VENUES:
+            venue = _exact_fields(
+                selected["venues"][dex],
+                frozenset((
+                    "pair_address", "factory_pair_forward",
+                    "factory_pair_reverse", "reserve_uni_raw",
+                    "reserve_weth_raw", "reserve_timestamp_last_raw",
+                    "raw_response_sha256",
+                )),
+                "venue",
+            )
+            expected_pair = _PAIR_BY_VENUE[dex]
+            if (
+                not isinstance(venue["pair_address"], str)
+                or _ADDRESS.fullmatch(venue["pair_address"]) is None
+                or venue["pair_address"] != expected_pair
+                or venue["factory_pair_forward"] != expected_pair
+                or venue["factory_pair_reverse"] != expected_pair
+                or type(venue["reserve_uni_raw"]) is not int
+                or type(venue["reserve_weth_raw"]) is not int
+                or type(venue["reserve_timestamp_last_raw"]) is not int
+                or not 0 <= venue["reserve_timestamp_last_raw"] < 2 ** 32
+                or _hash(venue["raw_response_sha256"], "reserve response hash")
+                != venue["raw_response_sha256"]
+                or min(venue["reserve_uni_raw"], venue["reserve_weth_raw"]) <= 0
+            ):
+                raise ValueError("selected venue differs")
+        if not isinstance(selected["routes"], list) or len(selected["routes"]) != 2:
+            raise ValueError("selected routes are invalid")
+        expected_routes = []
+        for buy, sell in (
+            ("uniswap_v2", "sushiswap_v2"),
+            ("sushiswap_v2", "uniswap_v2"),
+        ):
+            identity = {
+                "token_symbol": "UNI",
+                "buy_market_id": "dex:eth:{}:{}:UNI".format(
+                    buy, selected["venues"][buy]["pair_address"]
+                ),
+                "sell_market_id": "dex:eth:{}:{}:UNI".format(
+                    sell, selected["venues"][sell]["pair_address"]
+                ),
+                "route_mode": "atomic_onchain",
+            }
+            expected_routes.append({
+                **identity, "route_id": canonical_route_id(identity)
+            })
+        if selected["routes"] != expected_routes:
+            raise ValueError("selected routes differ")
+        if (
+            not isinstance(value["typed_members"], list)
+            or len(value["typed_members"]) != 4
+        ):
+            raise ValueError("typed members are invalid")
+        payloads = []
+        price_payloads = []
+        eth_usd_values = []
+        for index, dex in enumerate(_VENUES):
+            payloads.append(_validate_typed_member(
+                value["typed_members"][index * 2], config=config,
+                dex=dex, selected=selected,
+            ))
+            price_payload, eth_usd = _validate_usd_member(
+                value["typed_members"][index * 2 + 1], config=config,
+                dex=dex, selected=selected,
+                scan_inventory_sha256=scan_inventory_sha256,
+            )
+            payloads.append(price_payload)
+            price_payloads.append({
+                key: item for key, item in price_payload.items()
+                if key not in {"market_id", "venue_id"}
+            })
+            eth_usd_values.append(eth_usd)
+        if (
+            price_payloads[0] != price_payloads[1]
+            or eth_usd_values[0] != eth_usd_values[1]
+        ):
+            raise ValueError("USD market contexts differ")
+        scenarios = value["scenarios"]
+        expected_pairs = {
+            (route["route_id"], notional)
+            for route in expected_routes
+            for notional in (1000, 5000, 10000, 50000, 100000)
+        }
+        actual = set()
+        if not isinstance(scenarios, list) or len(scenarios) != 10:
+            raise ValueError("historical scenarios are invalid")
+        for scenario in scenarios:
+            _exact_fields(
+                scenario,
+                frozenset((
+                    "route_id", "requested_notional_usd", "receipt_status",
+                )),
+                "scenario",
+            )
+            if (
+                type(scenario["receipt_status"]) is not int
+                or scenario["receipt_status"] != 1
+                or type(scenario["requested_notional_usd"]) is not int
+            ):
+                raise ValueError("historical scenario is not proved")
+            actual.add((scenario["route_id"], scenario["requested_notional_usd"]))
+        if actual != expected_pairs:
+            raise ValueError("historical scenarios differ")
+        _validate_task7_selection(
+            task7_selection,
+            selected=selected,
+            scan_inventory_sha256=scan_inventory_sha256,
+            expected_routes=expected_routes,
+            scenarios=scenarios,
+        )
+        _validate_task7_typed_manifest(
+            task7_typed_manifest,
+            task7_selection=task7_selection,
+            selected=selected,
+            typed_members=value["typed_members"],
+        )
+        normalized = dict(_plain(value))
+        normalized["typed_payloads"] = payloads
+        normalized["eth_usd"] = decimal_text(eth_usd_values[0])
+        return issue(_freeze(normalized))
+
+    return validate_selected_historical_run, require_projection
 
 
-def _issue_validated_run(projection: Mapping[str, Any]) -> _ValidatedHistoricalRun:
-    value = object.__new__(_ValidatedHistoricalRun)
-    value_id = id(value)
-    record = {"issuer": _VALIDATED_RUN_ISSUER, "projection": projection}
-
-    def retire(reference: weakref.ReferenceType) -> None:
-        current = _VALIDATED_RUN_REGISTRY.get(value_id)
-        if current is not None and current[0] is reference:
-            _VALIDATED_RUN_REGISTRY.pop(value_id, None)
-
-    _VALIDATED_RUN_REGISTRY[value_id] = (weakref.ref(value, retire), record)
-    return value
+(
+    validate_selected_historical_run,
+    _validated_run_projection,
+) = _initialize_validated_historical_run_capability()
+del _initialize_validated_historical_run_capability
 
 
 def _plain(value: Any) -> Any:
@@ -153,6 +409,309 @@ def _hash(value: Any, label: str) -> str:
     if not isinstance(value, str) or _SHA.fullmatch(value) is None:
         raise ValueError("{} is invalid".format(label))
     return value
+
+
+def _decode_task7_canonical_document(value: Any, label: str):
+    if (
+        type(value) is not str
+        or not value
+        or re.fullmatch(r"(?:[0-9a-f]{2})+", value) is None
+    ):
+        raise ValueError("{} bytes are invalid".format(label))
+    try:
+        raw = bytes.fromhex(value)
+        document = json.loads(raw.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("{} bytes are invalid".format(label))
+    if (
+        type(document) is not dict
+        or raw.hex() != value
+        or _canonical_bytes(document) != raw
+    ):
+        raise ValueError("{} is not canonical".format(label))
+    return raw, document
+
+
+def _task7_int(value: Any, label: str, *, minimum: Any = None) -> int:
+    if type(value) is not int or (minimum is not None and value < minimum):
+        raise ValueError("{} is invalid".format(label))
+    return value
+
+
+def _validate_task7_fraction(value: Any, label: str) -> Mapping[str, Any]:
+    fraction = _exact_fields(value, _TASK7_FRACTION_FIELDS, label)
+    numerator = _task7_int(fraction["numerator"], label + " numerator")
+    denominator = _task7_int(
+        fraction["denominator"], label + " denominator", minimum=1
+    )
+    display = fraction["display"]
+    if type(display) is not str or not display:
+        raise ValueError("{} display is invalid".format(label))
+    try:
+        decimal = Decimal(display)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("{} display is invalid".format(label))
+    if not decimal.is_finite() or decimal * denominator != numerator:
+        raise ValueError("{} display differs".format(label))
+    return fraction
+
+
+def _validate_task7_selection(
+    value: Any, *, selected: Mapping[str, Any],
+    scan_inventory_sha256: str, expected_routes: Any, scenarios: Any,
+) -> None:
+    selection = _exact_fields(
+        value, _TASK7_SELECTION_FIELDS, "Task-7 selection"
+    )
+    if (
+        selection["schema"] != "historical_foundry_selection/v1"
+        or selection["status"]
+        != "found_publishable_profitable_block"
+        or selection["staging_inventory_sha256"]
+        != scan_inventory_sha256
+        or _hash(
+            selection["prefilter_grid_digest"], "Task-7 prefilter grid hash"
+        ) != selection["prefilter_grid_digest"]
+    ):
+        raise ValueError("Task-7 selection identity differs")
+    candidate_count = _task7_int(
+        selection["candidate_block_count"],
+        "Task-7 candidate block count", minimum=1,
+    )
+    denominator = _task7_int(
+        selection["scenario_denominator"],
+        "Task-7 scenario denominator", minimum=10,
+    )
+    initial_count = _task7_int(
+        selection["initial_replay_required_count"],
+        "Task-7 initial replay count", minimum=1,
+    )
+    if denominator != candidate_count * 10 or initial_count > denominator:
+        raise ValueError("Task-7 selection counts differ")
+    block = _exact_fields(
+        selection["selected_block"], _TASK7_BLOCK_FIELDS,
+        "Task-7 selected block",
+    )
+    for field in (
+        "number", "timestamp", "gas_limit", "gas_used", "base_fee_per_gas",
+    ):
+        _task7_int(block[field], "Task-7 block {}".format(field), minimum=0)
+    if (
+        block["number"] <= 0
+        or block["gas_limit"] <= 0
+        or block["gas_used"] > block["gas_limit"]
+        or not isinstance(block["hash"], str)
+        or re.fullmatch(r"0x[0-9a-f]{64}", block["hash"]) is None
+        or not isinstance(block["parent_hash"], str)
+        or re.fullmatch(r"0x[0-9a-f]{64}", block["parent_hash"]) is None
+        or not isinstance(block["state_root"], str)
+        or re.fullmatch(r"0x[0-9a-f]{64}", block["state_root"]) is None
+        or block["number"] != selected["block_number"]
+        or block["hash"] != selected["block_hash"]
+        or block["timestamp"]
+        != int(_timestamp(selected["block_timestamp"]).timestamp())
+        or _digest(block) != selected["block_header_sha256"]
+    ):
+        raise ValueError("Task-7 selected block differs")
+    selected_scenarios = selection["selected_scenarios"]
+    if (
+        _task7_int(
+            selection["selected_scenario_count"],
+            "Task-7 selected scenario count", minimum=0,
+        ) != 10
+        or type(selected_scenarios) is not list
+        or len(selected_scenarios) != 10
+        or _task7_int(
+            selection["unresolved_candidate_count"],
+            "Task-7 unresolved candidate count", minimum=0,
+        ) != 0
+    ):
+        raise ValueError("Task-7 selected scenarios differ")
+    notionals = (1000, 5000, 10000, 50000, 100000)
+    directions = ("uniswap_to_sushiswap", "sushiswap_to_uniswap")
+    expected_reduced = [
+        (route["route_id"], notional, 1)
+        for route in expected_routes for notional in notionals
+    ]
+    if [
+        (row["route_id"], row["requested_notional_usd"], row["receipt_status"])
+        for row in scenarios
+    ] != expected_reduced:
+        raise ValueError("historical scenario ordering differs")
+    expected_task7 = [
+        (direction, notional)
+        for direction in directions for notional in notionals
+    ]
+    positive_count = 0
+    for scenario, (direction, notional) in zip(
+        selected_scenarios, expected_task7
+    ):
+        row = _exact_fields(
+            scenario, _TASK7_SCENARIO_FIELDS, "Task-7 scenario"
+        )
+        if (
+            row["scenario_key"]
+            != "{}:{}:{}".format(block["number"], direction, notional)
+            or _task7_int(
+                row["block_number"], "Task-7 scenario block", minimum=1
+            ) != block["number"]
+            or _task7_int(
+                row["status"], "Task-7 scenario status", minimum=0
+            ) != 1
+            or row["classification"] != "replay_success"
+            or row["direction"] != direction
+            or _task7_int(
+                row["requested_notional_usd"],
+                "Task-7 scenario notional", minimum=1,
+            ) != notional
+            or _task7_int(
+                row["gas_used"], "Task-7 scenario gas", minimum=1
+            ) <= 0
+            or _task7_int(
+                row["effective_gas_price"],
+                "Task-7 scenario gas price", minimum=1,
+            ) <= 0
+            or type(row["weth_delta_raw"]) is not int
+        ):
+            raise ValueError("Task-7 scenario identity differs")
+        for field in (
+            "proof_inputs_hash", "overlay_sha256", "receipt_sha256",
+            "trace_sha256", "result_sha256",
+        ):
+            _hash(row[field], "Task-7 scenario {}".format(field))
+        economics = _exact_fields(
+            row["economics"], _TASK7_ECONOMICS_FIELDS,
+            "Task-7 scenario economics",
+        )
+        for field in _TASK7_ECONOMICS_FIELDS:
+            _validate_task7_fraction(
+                economics[field], "Task-7 scenario {}".format(field)
+            )
+        positive_count += (
+            economics["policy_net_edge_usd"]["numerator"] > 0
+        )
+    if positive_count == 0:
+        raise ValueError("Task-7 selection is not profitable")
+    candidate_states = selection["candidate_states"]
+    if type(candidate_states) is not list or not candidate_states:
+        raise ValueError("Task-7 candidate states are invalid")
+    selected_states = []
+    for state in candidate_states:
+        row = _exact_fields(
+            state, _TASK7_CANDIDATE_STATE_FIELDS,
+            "Task-7 candidate state",
+        )
+        _task7_int(row["block_number"], "Task-7 state block", minimum=1)
+        _task7_int(row["scenario_count"], "Task-7 state count", minimum=0)
+        if (
+            type(row["state"]) is not str
+            or row["state"] not in {
+                "resolved_nonpositive", "nonpublishable_positive", "selected",
+                "not_needed_older_than_selected",
+            }
+            or type(row["transitions"]) is not list
+            or not row["transitions"]
+            or any(type(item) is not str or not item for item in row["transitions"])
+        ):
+            raise ValueError("Task-7 candidate state differs")
+        if row["state"] == "selected":
+            selected_states.append(row)
+    if (
+        len(selected_states) != 1
+        or selected_states[0]["block_number"] != block["number"]
+        or selected_states[0]["scenario_count"] != 10
+    ):
+        raise ValueError("Task-7 candidate closure differs")
+
+
+def _validate_task7_typed_manifest(
+    value: Any, *, task7_selection: Mapping[str, Any],
+    selected: Mapping[str, Any], typed_members: Any,
+) -> None:
+    manifest = _exact_fields(
+        value, _TASK7_TYPED_MANIFEST_FIELDS, "Task-7 typed manifest"
+    )
+    if (
+        manifest["schema"] != "historical_foundry_typed_manifest/v1"
+        or manifest["selection_status"]
+        != "found_publishable_profitable_block"
+        or manifest["selected_block"] != task7_selection["selected_block"]
+        or _task7_int(
+            manifest["market_count"], "Task-7 market count", minimum=0
+        ) != 2
+        or _task7_int(
+            manifest["member_count"], "Task-7 member count", minimum=0
+        ) != 4
+        or type(manifest["markets"]) is not list
+        or len(manifest["markets"]) != 2
+        or type(manifest["members"]) is not list
+        or len(manifest["members"]) != 4
+    ):
+        raise ValueError("Task-7 typed manifest identity differs")
+    expected_global_members = []
+    for index, dex in enumerate(_VENUES):
+        market = _exact_fields(
+            manifest["markets"][index], _TASK7_MARKET_FIELDS,
+            "Task-7 typed market",
+        )
+        expected_market = _market_id(selected, dex)
+        expected_pair = _PAIR_BY_VENUE[dex]
+        if (
+            market["market_id"] != expected_market
+            or market["market_key"] != _market_key(expected_market)
+            or market["venue_id"] != dex
+            or market["pair_address"] != expected_pair
+            or market["factory_pair_forward"] != expected_pair
+            or market["factory_pair_reverse"] != expected_pair
+            or type(market["members"]) is not list
+            or len(market["members"]) != 2
+        ):
+            raise ValueError("Task-7 typed market differs")
+        for offset, role in enumerate((
+            "dex_pool_state", "dex_usd_price_context",
+        )):
+            row = _exact_fields(
+                market["members"][offset], _TASK7_MARKET_MEMBER_FIELDS,
+                "Task-7 typed market member",
+            )
+            descriptor = _exact_fields(
+                typed_members[index * 2 + offset]["descriptor"],
+                _DESCRIPTOR_FIELDS, "typed member descriptor",
+            )
+            if (
+                row["role"] != role
+                or type(row["path"]) is not str
+                or row["path"] != descriptor["path"]
+                or _task7_int(
+                    row["byte_count"], "Task-7 member byte count", minimum=1
+                ) != descriptor["byte_count"]
+                or _hash(row["sha256"], "Task-7 member hash")
+                != descriptor["sha256"]
+                or descriptor["market_id"] != expected_market
+                or descriptor["role"] != role
+            ):
+                raise ValueError("Task-7 typed member differs")
+            expected_global_members.append({
+                "path": row["path"],
+                "byte_count": row["byte_count"],
+                "sha256": row["sha256"],
+            })
+    observed_global_members = []
+    for item in manifest["members"]:
+        row = _exact_fields(
+            item, _TASK7_GLOBAL_MEMBER_FIELDS, "Task-7 global member"
+        )
+        if type(row["path"]) is not str or not row["path"]:
+            raise ValueError("Task-7 global member path is invalid")
+        _task7_int(
+            row["byte_count"], "Task-7 global member byte count", minimum=1
+        )
+        _hash(row["sha256"], "Task-7 global member hash")
+        observed_global_members.append(dict(row))
+    if observed_global_members != sorted(
+        expected_global_members, key=lambda item: item["path"]
+    ):
+        raise ValueError("Task-7 global member closure differs")
 
 
 def _positive_decimal(value: Any, label: str) -> Decimal:
@@ -355,108 +914,6 @@ def _validate_usd_member(member: Any, *, config: HistoricalFoundryConfigSet,
     if descriptor != expected_descriptor:
         raise ValueError("USD descriptor identity differs")
     return payload, eth_usd
-
-
-def validate_selected_historical_run(*, config: HistoricalFoundryConfigSet,
-                                     run_evidence: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Validate one already-reread closed input; Task 7 owns root authenticity."""
-    if not isinstance(config, HistoricalFoundryConfigSet):
-        raise ValueError("historical config capability is invalid")
-    value = _exact_fields(run_evidence, _RUN_FIELDS, "historical run")
-    if value["schema"] != "historical_foundry_selected_run_closed/v1":
-        raise ValueError("historical run schema is invalid")
-    if (not isinstance(value["run_id"], str) or _RUN_ID.fullmatch(value["run_id"]) is None
-            or value["snapshot_run_id"] != value["run_id"]
-            or _hash(value["manifest_sha256"], "manifest hash")
-            != value["manifest_sha256"]):
-        raise ValueError("historical run id is invalid")
-    for field, expected in (("policy_sha256", config.policy.physical_sha256),
-                            ("authority_sha256", config.authority.physical_sha256),
-                            ("toolchain_sha256", config.toolchain.physical_sha256)):
-        if value[field] != expected:
-            raise ValueError("historical config binding differs")
-    unsigned = {key: item for key, item in value.items() if key != "evidence_sha256"}
-    if _hash(value["evidence_sha256"], "evidence hash") != _digest(unsigned):
-        raise ValueError("historical evidence hash differs")
-    selected = _exact_fields(value["selection"], _SELECTION_FIELDS, "selection")
-    if (_hash(value["selection_sha256"], "selection hash")
-            != _digest(selected)):
-        raise ValueError("selection hash differs")
-    scan_inventory_sha256 = _hash(
-        value["scan_inventory_sha256"], "scan inventory hash"
-    )
-    anchor_time = _timestamp(selected["anchor_timestamp"])
-    block_time = _timestamp(selected["block_timestamp"])
-    lookback = config.policy.value["lookback_seconds"]
-    if not anchor_time - timedelta(seconds=lookback) <= block_time <= anchor_time:
-        raise ValueError("selected block is outside the policy window")
-    if type(selected["block_number"]) is not int or selected["block_number"] <= 0:
-        raise ValueError("selected block differs")
-    if (not isinstance(selected["block_hash"], str)
-            or re.fullmatch(r"0x[0-9a-f]{64}", selected["block_hash"]) is None
-            or _hash(selected["block_header_sha256"], "block header hash")
-            != selected["block_header_sha256"]):
-        raise ValueError("selected block identity differs")
-    _exact_fields(selected["venues"], frozenset(_VENUES), "selected venues")
-    for dex in _VENUES:
-        venue = _exact_fields(selected["venues"][dex], frozenset(("pair_address", "factory_pair_forward", "factory_pair_reverse", "reserve_uni_raw", "reserve_weth_raw", "reserve_timestamp_last_raw", "raw_response_sha256")), "venue")
-        if (not isinstance(venue["pair_address"], str) or _ADDRESS.fullmatch(venue["pair_address"]) is None
-                or venue["factory_pair_forward"] != venue["pair_address"]
-                or venue["factory_pair_reverse"] != venue["pair_address"]
-                or type(venue["reserve_uni_raw"]) is not int or type(venue["reserve_weth_raw"]) is not int
-                or type(venue["reserve_timestamp_last_raw"]) is not int
-                or not 0 <= venue["reserve_timestamp_last_raw"] < 2 ** 32
-                or _hash(venue["raw_response_sha256"], "reserve response hash")
-                != venue["raw_response_sha256"]
-                or min(venue["reserve_uni_raw"], venue["reserve_weth_raw"]) <= 0):
-            raise ValueError("selected venue differs")
-    if not isinstance(selected["routes"], list) or len(selected["routes"]) != 2:
-        raise ValueError("selected routes are invalid")
-    expected_routes = []
-    for buy, sell in (("uniswap_v2", "sushiswap_v2"), ("sushiswap_v2", "uniswap_v2")):
-        identity = {"token_symbol": "UNI", "buy_market_id": "dex:eth:{}:{}:UNI".format(buy, selected["venues"][buy]["pair_address"]), "sell_market_id": "dex:eth:{}:{}:UNI".format(sell, selected["venues"][sell]["pair_address"]), "route_mode": "atomic_onchain"}
-        expected_routes.append({**identity, "route_id": canonical_route_id(identity)})
-    if selected["routes"] != expected_routes:
-        raise ValueError("selected routes differ")
-    if not isinstance(value["typed_members"], list) or len(value["typed_members"]) != 4:
-        raise ValueError("typed members are invalid")
-    payloads = []
-    price_payloads = []
-    eth_usd_values = []
-    for index, dex in enumerate(_VENUES):
-        payloads.append(_validate_typed_member(value["typed_members"][index * 2], config=config, dex=dex, selected=selected))
-        price_payload, eth_usd = _validate_usd_member(
-            value["typed_members"][index * 2 + 1], config=config, dex=dex,
-            selected=selected, scan_inventory_sha256=scan_inventory_sha256,
-        )
-        payloads.append(price_payload)
-        price_payloads.append({
-            key: item for key, item in price_payload.items()
-            if key not in {"market_id", "venue_id"}
-        })
-        eth_usd_values.append(eth_usd)
-    if (price_payloads[0] != price_payloads[1]
-            or eth_usd_values[0] != eth_usd_values[1]):
-        raise ValueError("USD market contexts differ")
-    scenarios = value["scenarios"]
-    expected_pairs = {(route["route_id"], n) for route in expected_routes
-                      for n in (1000, 5000, 10000, 50000, 100000)}
-    actual = set()
-    if not isinstance(scenarios, list) or len(scenarios) != 10:
-        raise ValueError("historical scenarios are invalid")
-    for scenario in scenarios:
-        _exact_fields(scenario, frozenset(("route_id", "requested_notional_usd", "receipt_status")), "scenario")
-        if (type(scenario["receipt_status"]) is not int
-                or scenario["receipt_status"] != 1
-                or type(scenario["requested_notional_usd"]) is not int):
-            raise ValueError("historical scenario is not proved")
-        actual.add((scenario["route_id"], scenario["requested_notional_usd"]))
-    if actual != expected_pairs:
-        raise ValueError("historical scenarios differ")
-    normalized = dict(_plain(value))
-    normalized["typed_payloads"] = payloads
-    normalized["eth_usd"] = decimal_text(eth_usd_values[0])
-    return _issue_validated_run(_freeze(normalized))
 
 
 def _market_projection(validated: Mapping[str, Any], dex: str) -> Dict[str, Any]:
