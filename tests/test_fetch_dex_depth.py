@@ -3374,6 +3374,127 @@ class RpcEndpointFailoverTest(unittest.TestCase):
             ["retry", "retry", "retry", "switch", "use"],
         )
 
+    def test_explicit_http_json_rpc_has_one_four_attempt_owner_and_exact_ledger(self):
+        from scripts.fetch_dex_depth import RpcClient, RpcError, http_json_rpc
+
+        calls = []
+        url = "https://rpc.example.test"
+
+        def unavailable(request, **_kwargs):
+            calls.append(request.full_url)
+            raise urllib.error.HTTPError(
+                request.full_url,
+                503,
+                "private provider outage",
+                {},
+                None,
+            )
+
+        client = RpcClient(
+            "eth",
+            url,
+            request=http_json_rpc,
+            sleeper=lambda _seconds: None,
+        )
+        with patch("urllib.request.urlopen", unavailable), patch("time.sleep"):
+            with self.assertRaisesRegex(RpcError, "^rpc_endpoint_exhausted$"):
+                client.method("eth_chainId", [])
+
+        self.assertEqual(calls, [url] * 4)
+        self.assertEqual(len(client.endpoint_attempts), 4)
+        self.assertEqual(
+            [record["attempt_ordinal"] for record in client.endpoint_attempts],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(
+            [record["endpoint_attempt"] for record in client.endpoint_attempts],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(
+            [record["decision"] for record in client.endpoint_attempts],
+            ["retry", "retry", "retry", "exhausted"],
+        )
+
+    def test_wrapped_retry_aware_request_receives_single_attempt_controls(self):
+        import functools
+
+        from scripts.fetch_dex_depth import RpcClient, http_json_rpc
+
+        observed = []
+
+        @functools.wraps(http_json_rpc)
+        def wrapped(url, payload, **kwargs):
+            observed.append((url, dict(kwargs)))
+            return self._result(payload)
+
+        client = RpcClient(
+            "eth",
+            "https://rpc.example.test",
+            request=wrapped,
+        )
+        self.assertEqual(client.method("eth_chainId", []), "0x1")
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0][0], "https://rpc.example.test")
+        self.assertEqual(
+            observed[0][1],
+            {
+                "deadline": None,
+                "timeout_seconds": 30.0,
+                "max_retries": 1,
+            },
+        )
+
+    def test_legacy_two_positional_request_keeps_exact_call_shape(self):
+        from scripts.fetch_dex_depth import RpcClient
+
+        calls = []
+
+        def legacy_request(url, payload):
+            calls.append((url, payload))
+            return self._result(payload)
+
+        client = RpcClient(
+            "eth",
+            "https://rpc.example.test",
+            request=legacy_request,
+            timeout_seconds=7,
+            max_retries=2,
+        )
+        self.assertEqual(client.method("eth_chainId", []), "0x1")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "https://rpc.example.test")
+        self.assertEqual(calls[0][1]["method"], "eth_chainId")
+
+    def test_uninspectable_request_boundary_fails_safely_without_invocation(self):
+        from scripts.fetch_dex_depth import RpcClient, RpcConfigurationError
+
+        class UninspectableRequest:
+            calls = 0
+
+            @property
+            def __signature__(self):
+                raise ValueError("private request signature")
+
+            def __call__(self, _url, payload):
+                self.calls += 1
+                return self._result(payload)
+
+        request = UninspectableRequest()
+        with self.assertRaisesRegex(
+            RpcConfigurationError,
+            "^invalid_rpc_request_boundary$",
+        ) as raised:
+            RpcClient(
+                "eth",
+                "https://rpc.example.test",
+                request=request,
+            )
+
+        self.assertEqual(request.calls, 0)
+        self.assertNotIn("private", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertTrue(raised.exception.__suppress_context__)
+
     def test_401_and_404_switch_immediately_without_retry(self):
         from scripts.fetch_dex_depth import RpcClient
 

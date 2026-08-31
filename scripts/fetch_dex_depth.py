@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -1032,6 +1033,30 @@ def http_json_rpc(
     ) from None
 
 
+def _request_accepts_retry_controls(request: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(request)
+    except Exception:
+        raise RpcConfigurationError("invalid_rpc_request_boundary") from None
+    try:
+        signature.bind(
+            object(),
+            object(),
+            deadline=None,
+            timeout_seconds=30.0,
+            max_retries=1,
+        )
+    except TypeError:
+        try:
+            signature.bind(object(), object())
+        except Exception:
+            raise RpcConfigurationError("invalid_rpc_request_boundary") from None
+        return False
+    except Exception:
+        raise RpcConfigurationError("invalid_rpc_request_boundary") from None
+    return True
+
+
 class RpcClient:
     def __init__(
         self,
@@ -1079,8 +1104,14 @@ class RpcClient:
         self.endpoint = endpoint_pool[0].identity
         if request is not None and not callable(request):
             raise RpcConfigurationError("invalid_rpc_request_boundary") from None
-        self._uses_default_request = request is None
-        self.request = request or self._default_one_attempt_request
+        if request is None:
+            self.request = self._default_one_attempt_request
+            self._request_accepts_retry_controls = True
+        else:
+            self.request = request
+            self._request_accepts_retry_controls = (
+                _request_accepts_retry_controls(request)
+            )
         self.deadline = deadline
         self._call_deadline = deadline
         try:
@@ -1182,19 +1213,7 @@ class RpcClient:
         payload: Any,
         effective_deadline: CollectionDeadline | None,
     ) -> tuple[Any, bytes]:
-        if self._uses_default_request:
-            return self.request(
-                endpoint.url,
-                payload,
-                deadline=effective_deadline,
-                timeout_seconds=self.timeout_seconds,
-                max_retries=1,
-            )
-        if (
-            effective_deadline is None
-            and self.timeout_seconds == 30
-            and self.max_retries == MAX_RETRIES
-        ):
+        if not self._request_accepts_retry_controls:
             return self.request(endpoint.url, payload)
         return self.request(
             endpoint.url,
