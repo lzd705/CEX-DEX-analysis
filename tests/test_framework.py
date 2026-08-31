@@ -143,24 +143,56 @@ class FrameworkStructureTest(unittest.TestCase):
         daily_service = (
             PROJECT_ROOT / "deploy/systemd/cex-dex-daily.service.in"
         ).read_text(encoding="utf-8")
+        daily_user_service = (
+            PROJECT_ROOT / "deploy/systemd/cex-dex-daily-user.service.in"
+        ).read_text(encoding="utf-8")
         depth_service = (
             PROJECT_ROOT / "deploy/systemd/cex-dex-depth.service.in"
         ).read_text(encoding="utf-8")
+        depth_user_service = (
+            PROJECT_ROOT / "deploy/systemd/cex-dex-depth-user.service.in"
+        ).read_text(encoding="utf-8")
+        daily_timer = (
+            PROJECT_ROOT / "deploy/systemd/cex-dex-daily.timer"
+        ).read_text(encoding="utf-8")
+        depth_timer = (
+            PROJECT_ROOT / "deploy/systemd/cex-dex-depth.timer"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("--profile daily --publish-local", daily_service)
+        self.assertIn("--lock-wait-seconds 900", daily_service)
         self.assertNotIn("--fail-fast", daily_service)
-        self.assertIn("TimeoutStartSec=75min", daily_service)
+        self.assertIn("TimeoutStartSec=90min", daily_service)
         self.assertIn("User=@SERVICE_USER@", daily_service)
         self.assertIn("--data-dir @MARKET_DATA_DIR@", daily_service)
         self.assertIn("ReadWritePaths=@MARKET_DATA_DIR@", daily_service)
         self.assertIn("ReadWritePaths=@MARKET_WORK_DIR@", daily_service)
         self.assertIn("--profile depth --publish-local", depth_service)
+        self.assertIn("--lock-wait-seconds 900", depth_service)
         self.assertNotIn("--fail-fast", depth_service)
-        self.assertIn("TimeoutStartSec=30min", depth_service)
+        self.assertIn("TimeoutStartSec=50min", depth_service)
         self.assertIn("User=@SERVICE_USER@", depth_service)
         self.assertIn("--data-dir @MARKET_DATA_DIR@", depth_service)
         self.assertIn("ReadWritePaths=@MARKET_DATA_DIR@", depth_service)
         self.assertIn("ReadWritePaths=@MARKET_WORK_DIR@", depth_service)
+        self.assertIn("--profile daily --publish-local", daily_user_service)
+        self.assertIn("--lock-wait-seconds 900", daily_user_service)
+        self.assertIn(
+            "EnvironmentFile=-%h/.config/cex-dex/dashboard.env",
+            daily_user_service,
+        )
+        self.assertIn("TimeoutStartSec=90min", daily_user_service)
+        self.assertNotIn("/etc/cex-dex", daily_user_service)
+        self.assertIn("--profile depth --publish-local", depth_user_service)
+        self.assertIn("--lock-wait-seconds 900", depth_user_service)
+        self.assertIn(
+            "EnvironmentFile=-%h/.config/cex-dex/dashboard.env",
+            depth_user_service,
+        )
+        self.assertIn("TimeoutStartSec=50min", depth_user_service)
+        self.assertNotIn("/etc/cex-dex", depth_user_service)
+        self.assertIn("OnCalendar=*-*-* 00:30:00 UTC", daily_timer)
+        self.assertIn("OnCalendar=*-*-* *:05:00 UTC", depth_timer)
 
     def test_framework_is_not_bound_to_render(self):
         self.assertFalse((PROJECT_ROOT / "render.yaml").exists())

@@ -24,6 +24,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -795,6 +796,38 @@ def publication_gates_from_log(path: Path) -> dict[str, Any]:
     return {}
 
 
+def validate_lock_wait_seconds(lock_wait_seconds: float) -> None:
+    if not math.isfinite(lock_wait_seconds) or lock_wait_seconds < 0:
+        raise ValueError("lock_wait_seconds must be finite and non-negative")
+
+
+def acquire_collection_lock(
+    lock_handle: Any,
+    *,
+    lock_wait_seconds: float,
+    monotonic: Callable[[], float],
+    sleeper: Callable[[float], None],
+) -> str | None:
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return None
+    except BlockingIOError:
+        if lock_wait_seconds == 0:
+            return "already_locked"
+
+    deadline = monotonic() + lock_wait_seconds
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return "lock_wait_timeout"
+        sleeper(min(0.25, remaining))
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return None
+        except BlockingIOError:
+            continue
+
+
 def run_collection_cycle(
     profile: str,
     *,
@@ -813,8 +846,12 @@ def run_collection_cycle(
     require_uniswap_v3_exact_validation: bool = False,
     fail_fast: bool = False,
     dry_run: bool = False,
+    lock_wait_seconds: float = 0.0,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
     step_runner: Callable[[list[str], Path], int] = default_step_runner,
 ) -> dict[str, Any]:
+    validate_lock_wait_seconds(lock_wait_seconds)
     data_dir = data_dir.expanduser().resolve()
     run_root = run_root or data_dir / "collection/runs"
     latest_status_path = latest_status_path or data_dir / "collection/latest.json"
@@ -848,18 +885,24 @@ def run_collection_cycle(
                 for name, command in commands
             ],
         }
-
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
-        try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return {
+        lock_skip_reason = acquire_collection_lock(
+            lock_handle,
+            lock_wait_seconds=lock_wait_seconds,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
+        if lock_skip_reason is not None:
+            result = {
                 "run_id": run_id,
                 "profile": profile,
                 "status": "skipped_locked",
                 "publish_local": publish_local,
             }
+            if lock_skip_reason == "lock_wait_timeout":
+                result["reason"] = lock_skip_reason
+            return result
 
         run_dir = run_root / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -1136,6 +1179,12 @@ def parse_args() -> argparse.Namespace:
         help="Finite positive collection deadline for the routes profile",
     )
     parser.add_argument(
+        "--lock-wait-seconds",
+        type=float,
+        default=0.0,
+        help="Finite non-negative seconds to wait for the collection lock",
+    )
+    parser.add_argument(
         "--market-id",
         help="One canonical CEX/DEX market for a bounded snapshot refresh",
     )
@@ -1171,8 +1220,14 @@ def main() -> None:
         ),
         fail_fast=args.fail_fast,
         dry_run=args.dry_run,
+        lock_wait_seconds=args.lock_wait_seconds,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if (
+        result["status"] == "skipped_locked"
+        and result.get("reason") == "lock_wait_timeout"
+    ):
+        raise SystemExit(75)
     if result["status"] == "failed":
         raise SystemExit(1)
 
