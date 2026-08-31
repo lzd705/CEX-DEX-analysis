@@ -3364,6 +3364,129 @@ class RpcEndpointFailoverTest(unittest.TestCase):
                 ):
                     self.assertNotIn(secret, retained)
 
+    def test_initial_fixed_block_bind_restarts_identity_on_endpoint_switch(self):
+        from scripts.fetch_dex_depth import RpcClient, _bind_chain_fixed_block
+
+        expected_block = {
+            "number": "0x7b",
+            "hash": "0x" + "a" * 64,
+            "timestamp": "0x65920080",
+        }
+        calls = []
+
+        def request(url, payload):
+            method = payload["method"]
+            endpoint = "primary" if "primary" in url else "fallback"
+            calls.append((endpoint, method))
+            if endpoint == "primary" and method == "eth_getBlockByNumber":
+                raise urllib.error.HTTPError(url, 403, "private", {}, None)
+            if method == "eth_chainId":
+                result = "0x1"
+            elif method == "eth_getBlockByNumber":
+                result = expected_block
+            elif method == "eth_call":
+                result = "0x1"
+            else:
+                raise AssertionError(method)
+            response = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
+            return response, json.dumps(response).encode("utf-8")
+
+        client = RpcClient(
+            "eth",
+            self._endpoints()[0].url,
+            endpoints=self._endpoints(),
+            request=request,
+        )
+
+        identity = _bind_chain_fixed_block(client, "eth", 123)
+        self.assertEqual(
+            identity,
+            {
+                "number": "123",
+                "hash": "0x" + "a" * 64,
+                "timestamp": "2024-01-01T00:00:00+00:00",
+            },
+        )
+        self.assertEqual(
+            [method for endpoint, method in calls if endpoint == "fallback"],
+            [
+                "eth_getBlockByNumber",
+                "eth_chainId",
+                "eth_getBlockByNumber",
+            ],
+        )
+        self.assertEqual(client.validated_endpoint_generation, 1)
+        self.assertNotIn("eth_call", [method for _endpoint, method in calls])
+
+        self.assertEqual(client.method("eth_call", []), "0x1")
+        self.assertEqual(calls[-1], ("fallback", "eth_call"))
+
+    def test_fallback_identity_restarts_when_validation_switches_again(self):
+        from scripts.fetch_dex_depth import RpcClient, RpcEndpoint
+
+        endpoints = (
+            RpcEndpoint("eth-primary", "https://primary.example.test/rpc"),
+            RpcEndpoint("eth-fallback-1", "https://fallback-one.example.test/rpc"),
+            RpcEndpoint("eth-fallback-2", "https://fallback-two.example.test/rpc"),
+        )
+        expected_block = {
+            "number": "0x7b",
+            "hash": "0x" + "a" * 64,
+            "timestamp": "0x65920080",
+        }
+        calls = []
+
+        def request(url, payload):
+            method = payload["method"]
+            if "primary" in url:
+                endpoint = "primary"
+            elif "fallback-one" in url:
+                endpoint = "fallback-1"
+            else:
+                endpoint = "fallback-2"
+            calls.append((endpoint, method))
+            if endpoint == "primary" and method == "eth_call":
+                raise urllib.error.HTTPError(url, 403, "private", {}, None)
+            if endpoint == "fallback-1" and method == "eth_getBlockByNumber":
+                raise urllib.error.HTTPError(url, 403, "private", {}, None)
+            if method == "eth_chainId":
+                result = "0x1"
+            elif method == "eth_getBlockByNumber":
+                result = expected_block
+            elif method == "eth_call":
+                result = "0x1"
+            else:
+                raise AssertionError(method)
+            response = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
+            return response, json.dumps(response).encode("utf-8")
+
+        client = RpcClient(
+            "eth",
+            endpoints[0].url,
+            endpoints=endpoints,
+            request=request,
+        )
+        client.bind_fixed_block_identity(
+            chain_id=1,
+            block={
+                "number": "123",
+                "hash": expected_block["hash"],
+                "timestamp": "2024-01-01T00:00:00+00:00",
+            },
+        )
+
+        self.assertEqual(client.method("eth_call", []), "0x1")
+        self.assertEqual(
+            [method for endpoint, method in calls if endpoint == "fallback-2"],
+            [
+                "eth_getBlockByNumber",
+                "eth_chainId",
+                "eth_getBlockByNumber",
+                "eth_call",
+            ],
+        )
+        self.assertEqual(client.validated_endpoint_generation, 2)
+
     def test_429_and_5xx_retry_one_endpoint_before_switching(self):
         from scripts.fetch_dex_depth import RpcClient
 

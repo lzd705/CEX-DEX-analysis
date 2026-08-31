@@ -1281,21 +1281,27 @@ class RpcClient:
             return
         self._validating_endpoint = True
         try:
-            actual_chain_id = int(
-                canonical_rpc_quantity(self.chain_id(), "eth_chainId"),
-                16,
-            )
-            actual_block = exact_v3_block_identity(
-                self.block(hex(expected["number"])),
-                expected["number"],
-            )
-            if actual_chain_id != expected["chain_id"] or actual_block != {
-                "number": str(expected["number"]),
-                "hash": expected["hash"],
-                "timestamp": expected["timestamp"],
-            }:
-                raise RpcError("rpc_endpoint_identity_mismatch")
-            self._validated_endpoint_generation = self.endpoint_generation
+            while self._validated_endpoint_generation != self.endpoint_generation:
+                validation_generation = self.endpoint_generation
+                actual_chain_id = int(
+                    canonical_rpc_quantity(self.chain_id(), "eth_chainId"),
+                    16,
+                )
+                if self.endpoint_generation != validation_generation:
+                    continue
+                actual_block = exact_v3_block_identity(
+                    self.block(hex(expected["number"])),
+                    expected["number"],
+                )
+                if self.endpoint_generation != validation_generation:
+                    continue
+                if actual_chain_id != expected["chain_id"] or actual_block != {
+                    "number": str(expected["number"]),
+                    "hash": expected["hash"],
+                    "timestamp": expected["timestamp"],
+                }:
+                    raise RpcError("rpc_endpoint_identity_mismatch")
+                self._validated_endpoint_generation = validation_generation
         finally:
             self._validating_endpoint = False
 
@@ -5634,18 +5640,25 @@ def _bind_chain_fixed_block(
     expected_chain_id = V3_CHAIN_ID_BY_NAME.get(chain)
     if expected_chain_id is None:
         raise ValueError("unsupported fixed-block chain")
-    actual_chain_id = int(
-        canonical_rpc_quantity(client.chain_id(), "fixed block chain id"),
-        16,
-    )
-    if actual_chain_id != expected_chain_id:
-        raise ValueError("fixed block chain identity does not match")
-    actual_identity = exact_v3_block_identity(
-        client.block(hex(block_number)),
-        block_number,
-    )
-    if expected_identity is not None and actual_identity != dict(expected_identity):
-        raise ValueError("fixed block header identity does not match")
+    while True:
+        binding_generation = client.endpoint_generation
+        actual_chain_id = int(
+            canonical_rpc_quantity(client.chain_id(), "fixed block chain id"),
+            16,
+        )
+        if client.endpoint_generation != binding_generation:
+            continue
+        actual_identity = exact_v3_block_identity(
+            client.block(hex(block_number)),
+            block_number,
+        )
+        if client.endpoint_generation != binding_generation:
+            continue
+        if actual_chain_id != expected_chain_id:
+            raise ValueError("fixed block chain identity does not match")
+        if expected_identity is not None and actual_identity != dict(expected_identity):
+            raise ValueError("fixed block header identity does not match")
+        break
     if isinstance(client, RpcClient):
         client.bind_fixed_block_identity(
             chain_id=expected_chain_id,
