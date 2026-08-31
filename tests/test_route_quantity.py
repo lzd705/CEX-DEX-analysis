@@ -29,6 +29,7 @@ from scripts.route_quantity import (
     quote_v2_pool_quantity,
     validate_v2_quantity_quote_against_state,
 )
+from tests.test_route_opportunity import cex_v2_fixture
 
 
 HASH = "a" * 64
@@ -2183,6 +2184,80 @@ class V2ExactInputIntegerMathTests(unittest.TestCase):
             self.quote_wire_sha256("buy"),
             "64e233855d47a083c4bc17e856c89999c9209377c6ee38b9b7aef12e0796a7a1",
         )
+
+    def test_v2_state_validator_returns_the_frozen_canonical_quote_bytes(self):
+        kwargs = cex_v2_fixture()
+        quote = kwargs["buy_quote"]
+        evidence = kwargs["buy_quote_evidence"]
+
+        validated = validate_v2_quantity_quote_against_state(
+            quote,
+            evidence["pool_state"],
+            kwargs["common_target"],
+            evidence["market_rules"],
+            direction="buy",
+            target_token_address=evidence["target_token_address"],
+            quote_token_address=evidence["quote_token_address"],
+            cohort_now=evidence["cohort_now"],
+        )
+        payload = {
+            key: str(value) if isinstance(value, Decimal) else value
+            for key, value in vars(validated).items()
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+
+        self.assertIs(validated, quote)
+        self.assertEqual(validated.direction, "buy")
+        self.assertEqual(validated.target_base_raw, 100_000_000_000_000_000_000)
+        self.assertEqual(validated.quote_debit_quantity, Decimal("11144.544746"))
+        self.assertEqual(len(encoded), 2219)
+        self.assertEqual(
+            hashlib.sha256(encoded).hexdigest(),
+            "dfb40c70bc2aad87c0e8e254acab0c85163361ff0bade1fce37d81e9333b0660",
+        )
+
+    def test_live_opportunity_builder_returns_frozen_canonical_bytes(self):
+        result = build_route_opportunity(**cex_v2_fixture())
+        encoded = json.dumps(
+            result,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+
+        self.assertEqual(result["opportunity_class"], "research_estimate")
+        self.assertEqual(result["primary_reason"], "cost_components_incomplete")
+        self.assertEqual(result["gross_buy_cost_usd"], "11144.544746")
+        self.assertEqual(result["gross_sell_proceeds_usd"], "11988")
+        self.assertEqual(result["gross_edge_usd"], "843.455254")
+        self.assertEqual(result["strict_net_edge_usd"], "841.455254")
+        self.assertEqual(len(encoded), 3028)
+        self.assertEqual(
+            hashlib.sha256(encoded).hexdigest(),
+            "118d57a2ddf4aa5948b43e74cc14f430c8dca08c0c43d1cd9c82892e2a601e26",
+        )
+
+    def test_live_opportunity_rejects_exact_input_as_quote_evidence_kind(self):
+        for leg, message in (
+            ("buy", "pool fee quantity-quote lineage is unavailable"),
+            ("sell", "venue fee quantity-quote lineage is unavailable"),
+        ):
+            kwargs = cex_v2_fixture()
+            evidence_key = leg + "_quote_evidence"
+            kwargs[evidence_key] = {
+                **kwargs[evidence_key],
+                "kind": "dex_v2_exact_input",
+            }
+            with self.subTest(leg=leg):
+                with self.assertRaisesRegex(ValueError, message):
+                    build_route_opportunity(**kwargs)
 
 
 class V1NonRegressionTests(unittest.TestCase):
