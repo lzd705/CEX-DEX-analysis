@@ -410,7 +410,7 @@ behavior and every existing fail-closed publication gate.
 - [ ] **Step 2: Run focused regression**
 
   ```bash
-  PYTHONPATH=. python3 -m unittest \
+  PYTHONPATH=.:tests python3 -m unittest \
     tests.test_uniswap_v3_math \
     tests.test_uniswap_v3_authority \
     tests.test_uniswap_v3_collection \
