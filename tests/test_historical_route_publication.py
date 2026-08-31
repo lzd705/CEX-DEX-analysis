@@ -848,6 +848,59 @@ class HistoricalCorePublicationTests(unittest.TestCase):
             duplicate_first_timing_route
         )
 
+    def test_historical_cohort_rejects_six_rehashed_trusted_field_mutations(self):
+        import scripts.historical_route_publication as publication
+
+        run, finalized, lease, _identity = self._open_real_task7_lease()
+        stage = None
+        try:
+            stage = publication.stage_historical_replay_core(
+                data_dir=run["fixture"].data_dir, config=run["config"],
+                publication_lease=lease,
+            )
+            lease = None
+            record = publication._stage_record(stage)
+            baseline = record["derived"]["cohort"]
+            attacks = (
+                ("target_observed_at", lambda cohort: cohort.__setitem__(
+                    "target_observed_at", "2000-01-01T00:00:00Z"
+                )),
+                ("collection_started_at", lambda cohort: cohort.__setitem__(
+                    "collection_started_at", "2000-01-01T00:00:00Z"
+                )),
+                ("skew_sla_seconds", lambda cohort: cohort.__setitem__(
+                    "skew_sla_seconds", "999"
+                )),
+                ("route_age_sla_seconds", lambda cohort: cohort.__setitem__(
+                    "route_age_sla_seconds", "999"
+                )),
+                ("selection_window", lambda cohort: cohort.__setitem__(
+                    "selection_window", {
+                        "start": "2000-01-01", "end": "2000-01-02",
+                    }
+                )),
+                ("leg_raw_response_sha256", lambda cohort: cohort["legs"][
+                    0
+                ].__setitem__("raw_response_sha256", "f" * 64)),
+            )
+            for label, attack in attacks:
+                with self.subTest(attack=label):
+                    cohort = json.loads(json.dumps(baseline))
+                    attack(cohort)
+                    self._rehash_attacker_cohort(cohort)
+                    with self.assertRaises(
+                        publication.HistoricalRoutePublicationError
+                    ):
+                        publication._validate_historical_cohort(
+                            cohort=cohort, derived=record["derived"]
+                        )
+        finally:
+            if stage is not None:
+                stage.close()
+            if lease is not None:
+                lease.close()
+            self._close_real_task7_run(run, finalized)
+
     def test_same_byte_stage_directory_replacement_is_rejected(self):
         import scripts.historical_route_publication as publication
 

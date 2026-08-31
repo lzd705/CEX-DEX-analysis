@@ -665,8 +665,8 @@ def _build_run_evidence_from_source(
 
 
 def _historical_cohort(
-    *, config: HistoricalFoundryConfigSet, validated_run: Mapping[str, Any],
-    universe: Mapping[str, Any], core_projection: Mapping[str, Any],
+    *, validated_run: Mapping[str, Any], universe: Mapping[str, Any],
+    core_projection: Mapping[str, Any],
 ) -> Dict[str, Any]:
     selection = validated_run["selection"]
     observed_at = selection["block_timestamp"]
@@ -675,8 +675,8 @@ def _historical_cohort(
         "run_id": validated_run["run_id"],
         "manifest_sha256": validated_run["manifest_sha256"],
         "selection_sha256": validated_run["selection_sha256"],
-        "policy_sha256": config.policy.physical_sha256,
-        "authority_sha256": config.authority.physical_sha256,
+        "policy_sha256": validated_run["policy_sha256"],
+        "authority_sha256": validated_run["authority_sha256"],
     })).hexdigest()
     collection_generation = core_projection["universe_sha256"]
     routes = []
@@ -765,8 +765,7 @@ def _derive_historical_core(
         config=config, validated_run=validated, universe=universe
     )
     cohort = _historical_cohort(
-        config=config, validated_run=validated, universe=universe,
-        core_projection=core,
+        validated_run=validated, universe=universe, core_projection=core,
     )
     return {
         "evidence": evidence, "validated": validated, "universe": universe,
@@ -828,6 +827,22 @@ def _validate_historical_cohort(
     ):
         raise HistoricalRoutePublicationError(
             "historical route cohort shape differs"
+        )
+    expected_cohort = _historical_cohort(
+        validated_run=derived["validated"], universe=derived["universe"],
+        core_projection=derived["core"],
+    )
+    try:
+        exact_match = (
+            _canonical_bytes(cohort) == _canonical_bytes(expected_cohort)
+        )
+    except (TypeError, ValueError) as error:
+        raise HistoricalRoutePublicationError(
+            "historical route cohort is not canonical"
+        ) from error
+    if not exact_match:
+        raise HistoricalRoutePublicationError(
+            "historical route cohort differs from trusted derivation"
         )
     expected_markets = {
         row["market_id"] for row in derived["core"]["markets"]
