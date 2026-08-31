@@ -7029,6 +7029,10 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
                 fixture, capability = self._new_capability()
                 original_open = self.storage.os.open
                 original_fstat = self.storage.os.fstat
+                task6_registry = inspect.getclosurevars(
+                    self.storage.ScenarioEvidenceSink.write_member
+                ).nonlocals["task6_transaction_registry"]
+                task6_registry_before = tuple(task6_registry.items())
                 entropy = bytes((0xe0 + index,)) * 16
                 staging_name = ".staging-" + entropy.hex()
                 target_path = (
@@ -7130,6 +7134,21 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
                     self.assertTrue(observation["opcode_fired"])
                     self.assertIs(escaped, control)
                     self.assertIsNone(control.__context__)
+                    if label in ("created_directory", "cleanup_reopen"):
+                        traceback_cursor = escaped.__traceback__
+                        captured_entry = None
+                        while traceback_cursor is not None:
+                            if (
+                                traceback_cursor.tb_frame.f_code.co_name
+                                == "_task4b_open_capture_directory"
+                            ):
+                                captured_entry = traceback_cursor.tb_frame.f_locals[
+                                    "entry"
+                                ]
+                                break
+                            traceback_cursor = traceback_cursor.tb_next
+                        self.assertIs(type(captured_entry), dict)
+                        self.assertIsNotNone(captured_entry["identity"])
 
                     call_args = observation["call_args"]
                     call_kwargs = observation["call_kwargs"]
@@ -7174,6 +7193,9 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
                         self.assertEqual(tuple(replay.iterdir()), ())
                     else:
                         self.assertEqual(tuple(fixture.data_dir.iterdir()), ())
+                    self.assertEqual(
+                        tuple(task6_registry.items()), task6_registry_before
+                    )
                 finally:
                     sys.settrace(prior_trace)
                     returned_fd = observation["returned_fd"]
@@ -8272,7 +8294,7 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
                 and type(entry) is dict
                 and entry.get("name") == staging_name
                 and entry.get("created") is True
-                and entry.get("identity") is None
+                and entry.get("identity") is not None
                 and isinstance(frame.f_locals.get("before"), os.stat_result)
             ):
                 fired[0] = True
@@ -8316,7 +8338,7 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
                 and type(entry) is dict
                 and entry.get("name") == staging_name
                 and entry.get("created") is True
-                and entry.get("identity") is None
+                and entry.get("identity") is not None
                 and isinstance(frame.f_locals.get("before"), os.stat_result)
             ):
                 parent_fd = entry.get("parent_fd")
@@ -15264,7 +15286,7 @@ class HistoricalFoundryStorageTask4bMaximumIntegrationTests(
             "fees/00000001.json.gz", 268,
             "3d221de2ad977645a086c54ebd8b1f2e9363bc2c5b5ae571fe54030098bc8330",
         ),
-        "8d726d93def20a52e4c6f4c3ec94fa18078ba058d13bdd777b1bbc9af121d6d9",
+        "26f361e990cdb3ce6e840e8496a3f6d5ca0f53f0eef4a4779e9a54bfe0889a12",
     )
 
     @staticmethod

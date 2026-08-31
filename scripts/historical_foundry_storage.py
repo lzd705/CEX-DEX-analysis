@@ -23,6 +23,18 @@ def _task6_commit_checkpoint(_phase: str) -> None:
     return None
 
 
+def _task6_helper_mutation_checkpoint(_phase: str) -> None:
+    return None
+
+
+def _task6_journal_mutation_checkpoint(_phase: str) -> None:
+    return None
+
+
+def _task6_prepare_cleanup_checkpoint(_phase: str) -> None:
+    return None
+
+
 def _task6_rename_directory_noreplace(
     *, parent_fd: int, source_name: str, destination_name: str
 ) -> None:
@@ -153,6 +165,12 @@ def _validate_historical_scenario_member_size(
         or byte_count > limits[role]
     ):
         raise ValueError("historical scenario member size is invalid")
+    return None
+
+
+def _task6_validate_journal_payload(payload: bytes) -> None:
+    if type(payload) is not bytes or not payload or len(payload) > 8_388_608:
+        raise ValueError("historical replay journal is invalid")
     return None
 
 
@@ -1905,7 +1923,14 @@ def _initialize_historical_foundry_storage_types():
         name: str,
         *,
         allow_existing: bool,
+        mutation_owner: Any = None,
+        blocking_guard: Any = None,
     ) -> Dict[str, Any]:
+        if blocking_guard is not None and not callable(blocking_guard):
+            raise _InternalFailure()
+        def guard() -> None:
+            if blocking_guard is not None:
+                blocking_guard()
         _require_relative_basename(name)
         entry = {
             "parent_fd": parent_fd,
@@ -1913,6 +1938,7 @@ def _initialize_historical_foundry_storage_types():
             "fd": None,
             "identity": None,
             "created": False,
+            "allow_existing": allow_existing,
             "mkdir_state": "pending",
             "open_state": "pending",
             "reopen_state": "pending",
@@ -1921,25 +1947,81 @@ def _initialize_historical_foundry_storage_types():
             "close_state": "pending",
             "cleanup_phase": "verify",
         }
+        if mutation_owner is not None:
+            if not callable(mutation_owner):
+                raise _InternalFailure()
+            mutation_owner(entry)
         ledger["directories"].append(entry)
+        if mutation_owner is not None:
+            _task6_helper_mutation_checkpoint("after_directory_ledger_append")
         entry["mkdir_state"] = "attempting"
         try:
+            guard()
             os.mkdir(name, 0o700, dir_fd=parent_fd); entry["created"] = True; entry["mkdir_state"] = "attempted"
+            guard()
         except FileExistsError:
             entry["mkdir_state"] = "attempted"
             if not allow_existing:
                 raise
         if entry["created"]:
             entry["open_state"] = "attempting"
+
+            def authenticate_created_directory() -> None:
+                registered_fd = _task4b_registered_slot_fd(entry)
+                if registered_fd is None:
+                    _task4b_open_registered_slot(
+                        entry, name, _task4b_directory_flags(),
+                        dir_fd=parent_fd,
+                    )
+                    registered_fd = _task4b_registered_slot_fd(entry)
+                if registered_fd is None:
+                    raise _InternalFailure()
+                entry["fd"] = registered_fd
+                opened_owned = os.fstat(registered_fd)
+                opened_identity = _metadata_snapshot(opened_owned)
+                prior_identity = entry.get("identity")
+                if (
+                    not stat.S_ISDIR(opened_owned.st_mode)
+                    or opened_owned.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened_owned.st_mode) != 0o700
+                    or (
+                        prior_identity is not None
+                        and prior_identity != opened_identity
+                    )
+                ):
+                    raise _InternalFailure()
+                entry["identity"] = opened_identity
+                installed_owned = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if _metadata_snapshot(installed_owned) != opened_identity:
+                    raise _InternalFailure()
+                return None
+
             open_error = None
             open_traceback = None
             try:
+                guard()
                 _task4b_open_registered_slot(
                     entry,
                     name,
                     _task4b_directory_flags(),
                     dir_fd=parent_fd,
                 ); entry["open_state"] = "attempted"
+                opened_owned = os.fstat(entry["fd"])
+                entry["identity"] = _metadata_snapshot(opened_owned)
+                guard()
+                installed_owned = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(opened_owned.st_mode)
+                    or _metadata_snapshot(installed_owned)
+                    != entry["identity"]
+                    or opened_owned.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened_owned.st_mode) != 0o700
+                ):
+                    raise _InternalFailure()
             except BaseException as observed_open_error:
                 open_error = observed_open_error
                 open_traceback = observed_open_error.__traceback__
@@ -1948,9 +2030,7 @@ def _initialize_historical_foundry_storage_types():
                 identity_error = None
                 identity_traceback = None
                 try:
-                    entry["identity"] = _metadata_snapshot(os.stat(
-                        name, dir_fd=parent_fd, follow_symlinks=False
-                    ))
+                    authenticate_created_directory()
                 except BaseException as observed_identity_error:
                     identity_error = observed_identity_error
                     identity_traceback = observed_identity_error.__traceback__
@@ -1959,9 +2039,7 @@ def _initialize_historical_foundry_storage_types():
                 retry_traceback = None
                 if identity_error is not None:
                     try:
-                        entry["identity"] = _metadata_snapshot(os.stat(
-                            name, dir_fd=parent_fd, follow_symlinks=False
-                        ))
+                        authenticate_created_directory()
                     except BaseException as observed_retry_error:
                         retry_error = observed_retry_error
                         retry_traceback = observed_retry_error.__traceback__
@@ -1980,26 +2058,38 @@ def _initialize_historical_foundry_storage_types():
                         selected = retry_error
                         selected_traceback = retry_traceback
                 raise selected.with_traceback(selected_traceback) from None
+            if mutation_owner is not None:
+                _task6_helper_mutation_checkpoint(
+                    "after_directory_mkdir"
+                )
+            guard()
             before = os.stat(
                 name, dir_fd=parent_fd, follow_symlinks=False
             )
+            guard()
             entry["identity"] = _metadata_snapshot(before)
         else:
+            guard()
             before = os.stat(
                 name, dir_fd=parent_fd, follow_symlinks=False
             )
+            guard()
             entry["open_state"] = "attempting"
+            guard()
             _task4b_open_registered_slot(
                 entry,
                 name,
                 _task4b_directory_flags(),
                 dir_fd=parent_fd,
             ); entry["open_state"] = "attempted"
+            guard()
         fd = entry["fd"]
+        guard()
         opened = os.fstat(fd)
         after = os.stat(
             name, dir_fd=parent_fd, follow_symlinks=False
         )
+        guard()
         identity = _metadata_snapshot(opened)
         entry["identity"] = identity
         if (
@@ -2045,6 +2135,7 @@ def _initialize_historical_foundry_storage_types():
             "name": target,
             "fd": None,
             "identity": None,
+            "ownership_identity": None,
             "acquisition_state": "pending",
             "unlink_state": "pending",
             "parent_fsync_state": "pending",
@@ -2409,11 +2500,21 @@ def _initialize_historical_foundry_storage_types():
         directory: Dict[str, Any],
         target: str,
         payload: bytes,
+        *,
+        mutation_owner: Any = None,
+        blocking_guard: Any = None,
     ) -> None:
+        if blocking_guard is not None and not callable(blocking_guard):
+            raise _InternalFailure()
+        def guard() -> None:
+            if blocking_guard is not None:
+                blocking_guard()
         if type(payload) is not bytes or not payload:
             raise _InternalFailure()
         _require_relative_basename(target)
+        guard()
         _task4b_verify_capture_directory(directory)
+        guard()
         parent_fd = directory.get("fd")
         if type(parent_fd) is not int:
             raise _InternalFailure()
@@ -2428,11 +2529,18 @@ def _initialize_historical_foundry_storage_types():
             "close_state": "pending",
             "cleanup_phase": "verify",
         }
+        if mutation_owner is not None:
+            if not callable(mutation_owner):
+                raise _InternalFailure()
+            mutation_owner(entry)
         ledger["files"].append(entry)
+        if mutation_owner is not None:
+            _task6_helper_mutation_checkpoint("after_file_ledger_append")
         quota_token = _task4b_reserve_output_quota(
             ledger, entry, len(payload)
         )
         entry["acquisition_state"] = "attempting"
+        guard()
         fd = _task4b_open_registered_slot(
             entry,
             target,
@@ -2440,10 +2548,37 @@ def _initialize_historical_foundry_storage_types():
             dir_fd=parent_fd,
             mode=0o600,
         ); entry["acquisition_state"] = "attempted"
+        guard()
+        opened_fd = os.fstat(fd)
+        opened_path = os.stat(
+            target, dir_fd=parent_fd, follow_symlinks=False
+        )
+        entry["ownership_identity"] = _file_identity(opened_fd)
+        if (
+            not stat.S_ISREG(opened_fd.st_mode)
+            or _file_identity(opened_path) != entry["ownership_identity"]
+            or opened_fd.st_nlink != 1
+            or opened_path.st_nlink != 1
+            or opened_fd.st_uid != os.geteuid()
+            or opened_path.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_fd.st_mode) != 0o600
+            or stat.S_IMODE(opened_path.st_mode) != 0o600
+        ):
+            raise _InternalFailure()
+        if mutation_owner is not None:
+            _task6_helper_mutation_checkpoint("after_file_open")
         if os.get_inheritable(fd):
             raise _InternalFailure()
+        guard()
         _pwrite_all(fd, payload, 0)
+        guard()
+        if mutation_owner is not None:
+            _task6_helper_mutation_checkpoint("after_file_write")
+        guard()
         os.fsync(fd)
+        guard()
+        if mutation_owner is not None:
+            _task6_helper_mutation_checkpoint("after_file_fsync")
         before_fd = os.fstat(fd)
         before_path = os.stat(
             target, dir_fd=parent_fd, follow_symlinks=False
@@ -2464,6 +2599,7 @@ def _initialize_historical_foundry_storage_types():
             or before_path.st_size != len(payload)
         ):
             raise _InternalFailure()
+        guard()
         observed = _pread_exact(fd, len(payload), 0)
         if os.pread(fd, 1, len(payload)) != b"":
             raise _InternalFailure()
@@ -2477,10 +2613,22 @@ def _initialize_historical_foundry_storage_types():
             or observed != payload
         ):
             raise _InternalFailure()
+        guard()
+        guard()
         _task4b_close_fd_slot(ledger, entry)
+        guard()
+        if mutation_owner is not None:
+            _task6_helper_mutation_checkpoint("after_file_close")
+        guard()
         os.fsync(parent_fd)
+        guard()
+        if mutation_owner is not None:
+            _task6_helper_mutation_checkpoint("after_file_parent_fsync")
         _task4b_verify_capture_directory(directory)
+        guard()
         _task4b_commit_output_quota(ledger, entry, quota_token)
+        if mutation_owner is not None:
+            _task6_helper_mutation_checkpoint("after_file_quota_commit")
         return None
 
     def _task4b_validate_typed_rows(role: str, rows: Any) -> None:
@@ -7729,6 +7877,25 @@ def _initialize_historical_foundry_storage_types():
             return {_task6_clone_mutable(nested) for nested in value}
         return value
 
+    def _task6_precommit_remaining(
+        transaction: Dict[str, Any], cap: float = 120.0
+    ) -> float:
+        remaining = transaction.get("remaining")
+        if not callable(remaining):
+            raise _InternalFailure()
+        try:
+            value = remaining(cap)
+        except (TypeError, ValueError, TimeoutError):
+            raise _InternalFailure() from None
+        if (
+            type(value) not in (int, float)
+            or isinstance(value, bool)
+            or value <= 0
+            or value > cap
+        ):
+            raise _InternalFailure()
+        return float(value)
+
     def _task6_journal_projection(value: Any) -> Any:
         if type(value) is dict:
             return {
@@ -7744,43 +7911,116 @@ def _initialize_historical_foundry_storage_types():
         raise _InternalFailure()
 
     def _task6_raw_journal_write(
-        *, parent_fd: int, name: str, payload: bytes
+        *, transaction: Dict[str, Any], parent_fd: int,
+        name: str, payload: bytes,
     ) -> None:
+        try:
+            _task6_validate_journal_payload(payload)
+        except ValueError:
+            raise _InternalFailure() from None
         _require_relative_basename(name)
         flags = (
             os.O_RDWR | os.O_CREAT | os.O_EXCL
             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         )
+        entry = transaction.get("prepare_entry")
+        if (
+            type(entry) is not dict
+            or entry.get("name") != name
+            or entry.get("state") != "INTENDED"
+            or entry.get("fd") is not None
+        ):
+            raise _InternalFailure()
+
+        def guard() -> None:
+            _task6_precommit_remaining(transaction)
+
+        guard()
         fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
-        try:
-            offset = 0
-            while offset < len(payload):
-                count = os.write(fd, payload[offset:])
-                if count <= 0:
-                    raise _InternalFailure()
-                offset += count
-            os.fsync(fd)
-            details = os.fstat(fd)
-            path_details = os.stat(
-                name, dir_fd=parent_fd, follow_symlinks=False
-            )
-            if (
-                not stat.S_ISREG(details.st_mode)
-                or stat.S_IMODE(details.st_mode) != 0o600
-                or details.st_nlink != 1
-                or _metadata_snapshot(details) != _metadata_snapshot(path_details)
-                or os.pread(fd, len(payload) + 1, 0) != payload
-            ):
+        entry["fd"] = fd
+        entry["state"] = "OPEN"
+        _task6_journal_mutation_checkpoint("after_journal_open")
+        guard()
+        details = os.fstat(fd)
+        entry["identity"] = _file_identity(details)
+        entry["metadata"] = _metadata_snapshot(details)
+        guard()
+        path_details = os.stat(
+            name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        guard()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_nlink != 1
+            or _metadata_snapshot(details) != _metadata_snapshot(path_details)
+        ):
+            raise _InternalFailure()
+        offset = 0
+        while offset < len(payload):
+            guard()
+            count = os.write(fd, payload[offset:])
+            entry["state"] = "PARTIAL"
+            _task6_journal_mutation_checkpoint("after_journal_write")
+            guard()
+            if count <= 0:
                 raise _InternalFailure()
-        finally:
+            offset += count
+        guard()
+        os.fsync(fd)
+        entry["state"] = "FILE_FSYNCED"
+        _task6_journal_mutation_checkpoint("after_journal_file_fsync")
+        guard()
+        details = os.fstat(fd)
+        guard()
+        path_details = os.stat(
+            name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        guard()
+        observed_payload = os.pread(fd, len(payload) + 1, 0)
+        guard()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_nlink != 1
+            or _metadata_snapshot(details) != _metadata_snapshot(path_details)
+            or observed_payload != payload
+        ):
+            raise _InternalFailure()
+        guard()
+        try:
             os.close(fd)
+        except BaseException:
+            try:
+                os.fstat(fd)
+            except OSError as observed:
+                if observed.errno == errno.EBADF:
+                    entry["fd"] = None
+                    entry["state"] = "FILE_CLOSED"
+                else:
+                    entry["state"] = "CLOSE_UNCERTAIN"
+            else:
+                entry["state"] = "CLOSE_UNCERTAIN"
+            raise
+        entry["fd"] = None
+        entry["state"] = "FILE_CLOSED"
+        guard()
         os.fsync(parent_fd)
+        entry["state"] = "ROOT_FSYNCED"
+        _task6_journal_mutation_checkpoint("after_journal_root_fsync")
+        guard()
         return None
 
     def _task6_raw_journal_read(
         *, parent_fd: int, name: str, expected_size: int,
         expected_sha256: str,
     ) -> bytes:
+        if (
+            type(expected_size) is not int
+            or expected_size <= 0
+            or expected_size > 8_388_608
+        ):
+            raise _InternalFailure()
         _require_relative_basename(name)
         fd = os.open(
             name,
@@ -7866,27 +8106,231 @@ def _initialize_historical_foundry_storage_types():
                 ):
                     raise _InternalFailure()
                 recovered["state"] = (
-                    "COMMIT_DURABLE"
+                    "COMMITTING"
                     if names[0][0] == committed_name else "PREPARED"
                 )
+                recovered["writer_active"] = False
+                recovered["orphaned"] = True
                 owner["_task6_transaction"] = recovered
                 task6_transaction_registry[id(owner)] = recovered
                 return recovered
         return None
 
+    def _task6_remove_owned_prepare_entry(
+        transaction: Dict[str, Any]
+    ) -> None:
+        entry = transaction.get("prepare_entry")
+        if type(entry) is not dict:
+            raise _InternalFailure()
+        parent_fd = transaction["journal_parent_fd"]
+        name = transaction["prepare_name"]
+        if entry.get("name") != name:
+            raise _InternalFailure()
+        state = entry.get("state")
+        fd = entry.get("fd")
+        expected_identity = entry.get("identity")
+        if fd is not None:
+            try:
+                details = os.fstat(fd)
+            except OSError as observed:
+                if observed.errno != errno.EBADF:
+                    raise
+                entry["fd"] = None
+                fd = None
+                details = None
+            if details is None:
+                observed_identity = expected_identity
+            else:
+                observed_identity = _file_identity(details)
+            if expected_identity is None:
+                if observed_identity is None:
+                    raise _InternalFailure()
+                entry["identity"] = observed_identity
+                expected_identity = observed_identity
+            elif (
+                observed_identity is not None
+                and observed_identity != expected_identity
+                and not (
+                    observed_identity[:-1] == expected_identity[:-1]
+                    and observed_identity[-1] == 0
+                    and entry.get("unlink_state") in (
+                        "ATTEMPTING", "UNLINKED_NEEDS_FSYNC", "FSYNCED"
+                    )
+                )
+            ):
+                raise _InternalFailure()
+        try:
+            installed = os.stat(
+                name, dir_fd=parent_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            installed = None
+        if expected_identity is None:
+            if state == "INTENDED" and fd is None and installed is None:
+                entry["unlink_state"] = "ABSENT"
+                entry["parent_fsync_state"] = "FSYNCED"
+                return None
+            raise _InternalFailure()
+        if installed is not None:
+            if _file_identity(installed) != expected_identity:
+                raise _InternalFailure()
+            entry["unlink_state"] = "ATTEMPTING"
+            try:
+                os.unlink(name, dir_fd=parent_fd)
+            except BaseException:
+                try:
+                    current = os.stat(
+                        name, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    entry["unlink_state"] = "UNLINKED_NEEDS_FSYNC"
+                else:
+                    if _file_identity(current) != expected_identity:
+                        raise _InternalFailure()
+                raise
+            entry["unlink_state"] = "UNLINKED_NEEDS_FSYNC"
+            _task6_prepare_cleanup_checkpoint("after_prepare_unlink")
+        elif entry.get("unlink_state") not in (
+            "ATTEMPTING", "UNLINKED_NEEDS_FSYNC", "FSYNCED"
+        ):
+            raise _InternalFailure()
+        if entry.get("parent_fsync_state") != "FSYNCED":
+            os.fsync(parent_fd)
+            entry["parent_fsync_state"] = "FSYNCED"
+            entry["unlink_state"] = "FSYNCED"
+            _task6_prepare_cleanup_checkpoint(
+                "after_prepare_parent_fsync"
+            )
+        if fd is not None:
+            try:
+                os.close(fd)
+            except BaseException:
+                try:
+                    os.fstat(fd)
+                except OSError as observed:
+                    if observed.errno == errno.EBADF:
+                        entry["fd"] = None
+                        entry["state"] = "REMOVED"
+                    else:
+                        entry["state"] = "CLOSE_UNCERTAIN"
+                else:
+                    entry["state"] = state
+                raise
+            entry["fd"] = None
+        entry["state"] = "REMOVED"
+        _task6_prepare_cleanup_checkpoint("after_prepare_fd_close")
+        return None
+
     def _task6_remove_v2_journal(transaction: Dict[str, Any]) -> None:
         parent_fd = transaction["journal_parent_fd"]
-        removed = False
+        authority = transaction["owner"].get(
+            "_task6_journal_authority", {}
+        ).get(transaction["transaction_id"])
+        if authority is None:
+            if task6_transaction_registry.get(
+                id(transaction["owner"])
+            ) is not transaction:
+                raise _InternalFailure()
+            expected_size = transaction["journal_size"]
+            expected_sha256 = transaction["journal_sha256"]
+        else:
+            if (
+                type(authority) is not dict
+                or authority.get("rollback_authority") is not transaction
+            ):
+                raise _InternalFailure()
+            expected_size = authority["size"]
+            expected_sha256 = authority["sha256"]
+        cleanup = transaction.setdefault("journal_cleanup", {})
+        required_name = (
+            transaction["committed_name"]
+            if transaction.get("state") in (
+                "COMMITTING", "DURABLE", "COMPLETING", "COMMITTED"
+            )
+            else transaction["prepare_name"]
+        )
+        if (
+            transaction.get("state") == "ROLLBACK"
+            and required_name == transaction["prepare_name"]
+        ):
+            _task6_remove_owned_prepare_entry(transaction)
+            cleanup[transaction["prepare_name"]] = "FSYNCED"
         for name in (
             transaction["prepare_name"], transaction["committed_name"]
         ):
+            state = cleanup.get(name, "PENDING")
+            if state == "FSYNCED" or state == "ABSENT":
+                continue
+            if state == "UNLINKED_NEEDS_FSYNC":
+                os.fsync(parent_fd)
+                cleanup[name] = "FSYNCED"
+                continue
+            try:
+                payload = _task6_raw_journal_read(
+                    parent_fd=parent_fd, name=name,
+                    expected_size=expected_size,
+                    expected_sha256=expected_sha256,
+                )
+            except FileNotFoundError:
+                if state == "ATTEMPTING":
+                    cleanup[name] = "UNLINKED_NEEDS_FSYNC"
+                    os.fsync(parent_fd)
+                    cleanup[name] = "FSYNCED"
+                elif (
+                    name == required_name
+                    and not (
+                        transaction.get("rollback_from_state") == "PREPARING"
+                        and authority is None
+                    )
+                ):
+                    raise _InternalFailure()
+                else:
+                    cleanup[name] = "ABSENT"
+                continue
+            if payload != transaction["journal_payload"]:
+                raise _InternalFailure()
+            cleanup[name] = "AUTHENTICATED"
+            cleanup[name] = "ATTEMPTING"
             try:
                 os.unlink(name, dir_fd=parent_fd)
-                removed = True
-            except FileNotFoundError:
-                pass
-        if removed:
+            except BaseException:
+                try:
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    cleanup[name] = "UNLINKED_NEEDS_FSYNC"
+                raise
+            cleanup[name] = "UNLINKED_NEEDS_FSYNC"
             os.fsync(parent_fd)
+            cleanup[name] = "FSYNCED"
+        return None
+
+    def _task6_detach_v2_transaction(transaction: Dict[str, Any]) -> None:
+        owner = transaction["owner"]
+        transaction_id = transaction["transaction_id"]
+        attached = owner.get("_task6_transaction")
+        if attached is not None and attached is not transaction:
+            raise _InternalFailure()
+        authorities = owner.get("_task6_journal_authority")
+        authority = (
+            authorities.get(transaction_id)
+            if type(authorities) is dict else None
+        )
+        if authority is not None and (
+            type(authority) is not dict
+            or authority.get("rollback_authority") is not transaction
+        ):
+            raise _InternalFailure()
+        registered = task6_transaction_registry.get(id(owner))
+        if registered is not None and registered is not transaction:
+            raise _InternalFailure()
+        if attached is transaction:
+            owner.pop("_task6_transaction")
+        if authority is not None:
+            authorities.pop(transaction_id)
+            if not authorities:
+                owner.pop("_task6_journal_authority")
+        if registered is transaction:
+            task6_transaction_registry.pop(id(owner))
         return None
 
     def _task6_rollback_v2(transaction: Dict[str, Any]) -> None:
@@ -7894,16 +8338,31 @@ def _initialize_historical_foundry_storage_types():
         if transaction.get("rollback_complete") is True:
             return None
         if transaction.get("state") in (
-            "COMMIT_DURABLE", "COMPLETING", "COMMITTED"
+            "COMMITTING", "DURABLE", "COMPLETING", "COMMITTED"
         ):
             raise _InternalFailure()
+        transaction["rollback_from_state"] = transaction.get("state")
         transaction["state"] = "ROLLBACK"
         _task6_commit_checkpoint("rollback")
         ledger_record = transaction.get("ledger_record")
         ledger_handle = transaction.get("ledger_handle")
         if ledger_handle is not None:
-            replay_ledger_registry.pop(id(ledger_handle), None)
+            current = replay_ledger_registry.get(id(ledger_handle))
+            if current is not None and not (
+                current[0]() is ledger_handle
+                and current[1] is ledger_record
+            ):
+                raise _InternalFailure()
         successor = transaction.get("successor")
+        if successor is not None:
+            current = staging_snapshot_registry.get(id(successor))
+            if current is not None and current != (successor, owner):
+                raise _InternalFailure()
+            tombstone = staging_snapshot_tombstones.get(id(successor))
+            if tombstone is not None and tombstone[0]() is not successor:
+                raise _InternalFailure()
+        if ledger_handle is not None:
+            replay_ledger_registry.pop(id(ledger_handle), None)
         if successor is not None:
             staging_snapshot_registry.pop(id(successor), None)
             staging_snapshot_tombstones.pop(id(successor), None)
@@ -7962,29 +8421,65 @@ def _initialize_historical_foundry_storage_types():
                 scenario["name"] = transaction["private_name"]
                 scenario["identity"] = held_identity
         for entry in reversed(tuple(transaction.get("files", ()))):
+            if entry not in ledger["files"]:
+                raise _InternalFailure()
+            _task4b_close_fd_slot(ledger, entry)
             try:
-                os.unlink(entry["name"], dir_fd=entry["parent_fd"])
+                current = os.stat(
+                    entry["name"], dir_fd=entry["parent_fd"],
+                    follow_symlinks=False,
+                )
             except FileNotFoundError:
-                pass
+                current = None
+            if current is not None:
+                expected_identity = entry.get("ownership_identity")
+                if (
+                    expected_identity is None
+                    or _file_identity(current) != expected_identity
+                ):
+                    raise _InternalFailure()
+                os.unlink(entry["name"], dir_fd=entry["parent_fd"])
             os.fsync(entry["parent_fd"])
-            if entry in ledger["files"]:
-                ledger["files"].remove(entry)
+            ledger["files"].remove(entry)
         for directory in reversed(tuple(transaction.get("opened_directories", ()))):
+            if directory not in ledger["directories"]:
+                raise _InternalFailure()
+            if (
+                directory.get("created") is not True
+                and directory.get("allow_existing") is False
+                and directory.get("mkdir_state") == "attempting"
+            ):
+                raise _InternalFailure()
             _task4b_close_fd_slot(ledger, directory)
             if directory.get("created"):
                 try:
+                    current = os.stat(
+                        directory["name"], dir_fd=directory["parent_fd"],
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    current = None
+                if current is not None:
+                    expected_identity = directory.get("identity")
+                    if (
+                        expected_identity is None
+                        or _metadata_snapshot(current) != expected_identity
+                    ):
+                        raise _InternalFailure()
                     os.rmdir(
                         directory["name"], dir_fd=directory["parent_fd"]
                     )
-                except FileNotFoundError:
-                    pass
                 os.fsync(directory["parent_fd"])
-            if directory in ledger["directories"]:
-                ledger["directories"].remove(directory)
+            ledger["directories"].remove(directory)
         for relative_path in tuple(transaction.get("mapped_paths", ())):
-            ledger.get("task6_member_directories", {}).pop(
-                relative_path, None
-            )
+            mappings = ledger.get("task6_member_directories", {})
+            current = mappings.get(relative_path)
+            if current is not None:
+                scenario = transaction.get("scenario")
+                target = relative_path.rsplit("/", 1)[-1]
+                if current != (scenario, target):
+                    raise _InternalFailure()
+                mappings.pop(relative_path)
         _task6_install_quota_snapshot(
             owner, transaction["predecessor_quota"]
         )
@@ -8000,13 +8495,7 @@ def _initialize_historical_foundry_storage_types():
             else:
                 ledger.pop("quota_owner_handle", None)
         _task6_remove_v2_journal(transaction)
-        owner.pop("_task6_transaction", None)
-        authorities = owner.get("_task6_journal_authority")
-        if type(authorities) is dict:
-            authorities.pop(transaction["transaction_id"], None)
-            if not authorities:
-                owner.pop("_task6_journal_authority", None)
-        task6_transaction_registry.pop(id(owner), None)
+        _task6_detach_v2_transaction(transaction)
         transaction["rollback_complete"] = True
         _task6_commit_checkpoint("after_rollback")
         del ledger_record
@@ -8017,7 +8506,7 @@ def _initialize_historical_foundry_storage_types():
         if transaction.get("state") == "COMMITTED":
             return None
         if transaction.get("state") not in (
-            "COMMIT_DURABLE", "COMPLETING"
+            "DURABLE", "COMPLETING"
         ):
             raise _InternalFailure()
         transaction["state"] = "COMPLETING"
@@ -8038,22 +8527,75 @@ def _initialize_historical_foundry_storage_types():
         sink_record["state"] = "committed"
         _task6_commit_checkpoint("after_sink_commit")
         _task6_remove_v2_journal(transaction)
-        owner.pop("_task6_transaction", None)
-        authorities = owner.get("_task6_journal_authority")
-        if type(authorities) is dict:
-            authorities.pop(transaction["transaction_id"], None)
-            if not authorities:
-                owner.pop("_task6_journal_authority", None)
-        task6_transaction_registry.pop(id(owner), None)
+        _task6_detach_v2_transaction(transaction)
         transaction["state"] = "COMMITTED"
+        return None
+
+    def _task6_observed_journal_name(
+        transaction: Dict[str, Any]
+    ) -> str:
+        authority = transaction["owner"].get(
+            "_task6_journal_authority", {}
+        ).get(transaction["transaction_id"])
+        if (
+            type(authority) is not dict
+            or authority.get("rollback_authority") is not transaction
+        ):
+            raise _InternalFailure()
+        observed = []
+        for name in (
+            transaction["prepare_name"], transaction["committed_name"]
+        ):
+            try:
+                payload = _task6_raw_journal_read(
+                    parent_fd=transaction["journal_parent_fd"],
+                    name=name, expected_size=authority["size"],
+                    expected_sha256=authority["sha256"],
+                )
+            except FileNotFoundError:
+                continue
+            if payload != transaction["journal_payload"]:
+                raise _InternalFailure()
+            observed.append(name)
+        if len(observed) != 1:
+            raise _InternalFailure()
+        return observed[0]
+
+    def _task6_make_commit_durable(transaction: Dict[str, Any]) -> None:
+        if transaction.get("state") not in (
+            "INTENT_RENAME_PENDING", "COMMITTING"
+        ):
+            raise _InternalFailure()
+        if _task6_observed_journal_name(transaction) != transaction[
+            "committed_name"
+        ]:
+            raise _InternalFailure()
+        transaction["state"] = "COMMITTING"
+        _task6_freeze_audit(transaction["owner"])
+        os.fsync(transaction["journal_parent_fd"])
+        transaction["state"] = "DURABLE"
+        _task6_commit_checkpoint("after_commit_marker_fsync")
         return None
 
     def _task6_resolve_v2_transaction(owner: Dict[str, Any]) -> None:
         transaction = _task6_v2_transaction(owner)
         if transaction is None:
             return None
+        if transaction.get("writer_active") is True:
+            raise _InternalFailure()
+        if transaction.get("orphaned") is not True:
+            raise _InternalFailure()
         if transaction.get("state") in (
-            "COMMIT_DURABLE", "COMPLETING", "COMMITTED"
+            "INTENT_RENAME_PENDING", "COMMITTING"
+        ):
+            if _task6_observed_journal_name(transaction) != transaction[
+                "committed_name"
+            ]:
+                raise _InternalFailure()
+            _task6_make_commit_durable(transaction)
+            _task6_complete_v2(transaction)
+        elif transaction.get("state") in (
+            "DURABLE", "COMPLETING", "COMMITTED"
         ):
             _task6_complete_v2(transaction)
         else:
@@ -8263,6 +8805,9 @@ def _initialize_historical_foundry_storage_types():
         transaction = {
             "schema": "historical_foundry_replay_transaction/v2",
             "state": "OPEN", "owner": owner,
+            "writer_token": object(), "writer_active": True,
+            "orphaned": False,
+            "remaining": record["remaining"],
             "lineage": owner["lineage"],
             "transaction_id": transaction_id,
             "scenario_key": record["scenario_key"],
@@ -8272,6 +8817,8 @@ def _initialize_historical_foundry_storage_types():
             "journal_parent_fd": journal_parent_fd,
             "journal_document": journal_document,
             "journal_payload": journal_payload,
+            "journal_size": len(journal_payload),
+            "journal_sha256": hashlib.sha256(journal_payload).hexdigest(),
             "predecessor_quota": predecessor_quota,
             "predecessor_owner_values": predecessor_owner_values,
             "predecessor_sink_record": predecessor_sink_record,
@@ -8288,6 +8835,12 @@ def _initialize_historical_foundry_storage_types():
             "old_snapshot": record["staging"], "old_retired": False,
             "stored": stored, "files": [], "mapped_paths": [],
             "opened_directories": [],
+            "prepare_entry": {
+                "name": prepare_name, "fd": None,
+                "identity": None, "metadata": None,
+                "state": "INTENDED", "unlink_state": "PENDING",
+                "parent_fsync_state": "PENDING",
+            },
             "predecessor_quota_owner_handle": (
                 "quota_owner_handle" in ledger,
                 ledger.get("quota_owner_handle"),
@@ -8296,10 +8849,13 @@ def _initialize_historical_foundry_storage_types():
         task6_transaction_registry[id(owner)] = transaction
         try:
             transaction["state"] = "PREPARING"
+            _task6_precommit_remaining(transaction)
             _task6_raw_journal_write(
+                transaction=transaction,
                 parent_fd=journal_parent_fd, name=prepare_name,
                 payload=journal_payload,
             )
+            _task6_precommit_remaining(transaction)
             transaction["state"] = "PREPARED"
             _task6_commit_checkpoint("after_prepare_fsync")
             owner["_task6_transaction"] = transaction
@@ -8322,24 +8878,40 @@ def _initialize_historical_foundry_storage_types():
             ledger["quota_owner_handle"] = record["staging"]
             _task6_commit_checkpoint("after_quota_owner_install")
             staging_directory = ledger["capture_directories"]["staging"]
+            def own_directory(entry: Dict[str, Any]) -> None:
+                if entry in transaction["opened_directories"]:
+                    raise _InternalFailure()
+                transaction["opened_directories"].append(entry)
+
+            def own_file(entry: Dict[str, Any]) -> None:
+                if entry in transaction["files"]:
+                    raise _InternalFailure()
+                transaction["files"].append(entry)
+
+            def precommit_guard() -> None:
+                _task6_precommit_remaining(transaction)
+
             foundry = _task4b_open_capture_directory(
                 ledger, staging_directory["fd"], "foundry",
                 allow_existing=True,
+                mutation_owner=own_directory,
+                blocking_guard=precommit_guard,
             )
-            transaction["opened_directories"].append(foundry)
             transaction["foundry"] = foundry
             _task6_commit_checkpoint("after_foundry_directory_open")
             block = _task4b_open_capture_directory(
-                ledger, foundry["fd"], block_name, allow_existing=True
+                ledger, foundry["fd"], block_name, allow_existing=True,
+                mutation_owner=own_directory,
+                blocking_guard=precommit_guard,
             )
-            transaction["opened_directories"].append(block)
             transaction["block"] = block
             _task6_commit_checkpoint("after_block_directory_open")
             scenario = _task4b_open_capture_directory(
                 ledger, block["fd"], transaction["private_name"],
                 allow_existing=False,
+                mutation_owner=own_directory,
+                blocking_guard=precommit_guard,
             )
-            transaction["opened_directories"].append(scenario)
             transaction["scenario"] = scenario
             _task6_commit_checkpoint("after_scenario_directory_create")
             ledger.setdefault("task6_member_directories", {})
@@ -8349,23 +8921,26 @@ def _initialize_historical_foundry_storage_types():
                 payload = candidate_members[role]
                 target = filenames[role]
                 _task4b_write_capture_member(
-                    ledger, scenario, target, payload
+                    ledger, scenario, target, payload,
+                    mutation_owner=own_file,
+                    blocking_guard=precommit_guard,
                 )
                 entry = ledger["files"][-1]
-                transaction["files"].append(entry)
                 _task6_commit_checkpoint("after_member_file_" + role)
                 path = stored[role]["path"]
+                transaction["mapped_paths"].append(path)
                 ledger["task6_member_directories"][path] = (
                     scenario, target
                 )
-                transaction["mapped_paths"].append(path)
                 _task6_commit_checkpoint("after_member_map_" + role)
+                precommit_guard()
                 observed = _task4b_reread_capture_member(
                     ledger, relative_path=path,
                     expected_size=stored[role]["size"],
                     maximum_size=stored[role]["cap"],
                     size_kind=stored[role]["kind"],
                 )
+                precommit_guard()
                 if hashlib.sha256(observed).hexdigest() != stored[role]["sha256"]:
                     raise _InternalFailure()
                 reread_members[role] = observed
@@ -8373,6 +8948,7 @@ def _initialize_historical_foundry_storage_types():
                 record["scenario_key"], reread_members, owner
             ) != quartet:
                 raise _InternalFailure()
+            precommit_guard()
             try:
                 os.stat(
                     record["scenario_key"], dir_fd=block["fd"],
@@ -8382,18 +8958,22 @@ def _initialize_historical_foundry_storage_types():
                 pass
             else:
                 raise _InternalFailure()
+            precommit_guard()
             _task6_rename_directory_noreplace(
                 parent_fd=block["fd"],
                 source_name=transaction["private_name"],
                 destination_name=record["scenario_key"],
             )
+            precommit_guard()
             transaction["formal_installed"] = True
             _task6_commit_checkpoint("after_formal_directory_rename")
             scenario["name"] = record["scenario_key"]
             _task6_commit_checkpoint("after_formal_directory_name_install")
             scenario["identity"] = _metadata_snapshot(os.fstat(scenario["fd"]))
             _task6_commit_checkpoint("after_formal_directory_identity_install")
+            precommit_guard()
             os.fsync(block["fd"])
+            precommit_guard()
             _task6_commit_checkpoint("after_formal_quartet_install")
             _task6_install_quota_snapshot(owner, target_quota)
             _task6_commit_checkpoint("after_quota_install")
@@ -8411,9 +8991,11 @@ def _initialize_historical_foundry_storage_types():
                 target_projection
             )
             _task6_commit_checkpoint("after_owner_projection_install")
+            precommit_guard()
             _task4b_freeze_audit(owner["_task4b_frozen_record"])
             _task5_freeze_audit(owner)
             _task6_freeze_audit(owner)
+            precommit_guard()
             owner["owner_generation"] = next_owner_generation
             _task6_commit_checkpoint("after_owner_generation_counter_install")
             owner["_task4b_snapshot_handle"] = successor
@@ -8442,17 +9024,21 @@ def _initialize_historical_foundry_storage_types():
                 or _quota_record_for_owner(owner) != target_quota
             ):
                 raise _InternalFailure()
+            precommit_guard()
             _task6_freeze_audit(owner)
+            precommit_guard()
             _task6_commit_checkpoint("after_target_audit")
+            _task6_precommit_remaining(transaction)
+            transaction["state"] = "INTENT_RENAME_PENDING"
+            _task6_commit_checkpoint("before_commit_marker_rename")
             _task6_rename_directory_noreplace(
                 parent_fd=journal_parent_fd,
                 source_name=prepare_name,
                 destination_name=committed_name,
             )
+            transaction["state"] = "COMMITTING"
             _task6_commit_checkpoint("after_commit_marker_rename")
-            os.fsync(journal_parent_fd)
-            transaction["state"] = "COMMIT_DURABLE"
-            _task6_commit_checkpoint("after_commit_marker_fsync")
+            _task6_make_commit_durable(transaction)
             _task6_complete_v2(transaction)
             return MappingProxyType({
                 "role": "result", "byte_count": len(result_payload),
@@ -8461,14 +9047,26 @@ def _initialize_historical_foundry_storage_types():
         except BaseException as original_error:
             cleanup_error = None
             try:
+                observed_name = None
                 if transaction.get("state") in (
-                    "COMMIT_DURABLE", "COMPLETING", "COMMITTED"
+                    "INTENT_RENAME_PENDING", "COMMITTING"
+                ):
+                    observed_name = _task6_observed_journal_name(transaction)
+                if observed_name == transaction["committed_name"]:
+                    transaction["state"] = "COMMITTING"
+                    _task6_make_commit_durable(transaction)
+                    _task6_complete_v2(transaction)
+                elif transaction.get("state") in (
+                    "DURABLE", "COMPLETING", "COMMITTED"
                 ):
                     _task6_complete_v2(transaction)
                 else:
                     _task6_rollback_v2(transaction)
             except BaseException as observed_cleanup_error:
                 cleanup_error = observed_cleanup_error
+            if cleanup_error is not None:
+                transaction["writer_active"] = False
+                transaction["orphaned"] = True
             if not isinstance(original_error, Exception):
                 raise original_error
             if (
@@ -8476,6 +9074,14 @@ def _initialize_historical_foundry_storage_types():
                 and not isinstance(cleanup_error, Exception)
             ):
                 raise cleanup_error
+            if (
+                cleanup_error is None
+                and transaction.get("state") == "COMMITTED"
+            ):
+                return MappingProxyType({
+                    "role": "result", "byte_count": len(result_payload),
+                    "sha256": hashlib.sha256(result_payload).hexdigest(),
+                })
             raise original_error
 
     def _validate_historical_quartet_for_test(
@@ -8611,16 +9217,16 @@ def _initialize_historical_foundry_storage_types():
                     )
             except (ValueError, _InternalFailure):
                 raise ValueError("historical scenario evidence is invalid") from None
-            members[role] = bytes(canonical_bytes)
             projection = MappingProxyType({
                 "role": role,
                 "byte_count": len(canonical_bytes),
                 "sha256": hashlib.sha256(canonical_bytes).hexdigest(),
             })
             if role != "result":
+                members[role] = bytes(canonical_bytes)
                 return projection
             candidate_members = dict(members)
-            members.pop("result", None)
+            candidate_members["result"] = bytes(canonical_bytes)
             try:
                 quartet = _task6_validate_quartet(
                     record["scenario_key"], candidate_members, owner
@@ -8682,8 +9288,11 @@ def _initialize_historical_foundry_storage_types():
         return successor
 
     def _open_historical_scenario_evidence_sink(
-        *, staging: object, scenario_token: object, scenario_key: str
+        *, staging: object, scenario_token: object, scenario_key: str,
+        remaining: Any,
     ) -> ScenarioEvidenceSink:
+        if not callable(remaining):
+            _raise_storage_error()
         owner, transition = _task6_transition_record(
             scenario_token, staging, scenario_key
         )
@@ -8698,6 +9307,7 @@ def _initialize_historical_foundry_storage_types():
             "scenario_key": scenario_key,
             "members": {},
             "state": "open",
+            "remaining": remaining,
         }
         sink = _prepare_handle(ScenarioEvidenceSink, record)
         _task6_register_weak(sink, record, scenario_sink_registry)

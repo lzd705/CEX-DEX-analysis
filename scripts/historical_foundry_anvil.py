@@ -2018,6 +2018,7 @@ def _open_scenario_evidence_sink(
         staging=checked._staging,
         scenario_token=token,
         scenario_key=row["scenario_key"],
+        remaining=lambda cap: _context_remaining(checked, cap),
     )
 
 
@@ -2220,6 +2221,9 @@ def _replay_historical_scenario_untyped(
             or relay_port == anvil_port
         ):
             raise ValueError("historical relay lease is invalid")
+        checked._toolchain._bind_historical_anvil_process_budget(
+            remaining=lambda cap: _context_remaining(checked, cap)
+        )
         process = checked._toolchain._spawn_historical_anvil_process(
             selected_block=override["block_number"],
             hardfork=checked._config.toolchain.value[
