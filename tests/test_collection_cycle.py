@@ -1,7 +1,10 @@
 import csv
 import fcntl
 import json
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +14,7 @@ from scripts.run_collection_cycle import (
     build_collection_status,
     build_step_commands,
     configured_data_dir,
+    main,
     parse_args,
     processed_dir_for,
     publication_gates_from_log,
@@ -982,6 +986,202 @@ class CollectionCycleTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "skipped_locked")
         self.assertFalse(run_root.exists())
+
+    def test_lock_wait_runs_only_after_external_holder_releases(self):
+        lock_path = self.root / "waited.lock"
+        run_root = self.root / "waited-runs"
+        ready_path = self.root / "holder-ready"
+        released_path = self.root / "holder-released"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl, pathlib, sys, time;"
+                    "lock=pathlib.Path(sys.argv[1]);"
+                    "ready=pathlib.Path(sys.argv[2]);"
+                    "released=pathlib.Path(sys.argv[3]);"
+                    "handle=lock.open('a+', encoding='utf-8');"
+                    "fcntl.flock(handle.fileno(), fcntl.LOCK_EX);"
+                    "ready.write_text('1', encoding='utf-8');"
+                    "time.sleep(0.35);"
+                    "fcntl.flock(handle.fileno(), fcntl.LOCK_UN);"
+                    "released.write_text('1', encoding='utf-8')"
+                ),
+                str(lock_path),
+                str(ready_path),
+                str(released_path),
+            ],
+        )
+        try:
+            for _attempt in range(100):
+                if ready_path.exists():
+                    break
+                holder.poll()
+                if holder.returncode is not None:
+                    self.fail("external lock holder exited before acquiring lock")
+                time.sleep(0.01)
+            self.assertTrue(ready_path.exists())
+
+            def runner(_command, log_path):
+                self.assertTrue(released_path.exists())
+                log_path.write_text("ok\n", encoding="utf-8")
+                return 0
+
+            result = run_collection_cycle(
+                "tvl",
+                publish_local=False,
+                data_dir=self.data_dir,
+                run_root=run_root,
+                latest_status_path=self.root / "waited-latest.json",
+                lock_path=lock_path,
+                now=NOW,
+                lock_wait_seconds=2.0,
+                step_runner=runner,
+            )
+        finally:
+            if holder.poll() is None:
+                holder.terminate()
+                holder.wait(timeout=5)
+
+        self.assertEqual(holder.wait(timeout=5), 0)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(Path(result["manifest_path"]).is_file())
+        self.assertEqual(
+            json.loads((self.root / "waited-latest.json").read_text())[
+                "status"
+            ],
+            "succeeded",
+        )
+
+    def test_lock_wait_timeout_is_observable_without_run_or_latest_mutation(self):
+        lock_path = self.root / "timeout.lock"
+        run_root = self.root / "timeout-runs"
+        latest_path = self.root / "timeout-latest.json"
+        latest_path.write_text('{"status":"previous"}\n', encoding="utf-8")
+        ready_path = self.root / "timeout-holder-ready"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl, pathlib, sys, time;"
+                    "lock=pathlib.Path(sys.argv[1]);"
+                    "ready=pathlib.Path(sys.argv[2]);"
+                    "handle=lock.open('a+', encoding='utf-8');"
+                    "fcntl.flock(handle.fileno(), fcntl.LOCK_EX);"
+                    "ready.write_text('1', encoding='utf-8');"
+                    "time.sleep(5)"
+                ),
+                str(lock_path),
+                str(ready_path),
+            ],
+        )
+        clock_value = 0.0
+        sleeps = []
+
+        def monotonic():
+            return clock_value
+
+        def sleeper(seconds):
+            nonlocal clock_value
+            sleeps.append(seconds)
+            clock_value += seconds
+
+        try:
+            for _attempt in range(100):
+                if ready_path.exists():
+                    break
+                holder.poll()
+                if holder.returncode is not None:
+                    self.fail("external lock holder exited before acquiring lock")
+                time.sleep(0.01)
+            self.assertTrue(ready_path.exists())
+
+            result = run_collection_cycle(
+                "tvl",
+                publish_local=False,
+                data_dir=self.data_dir,
+                run_root=run_root,
+                latest_status_path=latest_path,
+                lock_path=lock_path,
+                now=NOW,
+                lock_wait_seconds=0.5,
+                monotonic=monotonic,
+                sleeper=sleeper,
+                step_runner=lambda _command, _log_path: self.fail(
+                    "timed-out lock wait must not run a collector"
+                ),
+            )
+        finally:
+            if holder.poll() is None:
+                holder.terminate()
+                holder.wait(timeout=5)
+
+        self.assertEqual(result["status"], "skipped_locked")
+        self.assertEqual(result["reason"], "lock_wait_timeout")
+        self.assertFalse(run_root.exists())
+        self.assertEqual(
+            json.loads(latest_path.read_text(encoding="utf-8")),
+            {"status": "previous"},
+        )
+        self.assertEqual(sleeps, [0.25, 0.25])
+
+    def test_collection_cli_parses_lock_wait_seconds(self):
+        with patch(
+            "sys.argv",
+            [
+                "run_collection_cycle.py",
+                "--profile",
+                "depth",
+                "--lock-wait-seconds",
+                "900",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.profile, "depth")
+        self.assertEqual(args.lock_wait_seconds, 900.0)
+
+    def test_collection_cli_exits_temporary_failure_on_lock_wait_timeout(self):
+        with patch(
+            "sys.argv",
+            ["run_collection_cycle.py", "--profile", "tvl"],
+        ):
+            with patch(
+                "scripts.run_collection_cycle.run_collection_cycle",
+                return_value={
+                    "status": "skipped_locked",
+                    "reason": "lock_wait_timeout",
+                },
+            ):
+                with self.assertRaises(SystemExit) as context:
+                    main()
+
+        self.assertEqual(context.exception.code, 75)
+
+    def test_collection_rejects_invalid_lock_wait_before_filesystem_actions(self):
+        lock_path = self.root / "invalid-lock-wait" / "collection.lock"
+        for lock_wait_seconds in (
+            -1.0,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+        ):
+            with self.subTest(lock_wait_seconds=lock_wait_seconds):
+                with self.assertRaisesRegex(ValueError, "lock_wait_seconds"):
+                    run_collection_cycle(
+                        "tvl",
+                        publish_local=False,
+                        data_dir=self.data_dir,
+                        run_root=self.root / "invalid-lock-runs",
+                        latest_status_path=self.root / "invalid-lock-latest.json",
+                        lock_path=lock_path,
+                        now=NOW,
+                        lock_wait_seconds=lock_wait_seconds,
+                    )
+                self.assertFalse(lock_path.parent.exists())
 
     def test_cycle_manifest_keeps_structured_publication_gate_evidence(self):
         gate = {

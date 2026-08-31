@@ -2,8 +2,10 @@
 
 import hashlib
 import json
+import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +29,7 @@ from scripts.fetch_dex_depth import (
     SELECTOR_TICKS,
     SELECTOR_TOKEN0,
     SELECTOR_TOKEN1,
+    RpcClient,
     collect_dex_pool_observation,
     collect_dex_depth_with_execution,
     observed_pool_row,
@@ -36,9 +39,11 @@ from scripts.uniswap_v3_math import get_sqrt_ratio_at_tick
 
 UNI = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
 USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 FACTORY = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
 QUOTER_V2 = "0x61ffe014ba17989e743c5f6cb21bf9697530b21e"
 UNI_USDT_POOL = "0x3470447f3cecffac709d3e783a307790b0208d60"
+UNI_WETH_POOL = "0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801"
 BLOCK_NUMBER = 123
 BLOCK_TAG = "0x7b"
 BLOCK_HASH = "0x" + "a" * 64
@@ -121,6 +126,17 @@ def _pool(pool_address=UNI_USDT_POOL):
         ),
         "raw_response_sha256": "d" * 64,
         "status": "observed",
+    }
+
+
+def _uni_weth_pool():
+    return {
+        **_pool(UNI_WETH_POOL),
+        "market_id": f"dex:eth:uniswap_v3:{UNI_WETH_POOL}:UNI",
+        "pool_name": "UNI / WETH 0.3%",
+        "quote_token_id": f"eth_{WETH}",
+        "base_token_price_usd": "0.99990000999900009999",
+        "quote_token_price_usd": "1",
     }
 
 
@@ -290,6 +306,20 @@ class FinalizedHashMismatchV3Rpc(FakeApprovedUniUsdtV3Rpc):
         return result
 
 
+class AdvancingFinalizedV3Rpc(FakeApprovedUniUsdtV3Rpc):
+    def block(self, block_tag):
+        result = super().block(block_tag)
+        if block_tag == "finalized":
+            result.update(
+                {
+                    "number": "0x9b",
+                    "hash": "0x" + "c" * 64,
+                    "timestamp": "0x65920880",
+                }
+            )
+        return result
+
+
 class OrderedTwoPoolV3Rpc(FakeApprovedUniUsdtV3Rpc):
     def __init__(self, secondary_pool):
         super().__init__()
@@ -304,6 +334,85 @@ class OrderedTwoPoolV3Rpc(FakeApprovedUniUsdtV3Rpc):
             return super()._response(to, data)
         finally:
             self.pool_address = primary_pool
+
+
+class ProductionTwoAuthorityPoolTransport:
+    """Literal transport for both configured Ethereum authority pools."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, url, payload, **_kwargs):
+        method = payload[0]["method"] if isinstance(payload, list) else payload["method"]
+        self.calls.append((url, method, payload))
+        if "primary" in url:
+            raise urllib.error.HTTPError(url, 403, "private forbidden " + url, {}, None)
+        response = (
+            [self._response(item) for item in payload]
+            if isinstance(payload, list)
+            else self._response(payload)
+        )
+        return response, json.dumps(response, sort_keys=True).encode("utf-8")
+
+    def _response(self, payload):
+        method = payload["method"]
+        if method == "eth_chainId":
+            result = "0x1"
+        elif method == "eth_getBlockByNumber":
+            result = _header()
+        elif method == "eth_call":
+            call = payload["params"][0]
+            result = self._eth_call(call["to"].lower(), call["data"])
+        else:
+            raise AssertionError(method)
+        return {"jsonrpc": "2.0", "id": payload["id"], "result": result}
+
+    def _eth_call(self, to, data):
+        if to in {UNI_USDT_POOL, UNI_WETH_POOL}:
+            token1 = USDT if to == UNI_USDT_POOL else WETH
+            if data == SELECTOR_TOKEN0:
+                return _address_result(UNI)
+            if data == SELECTOR_TOKEN1:
+                return _address_result(token1)
+            if data == SELECTOR_SLOT0:
+                return _uint_result(
+                    get_sqrt_ratio_at_tick(CURRENT_TICK),
+                    CURRENT_TICK,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                )
+            if data == SELECTOR_LIQUIDITY:
+                return _uint_result(ACTIVE_LIQUIDITY)
+            if data == SELECTOR_FEE:
+                return _uint_result(3000)
+            if data == SELECTOR_TICK_SPACING:
+                return _uint_result(60)
+            if data == SELECTOR_FACTORY:
+                return _address_result(FACTORY)
+            if data.startswith(SELECTOR_TICK_BITMAP):
+                return _uint_result({-1: 1 << 255, 0: 1}.get(_signed_argument(data), 0))
+            if data.startswith(SELECTOR_TICKS):
+                return _uint_result(ACTIVE_LIQUIDITY, 0)
+        if to == FACTORY and data.startswith(SELECTOR_FACTORY_GET_POOL):
+            return _address_result(
+                UNI_WETH_POOL if WETH[2:] in data.lower() else UNI_USDT_POOL
+            )
+        if to == QUOTER_V2:
+            return "0x00"
+        if to == UNI:
+            if data == SELECTOR_DECIMALS:
+                return _uint_result(18)
+            if data == SELECTOR_SYMBOL:
+                return _string_result("UNI")
+        if to in {USDT, WETH}:
+            if data == SELECTOR_DECIMALS:
+                return _uint_result(6 if to == USDT else 18)
+            if data == SELECTOR_SYMBOL:
+                return _string_result("USDT" if to == USDT else "WETH")
+        raise AssertionError((to, data))
 
 
 class MixedFinalizedCohortV3Rpc(OrderedTwoPoolV3Rpc):
@@ -352,6 +461,51 @@ class UniswapV3CollectionTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    def test_eth_403_validates_fallback_and_keeps_both_authority_pools_on_numeric_f(self):
+        transport = ProductionTwoAuthorityPoolTransport()
+        environment = {
+            "DEX_DEPTH_RPC_ETH": "https://user:one@primary.example.test/rpc?secret=one",
+            "DEX_DEPTH_RPC_ETH_FALLBACKS": json.dumps(
+                ["https://user:two@fallback.example.test/rpc?secret=two"]
+            ),
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            RpcClient,
+            "_default_one_attempt_request",
+            new=staticmethod(transport),
+        ):
+            snapshot_id, depth, execution = collect_dex_depth_with_execution(
+                [_pool(), _uni_weth_pool()],
+                raw_root=self.root,
+                sleep_seconds=0,
+            )
+
+        self.assertEqual({row["block_number"] for row in depth}, {str(BLOCK_NUMBER)})
+        self.assertTrue(all(row["status"] in {"observed", "partial"} for row in depth))
+        self.assertEqual(len(execution), 20)
+        self.assertEqual(
+            {call[1] for call in transport.calls if "primary" in call[0]},
+            {"eth_getBlockByNumber"},
+        )
+        fixed_calls = []
+        for _url, method, payload in transport.calls:
+            requests = payload if isinstance(payload, list) else [payload]
+            for request in requests:
+                if request["method"] == "eth_call":
+                    fixed_calls.append(request["params"][-1])
+        self.assertTrue(fixed_calls)
+        self.assertEqual(set(fixed_calls), {BLOCK_TAG})
+        transcripts = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (self.root / snapshot_id).glob("*.json")
+            if path.name != "manifest.json"
+        ]
+        self.assertEqual(len(transcripts), 2)
+        self.assertTrue(all(item["attempt_ledger"] for item in transcripts))
+        retained = json.dumps(transcripts, sort_keys=True)
+        for secret in ("secret=one", "secret=two", "private forbidden"):
+            self.assertNotIn(secret, retained)
 
     def test_approved_pool_collects_one_verified_window_for_depth_and_execution(self):
         client = FakeApprovedUniUsdtV3Rpc()
@@ -767,6 +921,65 @@ class UniswapV3CollectionTest(unittest.TestCase):
         self.assertEqual(depth["status"], "failed")
         self.assertEqual({row["status"] for row in execution}, {"failed"})
         self.assertIn("finalized block identity", depth["error"])
+
+    def test_later_finalized_checkpoint_keeps_every_state_request_pinned(self):
+        raw_path = self.root / "advancing-finality.json"
+
+        depth, execution = collect_dex_pool_observation(
+            _pool(),
+            snapshot_id="advancing-finality",
+            raw_path=raw_path,
+            client=AdvancingFinalizedV3Rpc(),
+            fixed_block_number=123,
+        )
+
+        self.assertIn(depth["status"], {"observed", "partial"})
+        self.assertTrue(
+            all(row["status"] in {"observed", "partial"} for row in execution)
+        )
+        raw = json.loads(raw_path.read_bytes())
+        finalized_headers = [
+            record["response"]
+            for record in raw["records"]
+            if record.get("request", {}).get("method") == "eth_getBlockByNumber"
+            and record["request"].get("block") == "finalized"
+        ]
+        self.assertEqual(
+            finalized_headers,
+            [
+                {
+                    "number": "0x9b",
+                    "hash": "0x" + "c" * 64,
+                    "parentHash": "0x" + "b" * 64,
+                    "timestamp": "0x65920880",
+                    "baseFeePerGas": "0x3b9aca00",
+                    "gasUsed": "0xe4e1c0",
+                    "gasLimit": "0x1c9c380",
+                }
+            ],
+        )
+        numeric_headers = [
+            record["response"]
+            for record in raw["records"]
+            if record.get("request", {}).get("method") == "eth_getBlockByNumber"
+            and record["request"].get("block") == "0x7b"
+        ]
+        self.assertTrue(numeric_headers)
+        self.assertTrue(
+            all(
+                header["number"] == "0x7b"
+                and header["hash"] == "0x" + "a" * 64
+                and header["timestamp"] == "0x65920080"
+                for header in numeric_headers
+            )
+        )
+        state_requests = [
+            record["request"]
+            for record in raw["records"]
+            if isinstance(record.get("request"), dict) and "to" in record["request"]
+        ]
+        self.assertTrue(state_requests)
+        self.assertEqual({request["block"] for request in state_requests}, {"0x7b"})
 
 
 if __name__ == "__main__":

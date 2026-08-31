@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -34,6 +35,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from decimal import (
     Decimal,
     InvalidOperation,
@@ -219,6 +221,9 @@ DEX_EXECUTION_EXCLUDED_COSTS = (
 )
 REQUEST_SLEEP_SECONDS = 0.15
 MAX_RETRIES = 4
+MAX_RPC_ENDPOINTS = 3
+MAX_RPC_ATTEMPT_RECORDS = MAX_RPC_ENDPOINTS * MAX_RETRIES
+MAX_RPC_RETRY_DELAY_SECONDS = 8.0
 Q96 = Decimal(2**96)
 ONE_MILLION = Decimal(1_000_000)
 TLS_CONTEXT = (
@@ -371,6 +376,7 @@ DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES = frozenset(
         "parse",
         "validation",
         "collection_failed",
+        "rpc_endpoint_exhausted",
         "depth_usd_price_time_mismatch",
     }
 )
@@ -390,6 +396,32 @@ class RpcError(RuntimeError):
     """Raised when a JSON-RPC endpoint returns no usable result."""
 
 
+class RpcConfigurationError(ValueError):
+    """Raised for bounded, sanitized RPC configuration failures."""
+
+
+class RpcTransportError(RpcError):
+    """A sanitized transport failure with bounded failover metadata."""
+
+    def __init__(
+        self,
+        *,
+        outcome: str,
+        http_status: int | None = None,
+        retryable: bool,
+        failover_eligible: bool,
+    ) -> None:
+        super().__init__("rpc_transport_failed")
+        self.outcome = outcome
+        self.http_status = http_status
+        self.retryable = retryable
+        self.failover_eligible = failover_eligible
+
+
+class RpcEndpointExhausted(RpcError):
+    """Raised when every configured endpoint has failed for this run."""
+
+
 class UsdPriceTimeMismatch(ValueError):
     """Pool state and its USD conversion evidence are not time-aligned."""
 
@@ -398,6 +430,10 @@ def dex_depth_failure_reason_code(error: BaseException) -> str:
     """Classify typed DEX-depth failures without parsing raw messages."""
     if isinstance(error, UsdPriceTimeMismatch):
         return "depth_usd_price_time_mismatch"
+    if isinstance(error, RpcEndpointExhausted):
+        return "rpc_endpoint_exhausted"
+    if isinstance(error, RpcTransportError) and error.http_status == 429:
+        return "rate_limit"
     if isinstance(error, urllib.error.HTTPError):
         if error.code == 429:
             return "rate_limit"
@@ -496,6 +532,105 @@ def sanitize_endpoint(url: str) -> str:
         return canonical_endpoint
     digest = hashlib.sha256(canonical_endpoint.encode("utf-8")).hexdigest()
     return "rpc-endpoint-sha256:{}".format(digest)
+
+
+def validate_rpc_endpoint_url(url: Any) -> str:
+    """Accept only structurally valid HTTP(S) RPC URLs without echoing them."""
+    try:
+        if not isinstance(url, str) or not url:
+            raise ValueError
+        if any(ord(character) < 32 or character.isspace() for character in url):
+            raise ValueError
+        if re.search(r"%(?![0-9a-fA-F]{2})", url):
+            raise ValueError
+        parsed = urllib.parse.urlsplit(url)
+        hostname = parsed.hostname
+        _port = parsed.port
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.netloc
+            or not hostname
+            or parsed.fragment
+            or any(character in hostname for character in "/\\?#@")
+        ):
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise RpcConfigurationError("invalid_rpc_endpoint") from None
+    return url
+
+
+def _bounded_rpc_transport_error(error: BaseException) -> RpcTransportError:
+    if isinstance(error, CollectionDeadlineExceeded):
+        raise error from None
+    if isinstance(error, RpcTransportError):
+        return error
+    if isinstance(error, urllib.error.HTTPError):
+        status = error.code if type(error.code) is int else None
+        if status in (401, 403, 404):
+            return RpcTransportError(
+                outcome="provider_rejected",
+                http_status=status,
+                retryable=False,
+                failover_eligible=True,
+            )
+        if status == 429:
+            return RpcTransportError(
+                outcome="rate_limited",
+                http_status=status,
+                retryable=True,
+                failover_eligible=True,
+            )
+        if status is not None and 500 <= status < 600:
+            return RpcTransportError(
+                outcome="provider_unavailable",
+                http_status=status,
+                retryable=True,
+                failover_eligible=True,
+            )
+        return RpcTransportError(
+            outcome="http_error",
+            http_status=status,
+            retryable=False,
+            failover_eligible=False,
+        )
+    if isinstance(error, urllib.error.URLError):
+        if isinstance(error.reason, CollectionDeadlineExceeded):
+            raise error.reason from None
+        return RpcTransportError(
+            outcome="network_error",
+            retryable=True,
+            failover_eligible=True,
+        )
+    if isinstance(error, TimeoutError):
+        return RpcTransportError(
+            outcome="timeout",
+            retryable=True,
+            failover_eligible=True,
+        )
+    if isinstance(error, OSError):
+        return RpcTransportError(
+            outcome="network_error",
+            retryable=True,
+            failover_eligible=True,
+        )
+    return RpcTransportError(
+        outcome="transport_error",
+        retryable=False,
+        failover_eligible=False,
+    )
+
+
+def _rpc_retry_delay(error: BaseException, attempt: int) -> float:
+    retry_after = 0.0
+    if isinstance(error, urllib.error.HTTPError):
+        try:
+            retry_after = float(error.headers.get("Retry-After") or 0)
+        except (AttributeError, TypeError, ValueError):
+            retry_after = 0.0
+    return min(
+        max(0.0, retry_after, float(2 ** attempt)),
+        MAX_RPC_RETRY_DELAY_SECONDS,
+    )
 
 
 def is_canonical_rpc_quantity(value: Any) -> bool:
@@ -651,7 +786,56 @@ def redacted_rpc_record_response(payload: Any, response: Any) -> Any:
 def rpc_url_for_chain(chain: str) -> str | None:
     normalized = chain.lower()
     configured = os.environ.get(RPC_ENV_KEYS.get(normalized, ""))
-    return configured or DEFAULT_RPC_URLS.get(normalized)
+    url = configured or DEFAULT_RPC_URLS.get(normalized)
+    return validate_rpc_endpoint_url(url) if url is not None else None
+
+
+@dataclass(frozen=True)
+class RpcEndpoint:
+    """One ordered RPC endpoint with a private URL and safe identity."""
+
+    endpoint_id: str
+    url: str
+    identity: str = ""
+
+    def __post_init__(self) -> None:
+        validate_rpc_endpoint_url(self.url)
+        object.__setattr__(self, "identity", sanitize_endpoint(self.url))
+
+
+def rpc_endpoints_for_chain(chain: str) -> tuple[RpcEndpoint, ...]:
+    """Return the bounded, ordered endpoint pool for one supported chain."""
+    normalized = chain.lower()
+    primary = rpc_url_for_chain(normalized)
+    if not primary:
+        return ()
+    fallback_key = "{}_FALLBACKS".format(RPC_ENV_KEYS.get(normalized, ""))
+    fallback_value = os.environ.get(fallback_key)
+    if fallback_value is None:
+        fallbacks: list[str] = []
+    else:
+        try:
+            fallbacks = json.loads(fallback_value)
+        except (json.JSONDecodeError, TypeError):
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
+        if not isinstance(fallbacks, list):
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
+        if any(not isinstance(item, str) or not item.strip() for item in fallbacks):
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
+        if len(fallbacks) > 2:
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
+        if len({primary, *fallbacks}) != len(fallbacks) + 1:
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
+    urls = [primary, *fallbacks]
+    return tuple(
+        RpcEndpoint(
+            "{}-primary".format(normalized)
+            if index == 0
+            else "{}-fallback-{}".format(normalized, index),
+            url,
+        )
+        for index, url in enumerate(urls)
+    )
 
 
 def protocol_model(dex: str, chain: str, pool_address: str) -> tuple[str, str]:
@@ -791,25 +975,35 @@ def http_json_rpc(
     timeout_seconds: float = 30,
     max_retries: int = MAX_RETRIES,
 ) -> tuple[Any, bytes]:
-    if max_retries < 1:
-        raise ValueError("max_retries must be at least 1")
-    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=encoded,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "CEX-DEX-Market-Monitor/2.0",
-        },
-        method="POST",
-    )
+    validate_rpc_endpoint_url(url)
+    if type(max_retries) is not int or not 1 <= max_retries <= MAX_RETRIES:
+        raise RpcConfigurationError("invalid_rpc_retry_configuration") from None
+    try:
+        configured_timeout = float(timeout_seconds)
+    except (TypeError, ValueError):
+        raise RpcConfigurationError("invalid_rpc_timeout") from None
+    if not math.isfinite(configured_timeout) or configured_timeout <= 0:
+        raise RpcConfigurationError("invalid_rpc_timeout") from None
+    try:
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=encoded,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "CEX-DEX-Market-Monitor/2.0",
+            },
+            method="POST",
+        )
+    except Exception:
+        raise RpcConfigurationError("invalid_rpc_request") from None
     for attempt in range(max_retries):
         try:
             timeout = (
-                deadline.request_timeout(timeout_seconds)
+                deadline.request_timeout(configured_timeout)
                 if deadline is not None
-                else timeout_seconds
+                else configured_timeout
             )
             with urllib.request.urlopen(
                 request,
@@ -818,29 +1012,56 @@ def http_json_rpc(
             ) as response:
                 raw = response.read()
                 return json.loads(raw.decode("utf-8")), raw
-        except urllib.error.HTTPError as error:
+        except CollectionDeadlineExceeded as error:
+            raise error from None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise
+        except Exception as error:
+            transport_error = _bounded_rpc_transport_error(error)
             if deadline is not None:
-                deadline.require_remaining()
-            retryable = error.code == 429 or 500 <= error.code < 600
-            if not retryable or attempt + 1 >= max_retries:
-                raise
-            retry_after = float(error.headers.get("Retry-After") or 0)
-            delay = max(retry_after, 2 ** attempt)
+                try:
+                    deadline.require_remaining()
+                except CollectionDeadlineExceeded as deadline_error:
+                    raise deadline_error from None
+            if not transport_error.retryable or attempt + 1 >= max_retries:
+                raise transport_error from None
+            delay = _rpc_retry_delay(error, attempt)
             if deadline is not None:
-                deadline.sleep_before_retry(delay)
+                try:
+                    deadline.sleep_before_retry(delay)
+                except CollectionDeadlineExceeded as deadline_error:
+                    raise deadline_error from None
             else:
                 time.sleep(delay)
-        except urllib.error.URLError:
-            if deadline is not None:
-                deadline.require_remaining()
-            if attempt + 1 >= max_retries:
-                raise
-            delay = max(1.0, 2 ** attempt)
-            if deadline is not None:
-                deadline.sleep_before_retry(delay)
-            else:
-                time.sleep(delay)
-    raise RpcError(f"JSON-RPC request failed after retries: {sanitize_endpoint(url)}")
+    raise RpcTransportError(
+        outcome="transport_error",
+        retryable=False,
+        failover_eligible=False,
+    ) from None
+
+
+def _request_accepts_retry_controls(request: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(request, follow_wrapped=False)
+    except Exception:
+        raise RpcConfigurationError("invalid_rpc_request_boundary") from None
+    try:
+        signature.bind(
+            object(),
+            object(),
+            deadline=None,
+            timeout_seconds=30.0,
+            max_retries=1,
+        )
+    except TypeError:
+        try:
+            signature.bind(object(), object())
+        except Exception:
+            raise RpcConfigurationError("invalid_rpc_request_boundary") from None
+        return False
+    except Exception:
+        raise RpcConfigurationError("invalid_rpc_request_boundary") from None
+    return True
 
 
 class RpcClient:
@@ -849,48 +1070,405 @@ class RpcClient:
         chain: str,
         url: str,
         *,
-        request: Callable[[str, Any], tuple[Any, bytes]] = http_json_rpc,
+        request: Callable[[str, Any], tuple[Any, bytes]] | None = None,
         deadline: CollectionDeadline | None = None,
         timeout_seconds: float = 30,
         max_retries: int = MAX_RETRIES,
+        endpoints: Iterable[RpcEndpoint] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.chain = chain
-        self.url = url
-        self.endpoint = sanitize_endpoint(url)
-        self.request = request
+        validate_rpc_endpoint_url(url)
+        try:
+            endpoint_pool = tuple(endpoints or ())
+        except Exception:
+            raise RpcConfigurationError("invalid_rpc_endpoint_pool") from None
+        if not endpoint_pool:
+            endpoint_pool = (
+                RpcEndpoint(
+                    "{}-primary".format(chain.lower()),
+                    url,
+                ),
+            )
+        if (
+            len(endpoint_pool) > MAX_RPC_ENDPOINTS
+            or any(not isinstance(item, RpcEndpoint) for item in endpoint_pool)
+            or len({item.endpoint_id for item in endpoint_pool}) != len(endpoint_pool)
+        ):
+            raise RpcConfigurationError("invalid_rpc_endpoint_pool") from None
+        expected_ids = tuple(
+            "{}-primary".format(chain.lower())
+            if index == 0
+            else "{}-fallback-{}".format(chain.lower(), index)
+            for index in range(len(endpoint_pool))
+        )
+        if tuple(item.endpoint_id for item in endpoint_pool) != expected_ids:
+            raise RpcConfigurationError("invalid_rpc_endpoint_pool") from None
+        self._endpoints = endpoint_pool
+        self._endpoint_index = 0
+        self.url = endpoint_pool[0].url
+        self.endpoint = endpoint_pool[0].identity
+        if request is not None and not callable(request):
+            raise RpcConfigurationError("invalid_rpc_request_boundary") from None
+        if request is None:
+            self.request = self._default_one_attempt_request
+            self._request_accepts_retry_controls = True
+        else:
+            self.request = request
+            self._request_accepts_retry_controls = (
+                _request_accepts_retry_controls(request)
+            )
         self.deadline = deadline
         self._call_deadline = deadline
-        self.timeout_seconds = timeout_seconds
+        try:
+            self.timeout_seconds = float(timeout_seconds)
+        except (TypeError, ValueError):
+            raise RpcConfigurationError("invalid_rpc_timeout") from None
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise RpcConfigurationError("invalid_rpc_timeout") from None
         self.max_retries = max_retries
+        if type(self.max_retries) is not int or not 1 <= self.max_retries <= MAX_RETRIES:
+            raise RpcConfigurationError("invalid_rpc_retry_configuration") from None
+        self.clock = clock
+        self.sleeper = sleeper
         self.records: list[dict[str, Any]] = []
+        self.endpoint_attempts: list[dict[str, Any]] = []
+        self.attempt_ledger = self.endpoint_attempts
+        self.endpoint_attempts_dropped = 0
+        self._network_attempt_ordinal = 0
+        self.endpoint_generation = 0
+        self.selected_endpoint_id = endpoint_pool[0].endpoint_id
+        self._bound_fixed_block_identity: dict[str, Any] | None = None
+        self._validated_endpoint_generation: int | None = None
+        self._validating_endpoint = False
+        self._open_endpoint_ids: set[str] = set()
         self._next_id = 1
+
+    @staticmethod
+    def _default_one_attempt_request(
+        url: str,
+        payload: Any,
+        *,
+        deadline: CollectionDeadline | None = None,
+        timeout_seconds: float = 30,
+        max_retries: int = 1,
+    ) -> tuple[Any, bytes]:
+        del max_retries
+        return http_json_rpc(
+            url,
+            payload,
+            deadline=deadline,
+            timeout_seconds=timeout_seconds,
+            max_retries=1,
+        )
+
+    @property
+    def open_endpoint_ids(self) -> tuple[str, ...]:
+        return tuple(
+            item.endpoint_id
+            for item in self._endpoints
+            if item.endpoint_id in self._open_endpoint_ids
+        )
+
+    def _active_endpoint(self) -> RpcEndpoint | None:
+        while self._endpoint_index < len(self._endpoints):
+            endpoint = self._endpoints[self._endpoint_index]
+            if endpoint.endpoint_id not in self._open_endpoint_ids:
+                if endpoint.endpoint_id != self.selected_endpoint_id:
+                    self.endpoint_generation += 1
+                    self.selected_endpoint_id = endpoint.endpoint_id
+                self.url = endpoint.url
+                self.endpoint = endpoint.identity
+                return endpoint
+            self._endpoint_index += 1
+        return None
+
+    def _record_endpoint_attempt(
+        self,
+        endpoint: RpcEndpoint,
+        payload: Any,
+        *,
+        outcome: str,
+        decision: str,
+        duration_seconds: float,
+        attempt_ordinal: int,
+        endpoint_attempt: int,
+        http_status: int | None = None,
+    ) -> None:
+        if len(self.endpoint_attempts) >= MAX_RPC_ATTEMPT_RECORDS:
+            replaceable = next(
+                (
+                    index
+                    for index, item in enumerate(self.endpoint_attempts)
+                    if item.get("outcome") == "success"
+                    and item.get("evidence_stage") == "rpc_request"
+                ),
+                None,
+            )
+            if (
+                replaceable is None
+                or (outcome == "success" and not self._validating_endpoint)
+            ):
+                self.endpoint_attempts_dropped += 1
+                return
+            self.endpoint_attempts.pop(replaceable)
+            self.endpoint_attempts_dropped += 1
+        record: dict[str, Any] = {
+            "endpoint_id": endpoint.endpoint_id,
+            "endpoint": endpoint.identity,
+            "method": (
+                payload.get("method", "unknown")
+                if isinstance(payload, dict)
+                else "batch"
+            ),
+            "outcome": outcome,
+            "decision": decision,
+            "duration_seconds": round(max(0.0, duration_seconds), 6),
+            "attempt_ordinal": attempt_ordinal,
+            "endpoint_attempt": endpoint_attempt,
+            "evidence_stage": (
+                "fallback_identity_validation"
+                if self._validating_endpoint
+                else "rpc_request"
+            ),
+        }
+        if self._validating_endpoint and self._bound_fixed_block_identity is not None:
+            record["fixed_block_identity"] = dict(self._bound_fixed_block_identity)
+        if http_status is not None:
+            record["http_status"] = http_status
+        self.endpoint_attempts.append(record)
+
+    @property
+    def validated_endpoint_generation(self) -> int | None:
+        return self._validated_endpoint_generation
+
+    def bind_fixed_block_identity(
+        self,
+        *,
+        chain_id: int,
+        block: Mapping[str, Any],
+    ) -> None:
+        if type(chain_id) is not int or chain_id <= 0:
+            raise RpcConfigurationError("invalid_rpc_fixed_block_identity")
+        try:
+            block_number = int(str(block["number"]))
+            block_hash = str(block["hash"]).lower()
+            block_timestamp = str(block["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            raise RpcConfigurationError("invalid_rpc_fixed_block_identity") from None
+        if (
+            block_number < 0
+            or _V3_BLOCK_HASH.fullmatch(block_hash) is None
+            or not block_timestamp
+        ):
+            raise RpcConfigurationError("invalid_rpc_fixed_block_identity")
+        self._bound_fixed_block_identity = {
+            "chain_id": chain_id,
+            "number": block_number,
+            "hash": block_hash,
+            "timestamp": block_timestamp,
+        }
+        self._validated_endpoint_generation = self.endpoint_generation
+
+    def _validate_selected_endpoint_identity(self) -> None:
+        expected = self._bound_fixed_block_identity
+        if (
+            expected is None
+            or self._validating_endpoint
+            or self._validated_endpoint_generation == self.endpoint_generation
+        ):
+            return
+        self._validating_endpoint = True
+        try:
+            while self._validated_endpoint_generation != self.endpoint_generation:
+                validation_generation = self.endpoint_generation
+                actual_chain_id = int(
+                    canonical_rpc_quantity(self.chain_id(), "eth_chainId"),
+                    16,
+                )
+                if self.endpoint_generation != validation_generation:
+                    continue
+                actual_block = exact_v3_block_identity(
+                    self.block(hex(expected["number"])),
+                    expected["number"],
+                )
+                if self.endpoint_generation != validation_generation:
+                    continue
+                if actual_chain_id != expected["chain_id"] or actual_block != {
+                    "number": str(expected["number"]),
+                    "hash": expected["hash"],
+                    "timestamp": expected["timestamp"],
+                }:
+                    raise RpcError("rpc_endpoint_identity_mismatch")
+                self._validated_endpoint_generation = validation_generation
+        finally:
+            self._validating_endpoint = False
+
+    def _request_endpoint(
+        self,
+        endpoint: RpcEndpoint,
+        payload: Any,
+        effective_deadline: CollectionDeadline | None,
+    ) -> tuple[Any, bytes]:
+        if not self._request_accepts_retry_controls:
+            return self.request(endpoint.url, payload)
+        return self.request(
+            endpoint.url,
+            payload,
+            deadline=effective_deadline,
+            timeout_seconds=self.timeout_seconds,
+            max_retries=1,
+        )
+
+    def _sleep_before_retry(
+        self,
+        effective_deadline: CollectionDeadline | None,
+        attempt: int,
+    ) -> None:
+        delay = min(float(2 ** attempt), MAX_RPC_RETRY_DELAY_SECONDS)
+        if effective_deadline is not None:
+            try:
+                effective_deadline.sleep_before_retry(delay)
+            except CollectionDeadlineExceeded as error:
+                raise error from None
+        else:
+            self.sleeper(delay)
 
     def _send(self, payload: Any) -> Any:
         effective_deadline = self._call_deadline or self.deadline
         if effective_deadline is not None:
             effective_deadline.require_remaining()
-        if (
-            effective_deadline is None
-            and self.timeout_seconds == 30
-            and self.max_retries == MAX_RETRIES
-        ):
-            response, raw = self.request(self.url, payload)
-        else:
-            response, raw = self.request(
-                self.url,
-                payload,
-                deadline=effective_deadline,
-                timeout_seconds=self.timeout_seconds,
-                max_retries=self.max_retries,
-            )
-        self.records.append(
-            {
-                "request": redacted_rpc_record_request(payload),
-                "response": redacted_rpc_record_response(payload, response),
-                "response_sha256": hashlib.sha256(raw).hexdigest(),
-            }
-        )
-        return response
+        while True:
+            if effective_deadline is not None:
+                effective_deadline.require_remaining()
+            endpoint = self._active_endpoint()
+            if endpoint is None:
+                raise RpcEndpointExhausted("rpc_endpoint_exhausted")
+            self._validate_selected_endpoint_identity()
+            endpoint = self._active_endpoint()
+            if endpoint is None:
+                raise RpcEndpointExhausted("rpc_endpoint_exhausted")
+            for attempt in range(self.max_retries):
+                self._network_attempt_ordinal += 1
+                attempt_ordinal = self._network_attempt_ordinal
+                started = self.clock()
+                try:
+                    response, raw = self._request_endpoint(
+                        endpoint,
+                        payload,
+                        effective_deadline,
+                    )
+                except CollectionDeadlineExceeded as error:
+                    self._record_endpoint_attempt(
+                        endpoint,
+                        payload,
+                        outcome="deadline_exceeded",
+                        decision="abort",
+                        duration_seconds=self.clock() - started,
+                        attempt_ordinal=attempt_ordinal,
+                        endpoint_attempt=attempt + 1,
+                    )
+                    raise error from None
+                except Exception as error:
+                    if isinstance(error, RpcConfigurationError):
+                        self._record_endpoint_attempt(
+                            endpoint,
+                            payload,
+                            outcome="configuration_error",
+                            decision="abort",
+                            duration_seconds=self.clock() - started,
+                            attempt_ordinal=attempt_ordinal,
+                            endpoint_attempt=attempt + 1,
+                        )
+                        raise error from None
+                    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+                        self._record_endpoint_attempt(
+                            endpoint,
+                            payload,
+                            outcome="protocol_error",
+                            decision="abort",
+                            duration_seconds=self.clock() - started,
+                            attempt_ordinal=attempt_ordinal,
+                            endpoint_attempt=attempt + 1,
+                        )
+                        raise
+                    if isinstance(error, RpcError) and not isinstance(
+                        error,
+                        RpcTransportError,
+                    ):
+                        self._record_endpoint_attempt(
+                            endpoint,
+                            payload,
+                            outcome="protocol_error",
+                            decision="abort",
+                            duration_seconds=self.clock() - started,
+                            attempt_ordinal=attempt_ordinal,
+                            endpoint_attempt=attempt + 1,
+                        )
+                        raise
+                    transport_error = _bounded_rpc_transport_error(error)
+                    is_last_attempt = attempt + 1 >= self.max_retries
+                    if effective_deadline is not None:
+                        try:
+                            effective_deadline.require_remaining()
+                        except CollectionDeadlineExceeded as deadline_error:
+                            self._record_endpoint_attempt(
+                                endpoint,
+                                payload,
+                                outcome="deadline_exceeded",
+                                decision="abort",
+                                duration_seconds=self.clock() - started,
+                                attempt_ordinal=attempt_ordinal,
+                                endpoint_attempt=attempt + 1,
+                            )
+                            raise deadline_error from None
+                    has_next_endpoint = self._endpoint_index + 1 < len(
+                        self._endpoints
+                    )
+                    if not transport_error.failover_eligible:
+                        decision = "abort"
+                    elif transport_error.retryable and not is_last_attempt:
+                        decision = "retry"
+                    elif has_next_endpoint:
+                        decision = "switch"
+                    else:
+                        decision = "exhausted"
+                    self._record_endpoint_attempt(
+                        endpoint,
+                        payload,
+                        outcome=transport_error.outcome,
+                        decision=decision,
+                        duration_seconds=self.clock() - started,
+                        attempt_ordinal=attempt_ordinal,
+                        endpoint_attempt=attempt + 1,
+                        http_status=transport_error.http_status,
+                    )
+                    if not transport_error.failover_eligible:
+                        raise transport_error from None
+                    if transport_error.retryable and not is_last_attempt:
+                        self._sleep_before_retry(effective_deadline, attempt)
+                        continue
+                    self._open_endpoint_ids.add(endpoint.endpoint_id)
+                    self._endpoint_index += 1
+                    break
+                self._record_endpoint_attempt(
+                    endpoint,
+                    payload,
+                    outcome="success",
+                    decision="use",
+                    duration_seconds=self.clock() - started,
+                    attempt_ordinal=attempt_ordinal,
+                    endpoint_attempt=attempt + 1,
+                )
+                self.records.append(
+                    {
+                        "request": redacted_rpc_record_request(payload),
+                        "response": redacted_rpc_record_response(payload, response),
+                        "response_sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                )
+                return response
 
     def method(self, method: str, params: list[Any]) -> Any:
         request_id = self._next_id
@@ -1007,7 +1585,30 @@ class _DeadlineBoundRpcClient:
         self._client = client
         self._deadline = deadline
         self.records = client.records
-        self.endpoint = client.endpoint
+
+    @property
+    def endpoint(self) -> str:
+        return self._client.endpoint
+
+    @property
+    def attempt_ledger(self) -> list[dict[str, Any]]:
+        return getattr(self._client, "attempt_ledger", [])
+
+    @property
+    def endpoint_attempts_dropped(self) -> int:
+        return getattr(self._client, "endpoint_attempts_dropped", 0)
+
+    @property
+    def endpoint_generation(self) -> int | None:
+        return getattr(self._client, "endpoint_generation", None)
+
+    @property
+    def selected_endpoint_id(self) -> str | None:
+        return getattr(self._client, "selected_endpoint_id", None)
+
+    @property
+    def validated_endpoint_generation(self) -> int | None:
+        return getattr(self._client, "validated_endpoint_generation", None)
 
     def _call(self, operation: Callable[..., Any], *args: Any) -> Any:
         self._deadline.require_remaining()
@@ -2771,10 +3372,20 @@ def _execution_quantity_raw(row: Mapping[str, Any], field: str, decimals: int) -
     return int(integral)
 
 
-def _retained_finalized_block(records: Any, block_number: int) -> dict[str, str]:
+def _retained_finalized_block(
+    records: Any,
+    pinned_block: Mapping[str, Any],
+) -> dict[str, str]:
     if not isinstance(records, list):
         raise ValueError("Uniswap V3 raw finalized block proof is missing")
-    identities = []
+    block_number = int(pinned_block["number"])
+    expected = {
+        "number": str(block_number),
+        "hash": str(pinned_block["hash"]).lower(),
+        "timestamp": str(pinned_block["timestamp"]),
+    }
+    pinned_identities = []
+    finalized_checkpoints = []
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -2791,20 +3402,54 @@ def _retained_finalized_block(records: Any, block_number: int) -> dict[str, str]
             if (
                 not isinstance(request, dict)
                 or request.get("method") != "eth_getBlockByNumber"
-                or request.get("params") != ["finalized", False]
             ):
                 continue
             response = responses_by_id.get(request.get("id"))
             result = response.get("result") if isinstance(response, dict) else None
-            try:
-                identities.append(exact_v3_block_identity(result, block_number))
-            except (RpcError, TypeError, ValueError) as error:
-                raise ValueError(
-                    "Uniswap V3 raw finalized block proof is invalid"
-                ) from error
-    if not identities or any(identity != identities[0] for identity in identities):
+            if request.get("params") == [hex(block_number), False]:
+                try:
+                    pinned_identities.append(
+                        exact_v3_block_identity(result, block_number)
+                    )
+                except (RpcError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        "Uniswap V3 raw finalized block proof is invalid"
+                    ) from error
+            elif request.get("params") == ["finalized", False]:
+                try:
+                    checkpoint_number = int(
+                        canonical_rpc_quantity(
+                            result.get("number") if isinstance(result, dict) else None,
+                            "Uniswap V3 finalized checkpoint number",
+                        ),
+                        16,
+                    )
+                    checkpoint_hash = str(
+                        result.get("hash") if isinstance(result, dict) else ""
+                    ).lower()
+                    if _V3_BLOCK_HASH.fullmatch(checkpoint_hash) is None:
+                        raise ValueError("Uniswap V3 finalized checkpoint hash is invalid")
+                    block_timestamp_text(dict(result))
+                except (RpcError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        "Uniswap V3 raw finalized block proof is invalid"
+                    ) from error
+                finalized_checkpoints.append((checkpoint_number, checkpoint_hash))
+    if (
+        not pinned_identities
+        or any(identity != expected for identity in pinned_identities)
+        or not finalized_checkpoints
+        or any(
+            not checkpoint_number >= block_number
+            or (
+                checkpoint_number == block_number
+                and checkpoint_hash != expected["hash"]
+            )
+            for checkpoint_number, checkpoint_hash in finalized_checkpoints
+        )
+    ):
         raise ValueError("Uniswap V3 raw finalized block proof is invalid")
-    return identities[0]
+    return expected
 
 
 def require_uniswap_v3_publication_scope(
@@ -3193,9 +3838,7 @@ def validate_uniswap_v3_exact_candidate(
         ):
             raise ValueError("Uniswap V3 shared finalized block evidence is invalid")
         block_identities.add((int(block_number), block_hash))
-        if _retained_finalized_block(
-            transcript.get("records"), int(block_number)
-        ) != block:
+        if _retained_finalized_block(transcript.get("records"), block) != block:
             raise ValueError("Uniswap V3 raw finalized block proof is inconsistent")
         depth_row = depth_by_market[market_id]
         market_execution = execution_by_market[market_id]
@@ -4908,6 +5551,8 @@ def raw_transcript_bytes(
     block_number: int | None,
     endpoint: str,
     records: list[dict[str, Any]],
+    attempt_ledger: Iterable[Mapping[str, Any]] = (),
+    attempt_ledger_dropped: int = 0,
     error: Exception | None = None,
     v3_tick_scan_manifest: Mapping[str, Any] | None = None,
 ) -> bytes:
@@ -4921,6 +5566,8 @@ def raw_transcript_bytes(
         "block_number": block_number,
         "source_endpoint": endpoint,
         "records": records,
+        "attempt_ledger": [dict(item) for item in attempt_ledger],
+        "attempt_ledger_dropped": int(attempt_ledger_dropped),
     }
     if any(
         str(pool.get(field) or "").strip()
@@ -4945,10 +5592,89 @@ def raw_transcript_bytes(
         payload["v3_tick_scan_manifest"] = dict(v3_tick_scan_manifest)
     if error is not None:
         payload["error_type"] = type(error).__name__
-        payload["error"] = str(error)
+        payload["error"] = bounded_dex_error_text(error)
     return (
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
+
+
+def bounded_dex_error_text(error: BaseException) -> str:
+    """Return a bounded collector-owned error without transport secrets."""
+    if isinstance(error, RpcEndpointExhausted):
+        return "rpc_endpoint_exhausted"
+    if isinstance(error, RpcTransportError):
+        return "rpc_transport_failed"
+    if isinstance(error, RpcError):
+        if str(error) == "rpc_endpoint_identity_mismatch":
+            return "rpc_endpoint_identity_mismatch"
+        return "rpc_protocol_failed"
+    if isinstance(error, urllib.error.HTTPError):
+        return "rpc_http_failed"
+    if isinstance(error, (urllib.error.URLError, TimeoutError)):
+        return "rpc_network_failed"
+    return "{}: {}".format(type(error).__name__, str(error))
+
+
+def _make_chain_rpc_client(
+    chain: str,
+    rpc_url: str,
+    rpc_factory: Callable[[str, str], RpcClient],
+    deadline: CollectionDeadline | None,
+) -> RpcClient:
+    if rpc_factory is RpcClient:
+        return RpcClient(
+            chain,
+            rpc_url,
+            endpoints=rpc_endpoints_for_chain(chain),
+            deadline=deadline,
+        )
+    return rpc_factory(chain, rpc_url)
+
+
+def _bind_chain_fixed_block(
+    client: RpcClient,
+    chain: str,
+    block_number: int,
+    expected_identity: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    expected_chain_id = V3_CHAIN_ID_BY_NAME.get(chain)
+    if expected_chain_id is None:
+        raise ValueError("unsupported fixed-block chain")
+    while True:
+        binding_generation = client.endpoint_generation
+        actual_chain_id = int(
+            canonical_rpc_quantity(client.chain_id(), "fixed block chain id"),
+            16,
+        )
+        if client.endpoint_generation != binding_generation:
+            continue
+        actual_identity = exact_v3_block_identity(
+            client.block(hex(block_number)),
+            block_number,
+        )
+        if client.endpoint_generation != binding_generation:
+            continue
+        if actual_chain_id != expected_chain_id:
+            raise ValueError("fixed block chain identity does not match")
+        if expected_identity is not None and actual_identity != dict(expected_identity):
+            raise ValueError("fixed block header identity does not match")
+        break
+    if isinstance(client, RpcClient):
+        client.bind_fixed_block_identity(
+            chain_id=expected_chain_id,
+            block=actual_identity,
+        )
+    return actual_identity
+
+
+def _validated_endpoint_changed(client: Any, original_generation: Any) -> bool:
+    current_generation = getattr(client, "endpoint_generation", None)
+    return (
+        original_generation is not None
+        and current_generation != original_generation
+        and getattr(client, "validated_endpoint_generation", None)
+        == current_generation
+    )
 
 
 def collect_dex_pool_observation(
@@ -4962,6 +5688,7 @@ def collect_dex_pool_observation(
     fixed_block_timestamp: str = "",
     expected_v3_block_identity: Mapping[str, str] | None = None,
     deadline: CollectionDeadline | None = None,
+    preflight_error: Exception | None = None,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Collect one DEX pool with isolated client state unless one is supplied."""
     if deadline is not None:
@@ -5014,19 +5741,19 @@ def collect_dex_pool_observation(
         )
 
     if client is None:
-        if deadline is None:
-            client = rpc_factory(chain, rpc_url)
-        else:
-            client = rpc_factory(chain, rpc_url, deadline=deadline)
+        client = _make_chain_rpc_client(chain, rpc_url, rpc_factory, deadline)
     active_client = (
         _DeadlineBoundRpcClient(client, deadline)
         if deadline is not None
         else client
     )
     record_start = len(active_client.records)
+    endpoint_generation_start = getattr(active_client, "endpoint_generation", None)
     block_number = fixed_block_number
     block_timestamp = fixed_block_timestamp
     try:
+        if preflight_error is not None:
+            raise preflight_error
         exact_v3_approved = (
             protocol == "concentrated_liquidity_v3"
             and is_uniswap_v3_execution_approved(pool)
@@ -5105,12 +5832,30 @@ def collect_dex_pool_observation(
             protocol=protocol,
             expected_v3_block_identity=expected_v3_block_identity,
         )
+        if _validated_endpoint_changed(active_client, endpoint_generation_start):
+            return collect_dex_pool_observation(
+                pool,
+                snapshot_id=snapshot_id,
+                raw_path=raw_path,
+                rpc_factory=rpc_factory,
+                client=client,
+                fixed_block_number=fixed_block_number,
+                fixed_block_timestamp=fixed_block_timestamp,
+                expected_v3_block_identity=expected_v3_block_identity,
+                deadline=deadline,
+            )
         v3_tick_scan_manifest = row.get("_v3_tick_scan_manifest")
         transcript = raw_transcript_bytes(
             pool=pool,
             block_number=block_number,
             endpoint=active_client.endpoint,
             records=active_client.records[record_start:],
+            attempt_ledger=getattr(active_client, "attempt_ledger", ()),
+            attempt_ledger_dropped=getattr(
+                active_client,
+                "endpoint_attempts_dropped",
+                0,
+            ),
             v3_tick_scan_manifest=(
                 v3_tick_scan_manifest
                 if isinstance(v3_tick_scan_manifest, Mapping)
@@ -5126,11 +5871,29 @@ def collect_dex_pool_observation(
     except CollectionDeadlineExceeded:
         raise
     except Exception as error:
+        if _validated_endpoint_changed(active_client, endpoint_generation_start):
+            return collect_dex_pool_observation(
+                pool,
+                snapshot_id=snapshot_id,
+                raw_path=raw_path,
+                rpc_factory=rpc_factory,
+                client=client,
+                fixed_block_number=fixed_block_number,
+                fixed_block_timestamp=fixed_block_timestamp,
+                expected_v3_block_identity=expected_v3_block_identity,
+                deadline=deadline,
+            )
         transcript = raw_transcript_bytes(
             pool=pool,
             block_number=block_number,
             endpoint=active_client.endpoint,
             records=active_client.records[record_start:],
+            attempt_ledger=getattr(active_client, "attempt_ledger", ()),
+            attempt_ledger_dropped=getattr(
+                active_client,
+                "endpoint_attempts_dropped",
+                0,
+            ),
             error=error,
         )
         raw_path.write_bytes(transcript)
@@ -5158,7 +5921,7 @@ def collect_dex_pool_observation(
                 "raw_response_sha256": raw_hash,
                 "status": "failed",
                 "reason_code": dex_depth_failure_reason_code(error),
-                "error": f"{type(error).__name__}: {error}",
+                "error": bounded_dex_error_text(error),
             }
         )
         status_reason = (
@@ -5174,7 +5937,7 @@ def collect_dex_pool_observation(
             protocol=protocol,
             status="failed",
             status_reason=status_reason,
-            error=f"{type(error).__name__}: {error}",
+            error=bounded_dex_error_text(error),
             block_number=block_number,
             block_timestamp=block_timestamp,
             source_endpoint=active_client.endpoint,
@@ -5190,6 +5953,7 @@ def collect_dex_depth_with_execution(
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
     rpc_factory: Callable[[str, str], RpcClient] = RpcClient,
     allow_terminal_only: bool = False,
+    deadline: CollectionDeadline | None = None,
 ) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
     from datetime import datetime, timezone
 
@@ -5218,6 +5982,8 @@ def collect_dex_depth_with_execution(
     execution_rows: list[dict[str, str]] = []
 
     for index, pool in enumerate(pools, start=1):
+        if deadline is not None:
+            deadline.require_remaining()
         protocol, unsupported_reason = protocol_model(
             pool["dex"],
             pool["chain"],
@@ -5245,29 +6011,68 @@ def collect_dex_depth_with_execution(
                     flush=True,
                 )
             continue
-        client = clients.setdefault(chain, rpc_factory(chain, rpc_url))
+        client = clients.get(chain)
+        if client is None:
+            client = _make_chain_rpc_client(
+                chain,
+                rpc_url,
+                rpc_factory,
+                deadline,
+            )
+            clients[chain] = client
         block_number = blocks.get(chain)
         block_timestamp = block_timestamps.get(chain, "")
-        if block_number is None and chain in finalized_chains:
-            finalized_header = client.block("finalized")
-            finalized_number_raw = finalized_header.get("number")
-            if not isinstance(finalized_number_raw, str):
-                raise ValueError("finalized Ethereum block is unavailable")
-            block_number = int(
-                canonical_rpc_quantity(
-                    finalized_number_raw,
-                    "finalized Ethereum block number",
-                ),
-                16,
-            )
-            block_timestamp = block_timestamp_text(finalized_header)
-            block_identity = exact_v3_block_identity(
-                finalized_header,
-                block_number,
-            )
-            blocks[chain] = block_number
-            block_timestamps[chain] = block_timestamp
-            block_identities[chain] = block_identity
+        preflight_error = None
+        try:
+            if block_number is None and chain in finalized_chains:
+                finalized_header = client.block("finalized")
+                finalized_number_raw = finalized_header.get("number")
+                if not isinstance(finalized_number_raw, str):
+                    raise ValueError("finalized Ethereum block is unavailable")
+                block_number = int(
+                    canonical_rpc_quantity(
+                        finalized_number_raw,
+                        "finalized Ethereum block number",
+                    ),
+                    16,
+                )
+                block_timestamp = block_timestamp_text(finalized_header)
+                block_identity = exact_v3_block_identity(
+                    finalized_header,
+                    block_number,
+                )
+                blocks[chain] = block_number
+                block_timestamps[chain] = block_timestamp
+                block_identities[chain] = block_identity
+            if block_number is None:
+                block_number = client.block_number()
+                blocks[chain] = block_number
+            if isinstance(client, RpcClient) and chain not in block_identities:
+                block_identity = _bind_chain_fixed_block(
+                    client,
+                    chain,
+                    block_number,
+                )
+                block_timestamp = block_identity["timestamp"]
+                block_identities[chain] = block_identity
+                block_timestamps[chain] = block_timestamp
+            elif (
+                isinstance(client, RpcClient)
+                and client._bound_fixed_block_identity is None
+            ):
+                block_identity = _bind_chain_fixed_block(
+                    client,
+                    chain,
+                    block_number,
+                    block_identities.get(chain),
+                )
+                block_identities[chain] = block_identity
+                block_timestamp = block_identity["timestamp"]
+                block_timestamps[chain] = block_timestamp
+        except CollectionDeadlineExceeded:
+            raise
+        except Exception as error:
+            preflight_error = error
         row, pool_execution_rows = collect_dex_pool_observation(
             pool,
             snapshot_id=snapshot_id,
@@ -5277,6 +6082,8 @@ def collect_dex_depth_with_execution(
             fixed_block_number=block_number,
             fixed_block_timestamp=block_timestamp,
             expected_v3_block_identity=block_identities.get(chain),
+            deadline=deadline,
+            preflight_error=preflight_error,
         )
         if row["block_number"] and row["block_timestamp"]:
             blocks[chain] = int(row["block_number"])
@@ -5289,7 +6096,10 @@ def collect_dex_depth_with_execution(
             flush=True,
         )
         if index < len(pools) and sleep_seconds > 0:
-            time.sleep(sleep_seconds)
+            if deadline is not None:
+                deadline.sleep_before_retry(sleep_seconds)
+            else:
+                time.sleep(sleep_seconds)
 
     manifest = {
         "snapshot_id": snapshot_id,
@@ -5334,6 +6144,7 @@ def collect_dex_depth(
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
     rpc_factory: Callable[[str, str], RpcClient] = RpcClient,
     allow_terminal_only: bool = False,
+    deadline: CollectionDeadline | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
     """Backward-compatible depth-only return shape."""
     snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
@@ -5342,6 +6153,7 @@ def collect_dex_depth(
         sleep_seconds=sleep_seconds,
         rpc_factory=rpc_factory,
         allow_terminal_only=allow_terminal_only,
+        deadline=deadline,
     )
     return snapshot_id, rows
 
@@ -5374,7 +6186,11 @@ def validate_snapshot(
         supplied_reason = str(row.get("reason_code") or "").strip().lower()
         if "reason_code" in row and not supplied_reason:
             raise ValueError("DEX depth snapshot reason code is missing")
-        if supplied_reason and dex_depth_reason_code(supplied_reason) is None:
+        if (
+            supplied_reason
+            and supplied_reason != "rpc_endpoint_exhausted"
+            and dex_depth_reason_code(supplied_reason) is None
+        ):
             raise ValueError("DEX depth snapshot contains an invalid reason code")
         allowed_reasons = {
             "observed": {"observed"},

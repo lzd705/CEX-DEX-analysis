@@ -78,21 +78,32 @@ class DeployTemplateTests(unittest.TestCase):
             for collection in (daily, depth):
                 self.assertIn("User=market-monitor", collection)
                 self.assertIn("Group=market-monitor", collection)
+                self.assertIn("EnvironmentFile=-/etc/cex-dex/dashboard.env", collection)
                 self.assertIn(f"--data-dir {market_data_dir}", collection)
+                self.assertIn("--lock-wait-seconds 900", collection)
                 self.assertIn(f"ReadOnlyPaths={project_root}", collection)
                 self.assertIn(f"ReadWritePaths={market_data_dir}", collection)
                 self.assertIn(f"ReadWritePaths={work_dir}", collection)
                 self.assertIn("ProtectSystem=strict", collection)
                 self.assertNotRegex(collection, renderer.PLACEHOLDER)
+            self.assertIn("TimeoutStartSec=90min", daily)
+            self.assertIn("TimeoutStartSec=50min", depth)
             for collection in (daily_user, depth_user):
                 self.assertIn(
                     f"Environment=MARKET_DATA_DIR={market_data_dir}",
                     collection,
                 )
+                self.assertIn(
+                    "EnvironmentFile=-%h/.config/cex-dex/dashboard.env",
+                    collection,
+                )
                 self.assertIn(f"--data-dir {market_data_dir}", collection)
+                self.assertIn("--lock-wait-seconds 900", collection)
                 self.assertNotIn("/etc/cex-dex", collection)
                 self.assertNotIn("User=", collection)
                 self.assertNotRegex(collection, renderer.PLACEHOLDER)
+            self.assertIn("TimeoutStartSec=90min", daily_user)
+            self.assertIn("TimeoutStartSec=50min", depth_user)
             self.assertNotRegex(service, renderer.PLACEHOLDER)
             self.assertNotRegex(user_service, renderer.PLACEHOLDER)
             self.assertNotRegex(environment, renderer.PLACEHOLDER)

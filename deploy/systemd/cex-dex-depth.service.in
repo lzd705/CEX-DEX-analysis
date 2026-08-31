@@ -11,8 +11,8 @@ WorkingDirectory=@PROJECT_ROOT@
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/etc/cex-dex/dashboard.env
-ExecStart=/usr/bin/python3 scripts/run_collection_cycle.py --profile depth --publish-local --data-dir @MARKET_DATA_DIR@
-TimeoutStartSec=30min
+ExecStart=/usr/bin/python3 scripts/run_collection_cycle.py --profile depth --publish-local --data-dir @MARKET_DATA_DIR@ --lock-wait-seconds 900
+TimeoutStartSec=50min
 Nice=10
 NoNewPrivileges=true
 PrivateTmp=true

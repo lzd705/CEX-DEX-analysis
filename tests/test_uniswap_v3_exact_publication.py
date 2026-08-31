@@ -110,7 +110,7 @@ class ExactCandidateFixture:
             )
         )
 
-    def __init__(self, root):
+    def __init__(self, root, finalized_headers=None):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
         self.authority_path = root / "authority.json"
@@ -203,6 +203,15 @@ class ExactCandidateFixture:
             }
             parity = []
             scenario_facts = {}
+            finalized_header = (
+                dict(finalized_headers[market_id])
+                if finalized_headers and market_id in finalized_headers
+                else {
+                    "number": "0x7b",
+                    "hash": BLOCK_HASH,
+                    "timestamp": "0x65920080",
+                }
+            )
             records = [
                 {
                     "request": {
@@ -214,11 +223,7 @@ class ExactCandidateFixture:
                     "response": {
                         "jsonrpc": "2.0",
                         "id": 0,
-                        "result": {
-                            "number": "0x7b",
-                            "hash": BLOCK_HASH,
-                            "timestamp": "0x65920080",
-                        },
+                        "result": finalized_header,
                     },
                     "response_sha256": "e" * 64,
                 }
@@ -373,6 +378,26 @@ class ExactCandidateFixture:
                     ],
                     first_id=110,
                 )
+            )
+            records.append(
+                {
+                    "request": {
+                        "jsonrpc": "2.0",
+                        "id": 99,
+                        "method": "eth_getBlockByNumber",
+                        "params": ["0x7b", False],
+                    },
+                    "response": {
+                        "jsonrpc": "2.0",
+                        "id": 99,
+                        "result": {
+                            "number": "0x7b",
+                            "hash": BLOCK_HASH,
+                            "timestamp": "0x65920080",
+                        },
+                    },
+                    "response_sha256": "e" * 64,
+                }
             )
             block = {
                 "number": "123",
@@ -667,6 +692,68 @@ class UniswapV3ExactPublicationTest(unittest.TestCase):
         self.assertNotIn(str(self.root), encoded)
         self.assertNotIn("secret", encoded)
         self.assertNotIn("rpc.invalid", encoded)
+
+    def test_advancing_finality_keeps_the_pinned_v1_receipt(self):
+        fixture = ExactCandidateFixture(
+            self.root / "advancing-finality",
+            finalized_headers={
+                "dex:eth:uniswap_v3:0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801:UNI": {
+                    "number": "0x9b",
+                    "hash": "0x" + "b" * 64,
+                    "timestamp": "0x65920880",
+                },
+            },
+        )
+
+        receipt = fixture.validate()
+
+        self.assertEqual(receipt["schema"], "uniswap_v3_exact_validation/v1")
+        self.assertEqual(
+            receipt["shared_finalized_block"],
+            {"number": 123, "hash": "0x" + "a" * 64},
+        )
+        self.assertNotIn("later_finalized_block", receipt)
+
+    def test_finality_evidence_roles_reject_missing_or_inconsistent_proofs(self):
+        market_id = self.fixture.market_ids[0]
+
+        def mutate_finalized(payload, **changes):
+            payload["records"][0]["response"]["result"].update(changes)
+
+        cases = (
+            (
+                "checkpoint_below_pinned_block",
+                lambda payload: mutate_finalized(payload, number="0x7a"),
+            ),
+            (
+                "checkpoint_same_height_wrong_hash",
+                lambda payload: mutate_finalized(
+                    payload, hash="0x" + "b" * 64
+                ),
+            ),
+            (
+                "missing_numeric_pinned_header",
+                lambda payload: payload["records"].pop(),
+            ),
+            (
+                "numeric_pinned_header_wrong_hash",
+                lambda payload: payload["records"][-1]["response"]["result"].update(
+                    hash="0x" + "b" * 64
+                ),
+            ),
+            (
+                "numeric_pinned_header_wrong_timestamp",
+                lambda payload: payload["records"][-1]["response"]["result"].update(
+                    timestamp="0x65920081"
+                ),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                fixture = ExactCandidateFixture(self.root / name)
+                fixture.rewrite_transcript(market_id, mutate)
+                with self.assertRaisesRegex(ValueError, "raw finalized block"):
+                    fixture.validate()
 
     def test_missing_or_mismatched_production_inventory_is_rejected(self):
         cases = {
@@ -1021,6 +1108,9 @@ class UniswapV3ExactPublicationTest(unittest.TestCase):
             manifest["block"]["hash"] = "0x" + "b" * 64
             manifest["block_final"]["hash"] = "0x" + "b" * 64
             payload["records"][0]["response"]["result"]["hash"] = (
+                "0x" + "b" * 64
+            )
+            payload["records"][-1]["response"]["result"]["hash"] = (
                 "0x" + "b" * 64
             )
 
@@ -1456,6 +1546,62 @@ class UniswapV3ExactPublicationTest(unittest.TestCase):
             protected,
         )
         self.assertFalse(arguments.output_dir.exists())
+
+    def test_rpc_endpoint_exhaustion_rejects_exact_gate_and_preserves_bundle(self):
+        publish_dir = self.root / "published-exhaustion"
+        publish_dir.mkdir()
+        protected = {
+            publish_dir / fetch_dex_depth.LATEST_FILENAME: b"old-depth\n",
+            publish_dir / fetch_dex_depth.EXECUTION_LATEST_FILENAME: b"old-execution\n",
+            publish_dir / fetch_dex_depth.UNISWAP_V3_EXACT_LATEST_FILENAME: b"old-receipt\n",
+        }
+        for path, payload in protected.items():
+            path.write_bytes(payload)
+        failed_depth = [
+            {
+                **row,
+                "status": "failed",
+                "reason_code": "rpc_endpoint_exhausted",
+                "error": "rpc_endpoint_exhausted",
+            }
+            for row in self.fixture.depth_rows
+        ]
+        arguments = SimpleNamespace(
+            tvl_csv=self.root / "inventory.csv",
+            output_dir=self.root / "processed-exhaustion",
+            raw_root=self.fixture.depth_raw_root,
+            tvl_raw_root=self.fixture.tvl_raw_root,
+            publish_local=False,
+            publish_dir=publish_dir,
+            sleep_seconds=0,
+            tokens=None,
+            chains=None,
+            market_id=None,
+            merge_publish=False,
+            require_uniswap_v3_exact_validation=True,
+        )
+
+        with patch.object(fetch_dex_depth, "parse_args", return_value=arguments), patch.object(
+            fetch_dex_depth,
+            "load_pool_inventory",
+            return_value=self.fixture.inventory,
+        ), patch.object(
+            fetch_dex_depth,
+            "collect_dex_depth_with_execution",
+            return_value=(
+                self.fixture.depth_snapshot_id,
+                failed_depth,
+                self.fixture.execution_rows,
+            ),
+        ), patch.object(
+            fetch_dex_depth,
+            "publish_full_publication_bundle",
+            side_effect=AssertionError("publication must not run"),
+        ):
+            with self.assertRaises(ValueError):
+                fetch_dex_depth.main()
+
+        self.assertEqual({path: path.read_bytes() for path in protected}, protected)
 
     def test_runner_enables_exact_gate_for_production_and_explicit_no_publish(self):
         data_dir = self.root / "runtime"

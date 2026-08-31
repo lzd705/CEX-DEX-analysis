@@ -29,8 +29,16 @@ The endpoint field is either an allowlisted public scheme/host/optional-port
 label or an opaque SHA-256 endpoint label; credentials, paths, queries, and
 unapproved hostnames are never published.
 
+For Uniswap V3 exact authority pools, the shared finalized block `F` has two
+separate evidence roles. Numeric reads of `F` must match the scan manifest's
+block number, hash, and timestamp exactly; those are the state calls used for
+depth, execution, and the public exact receipt. Later `finalized` reads are only
+checkpoint proofs that the chain's finalized head is still at or beyond `F`. If
+that later head has advanced, its hash is not compared with `F`.
+
 This prevents different calls for one snapshot from silently mixing states from
-different blocks.
+different blocks while allowing normal finalized-head advancement after the
+fixed observation block has already been chosen.
 
 ## Supported models
 
@@ -306,6 +314,30 @@ Base explicitly labels `mainnet.base.org` rate-limited and unsuitable for
 production, so the default uses PublicNode while retaining an environment
 override:
 [Base connection documentation](https://docs.base.org/base-chain/quickstart/connecting-to-base).
+
+Optional ordered fallbacks use strict JSON-array variables such as
+`DEX_DEPTH_RPC_ETH_FALLBACKS` and `DEX_DEPTH_RPC_BSC_FALLBACKS`. The scalar
+primary remains backward compatible; fallbacks are used sequentially, never in
+parallel. The collector rejects malformed JSON, empty entries, duplicate URLs,
+and endpoint pools larger than one primary plus two fallbacks.
+
+Eligible provider failures, including HTTP 401/403/404, 429/5xx, connection
+errors, DNS failures, and timeouts, can move the run to the next endpoint.
+JSON-RPC contract reverts, malformed protocol facts, wrong-chain responses, and
+fixed-block identity mismatches remain data failures rather than hidden
+provider hops. Before a fallback can serve fixed-block state, it must prove the
+expected chain ID and the exact `F` number, hash, and timestamp. If all
+endpoints are exhausted, the affected facts fail with bounded reason codes such
+as `rpc_endpoint_exhausted`; existing publication gates keep the previous
+complete public generation.
+
+Retained evidence binds a bounded RPC-attempt ledger into the transcript hash.
+That ledger keeps stable endpoint IDs, sanitized endpoint identities, method
+stage, bounded outcome category, status code when safe, retry/failover decision,
+and timing. It does not retain URL credentials, query strings, headers, raw
+exception text, or unbounded response bodies. A free-only endpoint pair improves
+best-effort availability for that observation; it is not an uptime guarantee or
+a substitute for a paid RPC SLA.
 
 ## Separate route-cost evidence
 
