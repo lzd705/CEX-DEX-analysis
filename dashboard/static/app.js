@@ -2435,7 +2435,7 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
     || !opportunityResponseFiltersMatch(payload?.filters, requestedFilters)
   ) return false;
   const identities = new Set();
-  return routes.every((route) => {
+  const validRows = routes.every((route) => {
     const opportunityId = route?.opportunity_id;
     const valid = (
       typeof opportunityId === "string"
@@ -2474,10 +2474,47 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
       && historicalOpportunityDecimal(route.stress_25_net_edge_usd) !== null
       && historicalOpportunityDecimal(route.stress_50_net_edge_usd) !== null
       && typeof route.stress_robust === "boolean"
+      && opportunityRowMatchesRequest(route, requestedFilters)
     );
     if (valid) identities.add(opportunityId);
     return valid;
   });
+  if (!validRows) return false;
+  for (let index = 1; index < routes.length; index += 1) {
+    const comparison = opportunitySortComparison(
+      routes[index - 1], routes[index], requestedFilters,
+    );
+    if (comparison === null || comparison > 0) return false;
+  }
+  return true;
+}
+
+function historicalOpportunityUnavailableMatchesRequest(payload, requestedFilters) {
+  const coverage = payload?.metadata?.coverage;
+  const zeroCoverageFields = [
+    "route_count",
+    "scenario_count",
+    "returned_count",
+    "foundry_verified_count",
+    "research_estimate_count",
+    "positive_count",
+    "strict_count",
+    "executable_count",
+    "attested_count",
+    "unavailable_count",
+  ];
+  return (
+    payload?.availability?.status === "unavailable"
+    && payload.availability.reason === "historical_replay_pointer_absent"
+    && payload?.metadata?.contract_version
+      === "opportunity_historical_summary/v1"
+    && payload?.metadata?.data_generation === null
+    && coverage
+    && zeroCoverageFields.every((field) => coverage[field] === 0)
+    && Array.isArray(payload.routes)
+    && payload.routes.length === 0
+    && opportunityResponseFiltersMatch(payload.filters, requestedFilters)
+  );
 }
 
 function renderHistoricalOpportunities(payload) {
@@ -2522,6 +2559,26 @@ function renderHistoricalOpportunities(payload) {
   if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
 
+function renderHistoricalOpportunityUnavailable(payload) {
+  app.opportunities = payload;
+  syncOpportunityScopePresentation("historical");
+  byId("opportunities-view")?.setAttribute("aria-busy", "false");
+  hideStatus(byId("opportunity-loading"));
+  hideStatus(byId("opportunity-status"));
+  hideError(byId("opportunity-error"));
+  clearCurrentOpportunityInventories();
+  clearHistoricalOpportunityInventory();
+  showStatus(
+    byId("opportunity-bundle-unavailable"),
+    "No historical replay has been published yet. No historical route inventory or numeric zero is inferred.",
+    "warning",
+  );
+  const badge = byId("opportunity-cohort-status");
+  badge.textContent = "Historical replay unavailable";
+  badge.removeAttribute("title");
+  badge.setAttribute("aria-label", "Historical replay not published");
+}
+
 function opportunityInventoryVisibility(filters = {}) {
   const opportunityClass = filters.opportunity_class || "all";
   const availability = filters.availability || "all";
@@ -2549,6 +2606,19 @@ function renderOpportunityInventory(name, routes, visible) {
   empty.hidden = !visible || routes.length > 0;
 }
 
+function clearCurrentOpportunityInventories() {
+  ["strict", "estimate", "unavailable"].forEach((name) => {
+    const section = byId(`${name}-opportunities`);
+    const body = byId(`${name}-opportunity-body`);
+    const empty = byId(`${name}-opportunity-empty`);
+    const count = byId(`${name}-opportunity-count`);
+    if (section) section.hidden = true;
+    if (body) body.innerHTML = "";
+    if (empty) empty.hidden = true;
+    if (count) count.textContent = "Unavailable";
+  });
+}
+
 function clearHistoricalOpportunityInventory() {
   const root = byId("historical-opportunity-inventory");
   if (root) {
@@ -2564,6 +2634,16 @@ function clearHistoricalOpportunityInventory() {
   if (count) count.textContent = "Unavailable";
   const empty = byId("historical-opportunity-empty");
   if (empty) empty.hidden = true;
+}
+
+function prepareOpportunityScopeLoad(scope) {
+  syncOpportunityScopePresentation(scope);
+  if (scope === "historical") {
+    clearCurrentOpportunityInventories();
+    clearHistoricalOpportunityInventory();
+  } else {
+    clearHistoricalOpportunityInventory();
+  }
 }
 
 function renderOpportunities(payload) {
@@ -2977,6 +3057,7 @@ function clearOpportunityResult(message) {
 async function loadOpportunities(filters = app.route?.filters || {}) {
   const normalized = normalizedOpportunityFilters(filters);
   const scope = opportunityScope(normalized);
+  prepareOpportunityScopeLoad(scope);
   const requestKey = opportunityRequestKey(normalized);
   const requestId = invalidateOpportunityRequest();
   const controller = new AbortController();
@@ -3008,15 +3089,20 @@ async function loadOpportunities(filters = app.route?.filters || {}) {
     ) {
       throw new Error("The opportunity response failed its compact payload contract.");
     }
-    const responseMatches = scope === "historical"
-      ? historicalOpportunityResponseMatchesRequest(payload, normalized)
-      : opportunityResponseMatchesRequest(payload, normalized);
+    const historicalUnavailable = scope === "historical"
+      && historicalOpportunityUnavailableMatchesRequest(payload, normalized);
+    const responseMatches = historicalUnavailable || (
+      scope === "historical"
+        ? historicalOpportunityResponseMatchesRequest(payload, normalized)
+        : opportunityResponseMatchesRequest(payload, normalized)
+    );
     if (!responseMatches) {
       throw new Error(
         "The opportunity response failed its request-bound payload contract.",
       );
     }
-    if (scope === "historical") renderHistoricalOpportunities(payload);
+    if (historicalUnavailable) renderHistoricalOpportunityUnavailable(payload);
+    else if (scope === "historical") renderHistoricalOpportunities(payload);
     else renderOpportunities(payload);
     return true;
   } catch (error) {
