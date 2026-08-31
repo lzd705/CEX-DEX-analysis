@@ -419,6 +419,40 @@ def _third_cohort():
     return _rehash(cohort)
 
 
+class SharedCoreArtifactPrimitiveTests(unittest.TestCase):
+    def test_shared_core_representation_bytes_match_live_publication(self):
+        """Catch a shared primitive that serializes different live bytes."""
+        self.assertTrue(
+            hasattr(route_publication, "_core_representation_artifact_bytes"),
+            "shared core artifact primitive is not implemented",
+        )
+        cohort = _cohort()
+        with tempfile.TemporaryDirectory() as temporary:
+            core_root = Path(temporary) / "core"
+            pointer = publish_route_cohort_bundle(cohort, core_root=core_root)
+            artifacts, files = (
+                route_publication._core_representation_artifact_bytes(cohort)
+            )
+            bundle = core_root / "bundles" / cohort["route_cohort_id"]
+            self.assertEqual(
+                set(artifacts),
+                {
+                    "route_candidates.csv",
+                    "route_legs.csv",
+                    "route_timing.csv",
+                    "route_cohort.sqlite3",
+                },
+            )
+            for filename, expected_bytes in artifacts.items():
+                self.assertEqual((bundle / filename).read_bytes(), expected_bytes)
+            manifest = json.loads((bundle / "manifest.json").read_text())
+            self.assertEqual(manifest["files"], files)
+            self.assertEqual(
+                pointer["manifest_sha256"],
+                hashlib.sha256((bundle / "manifest.json").read_bytes()).hexdigest(),
+            )
+
+
 def _publish_core_with_raw_members(core_root, raw_root):
     cohort = _cohort()
     raw_by_market = {

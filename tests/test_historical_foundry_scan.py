@@ -15,6 +15,7 @@ import json
 import linecache
 import pickle
 import os
+import re
 import sys
 import tempfile
 import traceback
@@ -46,6 +47,7 @@ from scripts.historical_foundry_scan import (
     project_historical_window_projection,
 )
 from tests.test_historical_foundry_rpc import (
+    _address_word,
     _round_data,
     _synthetic_responses,
 )
@@ -572,11 +574,28 @@ class _Task4bOfflineCapabilityFixture:
         split_reserve_root=True,
         record_calls=True,
         reserve_by_target=None,
+        pair_by_venue=None,
     ):
         self.context_factory = context_factory
         self.split_reserve_root = split_reserve_root
         self.record_calls = record_calls
         self.reserve_by_target = reserve_by_target
+        if pair_by_venue is None:
+            pair_by_venue = {
+                "uniswap_v2": PAIR_UNISWAP,
+                "sushiswap_v2": PAIR_SUSHI,
+            }
+        if (
+            type(pair_by_venue) not in (dict, types.MappingProxyType)
+            or set(pair_by_venue) != {"uniswap_v2", "sushiswap_v2"}
+            or any(
+                type(value) is not str
+                or re.fullmatch(r"0x[0-9a-f]{40}", value) is None
+                for value in pair_by_venue.values()
+            )
+        ):
+            raise ValueError("Task4b fixture pair map is invalid")
+        self.pair_by_venue = dict(pair_by_venue)
         self.temporary = None
         self.data_dir = None
         self.capability = None
@@ -608,6 +627,13 @@ class _Task4bOfflineCapabilityFixture:
             headers[anchor_number]["timestamp"],
             round_id,
         )
+        for request_id, venue in (
+            (23, "uniswap_v2"), (24, "uniswap_v2"),
+            (29, "sushiswap_v2"), (30, "sushiswap_v2"),
+        ):
+            scripted[request_id - 1]["result"] = _address_word(
+                self.pair_by_venue[venue]
+            )
         response_by_id = {row["id"]: row for row in scripted}
         search_probes = lower_capture.get("search_probes")
         boundary_witness = lower_capture.get("boundary_witness")
@@ -667,7 +693,7 @@ class _Task4bOfflineCapabilityFixture:
                     request["params"][1]["blockHash"], 16
                 ) - 1
                 target = request["params"][0]["to"].lower()
-                if target in (PAIR_UNISWAP, PAIR_SUSHI):
+                if target in tuple(fixture.pair_by_venue.values()):
                     reserves = (
                         fixture.reserve_by_target.get(target)
                         if fixture.reserve_by_target is not None
@@ -9248,14 +9274,20 @@ class HistoricalPrefilterGridTests(unittest.TestCase):
         return tuple(getattr(scan, name) for name in names)
 
     @staticmethod
-    def _new_fixture():
+    def _new_fixture(*, pair_by_venue=None):
+        if pair_by_venue is None:
+            pair_by_venue = {
+                "uniswap_v2": PAIR_UNISWAP,
+                "sushiswap_v2": PAIR_SUSHI,
+            }
         unit = 10 ** 18
         return _Task4bOfflineCapabilityFixture(
             split_reserve_root=False,
             record_calls=False,
+            pair_by_venue=pair_by_venue,
             reserve_by_target={
-                PAIR_UNISWAP: (4000 * unit, 1000 * unit),
-                PAIR_SUSHI: (1000 * unit, 1000 * unit),
+                pair_by_venue["uniswap_v2"]: (4000 * unit, 1000 * unit),
+                pair_by_venue["sushiswap_v2"]: (1000 * unit, 1000 * unit),
             },
         )
 
@@ -10793,8 +10825,19 @@ class HistoricalCandidateSelectionTests(unittest.TestCase):
 
     def test_phase3_preflight_fixture_is_deterministic_test_only_projection(self):
         from tests.historical_foundry_task7_fixture import (
+            historical_phase3_mainnet_pair_by_venue,
             PHASE3_FINAL_RUN_FIXTURE_SCHEMA,
             canonical_phase3_final_run_fixture,
+        )
+
+        self.assertEqual(
+            historical_phase3_mainnet_pair_by_venue(),
+            {
+                "uniswap_v2":
+                    "0xd3d2e2692501a5c9ca623199d38826e513033a17",
+                "sushiswap_v2":
+                    "0xdafd66636e2561b0284edde37e42d192f2844d40",
+            },
         )
 
         values = {

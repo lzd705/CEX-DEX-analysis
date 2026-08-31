@@ -13,6 +13,15 @@ from types import MappingProxyType
 PHASE3_FINAL_RUN_FIXTURE_SCHEMA = (
     "historical_foundry_phase3_final_run_fixture/v1"
 )
+_PHASE3_MAINNET_PAIR_BY_VENUE = MappingProxyType({
+    "uniswap_v2": "0xd3d2e2692501a5c9ca623199d38826e513033a17",
+    "sushiswap_v2": "0xdafd66636e2561b0284edde37e42d192f2844d40",
+})
+
+
+def historical_phase3_mainnet_pair_by_venue():
+    """Return the fixed real-pair input for the existing Task-7 harness."""
+    return MappingProxyType(dict(_PHASE3_MAINNET_PAIR_BY_VENUE))
 
 
 def canonical_phase3_final_run_fixture(

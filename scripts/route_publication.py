@@ -2379,12 +2379,20 @@ def _manifest_payload(
     }
 
 
-def _write_bundle_artifacts(
-    stage_path: Path,
+def _core_representation_artifact_bytes(
     cohort: Mapping[str, Any],
-    *,
-    stage_fd: Optional[int] = None,
-) -> None:
+) -> Tuple[Dict[str, bytes], Dict[str, Dict[str, Any]]]:
+    """Build the four existing core representations from a validated cohort."""
+    normalized = _normalize_and_validate_cohort(cohort)
+    return _core_representation_artifact_bytes_from_validated_cohort(
+        normalized
+    )
+
+
+def _core_representation_artifact_bytes_from_validated_cohort(
+    cohort: Mapping[str, Any],
+) -> Tuple[Dict[str, bytes], Dict[str, Dict[str, Any]]]:
+    """Serialize a cohort already closed by its profile-specific validator."""
     route_cohort_id = str(cohort["route_cohort_id"])
     candidate_bytes = _csv_bytes(
         CANDIDATE_COLUMNS,
@@ -2400,7 +2408,9 @@ def _write_bundle_artifacts(
     )
     with tempfile.TemporaryDirectory(prefix="route-cohort-sqlite-build-") as temporary:
         database_path = Path(temporary) / ROUTE_SQLITE_FILENAME
-        sqlite_logical = build_route_cohort_sqlite(database_path, cohort)
+        sqlite_logical = _build_route_cohort_sqlite_file(
+            database_path, cohort
+        )
         database_bytes = _read_bounded_bytes(
             database_path,
             limit=_MAX_SQLITE_BYTES,
@@ -2443,12 +2453,24 @@ def _write_bundle_artifacts(
             ),
         ),
     }
-    manifest = _manifest_payload(cohort, files)
-    artifact_bytes = {
+    return {
         ROUTE_CANDIDATES_FILENAME: candidate_bytes,
         ROUTE_LEGS_FILENAME: leg_bytes,
         ROUTE_TIMING_FILENAME: timing_bytes,
         ROUTE_SQLITE_FILENAME: database_bytes,
+    }, files
+
+
+def _write_bundle_artifacts(
+    stage_path: Path,
+    cohort: Mapping[str, Any],
+    *,
+    stage_fd: Optional[int] = None,
+) -> None:
+    representation_bytes, files = _core_representation_artifact_bytes(cohort)
+    manifest = _manifest_payload(cohort, files)
+    artifact_bytes = {
+        **representation_bytes,
         MANIFEST_FILENAME: json.dumps(
             manifest,
             ensure_ascii=False,
