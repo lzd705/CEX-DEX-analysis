@@ -2770,7 +2770,7 @@ class DexDepthCollectionTest(unittest.TestCase):
         )
         self.assertEqual(
             {call["max_retries"] for call in transport.calls},
-            {2},
+            {1},
         )
 
     def test_success_restores_unbound_client_and_later_call_ignores_route_deadline(self):
@@ -3073,7 +3073,7 @@ class RpcEndpointFailoverTest(unittest.TestCase):
         self.assertNotIn("fallback-secret", retained)
 
     def test_http_json_rpc_retries_direct_timeouterror(self):
-        from scripts.fetch_dex_depth import http_json_rpc
+        from scripts.fetch_dex_depth import RpcTransportError, http_json_rpc
 
         attempts = []
 
@@ -3082,7 +3082,10 @@ class RpcEndpointFailoverTest(unittest.TestCase):
             raise TimeoutError("private timeout")
 
         with patch("urllib.request.urlopen", timeout), patch("time.sleep") as sleep:
-            with self.assertRaises(TimeoutError):
+            with self.assertRaisesRegex(
+                RpcTransportError,
+                "^rpc_transport_failed$",
+            ) as raised:
                 http_json_rpc(
                     "https://rpc.example.test",
                     {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
@@ -3090,6 +3093,392 @@ class RpcEndpointFailoverTest(unittest.TestCase):
                 )
         self.assertEqual(attempts, ["timeout", "timeout"])
         sleep.assert_called_once_with(1.0)
+        self.assertEqual(raised.exception.outcome, "timeout")
+        self.assertNotIn("private timeout", str(raised.exception))
+
+    def test_malformed_scalar_fallback_and_injected_urls_fail_without_echo(self):
+        from scripts.fetch_dex_depth import (
+            RpcClient,
+            RpcConfigurationError,
+            RpcEndpoint,
+            rpc_endpoints_for_chain,
+        )
+
+        malformed = "https://user:password@example.test:bad/rpc?api_key=private"
+        cases = (
+            {
+                "DEX_DEPTH_RPC_ETH": malformed,
+            },
+            {
+                "DEX_DEPTH_RPC_ETH": "https://rpc.example.test",
+                "DEX_DEPTH_RPC_ETH_FALLBACKS": json.dumps([malformed]),
+            },
+            {
+                "DEX_DEPTH_RPC_ETH": (
+                    "ftp://user:password@example.test/rpc?api_key=private"
+                ),
+            },
+        )
+        for environment in cases:
+            with self.subTest(environment=tuple(environment)), patch.dict(
+                os.environ,
+                environment,
+                clear=True,
+            ):
+                with self.assertRaisesRegex(
+                    RpcConfigurationError,
+                    "^invalid_rpc_endpoint$",
+                ) as raised:
+                    rpc_endpoints_for_chain("eth")
+                self.assertNotIn("password", str(raised.exception))
+                self.assertNotIn("api_key", str(raised.exception))
+                self.assertIsNone(raised.exception.__cause__)
+
+        for build in (
+            lambda: RpcEndpoint("eth-primary", malformed),
+            lambda: RpcClient("eth", malformed),
+            lambda: RpcClient("eth", malformed, endpoints=self._endpoints()),
+        ):
+            with self.subTest(build=build):
+                with self.assertRaisesRegex(
+                    RpcConfigurationError,
+                    "^invalid_rpc_endpoint$",
+                ) as raised:
+                    build()
+                self.assertNotIn("password", str(raised.exception))
+                self.assertNotIn("api_key", str(raised.exception))
+                self.assertIsNone(raised.exception.__cause__)
+
+    def test_retry_configuration_cannot_exceed_four_attempts(self):
+        from scripts.fetch_dex_depth import (
+            RpcConfigurationError,
+            http_json_rpc,
+        )
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_chainId",
+            "params": [],
+        }
+        for invalid_retries in (True, None, 5):
+            with self.subTest(invalid_retries=invalid_retries), patch(
+                "urllib.request.urlopen"
+            ) as urlopen:
+                with self.assertRaisesRegex(
+                    RpcConfigurationError,
+                    "^invalid_rpc_retry_configuration$",
+                ):
+                    http_json_rpc(
+                        "https://rpc.example.test",
+                        payload,
+                        max_retries=invalid_retries,
+                    )
+                urlopen.assert_not_called()
+
+    def test_request_construction_failure_is_bounded_and_suppresses_raw_context(self):
+        from scripts.fetch_dex_depth import RpcConfigurationError, http_json_rpc
+
+        with patch(
+            "urllib.request.Request",
+            side_effect=ValueError("private URL query and header failure"),
+        ):
+            with self.assertRaisesRegex(
+                RpcConfigurationError,
+                "^invalid_rpc_request$",
+            ) as raised:
+                http_json_rpc(
+                    "https://rpc.example.test",
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "eth_chainId",
+                        "params": [],
+                    },
+                )
+
+        self.assertNotIn("private", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_non_hop_http_error_is_typed_bounded_and_does_not_switch(self):
+        from scripts.fetch_dex_depth import RpcClient, RpcTransportError
+
+        calls = []
+
+        def request(url, _payload):
+            calls.append(url)
+            raise urllib.error.HTTPError(
+                url,
+                418,
+                "private exception reason",
+                {"X-Private": "secret-header"},
+                None,
+            )
+
+        client = RpcClient(
+            "eth",
+            self._endpoints()[0].url,
+            endpoints=self._endpoints(),
+            request=request,
+        )
+        with self.assertRaisesRegex(
+            RpcTransportError,
+            "^rpc_transport_failed$",
+        ) as raised:
+            client.method("eth_chainId", [])
+
+        self.assertEqual(calls, [self._endpoints()[0].url])
+        self.assertEqual(client.open_endpoint_ids, ())
+        self.assertEqual(client.endpoint_generation, 0)
+        retained = json.dumps(client.endpoint_attempts, sort_keys=True)
+        for private_value in (
+            "primary-secret",
+            "fallback-secret",
+            "private exception reason",
+            "secret-header",
+        ):
+            self.assertNotIn(private_value, str(raised.exception))
+            self.assertNotIn(private_value, retained)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_collection_deadline_exception_never_retries_opens_or_hops(self):
+        from scripts.collection_deadline import CollectionDeadlineExceeded
+        from scripts.fetch_dex_depth import RpcClient
+
+        calls = []
+
+        def request(url, _payload):
+            calls.append(url)
+            raise CollectionDeadlineExceeded("collection deadline exceeded")
+
+        client = RpcClient(
+            "eth",
+            self._endpoints()[0].url,
+            endpoints=self._endpoints(),
+            request=request,
+        )
+        with self.assertRaisesRegex(
+            CollectionDeadlineExceeded,
+            "^collection deadline exceeded$",
+        ):
+            client.method("eth_chainId", [])
+
+        self.assertEqual(calls, [self._endpoints()[0].url])
+        self.assertEqual(client.open_endpoint_ids, ())
+        self.assertEqual(client.endpoint_generation, 0)
+
+    def test_expired_deadline_aborts_before_retry_or_endpoint_switch(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+        from scripts.fetch_dex_depth import RpcClient
+
+        for failure in (
+            urllib.error.URLError("private DNS failure"),
+            urllib.error.HTTPError(
+                self._endpoints()[0].url,
+                403,
+                "private forbidden",
+                {},
+                None,
+            ),
+        ):
+            class Clock:
+                now = 0.0
+
+                def monotonic(self):
+                    return self.now
+
+            clock = Clock()
+            calls = []
+
+            def request(url, _payload, **_kwargs):
+                calls.append(url)
+                clock.now = 2.0
+                raise failure
+
+            with self.subTest(failure=failure.__class__.__name__):
+                client = RpcClient(
+                    "eth",
+                    self._endpoints()[0].url,
+                    endpoints=self._endpoints(),
+                    request=request,
+                    deadline=CollectionDeadline.for_duration(
+                        1,
+                        clock=clock.monotonic,
+                        sleeper=lambda _seconds: None,
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    CollectionDeadlineExceeded,
+                    "^collection deadline exceeded$",
+                ):
+                    client.method("eth_chainId", [])
+                self.assertEqual(calls, [self._endpoints()[0].url])
+                self.assertEqual(client.open_endpoint_ids, ())
+                self.assertEqual(client.endpoint_generation, 0)
+
+    def test_real_default_transport_has_one_four_attempt_owner_and_exact_ledger(self):
+        from scripts.fetch_dex_depth import RpcClient
+
+        calls = []
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.payload
+
+        def urlopen(request, **_kwargs):
+            calls.append(request.full_url)
+            if "primary" in request.full_url:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    503,
+                    "private outage",
+                    {},
+                    None,
+                )
+            return Response(b'{"jsonrpc":"2.0","id":1,"result":"0x1"}')
+
+        client = RpcClient(
+            "eth",
+            self._endpoints()[0].url,
+            endpoints=self._endpoints(),
+            sleeper=lambda _seconds: None,
+        )
+        with patch("urllib.request.urlopen", urlopen), patch("time.sleep"):
+            self.assertEqual(client.method("eth_chainId", []), "0x1")
+
+        self.assertEqual(
+            calls,
+            [self._endpoints()[0].url] * 4 + [self._endpoints()[1].url],
+        )
+        self.assertEqual(len(client.endpoint_attempts), 5)
+        self.assertEqual(
+            [record["attempt_ordinal"] for record in client.endpoint_attempts],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertEqual(
+            [record["decision"] for record in client.endpoint_attempts],
+            ["retry", "retry", "retry", "switch", "use"],
+        )
+
+    def test_401_and_404_switch_immediately_without_retry(self):
+        from scripts.fetch_dex_depth import RpcClient
+
+        for status in (401, 404):
+            calls = []
+
+            def request(url, payload):
+                calls.append(url)
+                if "primary" in url:
+                    raise urllib.error.HTTPError(url, status, "private", {}, None)
+                return self._result(payload)
+
+            with self.subTest(status=status):
+                client = RpcClient(
+                    "eth",
+                    self._endpoints()[0].url,
+                    endpoints=self._endpoints(),
+                    request=request,
+                    sleeper=lambda _seconds: self.fail("must not retry"),
+                )
+                self.assertEqual(client.method("eth_chainId", []), "0x1")
+                self.assertEqual(
+                    calls,
+                    [self._endpoints()[0].url, self._endpoints()[1].url],
+                )
+
+    def test_terminal_exhaustion_does_not_advance_selected_generation(self):
+        from scripts.fetch_dex_depth import RpcClient, RpcError
+
+        def request(url, _payload):
+            raise urllib.error.HTTPError(url, 403, "private", {}, None)
+
+        client = RpcClient(
+            "eth",
+            self._endpoints()[0].url,
+            endpoints=self._endpoints(),
+            request=request,
+        )
+        with self.assertRaisesRegex(RpcError, "^rpc_endpoint_exhausted$"):
+            client.method("eth_chainId", [])
+
+        self.assertEqual(client.endpoint_generation, 1)
+        self.assertEqual(client.selected_endpoint_id, "eth-fallback-1")
+        self.assertEqual(
+            [record["decision"] for record in client.endpoint_attempts],
+            ["switch", "exhausted"],
+        )
+
+    def test_attempt_ledger_has_a_hard_retention_cap(self):
+        from scripts.fetch_dex_depth import (
+            MAX_RPC_ATTEMPT_RECORDS,
+            RpcClient,
+        )
+
+        client = RpcClient(
+            "eth",
+            "https://rpc.example.test",
+            request=lambda _url, payload: self._result(payload),
+        )
+        for index in range(MAX_RPC_ATTEMPT_RECORDS + 3):
+            self.assertEqual(client.method("method_{}".format(index), []), "0x1")
+
+        self.assertEqual(len(client.endpoint_attempts), MAX_RPC_ATTEMPT_RECORDS)
+        self.assertEqual(client.endpoint_attempts_dropped, 3)
+        self.assertEqual(
+            [record["attempt_ordinal"] for record in client.endpoint_attempts],
+            list(range(1, MAX_RPC_ATTEMPT_RECORDS + 1)),
+        )
+
+    def test_standalone_http_json_rpc_retains_four_attempt_budget_with_typed_error(self):
+        from scripts.fetch_dex_depth import RpcTransportError, http_json_rpc
+
+        calls = []
+
+        def unavailable(request, **_kwargs):
+            calls.append(request.full_url)
+            raise urllib.error.HTTPError(
+                request.full_url,
+                503,
+                "private provider outage",
+                {"X-Private": "header-secret"},
+                None,
+            )
+
+        with patch("urllib.request.urlopen", unavailable), patch("time.sleep"):
+            with self.assertRaisesRegex(
+                RpcTransportError,
+                "^rpc_transport_failed$",
+            ) as raised:
+                http_json_rpc(
+                    "https://user:password@rpc.example.test/rpc?api_key=secret",
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "eth_chainId",
+                        "params": [],
+                    },
+                )
+
+        self.assertEqual(len(calls), 4)
+        self.assertNotIn("password", str(raised.exception))
+        self.assertNotIn("api_key", str(raised.exception))
+        self.assertNotIn("header-secret", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertTrue(raised.exception.__suppress_context__)
 
 
 if __name__ == "__main__":

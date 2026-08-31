@@ -220,6 +220,9 @@ DEX_EXECUTION_EXCLUDED_COSTS = (
 )
 REQUEST_SLEEP_SECONDS = 0.15
 MAX_RETRIES = 4
+MAX_RPC_ENDPOINTS = 3
+MAX_RPC_ATTEMPT_RECORDS = MAX_RPC_ENDPOINTS * MAX_RETRIES
+MAX_RPC_RETRY_DELAY_SECONDS = 8.0
 Q96 = Decimal(2**96)
 ONE_MILLION = Decimal(1_000_000)
 TLS_CONTEXT = (
@@ -391,6 +394,28 @@ class RpcError(RuntimeError):
     """Raised when a JSON-RPC endpoint returns no usable result."""
 
 
+class RpcConfigurationError(ValueError):
+    """Raised for bounded, sanitized RPC configuration failures."""
+
+
+class RpcTransportError(RpcError):
+    """A sanitized transport failure with bounded failover metadata."""
+
+    def __init__(
+        self,
+        *,
+        outcome: str,
+        http_status: int | None = None,
+        retryable: bool,
+        failover_eligible: bool,
+    ) -> None:
+        super().__init__("rpc_transport_failed")
+        self.outcome = outcome
+        self.http_status = http_status
+        self.retryable = retryable
+        self.failover_eligible = failover_eligible
+
+
 class UsdPriceTimeMismatch(ValueError):
     """Pool state and its USD conversion evidence are not time-aligned."""
 
@@ -399,6 +424,8 @@ def dex_depth_failure_reason_code(error: BaseException) -> str:
     """Classify typed DEX-depth failures without parsing raw messages."""
     if isinstance(error, UsdPriceTimeMismatch):
         return "depth_usd_price_time_mismatch"
+    if isinstance(error, RpcTransportError) and error.http_status == 429:
+        return "rate_limit"
     if isinstance(error, urllib.error.HTTPError):
         if error.code == 429:
             return "rate_limit"
@@ -497,6 +524,105 @@ def sanitize_endpoint(url: str) -> str:
         return canonical_endpoint
     digest = hashlib.sha256(canonical_endpoint.encode("utf-8")).hexdigest()
     return "rpc-endpoint-sha256:{}".format(digest)
+
+
+def validate_rpc_endpoint_url(url: Any) -> str:
+    """Accept only structurally valid HTTP(S) RPC URLs without echoing them."""
+    try:
+        if not isinstance(url, str) or not url:
+            raise ValueError
+        if any(ord(character) < 32 or character.isspace() for character in url):
+            raise ValueError
+        if re.search(r"%(?![0-9a-fA-F]{2})", url):
+            raise ValueError
+        parsed = urllib.parse.urlsplit(url)
+        hostname = parsed.hostname
+        _port = parsed.port
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.netloc
+            or not hostname
+            or parsed.fragment
+            or any(character in hostname for character in "/\\?#@")
+        ):
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise RpcConfigurationError("invalid_rpc_endpoint") from None
+    return url
+
+
+def _bounded_rpc_transport_error(error: BaseException) -> RpcTransportError:
+    if isinstance(error, CollectionDeadlineExceeded):
+        raise error from None
+    if isinstance(error, RpcTransportError):
+        return error
+    if isinstance(error, urllib.error.HTTPError):
+        status = error.code if type(error.code) is int else None
+        if status in (401, 403, 404):
+            return RpcTransportError(
+                outcome="provider_rejected",
+                http_status=status,
+                retryable=False,
+                failover_eligible=True,
+            )
+        if status == 429:
+            return RpcTransportError(
+                outcome="rate_limited",
+                http_status=status,
+                retryable=True,
+                failover_eligible=True,
+            )
+        if status is not None and 500 <= status < 600:
+            return RpcTransportError(
+                outcome="provider_unavailable",
+                http_status=status,
+                retryable=True,
+                failover_eligible=True,
+            )
+        return RpcTransportError(
+            outcome="http_error",
+            http_status=status,
+            retryable=False,
+            failover_eligible=False,
+        )
+    if isinstance(error, urllib.error.URLError):
+        if isinstance(error.reason, CollectionDeadlineExceeded):
+            raise error.reason from None
+        return RpcTransportError(
+            outcome="network_error",
+            retryable=True,
+            failover_eligible=True,
+        )
+    if isinstance(error, TimeoutError):
+        return RpcTransportError(
+            outcome="timeout",
+            retryable=True,
+            failover_eligible=True,
+        )
+    if isinstance(error, OSError):
+        return RpcTransportError(
+            outcome="network_error",
+            retryable=True,
+            failover_eligible=True,
+        )
+    return RpcTransportError(
+        outcome="transport_error",
+        retryable=False,
+        failover_eligible=False,
+    )
+
+
+def _rpc_retry_delay(error: BaseException, attempt: int) -> float:
+    retry_after = 0.0
+    if isinstance(error, urllib.error.HTTPError):
+        try:
+            retry_after = float(error.headers.get("Retry-After") or 0)
+        except (AttributeError, TypeError, ValueError):
+            retry_after = 0.0
+    return min(
+        max(0.0, retry_after, float(2 ** attempt)),
+        MAX_RPC_RETRY_DELAY_SECONDS,
+    )
 
 
 def is_canonical_rpc_quantity(value: Any) -> bool:
@@ -652,7 +778,8 @@ def redacted_rpc_record_response(payload: Any, response: Any) -> Any:
 def rpc_url_for_chain(chain: str) -> str | None:
     normalized = chain.lower()
     configured = os.environ.get(RPC_ENV_KEYS.get(normalized, ""))
-    return configured or DEFAULT_RPC_URLS.get(normalized)
+    url = configured or DEFAULT_RPC_URLS.get(normalized)
+    return validate_rpc_endpoint_url(url) if url is not None else None
 
 
 @dataclass(frozen=True)
@@ -664,6 +791,7 @@ class RpcEndpoint:
     identity: str = ""
 
     def __post_init__(self) -> None:
+        validate_rpc_endpoint_url(self.url)
         object.__setattr__(self, "identity", sanitize_endpoint(self.url))
 
 
@@ -680,16 +808,16 @@ def rpc_endpoints_for_chain(chain: str) -> tuple[RpcEndpoint, ...]:
     else:
         try:
             fallbacks = json.loads(fallback_value)
-        except json.JSONDecodeError as error:
-            raise ValueError("RPC fallback configuration must be a JSON array") from error
+        except (json.JSONDecodeError, TypeError):
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
         if not isinstance(fallbacks, list):
-            raise ValueError("RPC fallback configuration must be a JSON array")
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
         if any(not isinstance(item, str) or not item.strip() for item in fallbacks):
-            raise ValueError("RPC fallback configuration contains an empty fallback")
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
         if len(fallbacks) > 2:
-            raise ValueError("RPC fallback configuration exceeds the endpoint limit")
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
         if len({primary, *fallbacks}) != len(fallbacks) + 1:
-            raise ValueError("RPC fallback configuration contains a duplicate fallback")
+            raise RpcConfigurationError("invalid_rpc_fallbacks") from None
     urls = [primary, *fallbacks]
     return tuple(
         RpcEndpoint(
@@ -839,25 +967,35 @@ def http_json_rpc(
     timeout_seconds: float = 30,
     max_retries: int = MAX_RETRIES,
 ) -> tuple[Any, bytes]:
-    if max_retries < 1:
-        raise ValueError("max_retries must be at least 1")
-    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=encoded,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "CEX-DEX-Market-Monitor/2.0",
-        },
-        method="POST",
-    )
+    validate_rpc_endpoint_url(url)
+    if type(max_retries) is not int or not 1 <= max_retries <= MAX_RETRIES:
+        raise RpcConfigurationError("invalid_rpc_retry_configuration") from None
+    try:
+        configured_timeout = float(timeout_seconds)
+    except (TypeError, ValueError):
+        raise RpcConfigurationError("invalid_rpc_timeout") from None
+    if not math.isfinite(configured_timeout) or configured_timeout <= 0:
+        raise RpcConfigurationError("invalid_rpc_timeout") from None
+    try:
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=encoded,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "CEX-DEX-Market-Monitor/2.0",
+            },
+            method="POST",
+        )
+    except Exception:
+        raise RpcConfigurationError("invalid_rpc_request") from None
     for attempt in range(max_retries):
         try:
             timeout = (
-                deadline.request_timeout(timeout_seconds)
+                deadline.request_timeout(configured_timeout)
                 if deadline is not None
-                else timeout_seconds
+                else configured_timeout
             )
             with urllib.request.urlopen(
                 request,
@@ -866,29 +1004,32 @@ def http_json_rpc(
             ) as response:
                 raw = response.read()
                 return json.loads(raw.decode("utf-8")), raw
-        except urllib.error.HTTPError as error:
+        except CollectionDeadlineExceeded as error:
+            raise error from None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise
+        except Exception as error:
+            transport_error = _bounded_rpc_transport_error(error)
             if deadline is not None:
-                deadline.require_remaining()
-            retryable = error.code == 429 or 500 <= error.code < 600
-            if not retryable or attempt + 1 >= max_retries:
-                raise
-            retry_after = float(error.headers.get("Retry-After") or 0)
-            delay = max(retry_after, 2 ** attempt)
+                try:
+                    deadline.require_remaining()
+                except CollectionDeadlineExceeded as deadline_error:
+                    raise deadline_error from None
+            if not transport_error.retryable or attempt + 1 >= max_retries:
+                raise transport_error from None
+            delay = _rpc_retry_delay(error, attempt)
             if deadline is not None:
-                deadline.sleep_before_retry(delay)
+                try:
+                    deadline.sleep_before_retry(delay)
+                except CollectionDeadlineExceeded as deadline_error:
+                    raise deadline_error from None
             else:
                 time.sleep(delay)
-        except (urllib.error.URLError, TimeoutError):
-            if deadline is not None:
-                deadline.require_remaining()
-            if attempt + 1 >= max_retries:
-                raise
-            delay = max(1.0, 2 ** attempt)
-            if deadline is not None:
-                deadline.sleep_before_retry(delay)
-            else:
-                time.sleep(delay)
-    raise RpcError(f"JSON-RPC request failed after retries: {sanitize_endpoint(url)}")
+    raise RpcTransportError(
+        outcome="transport_error",
+        retryable=False,
+        failover_eligible=False,
+    ) from None
 
 
 class RpcClient:
@@ -897,7 +1038,7 @@ class RpcClient:
         chain: str,
         url: str,
         *,
-        request: Callable[[str, Any], tuple[Any, bytes]] = http_json_rpc,
+        request: Callable[[str, Any], tuple[Any, bytes]] | None = None,
         deadline: CollectionDeadline | None = None,
         timeout_seconds: float = 30,
         max_retries: int = MAX_RETRIES,
@@ -906,7 +1047,11 @@ class RpcClient:
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.chain = chain
-        endpoint_pool = tuple(endpoints or ())
+        validate_rpc_endpoint_url(url)
+        try:
+            endpoint_pool = tuple(endpoints or ())
+        except Exception:
+            raise RpcConfigurationError("invalid_rpc_endpoint_pool") from None
         if not endpoint_pool:
             endpoint_pool = (
                 RpcEndpoint(
@@ -914,29 +1059,68 @@ class RpcClient:
                     url,
                 ),
             )
-        if len(endpoint_pool) > 3:
-            raise ValueError("RPC endpoint pool exceeds the endpoint limit")
-        if len({item.endpoint_id for item in endpoint_pool}) != len(endpoint_pool):
-            raise ValueError("RPC endpoint pool contains duplicate endpoint IDs")
+        if (
+            len(endpoint_pool) > MAX_RPC_ENDPOINTS
+            or any(not isinstance(item, RpcEndpoint) for item in endpoint_pool)
+            or len({item.endpoint_id for item in endpoint_pool}) != len(endpoint_pool)
+        ):
+            raise RpcConfigurationError("invalid_rpc_endpoint_pool") from None
+        expected_ids = tuple(
+            "{}-primary".format(chain.lower())
+            if index == 0
+            else "{}-fallback-{}".format(chain.lower(), index)
+            for index in range(len(endpoint_pool))
+        )
+        if tuple(item.endpoint_id for item in endpoint_pool) != expected_ids:
+            raise RpcConfigurationError("invalid_rpc_endpoint_pool") from None
         self._endpoints = endpoint_pool
         self._endpoint_index = 0
         self.url = endpoint_pool[0].url
         self.endpoint = endpoint_pool[0].identity
-        self.request = request
+        if request is not None and not callable(request):
+            raise RpcConfigurationError("invalid_rpc_request_boundary") from None
+        self._uses_default_request = request is None
+        self.request = request or self._default_one_attempt_request
         self.deadline = deadline
         self._call_deadline = deadline
-        self.timeout_seconds = timeout_seconds
+        try:
+            self.timeout_seconds = float(timeout_seconds)
+        except (TypeError, ValueError):
+            raise RpcConfigurationError("invalid_rpc_timeout") from None
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise RpcConfigurationError("invalid_rpc_timeout") from None
         self.max_retries = max_retries
-        if self.max_retries < 1:
-            raise ValueError("max_retries must be at least 1")
+        if type(self.max_retries) is not int or not 1 <= self.max_retries <= MAX_RETRIES:
+            raise RpcConfigurationError("invalid_rpc_retry_configuration") from None
         self.clock = clock
         self.sleeper = sleeper
         self.records: list[dict[str, Any]] = []
         self.endpoint_attempts: list[dict[str, Any]] = []
         self.attempt_ledger = self.endpoint_attempts
+        self.endpoint_attempts_dropped = 0
+        self._network_attempt_ordinal = 0
         self.endpoint_generation = 0
+        self.selected_endpoint_id = endpoint_pool[0].endpoint_id
         self._open_endpoint_ids: set[str] = set()
         self._next_id = 1
+
+    @staticmethod
+    def _default_one_attempt_request(
+        url: str,
+        payload: Any,
+        *,
+        deadline: CollectionDeadline | None = None,
+        timeout_seconds: float = 30,
+        max_retries: int = 1,
+    ) -> tuple[Any, bytes]:
+        del max_retries
+        return http_json_rpc(
+            url,
+            payload,
+            deadline=deadline,
+            timeout_seconds=timeout_seconds,
+            max_retries=1,
+        )
 
     @property
     def open_endpoint_ids(self) -> tuple[str, ...]:
@@ -950,26 +1134,13 @@ class RpcClient:
         while self._endpoint_index < len(self._endpoints):
             endpoint = self._endpoints[self._endpoint_index]
             if endpoint.endpoint_id not in self._open_endpoint_ids:
+                if endpoint.endpoint_id != self.selected_endpoint_id:
+                    self.endpoint_generation += 1
+                    self.selected_endpoint_id = endpoint.endpoint_id
                 self.url = endpoint.url
                 self.endpoint = endpoint.identity
                 return endpoint
             self._endpoint_index += 1
-        return None
-
-    @staticmethod
-    def _retryable_transport_error(error: BaseException) -> tuple[str, int | None, bool] | None:
-        if isinstance(error, urllib.error.HTTPError):
-            if error.code in (401, 403, 404):
-                return "provider_rejected", error.code, False
-            if error.code == 429:
-                return "rate_limited", error.code, True
-            if 500 <= error.code < 600:
-                return "provider_unavailable", error.code, True
-            return None
-        if isinstance(error, urllib.error.URLError):
-            return "network_error", None, True
-        if isinstance(error, TimeoutError):
-            return "timeout", None, True
         return None
 
     def _record_endpoint_attempt(
@@ -980,8 +1151,13 @@ class RpcClient:
         outcome: str,
         decision: str,
         duration_seconds: float,
+        attempt_ordinal: int,
+        endpoint_attempt: int,
         http_status: int | None = None,
     ) -> None:
+        if len(self.endpoint_attempts) >= MAX_RPC_ATTEMPT_RECORDS:
+            self.endpoint_attempts_dropped += 1
+            return
         record: dict[str, Any] = {
             "endpoint_id": endpoint.endpoint_id,
             "endpoint": endpoint.identity,
@@ -993,6 +1169,8 @@ class RpcClient:
             "outcome": outcome,
             "decision": decision,
             "duration_seconds": round(max(0.0, duration_seconds), 6),
+            "attempt_ordinal": attempt_ordinal,
+            "endpoint_attempt": endpoint_attempt,
         }
         if http_status is not None:
             record["http_status"] = http_status
@@ -1004,6 +1182,14 @@ class RpcClient:
         payload: Any,
         effective_deadline: CollectionDeadline | None,
     ) -> tuple[Any, bytes]:
+        if self._uses_default_request:
+            return self.request(
+                endpoint.url,
+                payload,
+                deadline=effective_deadline,
+                timeout_seconds=self.timeout_seconds,
+                max_retries=1,
+            )
         if (
             effective_deadline is None
             and self.timeout_seconds == 30
@@ -1015,7 +1201,7 @@ class RpcClient:
             payload,
             deadline=effective_deadline,
             timeout_seconds=self.timeout_seconds,
-            max_retries=self.max_retries,
+            max_retries=1,
         )
 
     def _sleep_before_retry(
@@ -1023,9 +1209,12 @@ class RpcClient:
         effective_deadline: CollectionDeadline | None,
         attempt: int,
     ) -> None:
-        delay = float(2 ** attempt)
+        delay = min(float(2 ** attempt), MAX_RPC_RETRY_DELAY_SECONDS)
         if effective_deadline is not None:
-            effective_deadline.sleep_before_retry(delay)
+            try:
+                effective_deadline.sleep_before_retry(delay)
+            except CollectionDeadlineExceeded as error:
+                raise error from None
         else:
             self.sleeper(delay)
 
@@ -1033,12 +1222,15 @@ class RpcClient:
         effective_deadline = self._call_deadline or self.deadline
         if effective_deadline is not None:
             effective_deadline.require_remaining()
-        attempts_per_endpoint = 1 if self.request is http_json_rpc else self.max_retries
         while True:
+            if effective_deadline is not None:
+                effective_deadline.require_remaining()
             endpoint = self._active_endpoint()
             if endpoint is None:
                 raise RpcError("rpc_endpoint_exhausted")
-            for attempt in range(attempts_per_endpoint):
+            for attempt in range(self.max_retries):
+                self._network_attempt_ordinal += 1
+                attempt_ordinal = self._network_attempt_ordinal
                 started = self.clock()
                 try:
                     response, raw = self._request_endpoint(
@@ -1046,34 +1238,98 @@ class RpcClient:
                         payload,
                         effective_deadline,
                     )
+                except CollectionDeadlineExceeded as error:
+                    self._record_endpoint_attempt(
+                        endpoint,
+                        payload,
+                        outcome="deadline_exceeded",
+                        decision="abort",
+                        duration_seconds=self.clock() - started,
+                        attempt_ordinal=attempt_ordinal,
+                        endpoint_attempt=attempt + 1,
+                    )
+                    raise error from None
                 except Exception as error:
-                    classified = self._retryable_transport_error(error)
-                    if classified is None:
+                    if isinstance(error, RpcConfigurationError):
+                        self._record_endpoint_attempt(
+                            endpoint,
+                            payload,
+                            outcome="configuration_error",
+                            decision="abort",
+                            duration_seconds=self.clock() - started,
+                            attempt_ordinal=attempt_ordinal,
+                            endpoint_attempt=attempt + 1,
+                        )
+                        raise error from None
+                    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+                        self._record_endpoint_attempt(
+                            endpoint,
+                            payload,
+                            outcome="protocol_error",
+                            decision="abort",
+                            duration_seconds=self.clock() - started,
+                            attempt_ordinal=attempt_ordinal,
+                            endpoint_attempt=attempt + 1,
+                        )
                         raise
-                    outcome, http_status, retryable = classified
-                    is_last_attempt = attempt + 1 >= attempts_per_endpoint
-                    if retryable and not is_last_attempt:
+                    if isinstance(error, RpcError) and not isinstance(
+                        error,
+                        RpcTransportError,
+                    ):
+                        self._record_endpoint_attempt(
+                            endpoint,
+                            payload,
+                            outcome="protocol_error",
+                            decision="abort",
+                            duration_seconds=self.clock() - started,
+                            attempt_ordinal=attempt_ordinal,
+                            endpoint_attempt=attempt + 1,
+                        )
+                        raise
+                    transport_error = _bounded_rpc_transport_error(error)
+                    is_last_attempt = attempt + 1 >= self.max_retries
+                    if effective_deadline is not None:
+                        try:
+                            effective_deadline.require_remaining()
+                        except CollectionDeadlineExceeded as deadline_error:
+                            self._record_endpoint_attempt(
+                                endpoint,
+                                payload,
+                                outcome="deadline_exceeded",
+                                decision="abort",
+                                duration_seconds=self.clock() - started,
+                                attempt_ordinal=attempt_ordinal,
+                                endpoint_attempt=attempt + 1,
+                            )
+                            raise deadline_error from None
+                    has_next_endpoint = self._endpoint_index + 1 < len(
+                        self._endpoints
+                    )
+                    if not transport_error.failover_eligible:
+                        decision = "abort"
+                    elif transport_error.retryable and not is_last_attempt:
                         decision = "retry"
-                    elif self._endpoint_index + 1 < len(self._endpoints):
+                    elif has_next_endpoint:
                         decision = "switch"
                     else:
                         decision = "exhausted"
                     self._record_endpoint_attempt(
                         endpoint,
                         payload,
-                        outcome=outcome,
+                        outcome=transport_error.outcome,
                         decision=decision,
                         duration_seconds=self.clock() - started,
-                        http_status=http_status,
+                        attempt_ordinal=attempt_ordinal,
+                        endpoint_attempt=attempt + 1,
+                        http_status=transport_error.http_status,
                     )
-                    if retryable and not is_last_attempt:
-                        if effective_deadline is not None:
-                            effective_deadline.require_remaining()
+                    if not transport_error.failover_eligible:
+                        raise transport_error from None
+                    if transport_error.retryable and not is_last_attempt:
                         self._sleep_before_retry(effective_deadline, attempt)
                         continue
                     self._open_endpoint_ids.add(endpoint.endpoint_id)
                     self._endpoint_index += 1
-                    self.endpoint_generation += 1
                     break
                 self._record_endpoint_attempt(
                     endpoint,
@@ -1081,6 +1337,8 @@ class RpcClient:
                     outcome="success",
                     decision="use",
                     duration_seconds=self.clock() - started,
+                    attempt_ordinal=attempt_ordinal,
+                    endpoint_attempt=attempt + 1,
                 )
                 self.records.append(
                     {
