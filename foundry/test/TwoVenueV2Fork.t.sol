@@ -65,6 +65,12 @@ contract TwoVenueV2ForkTest is Test {
         0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
     address private constant AUTHORIZED_SENDER =
         0x5CA9E6c3Ed27Cc0AcFb355061FcaB6964D4Fc444;
+    address private constant FORGE_TEST_CONTRACT =
+        0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496;
+    address private constant REVIEWED_EXECUTOR =
+        0x2BD736e245395B754c06d227e2112ACF3e2d401a;
+    bytes32 private constant EXECUTOR_CREATE2_SALT =
+        0x11b6c7e41f84814790e97cd71e75ce55a4dcd7dd79d7864494a1e45c48bc78c5;
 
     uint256 private constant REVIEWED_BLOCK_NUMBER = 25_000_000;
     uint256 private constant REVIEWED_BLOCK_TIMESTAMP = 1_777_637_363;
@@ -82,6 +88,7 @@ contract TwoVenueV2ForkTest is Test {
         assertEq(block.chainid, 1);
         assertEq(block.number, REVIEWED_BLOCK_NUMBER);
         assertEq(block.timestamp, REVIEWED_BLOCK_TIMESTAMP);
+        assertEq(address(this), FORGE_TEST_CONTRACT);
 
         _assertCode(UNI);
         _assertCode(WETH);
@@ -106,8 +113,28 @@ contract TwoVenueV2ForkTest is Test {
         _assertReviewedReserves();
         _assertReviewedFeed();
 
-        executor = new TwoVenueV2Executor();
-        _assertCode(address(executor));
+        address predictedExecutor = address(
+            uint160(
+                uint256(
+                    keccak256(
+                        abi.encodePacked(
+                            bytes1(0xff),
+                            address(this),
+                            EXECUTOR_CREATE2_SALT,
+                            keccak256(type(TwoVenueV2Executor).creationCode)
+                        )
+                    )
+                )
+            )
+        );
+        assertEq(predictedExecutor, REVIEWED_EXECUTOR);
+        assertEq(predictedExecutor.code.length, 0);
+        assertEq(predictedExecutor.balance, 0);
+        executor =
+            new TwoVenueV2Executor{salt: EXECUTOR_CREATE2_SALT}();
+        assertEq(address(executor), predictedExecutor);
+        _assertCode(predictedExecutor);
+        assertEq(predictedExecutor.balance, 0);
     }
 
     function testUniswapToSushiswapUsd1000() public {

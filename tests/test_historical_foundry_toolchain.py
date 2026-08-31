@@ -1641,6 +1641,35 @@ class HistoricalFoundryKatFixtureTests(unittest.TestCase):
         )
         self.assertEqual(calls, expected)
 
+    def test_checked_in_fork_source_seals_create2_deployment_lifecycle(self):
+        source = (
+            REAL_PROJECT_ROOT / "foundry" / "test" / "TwoVenueV2Fork.t.sol"
+        ).read_text(encoding="ascii")
+        salt = (
+            "0x11b6c7e41f84814790e97cd71e75ce55"
+            "a4dcd7dd79d7864494a1e45c48bc78c5"
+        )
+        reviewed_executor = "0x2BD736e245395B754c06d227e2112ACF3e2d401a"
+        deployment = (
+            "new TwoVenueV2Executor{salt: EXECUTOR_CREATE2_SALT}()"
+        )
+        pre_code = "assertEq(predictedExecutor.code.length, 0);"
+        native_balance = "assertEq(predictedExecutor.balance, 0);"
+        post_code = "_assertCode(predictedExecutor);"
+        deployed_identity = "assertEq(address(executor), predictedExecutor);"
+
+        self.assertIn(salt, source)
+        self.assertIn(reviewed_executor, source)
+        self.assertNotIn("new TwoVenueV2Executor();", source)
+        self.assertEqual(source.count(deployment), 1)
+        self.assertEqual(source.count(native_balance), 2)
+        deployment_offset = source.index(deployment)
+        self.assertLess(source.index(pre_code), deployment_offset)
+        self.assertLess(source.index(native_balance), deployment_offset)
+        self.assertGreater(source.index(deployed_identity), deployment_offset)
+        self.assertGreater(source.index(post_code), deployment_offset)
+        self.assertGreater(source.rindex(native_balance), deployment_offset)
+
     def test_unreviewed_fork_source_is_rejected_before_any_process(self):
         digests = self._install_fake_toolchain()
         self._write_fixture()
