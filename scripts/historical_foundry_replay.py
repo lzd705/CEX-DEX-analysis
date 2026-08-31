@@ -14,7 +14,7 @@ import re
 import weakref
 from collections.abc import Mapping as MappingABC
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 from types import MappingProxyType
 from typing import Any, Dict, Mapping
 
@@ -1060,6 +1060,7 @@ def _market_projection(validated: Mapping[str, Any], dex: str) -> Dict[str, Any]
     reserve_weth = Decimal(venue["reserve_weth_raw"])
     with localcontext() as context:
         context.prec = 28
+        context.rounding = ROUND_HALF_EVEN
         uni_usd = reserve_weth / reserve_uni * eth_usd
         amounts = v2_band_amounts(reserve_uni, reserve_weth, Decimal(30), 100)
         fields = depth_fields(target_position_index=0, token0_decimals=18,

@@ -6,7 +6,9 @@ import json
 import unittest
 import weakref
 from contextlib import ExitStack
-from decimal import Decimal, localcontext
+from decimal import (
+    Decimal, ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, localcontext,
+)
 from unittest import mock
 
 from scripts.fetch_dex_depth import depth_fields, v2_band_amounts
@@ -724,6 +726,29 @@ class HistoricalResearchUniverseTests(unittest.TestCase):
                                     "one_output": amount["one_for_zero_output"],
                                     "zero_complete": True, "one_complete": True}})
         self.assertEqual(uni["observed_100bps_depth_usd"], live["total_depth_100bps_usd"])
+
+    def test_full_projections_ignore_hostile_global_decimal_rounding(self):
+        validated = self.validated()
+        projections = {}
+        for rounding in (ROUND_HALF_EVEN, ROUND_DOWN, ROUND_UP):
+            with localcontext() as ambient:
+                ambient.rounding = rounding
+                universe = build_historical_research_universe(
+                    config=self.config, validated_run=validated,
+                )
+                core = build_historical_core_projection(
+                    config=self.config, validated_run=validated,
+                    universe=universe,
+                )
+                projections[rounding] = (
+                    canonical_bytes(universe), canonical_bytes(core),
+                )
+        self.assertEqual(
+            projections[ROUND_DOWN], projections[ROUND_HALF_EVEN]
+        )
+        self.assertEqual(
+            projections[ROUND_UP], projections[ROUND_HALF_EVEN]
+        )
 
     def test_core_projection_cross_binds_universe(self):
         validated = self.validated()
