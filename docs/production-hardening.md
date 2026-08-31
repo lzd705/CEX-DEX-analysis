@@ -20,6 +20,10 @@ Before deployment, choose:
   atomically refreshed daily manifest rather than the tracked seed file;
 - `ADMIN_JOB_DIR`: an absolute directory for administrator job records. It may
   live under `MARKET_DATA_DIR`, but it does not have to;
+- optional `DEX_DEPTH_RPC_<CHAIN>` and
+  `DEX_DEPTH_RPC_<CHAIN>_FALLBACKS` values for DEX collection. Keep them in the
+  private rendered environment file as one-line values; fallback values must be
+  strict JSON arrays and must not be committed;
 - TLS certificates for `@DOMAIN@`, normally issued and renewed by Certbot or the
   host's certificate manager.
 
@@ -104,6 +108,14 @@ systemctl list-timers cex-dex-daily.timer cex-dex-depth.timer
 journalctl -u cex-dex-dashboard.service --since today
 ```
 
+If DEX RPC overrides are configured, verify the private environment file rather
+than printing secrets into logs. Record the SHA-256 of
+`/etc/cex-dex/dashboard.env`, and test each configured Ethereum and BNB Smart
+Chain endpoint against one finalized block before deployment. Each endpoint in
+a pair must prove the same chain ID, numeric block number, block hash, and
+timestamp for that chosen fixed block. Treat free public endpoints as
+best-effort only; a successful capability check does not establish an SLA.
+
 Before calling a release current, confirm that the daily lifecycle step wrote
 fresh root evidence at the exact path read by the dashboard:
 
@@ -168,7 +180,10 @@ For user-level collection timers, use `scripts/install_collection_timers.sh`
 with an absolute `MARKET_DATA_DIR`. It renders the dedicated
 `cex-dex-daily-user.service.in` and `cex-dex-depth-user.service.in` templates,
 embedding that path rather than attempting to read the system-only
-`/etc/cex-dex/dashboard.env`.
+`/etc/cex-dex/dashboard.env`. User collector services also load
+`%h/.config/cex-dex/dashboard.env` when present, so unprivileged deployments can
+keep the same private RPC override and fallback variables outside tracked
+source.
 
 ## Exact Uniswap V3 staged launch and rollback
 
@@ -215,6 +230,15 @@ this order:
 ```text
 preflight -> pause -> backup -> stage -> verify-stage
 ```
+
+Before using the staged candidate for a production cutover, deliberately
+rehearse the provider-failure path in private staging: configure the primary
+Ethereum endpoint and primary BNB Smart Chain endpoint to fail or be unreachable,
+keep the fallback valid, and run the non-publishing stage/verification flow.
+The candidate must still prove fixed-block identity through the fallback, retain
+only redacted endpoint evidence, and pass the ordinary exact V3 release checks.
+Then restore the intended private environment values and record the new private
+environment-file checksum.
 
 `pause` manages only these fixed user units:
 `cex-dex-daily.timer`, `cex-dex-depth.timer`, and their matching `.service`
@@ -318,6 +342,16 @@ The normal forward dashboard uses the default live raw root, not a permanent
 stage-root override. Retain the private launch backup, receipts, complete
 staged raw/TVL evidence, validation receipt, and staged processed root through
 the complete observation and rollback window.
+
+After forward validation succeeds and timers are resumed, start a new
+observation window from the first successful scheduled exact run on the target
+SHA. Do not reuse the failed window. Acceptance requires at least 26 hours, at
+least one daily cycle, multiple hourly depth cycles, exact depth 2/2, exact
+execution 20/20, matching public and trusted V3 receipt SHA-256 values, no
+silent lock skips, no unexplained scheduled gap, and no coverage or release-gate
+failure. Any hard failure invalidates that window and should be reported with
+the retained run manifest, journal evidence, endpoint-attempt evidence, memory,
+disk, quota, and environment-file checksum context.
 
 ## Configure HTTPS
 

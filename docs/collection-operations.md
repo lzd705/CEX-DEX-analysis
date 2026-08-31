@@ -408,6 +408,15 @@ Funding Rate remains excluded and Upbit inputs remain unchanged.
 Every profile acquires `data/local/collection/collection.lock`. A second run
 does not write facts while another profile owns the lock.
 
+Manual and programmatic calls default to immediate non-blocking behavior: a
+held lock returns `status=skipped_locked`, creates no run directory, and leaves
+`collection/latest.json` unchanged. Scheduled services pass
+`--lock-wait-seconds 900`, so they wait up to 15 minutes on the same lock before
+giving up. If that bounded wait expires, the structured result remains
+`status=skipped_locked` with `reason=lock_wait_timeout`, but the CLI exits
+`75` so systemd records a temporary failure instead of a successful missing
+observation.
+
 Each completed run writes:
 
 ```text
@@ -892,11 +901,14 @@ journalctl --user -u cex-dex-daily.service
 journalctl --user -u cex-dex-depth.service
 ```
 
-The timers use the same lock. A failed collector leaves previously published
-facts in place and records a failed run manifest. Diagnose the retained step
-log, fix the source/configuration issue, then rerun the relevant profile.
-A lock-contention skip does not create an empty run directory or overwrite the
-latest completed run manifest.
+The timers use the same lock and keep their fixed schedules: daily runs at
+00:30 UTC and hourly depth runs at minute 05. A failed collector leaves
+previously published facts in place and records a failed run manifest. Diagnose
+the retained step log, fix the source/configuration issue, then rerun the
+relevant profile. A lock-contention skip does not create an empty run directory
+or overwrite the latest completed run manifest. For scheduled services, a
+15-minute lock-wait timeout exits `75` and should be treated as an invalid
+observation window, not as a successful run.
 The daily service is intentionally not fail-fast: OHLCV and TVL are still
 attempted when the independent lifecycle inventory or daily OHLCV step fails,
 while the final service status remains failed and auditable. A failed lifecycle
