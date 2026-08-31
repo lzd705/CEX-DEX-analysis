@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import gzip
 import hashlib
 import inspect
 import json
@@ -12,6 +13,7 @@ from contextlib import ExitStack
 from decimal import (
     Decimal, ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, localcontext,
 )
+from fractions import Fraction
 from unittest import mock
 
 from scripts.fetch_dex_depth import depth_fields, v2_band_amounts
@@ -1025,6 +1027,676 @@ class HistoricalOpportunityBridgeTests(unittest.TestCase):
                 HistoricalCorePublicationTests._close_real_task7_run(
                     run, finalized
                 )
+
+    @staticmethod
+    def _swap_calldata(
+        *, amount_in_raw, path, recipient, deadline,
+    ):
+        def word(value):
+            return int(value).to_bytes(32, "big")
+
+        encoded = b"\x38\xed\x17\x39" + b"".join((
+            word(amount_in_raw), word(0), word(160),
+            b"\0" * 12 + bytes.fromhex(recipient[2:]),
+            word(deadline), word(2),
+            b"\0" * 12 + bytes.fromhex(path[0][2:]),
+            b"\0" * 12 + bytes.fromhex(path[1][2:]),
+        ))
+        return encoded
+
+    @classmethod
+    def _expected_successful_calls(cls, projection):
+        direction = projection["selection_scenario"]["direction"]
+        first = projection["prefilter_scenario"]["first_amount_out_raw"]
+        amount = projection["prefilter_scenario"]["amount_weth_in_wei"]
+        executor = projection["overlay"]["transaction"]["to"]
+        deadline = projection["overlay"]["synthetic_block"]["timestamp"] + 60
+        if direction == "uniswap_to_sushiswap":
+            routers = (
+                "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",
+                "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f",
+            )
+        else:
+            routers = (
+                "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f",
+                "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",
+            )
+        rows = []
+        for call_path, leg, router, amount_in, path in (
+            ([2], "first_leg", routers[0], amount, [WETH, UNI]),
+            ([5], "second_leg", routers[1], first, [UNI, WETH]),
+        ):
+            calldata = cls._swap_calldata(
+                amount_in_raw=amount_in, path=path,
+                recipient=executor, deadline=deadline,
+            )
+            rows.append({
+                "call_path": call_path,
+                "leg": leg,
+                "router": router,
+                "calldata_sha256": hashlib.sha256(calldata).hexdigest(),
+                "amount_in_raw": amount_in,
+                "amount_out_min_raw": 0,
+                "path": path,
+                "recipient": executor,
+                "deadline": deadline,
+                "value": 0,
+            })
+        return rows
+
+    @staticmethod
+    def _expected_post_pair_state(projection):
+        direction = projection["selection_scenario"]["direction"]
+        amount = projection["prefilter_scenario"]["amount_weth_in_wei"]
+        first = projection["prefilter_scenario"]["first_amount_out_raw"]
+        second = projection["prefilter_scenario"]["second_amount_out_raw"]
+        buy, sell = (
+            ("uniswap_v2", "sushiswap_v2")
+            if direction == "uniswap_to_sushiswap"
+            else ("sushiswap_v2", "uniswap_v2")
+        )
+        result = copy.deepcopy(projection["result"]["pair_closure"])
+        result[buy]["reserve_uni_raw"] -= first
+        result[buy]["pair_uni_balance_raw"] -= first
+        result[buy]["reserve_weth_raw"] += amount
+        result[buy]["pair_weth_balance_raw"] += amount
+        result[sell]["reserve_uni_raw"] += first
+        result[sell]["pair_uni_balance_raw"] += first
+        result[sell]["reserve_weth_raw"] -= second
+        result[sell]["pair_weth_balance_raw"] -= second
+        return result
+
+    @staticmethod
+    def _scenario_bytes(value):
+        result = copy.deepcopy(value)
+        result.pop("scenario_projection_sha256", None)
+        result["scenario_projection_sha256"] = digest(result)
+        return canonical_bytes(result)
+
+    def test_apparent_issuer_symbols_cannot_mint_arbitrary_capabilities(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            legitimate = publication._issue_validated_historical_scenario_inputs(
+                context=context,
+                scenario_key="2:uniswap_to_sushiswap:1000",
+            )
+            projection = json.loads(legitimate.canonical_projection_bytes)
+            raw_scenario_issuer = getattr(
+                replay,
+                "_issue_validated_historical_scenario_inputs_from_publication",
+                None,
+            )
+            if raw_scenario_issuer is not None:
+                with self.assertRaises((TypeError, ValueError)):
+                    forged = raw_scenario_issuer(
+                        scenario_key=legitimate.scenario_key,
+                        context_projection_sha256=(
+                            legitimate.context_projection_sha256
+                        ),
+                        source_descriptor_set_sha256=(
+                            legitimate.source_descriptor_set_sha256
+                        ),
+                        proof_inputs_hash=legitimate.proof_inputs_hash,
+                        canonical_projection_bytes=canonical_bytes(projection),
+                    )
+                    replay.build_historical_atomic_v2_cashflow(forged)
+            raw_proof_issuer = getattr(
+                publication,
+                "_issue_validated_historical_cost_proof_inputs",
+                None,
+            )
+            if raw_proof_issuer is not None:
+                with self.assertRaises((TypeError, ValueError)):
+                    raw_proof_issuer(projection["proof_inputs"])
+            self.assertIsNone(raw_scenario_issuer)
+            self.assertIsNone(raw_proof_issuer)
+            self.assertFalse(hasattr(publication, "_SCENARIO_CONTEXT_ISSUER"))
+            apparent_replay = tuple(
+                name for name in dir(replay)
+                if "issue" in name.lower()
+                and "historical_scenario" in name.lower()
+            )
+            apparent_publication = tuple(
+                name for name in dir(publication)
+                if "issue" in name.lower()
+                and "historical_cost_proof" in name.lower()
+            )
+            self.assertEqual(apparent_replay, ())
+            self.assertEqual(apparent_publication, ())
+            with self.assertRaises((TypeError, ValueError)):
+                publication._issue_validated_historical_scenario_inputs(
+                    context=object(),
+                    scenario_key="2:uniswap_to_sushiswap:1000",
+                )
+            with self.assertRaises(TypeError):
+                publication.load_historical_cost_proof_inputs_for_build_context(
+                    proof=projection["proof_inputs"]
+                )
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_installed_scenario_issuer_captures_exact_material_validator(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            diverted = AssertionError("module-global material loader reached")
+            with mock.patch.object(
+                publication, "_historical_scenario_material",
+                side_effect=diverted,
+            ):
+                inputs = publication._issue_validated_historical_scenario_inputs(
+                    context=context,
+                    scenario_key="2:uniswap_to_sushiswap:1000",
+                )
+            self.assertEqual(
+                replay.build_historical_atomic_v2_cashflow(inputs)[
+                    "first_weth_in_raw"
+                ],
+                333333333333333333,
+            )
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_cashflow_rejects_each_retained_execution_projection_attack(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            inputs = publication._issue_validated_historical_scenario_inputs(
+                context=context,
+                scenario_key="2:uniswap_to_sushiswap:1000",
+            )
+            original = json.loads(inputs.canonical_projection_bytes)
+            successful_calls = self._expected_successful_calls(original)
+            post_pair_state = self._expected_post_pair_state(original)
+
+            def with_retained_execution(value):
+                value["trace"]["successful_calls"] = copy.deepcopy(
+                    successful_calls
+                )
+                value["result"]["trace_closure"]["successful_calls"] = (
+                    copy.deepcopy(successful_calls)
+                )
+                value["trace"]["post_pair_state"] = copy.deepcopy(
+                    post_pair_state
+                )
+                value["result"]["post_pair_state"] = copy.deepcopy(
+                    post_pair_state
+                )
+
+            def calldata_direction(value):
+                raw = bytearray(bytes.fromhex(
+                    value["overlay"]["transaction"]["input"][2:]
+                ))
+                raw[35] = 1
+                value["overlay"]["transaction"]["input"] = "0x" + raw.hex()
+                value["overlay"]["transaction"]["calldata_sha256"] = (
+                    hashlib.sha256(raw).hexdigest()
+                )
+
+            def calldata_input(value):
+                raw = bytearray(bytes.fromhex(
+                    value["overlay"]["transaction"]["input"][2:]
+                ))
+                raw[-1] ^= 1
+                value["overlay"]["transaction"]["input"] = "0x" + raw.hex()
+                value["overlay"]["transaction"]["calldata_sha256"] = (
+                    hashlib.sha256(raw).hexdigest()
+                )
+
+            mutations = [
+                ("calldata_direction", calldata_direction),
+                ("calldata_input", calldata_input),
+                ("calldata_hash", lambda value: value["overlay"][
+                    "transaction"
+                ].__setitem__("calldata_sha256", "0" * 64)),
+                ("prefilter_first_output", lambda value: value[
+                    "prefilter_scenario"
+                ].__setitem__(
+                    "first_amount_out_raw",
+                    value["prefilter_scenario"]["first_amount_out_raw"] + 1,
+                )),
+                ("prefilter_second_output", lambda value: value[
+                    "prefilter_scenario"
+                ].__setitem__(
+                    "second_amount_out_raw",
+                    value["prefilter_scenario"]["second_amount_out_raw"] + 1,
+                )),
+                ("trace_first_output", lambda value: value["trace"][
+                    "actual_deltas"
+                ].__setitem__(
+                    "first_leg_uni_raw",
+                    value["trace"]["actual_deltas"]["first_leg_uni_raw"] + 1,
+                )),
+                ("trace_second_output", lambda value: value["trace"][
+                    "balances"
+                ].__setitem__(
+                    "final_weth_raw",
+                    value["trace"]["balances"]["final_weth_raw"] + 1,
+                )),
+                ("first_router_input", lambda value: value["trace"][
+                    "successful_calls"
+                ][0].__setitem__(
+                    "amount_in_raw",
+                    value["trace"]["successful_calls"][0]["amount_in_raw"] + 1,
+                )),
+                ("second_router_input", lambda value: value["trace"][
+                    "successful_calls"
+                ][1].__setitem__(
+                    "amount_in_raw",
+                    value["trace"]["successful_calls"][1]["amount_in_raw"] + 1,
+                )),
+                ("p50_priority", lambda value: value["fee"].__setitem__(
+                    "p50_priority_fee_per_gas",
+                    value["receipt"]["effectiveGasPrice"]
+                    - value["fee"]["next_base_fee_per_gas"] + 1,
+                )),
+            ]
+            for venue in ("uniswap_v2", "sushiswap_v2"):
+                for field in (
+                    "reserve_uni_raw", "reserve_weth_raw",
+                    "pair_uni_balance_raw", "pair_weth_balance_raw",
+                ):
+                    def mutate_post(value, venue=venue, field=field):
+                        value["trace"]["post_pair_state"][venue][field] += 1
+
+                    mutations.append(("post_{}_{}".format(venue, field), mutate_post))
+
+            for label, mutate in mutations:
+                value = copy.deepcopy(original)
+                with_retained_execution(value)
+                mutate(value)
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    with mock.patch.object(
+                        replay, "_validated_historical_scenario_projection",
+                        return_value=value,
+                    ):
+                        replay.build_historical_atomic_v2_cashflow(inputs)
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_scenario_capability_retains_p50_calls_and_post_pair_state(self):
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            inputs = publication._issue_validated_historical_scenario_inputs(
+                context=context,
+                scenario_key="2:uniswap_to_sushiswap:1000",
+            )
+            projection = json.loads(inputs.canonical_projection_bytes)
+            self.assertEqual(
+                projection["receipt"]["effectiveGasPrice"],
+                projection["fee"]["next_base_fee_per_gas"]
+                + projection["fee"]["p50_priority_fee_per_gas"],
+            )
+            self.assertEqual(
+                projection["receipt"]["maxPriorityFeePerGas"],
+                projection["fee"]["p50_priority_fee_per_gas"],
+            )
+            self.assertEqual(
+                projection["overlay"]["transaction"]["maxPriorityFeePerGas"],
+                projection["fee"]["p50_priority_fee_per_gas"],
+            )
+            expected_calls = self._expected_successful_calls(projection)
+            self.assertEqual(
+                projection["trace"]["successful_calls"], expected_calls
+            )
+            self.assertEqual(
+                projection["result"]["trace_closure"]["successful_calls"],
+                expected_calls,
+            )
+            expected_post = self._expected_post_pair_state(projection)
+            self.assertEqual(
+                projection["trace"]["post_pair_state"], expected_post
+            )
+            self.assertEqual(
+                projection["result"]["post_pair_state"], expected_post
+            )
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_compact_evidence_rejects_self_rehashed_malformed_inventory(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            projections = tuple(
+                publication._build_historical_scenario_for_publication(
+                    context=context,
+                    scenario_key="2:{}:{}".format(direction, notional),
+                )["canonical_projection_bytes"]
+                for direction in (
+                    "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+                )
+                for notional in (1000, 5000, 10000, 50000, 100000)
+            )
+
+            def mutate_one(index, mutate):
+                values = list(projections)
+                value = json.loads(values[index])
+                mutate(value)
+                values[index] = self._scenario_bytes(value)
+                return tuple(values)
+
+            attacks = [
+                ("empty_costs", lambda: mutate_one(
+                    0, lambda value: value.__setitem__("cost_components", [])
+                )),
+                ("reordered_costs", lambda: mutate_one(
+                    0, lambda value: value["cost_components"].reverse()
+                )),
+                ("altered_cost", lambda: mutate_one(
+                    0, lambda value: value["cost_components"][0].__setitem__(
+                        "amount_usd", "123"
+                    )
+                )),
+                ("duplicate_proof_hash", lambda: mutate_one(
+                    1, lambda value: value.__setitem__(
+                        "proof_inputs_hash",
+                        json.loads(projections[0])["proof_inputs_hash"],
+                    )
+                )),
+                ("wrong_scenario_id", lambda: mutate_one(
+                    0, lambda value: value.__setitem__(
+                        "scenario_key", "2:uniswap_to_sushiswap:1001"
+                    )
+                )),
+                ("wrong_opportunity_id", lambda: mutate_one(
+                    0, lambda value: value["opportunity"].__setitem__(
+                        "opportunity_id", "opportunity:" + "0" * 64
+                    )
+                )),
+                ("arbitrary_economics", lambda: mutate_one(
+                    0, lambda value: value["economics_scenarios"][0].__setitem__(
+                        "name", "attacker"
+                    )
+                )),
+                ("inconsistent_positive", lambda: mutate_one(
+                    0, lambda value: value["economics_scenarios"][0].__setitem__(
+                        "positive_research_net",
+                        not value["economics_scenarios"][0][
+                            "positive_research_net"
+                        ],
+                    )
+                )),
+                ("wrong_order", lambda: (
+                    projections[1], projections[0], *projections[2:]
+                )),
+            ]
+            for label, attack in attacks:
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    replay.build_historical_replay_evidence(attack())
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_scenario_projection_retains_independent_economics_authority(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            inputs = publication._issue_validated_historical_scenario_inputs(
+                context=context,
+                scenario_key="2:uniswap_to_sushiswap:1000",
+            )
+            sealed = json.loads(inputs.canonical_projection_bytes)
+            compact = json.loads(
+                replay.build_historical_scenario_projection(inputs)
+            )
+            self.assertEqual(compact["proof_inputs"], sealed["proof_inputs"])
+            authority = compact["economics_authority"]
+            self.assertEqual(authority, {
+                "first_weth_in_raw": 333333333333333333,
+                "first_uni_out_raw": 1328891698325589794,
+                "final_weth_out_raw": 1323151972535702977,
+                "eth_usd_answer": 300000000000,
+                "feed_decimals": 8,
+                "fee_numerator": 997,
+                "fee_denominator": 1000,
+                "second_leg_reserve_uni_raw": 1000000000000000000000,
+                "second_leg_reserve_weth_raw": 1000000000000000000000,
+                "gas_used": 123456,
+                "receipt_effective_gas_price": 1,
+                "next_base_fee_per_gas": 0,
+                "p50_priority_fee_per_gas": 1,
+                "p90_priority_fee_per_gas": 2,
+            })
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_compact_evidence_rejects_fully_rebound_proof_row_and_gas_attacks(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            projections = tuple(
+                publication._build_historical_scenario_for_publication(
+                    context=context,
+                    scenario_key="2:{}:{}".format(direction, notional),
+                )["canonical_projection_bytes"]
+                for direction in (
+                    "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+                )
+                for notional in (1000, 5000, 10000, 50000, 100000)
+            )
+
+            def rebind(value):
+                proof = value["proof_inputs"]
+                proof_unsigned = {
+                    key: item for key, item in proof.items()
+                    if key != "proof_inputs_hash"
+                }
+                proof_hash = typed_digest(
+                    "historical_foundry_cost_proof_inputs/v1",
+                    proof_unsigned,
+                )
+                proof["proof_inputs_hash"] = proof_hash
+                value["proof_inputs_hash"] = proof_hash
+                opportunity = value["opportunity"]
+                opportunity["inventory_profile_hash"] = proof_hash
+                opportunity["mode_evidence_sha256"] = typed_digest(
+                    "historical_atomic_mode_evidence/v1",
+                    {
+                        "scenario_key": value["scenario_key"],
+                        "proof_inputs_hash": proof_hash,
+                    },
+                )
+                opportunity["cost_component_set_sha256"] = digest(
+                    value["cost_components"]
+                )
+                opportunity.pop("evidence_binding_sha256", None)
+                opportunity["evidence_binding_sha256"] = digest(opportunity)
+                value.pop("scenario_projection_sha256", None)
+                value["scenario_projection_sha256"] = digest(value)
+                return canonical_bytes(value)
+
+            def attacked(mutate):
+                values = list(projections)
+                value = json.loads(values[0])
+                mutate(value)
+                values[0] = rebind(value)
+                return tuple(values)
+
+            def alter_sell_pool_fee(value):
+                value["proof_inputs"]["rows"][3][
+                    "amount_usd_exact"
+                ] = "123"
+                value["cost_components"][3]["amount_usd"] = "123"
+
+            def alter_proof_row(value):
+                value["proof_inputs"]["rows"][0]["proof_sha256"] = "0" * 64
+
+            def alter_displayed_gas_used(value):
+                for row in value["economics_scenarios"]:
+                    row["gas_used"] += 1
+
+            for label, mutate in (
+                ("sell_pool_fee", alter_sell_pool_fee),
+                ("proof_row", alter_proof_row),
+                ("displayed_gas_used", alter_displayed_gas_used),
+            ):
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    replay.build_historical_replay_evidence(attacked(mutate))
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_publication_rejects_rehashed_raw_fee_adapter_and_proof_attacks(self):
+        import scripts.historical_route_publication as publication
+
+        scenario_key = "2:uniswap_to_sushiswap:1000"
+
+        def opened_run_root(run):
+            manifests = tuple(
+                run["fixture"].data_dir.rglob("run_manifest.json")
+            )
+            self.assertEqual(len(manifests), 1)
+            return manifests[0].parent
+
+        def commit_replacements(root, replacements, manifest_updates=None):
+            manifest_path = root / "run_manifest.json"
+            manifest = json.loads(manifest_path.read_bytes())
+            by_path = {row["path"]: row for row in manifest["members"]}
+            for relative, raw in replacements.items():
+                (root / relative).write_bytes(raw)
+                by_path[relative]["byte_count"] = len(raw)
+                by_path[relative]["sha256"] = hashlib.sha256(raw).hexdigest()
+            if manifest_updates is not None:
+                manifest_updates(manifest, replacements)
+            manifest_path.write_bytes(canonical_bytes(manifest))
+
+        def mutate_fee(run):
+            root = opened_run_root(run)
+            inventory_path = root / "scan/capture_inventory.json"
+            inventory = json.loads(inventory_path.read_bytes())
+            descriptor = next(
+                row for row in inventory["typed_chunks"]
+                if row["role"] == "fees"
+            )
+            fee_path = root / descriptor["path"]
+            rows = json.loads(gzip.decompress(fee_path.read_bytes()))
+            selected = next(
+                row for row in rows if row["block_number"] == 2
+            )
+            selected["p90_priority_fee_per_gas"] += 1
+            decoded = canonical_bytes(rows)
+            compressed = gzip.compress(decoded, mtime=0)
+            descriptor["decoded_byte_count"] = len(decoded)
+            descriptor["decoded_sha256"] = hashlib.sha256(decoded).hexdigest()
+            descriptor["gzip_byte_count"] = len(compressed)
+            descriptor["gzip_sha256"] = hashlib.sha256(compressed).hexdigest()
+            inventory_raw = canonical_bytes(inventory)
+            commit_replacements(root, {
+                descriptor["path"]: compressed,
+                "scan/capture_inventory.json": inventory_raw,
+            })
+
+        def mutate_proof(run, *, replace_adapter):
+            root = opened_run_root(run)
+            result_path = next(
+                path for path in root.rglob("result.json")
+                if scenario_key in str(path)
+                and "10000" not in str(path)
+                and "100000" not in str(path)
+            )
+            result_relative = result_path.relative_to(root).as_posix()
+            result = json.loads(result_path.read_bytes())
+            proof = result["cost_proof_inputs"]
+            replacements = {}
+            toolchain_sha = None
+            if replace_adapter:
+                toolchain_path = root / "toolchain.json"
+                toolchain = json.loads(toolchain_path.read_bytes())
+                replacement = "f" * 64
+                if (
+                    toolchain["executor_build"][
+                        "creation_bytecode_sha256"
+                    ] == replacement
+                ):
+                    replacement = "e" * 64
+                toolchain["executor_build"][
+                    "creation_bytecode_sha256"
+                ] = replacement
+                toolchain_raw = canonical_bytes(toolchain)
+                toolchain_sha = hashlib.sha256(toolchain_raw).hexdigest()
+                replacements["toolchain.json"] = toolchain_raw
+                proof["adapter_proof_sha256"] = replacement
+                result["proof_authority"][
+                    "adapter_proof_sha256"
+                ] = replacement
+                result["proof_authority"]["toolchain_sha256"] = toolchain_sha
+            else:
+                proof["rows"][3]["amount_usd_exact"] = "123"
+            unsigned = {
+                key: value for key, value in proof.items()
+                if key != "proof_inputs_hash"
+            }
+            proof["proof_inputs_hash"] = typed_digest(
+                "historical_foundry_cost_proof_inputs/v1", unsigned
+            )
+            result_raw = canonical_bytes(result)
+            replacements[result_relative] = result_raw
+            selection = json.loads((root / "selection.json").read_bytes())
+            selected = next(
+                row for row in selection["selected_scenarios"]
+                if row["scenario_key"] == scenario_key
+            )
+            selected["proof_inputs_hash"] = proof["proof_inputs_hash"]
+            selected["result_sha256"] = hashlib.sha256(result_raw).hexdigest()
+            replacements["selection.json"] = canonical_bytes(selection)
+
+            def update_manifest(manifest, _replacements):
+                if toolchain_sha is not None:
+                    manifest["toolchain_sha256"] = toolchain_sha
+
+            commit_replacements(root, replacements, update_manifest)
+
+        for label, mutate in (
+            ("p90_fee", mutate_fee),
+            ("adapter", lambda run: mutate_proof(
+                run, replace_adapter=True
+            )),
+            ("proof", lambda run: mutate_proof(
+                run, replace_adapter=False
+            )),
+        ):
+            with self.subTest(label=label):
+                run, finalized, stage, context = self._open_stage()
+                try:
+                    mutate(run)
+                    serializer = mock.Mock(
+                        side_effect=AssertionError("serialization reached")
+                    )
+                    matrix = mock.Mock(
+                        side_effect=AssertionError("matrix reached")
+                    )
+                    with mock.patch.object(
+                        publication,
+                        "build_historical_scenario_projection",
+                        serializer,
+                    ), mock.patch.object(
+                        publication,
+                        "_validate_historical_atomic_cost_component_matrix",
+                        matrix,
+                    ):
+                        with self.assertRaises(
+                            publication.HistoricalRoutePublicationError
+                        ):
+                            publication._build_historical_scenario_for_publication(
+                                context=context, scenario_key=scenario_key
+                            )
+                    serializer.assert_not_called()
+                    matrix.assert_not_called()
+                finally:
+                    self._close_stage(run, finalized, stage, context)
 
     def test_pure_bridge_rejects_forged_scenario_capability_before_arithmetic(self):
         import scripts.historical_foundry_replay as replay

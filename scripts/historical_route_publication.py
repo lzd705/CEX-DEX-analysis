@@ -22,9 +22,8 @@ from scripts.historical_foundry_contracts import (
     HistoricalFoundryConfigSet,
     load_historical_foundry_config_set,
 )
+import scripts.historical_foundry_replay as _historical_replay
 from scripts.historical_foundry_replay import (
-    ValidatedHistoricalScenarioInputs,
-    _issue_validated_historical_scenario_inputs_from_publication,
     build_historical_scenario_projection,
     build_historical_core_projection,
     build_historical_research_universe,
@@ -47,8 +46,6 @@ _STAGE_ISSUER = object()
 _CONTEXT_ISSUER = object()
 _STAGE_REGISTRY = {}
 _CONTEXT_REGISTRY = {}
-_SCENARIO_CONTEXT_ISSUER = object()
-_SCENARIO_CONTEXT_REGISTRY = {}
 
 _CONTEXT_SCHEMA = "historical_replay_build_context/v1"
 _POINTER_SCHEMA = "route_historical_replay_core_pointer/v1"
@@ -183,12 +180,38 @@ def _initialize_validated_historical_cost_proof_inputs():
         registry[value_id] = (weakref.ref(value, retire), record)
         return value
 
-    return ValidatedHistoricalCostProofInputs, issue, require
+    installed = [False]
+
+    def bind_loader(material_reader: Any) -> Any:
+        if (
+            installed[0]
+            or material_reader is not globals().get(
+                "_historical_scenario_material"
+            )
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical cost proof loader installer is invalid"
+            )
+
+        def load(
+            *, context: "HistoricalReplayBuildContext", scenario_key: str,
+        ) -> Any:
+            material = material_reader(
+                context=context, scenario_key=scenario_key,
+                validate_context=True,
+            )
+            return issue(material["proof"])
+
+        installed[0] = True
+        globals().pop("_bind_historical_cost_proof_loader", None)
+        return load
+
+    return ValidatedHistoricalCostProofInputs, bind_loader, require
 
 
 (
     ValidatedHistoricalCostProofInputs,
-    _issue_validated_historical_cost_proof_inputs,
+    _bind_historical_cost_proof_loader,
     _validated_historical_cost_proof_object,
 ) = _initialize_validated_historical_cost_proof_inputs()
 del _initialize_validated_historical_cost_proof_inputs
@@ -2457,6 +2480,182 @@ def _validate_historical_feed_validity_boundary(
     return None
 
 
+def _historical_swap_calldata_sha256(
+    *, amount_in_raw: int, path: list, recipient: str, deadline: int,
+) -> str:
+    def word(value: int) -> bytes:
+        if type(value) is not int or not 0 <= value < 2 ** 256:
+            raise HistoricalRoutePublicationError(
+                "historical successful router call is invalid"
+            )
+        return value.to_bytes(32, "big")
+
+    try:
+        raw = bytes.fromhex("38ed1739") + b"".join((
+            word(amount_in_raw), word(0), word(160),
+            b"\0" * 12 + bytes.fromhex(recipient[2:]),
+            word(deadline), word(2),
+            b"\0" * 12 + bytes.fromhex(path[0][2:]),
+            b"\0" * 12 + bytes.fromhex(path[1][2:]),
+        ))
+    except (TypeError, ValueError):
+        raise HistoricalRoutePublicationError(
+            "historical successful router call is invalid"
+        ) from None
+    return _sha(raw)
+
+
+def _validate_historical_retained_execution(
+    *, overlay: Mapping[str, Any], receipt: Mapping[str, Any],
+    trace: Mapping[str, Any], result: Mapping[str, Any],
+    prefilter: Mapping[str, Any], fee: Mapping[str, Any],
+    authority: Mapping[str, Any],
+) -> None:
+    transaction = overlay.get("transaction")
+    synthetic = overlay.get("synthetic_block")
+    if type(transaction) is not dict or type(synthetic) is not dict:
+        raise HistoricalRoutePublicationError(
+            "historical transaction envelope is invalid"
+        )
+    calldata = transaction.get("input")
+    try:
+        raw = bytes.fromhex(calldata[2:])
+    except (AttributeError, ValueError):
+        raise HistoricalRoutePublicationError(
+            "historical transaction calldata is invalid"
+        ) from None
+    direction_index = {
+        "uniswap_to_sushiswap": 0,
+        "sushiswap_to_uniswap": 1,
+    }.get(prefilter.get("direction"))
+    if (
+        direction_index is None
+        or len(raw) != 68
+        or raw[:4] != bytes.fromhex("64cc5eae")
+        or int.from_bytes(raw[4:36], "big") != direction_index
+        or int.from_bytes(raw[36:68], "big")
+        != prefilter.get("amount_weth_in_wei")
+        or transaction.get("calldata_sha256") != _sha(raw)
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical transaction calldata differs"
+        )
+    expected_effective = (
+        fee.get("next_base_fee_per_gas", -1)
+        + fee.get("p50_priority_fee_per_gas", -1)
+    )
+    if (
+        receipt.get("effectiveGasPrice") != expected_effective
+        or receipt.get("maxPriorityFeePerGas")
+        != fee.get("p50_priority_fee_per_gas")
+        or transaction.get("maxPriorityFeePerGas")
+        != fee.get("p50_priority_fee_per_gas")
+        or receipt.get("maxFeePerGas") != transaction.get("maxFeePerGas")
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical p50 gas envelope differs"
+        )
+    tokens = {
+        row.get("role"): row.get("address")
+        for row in authority.get("tokens", ())
+        if type(row) is dict
+    }
+    routers = {
+        row.get("venue_id"): row.get("router_address")
+        for row in authority.get("venues", ())
+        if type(row) is dict
+    }
+    if (
+        set(tokens) != {"uni", "weth"}
+        or set(routers) != {"uniswap_v2", "sushiswap_v2"}
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical router authority differs"
+        )
+    buy, sell = (
+        ("uniswap_v2", "sushiswap_v2")
+        if direction_index == 0
+        else ("sushiswap_v2", "uniswap_v2")
+    )
+    executor = transaction.get("to")
+    deadline = synthetic.get("timestamp", -1) + 60
+    call_specs = (
+        (
+            [2], "first_leg", routers[buy],
+            prefilter.get("amount_weth_in_wei"),
+            [tokens["weth"], tokens["uni"]],
+        ),
+        (
+            [5], "second_leg", routers[sell],
+            prefilter.get("first_amount_out_raw"),
+            [tokens["uni"], tokens["weth"]],
+        ),
+    )
+    expected_calls = []
+    for call_path, leg, router, amount, path in call_specs:
+        expected_calls.append({
+            "call_path": call_path,
+            "leg": leg,
+            "router": router,
+            "calldata_sha256": _historical_swap_calldata_sha256(
+                amount_in_raw=amount, path=path,
+                recipient=executor, deadline=deadline,
+            ),
+            "amount_in_raw": amount,
+            "amount_out_min_raw": 0,
+            "path": path,
+            "recipient": executor,
+            "deadline": deadline,
+            "value": 0,
+        })
+    if (
+        trace.get("successful_calls") != expected_calls
+        or result.get("trace_closure", {}).get("successful_calls")
+        != expected_calls
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical successful router calls differ"
+        )
+    baseline = result.get("pair_closure")
+    if type(baseline) is not dict:
+        raise HistoricalRoutePublicationError(
+            "historical pair transition is invalid"
+        )
+    expected_post = {
+        venue: dict(value)
+        for venue, value in baseline.items()
+        if type(value) is dict
+    }
+    if set(expected_post) != {"uniswap_v2", "sushiswap_v2"}:
+        raise HistoricalRoutePublicationError(
+            "historical pair transition is invalid"
+        )
+    amount = prefilter.get("amount_weth_in_wei")
+    first = prefilter.get("first_amount_out_raw")
+    second = prefilter.get("second_amount_out_raw")
+    if any(type(value) is not int or value <= 0 for value in (
+        amount, first, second,
+    )):
+        raise HistoricalRoutePublicationError(
+            "historical pair transition is invalid"
+        )
+    expected_post[buy]["reserve_uni_raw"] -= first
+    expected_post[buy]["pair_uni_balance_raw"] -= first
+    expected_post[buy]["reserve_weth_raw"] += amount
+    expected_post[buy]["pair_weth_balance_raw"] += amount
+    expected_post[sell]["reserve_uni_raw"] += first
+    expected_post[sell]["pair_uni_balance_raw"] += first
+    expected_post[sell]["reserve_weth_raw"] -= second
+    expected_post[sell]["pair_weth_balance_raw"] -= second
+    if (
+        trace.get("post_pair_state") != expected_post
+        or result.get("post_pair_state") != expected_post
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical pair transition differs"
+        )
+
+
 def _historical_scenario_material(
     *, context: HistoricalReplayBuildContext, scenario_key: str,
     validate_context: bool,
@@ -2877,6 +3076,11 @@ def _historical_scenario_material(
         raise HistoricalRoutePublicationError(
             "historical cost proof arithmetic differs"
         )
+    _validate_historical_retained_execution(
+        overlay=overlay, receipt=receipt, trace=trace, result=result,
+        prefilter=prefilter_row, fee=selected_capture_chunks["fees"],
+        authority=config_objects["authority"],
+    )
     if (
         selected.get("proof_inputs_hash") != proof["proof_inputs_hash"]
         or result.get("schema") != "historical_foundry_replay_result/v1"
@@ -2994,94 +3198,132 @@ def _historical_scenario_material(
     }
 
 
-def load_historical_cost_proof_inputs_for_build_context(
-    *, context: HistoricalReplayBuildContext, scenario_key: str,
-) -> ValidatedHistoricalCostProofInputs:
-    material = _historical_scenario_material(
-        context=context, scenario_key=scenario_key, validate_context=True
-    )
-    return _issue_validated_historical_cost_proof_inputs(material["proof"])
+load_historical_cost_proof_inputs_for_build_context = (
+    _bind_historical_cost_proof_loader(_historical_scenario_material)
+)
 
 
-def _issue_validated_historical_scenario_inputs(
-    *, context: HistoricalReplayBuildContext, scenario_key: str,
-) -> ValidatedHistoricalScenarioInputs:
-    material = _historical_scenario_material(
-        context=context, scenario_key=scenario_key, validate_context=True
-    )
-    inputs = _issue_validated_historical_scenario_inputs_from_publication(
-        scenario_key=material["scenario_key"],
-        context_projection_sha256=material["context_projection_sha256"],
-        source_descriptor_set_sha256=material[
-            "source_descriptor_set_sha256"
-        ],
-        proof_inputs_hash=material["proof_inputs_hash"],
-        canonical_projection_bytes=material["canonical_projection_bytes"],
-    )
-    input_id = id(inputs)
-    context_reference = weakref.ref(context)
-    record = {
-        "issuer": _SCENARIO_CONTEXT_ISSUER,
-        "context_reference": context_reference,
-        "scenario_key": scenario_key,
-        "context_projection_sha256": material[
-            "context_projection_sha256"
-        ],
-        "source_descriptor_set_sha256": material[
-            "source_descriptor_set_sha256"
-        ],
-        "proof_inputs_hash": material["proof_inputs_hash"],
-        "canonical_projection_bytes": material["canonical_projection_bytes"],
-    }
-
-    def retire(reference: weakref.ReferenceType) -> None:
-        current = _SCENARIO_CONTEXT_REGISTRY.get(input_id)
-        if current is not None and current[0] is reference:
-            _SCENARIO_CONTEXT_REGISTRY.pop(input_id, None)
-
-    _SCENARIO_CONTEXT_REGISTRY[input_id] = (
-        weakref.ref(inputs, retire), record
-    )
-    return inputs
-
-
-def _require_historical_scenario_inputs_current(
-    *, context: HistoricalReplayBuildContext,
-    inputs: ValidatedHistoricalScenarioInputs,
+def _install_historical_scenario_capability(
+    *, capability_type: Any, raw_mint: Any, require_projection: Any,
 ) -> None:
-    entry = _SCENARIO_CONTEXT_REGISTRY.get(id(inputs))
     if (
-        type(inputs) is not ValidatedHistoricalScenarioInputs
-        or entry is None
-        or entry[0]() is not inputs
-        or entry[1].get("issuer") is not _SCENARIO_CONTEXT_ISSUER
-        or entry[1]["context_reference"]() is not context
+        capability_type is not _historical_replay.ValidatedHistoricalScenarioInputs
+        or not callable(raw_mint)
+        or require_projection is not (
+            _historical_replay._validated_historical_scenario_projection
+        )
+        or "_issue_validated_historical_scenario_inputs" in globals()
     ):
         raise HistoricalRoutePublicationError(
-            "historical scenario capability context differs"
+            "historical scenario capability installer is invalid"
         )
-    record = entry[1]
-    try:
-        current = _historical_scenario_material(
-            context=context, scenario_key=record["scenario_key"],
-            validate_context=True,
+    material_reader = _historical_scenario_material
+    context_issuer = object()
+    context_registry = {}
+
+    def issue(
+        *, context: HistoricalReplayBuildContext, scenario_key: str,
+    ) -> Any:
+        try:
+            material = material_reader(
+                context=context, scenario_key=scenario_key,
+                validate_context=True,
+            )
+        except HistoricalRoutePublicationError:
+            raise
+        except Exception as error:
+            raise HistoricalRoutePublicationError(
+                "historical scenario source validation failed"
+            ) from error
+        inputs = raw_mint(
+            scenario_key=material["scenario_key"],
+            context_projection_sha256=material[
+                "context_projection_sha256"
+            ],
+            source_descriptor_set_sha256=material[
+                "source_descriptor_set_sha256"
+            ],
+            proof_inputs_hash=material["proof_inputs_hash"],
+            canonical_projection_bytes=material["canonical_projection_bytes"],
         )
-    except HistoricalRoutePublicationError:
-        raise
-    except Exception as error:
-        raise HistoricalRoutePublicationError(
-            "historical scenario capability is stale"
-        ) from error
-    for field in (
-        "scenario_key", "context_projection_sha256",
-        "source_descriptor_set_sha256", "proof_inputs_hash",
-        "canonical_projection_bytes",
-    ):
-        if current[field] != record[field]:
+        input_id = id(inputs)
+        fields = {
+            "context_reference": weakref.ref(context),
+            "scenario_key": scenario_key,
+            "context_projection_sha256": material[
+                "context_projection_sha256"
+            ],
+            "source_descriptor_set_sha256": material[
+                "source_descriptor_set_sha256"
+            ],
+            "proof_inputs_hash": material["proof_inputs_hash"],
+            "canonical_projection_bytes": material[
+                "canonical_projection_bytes"
+            ],
+        }
+        record = {"issuer": context_issuer, **fields}
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = context_registry.get(input_id)
+            if current is not None and current[0] is reference:
+                context_registry.pop(input_id, None)
+
+        context_registry[input_id] = (
+            weakref.ref(inputs, retire), record
+        )
+        return inputs
+
+    def require_current(
+        *, context: HistoricalReplayBuildContext, inputs: Any,
+    ) -> None:
+        try:
+            require_projection(inputs)
+        except (TypeError, ValueError) as error:
+            raise HistoricalRoutePublicationError(
+                "historical scenario capability context differs"
+            ) from error
+        entry = context_registry.get(id(inputs))
+        if (
+            type(inputs) is not capability_type
+            or entry is None
+            or entry[0]() is not inputs
+            or entry[1].get("issuer") is not context_issuer
+            or entry[1]["context_reference"]() is not context
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical scenario capability context differs"
+            )
+        record = entry[1]
+        try:
+            current = material_reader(
+                context=context, scenario_key=record["scenario_key"],
+                validate_context=True,
+            )
+        except HistoricalRoutePublicationError:
+            raise
+        except Exception as error:
             raise HistoricalRoutePublicationError(
                 "historical scenario capability is stale"
-            )
-    return None
+            ) from error
+        for field in (
+            "scenario_key", "context_projection_sha256",
+            "source_descriptor_set_sha256", "proof_inputs_hash",
+            "canonical_projection_bytes",
+        ):
+            if current[field] != record[field]:
+                raise HistoricalRoutePublicationError(
+                    "historical scenario capability is stale"
+                )
+
+    globals()["ValidatedHistoricalScenarioInputs"] = capability_type
+    globals()["_issue_validated_historical_scenario_inputs"] = issue
+    globals()["_require_historical_scenario_inputs_current"] = require_current
+
+
+_historical_replay._bind_historical_scenario_capability_to_publication(
+    _install_historical_scenario_capability
+)
+del _install_historical_scenario_capability
 
 
 def _validate_historical_cost_rows_for_build_context(

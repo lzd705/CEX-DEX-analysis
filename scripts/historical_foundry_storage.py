@@ -7566,6 +7566,80 @@ def _initialize_historical_foundry_storage_types():
             raise _InternalFailure()
         return metadata, closure
 
+    def _task6_successful_router_calls(
+        *, scenario: Dict[str, Any], overlay: Dict[str, Any],
+        authority: Dict[str, Any], status: int,
+    ) -> list:
+        if status == 0:
+            return []
+        tokens = {
+            row.get("role"): row.get("address")
+            for row in authority.get("tokens", ())
+            if type(row) is dict
+        }
+        routers = {
+            row.get("venue_id"): row.get("router_address")
+            for row in authority.get("venues", ())
+            if type(row) is dict
+        }
+        transaction = overlay.get("transaction")
+        synthetic = overlay.get("synthetic_block")
+        if (
+            set(tokens) != {"uni", "weth"}
+            or set(routers) != {"uniswap_v2", "sushiswap_v2"}
+            or type(transaction) is not dict
+            or type(synthetic) is not dict
+        ):
+            raise _InternalFailure()
+        first, second = (
+            ("uniswap_v2", "sushiswap_v2")
+            if scenario.get("direction") == "uniswap_to_sushiswap"
+            else ("sushiswap_v2", "uniswap_v2")
+        )
+        deadline = synthetic.get("timestamp", -1) + 60
+        executor = transaction.get("to")
+
+        def row(call_path, leg, venue, amount, path):
+            def word(value):
+                if type(value) is not int or not 0 <= value < 2 ** 256:
+                    raise _InternalFailure()
+                return value.to_bytes(32, "big")
+
+            try:
+                calldata = bytes.fromhex("38ed1739") + b"".join((
+                    word(amount), word(0), word(160),
+                    b"\0" * 12 + bytes.fromhex(executor[2:]),
+                    word(deadline), word(2),
+                    b"\0" * 12 + bytes.fromhex(path[0][2:]),
+                    b"\0" * 12 + bytes.fromhex(path[1][2:]),
+                ))
+            except (TypeError, ValueError):
+                raise _InternalFailure() from None
+            return {
+                "call_path": call_path,
+                "leg": leg,
+                "router": routers[venue],
+                "calldata_sha256": hashlib.sha256(calldata).hexdigest(),
+                "amount_in_raw": amount,
+                "amount_out_min_raw": 0,
+                "path": path,
+                "recipient": executor,
+                "deadline": deadline,
+                "value": 0,
+            }
+
+        return [
+            row(
+                [2], "first_leg", first, scenario["amount_weth_in_wei"],
+                [tokens["weth"], tokens["uni"]],
+            ),
+            row(
+                [5], "second_leg", second,
+                scenario["first_amount_out_raw"],
+                [tokens["uni"], tokens["weth"]],
+            ),
+        ]
+
     def _task6_validate_quartet(
         scenario_key: str, members: Dict[str, bytes],
         owner: Dict[str, Any],
@@ -7593,6 +7667,14 @@ def _initialize_historical_foundry_storage_types():
         scenario = matched[0]
         config_values, config_digests = _task6_current_config_values(owner)
         artifact = config_values["toolchain"].get("executor_build", {})
+        transaction = overlay.get("transaction")
+        fee = scenario.get("fee")
+        policy_fees = config_values["policy"].get("fees", {})
+        expected_p50 = (
+            fee.get("next_base_fee_per_gas", -1)
+            + fee.get("p50_priority_fee_per_gas", -1)
+            if type(fee) is dict else -1
+        )
         struct_log_storage, raw_trace_closure = _task6_validate_struct_trace(
             trace, config_values["toolchain"]
         )
@@ -7616,12 +7698,33 @@ def _initialize_historical_foundry_storage_types():
             or trace.get("fork_header") != scenario.get("header")
             or result.get("fork_header") != trace.get("fork_header")
             or result.get("pair_closure") != trace.get("pair_closure")
+            or result.get("post_pair_state")
+            != trace.get("post_pair_state")
             or result.get("balances") != trace.get("balances")
             or result.get("actual_deltas") != trace.get("actual_deltas")
+            or type(transaction) is not dict
+            or receipt.get("effectiveGasPrice") != expected_p50
+            or receipt.get("maxPriorityFeePerGas")
+            != fee.get("p50_priority_fee_per_gas")
+            or transaction.get("maxPriorityFeePerGas")
+            != fee.get("p50_priority_fee_per_gas")
+            or receipt.get("maxFeePerGas")
+            != transaction.get("maxFeePerGas")
+            or transaction.get("maxFeePerGas") != (
+                policy_fees.get("max_fee_multiplier", -1)
+                * scenario.get("child_base_fee_wei", -1)
+                + fee.get("p50_priority_fee_per_gas", -1)
+            )
         ):
             raise _InternalFailure()
         status = receipt.get("status")
         if result.get("status") != status or status not in (0, 1):
+            raise _InternalFailure()
+        expected_successful_calls = _task6_successful_router_calls(
+            scenario=scenario, overlay=overlay,
+            authority=config_values["authority"], status=status,
+        )
+        if trace.get("successful_calls") != expected_successful_calls:
             raise _InternalFailure()
         if status == 1:
             if (
@@ -7786,6 +7889,7 @@ def _initialize_historical_foundry_storage_types():
             "failed": trace.get("failed"),
             "gasprice_opcode_addresses": trace.get("gasprice_opcode_addresses"),
             "calls": trace.get("calls"),
+            "successful_calls": expected_successful_calls,
             "raw_trace_closure": raw_trace_closure,
             "struct_log_storage": struct_log_storage,
         }
@@ -7834,8 +7938,43 @@ def _initialize_historical_foundry_storage_types():
             "v2_fee_denominator": formula.get("fee_denominator"),
             "acceptance_mev_bps": mev_bps,
         }
+        expected_post_pairs = {
+            venue_id: dict(value)
+            for venue_id, value in expected_pairs.items()
+        }
+        if status == 1:
+            first_venue = (
+                "uniswap_v2"
+                if scenario["direction"] == "uniswap_to_sushiswap"
+                else "sushiswap_v2"
+            )
+            expected_post_pairs[first_venue]["reserve_uni_raw"] -= scenario[
+                "first_amount_out_raw"
+            ]
+            expected_post_pairs[first_venue]["pair_uni_balance_raw"] -= scenario[
+                "first_amount_out_raw"
+            ]
+            expected_post_pairs[first_venue]["reserve_weth_raw"] += scenario[
+                "amount_weth_in_wei"
+            ]
+            expected_post_pairs[first_venue]["pair_weth_balance_raw"] += scenario[
+                "amount_weth_in_wei"
+            ]
+            expected_post_pairs[second_venue]["reserve_uni_raw"] += scenario[
+                "first_amount_out_raw"
+            ]
+            expected_post_pairs[second_venue]["pair_uni_balance_raw"] += scenario[
+                "first_amount_out_raw"
+            ]
+            expected_post_pairs[second_venue]["reserve_weth_raw"] -= scenario[
+                "second_amount_out_raw"
+            ]
+            expected_post_pairs[second_venue]["pair_weth_balance_raw"] -= scenario[
+                "second_amount_out_raw"
+            ]
         if (
             result.get("pair_closure") != expected_pairs
+            or result.get("post_pair_state") != expected_post_pairs
             or balances != expected_balances
             or deltas != expected_deltas
             or gas != expected_gas

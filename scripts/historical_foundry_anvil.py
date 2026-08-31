@@ -426,6 +426,36 @@ def _execute_calldata(direction: str, amount_weth_in: int) -> str:
     ).hex()
 
 
+def _decode_swap_exact_tokens_for_tokens_calldata(value: Any) -> Dict[str, Any]:
+    if type(value) is not str or not value.startswith("0x"):
+        raise ValueError("historical successful router calldata is invalid")
+    try:
+        raw = bytes.fromhex(value[2:])
+    except ValueError:
+        raise ValueError(
+            "historical successful router calldata is invalid"
+        ) from None
+    if len(raw) != 260 or raw[:4] != bytes.fromhex("38ed1739"):
+        raise ValueError("historical successful router calldata is invalid")
+    words = [raw[4 + index * 32:4 + (index + 1) * 32] for index in range(8)]
+    if (
+        int.from_bytes(words[2], "big") != 160
+        or int.from_bytes(words[5], "big") != 2
+        or words[3][:12] != b"\0" * 12
+        or words[6][:12] != b"\0" * 12
+        or words[7][:12] != b"\0" * 12
+    ):
+        raise ValueError("historical successful router calldata is invalid")
+    return {
+        "calldata_sha256": hashlib.sha256(raw).hexdigest(),
+        "amount_in_raw": int.from_bytes(words[0], "big"),
+        "amount_out_min_raw": int.from_bytes(words[1], "big"),
+        "path": ["0x" + words[6][12:].hex(), "0x" + words[7][12:].hex()],
+        "recipient": "0x" + words[3][12:].hex(),
+        "deadline": int.from_bytes(words[4], "big"),
+    }
+
+
 def build_historical_state_override(
     *, context: HistoricalReplayContext, scenario: Any
 ) -> Mapping[str, Any]:
@@ -1002,6 +1032,71 @@ def _validate_historical_pair_closure(
     return detached
 
 
+def _validate_historical_post_pair_state(
+    *, baseline: Mapping[str, Any], observed: Mapping[str, Any],
+    row: Mapping[str, Any], status: int,
+) -> Dict[str, Any]:
+    venues = ("uniswap_v2", "sushiswap_v2")
+    fields = (
+        "pair_address", "reserve_uni_raw", "reserve_weth_raw",
+        "pair_uni_balance_raw", "pair_weth_balance_raw",
+    )
+    if (
+        type(baseline) is not dict
+        or type(observed) is not dict
+        or type(row) is not dict
+        or status not in (0, 1)
+        or tuple(baseline) != venues
+        or tuple(observed) != venues
+        or any(
+            type(baseline[venue]) is not dict
+            or type(observed[venue]) is not dict
+            or tuple(baseline[venue]) != fields
+            or tuple(observed[venue]) != fields
+            for venue in venues
+        )
+    ):
+        raise ValueError("historical post-pair state is invalid")
+    expected = {venue: dict(baseline[venue]) for venue in venues}
+    if status == 1:
+        buy, sell = (
+            ("uniswap_v2", "sushiswap_v2")
+            if row.get("direction") == "uniswap_to_sushiswap"
+            else ("sushiswap_v2", "uniswap_v2")
+            if row.get("direction") == "sushiswap_to_uniswap"
+            else (None, None)
+        )
+        try:
+            amount = row["amount_weth_in_wei"]
+            first = row["first_amount_out_raw"]
+            second = row["second_amount_out_raw"]
+        except KeyError as error:
+            raise ValueError("historical post-pair state is invalid") from error
+        if (
+            buy is None
+            or any(type(value) is not int or value <= 0 for value in (
+                amount, first, second,
+            ))
+        ):
+            raise ValueError("historical post-pair state is invalid")
+        expected[buy]["reserve_uni_raw"] -= first
+        expected[buy]["pair_uni_balance_raw"] -= first
+        expected[buy]["reserve_weth_raw"] += amount
+        expected[buy]["pair_weth_balance_raw"] += amount
+        expected[sell]["reserve_uni_raw"] += first
+        expected[sell]["pair_uni_balance_raw"] += first
+        expected[sell]["reserve_weth_raw"] -= second
+        expected[sell]["pair_weth_balance_raw"] -= second
+    if observed != expected or any(
+        type(value) is not int or value < 0
+        for venue in venues
+        for name, value in observed[venue].items()
+        if name != "pair_address"
+    ):
+        raise ValueError("historical post-pair state differs")
+    return {venue: dict(observed[venue]) for venue in venues}
+
+
 def _validate_historical_transaction_envelope(
     *, raw_transaction: Mapping[str, Any],
     expected_transaction: Mapping[str, Any], transaction_hash: str,
@@ -1284,7 +1379,7 @@ def _normalized_failed_router_calls(
 
     def visit(node: Any, *, path: list, expected_from: str) -> None:
         required = {
-            "type", "from", "to", "input", "output", "gas", "gasUsed",
+            "type", "from", "to", "input", "gas", "gasUsed",
         }
         if (
             type(node) is not dict
@@ -1296,8 +1391,11 @@ def _normalized_failed_router_calls(
             or node["from"].lower() != expected_from.lower()
             or type(node["to"]) is not str
             or any(type(node[name]) is not str for name in (
-                "input", "output", "gas", "gasUsed",
+                "input", "gas", "gasUsed",
             ))
+            or (
+                "output" in node and type(node["output"]) is not str
+            )
             or (
                 node["type"] in ("CALL", "CALLCODE")
                 and type(node.get("value")) is not str
@@ -1354,6 +1452,86 @@ def _normalized_failed_router_calls(
     )
     if len(router_paths) != len(set(router_paths)) or len(observed) > 1:
         raise ValueError("historical call trace is invalid")
+    return observed
+
+
+def _normalized_successful_router_calls(
+    *, call_trace: Mapping[str, Any], router_order: tuple,
+    root_sender: str, root_executor: str, root_input: str,
+    root_failed: bool,
+) -> list:
+    if (
+        type(call_trace) is not dict
+        or type(router_order) is not tuple
+        or len(router_order) != 2
+        or any(type(value) is not str for value in router_order)
+        or any(
+            type(value) is not str
+            for value in (root_sender, root_executor, root_input)
+        )
+        or type(root_failed) is not bool
+        or call_trace.get("type") != "CALL"
+        or call_trace.get("from", "").lower() != root_sender.lower()
+        or call_trace.get("to", "").lower() != root_executor.lower()
+        or call_trace.get("input", "").lower() != root_input.lower()
+        or bool(call_trace.get("error")) is not root_failed
+        or type(call_trace.get("calls")) is not list
+    ):
+        raise ValueError("historical successful router trace is invalid")
+    if root_failed:
+        return []
+    allowed = {
+        router.lower(): (index, router.lower())
+        for index, router in enumerate(router_order)
+    }
+    observed = []
+
+    def visit(node: Any, path: list) -> None:
+        if type(node) is not dict or (
+            "calls" in node and type(node["calls"]) is not list
+        ):
+            raise ValueError("historical successful router trace is invalid")
+        target = node.get("to")
+        matched = (
+            allowed.get(target.lower())
+            if type(target) is str else None
+        )
+        if matched is not None and not node.get("error"):
+            if (
+                node.get("type") != "CALL"
+                or type(node.get("value")) is not str
+                or type(node.get("input")) is not str
+            ):
+                raise ValueError(
+                    "historical successful router trace is invalid"
+                )
+            try:
+                call_value = int(node["value"], 16)
+            except ValueError:
+                raise ValueError(
+                    "historical successful router trace is invalid"
+                ) from None
+            decoded = _decode_swap_exact_tokens_for_tokens_calldata(
+                node["input"]
+            )
+            observed.append({
+                "call_path": list(path),
+                "leg": "first_leg" if matched[0] == 0 else "second_leg",
+                "router": matched[1],
+                **decoded,
+                "value": call_value,
+            })
+        for child_index, child in enumerate(node.get("calls", ())):
+            visit(child, path + [child_index])
+
+    visit(call_trace, [])
+    if (
+        len(observed) != 2
+        or [row["call_path"] for row in observed] != [[2], [5]]
+        or [row["leg"] for row in observed]
+        != ["first_leg", "second_leg"]
+    ):
+        raise ValueError("historical successful router trace differs")
     return observed
 
 
@@ -1748,6 +1926,11 @@ def _execute_historical_local_rpc(
         anvil_binary_sha256=checked._active_process_lease._binary_sha256,
         call_trace_config={"tracer": "callTracer"},
     )
+    successful_router_calls = _normalized_successful_router_calls(
+        call_trace=call_trace, router_order=router_order,
+        root_sender=tx["from"], root_executor=tx["to"],
+        root_input=tx["input"], root_failed=receipt["status"] == 0,
+    )
     if receipt["status"] == 0:
         root_output = call_trace.get("output", raw_trace.get("returnValue"))
         receipt["revert_data"] = root_output
@@ -1769,6 +1952,36 @@ def _execute_historical_local_rpc(
         "from": executor, "to": tokens["uni"]["address"],
         "data": balance_call,
     }, expected_executor=executor), "latest"]))
+    post_pair_state = _validate_historical_post_pair_state(
+        baseline=pair_closure,
+        observed=read_pair_state(),
+        row=row,
+        status=receipt["status"],
+    )
+    if receipt["status"] == 1:
+        expected_success = (
+            (
+                "first_leg", router_order[0], row["amount_weth_in_wei"],
+                [tokens["weth"]["address"], tokens["uni"]["address"]],
+            ),
+            (
+                "second_leg", router_order[1], row["first_amount_out_raw"],
+                [tokens["uni"]["address"], tokens["weth"]["address"]],
+            ),
+        )
+        if any(
+            (
+                call["leg"], call["router"], call["amount_in_raw"],
+                call["path"],
+            ) != expected
+            or call["amount_out_min_raw"] != 0
+            or call["recipient"] != executor
+            or call["deadline"]
+            != override["synthetic_block"]["timestamp"] + 60
+            or call["value"] != 0
+            for call, expected in zip(successful_router_calls, expected_success)
+        ):
+            raise ValueError("historical successful router trace differs")
     trace = {
         "schema": "historical_foundry_trace/v1",
         "scenario_key": override["scenario_key"],
@@ -1785,8 +1998,10 @@ def _execute_historical_local_rpc(
             "return_value": raw_trace["returnValue"],
         },
         "calls": failed_router_calls,
+        "successful_calls": successful_router_calls,
         "fork_header": dict(row["header"]),
         "pair_closure": pair_closure,
+        "post_pair_state": post_pair_state,
         "balances": {
             "initial_weth_raw": initial_weth,
             "initial_uni_raw": initial_uni,
@@ -1805,6 +2020,7 @@ def _execute_historical_local_rpc(
             "block_hash": override["block_hash"],
             "state_root": override["state_root"],
             "pair_closure": pair_closure,
+            "post_pair_state": post_pair_state,
         },
         "token_deltas": {
             "initial_weth_raw": initial_weth,
@@ -2296,6 +2512,7 @@ def _replay_historical_scenario_untyped(
             "trace_sha256": trace_sha,
             "fork_header": trace["fork_header"],
             "pair_closure": trace["pair_closure"],
+            "post_pair_state": trace["post_pair_state"],
             "balances": trace["balances"],
             "actual_deltas": trace["actual_deltas"],
             "gas": {
@@ -2318,6 +2535,7 @@ def _replay_historical_scenario_untyped(
                     "gasprice_opcode_addresses"
                 ],
                 "calls": trace["calls"],
+                "successful_calls": trace["successful_calls"],
                 "raw_trace_closure": trace["raw_trace_closure"],
                 "struct_log_storage": trace["struct_log_storage"],
             },

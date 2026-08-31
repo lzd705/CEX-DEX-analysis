@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 import weakref
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass
@@ -21,7 +22,10 @@ from types import MappingProxyType
 from typing import Any, Dict, Mapping, Tuple
 
 from scripts.fetch_dex_depth import decimal_text, depth_fields, v2_band_amounts
-from scripts.execution_cost_components import COST_COMPONENT_CONTRACT_VERSION
+from scripts.execution_cost_components import (
+    COST_COMPONENT_COLUMNS,
+    COST_COMPONENT_CONTRACT_VERSION,
+)
 from scripts.historical_foundry_contracts import HistoricalFoundryConfigSet
 from scripts.route_cohort import canonical_route_id
 from scripts.route_opportunity import (
@@ -34,10 +38,13 @@ from scripts.route_quantity import (
     V2_FEE_FORMULA,
     v2_exact_input_amount_out_raw,
 )
+from scripts.route_cost_topology import HISTORICAL_ATOMIC_COMPONENT_MATRIX
 
 
 _UNI = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
 _WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+_UNISWAP_ROUTER = "0x7a250d5630b4cf539739df2c5dacb4c659f2488d"
+_SUSHISWAP_ROUTER = "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f"
 _VENUES = ("uniswap_v2", "sushiswap_v2")
 _EXECUTION_CLAIM = "historical_counterfactual_state_override_next_block"
 _RUN_FIELDS = frozenset((
@@ -1296,12 +1303,40 @@ def _initialize_validated_historical_scenario_capability():
         registry[value_id] = (weakref.ref(value, retire), record)
         return value
 
-    return ValidatedHistoricalScenarioInputs, issue, require
+    installed = [False]
+
+    def bind_publication(installer: Any) -> None:
+        publication = sys.modules.get(
+            "scripts.historical_route_publication"
+        )
+        if (
+            installed[0]
+            or publication is None
+            or installer is not getattr(
+                publication,
+                "_install_historical_scenario_capability",
+                None,
+            )
+        ):
+            raise ValueError(
+                "historical scenario publication installer is invalid"
+            )
+        installer(
+            capability_type=ValidatedHistoricalScenarioInputs,
+            raw_mint=issue,
+            require_projection=require,
+        )
+        installed[0] = True
+        globals().pop(
+            "_bind_historical_scenario_capability_to_publication", None
+        )
+
+    return ValidatedHistoricalScenarioInputs, bind_publication, require
 
 
 (
     ValidatedHistoricalScenarioInputs,
-    _issue_validated_historical_scenario_inputs_from_publication,
+    _bind_historical_scenario_capability_to_publication,
     _validated_historical_scenario_projection,
 ) = _initialize_validated_historical_scenario_capability()
 del _initialize_validated_historical_scenario_capability
@@ -1381,6 +1416,58 @@ def _run_historical_v2_exact_input_kat() -> None:
         raise ValueError("historical V2 exact-input KAT differs")
 
 
+def _historical_swap_calldata_sha256(
+    *, amount_in_raw: int, path: Tuple[str, str],
+    recipient: str, deadline: int,
+) -> str:
+    def word(value: int) -> bytes:
+        if type(value) is not int or not 0 <= value < 2 ** 256:
+            raise ValueError("historical router call is invalid")
+        return value.to_bytes(32, "big")
+
+    try:
+        raw = bytes.fromhex("38ed1739") + b"".join((
+            word(amount_in_raw), word(0), word(160),
+            b"\0" * 12 + bytes.fromhex(recipient[2:]),
+            word(deadline), word(2),
+            b"\0" * 12 + bytes.fromhex(path[0][2:]),
+            b"\0" * 12 + bytes.fromhex(path[1][2:]),
+        ))
+    except (TypeError, ValueError):
+        raise ValueError("historical router call is invalid") from None
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _historical_expected_successful_calls(
+    *, direction: str, first_weth_in: int, first_uni_out: int,
+    executor: str, deadline: int,
+) -> list:
+    routers = (
+        (_UNISWAP_ROUTER, _SUSHISWAP_ROUTER)
+        if direction == "uniswap_to_sushiswap"
+        else (_SUSHISWAP_ROUTER, _UNISWAP_ROUTER)
+    )
+    specs = (
+        ([2], "first_leg", routers[0], first_weth_in, (_WETH, _UNI)),
+        ([5], "second_leg", routers[1], first_uni_out, (_UNI, _WETH)),
+    )
+    return [{
+        "call_path": call_path,
+        "leg": leg,
+        "router": router,
+        "calldata_sha256": _historical_swap_calldata_sha256(
+            amount_in_raw=amount, path=path,
+            recipient=executor, deadline=deadline,
+        ),
+        "amount_in_raw": amount,
+        "amount_out_min_raw": 0,
+        "path": list(path),
+        "recipient": executor,
+        "deadline": deadline,
+        "value": 0,
+    } for call_path, leg, router, amount, path in specs]
+
+
 def build_historical_atomic_v2_cashflow(
     inputs: ValidatedHistoricalScenarioInputs,
 ) -> Mapping[str, Any]:
@@ -1391,13 +1478,16 @@ def build_historical_atomic_v2_cashflow(
     receipt = projection.get("receipt")
     trace = projection.get("trace")
     overlay = projection.get("overlay")
+    prefilter = projection.get("prefilter_scenario")
+    fee = projection.get("fee")
+    policy_fees = projection.get("policy_fees")
     pools = projection.get("pools")
     route = projection.get("route")
     price = projection.get("price")
     formula = projection.get("v2_formula")
     if any(type(value) is not dict for value in (
         selection, result, receipt, trace, overlay, pools, route, price,
-        formula,
+        formula, prefilter, fee, policy_fees,
     )):
         raise ValueError("historical scenario arithmetic projection is invalid")
     direction = selection.get("direction")
@@ -1414,8 +1504,13 @@ def build_historical_atomic_v2_cashflow(
     proof_authority = result.get("proof_authority")
     balances = result.get("balances")
     deltas = result.get("actual_deltas")
+    trace_balances = trace.get("balances")
+    trace_deltas = trace.get("actual_deltas")
+    transaction = overlay.get("transaction")
+    synthetic = overlay.get("synthetic_block")
     if any(type(value) is not dict for value in (
-        proof_authority, balances, deltas,
+        proof_authority, balances, deltas, trace_balances, trace_deltas,
+        transaction, synthetic,
     )):
         raise ValueError("historical execution closure is invalid")
     try:
@@ -1446,6 +1541,64 @@ def build_historical_atomic_v2_cashflow(
     expected_weth_in = (
         requested_notional * 10 ** (18 + feed_decimals) // answer
     )
+    if (
+        type(first_weth_in) is not int or first_weth_in <= 0
+        or type(requested_notional) is not int or requested_notional <= 0
+    ):
+        raise ValueError("historical exact-input arithmetic is invalid")
+    direction_index = {
+        "uniswap_to_sushiswap": 0,
+        "sushiswap_to_uniswap": 1,
+    }[direction]
+    try:
+        calldata_text = transaction["input"]
+        if (
+            type(calldata_text) is not str
+            or not calldata_text.startswith("0x")
+        ):
+            raise ValueError
+        calldata = bytes.fromhex(calldata_text[2:])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "historical transaction calldata is invalid"
+        ) from error
+    expected_calldata = b"\x64\xcc\x5e\xae" + (
+        direction_index.to_bytes(32, "big")
+        + first_weth_in.to_bytes(32, "big")
+    )
+    try:
+        expected_effective_gas_price = (
+            fee["next_base_fee_per_gas"]
+            + fee["p50_priority_fee_per_gas"]
+        )
+        expected_max_fee_per_gas = (
+            policy_fees["max_fee_multiplier"]
+            * prefilter["child_base_fee_wei"]
+            + fee["p50_priority_fee_per_gas"]
+        )
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            "historical p50 gas envelope is invalid"
+        ) from error
+    if (
+        calldata != expected_calldata
+        or transaction.get("calldata_sha256")
+        != hashlib.sha256(calldata).hexdigest()
+        or transaction.get("value") != 0
+        or receipt.get("effectiveGasPrice")
+        != expected_effective_gas_price
+        or receipt.get("maxPriorityFeePerGas")
+        != fee.get("p50_priority_fee_per_gas")
+        or transaction.get("maxPriorityFeePerGas")
+        != fee.get("p50_priority_fee_per_gas")
+        or receipt.get("maxFeePerGas") != expected_max_fee_per_gas
+        or transaction.get("maxFeePerGas") != expected_max_fee_per_gas
+        or synthetic.get("base_fee_per_gas")
+        != prefilter.get("child_base_fee_wei")
+        or fee.get("next_base_fee_per_gas")
+        != prefilter.get("child_base_fee_wei")
+    ):
+        raise ValueError("historical p50 gas envelope differs")
     economics = selection.get("economics")
     if type(economics) is not dict or set(economics) != {
         "gross_edge_usd", "gas_cost_usd", "mev_buffer_usd",
@@ -1488,10 +1641,79 @@ def build_historical_atomic_v2_cashflow(
         raise ValueError("historical scenario economics differ")
     scenario_key = projection["scenario_key"]
     expected_route_id = route.get("route_id")
+    expected_balances = {
+        "initial_weth_raw": first_weth_in,
+        "initial_uni_raw": 0,
+        "final_weth_raw": final_weth_out,
+        "final_uni_raw": 0,
+    }
+    expected_deltas = {
+        "first_leg_uni_raw": first_uni_out,
+        "weth_raw": final_weth_out - first_weth_in,
+        "residual_uni_raw": 0,
+    }
+    try:
+        expected_calls = _historical_expected_successful_calls(
+            direction=direction,
+            first_weth_in=first_weth_in,
+            first_uni_out=first_uni_out,
+            executor=transaction["to"],
+            deadline=synthetic["timestamp"] + 60,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "historical successful router calls are invalid"
+        ) from error
+    baseline_pairs = result.get("pair_closure")
+    trace_pairs = trace.get("pair_closure")
     if (
-        type(first_weth_in) is not int
-        or first_weth_in <= 0
-        or first_weth_in != expected_weth_in
+        type(baseline_pairs) is not dict
+        or trace_pairs != baseline_pairs
+        or set(baseline_pairs) != {"uniswap_v2", "sushiswap_v2"}
+    ):
+        raise ValueError("historical pair baseline differs")
+    expected_post_pairs = {}
+    for venue in ("uniswap_v2", "sushiswap_v2"):
+        baseline = baseline_pairs.get(venue)
+        pool = pools.get(venue)
+        if (
+            type(baseline) is not dict
+            or type(pool) is not dict
+            or set(baseline) != {
+                "pair_address", "reserve_uni_raw", "reserve_weth_raw",
+                "pair_uni_balance_raw", "pair_weth_balance_raw",
+            }
+            or baseline.get("pair_address") != pool.get("pool_address")
+            or baseline.get("reserve_uni_raw") != int(pool["reserve0_raw"])
+            or baseline.get("reserve_weth_raw") != int(pool["reserve1_raw"])
+            or any(
+                type(baseline.get(field)) is not int
+                or baseline[field] < 0
+                for field in (
+                    "reserve_uni_raw", "reserve_weth_raw",
+                    "pair_uni_balance_raw", "pair_weth_balance_raw",
+                )
+            )
+        ):
+            raise ValueError("historical pair baseline differs")
+        expected_post_pairs[venue] = dict(baseline)
+    expected_post_pairs[buy_venue]["reserve_weth_raw"] += first_weth_in
+    expected_post_pairs[buy_venue]["pair_weth_balance_raw"] += first_weth_in
+    expected_post_pairs[buy_venue]["reserve_uni_raw"] -= first_uni_out
+    expected_post_pairs[buy_venue]["pair_uni_balance_raw"] -= first_uni_out
+    expected_post_pairs[sell_venue]["reserve_uni_raw"] += second_uni_in
+    expected_post_pairs[sell_venue]["pair_uni_balance_raw"] += second_uni_in
+    expected_post_pairs[sell_venue]["reserve_weth_raw"] -= final_weth_out
+    expected_post_pairs[sell_venue]["pair_weth_balance_raw"] -= final_weth_out
+    if any(
+        value < 0
+        for row in expected_post_pairs.values()
+        for field, value in row.items()
+        if field != "pair_address"
+    ):
+        raise ValueError("historical pair transition is invalid")
+    if (
+        first_weth_in != expected_weth_in
         or projection.get("proof_inputs_hash")
         != result.get("cost_proof_inputs", {}).get("proof_inputs_hash")
         or proof_authority.get("amount_weth_in_wei") != first_weth_in
@@ -1499,13 +1721,23 @@ def build_historical_atomic_v2_cashflow(
         or proof_authority.get("direction") != direction
         or proof_authority.get("requested_notional_usd")
         != requested_notional
-        or balances.get("initial_weth_raw") != first_weth_in
-        or balances.get("initial_uni_raw") != 0
-        or balances.get("final_weth_raw") != final_weth_out
-        or balances.get("final_uni_raw") != 0
-        or deltas.get("first_leg_uni_raw") != first_uni_out
-        or deltas.get("weth_raw") != final_weth_out - first_weth_in
-        or deltas.get("residual_uni_raw") != 0
+        or balances != expected_balances
+        or trace_balances != expected_balances
+        or deltas != expected_deltas
+        or trace_deltas != expected_deltas
+        or prefilter.get("scenario_key") != scenario_key
+        or prefilter.get("direction") != direction
+        or prefilter.get("requested_notional_usd") != requested_notional
+        or prefilter.get("amount_weth_in_wei") != first_weth_in
+        or prefilter.get("first_amount_out_raw") != first_uni_out
+        or prefilter.get("second_amount_out_raw") != final_weth_out
+        or prefilter.get("gross_profit_weth_wei")
+        != final_weth_out - first_weth_in
+        or trace.get("successful_calls") != expected_calls
+        or result.get("trace_closure", {}).get("successful_calls")
+        != expected_calls
+        or trace.get("post_pair_state") != expected_post_pairs
+        or result.get("post_pair_state") != expected_post_pairs
         or selection.get("weth_delta_raw")
         != final_weth_out - first_weth_in
         or selection.get("scenario_key") != scenario_key
@@ -1781,6 +2013,7 @@ def build_historical_scenario_projection(
     projection = _validated_historical_scenario_projection(inputs)
     cashflow = build_historical_atomic_v2_cashflow(inputs)
     built = build_historical_route_opportunity(inputs)
+    sell_pool = projection["pools"][cashflow["sell_venue"]]
     value = {
         "schema": "historical_foundry_replay_scenario/v1",
         "scenario_key": projection["scenario_key"],
@@ -1795,12 +2028,559 @@ def build_historical_scenario_projection(
         "trace_sha256": projection["trace_sha256"],
         "result_sha256": projection["result_sha256"],
         "gross_edge_weth_raw": cashflow["gross_edge_weth_raw"],
+        "proof_inputs": _plain(projection["proof_inputs"]),
+        "economics_authority": {
+            "first_weth_in_raw": cashflow["first_weth_in_raw"],
+            "first_uni_out_raw": cashflow["first_uni_out_raw"],
+            "final_weth_out_raw": cashflow["final_weth_out_raw"],
+            "eth_usd_answer": int(projection["price"]["answer"]),
+            "feed_decimals": int(projection["price"]["decimals"]),
+            "fee_numerator": projection["v2_formula"]["fee_numerator"],
+            "fee_denominator": projection["v2_formula"]["fee_denominator"],
+            "second_leg_reserve_uni_raw": int(sell_pool["reserve0_raw"]),
+            "second_leg_reserve_weth_raw": int(sell_pool["reserve1_raw"]),
+            "gas_used": projection["receipt"]["gasUsed"],
+            "receipt_effective_gas_price": projection["receipt"][
+                "effectiveGasPrice"
+            ],
+            "next_base_fee_per_gas": projection["fee"][
+                "next_base_fee_per_gas"
+            ],
+            "p50_priority_fee_per_gas": projection["fee"][
+                "p50_priority_fee_per_gas"
+            ],
+            "p90_priority_fee_per_gas": projection["fee"][
+                "p90_priority_fee_per_gas"
+            ],
+        },
         "opportunity": _plain(built["opportunity"]),
         "cost_components": _plain(built["cost_components"]),
         "economics_scenarios": _plain(built["economics_scenarios"]),
     }
     value["scenario_projection_sha256"] = _digest(value)
     return _canonical_bytes(value)
+
+
+def _historical_canonical_decimal_fraction(
+    value: Any, label: str, *, nonnegative: bool = False,
+    positive: bool = False,
+) -> Fraction:
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError(label + " is invalid")
+    try:
+        number = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(label + " is invalid") from error
+    if (
+        not number.is_finite()
+        or nonnegative and number < 0
+        or positive and number <= 0
+    ):
+        raise ValueError(label + " is invalid")
+    fraction = Fraction(number)
+    if value != _exact_fraction_decimal(fraction):
+        raise ValueError(label + " is not canonical")
+    return fraction
+
+
+def _validate_historical_compact_scenario(
+    *, value: Mapping[str, Any], expected_scenario_key: str,
+    expected_direction: str, expected_notional: int,
+) -> Mapping[str, Any]:
+    expected_fields = {
+        "schema", "scenario_key", "route_id", "requested_notional_usd",
+        "receipt_status", "proof_inputs_hash", "overlay_sha256",
+        "receipt_sha256", "trace_sha256", "result_sha256",
+        "gross_edge_weth_raw", "proof_inputs", "economics_authority",
+        "opportunity", "cost_components", "economics_scenarios",
+        "scenario_projection_sha256",
+    }
+    if (
+        type(value) is not dict
+        or set(value) != expected_fields
+        or value.get("schema")
+        != "historical_foundry_replay_scenario/v1"
+        or value.get("scenario_key") != expected_scenario_key
+        or value.get("requested_notional_usd") != expected_notional
+        or value.get("receipt_status") != 1
+        or type(value.get("route_id")) is not str
+        or not value["route_id"]
+        or type(value.get("gross_edge_weth_raw")) is not int
+    ):
+        raise ValueError("historical replay scenario contract differs")
+    unsigned = dict(value)
+    binding = unsigned.pop("scenario_projection_sha256")
+    if (
+        _SHA.fullmatch(binding or "") is None
+        or binding != _digest(unsigned)
+        or any(
+            _SHA.fullmatch(value.get(field) or "") is None
+            for field in (
+                "proof_inputs_hash", "overlay_sha256", "receipt_sha256",
+                "trace_sha256", "result_sha256",
+            )
+        )
+    ):
+        raise ValueError("historical replay scenario binding differs")
+
+    opportunity = value.get("opportunity")
+    rows = value.get("cost_components")
+    economics = value.get("economics_scenarios")
+    proof_inputs = value.get("proof_inputs")
+    economics_authority = value.get("economics_authority")
+    if (
+        type(opportunity) is not dict
+        or set(opportunity) != set(OPPORTUNITY_FIELDS)
+        or type(rows) is not list or len(rows) != 9
+        or type(economics) is not list or len(economics) != 3
+        or type(proof_inputs) is not dict
+        or type(economics_authority) is not dict
+    ):
+        raise ValueError("historical replay scenario inventory differs")
+    proof_fields = {
+        "schema", "scenario_key", "policy_sha256", "receipt_sha256",
+        "trace_sha256", "adapter_proof_sha256", "rows",
+        "proof_inputs_hash",
+    }
+    proof_row_fields = {
+        "grain", "component", "value_status", "embedded",
+        "amount_usd_exact", "rate_bps_exact", "proof_role",
+        "proof_sha256",
+    }
+    proof_rows = proof_inputs.get("rows")
+    proof_unsigned = {
+        key: item for key, item in proof_inputs.items()
+        if key != "proof_inputs_hash"
+    }
+    if (
+        set(proof_inputs) != proof_fields
+        or proof_inputs.get("schema")
+        != "historical_foundry_cost_proof_inputs/v1"
+        or proof_inputs.get("scenario_key") != expected_scenario_key
+        or proof_inputs.get("receipt_sha256") != value["receipt_sha256"]
+        or proof_inputs.get("trace_sha256") != value["trace_sha256"]
+        or _SHA.fullmatch(proof_inputs.get("policy_sha256") or "") is None
+        or _SHA.fullmatch(proof_inputs.get("adapter_proof_sha256") or "")
+        is None
+        or type(proof_rows) is not list or len(proof_rows) != 9
+        or any(
+            type(row) is not dict or set(row) != proof_row_fields
+            for row in proof_rows
+        )
+        or proof_inputs.get("proof_inputs_hash") != _typed_digest(
+            "historical_foundry_cost_proof_inputs/v1", proof_unsigned
+        )
+        or value["proof_inputs_hash"]
+        != proof_inputs.get("proof_inputs_hash")
+    ):
+        raise ValueError("historical compact cost proof differs")
+    authority_fields = {
+        "first_weth_in_raw", "first_uni_out_raw", "final_weth_out_raw",
+        "eth_usd_answer", "feed_decimals", "fee_numerator",
+        "fee_denominator", "second_leg_reserve_uni_raw",
+        "second_leg_reserve_weth_raw", "gas_used",
+        "receipt_effective_gas_price", "next_base_fee_per_gas",
+        "p50_priority_fee_per_gas", "p90_priority_fee_per_gas",
+    }
+    if (
+        set(economics_authority) != authority_fields
+        or any(
+            type(economics_authority.get(field)) is not int
+            for field in authority_fields
+        )
+        or any(
+            economics_authority[field] <= 0
+            for field in (
+                "first_weth_in_raw", "first_uni_out_raw",
+                "final_weth_out_raw", "eth_usd_answer",
+                "fee_numerator", "fee_denominator",
+                "second_leg_reserve_uni_raw",
+                "second_leg_reserve_weth_raw", "gas_used",
+                "receipt_effective_gas_price",
+            )
+        )
+        or not 0 <= economics_authority["feed_decimals"] <= 255
+        or not 0 < economics_authority["fee_numerator"]
+        < economics_authority["fee_denominator"]
+        or (
+            economics_authority["fee_denominator"]
+            - economics_authority["fee_numerator"]
+        ) * 10_000 != 30 * economics_authority["fee_denominator"]
+        or economics_authority["next_base_fee_per_gas"] < 0
+        or economics_authority["p50_priority_fee_per_gas"] < 0
+        or economics_authority["p90_priority_fee_per_gas"]
+        < economics_authority["p50_priority_fee_per_gas"]
+        or economics_authority["receipt_effective_gas_price"] != (
+            economics_authority["next_base_fee_per_gas"]
+            + economics_authority["p50_priority_fee_per_gas"]
+        )
+        or value["gross_edge_weth_raw"] != (
+            economics_authority["final_weth_out_raw"]
+            - economics_authority["first_weth_in_raw"]
+        )
+    ):
+        raise ValueError("historical economics authority differs")
+    usd_denominator = 10 ** (18 + economics_authority["feed_decimals"])
+    answer = economics_authority["eth_usd_answer"]
+    fee_units = (
+        economics_authority["fee_denominator"]
+        - economics_authority["fee_numerator"]
+    )
+    authority_gross_buy = Fraction(
+        economics_authority["first_weth_in_raw"] * answer,
+        usd_denominator,
+    )
+    authority_gross_sell = Fraction(
+        economics_authority["final_weth_out_raw"] * answer,
+        usd_denominator,
+    )
+    authority_gross_edge = authority_gross_sell - authority_gross_buy
+    authority_buy_pool_fee = Fraction(
+        economics_authority["first_weth_in_raw"] * answer * fee_units,
+        usd_denominator * economics_authority["fee_denominator"],
+    )
+    authority_sell_pool_fee = Fraction(
+        economics_authority["first_uni_out_raw"]
+        * economics_authority["second_leg_reserve_weth_raw"]
+        * answer * fee_units,
+        economics_authority["second_leg_reserve_uni_raw"]
+        * usd_denominator * economics_authority["fee_denominator"],
+    )
+    p50_effective = economics_authority["receipt_effective_gas_price"]
+    p90_effective = (
+        economics_authority["next_base_fee_per_gas"]
+        + economics_authority["p90_priority_fee_per_gas"]
+    )
+    authority_p50_gas = Fraction(
+        economics_authority["gas_used"] * p50_effective * answer,
+        usd_denominator,
+    )
+    authority_p90_gas = Fraction(
+        economics_authority["gas_used"] * p90_effective * answer,
+        usd_denominator,
+    )
+    opportunity_unsigned = dict(opportunity)
+    opportunity_binding = opportunity_unsigned.pop(
+        "evidence_binding_sha256", None
+    )
+    route_identity = {
+        "token_symbol": opportunity.get("token_symbol"),
+        "buy_market_id": opportunity.get("buy_market_id"),
+        "sell_market_id": opportunity.get("sell_market_id"),
+        "route_mode": opportunity.get("route_mode"),
+    }
+    try:
+        expected_route_id = canonical_route_id(route_identity)
+        expected_opportunity_id = route_opportunity_id(
+            expected_route_id, expected_notional
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("historical opportunity identity is invalid") from error
+    venue_order = (
+        ("uniswap_v2", "sushiswap_v2")
+        if expected_direction == "uniswap_to_sushiswap"
+        else ("sushiswap_v2", "uniswap_v2")
+    )
+    if (
+        opportunity_binding != _digest(opportunity_unsigned)
+        or opportunity.get("contract_version")
+        != ROUTE_OPPORTUNITY_CONTRACT_VERSION
+        or opportunity.get("route_id") != expected_route_id
+        or value["route_id"] != expected_route_id
+        or opportunity.get("opportunity_id") != expected_opportunity_id
+        or opportunity.get("requested_notional_usd")
+        != str(expected_notional)
+        or opportunity.get("token_symbol") != "UNI"
+        or opportunity.get("route_mode") != "atomic_onchain"
+        or ":{}:".format(venue_order[0])
+        not in opportunity.get("buy_market_id", "")
+        or ":{}:".format(venue_order[1])
+        not in opportunity.get("sell_market_id", "")
+        or opportunity.get("opportunity_class") != "research_estimate"
+        or opportunity.get("strict_eligible") is not False
+        or opportunity.get("strict_ready_for_publication") is not False
+        or opportunity.get("publication_attestation_sha256") is not None
+        or opportunity.get("mode_evidence_eligible") is not True
+        or opportunity.get("cost_completeness") != "incomplete"
+        or opportunity.get("scenario_cost_completeness") != "complete"
+        or opportunity.get("strict_nonembedded_cost_usd") != "0"
+        or opportunity.get("component_reasons")
+        != ["cost_component_estimated"]
+        or opportunity.get("primary_reason") != "cost_component_estimated"
+        or opportunity.get("reason_codes") != ["cost_component_estimated"]
+        or opportunity.get("reflected_or_embedded_component_keys")
+        != ["buy:pool_swap_fee", "sell:pool_swap_fee"]
+        or opportunity.get("edge_bps_denominator_basis")
+        != "gross_buy_cost_usd"
+        or opportunity.get("target_base_unit_decimals") != 18
+        or opportunity.get("target_lattice_raw") != "1"
+        or opportunity.get("skew_seconds") != "0"
+        or opportunity.get("route_age_seconds") != "0"
+        or opportunity.get("buy_state_observed_at")
+        != opportunity.get("sell_state_observed_at")
+        or opportunity.get("buy_core_manifest_sha256")
+        != opportunity.get("sell_core_manifest_sha256")
+        or opportunity.get("inventory_profile_hash")
+        != value["proof_inputs_hash"]
+        or opportunity.get("cost_component_set_sha256") != _digest(rows)
+        or opportunity.get("mode_evidence_sha256") != _typed_digest(
+            "historical_atomic_mode_evidence/v1",
+            {
+                "scenario_key": expected_scenario_key,
+                "proof_inputs_hash": value["proof_inputs_hash"],
+            },
+        )
+        or any(
+            _SHA.fullmatch(opportunity.get(field) or "") is None
+            for field in (
+                "buy_usd_projection_sha256", "sell_usd_projection_sha256",
+                "buy_core_manifest_sha256", "sell_core_manifest_sha256",
+                "cost_component_set_sha256", "mode_evidence_sha256",
+                "inventory_profile_hash", "evidence_binding_sha256",
+            )
+        )
+    ):
+        raise ValueError("historical opportunity contract differs")
+
+    target = _historical_canonical_decimal_fraction(
+        opportunity.get("target_token_quantity"),
+        "historical opportunity target", positive=True,
+    )
+    try:
+        target_raw = int(opportunity.get("target_base_raw"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("historical opportunity target is invalid") from error
+    if (
+        opportunity.get("target_base_raw") != str(target_raw)
+        or target * 10 ** 18 != target_raw
+        or target_raw != economics_authority["first_uni_out_raw"]
+        or opportunity.get("maximum_proved_capacity_quantity")
+        != opportunity.get("target_token_quantity")
+    ):
+        raise ValueError("historical opportunity target differs")
+
+    proof_roles = (
+        "receipt", "receipt", "receipt", "receipt", "receipt", "receipt",
+        "receipt", "trace", "policy",
+    )
+    common = None
+    amounts = []
+    policy_sha256 = None
+    for row, proof_row, shape, proof_role in zip(
+        rows, proof_rows, HISTORICAL_ATOMIC_COMPONENT_MATRIX, proof_roles
+    ):
+        if type(row) is not dict or set(row) != set(COST_COMPONENT_COLUMNS):
+            raise ValueError("historical compact cost row schema differs")
+        leg, component, status, embedded = shape
+        row_common = (
+            row.get("cohort_id"), row.get("opportunity_id"),
+            row.get("requested_notional_usd"),
+            row.get("target_token_quantity"),
+        )
+        if common is None:
+            common = row_common
+        if (
+            row_common != common
+            or row.get("contract_version") != COST_COMPONENT_CONTRACT_VERSION
+            or row.get("opportunity_id") != expected_opportunity_id
+            or row.get("cohort_id") != opportunity.get("cohort_id")
+            or row.get("requested_notional_usd") != str(expected_notional)
+            or row.get("target_token_quantity")
+            != opportunity.get("target_token_quantity")
+            or row.get("leg") != leg
+            or row.get("component_type") != component
+            or row.get("value_status") != status
+            or row.get("embedded_in_leg_quote") is not embedded
+            or row.get("direction") != (
+                "buy_token" if leg == "buy"
+                else "sell_token" if leg == "sell" else "route"
+            )
+            or row.get("market_id") != (
+                opportunity["buy_market_id"] if leg == "buy"
+                else opportunity["sell_market_id"] if leg == "sell" else ""
+            )
+            or row.get("basis")
+            != "historical_foundry_exact_proof_input"
+            or row.get("strict_eligible") is not False
+            or row.get("observed_at") is not None
+            or row.get("valid_until") is not None
+            or row.get("reason_code") is not None
+            or row.get("source") != proof_role
+            or _SHA.fullmatch(row.get("source_record_sha256") or "") is None
+            or proof_row.get("grain") != leg
+            or proof_row.get("component") != component
+            or proof_row.get("value_status") != status
+            or proof_row.get("embedded") is not embedded
+            or proof_row.get("proof_role") != proof_role
+            or proof_row.get("amount_usd_exact") != row.get("amount_usd")
+            or proof_row.get("rate_bps_exact") != row.get("rate_bps")
+            or proof_row.get("proof_sha256")
+            != row.get("source_record_sha256")
+            or proof_role == "receipt"
+            and row.get("source_record_sha256") != value["receipt_sha256"]
+            or proof_role == "trace"
+            and row.get("source_record_sha256") != value["trace_sha256"]
+        ):
+            raise ValueError("historical compact cost row contract differs")
+        key = (leg, component)
+        amount = row.get("amount_usd")
+        rate = row.get("rate_bps")
+        if key in (("buy", "pool_swap_fee"), ("sell", "pool_swap_fee")):
+            amount_value = _historical_canonical_decimal_fraction(
+                amount, "historical pool fee", positive=True
+            )
+            if rate != "30":
+                raise ValueError("historical pool fee differs")
+        elif key in (
+            ("buy", "router_or_integrator_fee"),
+            ("buy", "token_transfer_tax"),
+            ("sell", "router_or_integrator_fee"),
+            ("sell", "token_transfer_tax"),
+        ):
+            amount_value = Fraction(0)
+            if amount != "0" or rate != "0":
+                raise ValueError("historical proved zero fee differs")
+        elif key == ("route", "network_gas"):
+            amount_value = _historical_canonical_decimal_fraction(
+                amount, "historical network gas", positive=True
+            )
+            if rate is not None:
+                raise ValueError("historical network gas differs")
+        elif key == ("route", "rebalancing_or_transfer"):
+            amount_value = None
+            if amount is not None or rate is not None:
+                raise ValueError("historical transfer topology differs")
+        else:
+            amount_value = _historical_canonical_decimal_fraction(
+                amount, "historical MEV buffer", nonnegative=True
+            )
+            if (
+                rate != "10"
+                or amount_value != Fraction(expected_notional * 10, 10_000)
+            ):
+                raise ValueError("historical MEV buffer differs")
+            policy_sha256 = row["source_record_sha256"]
+        amounts.append(amount_value)
+
+    if (
+        amounts[0] != authority_buy_pool_fee
+        or amounts[3] != authority_sell_pool_fee
+        or amounts[6] != authority_p50_gas
+        or proof_inputs["policy_sha256"] != policy_sha256
+    ):
+        raise ValueError("historical compact cost proof arithmetic differs")
+
+    gross_buy = _historical_canonical_decimal_fraction(
+        opportunity.get("gross_buy_cost_usd"),
+        "historical gross buy cost", positive=True,
+    )
+    gross_sell = _historical_canonical_decimal_fraction(
+        opportunity.get("gross_sell_proceeds_usd"),
+        "historical gross sell proceeds", nonnegative=True,
+    )
+    gross_edge = _historical_canonical_decimal_fraction(
+        opportunity.get("gross_edge_usd"), "historical gross edge"
+    )
+    gas_cost = amounts[6]
+    mev_cost = amounts[8]
+    research_net = _historical_canonical_decimal_fraction(
+        opportunity.get("research_net_edge_usd"),
+        "historical research net",
+    )
+    if (
+        gross_sell - gross_buy != gross_edge
+        or gross_buy != authority_gross_buy
+        or gross_sell != authority_gross_sell
+        or gross_edge != authority_gross_edge
+        or amounts[0] != gross_buy * Fraction(30, 10_000)
+        or opportunity.get("strict_net_edge_usd")
+        != _exact_fraction_decimal(gross_edge)
+        or opportunity.get("research_bounded_cost_usd") != "0"
+        or opportunity.get("research_assumed_cost_usd")
+        != _exact_fraction_decimal(gas_cost + mev_cost)
+        or research_net != gross_edge - gas_cost - mev_cost
+    ):
+        raise ValueError("historical opportunity economics differ")
+    for prefix, edge in (
+        ("gross", gross_edge), ("strict_net", gross_edge),
+        ("research_net", research_net),
+    ):
+        bps, numerator, denominator = _historical_ratio_fields(edge, gross_buy)
+        if (
+            opportunity.get(prefix + "_edge_bps") != bps
+            or opportunity.get(prefix + "_edge_bps_numerator") != numerator
+            or opportunity.get(prefix + "_edge_bps_denominator") != denominator
+        ):
+            raise ValueError("historical opportunity bps differ")
+
+    economics_fields = {
+        "name", "priority_fee_percentile", "mev_bps", "gas_used",
+        "effective_gas_price", "gas_cost_usd", "mev_buffer_usd",
+        "research_net_edge_usd", "positive_research_net",
+    }
+    economics_matrix = (
+        ("baseline_p50_mev_10bps", 50, 10),
+        ("stress_p90_mev_25bps", 90, 25),
+        ("stress_p90_mev_50bps", 90, 50),
+    )
+    baseline_positive = None
+    for index, (row, expected) in enumerate(zip(economics, economics_matrix)):
+        name, percentile, mev_bps = expected
+        if (
+            type(row) is not dict or set(row) != economics_fields
+            or row.get("name") != name
+            or row.get("priority_fee_percentile") != percentile
+            or row.get("mev_bps") != str(mev_bps)
+            or type(row.get("gas_used")) is not int
+            or row["gas_used"] <= 0
+            or type(row.get("effective_gas_price")) is not int
+            or row["effective_gas_price"] <= 0
+            or type(row.get("positive_research_net")) is not bool
+            or row["gas_used"] != economics[0].get("gas_used")
+            or row["gas_used"] != economics_authority["gas_used"]
+        ):
+            raise ValueError("historical economics matrix differs")
+        scenario_gas = _historical_canonical_decimal_fraction(
+            row["gas_cost_usd"], "historical scenario gas", positive=True
+        )
+        scenario_mev = _historical_canonical_decimal_fraction(
+            row["mev_buffer_usd"], "historical scenario MEV",
+            nonnegative=True,
+        )
+        scenario_net = _historical_canonical_decimal_fraction(
+            row["research_net_edge_usd"], "historical scenario net"
+        )
+        expected_effective = p50_effective if index == 0 else p90_effective
+        expected_gas = authority_p50_gas if index == 0 else authority_p90_gas
+        if index == 0:
+            baseline_positive = row["positive_research_net"]
+        if (
+            scenario_mev != Fraction(expected_notional * mev_bps, 10_000)
+            or scenario_net != gross_edge - scenario_gas - scenario_mev
+            or row["positive_research_net"] is not (scenario_net > 0)
+            or row["effective_gas_price"] != expected_effective
+            or scenario_gas != expected_gas
+        ):
+            raise ValueError("historical economics values differ")
+        if index == 0 and (
+            scenario_gas != gas_cost
+            or scenario_mev != mev_cost
+            or scenario_net != research_net
+        ):
+            raise ValueError("historical baseline economics differ")
+    return {
+        "scenario_key": expected_scenario_key,
+        "route_id": value["route_id"],
+        "requested_notional_usd": expected_notional,
+        "proof_inputs_hash": value["proof_inputs_hash"],
+        "policy_sha256": policy_sha256,
+        "overlay_sha256": value["overlay_sha256"],
+        "scenario_projection_sha256": binding,
+        "opportunity_evidence_binding_sha256": opportunity_binding,
+        "research_net_edge_usd": opportunity["research_net_edge_usd"],
+        "economics_scenarios_sha256": _digest(economics),
+        "positive_research_net": baseline_positive,
+    }
 
 
 def build_historical_replay_evidence(
@@ -1812,64 +2592,64 @@ def build_historical_replay_evidence(
         or any(type(value) is not bytes for value in canonical_scenario_projection_bytes)
     ):
         raise ValueError("historical replay scenario inventory is not exact")
+    first_scenario_key = None
+    try:
+        first_value = json.loads(canonical_scenario_projection_bytes[0])
+        first_scenario_key = first_value.get("scenario_key")
+        block_text, _direction, _notional = first_scenario_key.split(":")
+        block_number = int(block_text)
+    except (
+        AttributeError, TypeError, ValueError, UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ValueError("historical replay scenario ID is invalid") from error
+    if str(block_number) != block_text or block_number < 0:
+        raise ValueError("historical replay scenario ID is invalid")
+    directions = (
+        "uniswap_to_sushiswap", "sushiswap_to_uniswap",
+    )
+    notionals = (1000, 5000, 10000, 50000, 100000)
+    expected_inventory = tuple(
+        (
+            "{}:{}:{}".format(block_number, direction, notional),
+            direction,
+            notional,
+        )
+        for direction in directions for notional in notionals
+    )
     scenarios = []
-    observed = set()
-    for raw in canonical_scenario_projection_bytes:
+    for raw, (scenario_key, direction, notional) in zip(
+        canonical_scenario_projection_bytes, expected_inventory
+    ):
         try:
             value = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("historical replay scenario is invalid") from error
-        provided = dict(value)
-        binding = provided.pop("scenario_projection_sha256", None)
         if (
             type(value) is not dict
             or _canonical_bytes(value) != raw
-            or value.get("schema") != "historical_foundry_replay_scenario/v1"
-            or binding != _digest(provided)
-            or value.get("receipt_status") != 1
-            or type(value.get("scenario_key")) is not str
-            or value["scenario_key"] in observed
         ):
-            raise ValueError("historical replay scenario binding differs")
-        observed.add(value["scenario_key"])
-        opportunity = value.get("opportunity")
-        if (
-            type(opportunity) is not dict
-            or opportunity.get("opportunity_class") != "research_estimate"
-            or opportunity.get("strict_eligible") is not False
-            or opportunity.get("strict_ready_for_publication") is not False
-            or opportunity.get("publication_attestation_sha256") is not None
-        ):
-            raise ValueError("historical opportunity classification differs")
-        scenarios.append({
-            "scenario_key": value["scenario_key"],
-            "route_id": value["route_id"],
-            "requested_notional_usd": value["requested_notional_usd"],
-            "proof_inputs_hash": value["proof_inputs_hash"],
-            "overlay_sha256": value["overlay_sha256"],
-            "scenario_projection_sha256": binding,
-            "opportunity_evidence_binding_sha256": opportunity[
-                "evidence_binding_sha256"
-            ],
-            "research_net_edge_usd": opportunity[
-                "research_net_edge_usd"
-            ],
-            "economics_scenarios_sha256": _digest(
-                value["economics_scenarios"]
-            ),
-            "positive_research_net": Decimal(
-                value["opportunity"]["research_net_edge_usd"]
-            ) > 0,
-        })
-    expected_notionals = {1000, 5000, 10000, 50000, 100000}
-    by_route = {}
-    for row in scenarios:
-        by_route.setdefault(row["route_id"], set()).add(
-            row["requested_notional_usd"]
-        )
+            raise ValueError("historical replay scenario is not canonical")
+        scenarios.append(dict(_validate_historical_compact_scenario(
+            value=value,
+            expected_scenario_key=scenario_key,
+            expected_direction=direction,
+            expected_notional=notional,
+        )))
+    route_ids = tuple(
+        scenarios[index * len(notionals)]["route_id"]
+        for index in range(len(directions))
+    )
+    proof_hashes = {row["proof_inputs_hash"] for row in scenarios}
+    policy_hashes = {row.pop("policy_sha256") for row in scenarios}
     if (
-        len(by_route) != 2
-        or any(notionals != expected_notionals for notionals in by_route.values())
+        len(set(route_ids)) != 2
+        or any(
+            row["route_id"] != route_ids[index // len(notionals)]
+            for index, row in enumerate(scenarios)
+        )
+        or len(proof_hashes) != 10
+        or len(policy_hashes) != 1
         or not any(row["positive_research_net"] for row in scenarios)
     ):
         raise ValueError("historical replay scenario set differs")

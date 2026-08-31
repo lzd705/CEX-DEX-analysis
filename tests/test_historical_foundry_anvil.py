@@ -2415,7 +2415,14 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
             "blockHash": "0x" + "b" * 64,
             "transactionIndex": 0,
             "gasUsed": 123456,
-            "effectiveGasPrice": 7,
+            "effectiveGasPrice": (
+                row["fee"]["next_base_fee_per_gas"]
+                + row["fee"]["p50_priority_fee_per_gas"]
+            ),
+            "maxFeePerGas": override["transaction"]["maxFeePerGas"],
+            "maxPriorityFeePerGas": override["transaction"][
+                "maxPriorityFeePerGas"
+            ],
             "transactionHash": "0x" + "c" * 64,
         }
         if reverted:
@@ -2483,12 +2490,80 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
             }
             for venue_id, value in pair_closure.items()
         }
-        overlay_bytes = self._canonical(override)
-        second_venue = (
-            "sushiswap_v2"
+        post_pair_state = copy.deepcopy(pair_closure)
+        first_venue, second_venue = (
+            ("uniswap_v2", "sushiswap_v2")
             if row["direction"] == "uniswap_to_sushiswap"
-            else "uniswap_v2"
+            else ("sushiswap_v2", "uniswap_v2")
         )
+        if not reverted:
+            post_pair_state[first_venue]["reserve_uni_raw"] -= row[
+                "first_amount_out_raw"
+            ]
+            post_pair_state[first_venue]["pair_uni_balance_raw"] -= row[
+                "first_amount_out_raw"
+            ]
+            post_pair_state[first_venue]["reserve_weth_raw"] += row[
+                "amount_weth_in_wei"
+            ]
+            post_pair_state[first_venue]["pair_weth_balance_raw"] += row[
+                "amount_weth_in_wei"
+            ]
+            post_pair_state[second_venue]["reserve_uni_raw"] += row[
+                "first_amount_out_raw"
+            ]
+            post_pair_state[second_venue]["pair_uni_balance_raw"] += row[
+                "first_amount_out_raw"
+            ]
+            post_pair_state[second_venue]["reserve_weth_raw"] -= row[
+                "second_amount_out_raw"
+            ]
+            post_pair_state[second_venue]["pair_weth_balance_raw"] -= row[
+                "second_amount_out_raw"
+            ]
+        authority = self.config.authority.value
+        tokens = {value["role"]: value["address"] for value in authority["tokens"]}
+        routers = {value["venue_id"]: value["router_address"] for value in authority["venues"]}
+        executor = authority["executor"]["address"]
+        deadline = override["synthetic_block"]["timestamp"] + 60
+
+        def router_call(*, call_path, leg, venue, amount, path):
+            def word(value):
+                return int(value).to_bytes(32, "big")
+
+            calldata = bytes.fromhex("38ed1739") + b"".join((
+                word(amount), word(0), word(160),
+                b"\0" * 12 + bytes.fromhex(executor[2:]),
+                word(deadline), word(2),
+                b"\0" * 12 + bytes.fromhex(path[0][2:]),
+                b"\0" * 12 + bytes.fromhex(path[1][2:]),
+            ))
+            return {
+                "call_path": call_path,
+                "leg": leg,
+                "router": routers[venue],
+                "calldata_sha256": hashlib.sha256(calldata).hexdigest(),
+                "amount_in_raw": amount,
+                "amount_out_min_raw": 0,
+                "path": path,
+                "recipient": executor,
+                "deadline": deadline,
+                "value": 0,
+            }
+
+        successful_calls = [] if reverted else [
+            router_call(
+                call_path=[2], leg="first_leg", venue=first_venue,
+                amount=row["amount_weth_in_wei"],
+                path=[tokens["weth"], tokens["uni"]],
+            ),
+            router_call(
+                call_path=[5], leg="second_leg", venue=second_venue,
+                amount=row["first_amount_out_raw"],
+                path=[tokens["uni"], tokens["weth"]],
+            ),
+        ]
+        overlay_bytes = self._canonical(override)
         second_reserves = row["reserves"][second_venue]
         balances = {
             "initial_weth_raw": row["amount_weth_in_wei"],
@@ -2510,6 +2585,8 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
         trace.update({
             "fork_header": dict(row["header"]),
             "pair_closure": pair_closure,
+            "post_pair_state": post_pair_state,
+            "successful_calls": successful_calls,
             "balances": balances,
             "actual_deltas": actual_deltas,
         })
@@ -2527,6 +2604,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
             "trace_sha256": trace_sha,
             "fork_header": dict(row["header"]),
             "pair_closure": pair_closure,
+            "post_pair_state": post_pair_state,
             "balances": balances,
             "actual_deltas": actual_deltas,
             "gas": {
@@ -2545,6 +2623,7 @@ class HistoricalFoundryOverlayTests(unittest.TestCase):
                 "failed": trace["failed"],
                 "gasprice_opcode_addresses": trace["gasprice_opcode_addresses"],
                 "calls": trace["calls"],
+                "successful_calls": trace["successful_calls"],
                 "raw_trace_closure": trace["raw_trace_closure"],
                 "struct_log_storage": trace["struct_log_storage"],
             },
@@ -5820,6 +5899,7 @@ class HistoricalFoundryOfflineRepeatTests(unittest.TestCase):
         source = r'''
 pragma solidity 0.8.36;
 interface T { function transferFrom(address,address,uint256) external returns (bool); }
+interface P { function sync(address,address,uint256,uint256) external; }
 contract UniToken {
     uint256 p0; uint256 p1; uint256 p2;
     mapping(address => mapping(address => uint256)) public allowance;
@@ -5857,6 +5937,7 @@ contract FixtureRouter {
         require(amountOut!=0,"UniswapV2: INSUFFICIENT_OUTPUT_AMOUNT");
         require(T(path[0]).transferFrom(msg.sender,pair,amountIn));
         require(T(path[1]).transferFrom(pair,recipient,amountOut));
+        P(pair).sync(path[0],path[1],amountIn,amountOut);
         amounts=new uint256[](2); amounts[0]=amountIn; amounts[1]=amountOut;
     }
 }
@@ -5864,6 +5945,10 @@ contract FixturePair {
     uint256 r0; uint256 r1; uint256 ts;
     function getReserves() external view returns(uint112,uint112,uint32) {
         return (uint112(r0),uint112(r1),uint32(ts));
+    }
+    function sync(address tokenIn,address tokenOut,uint256 amountIn,uint256 amountOut) external {
+        if(tokenIn<tokenOut) { r0+=amountIn; r1-=amountOut; }
+        else { r1+=amountIn; r0-=amountOut; }
     }
 }
 '''
