@@ -580,6 +580,7 @@ class HistoricalFoundryToolchainTests(unittest.TestCase):
                     / toolchain._SOURCE_LOCK_SHA256 / "bin" / "solc"
                 ),
                 "--contracts", "foundry/src/TwoVenueV2Executor.sol",
+                "--skip", "TwoVenueV2Fork.t.sol",
             ), 300),
         ])
         self.assertEqual(result["creation_bytecode"], bytes.fromhex("6000"))
@@ -1081,7 +1082,9 @@ class HistoricalFoundryToolchainTests(unittest.TestCase):
         _binary_dir, digests = self._install_fake_toolchain()
         fork_source = self.root / "foundry" / "test" / "TwoVenueV2Fork.t.sol"
         fork_source.parent.mkdir(parents=True)
-        fork_source.write_text("contract Placeholder {}\n", encoding="ascii")
+        fork_source.write_bytes(
+            (REAL_PROJECT_ROOT / toolchain._KAT_FORK_SOURCE).read_bytes()
+        )
         kat_fixture = (
             self.root / "tests" / "fixtures" / "historical_foundry_kat.json"
         )
@@ -1166,7 +1169,9 @@ class HistoricalFoundryKatFixtureTests(unittest.TestCase):
     def _write_fork_source(self):
         source = self.root / "foundry" / "test" / "TwoVenueV2Fork.t.sol"
         source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_text("contract TwoVenueV2Fork {}\n", encoding="ascii")
+        source.write_bytes(
+            (REAL_PROJECT_ROOT / toolchain._KAT_FORK_SOURCE).read_bytes()
+        )
         return source
 
     def _value_copy(self):
@@ -1592,6 +1597,79 @@ class HistoricalFoundryKatFixtureTests(unittest.TestCase):
         self.assertEqual(calls, self._expected_vectors(endpoint))
         self.assertFalse((self.root / "out").exists())
         self.assertFalse((self.root / "cache").exists())
+
+    def test_checked_in_fork_source_is_accepted_by_the_connected_gate(self):
+        source = REAL_PROJECT_ROOT / "foundry" / "test" / "TwoVenueV2Fork.t.sol"
+        self.assertTrue(source.is_file(), str(source))
+        endpoint = "https://rpc.invalid/checked-in-source"
+        outputs = self._preflight_outputs()
+        calls = []
+
+        def invoke(_capability, name, arguments, timeout=30):
+            calls.append((name, arguments))
+            if name == "cast":
+                return toolchain.subprocess.CompletedProcess(
+                    arguments, 0, outputs[len(calls) - 1], b""
+                )
+            return toolchain.subprocess.CompletedProcess(
+                arguments,
+                0,
+                b"Suite result: ok. 10 passed; 0 failed; 0 skipped;\n",
+                b"",
+            )
+
+        with mock.patch.dict(
+            os.environ, {"DEX_DEPTH_RPC_ETH": endpoint}, clear=True
+        ), mock.patch.object(
+            toolchain.ReviewedHistoricalToolchain, "_invoke", new=invoke
+        ), mock.patch.object(
+            toolchain.ReviewedHistoricalToolchain,
+            "_verify_versions_and_hardfork",
+            return_value=None,
+        ):
+            with toolchain.open_reviewed_historical_toolchain() as capability:
+                capability._verify_connected_kat()
+        expected = self._expected_vectors(endpoint)
+        temporary_prefix = str(self.root)
+        project_prefix = str(REAL_PROJECT_ROOT)
+        expected[-1] = (
+            expected[-1][0],
+            tuple(
+                value.replace(temporary_prefix, project_prefix)
+                for value in expected[-1][1]
+            ),
+        )
+        self.assertEqual(calls, expected)
+
+    def test_unreviewed_fork_source_is_rejected_before_any_process(self):
+        digests = self._install_fake_toolchain()
+        self._write_fixture()
+        source = self.root / "foundry" / "test" / "TwoVenueV2Fork.t.sol"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            "contract UnreviewedTenPassingTests {}\n", encoding="ascii"
+        )
+
+        with mock.patch.object(
+            toolchain, "_PROJECT_ROOT", self.root
+        ), mock.patch.object(
+            toolchain, "_EXPECTED_BINARY_SHA256", digests
+        ), mock.patch.dict(
+            os.environ,
+            {"DEX_DEPTH_RPC_ETH": "https://rpc.invalid/unreviewed-source"},
+            clear=True,
+        ):
+            with toolchain.open_reviewed_historical_toolchain() as capability:
+                with mock.patch.object(
+                    toolchain.ReviewedHistoricalToolchain,
+                    "_invoke",
+                    side_effect=AssertionError("process must not start"),
+                ) as invoke, self.assertRaisesRegex(
+                    toolchain.HistoricalFoundryToolchainError,
+                    r"\Aconnected_kat_fixture_invalid\Z",
+                ):
+                    capability._verify_connected_kat()
+        invoke.assert_not_called()
 
     def test_fork_source_inode_swap_during_first_cast_is_rejected(self):
         digests = self._install_fake_toolchain()

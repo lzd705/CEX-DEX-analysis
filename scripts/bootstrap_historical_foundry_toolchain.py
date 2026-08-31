@@ -197,6 +197,9 @@ _EXECUTOR_ARTIFACT_NAME = "TwoVenueV2Executor.json"
 _KAT_FIXTURE_DIRECTORIES = ("tests", "fixtures")
 _KAT_FIXTURE_NAME = "historical_foundry_kat.json"
 _KAT_FORK_SOURCE = "foundry/test/TwoVenueV2Fork.t.sol"
+_KAT_FORK_SOURCE_SHA256 = (
+    "4950fe86ca1c177112fc0db7d920b2963d6d7109f7c328d25f5d257c698bc4de"
+)
 _MAX_KAT_FIXTURE_BYTES = 64 * 1024
 _REVIEWED_HISTORICAL_FOUNDRY_KAT_BYTES = (
     b'{"archive_calls":[{"block_reference":"0x17d7840","calldata":"0x0902f1ac","method":"getReserves()","raw_response":"0x0000000000000000000000000000000000000000000051e38767437fac1d4c0f00000000000000000000000000000000000000000000001d6f8183a4807354760000000000000000000000000000000000000000000000000000000069f49013","response_sha256":"204e4b1706f10e75947b770017a684d4c3379a17dbd1ea54851f447544f58461","role":"uniswap_v2_uni_weth_reserves","target":"0xd3d2e2692501a5c9ca623199d38826e513033a17"},'
@@ -2741,6 +2744,7 @@ class ReviewedHistoricalToolchain:
                     "build", "--offline", "--root", str(_PROJECT_ROOT),
                     "--use", _sealed_solc_argument(),
                     "--contracts", _EXECUTOR_SOURCE,
+                    "--skip", "TwoVenueV2Fork.t.sol",
                 ),
             ):
                 completed = self._invoke("forge", arguments, timeout=300)
@@ -2860,6 +2864,8 @@ class ReviewedHistoricalToolchain:
             if source_open_failed or source_fd is None:
                 raise _error("connected_kat_fixture_unavailable")
             source_digest = _hash_bytes(source_bytes)
+            if source_digest != _KAT_FORK_SOURCE_SHA256:
+                raise _error("connected_kat_fixture_invalid")
 
             def assert_held_source_stable() -> None:
                 source_changed = False
