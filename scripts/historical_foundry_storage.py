@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import io
 import json
+from fractions import Fraction
 from pathlib import Path
 import os
 import stat
@@ -310,6 +311,9 @@ def _initialize_historical_foundry_storage_types():
     staging_lineage_token_registry: Dict[
         int, Tuple[weakref.ReferenceType, Dict[str, Any]]
     ] = {}
+    selection_transition_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
     scenario_transition_registry: Dict[
         int, Tuple[weakref.ReferenceType, Dict[str, Any]]
     ] = {}
@@ -319,6 +323,16 @@ def _initialize_historical_foundry_storage_types():
     replay_ledger_registry: Dict[
         int, Tuple[weakref.ReferenceType, Dict[str, Any]]
     ] = {}
+    finalization_token_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
+    publication_lease_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
+    publication_source_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
+    run_snapshot_registry: Dict[int, Tuple[object, Dict[str, Any]]] = {}
     task6_transaction_registry: Dict[int, Dict[str, Any]] = {}
     replay_source_registry: Dict[
         int, Tuple[object, Dict[str, Any]]
@@ -340,6 +354,9 @@ def _initialize_historical_foundry_storage_types():
         int, Tuple[weakref.ReferenceType, int]
     ] = {}
     staging_snapshot_tombstones: Dict[
+        int, Tuple[weakref.ReferenceType, int]
+    ] = {}
+    run_snapshot_tombstones: Dict[
         int, Tuple[weakref.ReferenceType, int]
     ] = {}
     replay_source_tombstones: Dict[
@@ -478,12 +495,24 @@ def _initialize_historical_foundry_storage_types():
     staging_lineage_token_base, staging_lineage_token_authorized = (
         _new_authority_base()
     )
+    selection_transition_base, selection_transition_authorized = (
+        _new_authority_base()
+    )
     run_snapshot_base, run_snapshot_authorized = _new_authority_base()
     scenario_transition_base, scenario_transition_authorized = (
         _new_authority_base()
     )
     scenario_sink_base, scenario_sink_authorized = _new_authority_base()
     replay_ledger_base, replay_ledger_authorized = _new_authority_base()
+    finalization_token_base, finalization_token_authorized = (
+        _new_authority_base()
+    )
+    publication_lease_base, publication_lease_authorized = (
+        _new_authority_base()
+    )
+    publication_source_base, publication_source_authorized = (
+        _new_authority_base()
+    )
 
     def _prepare_handle(authority_class: type, record: Dict[str, Any]) -> Any:
         handle = object.__new__(authority_class)
@@ -3201,10 +3230,15 @@ def _initialize_historical_foundry_storage_types():
     ) -> Tuple[Dict[str, Any], str]:
         if type(relative_path) is not str or not relative_path:
             raise _InternalFailure()
+        task7_directory = ledger.get("task7_member_directories", {}).get(
+            relative_path
+        )
         task6_directory = ledger.get("task6_member_directories", {}).get(
             relative_path
         )
-        if task6_directory is not None:
+        if task7_directory is not None:
+            directory, basename = task7_directory
+        elif task6_directory is not None:
             directory, basename = task6_directory
         elif relative_path.startswith("scan/prefilter/"):
             basename = relative_path[len("scan/prefilter/"):]
@@ -7025,6 +7059,41 @@ def _initialize_historical_foundry_storage_types():
         _HistoricalRunStagingLineageToken
     )
 
+    class _HistoricalSelectionTransition(selection_transition_base):
+        __slots__ = ("__weakref__",)
+
+    selection_transition_authorized[0] = _HistoricalSelectionTransition
+
+    def _bind_historical_selection_transition(*, staging: object) -> object:
+        owner = _task4b_current_snapshot_owner(staging)
+        projection = owner.get("_task4b_snapshot_projection")
+        if (
+            owner.get("capture_generation") != 2
+            or owner.get("state") != "prefilter_frozen"
+            or type(projection) is not dict
+            or projection.get("stage") != "prefilter_frozen"
+            or type(projection.get("scan_inventory_sha256")) is not str
+        ):
+            _raise_storage_error()
+        record = {
+            "constructor": constructor_provenance,
+            "lineage": owner.get("lineage"),
+            "source_owner_generation": owner.get("owner_generation"),
+            "scan_inventory_sha256": projection["scan_inventory_sha256"],
+            "current_staging": staging,
+        }
+        token = _prepare_handle(_HistoricalSelectionTransition, record)
+        token_id = id(token)
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = selection_transition_registry.get(token_id)
+            if current is not None and current[0] is reference:
+                selection_transition_registry.pop(token_id, None)
+
+        reference = weakref.ref(token, retire)
+        selection_transition_registry[token_id] = (reference, record)
+        return token
+
     def _bind_historical_prefilter_staging_transition(
         *, staging: object
     ) -> object:
@@ -9270,6 +9339,887 @@ def _initialize_historical_foundry_storage_types():
 
     scenario_sink_authorized[0] = ScenarioEvidenceSink
 
+    class _HistoricalRunFinalizationToken(finalization_token_base):
+        __slots__ = ("__weakref__",)
+
+    finalization_token_authorized[0] = _HistoricalRunFinalizationToken
+
+    def _seal_historical_run_finalization(
+        *, selection_transition: object,
+        candidate_manifest: bytes, typed_manifest: bytes,
+        selection: bytes, typed_members: Mapping[str, bytes],
+    ) -> object:
+        transition_entry = selection_transition_registry.get(
+            id(selection_transition)
+        )
+        if (
+            type(selection_transition) is not _HistoricalSelectionTransition
+            or transition_entry is None
+            or transition_entry[0]() is not selection_transition
+            or transition_entry[1].get("constructor")
+            is not constructor_provenance
+            or type(candidate_manifest) is not bytes
+            or type(typed_manifest) is not bytes
+            or type(selection) is not bytes
+            or type(typed_members) not in (dict, MappingProxyType)
+            or any(
+                type(path) is not str
+                or not path.startswith("typed/")
+                or type(payload) is not bytes
+                or not payload
+                for path, payload in typed_members.items()
+            )
+        ):
+            _raise_storage_error()
+        for payload in (candidate_manifest, typed_manifest, selection):
+            if not payload or len(payload) > 8_388_608:
+                _raise_storage_error()
+            try:
+                _task4b_decode_canonical_json(
+                    payload, expected_container=dict
+                )
+            except _InternalFailure:
+                _raise_storage_error()
+        staging = transition_entry[1].get("current_staging")
+        owner = _task4b_current_snapshot_owner(staging)
+        if (
+            transition_entry[1].get("lineage") is not owner.get("lineage")
+            or transition_entry[1].get("scan_inventory_sha256")
+            != owner.get("_task4b_snapshot_projection", {}).get(
+                "scan_inventory_sha256"
+            )
+            or owner.get("state") not in (
+                "prefilter_frozen", "replay_frozen"
+            )
+        ):
+            _raise_storage_error()
+        token = _prepare_handle(_HistoricalRunFinalizationToken, {})
+        record = {
+            "constructor": constructor_provenance,
+            "lineage": owner.get("lineage"),
+            "owner": owner,
+            "staging": staging,
+            "selection_transition": selection_transition,
+            "candidate_manifest": bytes(candidate_manifest),
+            "typed_manifest": bytes(typed_manifest),
+            "selection": bytes(selection),
+            "typed_members": {
+                path: bytes(payload)
+                for path, payload in typed_members.items()
+            },
+            "state": "sealed",
+            "consumed": False,
+        }
+        token_id = id(token)
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = finalization_token_registry.get(token_id)
+            if current is not None and current[0] is reference:
+                finalization_token_registry.pop(token_id, None)
+
+        finalization_token_registry[token_id] = (
+            weakref.ref(token, retire), record
+        )
+        return token
+
+    def _task7_member_descriptor(path: str, payload: bytes) -> Dict[str, Any]:
+        return {
+            "path": path,
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "cap": 8_388_608,
+            "kind": "task6_json",
+        }
+
+    def _task7_fraction_projection(value: Fraction) -> Dict[str, Any]:
+        numerator = value.numerator
+        denominator = value.denominator
+        sign = "-" if numerator < 0 else ""
+        integer, remainder = divmod(abs(numerator), denominator)
+        digits = []
+        while remainder and len(digits) <= 4_096:
+            remainder *= 10
+            digit, remainder = divmod(remainder, denominator)
+            digits.append(str(digit))
+        if remainder:
+            raise _InternalFailure()
+        display = sign + str(integer)
+        if digits:
+            display += "." + "".join(digits).rstrip("0")
+        return {
+            "numerator": numerator,
+            "denominator": denominator,
+            "display": display,
+        }
+
+    def _task7_scenario_economics(
+        owner: Dict[str, Any], row: Dict[str, Any], fact: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        policy = owner["_task4b_staging"]["policy_value"]
+        mev_bps = policy.get("fees", {}).get("acceptance_mev_bps")
+        if type(mev_bps) is not str or not mev_bps.isdigit():
+            raise _InternalFailure()
+        price = row["price"]
+        denominator = 10 ** (18 + price["feed_decimals"])
+        gross = Fraction(fact["weth_delta_raw"] * price["answer"], denominator)
+        gas = Fraction(
+            fact["gas_used"] * fact["effective_gas_price"]
+            * price["answer"], denominator,
+        )
+        mev = Fraction(row["requested_notional_usd"] * int(mev_bps), 10_000)
+        return {
+            "gross_edge_usd": _task7_fraction_projection(gross),
+            "gas_cost_usd": _task7_fraction_projection(gas),
+            "mev_buffer_usd": _task7_fraction_projection(mev),
+            "policy_net_edge_usd": _task7_fraction_projection(
+                gross - gas - mev
+            ),
+        }
+
+    def _task7_validate_finalization_payloads(
+        owner: Dict[str, Any], candidate: Dict[str, Any],
+        typed: Dict[str, Any], selection: Dict[str, Any],
+        typed_members: Mapping[str, bytes],
+    ) -> None:
+        inventory, grid_rows = _task5_rebuild_prefilter(owner)
+        block_numbers = tuple(dict.fromkeys(
+            row["block_number"] for row in grid_rows
+        ))
+        candidate_blocks = tuple(
+            block for block in block_numbers
+            if any(
+                row["block_number"] == block
+                and row["decision"] == "replay_required"
+                for row in grid_rows
+            )
+        )
+        scenario_records = owner.get("_task6_scenarios", {})
+        scenario_rows = candidate.get("scenarios")
+        candidate_states = candidate.get("candidate_states")
+        if (
+            candidate.get("schema")
+            != "historical_foundry_candidate_manifest/v1"
+            or candidate.get("staging_inventory_sha256")
+            != owner["_task4b_snapshot_projection"]["scan_inventory_sha256"]
+            or candidate.get("prefilter_grid_digest")
+            != inventory["grid_digest"]
+            or candidate.get("candidate_block_count") != len(candidate_blocks)
+            or candidate.get("scenario_denominator") != len(candidate_blocks) * 10
+            or candidate.get("initial_replay_required_count")
+            != sum(row["decision"] == "replay_required" for row in grid_rows)
+            or type(scenario_rows) is not list
+            or candidate.get("attempted_scenario_count") != len(scenario_rows)
+            or type(scenario_records) is not dict
+            or len(scenario_rows) != len(scenario_records)
+            or type(candidate_states) is not list
+            or len(candidate_states) != len(block_numbers)
+            or selection.get("schema") != "historical_foundry_selection/v1"
+            or selection.get("staging_inventory_sha256")
+            != candidate["staging_inventory_sha256"]
+            or selection.get("prefilter_grid_digest")
+            != candidate["prefilter_grid_digest"]
+            or selection.get("candidate_block_count")
+            != candidate["candidate_block_count"]
+            or selection.get("scenario_denominator")
+            != candidate["scenario_denominator"]
+            or selection.get("initial_replay_required_count")
+            != candidate["initial_replay_required_count"]
+            or selection.get("candidate_states") != candidate_states
+            or selection.get("unresolved_candidate_count") != 0
+        ):
+            raise _InternalFailure()
+        grid_by_key = {row["scenario_key"]: row for row in grid_rows}
+        if len(grid_by_key) != len(grid_rows):
+            raise _InternalFailure()
+        rebuilt_facts = []
+        for expected_key, projected in zip(scenario_records, scenario_rows):
+            scenario_record = scenario_records[expected_key]
+            descriptors = scenario_record.get("members")
+            if (
+                type(projected) is not dict
+                or projected.get("scenario_key") != expected_key
+                or expected_key not in grid_by_key
+                or type(descriptors) is not dict
+            ):
+                raise _InternalFailure()
+            member_values = {}
+            members = {}
+            for role in ("overlay", "receipt", "trace", "result"):
+                descriptor = descriptors.get(role)
+                payload = _task4b_reread_capture_member(
+                    owner["_task4b_staging"],
+                    relative_path=descriptor["path"],
+                    expected_size=descriptor["size"],
+                    maximum_size=descriptor["cap"],
+                    size_kind=descriptor["kind"],
+                )
+                members[role] = payload
+                if role != "trace":
+                    member_values[role] = _task4b_decode_canonical_json(
+                        payload, expected_container=dict
+                    )
+            rebuilt = _task6_validate_quartet(expected_key, members, owner)
+            receipt = member_values["receipt"]
+            result = member_values["result"]
+            fact = {
+                "scenario_key": expected_key,
+                "block_number": rebuilt["block_number"],
+                "status": receipt["status"],
+                "classification": result["classification"],
+                "gas_used": receipt["gasUsed"],
+                "effective_gas_price": receipt["effectiveGasPrice"],
+                "weth_delta_raw": result["actual_deltas"]["weth_raw"],
+                "proof_inputs_hash": rebuilt["proof_inputs_hash"],
+                "overlay_sha256": rebuilt["overlay_sha256"],
+                "receipt_sha256": rebuilt["receipt_sha256"],
+                "trace_sha256": rebuilt["trace_sha256"],
+                "result_sha256": rebuilt["result_sha256"],
+            }
+            expected_economics = (
+                _task7_scenario_economics(
+                    owner, grid_by_key[expected_key], fact
+                ) if fact["status"] == 1 else None
+            )
+            if projected != {**fact, "economics": expected_economics}:
+                raise _InternalFailure()
+            fact["economics"] = expected_economics
+            rebuilt_facts.append(fact)
+        position = 0
+        rebuilt_states = []
+        selected_block = None
+        selected_facts = []
+        for block in block_numbers:
+            block_rows = [row for row in grid_rows if row["block_number"] == block]
+            required = [row for row in block_rows if row["decision"] == "replay_required"]
+            if not required:
+                rebuilt_states.append({
+                    "block_number": block, "state": "resolved_nonpositive",
+                    "transitions": ["prefilter_non_candidate", "resolved_nonpositive"],
+                    "scenario_count": 0,
+                })
+                continue
+            transitions = ["candidate", "replaying_required"]
+            block_facts = []
+            for row in required:
+                if position >= len(rebuilt_facts) or rebuilt_facts[position]["scenario_key"] != row["scenario_key"]:
+                    raise _InternalFailure()
+                block_facts.append(rebuilt_facts[position]); position += 1
+            positive = any(
+                fact["status"] == 1
+                and fact["economics"]["policy_net_edge_usd"]["numerator"] > 0
+                for fact in block_facts
+            )
+            if not positive:
+                transitions.append("resolved_nonpositive")
+                rebuilt_states.append({
+                    "block_number": block, "state": "resolved_nonpositive",
+                    "transitions": transitions, "scenario_count": len(block_facts),
+                })
+                continue
+            transitions.extend(("tentative_positive", "completing_full_ten"))
+            completed = {fact["scenario_key"] for fact in block_facts}
+            for row in block_rows:
+                if row["scenario_key"] in completed:
+                    continue
+                if position >= len(rebuilt_facts) or rebuilt_facts[position]["scenario_key"] != row["scenario_key"]:
+                    raise _InternalFailure()
+                block_facts.append(rebuilt_facts[position]); position += 1
+            if len(block_facts) != 10:
+                raise _InternalFailure()
+            if any(fact["status"] == 0 for fact in block_facts):
+                transitions.append("nonpublishable_positive")
+                rebuilt_states.append({
+                    "block_number": block, "state": "nonpublishable_positive",
+                    "transitions": transitions, "scenario_count": 10,
+                })
+                continue
+            transitions.append("selected")
+            rebuilt_states.append({
+                "block_number": block, "state": "selected",
+                "transitions": transitions, "scenario_count": 10,
+            })
+            selected_block = block_rows[0]["header"]
+            selected_facts = block_facts
+            break
+        if selected_block is not None:
+            seen = {row["block_number"] for row in rebuilt_states}
+            for block in block_numbers:
+                if block < selected_block["number"] and block not in seen:
+                    rebuilt_states.append({
+                        "block_number": block,
+                        "state": "not_needed_older_than_selected",
+                        "transitions": ["not_needed_older_than_selected"],
+                        "scenario_count": 0,
+                    })
+        if position != len(rebuilt_facts) or rebuilt_states != candidate_states:
+            raise _InternalFailure()
+        expected_status = (
+            "found_publishable_profitable_block"
+            if selected_block is not None
+            else "no_publishable_profitable_block"
+        )
+        if (
+            selection.get("status") != expected_status
+            or selection.get("selected_block") != selected_block
+            or selection.get("selected_scenario_count")
+            != (10 if selected_block is not None else 0)
+            or typed.get("schema") != "historical_foundry_typed_manifest/v1"
+            or typed.get("selection_status") != expected_status
+            or typed.get("selected_block") != selected_block
+            or typed.get("member_count") != len(typed_members)
+        ):
+            raise _InternalFailure()
+        if selected_block is None:
+            expected_selected_scenarios = []
+        else:
+            expected_selected_scenarios = []
+            for fact in selected_facts:
+                row = grid_by_key[fact["scenario_key"]]
+                expected_selected_scenarios.append({
+                    **fact,
+                    "direction": row["direction"],
+                    "requested_notional_usd": row[
+                        "requested_notional_usd"
+                    ],
+                })
+        if selection.get("selected_scenarios") != expected_selected_scenarios:
+            raise _InternalFailure()
+        if selected_block is None:
+            if (
+                typed_members or typed.get("market_count") != 0
+                or typed.get("markets") != []
+                or selection.get("closed_reason")
+                != "no_publishable_profitable_block"
+            ):
+                raise _InternalFailure()
+        elif len(typed_members) != 4 or typed.get("market_count") != 2:
+            raise _InternalFailure()
+        expected_member_rows = [{
+            "path": path, "byte_count": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        } for path, payload in sorted(typed_members.items())]
+        if typed.get("members") != expected_member_rows:
+            raise _InternalFailure()
+        if selected_block is not None:
+            reserve_chunks = [
+                row for row in owner["_task4b_frozen_record"]["typed_chunks"]
+                if row["role"] == "reserves"
+                and row["block_start"] <= selected_block["number"]
+                <= row["block_stop"]
+            ]
+            markets = typed.get("markets")
+            if len(reserve_chunks) != 1 or type(markets) is not list:
+                raise _InternalFailure()
+            reserve_sha = reserve_chunks[0]["gzip_sha256"]
+            factory_pairs = _task7_factory_pair_authority(owner)
+            for market in markets:
+                venue_id = (
+                    market.get("venue_id")
+                    if type(market) is dict else None
+                )
+                pair_authority = factory_pairs.get(venue_id)
+                if (
+                    type(market) is not dict
+                    or set(market) != {
+                        "market_id", "market_key", "venue_id",
+                        "pair_address", "factory_pair_forward",
+                        "factory_pair_reverse", "members",
+                    }
+                    or type(pair_authority) is not MappingProxyType
+                    or type(market.get("market_id")) is not str
+                    or market.get("factory_pair_forward")
+                    != pair_authority["factory_pair_forward"]
+                    or market.get("factory_pair_reverse")
+                    != pair_authority["factory_pair_reverse"]
+                    or market.get("pair_address")
+                    != pair_authority["factory_pair_forward"]
+                    or market["market_id"] != "dex:eth:{}:{}:UNI".format(
+                        venue_id, market["pair_address"]
+                    )
+                    or market.get("market_key") != hashlib.sha256(
+                        b"historical_foundry_market_key/v1\0"
+                        + _task4b_canonical_json_bytes({
+                            "market_id": market["market_id"]
+                        })
+                    ).hexdigest()
+                    or type(market.get("members")) is not list
+                    or len(market["members"]) != 2
+                ):
+                    raise _InternalFailure()
+                by_role = {row["role"]: row for row in market["members"]}
+                if set(by_role) != {
+                    "dex_pool_state", "dex_usd_price_context"
+                }:
+                    raise _InternalFailure()
+                pool = _task4b_decode_canonical_json(
+                    typed_members[by_role["dex_pool_state"]["path"]],
+                    expected_container=dict,
+                )
+                price = _task4b_decode_canonical_json(
+                    typed_members[by_role["dex_usd_price_context"]["path"]],
+                    expected_container=dict,
+                )
+                if (
+                    pool.get("schema") != "route_v2_pool_state/v1"
+                    or pool.get("raw_response_sha256") != reserve_sha
+                    or pool.get("block_number")
+                    != str(selected_block["number"])
+                    or pool.get("block_hash") != selected_block["hash"]
+                    or price.get("schema")
+                    != "route_dex_usd_price_context/v1"
+                    or price.get("market_id") != market["market_id"]
+                    or price.get("block_number")
+                    != str(selected_block["number"])
+                    or price.get("block_hash") != selected_block["hash"]
+                ):
+                    raise _InternalFailure()
+        return None
+
+    def _task7_run_record(snapshot: object) -> Dict[str, Any]:
+        entry = run_snapshot_registry.get(id(snapshot))
+        if (
+            type(snapshot) is not HistoricalRunSnapshot
+            or entry is None
+            or entry[0] is not snapshot
+        ):
+            _raise_storage_error()
+        return entry[1]
+
+    def _task7_inventory_paths(root_fd: int) -> Tuple[set, set]:
+        observed = set()
+        observed_directories = set()
+
+        def walk(directory_fd: int, prefix: str, depth: int) -> None:
+            if depth > 8:
+                raise _InternalFailure()
+            names = os.listdir(directory_fd)
+            if type(names) is not list or len(set(names)) != len(names):
+                raise _InternalFailure()
+            for name in names:
+                _require_relative_basename(name)
+                details = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                relative = prefix + name
+                if stat.S_ISREG(details.st_mode):
+                    if relative in observed:
+                        raise _InternalFailure()
+                    observed.add(relative)
+                    continue
+                if not stat.S_ISDIR(details.st_mode):
+                    raise _InternalFailure()
+                observed_directories.add(relative)
+                child = os.open(
+                    name, _required_directory_flags(), dir_fd=directory_fd
+                )
+                try:
+                    opened = os.fstat(child)
+                    if _metadata_snapshot(opened) != _metadata_snapshot(details):
+                        raise _InternalFailure()
+                    walk(child, relative + "/", depth + 1)
+                finally:
+                    os.close(child)
+
+        walk(root_fd, "", 0)
+        return observed, observed_directories
+
+    def _commit_historical_run_finalization(*, token: object) -> object:
+        token_entry = finalization_token_registry.get(id(token))
+        if (
+            type(token) is not _HistoricalRunFinalizationToken
+            or token_entry is None
+            or token_entry[0]() is not token
+            or token_entry[1].get("constructor") is not constructor_provenance
+            or token_entry[1].get("consumed") is True
+            or token_entry[1].get("state") not in (
+                "sealed", "committing", "durable"
+            )
+        ):
+            _raise_storage_error()
+        record = token_entry[1]
+        owner = record["owner"]
+        staging = record["staging"]
+        if record["state"] in ("committing", "durable"):
+            ledger = owner["_task4b_staging"]
+            replay_directory = ledger["capture_directories"]["replay"]
+            if record["state"] == "committing":
+                os.fsync(replay_directory["fd"])
+                record["state"] = "durable"
+            run_snapshot = record["run_snapshot"]
+            run_record = record["run_record"]
+            run_snapshot_registry[id(run_snapshot)] = (
+                run_snapshot, run_record
+            )
+            if staging_snapshot_registry.get(id(staging), (None,))[0] is staging:
+                _retire_nonowner_handle(
+                    staging, staging_snapshot_registry,
+                    staging_snapshot_tombstones,
+                )
+            record["consumed"] = True
+            record["state"] = "committed"
+            finalization_token_registry.pop(id(token), None)
+            return run_snapshot
+        if _task4b_current_snapshot_owner(staging) is not owner:
+            _raise_storage_error()
+        ledger = owner["_task4b_staging"]
+        if id(owner) in task6_transaction_registry:
+            _raise_storage_error()
+        _task5_freeze_audit(owner)
+        if owner.get("_task6_scenarios"):
+            _task6_freeze_audit(owner)
+        candidate_value = _task4b_decode_canonical_json(
+            record["candidate_manifest"], expected_container=dict
+        )
+        typed_value = _task4b_decode_canonical_json(
+            record["typed_manifest"], expected_container=dict
+        )
+        selection_value = _task4b_decode_canonical_json(
+            record["selection"], expected_container=dict
+        )
+        _task7_validate_finalization_payloads(
+            owner, candidate_value, typed_value, selection_value,
+            record["typed_members"],
+        )
+        predecessor_state = owner["state"]
+        predecessor_projection = _task6_clone_mutable(
+            owner["_task4b_snapshot_projection"]
+        )
+        predecessor_members = _task6_clone_mutable(
+            owner["_task4b_snapshot_members"]
+        )
+        predecessor_quota = _task6_clone_mutable(
+            _quota_record_for_owner(owner)
+        )
+        predecessor_quota_owner = ledger.get("quota_owner_handle")
+        files = []
+        directories = []
+        mapped_paths = []
+
+        def own_file(entry: Dict[str, Any]) -> None:
+            files.append(entry)
+
+        def own_directory(entry: Dict[str, Any]) -> None:
+            directories.append(entry)
+
+        def rollback() -> None:
+            for entry in reversed(files):
+                if entry not in ledger["files"]:
+                    raise _InternalFailure()
+                _task4b_close_fd_slot(ledger, entry)
+                try:
+                    current = os.stat(
+                        entry["name"], dir_fd=entry["parent_fd"],
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    current = None
+                if current is not None:
+                    expected = entry.get("ownership_identity")
+                    if expected is None or _file_identity(current) != expected:
+                        raise _InternalFailure()
+                    os.unlink(entry["name"], dir_fd=entry["parent_fd"])
+                os.fsync(entry["parent_fd"])
+                ledger["files"].remove(entry)
+            for entry in reversed(directories):
+                if entry not in ledger["directories"]:
+                    raise _InternalFailure()
+                _task4b_close_fd_slot(ledger, entry)
+                if entry.get("created"):
+                    try:
+                        current = os.stat(
+                            entry["name"], dir_fd=entry["parent_fd"],
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        current = None
+                    if current is not None:
+                        if _metadata_snapshot(current) != entry.get("identity"):
+                            raise _InternalFailure()
+                        os.rmdir(entry["name"], dir_fd=entry["parent_fd"])
+                    os.fsync(entry["parent_fd"])
+                ledger["directories"].remove(entry)
+            mappings = ledger.get("task7_member_directories", {})
+            for path in mapped_paths:
+                mappings.pop(path, None)
+            _task6_install_quota_snapshot(owner, predecessor_quota)
+            ledger["quota_owner_handle"] = predecessor_quota_owner
+            owner["state"] = predecessor_state
+            owner["_task4b_snapshot_projection"] = predecessor_projection
+            owner["_task4b_snapshot_members"] = predecessor_members
+
+        record["state"] = "writing"
+        owner["state"] = "replay_materializing"
+        ledger["quota_owner_handle"] = staging
+        try:
+            staging_directory = ledger["capture_directories"]["staging"]
+            payloads = {
+                "candidate_manifest.json": record["candidate_manifest"],
+                "typed_manifest.json": record["typed_manifest"],
+                "selection.json": record["selection"],
+            }
+            typed_root = None
+            typed_directories = {}
+            if record["typed_members"]:
+                typed_root = _task4b_open_capture_directory(
+                    ledger, staging_directory["fd"], "typed",
+                    allow_existing=False, mutation_owner=own_directory,
+                )
+                for path, payload in sorted(record["typed_members"].items()):
+                    parts = path.split("/")
+                    if (
+                        len(parts) != 3 or parts[0] != "typed"
+                        or len(parts[1]) != 64
+                        or any(character not in "0123456789abcdef" for character in parts[1])
+                        or parts[2] not in (
+                            "dex_pool_state.json",
+                            "dex_usd_price_context.json",
+                        )
+                    ):
+                        raise _InternalFailure()
+                    directory = typed_directories.get(parts[1])
+                    if directory is None:
+                        directory = _task4b_open_capture_directory(
+                            ledger, typed_root["fd"], parts[1],
+                            allow_existing=False,
+                            mutation_owner=own_directory,
+                        )
+                        typed_directories[parts[1]] = directory
+                    _task4b_write_capture_member(
+                        ledger, directory, parts[2], payload,
+                        mutation_owner=own_file,
+                    )
+                    ledger.setdefault("task7_member_directories", {})[
+                        path
+                    ] = (directory, parts[2])
+                    mapped_paths.append(path)
+                    payloads[path] = payload
+            for name in (
+                "candidate_manifest.json", "typed_manifest.json",
+                "selection.json",
+            ):
+                _task4b_write_capture_member(
+                    ledger, staging_directory, name, payloads[name],
+                    mutation_owner=own_file,
+                )
+            target_members = _task6_clone_mutable(predecessor_members)
+            target_members.update({
+                path: _task7_member_descriptor(path, payload)
+                for path, payload in payloads.items()
+            })
+            capture_descriptor = target_members["scan/capture_inventory.json"]
+            capture_bytes = _task4b_reread_capture_member(
+                ledger, relative_path="scan/capture_inventory.json",
+                expected_size=capture_descriptor["size"],
+                maximum_size=16_777_216, size_kind="inventory",
+            )
+            capture_value = _task4b_decode_canonical_json(
+                capture_bytes, expected_container=dict
+            )
+            run_digest = hashlib.sha256(
+                b"historical_foundry_run_id/v1\0"
+                + record["candidate_manifest"]
+                + record["typed_manifest"]
+                + record["selection"]
+            ).hexdigest()
+            run_id = "run:" + run_digest
+            run_directory_name = run_digest
+            config_rows = {
+                row["role"]: row for row in ledger["config_rows"]
+            }
+            inventory = [{
+                "path": path,
+                "byte_count": descriptor["size"],
+                "sha256": descriptor["sha256"],
+            } for path, descriptor in sorted(target_members.items())]
+            run_manifest = {
+                "schema": "historical_foundry_run_manifest/v1",
+                "run_id": run_id,
+                "repository_head": capture_value.get(
+                    "source_identity", {}
+                ).get("repository_head"),
+                "source_identity": capture_value["source_identity"],
+                "source_identity_sha256": hashlib.sha256(
+                    _task4b_canonical_json_bytes(
+                        capture_value["source_identity"]
+                    )
+                ).hexdigest(),
+                "policy_sha256": config_rows["policy"]["sha256"],
+                "authority_sha256": config_rows["authority"]["sha256"],
+                "toolchain_sha256": config_rows["toolchain"]["sha256"],
+                "scan_inventory_sha256": selection_value[
+                    "staging_inventory_sha256"
+                ],
+                "prefilter_grid_digest": selection_value[
+                    "prefilter_grid_digest"
+                ],
+                "window": capture_value["range"],
+                "chain_id": ledger["policy_value"]["chain_id"],
+                "prefilter_row_count": capture_value["range"][
+                    "block_count"
+                ] * 10,
+                "candidate_block_count": selection_value[
+                    "candidate_block_count"
+                ],
+                "scenario_denominator": selection_value[
+                    "scenario_denominator"
+                ],
+                "initial_replay_required_count": selection_value[
+                    "initial_replay_required_count"
+                ],
+                "selection_status": selection_value["status"],
+                "selected_block": selection_value["selected_block"],
+                "selected_scenario_count": selection_value[
+                    "selected_scenario_count"
+                ],
+                "unresolved_candidate_count": selection_value[
+                    "unresolved_candidate_count"
+                ],
+                "simulated_scenario_count": candidate_value[
+                    "attempted_scenario_count"
+                ],
+                "resolved_candidate_count": sum(
+                    row["state"] in (
+                        "resolved_nonpositive", "nonpublishable_positive",
+                        "selected",
+                    ) for row in candidate_value["candidate_states"]
+                ),
+                "reverted_scenario_count": sum(
+                    row["status"] == 0
+                    for row in candidate_value["scenarios"]
+                ),
+                "positive_scenario_count": sum(
+                    row["status"] == 1
+                    and row["economics"]["policy_net_edge_usd"][
+                        "numerator"
+                    ] > 0
+                    for row in candidate_value["scenarios"]
+                ),
+                "member_count": len(inventory),
+                "members": inventory,
+                "publication_eligible": selection_value["status"]
+                == "found_publishable_profitable_block",
+            }
+            run_manifest_bytes = _task4b_canonical_json_bytes(run_manifest)
+            _task4b_write_capture_member(
+                ledger, staging_directory, "run_manifest.json",
+                run_manifest_bytes, mutation_owner=own_file,
+            )
+            run_descriptor = _task7_member_descriptor(
+                "run_manifest.json", run_manifest_bytes
+            )
+            target_members["run_manifest.json"] = run_descriptor
+            for path, descriptor in target_members.items():
+                observed = _task4b_reread_capture_member(
+                    ledger, relative_path=path,
+                    expected_size=descriptor["size"],
+                    maximum_size=descriptor["cap"],
+                    size_kind=descriptor["kind"],
+                )
+                if hashlib.sha256(observed).hexdigest() != descriptor["sha256"]:
+                    raise _InternalFailure()
+            owner["_task4b_snapshot_members"] = target_members
+            owner["_task4b_snapshot_projection"] = {
+                **predecessor_projection,
+                "stage": "complete",
+                "generation": predecessor_projection["generation"] + 1,
+                "frozen_member_count": len(target_members),
+                "frozen_physical_byte_count": sum(
+                    row["size"] for row in target_members.values()
+                ),
+                "quota_committed_physical_bytes": _quota_record_for_owner(
+                    owner
+                )["committed_physical_bytes"],
+                "quota_committed_member_count": _quota_record_for_owner(
+                    owner
+                )["committed_members"],
+                "run_id": run_id,
+                "run_manifest_sha256": run_descriptor["sha256"],
+                "selection_status": selection_value["status"],
+            }
+            owner["state"] = "complete"
+            os.fsync(staging_directory["fd"])
+            replay_directory = ledger["capture_directories"]["replay"]
+            private_name = ledger["private_basename"]
+            run_snapshot = _prepare_handle(HistoricalRunSnapshot, {})
+            run_projection = {
+                "schema": "historical_foundry_run_snapshot_identity/v1",
+                "stage": "complete", "run_id": run_id,
+                "run_manifest_sha256": run_descriptor["sha256"],
+                "member_count": len(target_members),
+                "selection_status": selection_value["status"],
+            }
+            run_record = {
+                "constructor": constructor_provenance,
+                "kind": "live", "state": "open", "owner": owner,
+                "members": target_members,
+                "projection": run_projection,
+            }
+            record["run_snapshot"] = run_snapshot
+            record["run_record"] = run_record
+            record["run_id"] = run_id
+            record["run_directory_name"] = run_directory_name
+            record["private_name"] = private_name
+            try:
+                _task6_rename_directory_noreplace(
+                    parent_fd=replay_directory["fd"],
+                    source_name=private_name,
+                    destination_name=run_directory_name,
+                )
+            except BaseException:
+                try:
+                    source = os.stat(
+                        private_name, dir_fd=replay_directory["fd"],
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    source = None
+                try:
+                    target = os.stat(
+                        run_directory_name, dir_fd=replay_directory["fd"],
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    target = None
+                expected_identity = staging_directory["identity"]
+                source_exact = (
+                    source is not None
+                    and _metadata_snapshot(source) == expected_identity
+                )
+                target_exact = (
+                    target is not None
+                    and _metadata_snapshot(target) == expected_identity
+                )
+                if target_exact and source is None:
+                    record["state"] = "committing"
+                elif source_exact and not target_exact:
+                    raise
+                else:
+                    record["state"] = "blocked"
+                    raise _InternalFailure()
+            else:
+                record["state"] = "committing"
+            staging_directory["name"] = run_directory_name
+            ledger["private_basename"] = run_directory_name
+            return _commit_historical_run_finalization(token=token)
+        except BaseException:
+            if record.get("state") not in (
+                "committing", "durable", "committed", "blocked"
+            ):
+                rollback()
+                record["state"] = "sealed"
+            raise
+
+    def _historical_run_finalization_is_retryable(*, token: object) -> bool:
+        entry = finalization_token_registry.get(id(token))
+        return bool(
+            type(token) is _HistoricalRunFinalizationToken
+            and entry is not None
+            and entry[0]() is token
+            and entry[1].get("constructor") is constructor_provenance
+            and entry[1].get("consumed") is not True
+            and entry[1].get("state") in ("committing", "durable")
+        )
+
     def _consume_historical_replay_successor(
         *, ledger: object, previous_staging: object
     ) -> object:
@@ -9286,6 +10236,384 @@ def _initialize_historical_foundry_storage_types():
         _task4b_current_snapshot_owner(successor)
         record["successor_consumed"] = True
         return successor
+
+    def _validated_historical_replay_ledger_projection(
+        *, ledger: object, selection_transition: object,
+    ) -> Mapping[str, Any]:
+        token_entry = selection_transition_registry.get(
+            id(selection_transition)
+        )
+        ledger_record = _task6_live_record(
+            ledger, ValidatedHistoricalReplayLedger,
+            replay_ledger_registry,
+        )
+        owner = ledger_record.get("owner")
+        if (
+            type(selection_transition) is not _HistoricalSelectionTransition
+            or token_entry is None
+            or token_entry[0]() is not selection_transition
+            or token_entry[1].get("constructor") is not constructor_provenance
+            or type(owner) is not dict
+            or token_entry[1].get("lineage") is not owner.get("lineage")
+            or token_entry[1].get("scan_inventory_sha256")
+            != owner.get("_task4b_snapshot_projection", {}).get(
+                "scan_inventory_sha256"
+            )
+            or ledger_record.get("generation")
+            != owner.get("capture_generation")
+            or ledger_record.get("scenario_count")
+            != len(owner.get("_task6_scenarios", {}))
+            or ledger_record.get("staging")
+            is not owner.get("_task4b_snapshot_handle")
+        ):
+            _raise_storage_error()
+        _task4b_current_snapshot_owner(ledger_record["staging"])
+        _task5_freeze_audit(owner)
+        _task6_freeze_audit(owner)
+        scenario_rows = []
+        scenarios = owner.get("_task6_scenarios")
+        if type(scenarios) is not dict or not scenarios:
+            _raise_storage_error()
+        for scenario_key, scenario_record in scenarios.items():
+            members = {}
+            descriptors = scenario_record.get("members")
+            if type(descriptors) is not dict:
+                _raise_storage_error()
+            for role in ("overlay", "receipt", "trace", "result"):
+                descriptor = descriptors.get(role)
+                if type(descriptor) is not dict:
+                    _raise_storage_error()
+                payload = _task4b_reread_capture_member(
+                    owner["_task4b_staging"],
+                    relative_path=descriptor["path"],
+                    expected_size=descriptor["size"],
+                    maximum_size=descriptor["cap"],
+                    size_kind=descriptor["kind"],
+                )
+                if hashlib.sha256(payload).hexdigest() != descriptor["sha256"]:
+                    _raise_storage_error()
+                members[role] = payload
+            rebuilt = _task6_validate_quartet(
+                scenario_key, members, owner
+            )
+            if rebuilt != scenario_record.get("projection"):
+                _raise_storage_error()
+            receipt = _task4b_decode_canonical_json(
+                members["receipt"], expected_container=dict
+            )
+            result = _task4b_decode_canonical_json(
+                members["result"], expected_container=dict
+            )
+            scenario_rows.append(MappingProxyType({
+                "scenario_key": scenario_key,
+                "block_number": rebuilt["block_number"],
+                "status": receipt["status"],
+                "classification": result["classification"],
+                "gas_used": receipt["gasUsed"],
+                "effective_gas_price": receipt["effectiveGasPrice"],
+                "weth_delta_raw": result["actual_deltas"]["weth_raw"],
+                "proof_inputs_hash": rebuilt["proof_inputs_hash"],
+                "overlay_sha256": rebuilt["overlay_sha256"],
+                "receipt_sha256": rebuilt["receipt_sha256"],
+                "trace_sha256": rebuilt["trace_sha256"],
+                "result_sha256": rebuilt["result_sha256"],
+            }))
+        token_entry[1]["current_staging"] = ledger_record["staging"]
+        return MappingProxyType({
+            "generation": ledger_record["generation"],
+            "scenario_count": len(scenario_rows),
+            "scan_inventory_sha256": token_entry[1][
+                "scan_inventory_sha256"
+            ],
+            "scenarios": tuple(scenario_rows),
+        })
+
+    def _historical_selected_block_source_projection(
+        *, selection_transition: object, block_number: int,
+    ) -> Mapping[str, Any]:
+        token_entry = selection_transition_registry.get(
+            id(selection_transition)
+        )
+        if (
+            token_entry is None
+            or token_entry[0]() is not selection_transition
+            or token_entry[1].get("constructor") is not constructor_provenance
+            or type(block_number) is not int
+            or block_number < 0
+        ):
+            _raise_storage_error()
+        owner = _task4b_current_snapshot_owner(
+            token_entry[1].get("current_staging")
+        )
+        if token_entry[1].get("lineage") is not owner.get("lineage"):
+            _raise_storage_error()
+        chunks = owner.get("_task4b_frozen_record", {}).get("typed_chunks")
+        matches = tuple(
+            row for row in chunks if (
+                type(row) is dict
+                and row.get("role") == "reserves"
+                and type(row.get("block_start")) is int
+                and type(row.get("block_stop")) is int
+                and row["block_start"] <= block_number <= row["block_stop"]
+            )
+        ) if type(chunks) is list else ()
+        if len(matches) != 1:
+            _raise_storage_error()
+        row = matches[0]
+        descriptor = owner.get("_task4b_snapshot_members", {}).get(
+            row.get("path")
+        )
+        if (
+            type(descriptor) is not dict
+            or descriptor.get("sha256") != row.get("gzip_sha256")
+            or descriptor.get("size") != row.get("gzip_byte_count")
+        ):
+            _raise_storage_error()
+        return MappingProxyType({
+            "path": row["path"],
+            "sha256": row["gzip_sha256"],
+            "byte_count": row["gzip_byte_count"],
+            "block_start": row["block_start"],
+            "block_stop": row["block_stop"],
+        })
+
+    def _task7_factory_pair_authority(
+        owner: Dict[str, Any],
+    ) -> Mapping[str, Any]:
+        _task4b_verify_snapshot_source_authority(
+            owner.get("_task4b_snapshot_source_authority")
+        )
+        _task4b_freeze_audit(owner.get("_task4b_frozen_record"))
+        ledger = owner.get("_task4b_staging")
+        authority_descriptor = owner.get(
+            "_task4b_snapshot_members", {}
+        ).get("authority.json")
+        frozen = owner.get("_task4b_frozen_record")
+        if (
+            type(ledger) is not dict
+            or type(authority_descriptor) is not dict
+            or type(frozen) is not dict
+            or type(frozen.get("raw_chunks")) is not list
+            or type(frozen.get("exchange_joins")) is not list
+        ):
+            raise _InternalFailure()
+        try:
+            authority_payload = _task4b_reread_capture_member(
+                ledger, relative_path="authority.json",
+                expected_size=authority_descriptor["size"],
+                maximum_size=1_048_576,
+                size_kind=authority_descriptor["kind"],
+            )
+            authority = _task4b_decode_canonical_config(authority_payload)
+        except (KeyError, _BoundSourceIdentityDrift):
+            raise _InternalFailure()
+        tokens = {
+            row.get("role"): row for row in authority.get("tokens", ())
+            if type(row) is dict
+        }
+        venues = {
+            row.get("venue_id"): row
+            for row in authority.get("venues", ())
+            if type(row) is dict
+        }
+        if set(tokens) != {"uni", "weth"} or set(venues) != {
+            "uniswap_v2", "sushiswap_v2"
+        }:
+            raise _InternalFailure()
+        relevant_ids = {2, 23, 24, 29, 30}
+        request_rows: Dict[int, Dict[str, Any]] = {}
+        response_rows: Dict[int, Dict[str, Any]] = {}
+        joins = frozen["exchange_joins"]
+        for chunk in frozen["raw_chunks"]:
+            path = chunk.get("path") if type(chunk) is dict else None
+            chunk_joins = [
+                row for row in joins
+                if type(row) is dict and row.get("raw_chunk_path") == path
+            ]
+            payload = _task4b_reread_capture_member(
+                ledger, relative_path=path,
+                expected_size=chunk.get("byte_count"),
+                maximum_size=16_777_216, size_kind="raw",
+            )
+            _task4b_verify_raw_chunk_payload(payload, tuple({
+                "projection": {key: row[key] for key in receipt_keys},
+                "raw_offset": row["raw_chunk_offset"],
+            } for row in chunk_joins))
+            for join in chunk_joins:
+                if relevant_ids.isdisjoint(join["request_ids"]):
+                    continue
+                cursor = join["raw_chunk_offset"]
+                request_length = int.from_bytes(
+                    payload[cursor:cursor + 8], "big"
+                )
+                request_start = cursor + 8
+                request_stop = request_start + request_length
+                response_length = int.from_bytes(
+                    payload[request_stop:request_stop + 8], "big"
+                )
+                response_start = request_stop + 8
+                response_stop = response_start + response_length
+                requests = _task4b_decode_canonical_json(
+                    payload[request_start:request_stop],
+                    expected_container=list,
+                )
+                responses = _task4b_decode_canonical_json(
+                    payload[response_start:response_stop],
+                    expected_container=list,
+                )
+                if (
+                    tuple(row.get("id") for row in requests)
+                    != join["request_ids"]
+                    or set(row.get("id") for row in responses)
+                    != set(join["response_ids"])
+                    or response_stop - cursor != join["spool_length"]
+                ):
+                    raise _InternalFailure()
+                for row in requests:
+                    request_id = row.get("id") if type(row) is dict else None
+                    if request_id in relevant_ids:
+                        if request_id in request_rows:
+                            raise _InternalFailure()
+                        request_rows[request_id] = row
+                for row in responses:
+                    response_id = row.get("id") if type(row) is dict else None
+                    if response_id in relevant_ids:
+                        if response_id in response_rows:
+                            raise _InternalFailure()
+                        response_rows[response_id] = row
+        if set(request_rows) != relevant_ids or set(response_rows) != relevant_ids:
+            raise _InternalFailure()
+        anchor_response = response_rows[2]
+        anchor_request = request_rows[2]
+        if (
+            anchor_request != {
+                "jsonrpc": "2.0", "id": 2,
+                "method": "eth_getBlockByNumber",
+                "params": ["finalized", False],
+            }
+            or type(anchor_response) is not dict
+            or set(anchor_response) != {"jsonrpc", "id", "result"}
+            or anchor_response.get("jsonrpc") != "2.0"
+            or anchor_response.get("id") != 2
+            or type(anchor_response.get("result")) is not dict
+            or type(anchor_response["result"].get("hash")) is not str
+            or len(anchor_response["result"]["hash"]) != 66
+            or not anchor_response["result"]["hash"].startswith("0x")
+            or anchor_response["result"]["hash"]
+            != anchor_response["result"]["hash"].lower()
+            or any(
+                value not in "0123456789abcdef"
+                for value in anchor_response["result"]["hash"][2:]
+            )
+        ):
+            raise _InternalFailure()
+        block_reference = {
+            "blockHash": anchor_response["result"]["hash"],
+            "requireCanonical": True,
+        }
+
+        def argument(address: Any) -> str:
+            if (
+                type(address) is not str or len(address) != 42
+                or not address.startswith("0x") or address != address.lower()
+                or any(value not in "0123456789abcdef" for value in address[2:])
+            ):
+                raise _InternalFailure()
+            return "0" * 24 + address[2:]
+
+        result = {}
+        for venue_id, forward_id, reverse_id in (
+            ("uniswap_v2", 23, 24),
+            ("sushiswap_v2", 29, 30),
+        ):
+            venue = venues[venue_id]
+            selector = venue.get("pair_getter_selector")
+            factory = venue.get("factory_address")
+            if selector != "0xe6a43905":
+                raise _InternalFailure()
+            expected_calldata = (
+                selector + argument(tokens["uni"].get("address"))
+                + argument(tokens["weth"].get("address"))
+            )
+            expected_reverse = (
+                selector + argument(tokens["weth"].get("address"))
+                + argument(tokens["uni"].get("address"))
+            )
+            observed = []
+            for request_id, calldata in (
+                (forward_id, expected_calldata),
+                (reverse_id, expected_reverse),
+            ):
+                request = request_rows[request_id]
+                response = response_rows[request_id]
+                if (
+                    type(request) is not dict
+                    or set(request) != {"jsonrpc", "id", "method", "params"}
+                    or request != {
+                        "jsonrpc": "2.0", "id": request_id,
+                        "method": "eth_call",
+                        "params": [{"to": factory, "data": calldata},
+                                   block_reference],
+                    }
+                    or type(response) is not dict
+                    or set(response) != {"jsonrpc", "id", "result"}
+                    or response.get("jsonrpc") != "2.0"
+                    or response.get("id") != request_id
+                ):
+                    raise _InternalFailure()
+                word = response.get("result")
+                if (
+                    type(word) is not str or len(word) != 66
+                    or not word.startswith("0x") or word != word.lower()
+                    or word[2:26] != "0" * 24
+                    or any(value not in "0123456789abcdef" for value in word[2:])
+                    or word[26:] == "0" * 40
+                ):
+                    raise _InternalFailure()
+                observed.append("0x" + word[26:])
+            if observed[0] != observed[1]:
+                raise _InternalFailure()
+            result[venue_id] = MappingProxyType({
+                "factory_pair_forward": observed[0],
+                "factory_pair_reverse": observed[1],
+            })
+        _inventory, grid_rows = _task5_rebuild_prefilter(owner)
+        for venue_id, projection in result.items():
+            pair_addresses = {
+                row["reserves"][venue_id]["pair_address"]
+                for row in grid_rows
+            }
+            if pair_addresses != {projection["factory_pair_forward"]}:
+                raise _InternalFailure()
+        return MappingProxyType(result)
+
+    def _historical_factory_pair_projection(
+        *, selection_transition: object,
+    ) -> Mapping[str, Any]:
+        token_entry = selection_transition_registry.get(
+            id(selection_transition)
+        )
+        if (
+            token_entry is None
+            or token_entry[0]() is not selection_transition
+            or token_entry[1].get("constructor") is not constructor_provenance
+        ):
+            _raise_storage_error()
+        try:
+            owner = _task4b_current_snapshot_owner(
+                token_entry[1].get("current_staging")
+            )
+            if token_entry[1].get("lineage") is not owner.get("lineage"):
+                raise _InternalFailure()
+            projection = _task7_factory_pair_authority(owner)
+            return MappingProxyType({
+                venue_id: MappingProxyType(dict(row))
+                for venue_id, row in projection.items()
+            })
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                raise
+            _raise_storage_error()
 
     def _open_historical_scenario_evidence_sink(
         *, staging: object, scenario_token: object, scenario_key: str,
@@ -9806,19 +11134,461 @@ def _initialize_historical_foundry_storage_types():
             expected_sha256: str,
             max_bytes: int,
         ) -> bytes:
-            del relative_path, expected_sha256, max_bytes
-            _raise_storage_error()
+            record = _task7_run_record(self)
+            row = record.get("members", {}).get(relative_path)
+            if (
+                type(relative_path) is not str
+                or type(row) is not dict
+                or not _exact_sha256(expected_sha256)
+                or expected_sha256 != row.get("sha256")
+                or type(max_bytes) is not int
+                or max_bytes < row.get("size", -1)
+                or max_bytes > row.get("cap", -1)
+            ):
+                _raise_storage_error()
+            try:
+                if record.get("kind") == "live":
+                    owner = record["owner"]
+                    payload = _task4b_reread_capture_member(
+                        owner["_task4b_staging"],
+                        relative_path=relative_path,
+                        expected_size=row["size"],
+                        maximum_size=row["cap"],
+                        size_kind=row["kind"],
+                    )
+                elif record.get("kind") == "reopened":
+                    payload = _task7_read_reopened_member(
+                        record, relative_path, row["size"], max_bytes
+                    )
+                else:
+                    raise _InternalFailure()
+                if hashlib.sha256(payload).hexdigest() != expected_sha256:
+                    raise _InternalFailure()
+                return bytes(payload)
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                _raise_storage_error()
 
         def identity_projection(self) -> Mapping[str, Any]:
-            _raise_storage_error()
+            record = _task7_run_record(self)
+            return MappingProxyType(dict(record["projection"]))
 
         def reread_unchanged(self) -> None:
-            _raise_storage_error()
+            record = _task7_run_record(self)
+            if record.get("kind") == "live":
+                root_fd = record["owner"]["_task4b_staging"][
+                    "capture_directories"
+                ]["staging"]["fd"]
+            elif record.get("kind") == "reopened":
+                root_fd = record["chain"][-1][0]
+            else:
+                _raise_storage_error()
+            try:
+                expected_files = set(record["members"])
+                expected_directories = set()
+                for path in expected_files:
+                    parts = path.split("/")
+                    for stop in range(1, len(parts)):
+                        expected_directories.add("/".join(parts[:stop]))
+                if _task7_inventory_paths(root_fd) != (
+                    expected_files, expected_directories
+                ):
+                    raise _InternalFailure()
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                _raise_storage_error()
+            for path, row in sorted(record["members"].items()):
+                self.read_member(
+                    path, expected_sha256=row["sha256"],
+                    max_bytes=row["cap"],
+                )
+            return None
 
         def close(self) -> None:
-            _raise_storage_error()
+            if type(self) is not HistoricalRunSnapshot:
+                _raise_storage_error()
+            entry = run_snapshot_registry.get(id(self))
+            if entry is None or entry[0] is not self:
+                if _is_exact_tombstone(
+                    self, HistoricalRunSnapshot, run_snapshot_tombstones
+                ):
+                    return None
+                _raise_storage_error()
+            record = entry[1]
+            if record.get("kind") == "reopened":
+                for row in reversed(record["chain"]):
+                    try:
+                        os.close(row[0])
+                    except OSError:
+                        _raise_storage_error()
+                _retire_nonowner_handle(
+                    self, run_snapshot_registry, run_snapshot_tombstones
+                )
+                record["state"] = "closed"
+                return None
+            if record.get("kind") != "live":
+                _raise_storage_error()
+            if any(
+                lease_entry[0]() is not None
+                and lease_entry[1].get("snapshot") is self
+                and lease_entry[1].get("state") == "held"
+                for lease_entry in publication_lease_registry.values()
+            ):
+                _raise_storage_error()
+            if any(
+                source_entry[0]() is not None
+                and source_entry[1].get("snapshot") is self
+                and source_entry[1].get("state") == "held"
+                for source_entry in publication_source_registry.values()
+            ):
+                _raise_storage_error()
+            owner = record["owner"]
+            ledger = owner["_task4b_staging"]
+            try:
+                relay = owner.get("_task6_relay_lease")
+                if relay is not None:
+                    relay.close()
+                    owner["_task6_relay_lease"] = None
+                for slot in tuple(ledger.get("transient_fds", ())):
+                    _task4b_close_fd_slot(ledger, slot)
+                for slot in tuple(ledger.get("files", ())):
+                    _task4b_close_fd_slot(ledger, slot)
+                for slot in reversed(tuple(ledger.get("directories", ()))):
+                    _task4b_close_fd_slot(ledger, slot)
+                ledger["cleanup_state"] = {"phase": "done"}
+                source_control, source_ordinary = (
+                    _task4b_close_snapshot_source_authority(owner)
+                )
+                if source_control is not None:
+                    raise source_control
+                if source_ordinary:
+                    raise _InternalFailure()
+                _revoke_bound_source(owner)
+                cleanup_control, cleanup_ordinary = _cleanup_resources(
+                    owner, created=True
+                )
+                if cleanup_control is not None:
+                    raise cleanup_control
+                if cleanup_ordinary:
+                    raise _InternalFailure()
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                _raise_storage_error()
+            _retire_nonowner_handle(
+                self, run_snapshot_registry, run_snapshot_tombstones
+            )
+            record["state"] = "closed"
+            return None
 
     run_snapshot_authorized[0] = HistoricalRunSnapshot
+
+    class _HistoricalRunPublicationLease(publication_lease_base):
+        __slots__ = ("__weakref__",)
+
+        def read_member(
+            self, relative_path: str, *,
+            expected_sha256: str, max_bytes: int,
+        ) -> bytes:
+            _validate_historical_run_publication_lease(lease=self)
+            record = _publication_lease_record(self)
+            return record["snapshot"].read_member(
+                relative_path, expected_sha256=expected_sha256,
+                max_bytes=max_bytes,
+            )
+
+        def identity_projection(self) -> Mapping[str, Any]:
+            return _validate_historical_run_publication_lease(lease=self)
+
+        def reread_unchanged(self) -> None:
+            _validate_historical_run_publication_lease(lease=self)
+            return None
+
+        def close(self) -> None:
+            return _close_historical_run_publication_lease(lease=self)
+
+    publication_lease_authorized[0] = _HistoricalRunPublicationLease
+
+    class _HistoricalRunPublicationSource(publication_source_base):
+        __slots__ = ("__weakref__",)
+
+        def read_member(
+            self, relative_path: str, *,
+            expected_sha256: str, max_bytes: int,
+        ) -> bytes:
+            _validate_historical_run_publication_source(source=self)
+            record = _publication_source_record(self)
+            return record["snapshot"].read_member(
+                relative_path, expected_sha256=expected_sha256,
+                max_bytes=max_bytes,
+            )
+
+        def identity_projection(self) -> Mapping[str, Any]:
+            return _validate_historical_run_publication_source(source=self)
+
+        def reread_unchanged(self) -> None:
+            _validate_historical_run_publication_source(source=self)
+            return None
+
+        def close(self) -> None:
+            return _close_historical_run_publication_source(source=self)
+
+    publication_source_authorized[0] = _HistoricalRunPublicationSource
+
+    def _publication_lease_record(lease: object) -> Dict[str, Any]:
+        entry = publication_lease_registry.get(id(lease))
+        if (
+            type(lease) is not _HistoricalRunPublicationLease
+            or entry is None
+            or entry[0]() is not lease
+            or entry[1].get("constructor") is not constructor_provenance
+            or entry[1].get("state") != "held"
+        ):
+            _raise_storage_error()
+        return entry[1]
+
+    def _acquire_historical_run_publication_lease(
+        *, run_id: str, expected_manifest_sha256: str,
+    ) -> object:
+        if (
+            type(run_id) is not str or len(run_id) != 68
+            or not run_id.startswith("run:")
+            or any(value not in "0123456789abcdef" for value in run_id[4:])
+            or not _exact_sha256(expected_manifest_sha256)
+        ):
+            _raise_storage_error()
+        matches = []
+        for snapshot, record in tuple(run_snapshot_registry.values()):
+            projection = record.get("projection")
+            if (
+                type(snapshot) is HistoricalRunSnapshot
+                and record.get("kind") == "live"
+                and record.get("state") == "open"
+                and type(projection) is dict
+                and projection.get("run_id") == run_id
+                and projection.get("run_manifest_sha256")
+                == expected_manifest_sha256
+            ):
+                matches.append((snapshot, record))
+        if len(matches) != 1:
+            _raise_storage_error()
+        snapshot, run_record = matches[0]
+        if run_record.get("publication_claimed") is True:
+            _raise_storage_error()
+        descriptor = run_record.get("members", {}).get(
+            "run_manifest.json"
+        )
+        if type(descriptor) is not dict:
+            _raise_storage_error()
+        snapshot.reread_unchanged()
+        manifest_bytes = snapshot.read_member(
+            "run_manifest.json",
+            expected_sha256=expected_manifest_sha256,
+            max_bytes=8_388_608,
+        )
+        try:
+            manifest = _task4b_decode_canonical_json(
+                manifest_bytes, expected_container=dict
+            )
+        except _InternalFailure:
+            _raise_storage_error()
+        if (
+            manifest.get("run_id") != run_id
+            or manifest.get("publication_eligible") is not True
+            or manifest.get("selection_status")
+            != "found_publishable_profitable_block"
+        ):
+            _raise_storage_error()
+        lease = _prepare_handle(_HistoricalRunPublicationLease, {})
+        record = {
+            "constructor": constructor_provenance,
+            "state": "held", "snapshot": snapshot,
+            "run_record": run_record,
+            "projection": dict(run_record["projection"]),
+        }
+        lease_id = id(lease)
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = publication_lease_registry.get(lease_id)
+            if current is not None and current[0] is reference:
+                publication_lease_registry.pop(lease_id, None)
+
+        publication_lease_registry[lease_id] = (
+            weakref.ref(lease, retire), record
+        )
+        run_record["publication_claimed"] = True
+        return lease
+
+    def _validate_historical_run_publication_lease(
+        *, lease: object,
+    ) -> Mapping[str, Any]:
+        record = _publication_lease_record(lease)
+        snapshot = record["snapshot"]
+        run_record = _task7_run_record(snapshot)
+        if (
+            run_record is not record["run_record"]
+            or run_record.get("kind") != "live"
+            or run_record.get("state") != "open"
+            or run_record.get("publication_claimed") is not True
+            or dict(run_record.get("projection", {}))
+            != record["projection"]
+        ):
+            _raise_storage_error()
+        snapshot.reread_unchanged()
+        return MappingProxyType(dict(record["projection"]))
+
+    def _publication_source_record(source: object) -> Dict[str, Any]:
+        entry = publication_source_registry.get(id(source))
+        if (
+            type(source) is not _HistoricalRunPublicationSource
+            or entry is None
+            or entry[0]() is not source
+            or entry[1].get("constructor") is not constructor_provenance
+            or entry[1].get("state") != "held"
+        ):
+            _raise_storage_error()
+        return entry[1]
+
+    def _consume_historical_run_publication_lease(
+        *, lease: object,
+    ) -> object:
+        _validate_historical_run_publication_lease(lease=lease)
+        lease_record = _publication_lease_record(lease)
+        source = _prepare_handle(_HistoricalRunPublicationSource, {})
+        source_record = {
+            "constructor": constructor_provenance,
+            "state": "held",
+            "snapshot": lease_record["snapshot"],
+            "run_record": lease_record["run_record"],
+            "projection": dict(lease_record["projection"]),
+        }
+        source_id = id(source)
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = publication_source_registry.get(source_id)
+            if current is not None and current[0] is reference:
+                publication_source_registry.pop(source_id, None)
+
+        publication_source_registry[source_id] = (
+            weakref.ref(source, retire), source_record
+        )
+        lease_record["state"] = "consumed"
+        lease_record["snapshot"] = None
+        lease_record["run_record"] = None
+        publication_lease_registry.pop(id(lease), None)
+        return source
+
+    def _validate_historical_run_publication_source(
+        *, source: object,
+    ) -> Mapping[str, Any]:
+        record = _publication_source_record(source)
+        snapshot = record["snapshot"]
+        run_record = _task7_run_record(snapshot)
+        if (
+            run_record is not record["run_record"]
+            or run_record.get("kind") != "live"
+            or run_record.get("state") != "open"
+            or run_record.get("publication_claimed") is not True
+            or dict(run_record.get("projection", {}))
+            != record["projection"]
+        ):
+            _raise_storage_error()
+        snapshot.reread_unchanged()
+        return MappingProxyType(dict(record["projection"]))
+
+    def _close_historical_run_publication_source(
+        *, source: object,
+    ) -> None:
+        record = _publication_source_record(source)
+        record["state"] = "closed"
+        record["snapshot"] = None
+        record["run_record"] = None
+        publication_source_registry.pop(id(source), None)
+        return None
+
+    def _close_historical_run_publication_lease(
+        *, lease: object,
+    ) -> None:
+        record = _publication_lease_record(lease)
+        record["state"] = "closed"
+        record["snapshot"] = None
+        record["run_record"] = None
+        publication_lease_registry.pop(id(lease), None)
+        return None
+
+    def _task7_read_reopened_member(
+        record: Dict[str, Any], relative_path: str,
+        expected_size: Optional[int], maximum_size: int,
+    ) -> bytes:
+        if (
+            type(relative_path) is not str or not relative_path
+            or relative_path.startswith("/") or "\\" in relative_path
+            or expected_size is not None and (
+                type(expected_size) is not int or expected_size <= 0
+                or expected_size > maximum_size
+            )
+        ):
+            raise _InternalFailure()
+        parts = relative_path.split("/")
+        if not 1 <= len(parts) <= 8:
+            raise _InternalFailure()
+        parent_fd = record["chain"][-1][0]
+        opened = []
+        try:
+            for component in parts[:-1]:
+                _require_relative_basename(component)
+                fd = os.open(
+                    component, _required_directory_flags(), dir_fd=parent_fd
+                )
+                opened.append(fd)
+                details = os.fstat(fd)
+                current = os.stat(
+                    component, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(details.st_mode)
+                    or _metadata_snapshot(details) != _metadata_snapshot(current)
+                ):
+                    raise _InternalFailure()
+                parent_fd = fd
+            basename = parts[-1]
+            _require_relative_basename(basename)
+            fd = os.open(
+                basename, _task4b_file_flags(create=False), dir_fd=parent_fd
+            )
+            opened.append(fd)
+            details = os.fstat(fd)
+            current = os.stat(
+                basename, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or _file_identity(details) != _file_identity(current)
+                or details.st_size <= 0
+                or details.st_size > maximum_size
+                or expected_size is not None
+                and details.st_size != expected_size
+            ):
+                raise _InternalFailure()
+            chunks = []
+            remaining = details.st_size
+            while remaining:
+                chunk = os.read(fd, min(remaining, 1_048_576))
+                if not chunk:
+                    raise _InternalFailure()
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(fd, 1) != b"":
+                raise _InternalFailure()
+            return b"".join(chunks)
+        finally:
+            for fd in reversed(opened):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def open_validated_run(
         *,
@@ -9826,7 +11596,95 @@ def _initialize_historical_foundry_storage_types():
         run_id: str,
         expected_manifest_sha256: str,
     ) -> "HistoricalRunSnapshot":
-        _raise_storage_error()
+        if (
+            not issubclass(type(data_dir), Path)
+            or type(run_id) is not str
+            or len(run_id) != 68
+            or not run_id.startswith("run:")
+            or any(
+                character not in "0123456789abcdef"
+                for character in run_id[4:]
+            )
+            or not _exact_sha256(expected_manifest_sha256)
+        ):
+            _raise_storage_error()
+        chain = None
+        try:
+            canonical, _components = _canonical_data_dir(data_dir)
+            suffix = run_id[4:]
+            target = canonical / "raw" / "historical-foundry-replay" / suffix
+            target_canonical, target_components = _canonical_data_dir(target)
+            chain = _open_ancestry(target_canonical, target_components, [])
+            _require_private_leaf(chain)
+            provisional = {"chain": chain}
+            manifest_bytes = _task7_read_reopened_member(
+                provisional, "run_manifest.json", None, 8_388_608
+            )
+            if (
+                len(manifest_bytes) > 8_388_608
+                or hashlib.sha256(manifest_bytes).hexdigest()
+                != expected_manifest_sha256
+            ):
+                raise _InternalFailure()
+            manifest = _task4b_decode_canonical_json(
+                manifest_bytes, expected_container=dict
+            )
+            inventory = manifest.get("members")
+            if (
+                manifest.get("schema") != "historical_foundry_run_manifest/v1"
+                or manifest.get("run_id") != run_id
+                or type(inventory) is not list
+                or manifest.get("member_count") != len(inventory)
+            ):
+                raise _InternalFailure()
+            members = {}
+            for row in inventory:
+                if (
+                    type(row) is not dict
+                    or set(row) != {"path", "byte_count", "sha256"}
+                    or type(row["path"]) is not str
+                    or row["path"] in members
+                    or type(row["byte_count"]) is not int
+                    or not 1 <= row["byte_count"] <= 16_842_752
+                    or not _exact_sha256(row["sha256"])
+                ):
+                    raise _InternalFailure()
+                members[row["path"]] = {
+                    "path": row["path"], "size": row["byte_count"],
+                    "sha256": row["sha256"], "cap": 16_842_752,
+                    "kind": "task6_json",
+                }
+            members["run_manifest.json"] = {
+                "path": "run_manifest.json", "size": len(manifest_bytes),
+                "sha256": expected_manifest_sha256, "cap": 8_388_608,
+                "kind": "task6_json",
+            }
+            record = {
+                "constructor": constructor_provenance,
+                "kind": "reopened", "state": "open", "chain": chain,
+                "members": members,
+                "projection": {
+                    "schema": "historical_foundry_run_snapshot_identity/v1",
+                    "stage": "complete", "run_id": run_id,
+                    "run_manifest_sha256": expected_manifest_sha256,
+                    "member_count": len(members),
+                    "selection_status": manifest.get("selection_status"),
+                },
+            }
+            snapshot = _prepare_handle(HistoricalRunSnapshot, {})
+            run_snapshot_registry[id(snapshot)] = (snapshot, record)
+            snapshot.reread_unchanged()
+            return snapshot
+        except BaseException as error:
+            if chain is not None:
+                for row in reversed(chain):
+                    try:
+                        os.close(row[0])
+                    except OSError:
+                        pass
+            if not isinstance(error, Exception):
+                raise
+            _raise_storage_error()
 
     class _HistoricalWindowSpoolSourceBinding(binding_base):
         __slots__ = ("__weakref__",)
@@ -12864,6 +14722,7 @@ def _initialize_historical_foundry_storage_types():
         _project_historical_window_exchange_spool_for_test,
         _bind_historical_prefilter_staging_transition,
         _verify_historical_prefilter_staging_transition,
+        _bind_historical_selection_transition,
         _freeze_historical_prefilter_grid,
         _bind_historical_relay_lease_for_test,
         _bind_historical_relay_lease_from_production_spool,
@@ -12876,6 +14735,20 @@ def _initialize_historical_foundry_storage_types():
         _validate_historical_quartet_for_test,
         _drop_historical_quartet_transaction_memory_for_test,
         _consume_historical_replay_successor,
+        _validated_historical_replay_ledger_projection,
+        _historical_selected_block_source_projection,
+        _historical_factory_pair_projection,
+        _seal_historical_run_finalization,
+        _commit_historical_run_finalization,
+        _historical_run_finalization_is_retryable,
+        _HistoricalRunPublicationLease,
+        _acquire_historical_run_publication_lease,
+        _validate_historical_run_publication_lease,
+        _consume_historical_run_publication_lease,
+        _close_historical_run_publication_lease,
+        _HistoricalRunPublicationSource,
+        _validate_historical_run_publication_source,
+        _close_historical_run_publication_source,
     )
 
 
@@ -12901,6 +14774,7 @@ def _initialize_historical_foundry_storage_types():
     _project_historical_window_exchange_spool_for_test,
     _bind_historical_prefilter_staging_transition,
     _verify_historical_prefilter_staging_transition,
+    _bind_historical_selection_transition,
     _freeze_historical_prefilter_grid,
     _bind_historical_relay_lease_for_test,
     _bind_historical_relay_lease_from_production_spool,
@@ -12913,6 +14787,20 @@ def _initialize_historical_foundry_storage_types():
     _validate_historical_quartet_for_test,
     _drop_historical_quartet_transaction_memory_for_test,
     _consume_historical_replay_successor,
+    _validated_historical_replay_ledger_projection,
+    _historical_selected_block_source_projection,
+    _historical_factory_pair_projection,
+    _seal_historical_run_finalization,
+    _commit_historical_run_finalization,
+    _historical_run_finalization_is_retryable,
+    _HistoricalRunPublicationLease,
+    _acquire_historical_run_publication_lease,
+    _validate_historical_run_publication_lease,
+    _consume_historical_run_publication_lease,
+    _close_historical_run_publication_lease,
+    _HistoricalRunPublicationSource,
+    _validate_historical_run_publication_source,
+    _close_historical_run_publication_source,
 ) = _initialize_historical_foundry_storage_types()
 del _initialize_historical_foundry_storage_types
 

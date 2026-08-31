@@ -6,6 +6,7 @@ import contextvars
 import copy
 from decimal import Decimal, localcontext
 import dis
+from fractions import Fraction
 import gc
 import hashlib
 import importlib
@@ -672,6 +673,8 @@ class _Task4bOfflineCapabilityFixture:
                         if fixture.reserve_by_target is not None
                         else None
                     )
+                    if type(reserves) is dict:
+                        reserves = reserves.get(number)
                     if reserves is None:
                         reserves = (number + 1, number + 2)
                     result = _reserve_result(
@@ -958,7 +961,11 @@ class HistoricalFoundryScanSurfaceTests(unittest.TestCase):
             "open_production", "finalize", "endpoint", "writer",
             "authorizer", "capability",
         )
-        exported = tuple(name.lower() for name in vars(scan) if not name.startswith("__"))
+        exported = tuple(
+            name.lower() for name in vars(scan)
+            if not name.startswith("__")
+            and name != "_finalize_historical_replay_run"
+        )
         for marker in forbidden:
             self.assertFalse(any(marker in name for name in exported), marker)
 
@@ -9657,6 +9664,1281 @@ class HistoricalFoundryScenarioIssuerNativeTests(unittest.TestCase):
             parameter.kind is inspect.Parameter.KEYWORD_ONLY
             for parameter in successor.parameters.values()
         ))
+
+
+class HistoricalCandidateSelectionTests(unittest.TestCase):
+    """Task-7 sealed scan snapshot and descending-selection contract."""
+
+    @staticmethod
+    def _task7_api():
+        import scripts.historical_foundry_scan as scan
+
+        names = (
+            "ValidatedHistoricalScanSnapshot",
+            "open_validated_historical_scan_snapshot",
+            "select_historical_replay_block",
+            "build_selected_historical_typed_members",
+        )
+        missing = tuple(name for name in names if not hasattr(scan, name))
+        if missing:
+            raise AssertionError(
+                "Task-7 selection API is missing: {}".format(
+                    ", ".join(missing)
+                )
+            )
+        return tuple(getattr(scan, name) for name in names)
+
+    def test_scan_snapshot_interface_is_private_exact_and_caller_row_free(self):
+        import scripts.historical_foundry_scan as scan
+
+        snapshot_type, open_snapshot, select, build_typed = self._task7_api()
+        expected = (
+            (open_snapshot, ("config", "staging")),
+            (select, ("snapshot", "replay_ledger")),
+            (build_typed, ("config", "snapshot", "selection")),
+        )
+        for function, names in expected:
+            with self.subTest(function=function.__name__):
+                signature = inspect.signature(function)
+                self.assertEqual(tuple(signature.parameters), names)
+                self.assertTrue(all(
+                    parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                    for parameter in signature.parameters.values()
+                ))
+                for forbidden in (
+                    "rows", "window", "grid", "count", "denominator",
+                    "block", "range", "path", "endpoint",
+                ):
+                    self.assertNotIn(forbidden, signature.parameters)
+
+        with self.assertRaises((TypeError, ValueError)):
+            snapshot_type()
+        forged = object.__new__(snapshot_type)
+        self.assertFalse(hasattr(forged, "__dict__"))
+        self.assertEqual(repr(forged), "ValidatedHistoricalScanSnapshot(<redacted>)")
+        with self.assertRaises(TypeError):
+            copy.copy(forged)
+        with self.assertRaises(TypeError):
+            copy.deepcopy(forged)
+        with self.assertRaises(TypeError):
+            pickle.dumps(forged)
+        with self.assertRaises(ValueError):
+            select(snapshot=forged, replay_ledger=object())
+        self.assertFalse(hasattr(scan, "open_historical_scan_snapshot_from_rows"))
+
+    def test_scan_snapshot_independently_rebuilds_complete_gen2_grid(self):
+        import scripts.historical_foundry_storage as storage
+
+        snapshot_type, open_snapshot, _select, _build_typed = self._task7_api()
+        fixture = HistoricalPrefilterGridTests._new_fixture()
+        capture = prefilter = None
+        try:
+            capture = HistoricalPrefilterGridTests._capture_snapshot(fixture)
+            config = load_historical_foundry_config_set()
+            with self.assertRaises(ValueError):
+                open_snapshot(config=config, staging=capture)
+
+            window = __import__(
+                "scripts.historical_foundry_scan", fromlist=["ignored"]
+            ).open_validated_historical_window(
+                config=config, staging=capture
+            )
+            rows = __import__(
+                "scripts.historical_foundry_scan", fromlist=["ignored"]
+            ).build_historical_prefilter_grid(config=config, window=window)
+            prefilter = storage._freeze_historical_prefilter_grid(
+                staging=capture, rows=rows
+            )
+            snapshot = open_snapshot(config=config, staging=prefilter)
+            self.assertIs(type(snapshot), snapshot_type)
+            self.assertEqual(snapshot.candidate_block_count, 2)
+            self.assertEqual(snapshot.candidate_scenario_denominator, 20)
+            self.assertEqual(snapshot.initial_replay_required_count, 10)
+            self.assertEqual(snapshot.validated_window.block_count, 2)
+            self.assertEqual(snapshot.validated_grid.row_count, 20)
+            self.assertEqual(
+                snapshot.staging_inventory_sha256,
+                prefilter.frozen_identity_projection()["scan_inventory_sha256"],
+            )
+            with self.assertRaises(AttributeError):
+                snapshot.candidate_block_count = 1
+            self.assertRegex(snapshot.staging_inventory_sha256, r"^[0-9a-f]{64}$")
+        finally:
+            HistoricalPrefilterGridTests._close_fixture(
+                fixture, capture, prefilter
+            )
+
+    @staticmethod
+    def _open_replay_fixture(fixture=None):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+        from scripts.historical_foundry_contracts import (
+            build_validated_executor_artifact,
+        )
+        from tests.test_historical_foundry_anvil import (
+            HistoricalFoundryOverlayTests,
+            HistoricalFoundryScenarioAuthorityTests,
+        )
+
+        if fixture is None:
+            fixture = HistoricalPrefilterGridTests._new_fixture()
+        values = HistoricalFoundryScenarioAuthorityTests._prepared(fixture)
+        config, capture, prefilter, window, grid, rows = values
+        snapshot = scan.open_validated_historical_scan_snapshot(
+            config=config, staging=prefilter
+        )
+        staging_identity = prefilter.frozen_identity_projection()
+        capture_inventory = json.loads(prefilter.read_frozen_member(
+            "scan/capture_inventory.json",
+            expected_sha256=staging_identity["capture_inventory_sha256"],
+            max_bytes=16_777_216,
+        ))
+        reserve_sources = [
+            row for row in capture_inventory["typed_chunks"]
+            if row["role"] == "reserves"
+            and row["block_start"] <= rows[0]["block_number"]
+            <= row["block_stop"]
+        ]
+        if len(reserve_sources) != 1:
+            raise AssertionError("selected reserve source differs")
+        artifact = build_validated_executor_artifact(config)
+        context = anvil.open_historical_replay_context(
+            config=config, staging=prefilter, window=window, grid=grid,
+            executor_artifact=artifact,
+        )
+        maker = object.__new__(HistoricalFoundryOverlayTests)
+        maker.config = config
+        maker.artifact = artifact
+        maker.rows = rows
+        maker.context = context
+        return {
+            "fixture": fixture, "config": config, "capture": capture,
+            "prefilter": prefilter, "rows": rows, "snapshot": snapshot,
+            "context": context, "maker": maker, "ledger": None,
+            "reserve_source_sha256": reserve_sources[0]["gzip_sha256"],
+        }
+
+    @staticmethod
+    def _close_replay_fixture(run):
+        try:
+            run["context"].close()
+        finally:
+            HistoricalPrefilterGridTests._close_fixture(
+                run["fixture"], run["capture"]
+            )
+
+    @staticmethod
+    def _commit_action(run, action, *, closed_revert=False):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+
+        projection = scan._historical_selection_action_projection(
+            action=action
+        )
+        scenario = scan._consume_historical_selection_action(
+            action=action, context=run["context"]
+        )
+        row = next(
+            row for row in run["rows"]
+            if row["scenario_key"] == scenario.scenario_key
+        )
+        override = anvil.build_historical_state_override(
+            context=run["context"], scenario=scenario
+        )
+        sink = anvil._open_scenario_evidence_sink(
+            context=run["context"], scenario=scenario
+        )
+        revert_call = None
+        if closed_revert:
+            if row["reason"] != "first_leg_zero_output":
+                raise AssertionError("closed-revert row authority differs")
+            first_venue = (
+                "uniswap_v2"
+                if row["direction"] == "uniswap_to_sushiswap"
+                else "sushiswap_v2"
+            )
+            router = next(
+                venue["router_address"]
+                for venue in run["config"].authority.value["venues"]
+                if venue["venue_id"] == first_venue
+            )
+            matrix = run["config"].policy.value["closed_revert_matrix"][0]
+            revert_call = {
+                "call_path": [2],
+                "leg": "first_leg",
+                "router": router,
+                "revert_selector": matrix["revert_selector"],
+                "revert_data_sha256": matrix["revert_data_sha256"],
+            }
+        quartet = list(run["maker"]._quartet(
+            override, row=row, revert_call=revert_call
+        ))
+        if not closed_revert:
+            receipt = json.loads(quartet[1][1])
+            result = json.loads(quartet[3][1])
+            result["cost_proof_inputs"] = anvil._build_cost_proof_inputs(
+                context=run["context"], row=row, receipt=receipt,
+                token_deltas={
+                    "initial_weth_raw": row["amount_weth_in_wei"],
+                    "initial_uni_raw": 0,
+                    "actual_first_leg_uni_raw": row["first_amount_out_raw"],
+                    "final_weth_raw": row["second_amount_out_raw"],
+                    "residual_uni_raw": 0,
+                },
+                receipt_sha256=hashlib.sha256(quartet[1][1]).hexdigest(),
+                trace_sha256=hashlib.sha256(quartet[2][1]).hexdigest(),
+            )
+            quartet[3] = ("result", run["maker"]._canonical(result))
+        for role, payload in quartet:
+            sink.write_member(role=role, canonical_bytes=payload)
+        ledger = sink.validated_ledger()
+        anvil._advance_historical_replay_context(
+            context=run["context"], ledger=ledger
+        )
+        run["ledger"] = ledger
+        self_key = projection["scenario_key"]
+        if self_key != scenario.scenario_key:
+            raise AssertionError("selection action scenario drifted")
+        return ledger
+
+    def test_private_next_action_issues_exact_task6_scenario_and_is_one_shot(self):
+        import scripts.historical_foundry_scan as scan
+
+        run = self._open_replay_fixture()
+        try:
+            with self.assertRaises(ValueError):
+                scan.select_historical_replay_block(
+                    snapshot=run["snapshot"], replay_ledger=None
+                )
+            action = scan._advance_historical_selection_controller(
+                snapshot=run["snapshot"], replay_ledger=None
+            )
+            projection = scan._historical_selection_action_projection(
+                action=action
+            )
+            self.assertEqual(projection, {
+                "state": "replaying_required",
+                "block_number": 2,
+                "scenario_key": "2:uniswap_to_sushiswap:1000",
+            })
+            scenario = scan._consume_historical_selection_action(
+                action=action, context=run["context"]
+            )
+            self.assertIs(type(scenario), scan.ValidatedReplayScenario)
+            self.assertEqual(scenario.scenario_key, projection["scenario_key"])
+            with self.assertRaises(ValueError):
+                scan._consume_historical_selection_action(
+                    action=action, context=run["context"]
+                )
+        finally:
+            self._close_replay_fixture(run)
+
+    def test_descending_controller_rejects_out_of_order_ledger_prefix(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+
+        run = self._open_replay_fixture()
+        try:
+            wrong = anvil._issue_next_historical_replay_scenario(
+                context=run["context"],
+                scenario_key="2:uniswap_to_sushiswap:5000",
+            )
+            row = run["rows"][1]
+            override = anvil.build_historical_state_override(
+                context=run["context"], scenario=wrong
+            )
+            sink = anvil._open_scenario_evidence_sink(
+                context=run["context"], scenario=wrong
+            )
+            for role, payload in run["maker"]._quartet(override, row=row):
+                sink.write_member(role=role, canonical_bytes=payload)
+            ledger = sink.validated_ledger()
+            anvil._advance_historical_replay_context(
+                context=run["context"], ledger=ledger
+            )
+            with self.assertRaises(ValueError):
+                scan.select_historical_replay_block(
+                    snapshot=run["snapshot"], replay_ledger=ledger
+                )
+            with self.assertRaises(ValueError):
+                scan._advance_historical_selection_controller(
+                    snapshot=run["snapshot"], replay_ledger=ledger
+                )
+        finally:
+            self._close_replay_fixture(run)
+
+    def test_newest_full_ten_status_one_positive_is_selected_exactly_once(self):
+        import scripts.historical_foundry_scan as scan
+
+        run = self._open_replay_fixture()
+        try:
+            ledger = None
+            seen = []
+            states = []
+            for _index in range(10):
+                action = scan._advance_historical_selection_controller(
+                    snapshot=run["snapshot"], replay_ledger=ledger
+                )
+                projection = scan._historical_selection_action_projection(
+                    action=action
+                )
+                seen.append(projection["scenario_key"])
+                states.append(projection["state"])
+                ledger = self._commit_action(run, action)
+            selection = scan.select_historical_replay_block(
+                snapshot=run["snapshot"], replay_ledger=ledger
+            )
+            self.assertEqual(selection["status"], "found_publishable_profitable_block")
+            self.assertEqual(selection["selected_block"]["number"], 2)
+            self.assertEqual(selection["scenario_denominator"], 20)
+            self.assertEqual(selection["selected_scenario_count"], 10)
+            self.assertEqual(len(set(seen)), 10)
+            self.assertEqual(seen, [row["scenario_key"] for row in run["rows"][:10]])
+            self.assertEqual(states[:5], ["replaying_required"] * 5)
+            self.assertEqual(states[5:], ["completing_full_ten"] * 5)
+            self.assertEqual(
+                selection["candidate_states"][0]["transitions"],
+                (
+                    "candidate", "replaying_required", "tentative_positive",
+                    "completing_full_ten", "selected",
+                ),
+            )
+            self.assertEqual(
+                selection["candidate_states"][1]["state"],
+                "not_needed_older_than_selected",
+            )
+            rows_by_key = {row["scenario_key"]: row for row in run["rows"]}
+            for scenario in selection["selected_scenarios"]:
+                row = rows_by_key[scenario["scenario_key"]]
+                denominator = 10 ** (
+                    18 + row["price"]["feed_decimals"]
+                )
+                gross = Fraction(
+                    scenario["weth_delta_raw"] * row["price"]["answer"],
+                    denominator,
+                )
+                gas = Fraction(
+                    scenario["gas_used"]
+                    * scenario["effective_gas_price"]
+                    * row["price"]["answer"],
+                    denominator,
+                )
+                mev = Fraction(row["requested_notional_usd"] * 10, 10_000)
+                expected = {
+                    "gross_edge_usd": gross,
+                    "gas_cost_usd": gas,
+                    "mev_buffer_usd": mev,
+                    "policy_net_edge_usd": gross - gas - mev,
+                }
+                for name, value in expected.items():
+                    self.assertEqual(
+                        scenario["economics"][name]["numerator"],
+                        value.numerator,
+                    )
+                    self.assertEqual(
+                        scenario["economics"][name]["denominator"],
+                        value.denominator,
+                    )
+            with self.assertRaises(ValueError):
+                scan._advance_historical_selection_controller(
+                    snapshot=run["snapshot"], replay_ledger=ledger
+                )
+        finally:
+            self._close_replay_fixture(run)
+
+    def test_nonpublishable_newer_candidate_continues_to_older_winner(self):
+        import scripts.historical_foundry_scan as scan
+
+        unit = 10 ** 18
+        fixture = _Task4bOfflineCapabilityFixture(
+            split_reserve_root=False,
+            record_calls=False,
+            reserve_by_target={
+                PAIR_UNISWAP: {
+                    2: (2, unit),
+                    1: (4000 * unit, 1000 * unit),
+                },
+                PAIR_SUSHI: {
+                    2: (1, 10 * unit),
+                    1: (1000 * unit, 1000 * unit),
+                },
+            },
+        )
+        run = self._open_replay_fixture(fixture)
+        try:
+            ledger = None
+            seen = []
+            for _index in range(20):
+                action = scan._advance_historical_selection_controller(
+                    snapshot=run["snapshot"], replay_ledger=ledger
+                )
+                projection = scan._historical_selection_action_projection(
+                    action=action
+                )
+                row = next(
+                    row for row in run["rows"]
+                    if row["scenario_key"] == projection["scenario_key"]
+                )
+                closed = (
+                    row["block_number"] == 2
+                    and row["reason"] == "first_leg_zero_output"
+                )
+                ledger = self._commit_action(
+                    run, action, closed_revert=closed
+                )
+                seen.append(projection["scenario_key"])
+                if projection["block_number"] == 1 and len(
+                    [key for key in seen if key.startswith("1:")]
+                ) == 10:
+                    break
+            selection = scan.select_historical_replay_block(
+                snapshot=run["snapshot"], replay_ledger=ledger
+            )
+            self.assertEqual(selection["selected_block"]["number"], 1)
+            self.assertEqual(selection["selected_scenario_count"], 10)
+            self.assertEqual(len(seen), len(set(seen)))
+            self.assertEqual(len([key for key in seen if key.startswith("2:")]), 10)
+            self.assertEqual(len([key for key in seen if key.startswith("1:")]), 10)
+            self.assertEqual(
+                selection["candidate_states"][0]["state"],
+                "nonpublishable_positive",
+            )
+            self.assertEqual(
+                selection["candidate_states"][1]["state"], "selected"
+            )
+        finally:
+            self._close_replay_fixture(run)
+
+    def test_unknown_replay_failure_is_unresolved_terminal_not_no_opportunity(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+
+        run = self._open_replay_fixture()
+        try:
+            action = scan._advance_historical_selection_controller(
+                snapshot=run["snapshot"], replay_ledger=None
+            )
+            scan._consume_historical_selection_action(
+                action=action, context=run["context"]
+            )
+            with self.assertRaises(ValueError):
+                scan._record_historical_selection_failure(
+                    action=action, error=ValueError("untrusted endpoint path")
+                )
+            scan._record_historical_selection_failure(
+                action=action,
+                error=anvil.HistoricalReplayError("candidate_unresolved"),
+            )
+            terminal = scan._advance_historical_selection_controller(
+                snapshot=run["snapshot"], replay_ledger=None
+            )
+            self.assertEqual(terminal["status"], "candidate_unresolved")
+            self.assertEqual(terminal["closed_reason"], "candidate_unresolved")
+            self.assertEqual(terminal["unresolved_candidate_count"], 1)
+            self.assertEqual(
+                terminal["candidate_states"][0]["state"], "unresolved"
+            )
+            with self.assertRaises(ValueError):
+                scan._advance_historical_selection_controller(
+                    snapshot=run["snapshot"], replay_ledger=None
+                )
+        finally:
+            self._close_replay_fixture(run)
+
+    def test_existing_successful_quartet_is_never_reissued_or_overwritten(self):
+        import scripts.historical_foundry_scan as scan
+
+        run = self._open_replay_fixture()
+        try:
+            first = scan._advance_historical_selection_controller(
+                snapshot=run["snapshot"], replay_ledger=None
+            )
+            first_projection = scan._historical_selection_action_projection(
+                action=first
+            )
+            ledger = self._commit_action(run, first)
+            second = scan._advance_historical_selection_controller(
+                snapshot=run["snapshot"], replay_ledger=ledger
+            )
+            second_projection = scan._historical_selection_action_projection(
+                action=second
+            )
+            self.assertNotEqual(
+                first_projection["scenario_key"],
+                second_projection["scenario_key"],
+            )
+            with self.assertRaises(ValueError):
+                scan._consume_historical_selection_action(
+                    action=first, context=run["context"]
+                )
+            self.assertEqual(
+                ledger.scenario_count, 1
+            )
+        finally:
+            self._close_replay_fixture(run)
+
+    @staticmethod
+    def _complete_winner(run):
+        import scripts.historical_foundry_scan as scan
+
+        ledger = None
+        for _index in range(10):
+            action = scan._advance_historical_selection_controller(
+                snapshot=run["snapshot"], replay_ledger=ledger
+            )
+            ledger = HistoricalCandidateSelectionTests._commit_action(
+                run, action
+            )
+        return scan.select_historical_replay_block(
+            snapshot=run["snapshot"], replay_ledger=ledger
+        )
+
+    def test_zero_replay_window_closes_only_through_private_terminal_path(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        unit = 10 ** 18
+        fixture = _Task4bOfflineCapabilityFixture(
+            split_reserve_root=False,
+            record_calls=False,
+            reserve_by_target={
+                PAIR_UNISWAP: (1000 * unit, 1000 * unit),
+                PAIR_SUSHI: (1000 * unit, 1000 * unit),
+            },
+        )
+        capture = prefilter = None
+        try:
+            capture = HistoricalPrefilterGridTests._capture_snapshot(fixture)
+            config = load_historical_foundry_config_set()
+            window = scan.open_validated_historical_window(
+                config=config, staging=capture
+            )
+            rows = scan.build_historical_prefilter_grid(
+                config=config, window=window
+            )
+            self.assertTrue(all(row["decision"] == "safe_excluded" for row in rows))
+            prefilter = storage._freeze_historical_prefilter_grid(
+                staging=capture, rows=rows
+            )
+            snapshot = scan.open_validated_historical_scan_snapshot(
+                config=config, staging=prefilter
+            )
+            self.assertEqual(snapshot.candidate_block_count, 0)
+            self.assertEqual(snapshot.candidate_scenario_denominator, 0)
+            self.assertEqual(snapshot.initial_replay_required_count, 0)
+            with self.assertRaises(ValueError):
+                scan.select_historical_replay_block(
+                    snapshot=snapshot, replay_ledger=None
+                )
+            selection = scan._advance_historical_selection_controller(
+                snapshot=snapshot, replay_ledger=None
+            )
+            self.assertEqual(selection["status"], "no_publishable_profitable_block")
+            self.assertEqual(selection["selected_scenario_count"], 0)
+            self.assertEqual(selection["selected_scenarios"], ())
+            self.assertEqual(selection["unresolved_candidate_count"], 0)
+            self.assertEqual(
+                tuple(row["state"] for row in selection["candidate_states"]),
+                ("resolved_nonpositive", "resolved_nonpositive"),
+            )
+            self.assertEqual(
+                scan.build_selected_historical_typed_members(
+                    config=config, snapshot=snapshot, selection=selection
+                ),
+                {},
+            )
+        finally:
+            HistoricalPrefilterGridTests._close_fixture(
+                fixture, capture, prefilter
+            )
+
+    def test_selected_typed_members_are_canonical_market_keyed_and_sealed(self):
+        import scripts.historical_foundry_scan as scan
+
+        run = self._open_replay_fixture()
+        try:
+            selection = self._complete_winner(run)
+            members = scan.build_selected_historical_typed_members(
+                config=run["config"], snapshot=run["snapshot"],
+                selection=selection,
+            )
+            self.assertEqual(len(members), 4)
+            reserve_source_sha = run["reserve_source_sha256"]
+            paths = tuple(sorted(members))
+            for path in paths:
+                self.assertRegex(
+                    path,
+                    r"^typed/[0-9a-f]{64}/"
+                    r"(?:dex_pool_state|dex_usd_price_context)\.json$",
+                )
+                payload = json.loads(members[path].decode("utf-8"))
+                if payload["schema"] == "route_v2_pool_state/v1":
+                    self.assertRegex(
+                        payload["dex"], r"^(?:uniswap_v2|sushiswap_v2)$"
+                    )
+                    self.assertEqual(
+                        payload["raw_response_sha256"], reserve_source_sha
+                    )
+                    self.assertNotEqual(
+                        payload["raw_response_sha256"],
+                        run["snapshot"].staging_inventory_sha256,
+                    )
+                else:
+                    self.assertRegex(
+                        payload["market_id"],
+                        r"^dex:eth:(?:uniswap_v2|sushiswap_v2):"
+                        r"0x[0-9a-f]{40}:UNI$",
+                    )
+                    self.assertNotIn("UNI/WETH", payload["market_id"])
+                self.assertEqual(
+                    json.dumps(
+                        payload, sort_keys=True, separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8"),
+                    members[path],
+                )
+            self.assertEqual(
+                sorted(json.loads(value)["schema"] for value in members.values()),
+                [
+                    "route_dex_usd_price_context/v1",
+                    "route_dex_usd_price_context/v1",
+                    "route_v2_pool_state/v1",
+                    "route_v2_pool_state/v1",
+                ],
+            )
+            with self.assertRaises(ValueError):
+                scan.build_selected_historical_typed_members(
+                    config=run["config"], snapshot=run["snapshot"],
+                    selection=dict(selection),
+                )
+            other = self._open_replay_fixture()
+            try:
+                with self.assertRaises(ValueError):
+                    scan.build_selected_historical_typed_members(
+                        config=other["config"], snapshot=other["snapshot"],
+                        selection=selection,
+                    )
+            finally:
+                self._close_replay_fixture(other)
+        finally:
+            self._close_replay_fixture(run)
+
+    def test_final_run_manifest_is_last_logical_id_mapped_and_reopenable(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        run = self._open_replay_fixture()
+        finalized = reopened = None
+        try:
+            selection = self._complete_winner(run)
+            finalized = scan._finalize_historical_replay_run(
+                config=run["config"], snapshot=run["snapshot"],
+                selection=selection,
+            )
+            self.assertIs(type(finalized), storage.HistoricalRunSnapshot)
+            identity = finalized.identity_projection()
+            self.assertRegex(identity["run_id"], r"^run:[0-9a-f]{64}$")
+            self.assertRegex(identity["run_manifest_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(identity["stage"], "complete")
+            manifest_bytes = finalized.read_member(
+                "run_manifest.json",
+                expected_sha256=identity["run_manifest_sha256"],
+                max_bytes=8_388_608,
+            )
+            manifest = json.loads(manifest_bytes)
+            self.assertEqual(manifest["run_id"], identity["run_id"])
+            self.assertTrue(manifest["publication_eligible"])
+            self.assertEqual(
+                manifest["selection_status"],
+                "found_publishable_profitable_block",
+            )
+            self.assertNotIn(
+                "run_manifest.json", tuple(row["path"] for row in manifest["members"])
+            )
+            self.assertEqual(
+                len([row for row in manifest["members"] if row["path"].startswith("typed/")]),
+                4,
+            )
+            safe_suffix = identity["run_id"][4:]
+            final_path = (
+                run["fixture"].data_dir / "raw"
+                / "historical-foundry-replay" / safe_suffix
+            )
+            self.assertTrue(final_path.is_dir())
+            self.assertFalse(any(
+                path.name.startswith(".staging-")
+                for path in final_path.parent.iterdir()
+            ))
+            finalized.reread_unchanged()
+            reopened = storage.open_validated_run(
+                data_dir=run["fixture"].data_dir,
+                run_id=identity["run_id"],
+                expected_manifest_sha256=identity["run_manifest_sha256"],
+            )
+            self.assertEqual(reopened.identity_projection(), identity)
+            self.assertEqual(
+                reopened.read_member(
+                    "selection.json",
+                    expected_sha256=next(
+                        row["sha256"] for row in manifest["members"]
+                        if row["path"] == "selection.json"
+                    ),
+                    max_bytes=8_388_608,
+                ),
+                finalized.read_member(
+                    "selection.json",
+                    expected_sha256=next(
+                        row["sha256"] for row in manifest["members"]
+                        if row["path"] == "selection.json"
+                    ),
+                    max_bytes=8_388_608,
+                ),
+            )
+            member_rows = {
+                row["path"]: row for row in manifest["members"]
+            }
+            candidate_bytes = finalized.read_member(
+                "candidate_manifest.json",
+                expected_sha256=member_rows[
+                    "candidate_manifest.json"
+                ]["sha256"],
+                max_bytes=8_388_608,
+            )
+            typed_bytes = finalized.read_member(
+                "typed_manifest.json",
+                expected_sha256=member_rows[
+                    "typed_manifest.json"
+                ]["sha256"],
+                max_bytes=8_388_608,
+            )
+            selection_bytes = finalized.read_member(
+                "selection.json",
+                expected_sha256=member_rows["selection.json"]["sha256"],
+                max_bytes=8_388_608,
+            )
+            self.assertEqual(
+                identity["run_id"],
+                "run:" + hashlib.sha256(
+                    b"historical_foundry_run_id/v1\0"
+                    + candidate_bytes + typed_bytes + selection_bytes
+                ).hexdigest(),
+            )
+            typed_manifest = json.loads(typed_bytes)
+            expected_pairs = {
+                venue_id: reserve["pair_address"]
+                for venue_id, reserve
+                in run["rows"][0]["reserves"].items()
+            }
+            self.assertEqual(len(typed_manifest["markets"]), 2)
+            for market in typed_manifest["markets"]:
+                expected_pair = expected_pairs[market["venue_id"]]
+                self.assertEqual(
+                    market["factory_pair_forward"], expected_pair
+                )
+                self.assertEqual(
+                    market["factory_pair_reverse"], expected_pair
+                )
+                self.assertEqual(
+                    market["factory_pair_forward"],
+                    market["factory_pair_forward"].lower(),
+                )
+            for bad_id in (
+                identity["run_id"][:-1], safe_suffix,
+                "run:" + "A" * 64, "run:" + "0" * 65,
+            ):
+                with self.subTest(run_id=bad_id):
+                    with self.assertRaises(storage.HistoricalFoundryStorageError):
+                        storage.open_validated_run(
+                            data_dir=run["fixture"].data_dir,
+                            run_id=bad_id,
+                            expected_manifest_sha256=identity[
+                                "run_manifest_sha256"
+                            ],
+                        )
+        finally:
+            if reopened is not None:
+                reopened.close()
+            if finalized is not None:
+                finalized.close()
+            self._close_replay_fixture(run)
+
+    def test_publication_lease_is_live_finalizer_only_and_one_shot(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        run = self._open_replay_fixture()
+        finalized = reopened = lease = source = None
+        try:
+            selection = self._complete_winner(run)
+            finalized = scan._finalize_historical_replay_run(
+                config=run["config"], snapshot=run["snapshot"],
+                selection=selection,
+            )
+            identity = dict(finalized.identity_projection())
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._HistoricalRunPublicationLease()
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._HistoricalRunPublicationSource()
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._validate_historical_run_publication_lease(
+                    lease=dict(identity)
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._acquire_historical_run_publication_lease(
+                    run_id=identity["run_id"],
+                    expected_manifest_sha256="0" * 64,
+                )
+            lease = storage._acquire_historical_run_publication_lease(
+                run_id=identity["run_id"],
+                expected_manifest_sha256=identity[
+                    "run_manifest_sha256"
+                ],
+            )
+            self.assertIs(
+                type(lease), storage._HistoricalRunPublicationLease
+            )
+            self.assertEqual(
+                storage._validate_historical_run_publication_lease(
+                    lease=lease
+                ),
+                identity,
+            )
+            self.assertEqual(lease.identity_projection(), identity)
+            self.assertIsNone(lease.reread_unchanged())
+            manifest_bytes = lease.read_member(
+                "run_manifest.json",
+                expected_sha256=identity["run_manifest_sha256"],
+                max_bytes=8_388_608,
+            )
+            self.assertTrue(json.loads(manifest_bytes)[
+                "publication_eligible"
+            ])
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                finalized.close()
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._acquire_historical_run_publication_lease(
+                    run_id=identity["run_id"],
+                    expected_manifest_sha256=identity[
+                        "run_manifest_sha256"
+                    ],
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._consume_historical_run_publication_lease(
+                    lease=dict(identity)
+                )
+            source = storage._consume_historical_run_publication_lease(
+                lease=lease
+            )
+            self.assertIs(
+                type(source), storage._HistoricalRunPublicationSource
+            )
+            self.assertEqual(
+                storage._validate_historical_run_publication_source(
+                    source=source
+                ),
+                identity,
+            )
+            self.assertEqual(source.identity_projection(), identity)
+            self.assertIsNone(source.reread_unchanged())
+            self.assertEqual(
+                source.read_member(
+                    "run_manifest.json",
+                    expected_sha256=identity["run_manifest_sha256"],
+                    max_bytes=8_388_608,
+                ),
+                manifest_bytes,
+            )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._validate_historical_run_publication_lease(
+                    lease=lease
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._consume_historical_run_publication_lease(
+                    lease=lease
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._close_historical_run_publication_lease(lease=lease)
+            lease = None
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                finalized.close()
+            self.assertIsNone(
+                storage._close_historical_run_publication_source(
+                    source=source
+                )
+            )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._close_historical_run_publication_source(
+                    source=source
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._validate_historical_run_publication_source(
+                    source=source
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                source.read_member(
+                    "run_manifest.json",
+                    expected_sha256=identity["run_manifest_sha256"],
+                    max_bytes=8_388_608,
+                )
+            source = None
+            finalized.close()
+            finalized = None
+            reopened = storage.open_validated_run(
+                data_dir=run["fixture"].data_dir,
+                run_id=identity["run_id"],
+                expected_manifest_sha256=identity[
+                    "run_manifest_sha256"
+                ],
+            )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._consume_historical_run_publication_lease(
+                    lease=reopened
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._validate_historical_run_publication_source(
+                    source=reopened
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._acquire_historical_run_publication_lease(
+                    run_id=identity["run_id"],
+                    expected_manifest_sha256=identity[
+                        "run_manifest_sha256"
+                    ],
+                )
+        finally:
+            if source is not None:
+                storage._close_historical_run_publication_source(
+                    source=source
+                )
+            if lease is not None:
+                storage._close_historical_run_publication_lease(lease=lease)
+            if reopened is not None:
+                reopened.close()
+            if finalized is not None:
+                finalized.close()
+            self._close_replay_fixture(run)
+
+    def test_only_nonpublishable_complete_window_finalizes_closed_with_no_typed(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        unit = 10 ** 18
+        fixture = _Task4bOfflineCapabilityFixture(
+            split_reserve_root=False, record_calls=False,
+            reserve_by_target={
+                PAIR_UNISWAP: {
+                    2: (2, unit), 1: (1000 * unit, 1000 * unit),
+                },
+                PAIR_SUSHI: {
+                    2: (1, 10 * unit), 1: (1000 * unit, 1000 * unit),
+                },
+            },
+        )
+        run = self._open_replay_fixture(fixture)
+        finalized = None
+        try:
+            ledger = None
+            for _index in range(10):
+                action = scan._advance_historical_selection_controller(
+                    snapshot=run["snapshot"], replay_ledger=ledger
+                )
+                projection = scan._historical_selection_action_projection(
+                    action=action
+                )
+                row = next(
+                    row for row in run["rows"]
+                    if row["scenario_key"] == projection["scenario_key"]
+                )
+                ledger = self._commit_action(
+                    run, action,
+                    closed_revert=row["reason"] == "first_leg_zero_output",
+                )
+            selection = scan.select_historical_replay_block(
+                snapshot=run["snapshot"], replay_ledger=ledger
+            )
+            self.assertEqual(
+                selection["status"], "no_publishable_profitable_block"
+            )
+            self.assertEqual(
+                selection["candidate_states"][0]["state"],
+                "nonpublishable_positive",
+            )
+            self.assertEqual(selection["unresolved_candidate_count"], 0)
+            self.assertEqual(
+                scan.build_selected_historical_typed_members(
+                    config=run["config"], snapshot=run["snapshot"],
+                    selection=selection,
+                ),
+                {},
+            )
+            finalized = scan._finalize_historical_replay_run(
+                config=run["config"], snapshot=run["snapshot"],
+                selection=selection,
+            )
+            identity = finalized.identity_projection()
+            manifest = json.loads(finalized.read_member(
+                "run_manifest.json",
+                expected_sha256=identity["run_manifest_sha256"],
+                max_bytes=8_388_608,
+            ))
+            self.assertFalse(manifest["publication_eligible"])
+            self.assertEqual(manifest["selected_block"], None)
+            self.assertEqual(
+                len([row for row in manifest["members"] if row["path"].startswith("typed/")]),
+                0,
+            )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._acquire_historical_run_publication_lease(
+                    run_id=identity["run_id"],
+                    expected_manifest_sha256=identity[
+                        "run_manifest_sha256"
+                    ],
+                )
+        finally:
+            if finalized is not None:
+                finalized.close()
+            self._close_replay_fixture(run)
+
+    def test_closed_publication_lease_cannot_be_consumed_or_reissued(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        run = self._open_replay_fixture()
+        finalized = lease = None
+        try:
+            selection = self._complete_winner(run)
+            finalized = scan._finalize_historical_replay_run(
+                config=run["config"], snapshot=run["snapshot"],
+                selection=selection,
+            )
+            identity = dict(finalized.identity_projection())
+            lease = storage._acquire_historical_run_publication_lease(
+                run_id=identity["run_id"],
+                expected_manifest_sha256=identity[
+                    "run_manifest_sha256"
+                ],
+            )
+            self.assertIsNone(lease.close())
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._consume_historical_run_publication_lease(
+                    lease=lease
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                lease.read_member(
+                    "run_manifest.json",
+                    expected_sha256=identity["run_manifest_sha256"],
+                    max_bytes=8_388_608,
+                )
+            with self.assertRaises(storage.HistoricalFoundryStorageError):
+                storage._acquire_historical_run_publication_lease(
+                    run_id=identity["run_id"],
+                    expected_manifest_sha256=identity[
+                        "run_manifest_sha256"
+                    ],
+                )
+            lease = None
+        finally:
+            if lease is not None:
+                storage._close_historical_run_publication_lease(lease=lease)
+            if finalized is not None:
+                finalized.close()
+            self._close_replay_fixture(run)
+
+    def test_final_no_replace_failure_rolls_back_without_formal_visibility(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        run = self._open_replay_fixture()
+        finalized = None
+        try:
+            selection = self._complete_winner(run)
+            before = tuple(
+                path.name for path in (
+                    run["fixture"].data_dir / "raw"
+                    / "historical-foundry-replay"
+                ).iterdir()
+            )
+            with mock.patch.object(
+                storage, "_task6_rename_directory_noreplace",
+                side_effect=OSError("private path must not escape"),
+            ):
+                with self.assertRaises(ValueError) as raised:
+                    scan._finalize_historical_replay_run(
+                        config=run["config"], snapshot=run["snapshot"],
+                        selection=selection,
+                    )
+            self.assertEqual(
+                str(raised.exception), "historical replay finalization failed"
+            )
+            after = tuple(
+                path.name for path in (
+                    run["fixture"].data_dir / "raw"
+                    / "historical-foundry-replay"
+                ).iterdir()
+            )
+            self.assertEqual(after, before)
+            self.assertTrue(all(name.startswith(".staging-") for name in after))
+            finalized = scan._finalize_historical_replay_run(
+                config=run["config"], snapshot=run["snapshot"],
+                selection=selection,
+            )
+            self.assertRegex(
+                finalized.identity_projection()["run_id"],
+                r"^run:[0-9a-f]{64}$",
+            )
+        finally:
+            if finalized is not None:
+                finalized.close()
+            self._close_replay_fixture(run)
+
+    def test_phase3_preflight_fixture_is_deterministic_test_only_projection(self):
+        from tests.historical_foundry_task7_fixture import (
+            PHASE3_FINAL_RUN_FIXTURE_SCHEMA,
+            canonical_phase3_final_run_fixture,
+        )
+
+        values = {
+            "run_id": "run:" + "1" * 64,
+            "run_manifest_sha256": "2" * 64,
+            "selection_sha256": "3" * 64,
+            "selection_status": "found_publishable_profitable_block",
+            "selected_block": 123,
+            "market_ids": (
+                "dex:eth:sushiswap_v2:0x" + "2" * 40 + ":UNI",
+                "dex:eth:uniswap_v2:0x" + "1" * 40 + ":UNI",
+            ),
+            "scenario_count": 10,
+        }
+        first = canonical_phase3_final_run_fixture(**values)
+        second = canonical_phase3_final_run_fixture(**values)
+        self.assertEqual(first, second)
+        projection = json.loads(first["canonical_bytes"])
+        self.assertEqual(projection["schema"], PHASE3_FINAL_RUN_FIXTURE_SCHEMA)
+        self.assertEqual(projection["evidence_mode"], "offline_test_fixture")
+        self.assertNotIn("endpoint", projection)
+        self.assertNotIn("path", projection)
+        self.assertNotIn("connected", projection)
+        with self.assertRaises(ValueError):
+            canonical_phase3_final_run_fixture(
+                **dict(values, run_id="run:" + "1" * 63)
+            )
+        with self.assertRaises(ValueError):
+            canonical_phase3_final_run_fixture(
+                **dict(
+                    values,
+                    selection_status="no_publishable_profitable_block",
+                )
+            )
+
+    def test_storage_independently_rejects_candidate_typed_and_selection_tamper(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        run = self._open_replay_fixture()
+        finalized = None
+        try:
+            selection = self._complete_winner(run)
+            scan.build_selected_historical_typed_members(
+                config=run["config"], snapshot=run["snapshot"],
+                selection=selection,
+            )
+            original = storage._seal_historical_run_finalization
+
+            def mutate_payload(name):
+                def wrapped(**kwargs):
+                    value = json.loads(kwargs[name])
+                    if name == "candidate_manifest":
+                        value["scenarios"][0]["gas_used"] += 1
+                    elif name == "typed_manifest":
+                        value["members"][0]["sha256"] = "0" * 64
+                    elif name == "factory_pair_forward":
+                        value["markets"][0][
+                            "factory_pair_forward"
+                        ] = "0x" + "f" * 40
+                    elif name == "selection":
+                        value["scenario_denominator"] -= 1
+                    else:
+                        raise AssertionError("unknown Task-7 tamper axis")
+                    kwargs[name] = json.dumps(
+                        value, sort_keys=True, separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    return original(**kwargs)
+                return wrapped
+
+            for axis in (
+                "candidate_manifest", "typed_manifest",
+                "factory_pair_forward", "selection"
+            ):
+                with self.subTest(axis=axis), mock.patch.object(
+                    storage, "_seal_historical_run_finalization",
+                    side_effect=mutate_payload(axis),
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "^historical replay finalization failed$"
+                    ):
+                        scan._finalize_historical_replay_run(
+                            config=run["config"], snapshot=run["snapshot"],
+                            selection=selection,
+                        )
+            finalized = scan._finalize_historical_replay_run(
+                config=run["config"], snapshot=run["snapshot"],
+                selection=selection,
+            )
+            finalized.reread_unchanged()
+        finally:
+            if finalized is not None:
+                finalized.close()
+            self._close_replay_fixture(run)
+
+    def test_post_rename_parent_fsync_failure_retries_forward_without_rewrite(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        run = self._open_replay_fixture()
+        finalized = None
+        renamed = [False]
+        failed = [False]
+        rename_calls = [0]
+        original_rename = storage._task6_rename_directory_noreplace
+        original_fsync = storage.os.fsync
+
+        def rename_once(**kwargs):
+            rename_calls[0] += 1
+            result = original_rename(**kwargs)
+            renamed[0] = True
+            return result
+
+        def fsync_once(fd):
+            if renamed[0] and not failed[0]:
+                failed[0] = True
+                raise OSError("private parent fsync detail")
+            return original_fsync(fd)
+
+        try:
+            selection = self._complete_winner(run)
+            with mock.patch.object(
+                storage, "_task6_rename_directory_noreplace",
+                side_effect=rename_once,
+            ), mock.patch.object(storage.os, "fsync", side_effect=fsync_once):
+                with self.assertRaisesRegex(
+                    ValueError, "^historical replay finalization failed$"
+                ):
+                    scan._finalize_historical_replay_run(
+                        config=run["config"], snapshot=run["snapshot"],
+                        selection=selection,
+                    )
+                finalized = scan._finalize_historical_replay_run(
+                    config=run["config"], snapshot=run["snapshot"],
+                    selection=selection,
+                )
+            self.assertTrue(failed[0])
+            self.assertEqual(rename_calls[0], 1)
+            finalized.reread_unchanged()
+        finally:
+            if finalized is not None:
+                finalized.close()
+            self._close_replay_fixture(run)
 
 
 if __name__ == "__main__":

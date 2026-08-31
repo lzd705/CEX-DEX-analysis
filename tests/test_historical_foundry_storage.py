@@ -15286,7 +15286,7 @@ class HistoricalFoundryStorageTask4bMaximumIntegrationTests(
             "fees/00000001.json.gz", 268,
             "3d221de2ad977645a086c54ebd8b1f2e9363bc2c5b5ae571fe54030098bc8330",
         ),
-        "26f361e990cdb3ce6e840e8496a3f6d5ca0f53f0eef4a4779e9a54bfe0889a12",
+        "851bbaf93611bde51d95b4fe363ed6ed08d186969da8bd6f6c52844af9e3eb1d",
     )
 
     @staticmethod
@@ -16044,6 +16044,138 @@ class HistoricalFoundryScenarioStorageNativeTests(unittest.TestCase):
                 )
             finally:
                 os.close(parent_fd)
+
+
+class HistoricalTask7FinalizationStorageTests(unittest.TestCase):
+    """Storage-native Task-7 manifest ordering and reader closure."""
+
+    def test_task7_storage_seam_is_private_exact_and_manifest_is_last(self):
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+        from tests.test_historical_foundry_scan import (
+            HistoricalCandidateSelectionTests,
+        )
+
+        self.assertEqual(
+            tuple(inspect.signature(
+                storage._seal_historical_run_finalization
+            ).parameters),
+            (
+                "selection_transition", "candidate_manifest",
+                "typed_manifest", "selection", "typed_members",
+            ),
+        )
+        self.assertEqual(
+            tuple(inspect.signature(
+                storage._commit_historical_run_finalization
+            ).parameters),
+            ("token",),
+        )
+        for function, parameters in (
+            (
+                storage._acquire_historical_run_publication_lease,
+                ("run_id", "expected_manifest_sha256"),
+            ),
+            (
+                storage._validate_historical_run_publication_lease,
+                ("lease",),
+            ),
+            (
+                storage._consume_historical_run_publication_lease,
+                ("lease",),
+            ),
+            (
+                storage._close_historical_run_publication_lease,
+                ("lease",),
+            ),
+            (
+                storage._validate_historical_run_publication_source,
+                ("source",),
+            ),
+            (
+                storage._close_historical_run_publication_source,
+                ("source",),
+            ),
+        ):
+            signature = inspect.signature(function)
+            self.assertEqual(tuple(signature.parameters), parameters)
+            self.assertTrue(all(
+                parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                for parameter in signature.parameters.values()
+            ))
+        with self.assertRaises(storage.HistoricalFoundryStorageError):
+            storage._seal_historical_run_finalization(
+                selection_transition=object(), candidate_manifest=b"{}",
+                typed_manifest=b"{}", selection=b"{}", typed_members={},
+            )
+
+        run = HistoricalCandidateSelectionTests._open_replay_fixture()
+        finalized = None
+        events = []
+        closure = inspect.getclosurevars(
+            storage._commit_historical_run_finalization
+        ).nonlocals
+        original_write = closure["_task4b_write_capture_member"]
+        original_rename = storage._task6_rename_directory_noreplace
+
+        def observed_write(*args, **kwargs):
+            name = args[2] if len(args) > 2 else kwargs.get("name")
+            events.append(("write", name))
+            return original_write(*args, **kwargs)
+
+        def observed_rename(*args, **kwargs):
+            events.append(("rename", kwargs.get("destination_name")))
+            return original_rename(*args, **kwargs)
+
+        try:
+            selection = HistoricalCandidateSelectionTests._complete_winner(run)
+            original_write_cell = next(
+                cell for name, cell in zip(
+                    storage._commit_historical_run_finalization.__code__.co_freevars,
+                    storage._commit_historical_run_finalization.__closure__,
+                ) if name == "_task4b_write_capture_member"
+            )
+            original_write_cell.cell_contents = observed_write
+            try:
+                with mock.patch.object(
+                    storage, "_task6_rename_directory_noreplace",
+                    side_effect=observed_rename,
+                ):
+                    finalized = scan._finalize_historical_replay_run(
+                        config=run["config"], snapshot=run["snapshot"],
+                        selection=selection,
+                    )
+            finally:
+                original_write_cell.cell_contents = original_write
+            rename_positions = [
+                index for index, event in enumerate(events)
+                if event[0] == "rename"
+            ]
+            self.assertEqual(len(rename_positions), 1)
+            run_manifest_positions = [
+                index for index, event in enumerate(events)
+                if event == ("write", "run_manifest.json")
+            ]
+            self.assertEqual(len(run_manifest_positions), 1)
+            self.assertLess(run_manifest_positions[0], rename_positions[0])
+            self.assertTrue(all(
+                event[0] != "write"
+                for event in events[run_manifest_positions[0] + 1:]
+            ))
+            identity = finalized.identity_projection()
+            manifest = json.loads(finalized.read_member(
+                "run_manifest.json",
+                expected_sha256=identity["run_manifest_sha256"],
+                max_bytes=8_388_608,
+            ))
+            self.assertEqual(
+                identity["member_count"], manifest["member_count"] + 1
+            )
+            finalized.reread_unchanged()
+        finally:
+            if finalized is not None:
+                finalized.close()
+            HistoricalCandidateSelectionTests._close_replay_fixture(run)
 
 
 if __name__ == "__main__":

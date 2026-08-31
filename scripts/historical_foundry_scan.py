@@ -8,6 +8,7 @@ controller.
 
 from __future__ import annotations
 
+from collections.abc import Mapping as MappingABC
 from decimal import Decimal
 import contextvars
 from fractions import Fraction
@@ -8206,27 +8207,23 @@ def _initialize_historical_prefilter_capabilities():
             raise ValueError("historical prefilter denominator differs")
         return tuple(result)
 
-    def validate_historical_prefilter_grid(
-        *,
-        config: HistoricalFoundryConfigSet,
-        window: ValidatedHistoricalWindow,
-        staging: Any,
+    def validate_grid_core(
+        *, checked_config: HistoricalFoundryConfigSet,
+        window: ValidatedHistoricalWindow, staging: Any,
+        original: Dict[str, Any], verify_lineage: bool,
     ) -> ValidatedHistoricalPrefilterGrid:
-        checked_config = require_config(config)
-        original = capability_record(
-            window, ValidatedHistoricalWindow, window_registry
-        )
-        import scripts.historical_foundry_storage as storage
+        if verify_lineage:
+            import scripts.historical_foundry_storage as storage
 
-        try:
-            storage._verify_historical_prefilter_staging_transition(
-                lineage_token=original["lineage_token"],
-                staging=staging,
-            )
-        except storage.HistoricalFoundryStorageError:
-            raise ValueError(
-                "historical staging lineage differs"
-            ) from None
+            try:
+                storage._verify_historical_prefilter_staging_transition(
+                    lineage_token=original["lineage_token"],
+                    staging=staging,
+                )
+            except storage.HistoricalFoundryStorageError:
+                raise ValueError(
+                    "historical staging lineage differs"
+                ) from None
         fresh = validate_coverage(config=checked_config, staging=staging)
         for key in (
             "capture_inventory_sha256", "lower_bound_number",
@@ -8355,6 +8352,33 @@ def _initialize_historical_prefilter_capabilities():
         }
         register_capability(grid, grid_record, grid_registry)
         return grid
+
+    def validate_historical_prefilter_grid(
+        *,
+        config: HistoricalFoundryConfigSet,
+        window: ValidatedHistoricalWindow,
+        staging: Any,
+    ) -> ValidatedHistoricalPrefilterGrid:
+        checked_config = require_config(config)
+        original = capability_record(
+            window, ValidatedHistoricalWindow, window_registry
+        )
+        return validate_grid_core(
+            checked_config=checked_config, window=window, staging=staging,
+            original=original, verify_lineage=True,
+        )
+
+    def _open_validated_historical_scan_authorities(
+        *, config: HistoricalFoundryConfigSet, staging: Any,
+    ) -> tuple:
+        checked_config = require_config(config)
+        fresh = validate_coverage(config=checked_config, staging=staging)
+        window = issue_window(fresh)
+        grid = validate_grid_core(
+            checked_config=checked_config, window=window, staging=staging,
+            original=fresh, verify_lineage=False,
+        )
+        return window, grid
 
     def _iter_validated_historical_prefilter_rows(
         *, grid: ValidatedHistoricalPrefilterGrid
@@ -8509,6 +8533,7 @@ def _initialize_historical_prefilter_capabilities():
         _consume_replay_scenario_storage_token,
         _validate_replay_scenario_for_context,
         _advance_validated_replay_authorities,
+        _open_validated_historical_scan_authorities,
     )
 
 
@@ -8526,5 +8551,1060 @@ def _initialize_historical_prefilter_capabilities():
     _consume_replay_scenario_storage_token,
     _validate_replay_scenario_for_context,
     _advance_validated_replay_authorities,
+    _open_validated_historical_scan_authorities,
 ) = _initialize_historical_prefilter_capabilities()
 del _initialize_historical_prefilter_capabilities
+
+
+def _initialize_historical_selection_capabilities():
+    issuer = object()
+    snapshot_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
+    action_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
+    selection_registry: Dict[
+        int, Tuple[weakref.ReferenceType, Dict[str, Any]]
+    ] = {}
+
+    def snapshot_record(value: Any) -> Dict[str, Any]:
+        entry = snapshot_registry.get(id(value))
+        if (
+            type(value) is not ValidatedHistoricalScanSnapshot
+            or entry is None
+            or entry[0]() is not value
+            or entry[1].get("issuer") is not issuer
+        ):
+            raise ValueError("historical scan snapshot is invalid")
+        return entry[1]
+
+    class ValidatedHistoricalScanSnapshot:
+        """Opaque capability over a descriptor-reread frozen Task-5 grid."""
+
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            del cls, args, kwargs
+            raise ValueError("historical scan snapshot is private")
+
+        def __init_subclass__(cls, **_kwargs: Any) -> None:
+            del cls
+            raise TypeError("ValidatedHistoricalScanSnapshot is sealed")
+
+        @property
+        def staging_inventory_sha256(self) -> str:
+            return snapshot_record(self)["staging_inventory_sha256"]
+
+        @property
+        def validated_window(self) -> ValidatedHistoricalWindow:
+            return snapshot_record(self)["window"]
+
+        @property
+        def validated_grid(self) -> ValidatedHistoricalPrefilterGrid:
+            return snapshot_record(self)["grid"]
+
+        @property
+        def candidate_block_count(self) -> int:
+            return snapshot_record(self)["candidate_block_count"]
+
+        @property
+        def candidate_scenario_denominator(self) -> int:
+            return snapshot_record(self)["candidate_scenario_denominator"]
+
+        @property
+        def initial_replay_required_count(self) -> int:
+            return snapshot_record(self)["initial_replay_required_count"]
+
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError("ValidatedHistoricalScanSnapshot is immutable")
+
+        def __repr__(self) -> str:
+            return "ValidatedHistoricalScanSnapshot(<redacted>)"
+
+        def __copy__(self) -> Any:
+            raise TypeError("ValidatedHistoricalScanSnapshot is not copyable")
+
+        def __deepcopy__(self, _memo: Any) -> Any:
+            raise TypeError("ValidatedHistoricalScanSnapshot is not copyable")
+
+        def __reduce__(self) -> Any:
+            raise TypeError("ValidatedHistoricalScanSnapshot is not serializable")
+
+        def __reduce_ex__(self, _protocol: int) -> Any:
+            raise TypeError("ValidatedHistoricalScanSnapshot is not serializable")
+
+    class _HistoricalSelectionAction:
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            del cls, args, kwargs
+            raise ValueError("historical selection action is private")
+
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError("historical selection action is immutable")
+
+        def __repr__(self) -> str:
+            return "_HistoricalSelectionAction(<redacted>)"
+
+    class _ValidatedHistoricalSelection(MappingABC):
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            del cls, args, kwargs
+            raise ValueError("historical selection is private")
+
+        def __getitem__(self, key: str) -> Any:
+            return selection_record(self)["projection"][key]
+
+        def __iter__(self):
+            return iter(selection_record(self)["projection"])
+
+        def __len__(self) -> int:
+            return len(selection_record(self)["projection"])
+
+        def __setattr__(self, _name: str, _value: Any) -> None:
+            raise AttributeError("historical selection is immutable")
+
+        def __repr__(self) -> str:
+            return "ValidatedHistoricalSelection(<redacted>)"
+
+    def selection_record(value: Any) -> Dict[str, Any]:
+        entry = selection_registry.get(id(value))
+        if (
+            type(value) is not _ValidatedHistoricalSelection
+            or entry is None
+            or entry[0]() is not value
+            or entry[1].get("issuer") is not issuer
+        ):
+            raise ValueError("historical replay selection is invalid")
+        return entry[1]
+
+    def register_weak(
+        value: Any, record: Dict[str, Any],
+        registry: Dict[int, Tuple[weakref.ReferenceType, Dict[str, Any]]],
+    ) -> None:
+        value_id = id(value)
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = registry.get(value_id)
+            if current is not None and current[0] is reference:
+                registry.pop(value_id, None)
+
+        registry[value_id] = (weakref.ref(value, retire), record)
+
+    def exact_fraction_projection(value: Fraction) -> Dict[str, Any]:
+        numerator = value.numerator
+        denominator = value.denominator
+        sign = "-" if numerator < 0 else ""
+        integer, remainder = divmod(abs(numerator), denominator)
+        digits = []
+        while remainder and len(digits) <= 4_096:
+            remainder *= 10
+            digit, remainder = divmod(remainder, denominator)
+            digits.append(str(digit))
+        if remainder:
+            raise ValueError("historical replay economics is invalid")
+        display = sign + str(integer)
+        if digits:
+            display += "." + "".join(digits).rstrip("0")
+        return {
+            "numerator": numerator,
+            "denominator": denominator,
+            "display": display,
+        }
+
+    def scenario_economics(
+        record: Dict[str, Any], row: Mapping[str, Any],
+        fact: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        policy = record["config"].policy.value
+        mev_bps = policy.get("fees", {}).get("acceptance_mev_bps")
+        if type(mev_bps) is not str or not mev_bps.isdigit():
+            raise ValueError("historical replay economics is invalid")
+        price = row["price"]
+        denominator = 10 ** (18 + price["feed_decimals"])
+        gross = Fraction(
+            fact["weth_delta_raw"] * price["answer"], denominator
+        )
+        gas = Fraction(
+            fact["gas_used"] * fact["effective_gas_price"]
+            * price["answer"], denominator,
+        )
+        mev = Fraction(
+            row["requested_notional_usd"] * int(mev_bps), 10_000
+        )
+        policy_net = gross - gas - mev
+        return {
+            "gross_edge_usd": exact_fraction_projection(gross),
+            "gas_cost_usd": exact_fraction_projection(gas),
+            "mev_buffer_usd": exact_fraction_projection(mev),
+            "policy_net_edge_usd": exact_fraction_projection(policy_net),
+        }
+
+    def ledger_facts(
+        record: Dict[str, Any], replay_ledger: Any,
+    ) -> Tuple[Mapping[str, Any], ...]:
+        if replay_ledger is None:
+            return ()
+        import scripts.historical_foundry_storage as storage
+
+        try:
+            projection = storage._validated_historical_replay_ledger_projection(
+                ledger=replay_ledger,
+                selection_transition=record["storage_transition"],
+            )
+        except storage.HistoricalFoundryStorageError:
+            raise ValueError("historical replay ledger is invalid") from None
+        if (
+            projection.get("scan_inventory_sha256")
+            != record["staging_inventory_sha256"]
+            or projection.get("scenario_count")
+            != len(projection.get("scenarios", ()))
+        ):
+            raise ValueError("historical replay ledger differs")
+        return tuple(projection["scenarios"])
+
+    def compute_controller(
+        record: Dict[str, Any], replay_ledger: Any,
+    ) -> Tuple[str, Mapping[str, Any]]:
+        facts = ledger_facts(record, replay_ledger)
+        rows = record["rows"]
+        rows_by_key = {row["scenario_key"]: row for row in rows}
+        if (
+            len(rows_by_key) != len(rows)
+            or any(fact["scenario_key"] not in rows_by_key for fact in facts)
+        ):
+            raise ValueError("historical replay ledger differs")
+        issued_keys = record["issued_keys"]
+        observed_keys = tuple(fact["scenario_key"] for fact in facts)
+        failure = record.get("replay_failure")
+        failure_key = (
+            failure.get("scenario_key")
+            if isinstance(failure, MappingABC) else None
+        )
+        expected_observed_count = len(issued_keys) - (
+            1 if failure_key is not None else 0
+        )
+        if (
+            len(set(observed_keys)) != len(observed_keys)
+            or len(observed_keys) != expected_observed_count
+            or observed_keys != tuple(issued_keys[:expected_observed_count])
+            or (
+                failure_key is not None
+                and (
+                    not issued_keys
+                    or issued_keys[-1] != failure_key
+                    or failure.get("category") not in (
+                        "fork_hardfork_unsupported", "fork_window_mixed",
+                        "foundry_replay_failed", "candidate_unresolved",
+                        "authority", "archive",
+                    )
+                )
+            )
+        ):
+            raise ValueError("historical replay ledger order differs")
+        record["last_validated_facts"] = tuple(facts)
+
+        position = 0
+        candidate_states = []
+        selected_block = None
+        selected_facts = ()
+        for block_number in record["block_numbers"]:
+            block_rows = tuple(
+                row for row in rows if row["block_number"] == block_number
+            )
+            required = tuple(
+                row for row in block_rows
+                if row["decision"] == "replay_required"
+            )
+            if not required:
+                candidate_states.append({
+                    "block_number": block_number,
+                    "state": "resolved_nonpositive",
+                    "transitions": [
+                        "prefilter_non_candidate", "resolved_nonpositive",
+                    ],
+                    "scenario_count": 0,
+                })
+                continue
+            transitions = ["candidate", "replaying_required"]
+            block_facts = []
+            for row in required:
+                if position == len(facts):
+                    if failure_key == row["scenario_key"]:
+                        transitions.append("unresolved")
+                        candidate_states.append({
+                            "block_number": block_number,
+                            "state": "unresolved",
+                            "transitions": transitions,
+                            "scenario_count": len(block_facts),
+                        })
+                        return "final", _freeze_prefilter_value({
+                            "schema": "historical_foundry_selection/v1",
+                            "status": "candidate_unresolved",
+                            "staging_inventory_sha256": record[
+                                "staging_inventory_sha256"
+                            ],
+                            "prefilter_grid_digest": record["grid_digest"],
+                            "candidate_block_count": record[
+                                "candidate_block_count"
+                            ],
+                            "scenario_denominator": record[
+                                "candidate_scenario_denominator"
+                            ],
+                            "initial_replay_required_count": record[
+                                "initial_replay_required_count"
+                            ],
+                            "selected_block": None,
+                            "selected_scenario_count": 0,
+                            "selected_scenarios": [],
+                            "candidate_states": candidate_states,
+                            "unresolved_candidate_count": 1,
+                            "closed_reason": failure["category"],
+                        })
+                    return "action", MappingProxyType({
+                        "state": "replaying_required",
+                        "block_number": block_number,
+                        "scenario_key": row["scenario_key"],
+                    })
+                fact = facts[position]
+                if fact["scenario_key"] != row["scenario_key"]:
+                    raise ValueError("historical replay ledger order differs")
+                block_facts.append(fact)
+                position += 1
+            positive = any(
+                fact["status"] == 1
+                and scenario_economics(
+                    record, rows_by_key[fact["scenario_key"]], fact
+                )["policy_net_edge_usd"]["numerator"] > 0
+                for fact in block_facts
+            )
+            if not positive:
+                transitions.append("resolved_nonpositive")
+                candidate_states.append({
+                    "block_number": block_number,
+                    "state": "resolved_nonpositive",
+                    "transitions": transitions,
+                    "scenario_count": len(block_facts),
+                })
+                continue
+            transitions.extend(("tentative_positive", "completing_full_ten"))
+            completed = {fact["scenario_key"] for fact in block_facts}
+            for row in block_rows:
+                if row["scenario_key"] in completed:
+                    continue
+                if position == len(facts):
+                    if failure_key == row["scenario_key"]:
+                        transitions.append("unresolved")
+                        candidate_states.append({
+                            "block_number": block_number,
+                            "state": "unresolved",
+                            "transitions": transitions,
+                            "scenario_count": len(block_facts),
+                        })
+                        return "final", _freeze_prefilter_value({
+                            "schema": "historical_foundry_selection/v1",
+                            "status": "candidate_unresolved",
+                            "staging_inventory_sha256": record[
+                                "staging_inventory_sha256"
+                            ],
+                            "prefilter_grid_digest": record["grid_digest"],
+                            "candidate_block_count": record[
+                                "candidate_block_count"
+                            ],
+                            "scenario_denominator": record[
+                                "candidate_scenario_denominator"
+                            ],
+                            "initial_replay_required_count": record[
+                                "initial_replay_required_count"
+                            ],
+                            "selected_block": None,
+                            "selected_scenario_count": 0,
+                            "selected_scenarios": [],
+                            "candidate_states": candidate_states,
+                            "unresolved_candidate_count": 1,
+                            "closed_reason": failure["category"],
+                        })
+                    return "action", MappingProxyType({
+                        "state": "completing_full_ten",
+                        "block_number": block_number,
+                        "scenario_key": row["scenario_key"],
+                    })
+                fact = facts[position]
+                if fact["scenario_key"] != row["scenario_key"]:
+                    raise ValueError("historical replay ledger order differs")
+                block_facts.append(fact)
+                position += 1
+            if len(block_facts) != 10:
+                raise ValueError("historical replay denominator differs")
+            if any(fact["status"] == 0 for fact in block_facts):
+                transitions.append("nonpublishable_positive")
+                candidate_states.append({
+                    "block_number": block_number,
+                    "state": "nonpublishable_positive",
+                    "transitions": transitions,
+                    "scenario_count": 10,
+                })
+                continue
+            all_positive = any(
+                scenario_economics(
+                    record, rows_by_key[fact["scenario_key"]], fact
+                )["policy_net_edge_usd"]["numerator"] > 0
+                for fact in block_facts
+            )
+            if not all(fact["status"] == 1 for fact in block_facts):
+                raise ValueError("historical replay result is unresolved")
+            if not all_positive:
+                transitions.append("resolved_nonpositive")
+                candidate_states.append({
+                    "block_number": block_number,
+                    "state": "resolved_nonpositive",
+                    "transitions": transitions,
+                    "scenario_count": 10,
+                })
+                continue
+            transitions.append("selected")
+            candidate_states.append({
+                "block_number": block_number,
+                "state": "selected",
+                "transitions": transitions,
+                "scenario_count": 10,
+            })
+            selected_block = block_rows[0]["header"]
+            selected_facts = tuple(block_facts)
+            break
+
+        if selected_block is not None:
+            selected_number = selected_block["number"]
+            seen_blocks = {row["block_number"] for row in candidate_states}
+            for block_number in record["block_numbers"]:
+                if block_number >= selected_number or block_number in seen_blocks:
+                    continue
+                candidate_states.append({
+                    "block_number": block_number,
+                    "state": "not_needed_older_than_selected",
+                    "transitions": ["not_needed_older_than_selected"],
+                    "scenario_count": 0,
+                })
+            if position != len(facts):
+                raise ValueError("historical replay ledger has extra scenarios")
+            selected_scenarios = []
+            for fact in selected_facts:
+                row = rows_by_key[fact["scenario_key"]]
+                selected_scenarios.append({
+                    **dict(fact),
+                    "direction": row["direction"],
+                    "requested_notional_usd": row[
+                        "requested_notional_usd"
+                    ],
+                    "economics": scenario_economics(record, row, fact),
+                })
+            projection = {
+                "schema": "historical_foundry_selection/v1",
+                "status": "found_publishable_profitable_block",
+                "staging_inventory_sha256": record[
+                    "staging_inventory_sha256"
+                ],
+                "prefilter_grid_digest": record["grid_digest"],
+                "candidate_block_count": record["candidate_block_count"],
+                "scenario_denominator": record[
+                    "candidate_scenario_denominator"
+                ],
+                "initial_replay_required_count": record[
+                    "initial_replay_required_count"
+                ],
+                "selected_block": _detach_prefilter_value(selected_block),
+                "selected_scenario_count": 10,
+                "selected_scenarios": selected_scenarios,
+                "candidate_states": candidate_states,
+                "unresolved_candidate_count": 0,
+            }
+            return "final", _freeze_prefilter_value(projection)
+        if position != len(facts):
+            raise ValueError("historical replay ledger has extra scenarios")
+        projection = {
+            "schema": "historical_foundry_selection/v1",
+            "status": "no_publishable_profitable_block",
+            "staging_inventory_sha256": record[
+                "staging_inventory_sha256"
+            ],
+            "prefilter_grid_digest": record["grid_digest"],
+            "candidate_block_count": record["candidate_block_count"],
+            "scenario_denominator": record[
+                "candidate_scenario_denominator"
+            ],
+            "initial_replay_required_count": record[
+                "initial_replay_required_count"
+            ],
+            "selected_block": None,
+            "selected_scenario_count": 0,
+            "selected_scenarios": [],
+            "candidate_states": candidate_states,
+            "unresolved_candidate_count": 0,
+            "closed_reason": "no_publishable_profitable_block",
+        }
+        return "final", _freeze_prefilter_value(projection)
+
+    def issue_selection(
+        snapshot: ValidatedHistoricalScanSnapshot,
+        record: Dict[str, Any], projection: Mapping[str, Any],
+    ) -> _ValidatedHistoricalSelection:
+        selection = object.__new__(_ValidatedHistoricalSelection)
+        selection_record_value = {
+            "issuer": issuer,
+            "snapshot": snapshot,
+            "projection": projection,
+            "storage_transition": record["storage_transition"],
+            "validated_facts": tuple(record.get("last_validated_facts", ())),
+        }
+        register_weak(selection, selection_record_value, selection_registry)
+        return selection
+
+    def open_validated_historical_scan_snapshot(
+        *, config: HistoricalFoundryConfigSet, staging: Any,
+    ) -> ValidatedHistoricalScanSnapshot:
+        window, grid = _open_validated_historical_scan_authorities(
+            config=config, staging=staging
+        )
+        rows = tuple(_iter_validated_historical_prefilter_rows(grid=grid))
+        block_numbers = tuple(dict.fromkeys(
+            row["block_number"] for row in rows
+        ))
+        candidate_blocks = tuple(
+            block_number for block_number in block_numbers
+            if any(
+                row["block_number"] == block_number
+                and row["decision"] == "replay_required"
+                for row in rows
+            )
+        )
+        if (
+            len(rows) != window.block_count * 10
+            or len(block_numbers) != window.block_count
+            or tuple(sorted(block_numbers, reverse=True)) != block_numbers
+            or any(
+                sum(row["block_number"] == block for row in rows) != 10
+                for block in block_numbers
+            )
+        ):
+            raise ValueError("historical scan denominator differs")
+        import scripts.historical_foundry_storage as storage
+
+        transition = storage._bind_historical_selection_transition(
+            staging=staging
+        )
+        snapshot = object.__new__(ValidatedHistoricalScanSnapshot)
+        record = {
+            "issuer": issuer,
+            "config": config,
+            "staging": staging,
+            "window": window,
+            "grid": grid,
+            "rows": rows,
+            "block_numbers": block_numbers,
+            "candidate_blocks": candidate_blocks,
+            "candidate_block_count": len(candidate_blocks),
+            "candidate_scenario_denominator": len(candidate_blocks) * 10,
+            "initial_replay_required_count": sum(
+                row["decision"] == "replay_required" for row in rows
+            ),
+            "staging_inventory_sha256": grid.scan_inventory_sha256,
+            "grid_digest": grid.grid_digest,
+            "storage_transition": transition,
+            "issued_keys": [],
+            "active_action": None,
+            "transition_history": [],
+        }
+        snapshot_id = id(snapshot)
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = snapshot_registry.get(snapshot_id)
+            if current is not None and current[0] is reference:
+                snapshot_registry.pop(snapshot_id, None)
+
+        snapshot_registry[snapshot_id] = (weakref.ref(snapshot, retire), record)
+        return snapshot
+
+    def select_historical_replay_block(
+        *, snapshot: ValidatedHistoricalScanSnapshot, replay_ledger: Any,
+    ) -> Mapping[str, Any]:
+        record = snapshot_record(snapshot)
+        if replay_ledger is None:
+            raise ValueError("historical replay ledger is invalid")
+        kind, projection = compute_controller(record, replay_ledger)
+        if kind == "action":
+            return projection
+        terminal = record.get("terminal_selection")
+        if terminal is not None:
+            return terminal
+        terminal = issue_selection(snapshot, record, projection)
+        record["terminal_selection"] = terminal
+        return terminal
+
+    def _advance_historical_selection_controller(
+        *, snapshot: ValidatedHistoricalScanSnapshot, replay_ledger: Any,
+    ) -> Any:
+        record = snapshot_record(snapshot)
+        if record.get("terminal_selection") is not None:
+            raise ValueError("historical replay selection is terminal")
+        active = record.get("active_action")
+        if active is not None:
+            active_entry = action_registry.get(id(active))
+            if (
+                active_entry is not None
+                and active_entry[0]() is active
+                and active_entry[1].get("consumed") is not True
+            ):
+                raise ValueError("historical selection action is pending")
+        kind, projection = compute_controller(record, replay_ledger)
+        if kind == "final":
+            if (
+                replay_ledger is None
+                and record["initial_replay_required_count"]
+                and record.get("replay_failure") is None
+            ):
+                raise ValueError("historical replay ledger is invalid")
+            terminal = issue_selection(snapshot, record, projection)
+            record["terminal_selection"] = terminal
+            record["transition_history"].append(
+                _freeze_prefilter_value({
+                    "index": len(record["transition_history"]),
+                    "state": projection["status"],
+                    "scenario_prefix": tuple(record["issued_keys"]),
+                })
+            )
+            return terminal
+        action = object.__new__(_HistoricalSelectionAction)
+        action_record = {
+            "issuer": issuer,
+            "snapshot": snapshot,
+            "projection": projection,
+            "scenario_key": projection["scenario_key"],
+            "consumed": False,
+        }
+        register_weak(action, action_record, action_registry)
+        record["active_action"] = action
+        record["transition_history"].append(
+            _freeze_prefilter_value({
+                "index": len(record["transition_history"]),
+                "state": projection["state"],
+                "scenario_key": projection["scenario_key"],
+                "scenario_prefix": tuple(record["issued_keys"]),
+            })
+        )
+        return action
+
+    def _historical_selection_action_projection(
+        *, action: Any,
+    ) -> Mapping[str, Any]:
+        entry = action_registry.get(id(action))
+        if (
+            type(action) is not _HistoricalSelectionAction
+            or entry is None
+            or entry[0]() is not action
+            or entry[1].get("issuer") is not issuer
+            or entry[1].get("consumed") is True
+        ):
+            raise ValueError("historical selection action is invalid")
+        return entry[1]["projection"]
+
+    def _consume_historical_selection_action(
+        *, action: Any, context: Any,
+    ) -> ValidatedReplayScenario:
+        entry = action_registry.get(id(action))
+        if (
+            type(action) is not _HistoricalSelectionAction
+            or entry is None
+            or entry[0]() is not action
+            or entry[1].get("issuer") is not issuer
+            or entry[1].get("consumed") is True
+        ):
+            raise ValueError("historical selection action is invalid")
+        action_record = entry[1]
+        record = snapshot_record(action_record["snapshot"])
+        if record.get("active_action") is not action:
+            raise ValueError("historical selection action is invalid")
+        import scripts.historical_foundry_anvil as anvil
+
+        scenario = anvil._issue_next_historical_replay_scenario(
+            context=context, scenario_key=action_record["scenario_key"]
+        )
+        if (
+            type(scenario) is not ValidatedReplayScenario
+            or scenario.scenario_key != action_record["scenario_key"]
+        ):
+            raise ValueError("historical selection scenario differs")
+        action_record["consumed"] = True
+        record["issued_keys"].append(action_record["scenario_key"])
+        record["active_action"] = None
+        return scenario
+
+    def _record_historical_selection_failure(
+        *, action: Any, error: Any,
+    ) -> None:
+        import scripts.historical_foundry_anvil as anvil
+
+        entry = action_registry.get(id(action))
+        if (
+            type(action) is not _HistoricalSelectionAction
+            or entry is None
+            or entry[0]() is not action
+            or entry[1].get("issuer") is not issuer
+            or entry[1].get("consumed") is not True
+            or type(error) is not anvil.HistoricalReplayError
+        ):
+            raise ValueError("historical replay failure is invalid")
+        action_record = entry[1]
+        record = snapshot_record(action_record["snapshot"])
+        if (
+            record.get("replay_failure") is not None
+            or not record["issued_keys"]
+            or record["issued_keys"][-1] != action_record["scenario_key"]
+        ):
+            raise ValueError("historical replay failure is invalid")
+        record["replay_failure"] = MappingProxyType({
+            "scenario_key": action_record["scenario_key"],
+            "category": error.category,
+        })
+        return None
+
+    def build_selected_historical_typed_members(
+        *, config: HistoricalFoundryConfigSet,
+        snapshot: ValidatedHistoricalScanSnapshot,
+        selection: Mapping[str, Any],
+    ) -> Mapping[str, bytes]:
+        record = snapshot_record(snapshot)
+        selected = selection_record(selection)
+        bound_config = record["config"]
+        if (
+            selected.get("snapshot") is not snapshot
+            or type(config) is not HistoricalFoundryConfigSet
+            or any(
+                getattr(config, role).physical_sha256
+                != getattr(bound_config, role).physical_sha256
+                for role in ("policy", "authority", "toolchain")
+            )
+        ):
+            raise ValueError("historical replay selection lineage differs")
+        projection = selected["projection"]
+        if projection["status"] == "no_publishable_profitable_block":
+            selected["typed_members"] = MappingProxyType({})
+            return MappingProxyType({})
+        if projection["status"] != "found_publishable_profitable_block":
+            raise ValueError("historical replay selection is unresolved")
+        selected_number = projection["selected_block"]["number"]
+        block_rows = tuple(
+            row for row in record["rows"]
+            if row["block_number"] == selected_number
+        )
+        if len(block_rows) != 10:
+            raise ValueError("historical selected block denominator differs")
+        representative = block_rows[0]
+        import scripts.historical_foundry_storage as storage
+
+        try:
+            reserve_source = storage._historical_selected_block_source_projection(
+                selection_transition=record["storage_transition"],
+                block_number=selected_number,
+            )
+            factory_pairs = storage._historical_factory_pair_projection(
+                selection_transition=record["storage_transition"],
+            )
+        except storage.HistoricalFoundryStorageError:
+            raise ValueError(
+                "historical selected source authority differs"
+            ) from None
+        authority = config.authority.value
+        tokens = {row["role"]: row for row in authority["tokens"]}
+        venues = {row["venue_id"]: row for row in authority["venues"]}
+        formula = authority["v2_formula"]
+        if (
+            set(tokens) != {"uni", "weth"}
+            or set(venues) != {"uniswap_v2", "sushiswap_v2"}
+            or formula.get("fee_numerator") != 997
+            or formula.get("fee_denominator") != 1000
+        ):
+            raise ValueError("historical selected market authority differs")
+        from datetime import datetime, timezone
+        from scripts.route_quantity import V2PoolState, V2_FEE_FORMULA
+
+        observed_at = datetime.fromtimestamp(
+            representative["header"]["timestamp"], timezone.utc
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        header_sha = hashlib.sha256(_canonical_json_bytes(
+            representative["header"]
+        )).hexdigest()
+        typed_members: Dict[str, bytes] = {}
+        market_rows = []
+        for venue_id in ("uniswap_v2", "sushiswap_v2"):
+            reserve = representative["reserves"][venue_id]
+            pair_authority = factory_pairs.get(venue_id)
+            if (
+                type(pair_authority) is not MappingProxyType
+                or pair_authority.get("factory_pair_forward")
+                != reserve["pair_address"]
+                or pair_authority.get("factory_pair_reverse")
+                != reserve["pair_address"]
+            ):
+                raise ValueError(
+                    "historical selected pair authority differs"
+                )
+            market_id = "dex:eth:{}:{}:UNI".format(
+                venue_id, reserve["pair_address"]
+            )
+            market_key = hashlib.sha256(
+                b"historical_foundry_market_key/v1\0"
+                + _canonical_json_bytes({"market_id": market_id})
+            ).hexdigest()
+            fee_identity = {
+                "schema": "historical_foundry_v2_fee_identity/v1",
+                "authority_sha256": config.authority.physical_sha256,
+                "venue_id": venue_id,
+                "fee_numerator": 997,
+                "fee_denominator": 1000,
+                "fee_bps": 30,
+            }
+            fee_proof = hashlib.sha256(
+                b"historical_foundry_v2_fee_identity/v1\0"
+                + _canonical_json_bytes(fee_identity)
+            ).hexdigest()
+            state = V2PoolState(
+                chain="eth", chain_id=1, dex=venue_id,
+                pool_address=reserve["pair_address"],
+                token0_address=tokens["uni"]["address"],
+                token1_address=tokens["weth"]["address"],
+                token0_decimals=tokens["uni"]["decimals"],
+                token1_decimals=tokens["weth"]["decimals"],
+                reserve0_raw=reserve["reserve_uni_raw"],
+                reserve1_raw=reserve["reserve_weth_raw"],
+                reserve_timestamp_last_raw=reserve["pair_timestamp"],
+                fee_bps=30, fee_numerator=997, fee_denominator=1000,
+                fee_formula=V2_FEE_FORMULA,
+                fee_proof_sha256=fee_proof,
+                block_number=selected_number,
+                block_hash=representative["block_hash"],
+                block_header_sha256=header_sha,
+                observed_at=observed_at,
+                raw_response_sha256=reserve_source["sha256"],
+            )
+            integer_fields = {
+                "chain_id", "token0_decimals", "token1_decimals",
+                "reserve0_raw", "reserve1_raw",
+                "reserve_timestamp_last_raw", "fee_bps",
+                "fee_numerator", "fee_denominator", "block_number",
+            }
+            state_payload = {
+                "schema": "route_v2_pool_state/v1",
+                **{
+                    name: (
+                        str(getattr(state, name))
+                        if name in integer_fields else getattr(state, name)
+                    )
+                    for name in (
+                        "chain", "chain_id", "dex", "pool_address",
+                        "token0_address", "token1_address",
+                        "token0_decimals", "token1_decimals",
+                        "reserve0_raw", "reserve1_raw",
+                        "reserve_timestamp_last_raw", "fee_bps",
+                        "fee_numerator", "fee_denominator", "fee_formula",
+                        "fee_proof_sha256", "block_number", "block_hash",
+                        "block_header_sha256", "observed_at",
+                        "raw_response_sha256", "state_id",
+                    )
+                },
+            }
+            price = representative["price"]
+            price_payload = {
+                "schema": "route_dex_usd_price_context/v1",
+                "market_id": market_id,
+                "venue_id": venue_id,
+                "chain_id": "1",
+                "block_number": str(selected_number),
+                "block_hash": representative["block_hash"],
+                "proxy_address": price["proxy_address"],
+                "round_id": str(price["round_id"]),
+                "phase_id": str(price["phase_id"]),
+                "answer": str(price["answer"]),
+                "decimals": str(price["feed_decimals"]),
+                "started_at": str(price["started_at"]),
+                "updated_at": str(price["updated_at"]),
+                "answered_in_round": str(price["answered_in_round"]),
+                "valid_until": str(price["valid_until"]),
+                "scan_inventory_sha256": record[
+                    "staging_inventory_sha256"
+                ],
+            }
+            state_bytes = _canonical_json_bytes(state_payload)
+            price_bytes = _canonical_json_bytes(price_payload)
+            state_path = "typed/{}/dex_pool_state.json".format(market_key)
+            price_path = "typed/{}/dex_usd_price_context.json".format(
+                market_key
+            )
+            typed_members[state_path] = state_bytes
+            typed_members[price_path] = price_bytes
+            market_rows.append({
+                "market_id": market_id,
+                "market_key": market_key,
+                "venue_id": venue_id,
+                "pair_address": reserve["pair_address"],
+                "factory_pair_forward": pair_authority[
+                    "factory_pair_forward"
+                ],
+                "factory_pair_reverse": pair_authority[
+                    "factory_pair_reverse"
+                ],
+                "members": [
+                    {
+                        "role": "dex_pool_state", "path": state_path,
+                        "byte_count": len(state_bytes),
+                        "sha256": hashlib.sha256(state_bytes).hexdigest(),
+                    },
+                    {
+                        "role": "dex_usd_price_context", "path": price_path,
+                        "byte_count": len(price_bytes),
+                        "sha256": hashlib.sha256(price_bytes).hexdigest(),
+                    },
+                ],
+            })
+        selected["typed_members"] = MappingProxyType(dict(typed_members))
+        selected["typed_markets"] = _freeze_prefilter_value(market_rows)
+        return MappingProxyType(dict(typed_members))
+
+    def _finalize_historical_replay_run(
+        *, config: HistoricalFoundryConfigSet,
+        snapshot: ValidatedHistoricalScanSnapshot,
+        selection: Mapping[str, Any],
+    ) -> Any:
+        record = snapshot_record(snapshot)
+        selected = selection_record(selection)
+        projection = selected["projection"]
+        if (
+            selected.get("snapshot") is not snapshot
+            or selected.get("finalized") is True
+            or projection["status"] not in (
+                "found_publishable_profitable_block",
+                "no_publishable_profitable_block",
+            )
+        ):
+            raise ValueError("historical replay selection is not finalizable")
+        typed_members = selected.get("typed_members")
+        if typed_members is None:
+            typed_members = build_selected_historical_typed_members(
+                config=config, snapshot=snapshot, selection=selection
+            )
+        elif type(typed_members) is not MappingProxyType:
+            raise ValueError("historical selected typed inventory differs")
+        facts = selected.get("validated_facts")
+        if type(facts) is not tuple:
+            raise ValueError("historical candidate inventory differs")
+        candidate_rows = []
+        rows_by_key = {
+            row["scenario_key"]: row for row in record["rows"]
+        }
+        for fact in facts:
+            candidate_row = {
+                name: fact[name] for name in (
+                    "scenario_key", "block_number", "status",
+                    "classification", "gas_used", "effective_gas_price",
+                    "weth_delta_raw", "proof_inputs_hash",
+                    "overlay_sha256", "receipt_sha256", "trace_sha256",
+                    "result_sha256",
+                )
+            }
+            candidate_row["economics"] = (
+                scenario_economics(
+                    record, rows_by_key[fact["scenario_key"]], fact
+                ) if fact["status"] == 1 else None
+            )
+            candidate_rows.append(candidate_row)
+        candidate_manifest = {
+            "schema": "historical_foundry_candidate_manifest/v1",
+            "staging_inventory_sha256": record[
+                "staging_inventory_sha256"
+            ],
+            "prefilter_grid_digest": record["grid_digest"],
+            "candidate_block_count": record["candidate_block_count"],
+            "scenario_denominator": record[
+                "candidate_scenario_denominator"
+            ],
+            "initial_replay_required_count": record[
+                "initial_replay_required_count"
+            ],
+            "attempted_scenario_count": len(candidate_rows),
+            "candidate_states": _detach_prefilter_value(
+                projection["candidate_states"]
+            ),
+            "scenarios": candidate_rows,
+        }
+        typed_markets = selected.get("typed_markets", ())
+        typed_manifest = {
+            "schema": "historical_foundry_typed_manifest/v1",
+            "selection_status": projection["status"],
+            "selected_block": _detach_prefilter_value(
+                projection["selected_block"]
+            ),
+            "market_count": len(typed_markets),
+            "markets": _detach_prefilter_value(typed_markets),
+            "member_count": len(typed_members),
+            "members": [{
+                "path": path,
+                "byte_count": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            } for path, payload in sorted(typed_members.items())],
+        }
+        candidate_bytes = _canonical_json_bytes(candidate_manifest)
+        typed_bytes = _canonical_json_bytes(typed_manifest)
+        selection_bytes = _canonical_json_bytes(
+            _detach_prefilter_value(projection)
+        )
+        import scripts.historical_foundry_storage as storage
+
+        try:
+            token = selected.get("finalization_token")
+            if token is None:
+                token = storage._seal_historical_run_finalization(
+                    selection_transition=selected["storage_transition"],
+                    candidate_manifest=candidate_bytes,
+                    typed_manifest=typed_bytes,
+                    selection=selection_bytes,
+                    typed_members=typed_members,
+                )
+                selected["finalization_token"] = token
+            result = storage._commit_historical_run_finalization(token=token)
+        except Exception:
+            if not storage._historical_run_finalization_is_retryable(
+                token=token
+            ):
+                selected.pop("finalization_token", None)
+            raise ValueError("historical replay finalization failed") from None
+        selected.pop("finalization_token", None)
+        selected["finalized"] = True
+        selected["run_snapshot"] = result
+        return result
+
+    return (
+        ValidatedHistoricalScanSnapshot,
+        open_validated_historical_scan_snapshot,
+        select_historical_replay_block,
+        build_selected_historical_typed_members,
+        _advance_historical_selection_controller,
+        _historical_selection_action_projection,
+        _consume_historical_selection_action,
+        _record_historical_selection_failure,
+        _finalize_historical_replay_run,
+    )
+
+
+(
+    ValidatedHistoricalScanSnapshot,
+    open_validated_historical_scan_snapshot,
+    select_historical_replay_block,
+    build_selected_historical_typed_members,
+    _advance_historical_selection_controller,
+    _historical_selection_action_projection,
+    _consume_historical_selection_action,
+    _record_historical_selection_failure,
+    _finalize_historical_replay_run,
+) = _initialize_historical_selection_capabilities()
+del _initialize_historical_selection_capabilities
