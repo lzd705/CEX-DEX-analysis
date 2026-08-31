@@ -1968,6 +1968,38 @@ def _v2_fee_binding_sha256(state: V2PoolState) -> str:
     )
 
 
+def v2_exact_input_amount_out_raw(
+    *,
+    reserve_in_raw: int,
+    reserve_out_raw: int,
+    amount_in_raw: int,
+    fee_numerator: int,
+    fee_denominator: int,
+) -> int:
+    """Return one V2 exact-input output using integer-floor arithmetic."""
+    values = (
+        (reserve_in_raw, "reserve_in_raw"),
+        (reserve_out_raw, "reserve_out_raw"),
+        (amount_in_raw, "amount_in_raw"),
+        (fee_numerator, "fee_numerator"),
+        (fee_denominator, "fee_denominator"),
+    )
+    for value, field_name in values:
+        if type(value) is not int or value <= 0:
+            raise ValueError("{} must be a positive integer".format(field_name))
+    amount_in_with_fee = amount_in_raw * fee_numerator
+    amount_out_raw = (
+        amount_in_with_fee
+        * reserve_out_raw
+        // (reserve_in_raw * fee_denominator + amount_in_with_fee)
+    )
+    if not 0 < amount_out_raw < reserve_out_raw:
+        raise ValueError(
+            "V2 exact-input output must be strictly between zero and reserve_out_raw"
+        )
+    return amount_out_raw
+
+
 def _v2_unavailable_quote(
     *,
     state: V2PoolState,
@@ -2159,13 +2191,17 @@ def quote_v2_pool_quantity(
     fee_numerator = pool_state.fee_numerator
     fee_denominator = pool_state.fee_denominator
     if direction_text == "sell":
-        amount_with_fee = target_raw * fee_numerator
-        quote_raw = (
-            amount_with_fee
-            * reserve_quote
-            // (reserve_base * fee_denominator + amount_with_fee)
-        )
-        if quote_raw <= 0:
+        try:
+            quote_raw = v2_exact_input_amount_out_raw(
+                reserve_in_raw=reserve_base,
+                reserve_out_raw=reserve_quote,
+                amount_in_raw=target_raw,
+                fee_numerator=fee_numerator,
+                fee_denominator=fee_denominator,
+            )
+        except ValueError as error:
+            if "output must be strictly between" not in str(error):
+                raise
             return unavailable("pool_output_below_one_raw")
         new_base = reserve_base + target_raw
         new_quote = reserve_quote - quote_raw

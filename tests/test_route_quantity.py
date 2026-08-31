@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import unittest
 from dataclasses import replace
@@ -15,6 +16,8 @@ from scripts.fetch_cex_depth import (
     execution_rows_for_book,
     route_quantity_quote_for_book,
 )
+from scripts.historical_foundry_contracts import quote_v2_exact_in
+from scripts.route_opportunity import build_route_opportunity
 from scripts.route_quantity import (
     CommonTarget,
     FeeSemantics,
@@ -1917,6 +1920,269 @@ class V2PoolQuantityQuoteTests(unittest.TestCase):
                         quote_token_address=TOKEN1,
                         cohort_now="2026-08-01T12:02:00.0000005Z",
                     )
+
+
+class V2ExactInputIntegerMathTests(unittest.TestCase):
+    @staticmethod
+    def exact_input(**overrides):
+        values = {
+            "reserve_in_raw": 10,
+            "reserve_out_raw": 10,
+            "amount_in_raw": 4,
+            "fee_numerator": 997,
+            "fee_denominator": 1000,
+        }
+        values.update(overrides)
+        return route_quantity_module.v2_exact_input_amount_out_raw(**values)
+
+    @staticmethod
+    def quote_wire_sha256(direction):
+        quote = quote_v2_pool_quantity(
+            v2_state(),
+            dex_target(),
+            dex_rules(),
+            direction=direction,
+            target_token_address=TOKEN0,
+            quote_token_address=TOKEN1,
+            cohort_now="2026-08-01T12:02:00.0000005Z",
+        )
+        payload = {
+            key: str(value) if isinstance(value, Decimal) else value
+            for key, value in vars(quote).items()
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def test_receipt_bound_two_leg_cashflow_exposes_exact_output_plateau(self):
+        first_leg_uni_out = self.exact_input()
+        second_leg_weth_out = self.exact_input(
+            reserve_in_raw=10,
+            reserve_out_raw=20,
+            amount_in_raw=first_leg_uni_out,
+        )
+        legacy_buy = quote_v2_pool_quantity(
+            v2_state(
+                token0_decimals=0,
+                token1_decimals=0,
+                reserve0_raw=10,
+                reserve1_raw=10,
+            ),
+            CommonTarget(
+                asset="AAVE",
+                unit_decimals=0,
+                raw_quantity=2,
+                lattice_raw=1,
+            ),
+            dex_rules(
+                base_unit_decimals=0,
+                quote_unit_decimals=0,
+                base_increment=Decimal("1"),
+                quote_increment=Decimal("1"),
+            ),
+            direction="buy",
+            target_token_address=TOKEN0,
+            quote_token_address=TOKEN1,
+            cohort_now="2026-08-01T12:02:00.0000005Z",
+        )
+
+        self.assertEqual(first_leg_uni_out, 2)
+        self.assertEqual(legacy_buy.quote_debit_quantity, Decimal("3"))
+        self.assertEqual(4 - legacy_buy.quote_debit_quantity, Decimal("1"))
+        self.assertEqual(second_leg_weth_out, 3)
+        actual_gross_cashflow = Decimal(second_leg_weth_out) - Decimal(4)
+        legacy_gross_cashflow = (
+            Decimal(second_leg_weth_out) - legacy_buy.quote_debit_quantity
+        )
+        self.assertEqual(actual_gross_cashflow, Decimal("-1"))
+        self.assertEqual(legacy_gross_cashflow, Decimal("0"))
+        self.assertEqual(
+            legacy_gross_cashflow - actual_gross_cashflow,
+            Decimal("1"),
+        )
+        self.assertEqual(
+            self.exact_input(
+                reserve_in_raw=10,
+                reserve_out_raw=20,
+                amount_in_raw=first_leg_uni_out + 1,
+            ),
+            4,
+        )
+
+    def test_reserve_order_integer_floor_and_one_wei_boundary_are_exact(self):
+        self.assertEqual(self.exact_input(amount_in_raw=2), 1)
+        self.assertEqual(self.exact_input(amount_in_raw=3), 2)
+        self.assertEqual(
+            self.exact_input(reserve_in_raw=10, reserve_out_raw=20),
+            5,
+        )
+        self.assertEqual(
+            self.exact_input(reserve_in_raw=20, reserve_out_raw=10),
+            1,
+        )
+        self.assertEqual(
+            self.exact_input(
+                reserve_in_raw=1000,
+                reserve_out_raw=2000,
+                amount_in_raw=100,
+            ),
+            181,
+        )
+
+    def test_all_inputs_must_be_positive_non_boolean_integers(self):
+        fields = (
+            "reserve_in_raw",
+            "reserve_out_raw",
+            "amount_in_raw",
+            "fee_numerator",
+            "fee_denominator",
+        )
+        for field_name in fields:
+            for invalid in (0, -1, True, False, 1.0, "1"):
+                with self.subTest(field_name=field_name, invalid=invalid):
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        self.exact_input(**{field_name: invalid})
+
+    def test_zero_output_reserve_exhaustion_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "strictly between"):
+            self.exact_input(reserve_out_raw=1)
+        with self.assertRaisesRegex(ValueError, "strictly between"):
+            self.exact_input(
+                reserve_in_raw=10**30,
+                reserve_out_raw=2,
+                amount_in_raw=1,
+            )
+
+    def test_arbitrary_precision_math_does_not_overflow_intermediates(self):
+        result = self.exact_input(
+            reserve_in_raw=1 << 255,
+            reserve_out_raw=1 << 200,
+            amount_in_raw=1 << 255,
+        )
+
+        self.assertEqual(
+            result,
+            802262008075219481580038160272478274769472401002225566747857,
+        )
+        self.assertLess(result, 1 << 200)
+
+    def test_997_over_1000_matches_phase2_foundry_integer_math(self):
+        cases = (
+            (1000, 100000, 100000),
+            (100, 1000, 2000),
+            (100, 2000, 1000),
+            (1 << 255, 1 << 255, 1 << 200),
+        )
+        for amount_in, reserve_in, reserve_out in cases:
+            with self.subTest(
+                amount_in=amount_in,
+                reserve_in=reserve_in,
+                reserve_out=reserve_out,
+            ):
+                self.assertEqual(
+                    self.exact_input(
+                        amount_in_raw=amount_in,
+                        reserve_in_raw=reserve_in,
+                        reserve_out_raw=reserve_out,
+                    ),
+                    quote_v2_exact_in(amount_in, reserve_in, reserve_out),
+                )
+
+    def test_live_wrapper_signatures_and_known_answer_bytes_remain_frozen(self):
+        expected_parameters = {
+            route_quantity_module.v2_exact_input_amount_out_raw: (
+                (
+                    "reserve_in_raw",
+                    "reserve_out_raw",
+                    "amount_in_raw",
+                    "fee_numerator",
+                    "fee_denominator",
+                ),
+                0,
+                (),
+            ),
+            quote_v2_pool_quantity: (
+                (
+                    "pool_state",
+                    "target_token_quantity",
+                    "market_rules",
+                    "direction",
+                    "target_token_address",
+                    "quote_token_address",
+                    "cohort_now",
+                ),
+                3,
+                (),
+            ),
+            validate_v2_quantity_quote_against_state: (
+                (
+                    "quote",
+                    "pool_state",
+                    "target_token_quantity",
+                    "market_rules",
+                    "direction",
+                    "target_token_address",
+                    "quote_token_address",
+                    "cohort_now",
+                ),
+                4,
+                (),
+            ),
+            build_route_opportunity: (
+                (
+                    "cohort_id",
+                    "route",
+                    "requested_notional_usd",
+                    "common_target",
+                    "buy_leg",
+                    "sell_leg",
+                    "buy_quote",
+                    "sell_quote",
+                    "buy_quote_evidence",
+                    "sell_quote_evidence",
+                    "buy_usd_projection",
+                    "sell_usd_projection",
+                    "cost_components",
+                    "mode_evidence",
+                    "now",
+                    "publication_attestation",
+                ),
+                0,
+                ("publication_attestation",),
+            ),
+        }
+        for function, contract in expected_parameters.items():
+            with self.subTest(function=function.__name__):
+                names, positional_count, defaulted_names = contract
+                signature = inspect.signature(function)
+                self.assertEqual(tuple(signature.parameters), names)
+                for index, parameter in enumerate(signature.parameters.values()):
+                    expected_kind = (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD
+                        if index < positional_count
+                        else inspect.Parameter.KEYWORD_ONLY
+                    )
+                    self.assertIs(parameter.kind, expected_kind)
+                    expected_default = (
+                        None
+                        if parameter.name in defaulted_names
+                        else inspect.Parameter.empty
+                    )
+                    self.assertIs(parameter.default, expected_default)
+
+        self.assertEqual(
+            self.quote_wire_sha256("sell"),
+            "329ee68cd5472c64cffc886b01108d1acb98bc5471cf9fa987bcad0d466c0889",
+        )
+        self.assertEqual(
+            self.quote_wire_sha256("buy"),
+            "64e233855d47a083c4bc17e856c89999c9209377c6ee38b9b7aef12e0796a7a1",
+        )
 
 
 class V1NonRegressionTests(unittest.TestCase):
