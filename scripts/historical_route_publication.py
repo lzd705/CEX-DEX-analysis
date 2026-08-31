@@ -5,9 +5,10 @@ neither caller-built core projections nor caller-selected raw readers.
 """
 
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, NoReturn
+from typing import Any, Dict, Mapping, NoReturn, Tuple
 import fcntl
 import hashlib
 import json
@@ -22,11 +23,18 @@ from scripts.historical_foundry_contracts import (
     load_historical_foundry_config_set,
 )
 from scripts.historical_foundry_replay import (
+    ValidatedHistoricalScenarioInputs,
+    _issue_validated_historical_scenario_inputs_from_publication,
+    build_historical_scenario_projection,
     build_historical_core_projection,
     build_historical_research_universe,
     validate_selected_historical_run,
 )
 from scripts.route_cohort import canonical_route_id
+from scripts.route_cost_topology import (
+    HISTORICAL_ATOMIC_COMPONENT_MATRIX,
+    _validate_historical_atomic_cost_component_matrix,
+)
 import scripts.historical_foundry_storage as _historical_storage
 import scripts.route_publication as _route_publication
 
@@ -39,6 +47,8 @@ _STAGE_ISSUER = object()
 _CONTEXT_ISSUER = object()
 _STAGE_REGISTRY = {}
 _CONTEXT_REGISTRY = {}
+_SCENARIO_CONTEXT_ISSUER = object()
+_SCENARIO_CONTEXT_REGISTRY = {}
 
 _CONTEXT_SCHEMA = "historical_replay_build_context/v1"
 _POINTER_SCHEMA = "route_historical_replay_core_pointer/v1"
@@ -54,6 +64,17 @@ _NOTIONALS = [1000, 5000, 10000, 50000, 100000]
 _VENUES = ("uniswap_v2", "sushiswap_v2")
 _MAX_MEMBER_BYTES = 8_388_608
 _MAX_DECODED_MEMBER_BYTES = 16_777_216
+
+_COST_PROOF_FIELDS = frozenset((
+    "schema", "scenario_key", "policy_sha256", "receipt_sha256",
+    "trace_sha256", "adapter_proof_sha256", "rows",
+    "proof_inputs_hash",
+))
+_COST_PROOF_ROW_FIELDS = frozenset((
+    "grain", "component", "value_status", "embedded",
+    "amount_usd_exact", "rate_bps_exact", "proof_role",
+    "proof_sha256",
+))
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -72,6 +93,105 @@ def _json_file_bytes(value: Any) -> bytes:
 
 def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            key: _freeze(item) for key, item in value.items()
+        })
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _initialize_validated_historical_cost_proof_inputs():
+    issuer = object()
+    registry = {}
+
+    @dataclass(frozen=True, init=False, repr=False)
+    class ValidatedHistoricalCostProofInputs:
+        scenario_key: str
+        proof_inputs_hash: str
+        object_value: Mapping[str, Any]
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            del cls, args, kwargs
+            raise HistoricalRoutePublicationError(
+                "validated historical cost proof construction is private"
+            )
+
+        def __repr__(self) -> str:
+            return "ValidatedHistoricalCostProofInputs(<redacted>)"
+
+        def __reduce_ex__(self, _protocol: int) -> Any:
+            raise TypeError(
+                "validated historical cost proof is not serializable"
+            )
+
+    def require(value: Any) -> Mapping[str, Any]:
+        entry = registry.get(id(value))
+        if (
+            type(value) is not ValidatedHistoricalCostProofInputs
+            or entry is None
+            or entry[0]() is not value
+            or entry[1].get("issuer") is not issuer
+        ):
+            raise HistoricalRoutePublicationError(
+                "validated historical cost proof capability is invalid"
+            )
+        record = entry[1]
+        for field in ("scenario_key", "proof_inputs_hash", "object_value"):
+            try:
+                current = object.__getattribute__(value, field)
+            except AttributeError as error:
+                raise HistoricalRoutePublicationError(
+                    "validated historical cost proof capability is invalid"
+                ) from error
+            if current != record[field]:
+                raise HistoricalRoutePublicationError(
+                    "validated historical cost proof capability differs"
+                )
+        return record["object_value"]
+
+    def issue(proof: Mapping[str, Any]) -> Any:
+        frozen = _freeze(_plain(proof))
+        value = object.__new__(ValidatedHistoricalCostProofInputs)
+        fields = {
+            "scenario_key": frozen["scenario_key"],
+            "proof_inputs_hash": frozen["proof_inputs_hash"],
+            "object_value": frozen,
+        }
+        for field, field_value in fields.items():
+            object.__setattr__(value, field, field_value)
+        value_id = id(value)
+        record = {"issuer": issuer, **fields}
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = registry.get(value_id)
+            if current is not None and current[0] is reference:
+                registry.pop(value_id, None)
+
+        registry[value_id] = (weakref.ref(value, retire), record)
+        return value
+
+    return ValidatedHistoricalCostProofInputs, issue, require
+
+
+(
+    ValidatedHistoricalCostProofInputs,
+    _issue_validated_historical_cost_proof_inputs,
+    _validated_historical_cost_proof_object,
+) = _initialize_validated_historical_cost_proof_inputs()
+del _initialize_validated_historical_cost_proof_inputs
 
 
 def _snapshot_matches(current: Any, expected: Any) -> bool:
@@ -2169,3 +2289,897 @@ def _require_historical_replay_build_context(
     record = _context_record(context)
     _validate_context_current(record)
     return MappingProxyType(json.loads(record["projection_bytes"]))
+
+
+def _decode_gzip_canonical_object(value: bytes, label: str) -> Dict[str, Any]:
+    inflater = zlib.decompressobj(zlib.MAX_WBITS | 16)
+    try:
+        decoded = inflater.decompress(value, _MAX_DECODED_MEMBER_BYTES + 1)
+        decoded += inflater.flush()
+    except zlib.error as error:
+        raise HistoricalRoutePublicationError(
+            "{} is invalid".format(label)
+        ) from error
+    if (
+        len(decoded) > _MAX_DECODED_MEMBER_BYTES
+        or not inflater.eof
+        or inflater.unused_data
+        or inflater.unconsumed_tail
+    ):
+        raise HistoricalRoutePublicationError(
+            "{} is invalid".format(label)
+        )
+    return _decode_canonical_object(decoded, label)
+
+
+def _canonical_decimal_or_none(value: Any, label: str) -> Any:
+    if value is None:
+        return None
+    if type(value) is not str or not value or value != value.strip():
+        raise HistoricalRoutePublicationError("{} is invalid".format(label))
+    try:
+        from decimal import Decimal, InvalidOperation
+        number = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise HistoricalRoutePublicationError(
+            "{} is invalid".format(label)
+        ) from error
+    canonical = format(number, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    if number == 0:
+        canonical = "0"
+    if not number.is_finite() or number < 0 or value != canonical:
+        raise HistoricalRoutePublicationError("{} is invalid".format(label))
+    return value
+
+
+def _historical_exact_terminating_decimal(
+    numerator: int, denominator: int,
+) -> str:
+    if (
+        type(numerator) is not int
+        or type(denominator) is not int
+        or numerator < 0
+        or denominator <= 0
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical exact decimal input is invalid"
+        )
+    integer, remainder = divmod(numerator, denominator)
+    if remainder == 0:
+        return str(integer)
+    digits = []
+    while remainder and len(digits) <= 4_096:
+        remainder *= 10
+        digit, remainder = divmod(remainder, denominator)
+        digits.append(str(digit))
+    if remainder:
+        raise HistoricalRoutePublicationError(
+            "historical exact decimal is nonterminating"
+        )
+    return "{}.{}".format(integer, "".join(digits).rstrip("0"))
+
+
+def _validate_historical_cost_proof(
+    *, proof: Mapping[str, Any], scenario_key: str,
+    policy_sha256: str, receipt_sha256: str, trace_sha256: str,
+    adapter_proof_sha256: str,
+) -> Mapping[str, Any]:
+    if (
+        type(proof) is not dict
+        or frozenset(proof) != _COST_PROOF_FIELDS
+        or proof.get("schema")
+        != "historical_foundry_cost_proof_inputs/v1"
+        or proof.get("scenario_key") != scenario_key
+        or proof.get("policy_sha256") != policy_sha256
+        or proof.get("receipt_sha256") != receipt_sha256
+        or proof.get("trace_sha256") != trace_sha256
+        or proof.get("adapter_proof_sha256") != adapter_proof_sha256
+        or type(proof.get("rows")) is not list
+        or len(proof["rows"]) != 9
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical cost proof input is invalid"
+        )
+    roles = (
+        "receipt", "receipt", "receipt", "receipt", "receipt",
+        "receipt", "receipt", "trace", "policy",
+    )
+    role_hash = {
+        "receipt": receipt_sha256,
+        "trace": trace_sha256,
+        "policy": policy_sha256,
+    }
+    for row, shape, role in zip(
+        proof["rows"], HISTORICAL_ATOMIC_COMPONENT_MATRIX, roles
+    ):
+        if (
+            type(row) is not dict
+            or frozenset(row) != _COST_PROOF_ROW_FIELDS
+            or (
+                row.get("grain"), row.get("component"),
+                row.get("value_status"), row.get("embedded"),
+            ) != shape
+            or row.get("proof_role") != role
+            or row.get("proof_sha256") != role_hash[role]
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical cost proof row is invalid"
+            )
+        amount = _canonical_decimal_or_none(
+            row.get("amount_usd_exact"), "historical cost proof amount"
+        )
+        rate = _canonical_decimal_or_none(
+            row.get("rate_bps_exact"), "historical cost proof rate"
+        )
+        if (
+            row["value_status"] in ("bounded_estimate", "assumed")
+            and amount is None
+            or row["value_status"] == "not_applicable"
+            and (amount is not None or rate is not None)
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical cost proof numeric state is invalid"
+            )
+    unsigned = {
+        key: value for key, value in proof.items()
+        if key != "proof_inputs_hash"
+    }
+    expected_hash = _sha(
+        b"historical_foundry_cost_proof_inputs/v1\0"
+        + _canonical_bytes(unsigned)
+    )
+    if proof.get("proof_inputs_hash") != expected_hash:
+        raise HistoricalRoutePublicationError(
+            "historical cost proof hash differs"
+        )
+    return proof
+
+
+def _validate_historical_feed_validity_boundary(
+    *, updated_at: int, block_timestamp: int, max_age_seconds: int,
+    valid_until: int,
+) -> None:
+    if (
+        any(type(value) is not int for value in (
+            updated_at, block_timestamp, max_age_seconds, valid_until,
+        ))
+        or updated_at <= 0
+        or max_age_seconds <= 0
+        or block_timestamp < updated_at
+        or block_timestamp - updated_at > max_age_seconds
+        or valid_until != updated_at + max_age_seconds + 1
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical price validity boundary differs"
+        )
+    return None
+
+
+def _historical_scenario_material(
+    *, context: HistoricalReplayBuildContext, scenario_key: str,
+    validate_context: bool,
+) -> Mapping[str, Any]:
+    if type(scenario_key) is not str or not scenario_key:
+        raise HistoricalRoutePublicationError(
+            "historical scenario key is invalid"
+        )
+    record = _context_record(context)
+    if validate_context:
+        _validate_context_current(record)
+    source = record["source"]
+    try:
+        identity = dict(source.identity_projection())
+    except Exception as error:
+        raise HistoricalRoutePublicationError(
+            "historical raw source identity is invalid"
+        ) from error
+    manifest_sha256 = identity.get("run_manifest_sha256")
+    if (
+        type(manifest_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical raw source identity is invalid"
+        )
+    manifest_bytes = source.read_member(
+        "run_manifest.json", expected_sha256=manifest_sha256,
+        max_bytes=_MAX_MEMBER_BYTES,
+    )
+    if _sha(manifest_bytes) != manifest_sha256:
+        raise HistoricalRoutePublicationError(
+            "historical run manifest bytes differ"
+        )
+    manifest = _decode_canonical_object(
+        manifest_bytes, "historical run manifest"
+    )
+    member_rows = manifest.get("members")
+    if (
+        type(member_rows) is not list
+        or len(member_rows) != manifest.get("member_count")
+        or any(
+            type(row) is not dict
+            or set(row) != {"path", "byte_count", "sha256"}
+            for row in member_rows
+        )
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical run member inventory is invalid"
+        )
+    members = {row["path"]: row for row in member_rows}
+    if len(members) != len(member_rows):
+        raise HistoricalRoutePublicationError(
+            "historical run member inventory is invalid"
+        )
+    read_descriptors = [{
+        "path": "run_manifest.json",
+        "byte_count": len(manifest_bytes),
+        "sha256": manifest_sha256,
+    }]
+
+    def read(path: str) -> bytes:
+        value = _read_source_member(source, members, path)
+        read_descriptors.append(dict(members[path]))
+        return value
+
+    raw_config = {}
+    config_objects = {}
+    for role in ("policy", "authority", "toolchain"):
+        raw_config[role] = read(role + ".json")
+        try:
+            config_objects[role] = json.loads(raw_config[role])
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HistoricalRoutePublicationError(
+                "historical {} config is invalid".format(role)
+            ) from error
+        if (
+            type(config_objects[role]) is not dict
+            or _sha(raw_config[role]) != manifest.get(role + "_sha256")
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical {} config differs".format(role)
+            )
+    candidate = _decode_canonical_object(
+        read("candidate_manifest.json"), "historical candidate manifest"
+    )
+    selection = _decode_canonical_object(
+        read("selection.json"), "historical selection"
+    )
+    typed_manifest = _decode_canonical_object(
+        read("typed_manifest.json"), "historical typed manifest"
+    )
+    capture_inventory = _decode_canonical_object(
+        read("scan/capture_inventory.json"),
+        "historical capture inventory",
+    )
+    prefilter_inventory = _decode_canonical_object(
+        read("scan/prefilter_inventory.json"),
+        "historical prefilter inventory",
+    )
+    selected_block = selection.get("selected_block")
+    if (
+        type(selected_block) is not dict
+        or selected_block != typed_manifest.get("selected_block")
+        or selected_block != manifest.get("selected_block")
+        or candidate.get("selected_block") not in (None, selected_block)
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical selected block differs"
+        )
+    selected_number = selected_block["number"]
+
+    def decoded_chunk(descriptor: Mapping[str, Any], label: str) -> Any:
+        if (
+            type(descriptor) is not dict
+            or type(descriptor.get("path")) is not str
+            or type(descriptor.get("decoded_byte_count")) is not int
+            or type(descriptor.get("decoded_sha256")) is not str
+            or descriptor.get("path") not in members
+            or members[descriptor["path"]] != {
+                "path": descriptor["path"],
+                "byte_count": descriptor.get("gzip_byte_count"),
+                "sha256": descriptor.get("gzip_sha256"),
+            }
+        ):
+            raise HistoricalRoutePublicationError(
+                "{} descriptor is invalid".format(label)
+            )
+        compressed = read(descriptor["path"])
+        decoded = _decompress_single_gzip_member_bounded(
+            compressed,
+            expected_size=descriptor["decoded_byte_count"],
+        )
+        if _sha(decoded) != descriptor["decoded_sha256"]:
+            raise HistoricalRoutePublicationError(
+                "{} bytes differ".format(label)
+            )
+        try:
+            return json.loads(decoded)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HistoricalRoutePublicationError(
+                "{} is invalid".format(label)
+            ) from error
+
+    selected_capture_chunks = {}
+    for role in ("headers", "fees"):
+        descriptors = [
+            row for row in capture_inventory.get("typed_chunks", [])
+            if type(row) is dict and row.get("role") == role
+            and row.get("block_start") <= selected_number
+            <= row.get("block_stop")
+        ]
+        if len(descriptors) != 1:
+            raise HistoricalRoutePublicationError(
+                "historical {} chunk inventory differs".format(role)
+            )
+        rows = decoded_chunk(
+            descriptors[0], "historical {} chunk".format(role)
+        )
+        if type(rows) is not list:
+            raise HistoricalRoutePublicationError(
+                "historical {} rows are invalid".format(role)
+            )
+        matches = [
+            row for row in rows
+            if type(row) is dict and row.get("block_number") == selected_number
+        ]
+        if role == "headers":
+            matches = [
+                row for row in rows
+                if type(row) is dict and row.get("number") == selected_number
+            ]
+        if len(matches) != 1:
+            raise HistoricalRoutePublicationError(
+                "historical selected {} row differs".format(role)
+            )
+        selected_capture_chunks[role] = matches[0]
+    if {
+        key: selected_capture_chunks["headers"].get(key)
+        for key in selected_block
+    } != selected_block:
+        raise HistoricalRoutePublicationError(
+            "historical selected header differs"
+        )
+    prefilter_descriptors = prefilter_inventory.get("prefilter_chunks")
+    if type(prefilter_descriptors) is not list or not prefilter_descriptors:
+        raise HistoricalRoutePublicationError(
+            "historical prefilter chunk inventory differs"
+        )
+    prefilter_rows = []
+    for descriptor in prefilter_descriptors:
+        decoded = decoded_chunk(
+            descriptor, "historical prefilter chunk"
+        )
+        if type(decoded) is not list:
+            raise HistoricalRoutePublicationError(
+                "historical prefilter rows are invalid"
+            )
+        prefilter_rows.extend(decoded)
+    selected_rows = selection.get("selected_scenarios")
+    matches = [
+        row for row in selected_rows
+        if type(row) is dict and row.get("scenario_key") == scenario_key
+    ] if type(selected_rows) is list else []
+    if len(matches) != 1:
+        raise HistoricalRoutePublicationError(
+            "historical scenario selection differs"
+        )
+    selected = matches[0]
+    prefilter_matches = [
+        row for row in prefilter_rows
+        if type(row) is dict and row.get("scenario_key") == scenario_key
+    ]
+    if len(prefilter_matches) != 1:
+        raise HistoricalRoutePublicationError(
+            "historical prefilter scenario differs"
+        )
+    prefilter_row = prefilter_matches[0]
+    if (
+        selected.get("status") != 1
+        or selected.get("classification") != "replay_success"
+        or selected.get("block_number") != selected_block.get("number")
+        or prefilter_row.get("block_number") != selected_block.get("number")
+        or prefilter_row.get("direction") != selected.get("direction")
+        or prefilter_row.get("requested_notional_usd")
+        != selected.get("requested_notional_usd")
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical selected scenario is not proved"
+        )
+    pools = {}
+    feeds = {}
+    feed_sha_by_venue = {}
+    markets = typed_manifest.get("markets")
+    if type(markets) is not list or len(markets) != 2:
+        raise HistoricalRoutePublicationError(
+            "historical typed market inventory differs"
+        )
+    for market, venue in zip(markets, _VENUES):
+        if (
+            type(market) is not dict
+            or market.get("venue_id") != venue
+            or market.get("pair_address") not in (
+                "0xd3d2e2692501a5c9ca623199d38826e513033a17",
+                "0xdafd66636e2561b0284edde37e42d192f2844d40",
+            )
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical typed market differs"
+            )
+        market_members = market.get("members")
+        if type(market_members) is not list or len(market_members) != 2:
+            raise HistoricalRoutePublicationError(
+                "historical typed member inventory differs"
+            )
+        for member in market_members:
+            if type(member) is not dict or member.get("path") not in members:
+                raise HistoricalRoutePublicationError(
+                    "historical typed member descriptor differs"
+                )
+            raw = read(member["path"])
+            payload = _decode_canonical_object(
+                raw, "historical typed scenario dependency"
+            )
+            if (
+                member.get("byte_count") != len(raw)
+                or member.get("sha256") != _sha(raw)
+            ):
+                raise HistoricalRoutePublicationError(
+                    "historical typed member bytes differ"
+                )
+            role = member.get("role")
+            if role == "dex_pool_state":
+                pools[venue] = payload
+            elif role == "dex_usd_price_context":
+                feeds[venue] = payload
+                feed_sha_by_venue[venue] = member["sha256"]
+            else:
+                raise HistoricalRoutePublicationError(
+                    "historical typed member role differs"
+                )
+    for venue in _VENUES:
+        pool = pools.get(venue)
+        feed = feeds.get(venue)
+        if (
+            type(pool) is not dict
+            or pool.get("schema") != "route_v2_pool_state/v1"
+            or pool.get("dex") != venue
+            or int(pool.get("block_number", -1)) != selected_block["number"]
+            or pool.get("block_hash") != selected_block["hash"]
+            or type(feed) is not dict
+            or feed.get("schema") != "route_dex_usd_price_context/v1"
+            or feed.get("venue_id") != venue
+            or int(feed.get("block_number", -1)) != selected_block["number"]
+            or feed.get("block_hash") != selected_block["hash"]
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical typed scenario dependency differs"
+            )
+    comparable_feed_fields = {
+        key for key in feeds[_VENUES[0]]
+        if key not in {"market_id", "venue_id"}
+    }
+    if any(
+        {
+            key: feeds[_VENUES[0]][key] for key in comparable_feed_fields
+        } != {
+            key: feeds[_VENUES[1]][key] for key in comparable_feed_fields
+        }
+        for _unused in (0,)
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical price contexts differ"
+        )
+    feed = feeds[_VENUES[0]]
+    updated_at = int(feed["updated_at"])
+    valid_until = int(feed["valid_until"])
+    max_age = config_objects["policy"]["max_eth_usd_age_seconds"]
+    block_timestamp = selected_block["timestamp"]
+    _validate_historical_feed_validity_boundary(
+        updated_at=updated_at,
+        block_timestamp=block_timestamp,
+        max_age_seconds=max_age,
+        valid_until=valid_until,
+    )
+    scenario_root = "foundry/{}/{}".format(
+        selected_block["number"], scenario_key
+    )
+    overlay_bytes = read(scenario_root + "/overlay.json")
+    receipt_bytes = read(scenario_root + "/receipt.json")
+    trace_bytes = read(scenario_root + "/trace.json.gz")
+    result_bytes = read(scenario_root + "/result.json")
+    overlay = _decode_canonical_object(
+        overlay_bytes, "historical scenario overlay"
+    )
+    receipt = _decode_canonical_object(
+        receipt_bytes, "historical scenario receipt"
+    )
+    trace = _decode_gzip_canonical_object(
+        trace_bytes, "historical scenario trace"
+    )
+    result = _decode_canonical_object(
+        result_bytes, "historical scenario result"
+    )
+    hashes = {
+        "overlay_sha256": _sha(overlay_bytes),
+        "receipt_sha256": _sha(receipt_bytes),
+        "trace_sha256": _sha(trace_bytes),
+        "result_sha256": _sha(result_bytes),
+    }
+    if any(selected.get(field) != value for field, value in hashes.items()):
+        raise HistoricalRoutePublicationError(
+            "historical scenario member binding differs"
+        )
+    proof_authority = result.get("proof_authority")
+    if type(proof_authority) is not dict:
+        raise HistoricalRoutePublicationError(
+            "historical scenario proof authority is invalid"
+        )
+    adapter_sha = config_objects["toolchain"]["executor_build"][
+        "creation_bytecode_sha256"
+    ]
+    proof = _validate_historical_cost_proof(
+        proof=result.get("cost_proof_inputs"),
+        scenario_key=scenario_key,
+        policy_sha256=manifest["policy_sha256"],
+        receipt_sha256=hashes["receipt_sha256"],
+        trace_sha256=hashes["trace_sha256"],
+        adapter_proof_sha256=adapter_sha,
+    )
+    try:
+        amount_denominator = 10 ** (
+            18 + proof_authority["feed_decimals"]
+        )
+        fee_numerator = proof_authority["v2_fee_numerator"]
+        fee_denominator = proof_authority["v2_fee_denominator"]
+        fee_units = fee_denominator - fee_numerator
+        first_pool_fee = _historical_exact_terminating_decimal(
+            proof_authority["amount_weth_in_wei"]
+            * proof_authority["eth_usd_answer"] * fee_units,
+            amount_denominator * fee_denominator,
+        )
+        second_pool_fee = _historical_exact_terminating_decimal(
+            proof_authority["actual_first_leg_uni_raw"]
+            * proof_authority["second_leg_reserve_weth_raw"]
+            * proof_authority["eth_usd_answer"] * fee_units,
+            proof_authority["second_leg_reserve_uni_raw"]
+            * amount_denominator * fee_denominator,
+        )
+        gas_amount = _historical_exact_terminating_decimal(
+            receipt["gasUsed"] * receipt["effectiveGasPrice"]
+            * proof_authority["eth_usd_answer"],
+            amount_denominator,
+        )
+        mev_bps = int(proof_authority["acceptance_mev_bps"])
+        mev_amount = _historical_exact_terminating_decimal(
+            selected["requested_notional_usd"] * mev_bps, 10_000
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise HistoricalRoutePublicationError(
+            "historical cost proof arithmetic input is invalid"
+        ) from error
+    expected_amounts = (
+        first_pool_fee, "0", "0", second_pool_fee, "0", "0",
+        gas_amount, None, mev_amount,
+    )
+    expected_rates = (
+        "30", "0", "0", "30", "0", "0", None, None,
+        str(mev_bps),
+    )
+    if any(
+        row["amount_usd_exact"] != amount
+        or row["rate_bps_exact"] != rate
+        for row, amount, rate in zip(
+            proof["rows"], expected_amounts, expected_rates
+        )
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical cost proof arithmetic differs"
+        )
+    if (
+        selected.get("proof_inputs_hash") != proof["proof_inputs_hash"]
+        or result.get("schema") != "historical_foundry_replay_result/v1"
+        or result.get("scenario_key") != scenario_key
+        or result.get("status") != 1
+        or result.get("classification") != "replay_success"
+        or result.get("overlay_sha256") != hashes["overlay_sha256"]
+        or result.get("receipt_sha256") != hashes["receipt_sha256"]
+        or result.get("trace_sha256") != hashes["trace_sha256"]
+        or result.get("fork_header") != selected_block
+        or receipt.get("schema") != "historical_foundry_receipt/v1"
+        or receipt.get("scenario_key") != scenario_key
+        or receipt.get("status") != 1
+        or receipt.get("gasUsed") != selected.get("gas_used")
+        or receipt.get("effectiveGasPrice")
+        != selected.get("effective_gas_price")
+        or trace.get("schema") != "historical_foundry_trace/v1"
+        or trace.get("scenario_key") != scenario_key
+        or trace.get("failed") is not False
+        or trace.get("gasprice_opcode_addresses") != []
+        or result.get("balances") != trace.get("balances")
+        or result.get("actual_deltas") != trace.get("actual_deltas")
+        or result.get("pair_closure") != trace.get("pair_closure")
+        or result.get("trace_closure", {}).get("calls")
+        != trace.get("calls")
+        or result.get("receipt_closure", {}).get("status") != 1
+        or result.get("gas", {}).get("gas_cost_wei")
+        != receipt["gasUsed"] * receipt["effectiveGasPrice"]
+        or proof_authority.get("policy_sha256")
+        != manifest["policy_sha256"]
+        or proof_authority.get("authority_sha256")
+        != manifest["authority_sha256"]
+        or proof_authority.get("toolchain_sha256")
+        != manifest["toolchain_sha256"]
+        or proof_authority.get("adapter_proof_sha256") != adapter_sha
+        or proof_authority.get("executor_runtime_sha256")
+        != config_objects["toolchain"]["executor_build"][
+            "deployed_runtime_sha256"
+        ]
+        or overlay.get("scenario_key") != scenario_key
+        or overlay.get("block_number") != selected_block["number"]
+        or overlay.get("block_hash") != selected_block["hash"]
+        or overlay.get("executor_runtime_sha256")
+        != proof_authority.get("executor_runtime_sha256")
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical scenario execution closure differs"
+        )
+    routes = []
+    for buy, sell in (
+        ("uniswap_v2", "sushiswap_v2"),
+        ("sushiswap_v2", "uniswap_v2"),
+    ):
+        buy_market = next(
+            market for market in markets if market["venue_id"] == buy
+        )
+        sell_market = next(
+            market for market in markets if market["venue_id"] == sell
+        )
+        route_value = {
+            "token_symbol": "UNI",
+            "buy_market_id": buy_market["market_id"],
+            "sell_market_id": sell_market["market_id"],
+            "route_mode": "atomic_onchain",
+        }
+        route_value["route_id"] = canonical_route_id(route_value)
+        routes.append(route_value)
+    route = routes[
+        0 if selected.get("direction") == "uniswap_to_sushiswap" else 1
+    ]
+    context_projection = json.loads(record["projection_bytes"])
+    context_projection_sha256 = record["projection_sha256"]
+    descriptor_set = sorted(read_descriptors, key=lambda row: row["path"])
+    source_descriptor_set_sha256 = _sha(_canonical_bytes(descriptor_set))
+    scenario_projection = {
+        "schema": "historical_foundry_scenario_inputs/v1",
+        "scenario_key": scenario_key,
+        "context_projection_sha256": context_projection_sha256,
+        "source_descriptor_set_sha256": source_descriptor_set_sha256,
+        "proof_inputs_hash": proof["proof_inputs_hash"],
+        "cohort_id": context_projection["core_pointer"]["route_cohort_id"],
+        "route_id": route["route_id"],
+        "route": route,
+        "selected_block": selected_block,
+        "selection_scenario": selected,
+        "prefilter_scenario": prefilter_row,
+        "fee": selected_capture_chunks["fees"],
+        "policy_fees": config_objects["policy"]["fees"],
+        "pools": pools,
+        "price": feed,
+        "feed_sha256_by_venue": feed_sha_by_venue,
+        "v2_formula": config_objects["authority"]["v2_formula"],
+        "overlay": overlay,
+        "receipt": receipt,
+        "trace": trace,
+        "result": result,
+        "proof_inputs": proof,
+        **hashes,
+    }
+    canonical_projection_bytes = _canonical_bytes(scenario_projection)
+    try:
+        source.reread_unchanged()
+    except Exception as error:
+        raise HistoricalRoutePublicationError(
+            "historical raw source changed during scenario validation"
+        ) from error
+    return {
+        "scenario_key": scenario_key,
+        "context_projection_sha256": context_projection_sha256,
+        "source_descriptor_set_sha256": source_descriptor_set_sha256,
+        "proof_inputs_hash": proof["proof_inputs_hash"],
+        "proof": proof,
+        "descriptor_set": descriptor_set,
+        "canonical_projection_bytes": canonical_projection_bytes,
+    }
+
+
+def load_historical_cost_proof_inputs_for_build_context(
+    *, context: HistoricalReplayBuildContext, scenario_key: str,
+) -> ValidatedHistoricalCostProofInputs:
+    material = _historical_scenario_material(
+        context=context, scenario_key=scenario_key, validate_context=True
+    )
+    return _issue_validated_historical_cost_proof_inputs(material["proof"])
+
+
+def _issue_validated_historical_scenario_inputs(
+    *, context: HistoricalReplayBuildContext, scenario_key: str,
+) -> ValidatedHistoricalScenarioInputs:
+    material = _historical_scenario_material(
+        context=context, scenario_key=scenario_key, validate_context=True
+    )
+    inputs = _issue_validated_historical_scenario_inputs_from_publication(
+        scenario_key=material["scenario_key"],
+        context_projection_sha256=material["context_projection_sha256"],
+        source_descriptor_set_sha256=material[
+            "source_descriptor_set_sha256"
+        ],
+        proof_inputs_hash=material["proof_inputs_hash"],
+        canonical_projection_bytes=material["canonical_projection_bytes"],
+    )
+    input_id = id(inputs)
+    context_reference = weakref.ref(context)
+    record = {
+        "issuer": _SCENARIO_CONTEXT_ISSUER,
+        "context_reference": context_reference,
+        "scenario_key": scenario_key,
+        "context_projection_sha256": material[
+            "context_projection_sha256"
+        ],
+        "source_descriptor_set_sha256": material[
+            "source_descriptor_set_sha256"
+        ],
+        "proof_inputs_hash": material["proof_inputs_hash"],
+        "canonical_projection_bytes": material["canonical_projection_bytes"],
+    }
+
+    def retire(reference: weakref.ReferenceType) -> None:
+        current = _SCENARIO_CONTEXT_REGISTRY.get(input_id)
+        if current is not None and current[0] is reference:
+            _SCENARIO_CONTEXT_REGISTRY.pop(input_id, None)
+
+    _SCENARIO_CONTEXT_REGISTRY[input_id] = (
+        weakref.ref(inputs, retire), record
+    )
+    return inputs
+
+
+def _require_historical_scenario_inputs_current(
+    *, context: HistoricalReplayBuildContext,
+    inputs: ValidatedHistoricalScenarioInputs,
+) -> None:
+    entry = _SCENARIO_CONTEXT_REGISTRY.get(id(inputs))
+    if (
+        type(inputs) is not ValidatedHistoricalScenarioInputs
+        or entry is None
+        or entry[0]() is not inputs
+        or entry[1].get("issuer") is not _SCENARIO_CONTEXT_ISSUER
+        or entry[1]["context_reference"]() is not context
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical scenario capability context differs"
+        )
+    record = entry[1]
+    try:
+        current = _historical_scenario_material(
+            context=context, scenario_key=record["scenario_key"],
+            validate_context=True,
+        )
+    except HistoricalRoutePublicationError:
+        raise
+    except Exception as error:
+        raise HistoricalRoutePublicationError(
+            "historical scenario capability is stale"
+        ) from error
+    for field in (
+        "scenario_key", "context_projection_sha256",
+        "source_descriptor_set_sha256", "proof_inputs_hash",
+        "canonical_projection_bytes",
+    ):
+        if current[field] != record[field]:
+            raise HistoricalRoutePublicationError(
+                "historical scenario capability is stale"
+            )
+    return None
+
+
+def _validate_historical_cost_rows_for_build_context(
+    *, context: HistoricalReplayBuildContext,
+    inputs: ValidatedHistoricalScenarioInputs,
+    route: Mapping[str, Any], rows: Tuple[Mapping[str, Any], ...],
+) -> None:
+    from scripts.route_opportunity import route_opportunity_id
+
+    _require_historical_scenario_inputs_current(
+        context=context, inputs=inputs
+    )
+    try:
+        projection = json.loads(inputs.canonical_projection_bytes)
+        proof_rows = projection["proof_inputs"]["rows"]
+        opportunity_id = route_opportunity_id(
+            projection["route_id"],
+            projection["selection_scenario"]["requested_notional_usd"],
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise HistoricalRoutePublicationError(
+            "historical scenario cost projection is invalid"
+        ) from error
+    expected = {
+        (row["grain"], row["component"]): row for row in proof_rows
+    }
+    _validate_historical_atomic_cost_component_matrix(
+        route,
+        rows,
+        expected_cohort_id=projection["cohort_id"],
+        expected_opportunity_id=opportunity_id,
+        expected_pool_fee_source_sha256_by_leg={
+            leg: expected[(leg, "pool_swap_fee")]["proof_sha256"]
+            for leg in ("buy", "sell")
+        },
+        expected_pool_fee_amount_usd_by_leg={
+            leg: expected[(leg, "pool_swap_fee")]["amount_usd_exact"]
+            for leg in ("buy", "sell")
+        },
+        expected_zero_fee_proof_sha256_by_key={
+            key: expected[key]["proof_sha256"]
+            for key in (
+                ("buy", "router_or_integrator_fee"),
+                ("buy", "token_transfer_tax"),
+                ("sell", "router_or_integrator_fee"),
+                ("sell", "token_transfer_tax"),
+            )
+        },
+        expected_gas_amount_usd=expected[
+            ("route", "network_gas")
+        ]["amount_usd_exact"],
+        expected_gas_source_sha256=expected[
+            ("route", "network_gas")
+        ]["proof_sha256"],
+        expected_transfer_source_sha256=expected[
+            ("route", "rebalancing_or_transfer")
+        ]["proof_sha256"],
+        expected_mev_amount_usd=expected[
+            ("route", "mev_buffer")
+        ]["amount_usd_exact"],
+        expected_policy_sha256=expected[
+            ("route", "mev_buffer")
+        ]["proof_sha256"],
+    )
+    return None
+
+
+def _build_historical_scenario_for_publication(
+    *, context: HistoricalReplayBuildContext, scenario_key: str,
+) -> Mapping[str, Any]:
+    inputs = _issue_validated_historical_scenario_inputs(
+        context=context, scenario_key=scenario_key
+    )
+    _require_historical_scenario_inputs_current(
+        context=context, inputs=inputs
+    )
+    canonical_projection_bytes = build_historical_scenario_projection(inputs)
+    _require_historical_scenario_inputs_current(
+        context=context, inputs=inputs
+    )
+    try:
+        projection = json.loads(canonical_projection_bytes)
+        rows = tuple(projection["cost_components"])
+        opportunity = projection["opportunity"]
+        raw_inputs = json.loads(inputs.canonical_projection_bytes)
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise HistoricalRoutePublicationError(
+            "historical scenario serialization is invalid"
+        ) from error
+    _validate_historical_cost_rows_for_build_context(
+        context=context, inputs=inputs, route=raw_inputs["route"],
+        rows=rows,
+    )
+    return MappingProxyType({
+        "schema": "historical_scenario_publication_build/v1",
+        "scenario_key": scenario_key,
+        "proof_inputs_hash": inputs.proof_inputs_hash,
+        "canonical_projection_bytes": canonical_projection_bytes,
+        "opportunity": MappingProxyType(opportunity),
+        "cost_components": tuple(MappingProxyType(row) for row in rows),
+    })

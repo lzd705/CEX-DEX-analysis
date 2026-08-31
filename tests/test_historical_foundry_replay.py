@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
+import inspect
 import json
+import pickle
 import unittest
 import weakref
 from contextlib import ExitStack
@@ -968,6 +971,417 @@ class HistoricalResearchUniverseTests(unittest.TestCase):
         import scripts.historical_foundry_replay as module
         self.assertIn("Task 7", module.__doc__)
         self.assertIn("not root authority", module.__doc__)
+
+
+class HistoricalOpportunityBridgeTests(unittest.TestCase):
+    @staticmethod
+    def _open_stage():
+        import scripts.historical_route_publication as publication
+        from tests.test_historical_route_publication import (
+            HistoricalCorePublicationTests,
+        )
+
+        run, finalized, lease, _identity = (
+            HistoricalCorePublicationTests._open_real_task7_lease()
+        )
+        stage = context = None
+        try:
+            stage = publication.stage_historical_replay_core(
+                data_dir=run["fixture"].data_dir,
+                config=run["config"],
+                publication_lease=lease,
+            )
+            lease = None
+            context = publication.load_validated_historical_replay_core_at(
+                staged_core=stage
+            )
+            return run, finalized, stage, context
+        except BaseException:
+            if context is not None:
+                context.close()
+            if stage is not None:
+                stage.close()
+            if lease is not None:
+                lease.close()
+            HistoricalCorePublicationTests._close_real_task7_run(
+                run, finalized
+            )
+            raise
+
+    @staticmethod
+    def _close_stage(run, finalized, stage, context):
+        from tests.test_historical_route_publication import (
+            HistoricalCorePublicationTests,
+        )
+
+        try:
+            if context is not None:
+                context.close()
+        finally:
+            try:
+                if stage is not None:
+                    stage.close()
+            finally:
+                HistoricalCorePublicationTests._close_real_task7_run(
+                    run, finalized
+                )
+
+    def test_pure_bridge_rejects_forged_scenario_capability_before_arithmetic(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(
+                replay.ValidatedHistoricalScenarioInputs
+            )],
+            [
+                "scenario_key", "context_projection_sha256",
+                "source_descriptor_set_sha256", "proof_inputs_hash",
+                "canonical_projection_bytes",
+            ],
+        )
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(
+                publication.ValidatedHistoricalCostProofInputs
+            )],
+            ["scenario_key", "proof_inputs_hash", "object_value"],
+        )
+        self.assertEqual(
+            tuple(inspect.signature(
+                replay.build_historical_atomic_v2_cashflow
+            ).parameters),
+            ("inputs",),
+        )
+        with self.assertRaises((TypeError, ValueError)):
+            replay.ValidatedHistoricalScenarioInputs()
+        with self.assertRaises((TypeError, ValueError)):
+            publication.ValidatedHistoricalCostProofInputs(
+                "scenario", "0" * 64, {}
+            )
+        forged = object.__new__(replay.ValidatedHistoricalScenarioInputs)
+        self.assertEqual(
+            repr(forged), "ValidatedHistoricalScenarioInputs(<redacted>)"
+        )
+        with self.assertRaises((TypeError, ValueError)):
+            pickle.dumps(forged)
+        with mock.patch.object(
+            replay, "v2_exact_input_amount_out_raw",
+            side_effect=AssertionError("arithmetic reached"),
+        ):
+            with self.assertRaises(ValueError):
+                replay.build_historical_atomic_v2_cashflow(forged)
+
+    def test_same_capability_produces_byte_identical_projection(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+        from scripts.route_opportunity import OPPORTUNITY_FIELDS
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            scenario_key = "2:uniswap_to_sushiswap:1000"
+            proof = publication.load_historical_cost_proof_inputs_for_build_context(
+                context=context, scenario_key=scenario_key
+            )
+            self.assertEqual(proof.scenario_key, scenario_key)
+            self.assertEqual(
+                proof.object_value["schema"],
+                "historical_foundry_cost_proof_inputs/v1",
+            )
+            self.assertEqual(len(proof.object_value["rows"]), 9)
+            self.assertEqual(
+                repr(proof),
+                "ValidatedHistoricalCostProofInputs(<redacted>)",
+            )
+            with self.assertRaises((TypeError, ValueError)):
+                dataclasses.replace(proof, scenario_key="transplanted")
+            with self.assertRaises((TypeError, ValueError)):
+                pickle.dumps(proof)
+            inputs = publication._issue_validated_historical_scenario_inputs(
+                context=context, scenario_key=scenario_key
+            )
+            with self.assertRaises((TypeError, ValueError)):
+                dataclasses.replace(inputs, scenario_key="transplanted")
+            cashflow = replay.build_historical_atomic_v2_cashflow(inputs)
+            self.assertEqual(cashflow["first_weth_in_raw"], 333333333333333333)
+            self.assertEqual(cashflow["first_uni_out_raw"], 1328891698325589794)
+            self.assertEqual(cashflow["second_uni_in_raw"], 1328891698325589794)
+            self.assertEqual(cashflow["final_weth_out_raw"], 1323151972535702977)
+            built = replay.build_historical_route_opportunity(inputs)
+            self.assertEqual(set(built["opportunity"]), OPPORTUNITY_FIELDS)
+            self.assertEqual(
+                built["opportunity"]["opportunity_class"],
+                "research_estimate",
+            )
+            self.assertEqual(len(built["cost_components"]), 9)
+            self.assertGreater(
+                Decimal(built["opportunity"]["research_net_edge_usd"]), 0
+            )
+            first = replay.build_historical_scenario_projection(inputs)
+            second = replay.build_historical_scenario_projection(inputs)
+            self.assertEqual(first, second)
+            publication._require_historical_scenario_inputs_current(
+                context=context, inputs=inputs
+            )
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_ten_scenarios_produce_ninety_costs_and_compact_evidence(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+        from scripts.route_cost_topology import (
+            HISTORICAL_ATOMIC_COMPONENT_MATRIX,
+        )
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            scenario_keys = [
+                "2:{}:{}".format(direction, notional)
+                for direction in (
+                    "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+                )
+                for notional in (1000, 5000, 10000, 50000, 100000)
+            ]
+            projections = []
+            costs = []
+            classes = []
+            proof_hashes = set()
+            economics_names = set()
+            baseline_positive = []
+            for scenario_key in scenario_keys:
+                built = publication._build_historical_scenario_for_publication(
+                    context=context, scenario_key=scenario_key
+                )
+                projections.append(built["canonical_projection_bytes"])
+                scenario_projection = json.loads(
+                    built["canonical_projection_bytes"]
+                )
+                economics = scenario_projection["economics_scenarios"]
+                economics_names.update(row["name"] for row in economics)
+                baseline_positive.append(economics[0]["positive_research_net"])
+                self.assertEqual(
+                    [row["priority_fee_percentile"] for row in economics],
+                    [50, 90, 90],
+                )
+                self.assertEqual(
+                    [row["mev_bps"] for row in economics],
+                    ["10", "25", "50"],
+                )
+                costs.extend(built["cost_components"])
+                classes.append(built["opportunity"]["opportunity_class"])
+                proof_hashes.add(built["proof_inputs_hash"])
+            self.assertEqual(len(scenario_keys), 10)
+            self.assertEqual(len(costs), 90)
+            self.assertEqual(len(proof_hashes), 10)
+            self.assertEqual(set(classes), {"research_estimate"})
+            self.assertEqual(economics_names, {
+                "baseline_p50_mev_10bps",
+                "stress_p90_mev_25bps",
+                "stress_p90_mev_50bps",
+            })
+            self.assertTrue(any(baseline_positive))
+            for offset in range(0, 90, 9):
+                self.assertEqual(
+                    tuple(
+                        (
+                            row["leg"], row["component_type"],
+                            row["value_status"],
+                            row["embedded_in_leg_quote"],
+                        )
+                        for row in costs[offset:offset + 9]
+                    ),
+                    HISTORICAL_ATOMIC_COMPONENT_MATRIX,
+                )
+            evidence = json.loads(
+                replay.build_historical_replay_evidence(tuple(projections))
+            )
+            self.assertEqual(
+                evidence["schema"], "historical_foundry_replay_evidence/v1"
+            )
+            self.assertEqual(len(evidence["scenarios"]), 10)
+            self.assertEqual(evidence["opportunity_counts"], {
+                "research_estimate": 10,
+                "strict_eligible": 0,
+                "executable_candidate": 0,
+                "attested": 0,
+                "unavailable": 0,
+            })
+            self.assertEqual(
+                {row["proof_inputs_hash"] for row in evidence["scenarios"]},
+                proof_hashes,
+            )
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_publication_rejects_transplanted_scenario_capability_before_pure_bridge(self):
+        import scripts.historical_route_publication as publication
+
+        first = self._open_stage()
+        second_context = publication.load_validated_historical_replay_core_at(
+            staged_core=first[2]
+        )
+        try:
+            inputs = publication._issue_validated_historical_scenario_inputs(
+                context=first[3],
+                scenario_key="2:uniswap_to_sushiswap:1000",
+            )
+            pure_spy = mock.Mock(
+                side_effect=AssertionError("pure bridge reached")
+            )
+            with mock.patch.object(
+                publication,
+                "_issue_validated_historical_scenario_inputs",
+                return_value=inputs,
+            ), mock.patch.object(
+                publication, "build_historical_scenario_projection", pure_spy
+            ):
+                with self.assertRaises(
+                    publication.HistoricalRoutePublicationError
+                ):
+                    publication._build_historical_scenario_for_publication(
+                        context=second_context,
+                        scenario_key="2:uniswap_to_sushiswap:1000",
+                    )
+            pure_spy.assert_not_called()
+        finally:
+            second_context.close()
+            self._close_stage(*first)
+
+    def test_publication_rejects_stale_capability_before_matrix_and_serialization(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            scenario_key = "2:uniswap_to_sushiswap:1000"
+            inputs = publication._issue_validated_historical_scenario_inputs(
+                context=context, scenario_key=scenario_key
+            )
+            first_projection = replay.build_historical_scenario_projection(
+                inputs
+            )
+            result_path = next(
+                path for path in run["fixture"].data_dir.rglob("result.json")
+                if scenario_key in str(path)
+                and "10000" not in str(path)
+                and "100000" not in str(path)
+            )
+            original = result_path.read_bytes()
+            real_pure = publication.build_historical_scenario_projection
+            matrix_spy = mock.Mock(
+                side_effect=AssertionError("matrix validation reached")
+            )
+
+            def pure_then_mutate(capability):
+                value = real_pure(capability)
+                result_path.write_bytes(
+                    original.replace(b'"status":1', b'"status":0', 1)
+                )
+                return value
+
+            with mock.patch.object(
+                publication, "build_historical_scenario_projection",
+                side_effect=pure_then_mutate,
+            ), mock.patch.object(
+                publication,
+                "_validate_historical_atomic_cost_component_matrix",
+                matrix_spy,
+            ):
+                with self.assertRaises(
+                    publication.HistoricalRoutePublicationError
+                ):
+                    publication._build_historical_scenario_for_publication(
+                        context=context, scenario_key=scenario_key
+                    )
+            self.assertEqual(
+                replay.build_historical_scenario_projection(inputs),
+                first_projection,
+            )
+            matrix_spy.assert_not_called()
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_equivalent_staged_and_committed_capabilities_produce_identical_projection(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+        from tests.test_historical_route_publication import (
+            HistoricalCorePublicationTests,
+        )
+
+        run, finalized, stage, staged_context = self._open_stage()
+        published = None
+        try:
+            scenario_key = "2:uniswap_to_sushiswap:1000"
+            staged_inputs = publication._issue_validated_historical_scenario_inputs(
+                context=staged_context, scenario_key=scenario_key
+            )
+            staged_projection = replay.build_historical_scenario_projection(
+                staged_inputs
+            )
+            staged_context.close()
+            staged_context = None
+            published = publication.publish_historical_replay_core(
+                data_dir=run["fixture"].data_dir, staged_core=stage
+            )
+            stage = None
+            committed_inputs = publication._issue_validated_historical_scenario_inputs(
+                context=published, scenario_key=scenario_key
+            )
+            self.assertEqual(
+                staged_projection,
+                replay.build_historical_scenario_projection(committed_inputs),
+            )
+        finally:
+            if published is not None:
+                published.close()
+            if staged_context is not None:
+                staged_context.close()
+            if stage is not None:
+                stage.close()
+            HistoricalCorePublicationTests._close_real_task7_run(
+                run, finalized
+            )
+
+    def test_pure_bridge_performs_no_io_clock_rpc_or_subprocess(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            all_inputs = tuple(
+                publication._issue_validated_historical_scenario_inputs(
+                    context=context,
+                    scenario_key="2:{}:{}".format(direction, notional),
+                )
+                for direction in (
+                    "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+                )
+                for notional in (1000, 5000, 10000, 50000, 100000)
+            )
+            inputs = all_inputs[0]
+            projections = tuple(
+                replay.build_historical_scenario_projection(item)
+                for item in all_inputs
+            )
+            projection = projections[0]
+            denied = AssertionError("pure historical bridge attempted I/O")
+            with ExitStack() as stack:
+                for target in (
+                    "builtins.open", "pathlib.Path.open", "pathlib.Path.stat",
+                    "pathlib.Path.read_bytes", "os.open", "os.stat",
+                    "socket.socket", "subprocess.run", "subprocess.Popen",
+                    "time.time", "time.time_ns",
+                ):
+                    stack.enter_context(mock.patch(target, side_effect=denied))
+                for _repeat in range(2):
+                    replay.build_historical_atomic_v2_cashflow(inputs)
+                    replay.build_historical_route_opportunity(inputs)
+                    self.assertEqual(
+                        replay.build_historical_scenario_projection(inputs),
+                        projection,
+                    )
+                    replay.build_historical_replay_evidence(projections)
+        finally:
+            self._close_stage(run, finalized, stage, context)
 
 
 if __name__ == "__main__":

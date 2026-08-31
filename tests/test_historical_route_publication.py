@@ -120,6 +120,55 @@ class HistoricalCorePublicationInterfaceTests(unittest.TestCase):
         with self.assertRaises(publication.HistoricalRoutePublicationError):
             context.close()
 
+    def test_historical_feed_age_boundary_accepts_3600_and_rejects_3601(self):
+        publication = self._publication_module()
+
+        publication._validate_historical_feed_validity_boundary(
+            updated_at=100,
+            block_timestamp=3700,
+            max_age_seconds=3600,
+            valid_until=3701,
+        )
+        with self.assertRaises(publication.HistoricalRoutePublicationError):
+            publication._validate_historical_feed_validity_boundary(
+                updated_at=100,
+                block_timestamp=3701,
+                max_age_seconds=3600,
+                valid_until=3701,
+            )
+
+    def test_live_opportunity_quantity_and_quote_evidence_snapshots_remain_frozen(self):
+        import scripts.route_opportunity as opportunity
+        from tests.test_route_opportunity import strict_fixture
+        from tests.test_route_quantity import V2ExactInputIntegerMathTests
+
+        kwargs = strict_fixture()
+        built = opportunity.build_route_opportunity(**kwargs)
+        built_bytes = json.dumps(
+            built, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True, allow_nan=False,
+        ).encode("utf-8")
+        self.assertEqual(
+            hashlib.sha256(built_bytes).hexdigest(),
+            "5a2e17f22064fe385811926f2eb494756645ddb6b36a6132be5987d8ea1eac18",
+        )
+        quote_evidence = opportunity._validated_quote_evidence(
+            kwargs["buy_quote"], kwargs["buy_quote_evidence"],
+            target=kwargs["common_target"], direction="buy",
+        )
+        self.assertEqual(
+            hashlib.sha256(repr(quote_evidence).encode("utf-8")).hexdigest(),
+            "8b6593b3f2e76e1772e13377230e0673177fe0777f7f44c1a8a5caf3c3eec449",
+        )
+        self.assertEqual(
+            V2ExactInputIntegerMathTests.quote_wire_sha256("sell"),
+            "329ee68cd5472c64cffc886b01108d1acb98bc5471cf9fa987bcad0d466c0889",
+        )
+        self.assertEqual(
+            V2ExactInputIntegerMathTests.quote_wire_sha256("buy"),
+            "64e233855d47a083c4bc17e856c89999c9209377c6ee38b9b7aef12e0796a7a1",
+        )
+
 
 class HistoricalCorePublicationTask7SeamTests(unittest.TestCase):
     def test_task7_one_shot_publication_authority_seam_exists(self):

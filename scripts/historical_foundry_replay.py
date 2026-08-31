@@ -13,15 +13,27 @@ import json
 import re
 import weakref
 from collections.abc import Mapping as MappingABC
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
+from fractions import Fraction
 from types import MappingProxyType
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Tuple
 
 from scripts.fetch_dex_depth import decimal_text, depth_fields, v2_band_amounts
+from scripts.execution_cost_components import COST_COMPONENT_CONTRACT_VERSION
 from scripts.historical_foundry_contracts import HistoricalFoundryConfigSet
 from scripts.route_cohort import canonical_route_id
-from scripts.route_quantity import V2PoolState, V2_FEE_FORMULA
+from scripts.route_opportunity import (
+    OPPORTUNITY_FIELDS,
+    ROUTE_OPPORTUNITY_CONTRACT_VERSION,
+    route_opportunity_id,
+)
+from scripts.route_quantity import (
+    V2PoolState,
+    V2_FEE_FORMULA,
+    v2_exact_input_amount_out_raw,
+)
 
 
 _UNI = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
@@ -1133,3 +1145,753 @@ def build_historical_core_projection(*, config: HistoricalFoundryConfigSet,
         "markets": _plain(universe["markets"]), "routes": _plain(universe["routes"]),
         "typed_members": _plain(validated["typed_members"]),
     })
+
+
+def _initialize_validated_historical_scenario_capability():
+    issuer = object()
+    registry = {}
+
+    @dataclass(frozen=True, init=False, repr=False)
+    class ValidatedHistoricalScenarioInputs:
+        scenario_key: str
+        context_projection_sha256: str
+        source_descriptor_set_sha256: str
+        proof_inputs_hash: str
+        canonical_projection_bytes: bytes
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            del cls, args, kwargs
+            raise ValueError(
+                "validated historical scenario construction is private"
+            )
+
+        def __repr__(self) -> str:
+            return "ValidatedHistoricalScenarioInputs(<redacted>)"
+
+        def __reduce_ex__(self, _protocol: int) -> Any:
+            raise TypeError(
+                "validated historical scenario is not serializable"
+            )
+
+    def require(value: Any) -> Mapping[str, Any]:
+        entry = registry.get(id(value))
+        if (
+            type(value) is not ValidatedHistoricalScenarioInputs
+            or entry is None
+            or entry[0]() is not value
+            or entry[1].get("issuer") is not issuer
+        ):
+            raise ValueError(
+                "validated historical scenario capability is invalid"
+            )
+        record = entry[1]
+        for field in (
+            "scenario_key", "context_projection_sha256",
+            "source_descriptor_set_sha256", "proof_inputs_hash",
+            "canonical_projection_bytes",
+        ):
+            try:
+                current = object.__getattribute__(value, field)
+            except AttributeError as error:
+                raise ValueError(
+                    "validated historical scenario capability is invalid"
+                ) from error
+            if current != record[field]:
+                raise ValueError(
+                    "validated historical scenario capability is invalid"
+                )
+        projection_bytes = record["canonical_projection_bytes"]
+        if (
+            type(projection_bytes) is not bytes
+            or hashlib.sha256(projection_bytes).hexdigest()
+            != record["projection_sha256"]
+        ):
+            raise ValueError(
+                "validated historical scenario projection differs"
+            )
+        try:
+            projection = json.loads(projection_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                "validated historical scenario projection is invalid"
+            ) from error
+        if (
+            type(projection) is not dict
+            or _canonical_bytes(projection) != projection_bytes
+            or projection.get("schema")
+            != "historical_foundry_scenario_inputs/v1"
+            or projection.get("scenario_key") != record["scenario_key"]
+            or projection.get("context_projection_sha256")
+            != record["context_projection_sha256"]
+            or projection.get("source_descriptor_set_sha256")
+            != record["source_descriptor_set_sha256"]
+            or projection.get("proof_inputs_hash")
+            != record["proof_inputs_hash"]
+        ):
+            raise ValueError(
+                "validated historical scenario projection binding differs"
+            )
+        return projection
+
+    def issue(
+        *, scenario_key: str, context_projection_sha256: str,
+        source_descriptor_set_sha256: str, proof_inputs_hash: str,
+        canonical_projection_bytes: bytes,
+    ) -> Any:
+        values = (
+            scenario_key, context_projection_sha256,
+            source_descriptor_set_sha256, proof_inputs_hash,
+        )
+        if (
+            type(scenario_key) is not str or not scenario_key
+            or any(type(value) is not str for value in values)
+            or any(
+                _SHA.fullmatch(value) is None
+                for value in values[1:]
+            )
+            or type(canonical_projection_bytes) is not bytes
+        ):
+            raise ValueError("historical scenario issue input is invalid")
+        try:
+            projection = json.loads(canonical_projection_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("historical scenario projection is invalid") from error
+        if (
+            type(projection) is not dict
+            or _canonical_bytes(projection) != canonical_projection_bytes
+            or projection.get("schema")
+            != "historical_foundry_scenario_inputs/v1"
+            or projection.get("scenario_key") != scenario_key
+            or projection.get("context_projection_sha256")
+            != context_projection_sha256
+            or projection.get("source_descriptor_set_sha256")
+            != source_descriptor_set_sha256
+            or projection.get("proof_inputs_hash") != proof_inputs_hash
+        ):
+            raise ValueError("historical scenario projection differs")
+        value = object.__new__(ValidatedHistoricalScenarioInputs)
+        fields = {
+            "scenario_key": scenario_key,
+            "context_projection_sha256": context_projection_sha256,
+            "source_descriptor_set_sha256": source_descriptor_set_sha256,
+            "proof_inputs_hash": proof_inputs_hash,
+            "canonical_projection_bytes": canonical_projection_bytes,
+        }
+        for field, field_value in fields.items():
+            object.__setattr__(value, field, field_value)
+        value_id = id(value)
+        record = {
+            "issuer": issuer,
+            **fields,
+            "projection_sha256": hashlib.sha256(
+                canonical_projection_bytes
+            ).hexdigest(),
+        }
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = registry.get(value_id)
+            if current is not None and current[0] is reference:
+                registry.pop(value_id, None)
+
+        registry[value_id] = (weakref.ref(value, retire), record)
+        return value
+
+    return ValidatedHistoricalScenarioInputs, issue, require
+
+
+(
+    ValidatedHistoricalScenarioInputs,
+    _issue_validated_historical_scenario_inputs_from_publication,
+    _validated_historical_scenario_projection,
+) = _initialize_validated_historical_scenario_capability()
+del _initialize_validated_historical_scenario_capability
+
+
+def _exact_fraction_decimal(value: Fraction) -> str:
+    if not isinstance(value, Fraction):
+        raise ValueError("historical exact fraction is invalid")
+    sign = "-" if value < 0 else ""
+    numerator = abs(value.numerator)
+    denominator = value.denominator
+    integer, remainder = divmod(numerator, denominator)
+    if remainder == 0:
+        return sign + str(integer)
+    digits = []
+    while remainder and len(digits) <= 4_096:
+        remainder *= 10
+        digit, remainder = divmod(remainder, denominator)
+        digits.append(str(digit))
+    if remainder:
+        raise ValueError("historical exact fraction is nonterminating")
+    return "{}{}.{}".format(
+        sign, integer, "".join(digits).rstrip("0")
+    )
+
+
+def _rounded_fraction_text(value: Fraction, places: int = 8) -> str:
+    sign = -1 if value < 0 else 1
+    absolute = abs(value)
+    scale = 10 ** places
+    quotient, remainder = divmod(
+        absolute.numerator * scale, absolute.denominator
+    )
+    doubled = remainder * 2
+    if doubled > absolute.denominator or (
+        doubled == absolute.denominator and quotient % 2
+    ):
+        quotient += 1
+    quotient *= sign
+    if quotient == 0:
+        return "0"
+    negative = quotient < 0
+    digits = str(abs(quotient)).rjust(places + 1, "0")
+    text = digits[:-places] + "." + digits[-places:]
+    text = text.rstrip("0").rstrip(".")
+    return ("-" if negative else "") + text
+
+
+def _historical_ratio_fields(
+    edge: Fraction, buy_cost: Fraction,
+) -> Tuple[str, str, str]:
+    if buy_cost <= 0:
+        raise ValueError("historical buy cost is invalid")
+    ratio = edge * 10_000 / buy_cost
+    return (
+        _rounded_fraction_text(ratio),
+        str(ratio.numerator),
+        str(ratio.denominator),
+    )
+
+
+def _run_historical_v2_exact_input_kat() -> None:
+    first = v2_exact_input_amount_out_raw(
+        reserve_in_raw=10, reserve_out_raw=10, amount_in_raw=4,
+        fee_numerator=1, fee_denominator=1,
+    )
+    reverse = v2_exact_input_amount_out_raw(
+        reserve_in_raw=10, reserve_out_raw=10, amount_in_raw=4,
+        fee_numerator=1, fee_denominator=1,
+    )
+    second = v2_exact_input_amount_out_raw(
+        reserve_in_raw=10, reserve_out_raw=20, amount_in_raw=2,
+        fee_numerator=1, fee_denominator=1,
+    )
+    legacy_inverse = (10 * 2 + (10 - 2) - 1) // (10 - 2)
+    if (first, reverse, second, legacy_inverse) != (2, 2, 3, 3):
+        raise ValueError("historical V2 exact-input KAT differs")
+
+
+def build_historical_atomic_v2_cashflow(
+    inputs: ValidatedHistoricalScenarioInputs,
+) -> Mapping[str, Any]:
+    projection = _validated_historical_scenario_projection(inputs)
+    _run_historical_v2_exact_input_kat()
+    selection = projection.get("selection_scenario")
+    result = projection.get("result")
+    receipt = projection.get("receipt")
+    trace = projection.get("trace")
+    overlay = projection.get("overlay")
+    pools = projection.get("pools")
+    route = projection.get("route")
+    price = projection.get("price")
+    formula = projection.get("v2_formula")
+    if any(type(value) is not dict for value in (
+        selection, result, receipt, trace, overlay, pools, route, price,
+        formula,
+    )):
+        raise ValueError("historical scenario arithmetic projection is invalid")
+    direction = selection.get("direction")
+    if direction == "uniswap_to_sushiswap":
+        buy_venue, sell_venue = "uniswap_v2", "sushiswap_v2"
+    elif direction == "sushiswap_to_uniswap":
+        buy_venue, sell_venue = "sushiswap_v2", "uniswap_v2"
+    else:
+        raise ValueError("historical scenario direction is invalid")
+    buy_pool = pools.get(buy_venue)
+    sell_pool = pools.get(sell_venue)
+    if type(buy_pool) is not dict or type(sell_pool) is not dict:
+        raise ValueError("historical scenario pool projection is invalid")
+    proof_authority = result.get("proof_authority")
+    balances = result.get("balances")
+    deltas = result.get("actual_deltas")
+    if any(type(value) is not dict for value in (
+        proof_authority, balances, deltas,
+    )):
+        raise ValueError("historical execution closure is invalid")
+    try:
+        weth_account = overlay["accounts"][_WETH]
+        first_weth_in = weth_account["balance_delta"]
+        fee_numerator = formula["fee_numerator"]
+        fee_denominator = formula["fee_denominator"]
+        answer = int(price["answer"])
+        feed_decimals = int(price["decimals"])
+        requested_notional = selection["requested_notional_usd"]
+        first_uni_out = v2_exact_input_amount_out_raw(
+            reserve_in_raw=int(buy_pool["reserve1_raw"]),
+            reserve_out_raw=int(buy_pool["reserve0_raw"]),
+            amount_in_raw=first_weth_in,
+            fee_numerator=fee_numerator,
+            fee_denominator=fee_denominator,
+        )
+        second_uni_in = first_uni_out
+        final_weth_out = v2_exact_input_amount_out_raw(
+            reserve_in_raw=int(sell_pool["reserve0_raw"]),
+            reserve_out_raw=int(sell_pool["reserve1_raw"]),
+            amount_in_raw=second_uni_in,
+            fee_numerator=fee_numerator,
+            fee_denominator=fee_denominator,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("historical exact-input arithmetic is invalid") from error
+    expected_weth_in = (
+        requested_notional * 10 ** (18 + feed_decimals) // answer
+    )
+    economics = selection.get("economics")
+    if type(economics) is not dict or set(economics) != {
+        "gross_edge_usd", "gas_cost_usd", "mev_buffer_usd",
+        "policy_net_edge_usd",
+    }:
+        raise ValueError("historical scenario economics are invalid")
+
+    def proved_fraction(name: str) -> Fraction:
+        value = economics.get(name)
+        if (
+            type(value) is not dict
+            or set(value) != {"numerator", "denominator", "display"}
+            or type(value.get("numerator")) is not int
+            or type(value.get("denominator")) is not int
+            or value["denominator"] <= 0
+            or type(value.get("display")) is not str
+        ):
+            raise ValueError("historical scenario economics are invalid")
+        number = Fraction(value["numerator"], value["denominator"])
+        if value["display"] != _exact_fraction_decimal(number):
+            raise ValueError("historical scenario economics differ")
+        return number
+
+    gross_usd = Fraction(
+        (final_weth_out - first_weth_in) * answer,
+        10 ** (18 + feed_decimals),
+    )
+    gas_usd = Fraction(
+        receipt["gasUsed"] * receipt["effectiveGasPrice"] * answer,
+        10 ** (18 + feed_decimals),
+    )
+    mev_usd = Fraction(requested_notional * 10, 10_000)
+    if (
+        proved_fraction("gross_edge_usd") != gross_usd
+        or proved_fraction("gas_cost_usd") != gas_usd
+        or proved_fraction("mev_buffer_usd") != mev_usd
+        or proved_fraction("policy_net_edge_usd")
+        != gross_usd - gas_usd - mev_usd
+    ):
+        raise ValueError("historical scenario economics differ")
+    scenario_key = projection["scenario_key"]
+    expected_route_id = route.get("route_id")
+    if (
+        type(first_weth_in) is not int
+        or first_weth_in <= 0
+        or first_weth_in != expected_weth_in
+        or projection.get("proof_inputs_hash")
+        != result.get("cost_proof_inputs", {}).get("proof_inputs_hash")
+        or proof_authority.get("amount_weth_in_wei") != first_weth_in
+        or proof_authority.get("actual_first_leg_uni_raw") != first_uni_out
+        or proof_authority.get("direction") != direction
+        or proof_authority.get("requested_notional_usd")
+        != requested_notional
+        or balances.get("initial_weth_raw") != first_weth_in
+        or balances.get("initial_uni_raw") != 0
+        or balances.get("final_weth_raw") != final_weth_out
+        or balances.get("final_uni_raw") != 0
+        or deltas.get("first_leg_uni_raw") != first_uni_out
+        or deltas.get("weth_raw") != final_weth_out - first_weth_in
+        or deltas.get("residual_uni_raw") != 0
+        or selection.get("weth_delta_raw")
+        != final_weth_out - first_weth_in
+        or selection.get("scenario_key") != scenario_key
+        or receipt.get("scenario_key") != scenario_key
+        or receipt.get("status") != 1
+        or result.get("scenario_key") != scenario_key
+        or result.get("status") != 1
+        or trace.get("scenario_key") != scenario_key
+        or trace.get("failed") is not False
+        or trace.get("gasprice_opcode_addresses") != []
+        or projection.get("route_id") != expected_route_id
+        or route.get("route_mode") != "atomic_onchain"
+    ):
+        raise ValueError("historical exact-input evidence differs")
+    return _freeze({
+        "schema": "historical_atomic_v2_cashflow/v1",
+        "scenario_key": scenario_key,
+        "direction": direction,
+        "route_id": expected_route_id,
+        "requested_notional_usd": requested_notional,
+        "buy_venue": buy_venue,
+        "sell_venue": sell_venue,
+        "first_weth_in_raw": first_weth_in,
+        "first_uni_out_raw": first_uni_out,
+        "second_uni_in_raw": second_uni_in,
+        "final_weth_out_raw": final_weth_out,
+        "gross_edge_weth_raw": final_weth_out - first_weth_in,
+        "buy_post_reserve_weth_raw": int(buy_pool["reserve1_raw"])
+        + first_weth_in,
+        "buy_post_reserve_uni_raw": int(buy_pool["reserve0_raw"])
+        - first_uni_out,
+        "sell_post_reserve_uni_raw": int(sell_pool["reserve0_raw"])
+        + second_uni_in,
+        "sell_post_reserve_weth_raw": int(sell_pool["reserve1_raw"])
+        - final_weth_out,
+    })
+
+
+def _historical_cost_rows(
+    projection: Mapping[str, Any], cashflow: Mapping[str, Any],
+) -> Tuple[Mapping[str, Any], ...]:
+    route = projection["route"]
+    proof = projection["proof_inputs"]
+    requested = projection["selection_scenario"]["requested_notional_usd"]
+    opportunity_id = route_opportunity_id(route["route_id"], requested)
+    target = _exact_fraction_decimal(Fraction(
+        cashflow["first_uni_out_raw"], 10 ** 18
+    ))
+    rows = []
+    for proof_row in proof["rows"]:
+        leg = proof_row["grain"]
+        rows.append({
+            "contract_version": COST_COMPONENT_CONTRACT_VERSION,
+            "cohort_id": projection["cohort_id"],
+            "opportunity_id": opportunity_id,
+            "leg": leg,
+            "market_id": (
+                route["buy_market_id"] if leg == "buy"
+                else route["sell_market_id"] if leg == "sell" else ""
+            ),
+            "direction": (
+                "buy_token" if leg == "buy"
+                else "sell_token" if leg == "sell" else "route"
+            ),
+            "requested_notional_usd": str(requested),
+            "target_token_quantity": target,
+            "component_type": proof_row["component"],
+            "value_status": proof_row["value_status"],
+            "amount_usd": proof_row["amount_usd_exact"],
+            "rate_bps": proof_row["rate_bps_exact"],
+            "basis": "historical_foundry_exact_proof_input",
+            "strict_eligible": False,
+            "embedded_in_leg_quote": proof_row["embedded"],
+            "observed_at": None,
+            "valid_until": None,
+            "source": proof_row["proof_role"],
+            "source_record_sha256": proof_row["proof_sha256"],
+            "reason_code": None,
+        })
+    return tuple(_freeze(row) for row in rows)
+
+
+def build_historical_route_opportunity(
+    inputs: ValidatedHistoricalScenarioInputs,
+) -> Mapping[str, Any]:
+    projection = _validated_historical_scenario_projection(inputs)
+    cashflow = build_historical_atomic_v2_cashflow(inputs)
+    route = projection["route"]
+    pools = projection["pools"]
+    price = projection["price"]
+    selection = projection["selection_scenario"]
+    answer = int(price["answer"])
+    decimals = int(price["decimals"])
+    usd_denominator = 10 ** (18 + decimals)
+    buy_cost = Fraction(
+        cashflow["first_weth_in_raw"] * answer, usd_denominator
+    )
+    sell_proceeds = Fraction(
+        cashflow["final_weth_out_raw"] * answer, usd_denominator
+    )
+    gross_edge = sell_proceeds - buy_cost
+    rows = _historical_cost_rows(projection, cashflow)
+    bounded_cost = sum(
+        (
+            Fraction(Decimal(row["amount_usd"]))
+            for row in rows
+            if row["value_status"] == "bounded_estimate"
+            and row["embedded_in_leg_quote"] is False
+        ),
+        Fraction(0),
+    )
+    assumed_cost = sum(
+        (
+            Fraction(Decimal(row["amount_usd"]))
+            for row in rows if row["value_status"] == "assumed"
+        ),
+        Fraction(0),
+    )
+    strict_cost = Fraction(0)
+    strict_net = gross_edge - strict_cost
+    research_net = gross_edge - strict_cost - bounded_cost - assumed_cost
+    gross_bps = _historical_ratio_fields(gross_edge, buy_cost)
+    strict_bps = _historical_ratio_fields(strict_net, buy_cost)
+    research_bps = _historical_ratio_fields(research_net, buy_cost)
+    opportunity_id = route_opportunity_id(
+        route["route_id"], selection["requested_notional_usd"]
+    )
+    target = _exact_fraction_decimal(Fraction(
+        cashflow["first_uni_out_raw"], 10 ** 18
+    ))
+    buy_pool = pools[cashflow["buy_venue"]]
+    sell_pool = pools[cashflow["sell_venue"]]
+    row = {
+        "contract_version": ROUTE_OPPORTUNITY_CONTRACT_VERSION,
+        "cohort_id": projection["cohort_id"],
+        "route_id": route["route_id"],
+        "opportunity_id": opportunity_id,
+        "token_symbol": route["token_symbol"],
+        "buy_market_id": route["buy_market_id"],
+        "sell_market_id": route["sell_market_id"],
+        "route_mode": route["route_mode"],
+        "requested_notional_usd": str(selection["requested_notional_usd"]),
+        "target_token_quantity": target,
+        "target_base_raw": str(cashflow["first_uni_out_raw"]),
+        "target_base_unit_decimals": 18,
+        "target_lattice_raw": "1",
+        "buy_state_id": buy_pool["state_id"],
+        "sell_state_id": sell_pool["state_id"],
+        "buy_state_observed_at": buy_pool["observed_at"],
+        "sell_state_observed_at": sell_pool["observed_at"],
+        "skew_seconds": "0",
+        "route_age_seconds": "0",
+        "gross_buy_cost_usd": _exact_fraction_decimal(buy_cost),
+        "gross_sell_proceeds_usd": _exact_fraction_decimal(sell_proceeds),
+        "gross_edge_usd": _exact_fraction_decimal(gross_edge),
+        "gross_edge_bps": gross_bps[0],
+        "gross_edge_bps_numerator": gross_bps[1],
+        "gross_edge_bps_denominator": gross_bps[2],
+        "strict_nonembedded_cost_usd": _exact_fraction_decimal(strict_cost),
+        "research_bounded_cost_usd": _exact_fraction_decimal(bounded_cost),
+        "research_assumed_cost_usd": _exact_fraction_decimal(assumed_cost),
+        "strict_net_edge_usd": _exact_fraction_decimal(strict_net),
+        "strict_net_edge_bps": strict_bps[0],
+        "strict_net_edge_bps_numerator": strict_bps[1],
+        "strict_net_edge_bps_denominator": strict_bps[2],
+        "research_net_edge_usd": _exact_fraction_decimal(research_net),
+        "research_net_edge_bps": research_bps[0],
+        "research_net_edge_bps_numerator": research_bps[1],
+        "research_net_edge_bps_denominator": research_bps[2],
+        "edge_bps_denominator_basis": "gross_buy_cost_usd",
+        "cost_completeness": "incomplete",
+        "scenario_cost_completeness": "complete",
+        "reflected_or_embedded_component_keys": [
+            "buy:pool_swap_fee", "sell:pool_swap_fee",
+        ],
+        "component_reasons": ["cost_component_estimated"],
+        "mode_evidence_eligible": True,
+        "inventory_profile_hash": projection["proof_inputs_hash"],
+        "maximum_proved_capacity_quantity": target,
+        "opportunity_class": "research_estimate",
+        "primary_reason": "cost_component_estimated",
+        "reason_codes": ["cost_component_estimated"],
+        "strict_eligible": False,
+        "strict_ready_for_publication": False,
+        "publication_attestation_sha256": None,
+        "buy_usd_projection_sha256": projection["feed_sha256_by_venue"][
+            cashflow["buy_venue"]
+        ],
+        "sell_usd_projection_sha256": projection["feed_sha256_by_venue"][
+            cashflow["sell_venue"]
+        ],
+        "cost_component_set_sha256": _digest(rows),
+        "mode_evidence_sha256": _typed_digest(
+            "historical_atomic_mode_evidence/v1",
+            {
+                "scenario_key": projection["scenario_key"],
+                "proof_inputs_hash": projection["proof_inputs_hash"],
+            },
+        ),
+        "buy_core_manifest_sha256": projection["context_projection_sha256"],
+        "sell_core_manifest_sha256": projection["context_projection_sha256"],
+    }
+    if set(row) != set(OPPORTUNITY_FIELDS) - {"evidence_binding_sha256"}:
+        raise ValueError("historical opportunity schema differs")
+    row["evidence_binding_sha256"] = _digest(row)
+    fee = projection["fee"]
+    policy_fees = projection["policy_fees"]
+    receipt = projection["receipt"]
+    if (
+        type(fee) is not dict
+        or any(type(fee.get(field)) is not int for field in (
+            "next_base_fee_per_gas", "p50_priority_fee_per_gas",
+            "p90_priority_fee_per_gas",
+        ))
+        or fee["p50_priority_fee_per_gas"]
+        > fee["p90_priority_fee_per_gas"]
+        or type(policy_fees) is not dict
+        or policy_fees.get("acceptance_tip_percentile") != 50
+        or policy_fees.get("stress_tip_percentile") != 90
+        or policy_fees.get("acceptance_mev_bps") != "10"
+        or policy_fees.get("stress_mev_bps") != ["25", "50"]
+        or projection["trace"].get("gasprice_opcode_addresses") != []
+    ):
+        raise ValueError("historical stress policy projection differs")
+    gas_used = receipt["gasUsed"]
+    baseline_gas = Fraction(
+        gas_used * receipt["effectiveGasPrice"] * answer,
+        usd_denominator,
+    )
+    p90_effective_gas_price = (
+        fee["next_base_fee_per_gas"]
+        + fee["p90_priority_fee_per_gas"]
+    )
+    stress_gas = Fraction(
+        gas_used * p90_effective_gas_price * answer,
+        usd_denominator,
+    )
+    scenarios = []
+    for name, percentile, mev_bps, gas_amount in (
+        ("baseline_p50_mev_10bps", 50, 10, baseline_gas),
+        ("stress_p90_mev_25bps", 90, 25, stress_gas),
+        ("stress_p90_mev_50bps", 90, 50, stress_gas),
+    ):
+        mev_amount = Fraction(
+            selection["requested_notional_usd"] * mev_bps, 10_000
+        )
+        scenario_net = gross_edge - gas_amount - mev_amount
+        scenarios.append({
+            "name": name,
+            "priority_fee_percentile": percentile,
+            "mev_bps": str(mev_bps),
+            "gas_used": gas_used,
+            "effective_gas_price": (
+                receipt["effectiveGasPrice"]
+                if percentile == 50 else p90_effective_gas_price
+            ),
+            "gas_cost_usd": _exact_fraction_decimal(gas_amount),
+            "mev_buffer_usd": _exact_fraction_decimal(mev_amount),
+            "research_net_edge_usd": _exact_fraction_decimal(scenario_net),
+            "positive_research_net": scenario_net > 0,
+        })
+    return _freeze({
+        "schema": "historical_route_opportunity_build/v1",
+        "opportunity": row,
+        "cost_components": list(rows),
+        "economics_scenarios": scenarios,
+    })
+
+
+def build_historical_scenario_projection(
+    inputs: ValidatedHistoricalScenarioInputs,
+) -> bytes:
+    projection = _validated_historical_scenario_projection(inputs)
+    cashflow = build_historical_atomic_v2_cashflow(inputs)
+    built = build_historical_route_opportunity(inputs)
+    value = {
+        "schema": "historical_foundry_replay_scenario/v1",
+        "scenario_key": projection["scenario_key"],
+        "route_id": projection["route_id"],
+        "requested_notional_usd": projection["selection_scenario"][
+            "requested_notional_usd"
+        ],
+        "receipt_status": projection["receipt"]["status"],
+        "proof_inputs_hash": projection["proof_inputs_hash"],
+        "overlay_sha256": projection["overlay_sha256"],
+        "receipt_sha256": projection["receipt_sha256"],
+        "trace_sha256": projection["trace_sha256"],
+        "result_sha256": projection["result_sha256"],
+        "gross_edge_weth_raw": cashflow["gross_edge_weth_raw"],
+        "opportunity": _plain(built["opportunity"]),
+        "cost_components": _plain(built["cost_components"]),
+        "economics_scenarios": _plain(built["economics_scenarios"]),
+    }
+    value["scenario_projection_sha256"] = _digest(value)
+    return _canonical_bytes(value)
+
+
+def build_historical_replay_evidence(
+    canonical_scenario_projection_bytes: Tuple[bytes, ...],
+) -> bytes:
+    if (
+        type(canonical_scenario_projection_bytes) is not tuple
+        or len(canonical_scenario_projection_bytes) != 10
+        or any(type(value) is not bytes for value in canonical_scenario_projection_bytes)
+    ):
+        raise ValueError("historical replay scenario inventory is not exact")
+    scenarios = []
+    observed = set()
+    for raw in canonical_scenario_projection_bytes:
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("historical replay scenario is invalid") from error
+        provided = dict(value)
+        binding = provided.pop("scenario_projection_sha256", None)
+        if (
+            type(value) is not dict
+            or _canonical_bytes(value) != raw
+            or value.get("schema") != "historical_foundry_replay_scenario/v1"
+            or binding != _digest(provided)
+            or value.get("receipt_status") != 1
+            or type(value.get("scenario_key")) is not str
+            or value["scenario_key"] in observed
+        ):
+            raise ValueError("historical replay scenario binding differs")
+        observed.add(value["scenario_key"])
+        opportunity = value.get("opportunity")
+        if (
+            type(opportunity) is not dict
+            or opportunity.get("opportunity_class") != "research_estimate"
+            or opportunity.get("strict_eligible") is not False
+            or opportunity.get("strict_ready_for_publication") is not False
+            or opportunity.get("publication_attestation_sha256") is not None
+        ):
+            raise ValueError("historical opportunity classification differs")
+        scenarios.append({
+            "scenario_key": value["scenario_key"],
+            "route_id": value["route_id"],
+            "requested_notional_usd": value["requested_notional_usd"],
+            "proof_inputs_hash": value["proof_inputs_hash"],
+            "overlay_sha256": value["overlay_sha256"],
+            "scenario_projection_sha256": binding,
+            "opportunity_evidence_binding_sha256": opportunity[
+                "evidence_binding_sha256"
+            ],
+            "research_net_edge_usd": opportunity[
+                "research_net_edge_usd"
+            ],
+            "economics_scenarios_sha256": _digest(
+                value["economics_scenarios"]
+            ),
+            "positive_research_net": Decimal(
+                value["opportunity"]["research_net_edge_usd"]
+            ) > 0,
+        })
+    expected_notionals = {1000, 5000, 10000, 50000, 100000}
+    by_route = {}
+    for row in scenarios:
+        by_route.setdefault(row["route_id"], set()).add(
+            row["requested_notional_usd"]
+        )
+    if (
+        len(by_route) != 2
+        or any(notionals != expected_notionals for notionals in by_route.values())
+        or not any(row["positive_research_net"] for row in scenarios)
+    ):
+        raise ValueError("historical replay scenario set differs")
+    result = {
+        "schema": "historical_foundry_replay_evidence/v1",
+        "opportunity_counts": {
+            "research_estimate": 10,
+            "strict_eligible": 0,
+            "executable_candidate": 0,
+            "attested": 0,
+            "unavailable": 0,
+        },
+        "overlay_set_sha256": _typed_digest(
+            "historical_foundry_overlay_set/v1",
+            sorted(row["overlay_sha256"] for row in scenarios),
+        ),
+        "scenario_set_sha256": _typed_digest(
+            "historical_foundry_scenario_set/v1", scenarios
+        ),
+        "scenarios": scenarios,
+    }
+    result["complete_manifest_sha256"] = _typed_digest(
+        "historical_foundry_replay_evidence/v1", result
+    )
+    return _canonical_bytes(result)
