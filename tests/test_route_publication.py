@@ -55,6 +55,7 @@ from scripts.route_cost_evidence import (
     build_unavailable_route_cost_evidence_manifest,
 )
 from tests.test_route_opportunity import cex_leg, route_and_mode
+from tests.test_route_cost_topology import historical_rows
 import scripts.route_publication as route_publication
 
 
@@ -1858,6 +1859,35 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
             with self.subTest(rows=len(candidate["cost_components"])):
                 with self.assertRaises(ValueError):
                     route_publication._validate_complete_logical_bundle(candidate)
+
+    def test_live_publication_rejects_historical_atomic_nine_row_topology(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root, raw_root,
+            Path(self.temporary.name) / "sources",
+            Path(self.temporary.name) / "private",
+        )
+        complete = route_publication.build_complete_route_bundle(
+            core_root=self.root,
+            raw_root=raw_root,
+            source_root=fixture["source_root"],
+            fee_profile_path=fixture["fee_profile_path"],
+            fee_profile_id=fixture["fee_profile_id"],
+            inventory_profile_path=fixture["inventory_profile_path"],
+            opportunity_inputs=fixture["opportunity_inputs"],
+        )
+        candidate = copy.deepcopy(complete)
+        candidate["cost_components"] = historical_rows()
+        candidate["cost_components"].sort(key=lambda row: (
+            row["opportunity_id"], row["leg"], row["component_type"]
+        ))
+        self.assertEqual(len(candidate["cost_components"]), 9)
+
+        with self.assertRaisesRegex(
+            route_publication.RoutePublicationError,
+            "complete cost inventory is invalid",
+        ):
+            route_publication._validate_complete_logical_bundle(candidate)
 
     def test_sqlite_csv_divergence_and_incomplete_public_pointer_are_rejected(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"

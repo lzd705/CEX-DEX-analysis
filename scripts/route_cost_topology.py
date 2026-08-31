@@ -40,6 +40,10 @@ _HISTORICAL_ATOMIC_KEYS = tuple(
     for leg, component_type, _value_status, _embedded
     in HISTORICAL_ATOMIC_COMPONENT_MATRIX
 )
+_HISTORICAL_PROOF_ROLES = (
+    "receipt", "receipt", "receipt", "receipt", "receipt", "receipt",
+    "receipt", "trace", "policy",
+)
 _HISTORICAL_ZERO_FEE_KEYS = frozenset({
     ("buy", "router_or_integrator_fee"),
     ("buy", "token_transfer_tax"),
@@ -147,10 +151,14 @@ def _validate_historical_atomic_cost_component_matrix(
     expected_zero_fee_proof_sha256_by_key: Mapping[Tuple[str, str], str],
     expected_gas_amount_usd: str,
     expected_gas_source_sha256: str,
+    expected_transfer_source_sha256: str,
     expected_mev_amount_usd: str,
     expected_policy_sha256: str,
 ) -> None:
-    """Validate the exact context-free nine-row historical atomic matrix."""
+    """Validate the exact context-free nine-row historical atomic matrix.
+
+    Tasks 5-6 authenticate the expected hashes before calling this binder.
+    """
     if not isinstance(route, Mapping) or route.get("route_mode") != "atomic_onchain":
         raise ValueError("historical route must be atomic_onchain")
     buy_market_id = route.get("buy_market_id")
@@ -178,6 +186,7 @@ def _validate_historical_atomic_cost_component_matrix(
         _sha256(value, "{} {} proof".format(*key))
     _canonical_nonnegative_decimal(expected_gas_amount_usd, "expected gas amount")
     _sha256(expected_gas_source_sha256, "expected gas source")
+    _sha256(expected_transfer_source_sha256, "expected transfer source")
     _canonical_nonnegative_decimal(expected_mev_amount_usd, "expected MEV amount")
     _sha256(expected_policy_sha256, "expected policy source")
     if not isinstance(expected_cohort_id, str) or not expected_cohort_id:
@@ -188,7 +197,11 @@ def _validate_historical_atomic_cost_component_matrix(
     requested_notional = None
     target_quantity = None
     observed_keys = []
-    for row, expected_shape in zip(rows, HISTORICAL_ATOMIC_COMPONENT_MATRIX):
+    for row, expected_shape, expected_role in zip(
+        rows,
+        HISTORICAL_ATOMIC_COMPONENT_MATRIX,
+        _HISTORICAL_PROOF_ROLES,
+    ):
         if not isinstance(row, Mapping) or set(row) != set(COST_COMPONENT_COLUMNS):
             raise ValueError("historical cost row schema is invalid")
         leg, component_type, value_status, embedded = expected_shape
@@ -202,6 +215,9 @@ def _validate_historical_atomic_cost_component_matrix(
             or row.get("opportunity_id") != expected_opportunity_id
             or row.get("strict_eligible") is not False
             or row.get("reason_code") is not None
+            or row.get("observed_at") is not None
+            or row.get("valid_until") is not None
+            or row.get("source") != expected_role
         ):
             raise ValueError("historical atomic cost row contract is invalid")
         observed_keys.append((leg, component_type))
@@ -219,8 +235,6 @@ def _validate_historical_atomic_cost_component_matrix(
             or row.get("direction") != expected_direction
             or not isinstance(row.get("basis"), str)
             or not row["basis"]
-            or not isinstance(row.get("source"), str)
-            or not row["source"]
         ):
             raise ValueError("historical atomic cost row lineage is invalid")
         row_notional_text, row_notional = _positive_decimal(
@@ -264,8 +278,9 @@ def _validate_historical_atomic_cost_component_matrix(
             if (
                 row.get("amount_usd") is not None
                 or row.get("rate_bps") is not None
-                or row.get("source") != "validated route topology"
-                or row.get("source_record_sha256") is not None
+                or row.get("source") != "trace"
+                or row.get("source_record_sha256")
+                != expected_transfer_source_sha256
             ):
                 raise ValueError("historical transfer topology proof is invalid")
         elif key == ("route", "mev_buffer"):
@@ -285,4 +300,3 @@ def _validate_historical_atomic_cost_component_matrix(
     )
     if expected_mev != requested_notional[1] * Fraction(10, 10_000):
         raise ValueError("historical MEV amount does not reproduce ten bps")
-

@@ -24,6 +24,7 @@ from scripts.route_opportunity import (
 )
 from scripts.route_quantity import CommonTarget, FeeSemantics, MarketRules
 from scripts.route_quantity import V2PoolState, quote_v2_pool_quantity
+from tests.test_route_cost_topology import historical_rows
 
 
 COHORT_ID = "cohort:" + "c" * 64
@@ -665,6 +666,18 @@ class CommonQuantityTests(unittest.TestCase):
 
 
 class RouteOpportunityTests(unittest.TestCase):
+    def test_live_builder_rejects_historical_atomic_nine_row_topology(self):
+        kwargs = strict_fixture()
+        self.assertEqual(len(historical_rows()), 9)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "amount_usd and rate_bps do not recompute",
+        ):
+            build_route_opportunity(
+                **{**kwargs, "cost_components": historical_rows()}
+            )
+
     def test_public_reason_registry_covers_every_mode_reason(self):
         expected_mode_reasons = frozenset().union(
             *route_opportunity._MODE_REASON_CODES_BY_MODE.values()

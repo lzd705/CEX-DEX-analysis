@@ -54,15 +54,17 @@ HISTORICAL_ATOMIC_COMPONENT_MATRIX = (
     ("route", "mev_buffer", "assumed", False),
 )
 
-POOL_FEE_SOURCE_BY_LEG = {"buy": "5" * 64, "sell": "6" * 64}
+RECEIPT_SOURCE = "5" * 64
+TRACE_SOURCE = "6" * 64
+POOL_FEE_SOURCE_BY_LEG = {"buy": RECEIPT_SOURCE, "sell": RECEIPT_SOURCE}
 POOL_FEE_AMOUNT_BY_LEG = {"buy": "3", "sell": "4"}
 ZERO_PROOF_BY_KEY = {
-    ("buy", "router_or_integrator_fee"): "7" * 64,
-    ("buy", "token_transfer_tax"): "8" * 64,
-    ("sell", "router_or_integrator_fee"): "9" * 64,
-    ("sell", "token_transfer_tax"): "a" * 64,
+    ("buy", "router_or_integrator_fee"): RECEIPT_SOURCE,
+    ("buy", "token_transfer_tax"): RECEIPT_SOURCE,
+    ("sell", "router_or_integrator_fee"): RECEIPT_SOURCE,
+    ("sell", "token_transfer_tax"): RECEIPT_SOURCE,
 }
-GAS_SOURCE = "b" * 64
+GAS_SOURCE = RECEIPT_SOURCE
 POLICY_SOURCE = "c" * 64
 
 
@@ -114,47 +116,47 @@ def historical_rows():
     return [
         _row(
             "buy", "pool_swap_fee", "bounded_estimate", True,
-            amount="3", rate="30", source="receipt-bound pool fee",
+            amount="3", rate="30", source="receipt",
             source_hash=POOL_FEE_SOURCE_BY_LEG["buy"],
         ),
         _row(
             "buy", "router_or_integrator_fee", "bounded_estimate", False,
-            amount="0", rate="0", source="receipt-bound zero fee",
+            amount="0", rate="0", source="receipt",
             source_hash=ZERO_PROOF_BY_KEY[("buy", "router_or_integrator_fee")],
         ),
         _row(
             "buy", "token_transfer_tax", "bounded_estimate", False,
-            amount="0", rate="0", source="balance-bound zero tax",
+            amount="0", rate="0", source="receipt",
             source_hash=ZERO_PROOF_BY_KEY[("buy", "token_transfer_tax")],
         ),
         _row(
             "sell", "pool_swap_fee", "bounded_estimate", True,
-            amount="4", rate="30", source="receipt-bound pool fee",
+            amount="4", rate="30", source="receipt",
             source_hash=POOL_FEE_SOURCE_BY_LEG["sell"],
         ),
         _row(
             "sell", "router_or_integrator_fee", "bounded_estimate", False,
-            amount="0", rate="0", source="receipt-bound zero fee",
+            amount="0", rate="0", source="receipt",
             source_hash=ZERO_PROOF_BY_KEY[("sell", "router_or_integrator_fee")],
         ),
         _row(
             "sell", "token_transfer_tax", "bounded_estimate", False,
-            amount="0", rate="0", source="balance-bound zero tax",
+            amount="0", rate="0", source="receipt",
             source_hash=ZERO_PROOF_BY_KEY[("sell", "token_transfer_tax")],
         ),
         _row(
             "route", "network_gas", "assumed", False,
-            amount="2", rate=None, source="receipt gas evidence",
+            amount="2", rate=None, source="receipt",
             source_hash=GAS_SOURCE,
         ),
         _row(
             "route", "rebalancing_or_transfer", "not_applicable", False,
-            amount=None, rate=None, source="validated route topology",
-            source_hash=None,
+            amount=None, rate=None, source="trace",
+            source_hash=TRACE_SOURCE,
         ),
         _row(
             "route", "mev_buffer", "assumed", False,
-            amount="1", rate="10", source="historical replay policy",
+            amount="1", rate="10", source="policy",
             source_hash=POLICY_SOURCE,
         ),
     ]
@@ -169,6 +171,7 @@ def validate(rows, **changes):
         "expected_zero_fee_proof_sha256_by_key": ZERO_PROOF_BY_KEY,
         "expected_gas_amount_usd": "2",
         "expected_gas_source_sha256": GAS_SOURCE,
+        "expected_transfer_source_sha256": TRACE_SOURCE,
         "expected_mev_amount_usd": "1",
         "expected_policy_sha256": POLICY_SOURCE,
     }
@@ -304,6 +307,7 @@ class HistoricalAtomicCostTopologyTests(unittest.TestCase):
                 expected_zero_fee_proof_sha256_by_key=ZERO_PROOF_BY_KEY,
                 expected_gas_amount_usd="2",
                 expected_gas_source_sha256=GAS_SOURCE,
+                expected_transfer_source_sha256=TRACE_SOURCE,
                 expected_mev_amount_usd="1",
                 expected_policy_sha256=POLICY_SOURCE,
             )
@@ -338,6 +342,38 @@ class HistoricalAtomicCostTopologyTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 with self.assertRaises((TypeError, ValueError)):
                     validate(historical_rows(), **changes)
+
+    def test_phase_two_proof_roles_are_exact(self):
+        expected_roles = (
+            "receipt", "receipt", "receipt", "receipt", "receipt",
+            "receipt", "receipt", "trace", "policy",
+        )
+        for index, expected_role in enumerate(expected_roles):
+            rows = historical_rows()
+            rows[index]["source"] = expected_role + "-forged"
+            with self.subTest(index=index, field="source"):
+                with self.assertRaises((TypeError, ValueError)):
+                    validate(rows)
+
+    def test_historical_proof_rows_are_timeless(self):
+        for index in range(len(HISTORICAL_ATOMIC_COMPONENT_MATRIX)):
+            for field in ("observed_at", "valid_until"):
+                rows = historical_rows()
+                rows[index][field] = "2026-08-01T12:00:00Z"
+                with self.subTest(index=index, field=field):
+                    with self.assertRaises((TypeError, ValueError)):
+                        validate(rows)
+
+    def test_transfer_trace_sha_is_exact(self):
+        rows = historical_rows()
+        rows[7]["source_record_sha256"] = "d" * 64
+        with self.assertRaises((TypeError, ValueError)):
+            validate(rows)
+        with self.assertRaises((TypeError, ValueError)):
+            validate(
+                historical_rows(),
+                expected_transfer_source_sha256="d" * 64,
+            )
 
     def test_mev_amount_is_independently_recomputed_from_notional_and_ten_bps(self):
         rows = historical_rows()
@@ -388,6 +424,21 @@ class CostTopologyBoundaryTests(unittest.TestCase):
         for function, names in expected.items():
             with self.subTest(function=function.__name__):
                 self.assertEqual(tuple(inspect.signature(function).parameters), names)
+        self.assertEqual(
+            tuple(inspect.signature(
+                route_cost_topology._validate_historical_atomic_cost_component_matrix
+            ).parameters),
+            (
+                "route", "rows", "expected_cohort_id",
+                "expected_opportunity_id",
+                "expected_pool_fee_source_sha256_by_leg",
+                "expected_pool_fee_amount_usd_by_leg",
+                "expected_zero_fee_proof_sha256_by_key",
+                "expected_gas_amount_usd", "expected_gas_source_sha256",
+                "expected_transfer_source_sha256", "expected_mev_amount_usd",
+                "expected_policy_sha256",
+            ),
+        )
         self.assertEqual(
             inspect.signature(
                 route_publication.load_latest_complete_route_bundle

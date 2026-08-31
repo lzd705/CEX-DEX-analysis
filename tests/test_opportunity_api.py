@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from dashboard import server
+from dashboard import opportunity_facts, server
 from dashboard.opportunity_facts import (
     OpportunityBundleInvalid,
     OpportunityBundleUnavailable,
@@ -19,6 +19,12 @@ from dashboard.opportunity_facts import (
     resolve_opportunity_bundle,
 )
 from scripts.route_publication import publish_complete_route_bundle
+from tests.test_route_cost_topology import (
+    BUY_MARKET_ID,
+    OPPORTUNITY_ID,
+    SELL_MARKET_ID,
+    historical_rows,
+)
 from tests.test_route_publication import _task7_cex_inputs
 
 
@@ -442,6 +448,41 @@ class OpportunityBundleReaderTests(unittest.TestCase):
 
 
 class OpportunityPayloadTests(unittest.TestCase):
+    def test_live_api_projection_rejects_historical_nine_row_inventory(self):
+        row = _row(
+            "route:historical",
+            OPPORTUNITY_ID,
+            opportunity_class="unavailable",
+            strict_eligible=False,
+            strict_ready=False,
+            requested_notional="1000",
+            strict_net_edge_usd=None,
+            strict_net_edge_bps=None,
+            research_net_edge_usd=None,
+            research_net_edge_bps=None,
+            primary_reason="buy_leg_unavailable",
+            reason_codes=["buy_leg_unavailable"],
+            buy_market_id=BUY_MARKET_ID,
+            sell_market_id=SELL_MARKET_ID,
+        )
+        row["route_mode"] = "atomic_onchain"
+        row["target_token_quantity"] = "10"
+        rows = historical_rows()
+        self.assertEqual(len(rows), 9)
+
+        with patch(
+            "dashboard.opportunity_facts.live_complete_cost_component_keys",
+            wraps=opportunity_facts.live_complete_cost_component_keys,
+        ) as live_keys:
+            with self.assertRaises(OpportunityBundleInvalid):
+                build_opportunity_payload(
+                    [row],
+                    manifest=_manifest([row]),
+                    cost_components=rows,
+                    now=NOW,
+                )
+        live_keys.assert_called_once_with(row)
+
     def test_unknown_route_modes_and_reasons_fail_closed(self):
         base = _row("route:a", "opportunity:a")
         mutations = {
