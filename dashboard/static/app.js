@@ -2497,6 +2497,7 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
 }
 
 function historicalOpportunityUnavailableMatchesRequest(payload, requestedFilters) {
+  const availability = payload?.availability;
   const coverage = payload?.metadata?.coverage;
   const zeroCoverageFields = [
     "route_count",
@@ -2511,8 +2512,12 @@ function historicalOpportunityUnavailableMatchesRequest(payload, requestedFilter
     "unavailable_count",
   ];
   return (
-    payload?.availability?.status === "unavailable"
-    && payload.availability.reason === "historical_replay_pointer_absent"
+    availability
+    && typeof availability === "object"
+    && !Array.isArray(availability)
+    && Object.keys(availability).sort().join(",") === "reason,status"
+    && availability.status === "unavailable"
+    && availability.reason === "historical_replay_pointer_absent"
     && payload?.metadata?.contract_version
       === "opportunity_historical_summary/v1"
     && payload?.metadata?.data_generation === null

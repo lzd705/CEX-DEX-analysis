@@ -550,6 +550,51 @@ global.fetch = async () => ({ ok: true, status: 200, async json() { return paylo
         self.assertIn("request-bound payload contract", result["error"])
         self.assertEqual(result["badge"], "Bundle invalid")
 
+    def test_absent_historical_pointer_rejects_availability_extra_fields(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + r"""
+const payload = {
+  availability: {
+    status: "unavailable", reason: "historical_replay_pointer_absent",
+    stale: false,
+  },
+  metadata: {
+    contract_version: "opportunity_historical_summary/v1",
+    data_generation: null,
+    coverage: {
+      route_count: 0, scenario_count: 0, returned_count: 0,
+      foundry_verified_count: 0, research_estimate_count: 0,
+      positive_count: 0, strict_count: 0, executable_count: 0,
+      attested_count: 0, unavailable_count: 0,
+    },
+  },
+  filters: {
+    token: null, venue: null, notional_usd: null, opportunity_class: "all",
+    route_type: "all", availability: "all", sort: "net_edge_usd",
+    direction: "desc",
+  },
+  routes: [],
+};
+global.fetch = async () => ({ ok: true, status: 200, async json() { return payload; } });
+(async () => {
+  const loaded = await applyOpportunitiesRoute({
+    kind: "opportunities", filters: { opportunityScope: "historical" },
+  });
+  console.log(JSON.stringify({
+    loaded,
+    error: opportunityElements["opportunity-error"].textContent,
+    badge: opportunityElements["opportunity-cohort-status"].textContent,
+  }));
+})();
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertFalse(result["loaded"])
+        self.assertIn("request-bound payload contract", result["error"])
+        self.assertEqual(result["badge"], "Bundle invalid")
+
     def test_historical_rows_must_match_every_filter_and_response_order(self):
         result = run_app_javascript(
             HISTORICAL_DOM_FIXTURE
