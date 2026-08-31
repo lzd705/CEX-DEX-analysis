@@ -631,6 +631,34 @@ console.log(JSON.stringify({
         self.assertFalse(result["wrongDescendingOrder"])
         self.assertFalse(result["wrongAscendingOrder"])
 
+    def test_available_historical_payload_requires_exact_top_level_availability(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + HISTORICAL_PAYLOAD_FIXTURE
+            + r"""
+const requested = normalizedOpportunityFilters({ opportunityScope: "historical" });
+const valid = JSON.parse(JSON.stringify(historicalPayload));
+const mixedState = JSON.parse(JSON.stringify(historicalPayload));
+mixedState.availability = {
+  status: "unavailable", reason: "historical_replay_pointer_absent",
+};
+const extraField = JSON.parse(JSON.stringify(historicalPayload));
+extraField.availability = { status: "available", reason: null, stale: false };
+console.log(JSON.stringify({
+  valid: historicalOpportunityResponseMatchesRequest(valid, requested),
+  mixedState: historicalOpportunityResponseMatchesRequest(mixedState, requested),
+  extraField: historicalOpportunityResponseMatchesRequest(extraField, requested),
+}));
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertEqual(result, {
+            "valid": True,
+            "mixedState": False,
+            "extraField": False,
+        })
+
     def test_cross_scope_late_responses_never_overwrite_the_winning_scope(self):
         result = run_app_javascript(
             HISTORICAL_DOM_FIXTURE

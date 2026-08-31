@@ -2416,10 +2416,17 @@ function syncOpportunityScopePresentation(scope) {
 }
 
 function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) {
+  const availability = payload?.availability;
   const metadata = payload?.metadata;
   const routes = Array.isArray(payload?.routes) ? payload.routes : null;
   if (
-    !metadata
+    !availability
+    || typeof availability !== "object"
+    || Array.isArray(availability)
+    || Object.keys(availability).sort().join(",") !== "reason,status"
+    || availability.status !== "available"
+    || availability.reason !== null
+    || !metadata
     || metadata.contract_version !== "opportunity_historical_summary/v1"
     || metadata.temporal_scope !== "historical_replay"
     || metadata.execution_claim
