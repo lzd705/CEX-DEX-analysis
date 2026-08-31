@@ -2771,10 +2771,20 @@ def _execution_quantity_raw(row: Mapping[str, Any], field: str, decimals: int) -
     return int(integral)
 
 
-def _retained_finalized_block(records: Any, block_number: int) -> dict[str, str]:
+def _retained_finalized_block(
+    records: Any,
+    pinned_block: Mapping[str, Any],
+) -> dict[str, str]:
     if not isinstance(records, list):
         raise ValueError("Uniswap V3 raw finalized block proof is missing")
-    identities = []
+    block_number = int(pinned_block["number"])
+    expected = {
+        "number": str(block_number),
+        "hash": str(pinned_block["hash"]).lower(),
+        "timestamp": str(pinned_block["timestamp"]),
+    }
+    pinned_identities = []
+    finalized_checkpoints = []
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -2791,20 +2801,54 @@ def _retained_finalized_block(records: Any, block_number: int) -> dict[str, str]
             if (
                 not isinstance(request, dict)
                 or request.get("method") != "eth_getBlockByNumber"
-                or request.get("params") != ["finalized", False]
             ):
                 continue
             response = responses_by_id.get(request.get("id"))
             result = response.get("result") if isinstance(response, dict) else None
-            try:
-                identities.append(exact_v3_block_identity(result, block_number))
-            except (RpcError, TypeError, ValueError) as error:
-                raise ValueError(
-                    "Uniswap V3 raw finalized block proof is invalid"
-                ) from error
-    if not identities or any(identity != identities[0] for identity in identities):
+            if request.get("params") == [hex(block_number), False]:
+                try:
+                    pinned_identities.append(
+                        exact_v3_block_identity(result, block_number)
+                    )
+                except (RpcError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        "Uniswap V3 raw finalized block proof is invalid"
+                    ) from error
+            elif request.get("params") == ["finalized", False]:
+                try:
+                    checkpoint_number = int(
+                        canonical_rpc_quantity(
+                            result.get("number") if isinstance(result, dict) else None,
+                            "Uniswap V3 finalized checkpoint number",
+                        ),
+                        16,
+                    )
+                    checkpoint_hash = str(
+                        result.get("hash") if isinstance(result, dict) else ""
+                    ).lower()
+                    if _V3_BLOCK_HASH.fullmatch(checkpoint_hash) is None:
+                        raise ValueError("Uniswap V3 finalized checkpoint hash is invalid")
+                    block_timestamp_text(dict(result))
+                except (RpcError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        "Uniswap V3 raw finalized block proof is invalid"
+                    ) from error
+                finalized_checkpoints.append((checkpoint_number, checkpoint_hash))
+    if (
+        not pinned_identities
+        or any(identity != expected for identity in pinned_identities)
+        or not finalized_checkpoints
+        or any(
+            not checkpoint_number >= block_number
+            or (
+                checkpoint_number == block_number
+                and checkpoint_hash != expected["hash"]
+            )
+            for checkpoint_number, checkpoint_hash in finalized_checkpoints
+        )
+    ):
         raise ValueError("Uniswap V3 raw finalized block proof is invalid")
-    return identities[0]
+    return expected
 
 
 def require_uniswap_v3_publication_scope(
@@ -3193,9 +3237,7 @@ def validate_uniswap_v3_exact_candidate(
         ):
             raise ValueError("Uniswap V3 shared finalized block evidence is invalid")
         block_identities.add((int(block_number), block_hash))
-        if _retained_finalized_block(
-            transcript.get("records"), int(block_number)
-        ) != block:
+        if _retained_finalized_block(transcript.get("records"), block) != block:
             raise ValueError("Uniswap V3 raw finalized block proof is inconsistent")
         depth_row = depth_by_market[market_id]
         market_execution = execution_by_market[market_id]

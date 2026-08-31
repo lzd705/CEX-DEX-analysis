@@ -290,6 +290,20 @@ class FinalizedHashMismatchV3Rpc(FakeApprovedUniUsdtV3Rpc):
         return result
 
 
+class AdvancingFinalizedV3Rpc(FakeApprovedUniUsdtV3Rpc):
+    def block(self, block_tag):
+        result = super().block(block_tag)
+        if block_tag == "finalized":
+            result.update(
+                {
+                    "number": "0x9b",
+                    "hash": "0x" + "c" * 64,
+                    "timestamp": "0x65920880",
+                }
+            )
+        return result
+
+
 class OrderedTwoPoolV3Rpc(FakeApprovedUniUsdtV3Rpc):
     def __init__(self, secondary_pool):
         super().__init__()
@@ -767,6 +781,65 @@ class UniswapV3CollectionTest(unittest.TestCase):
         self.assertEqual(depth["status"], "failed")
         self.assertEqual({row["status"] for row in execution}, {"failed"})
         self.assertIn("finalized block identity", depth["error"])
+
+    def test_later_finalized_checkpoint_keeps_every_state_request_pinned(self):
+        raw_path = self.root / "advancing-finality.json"
+
+        depth, execution = collect_dex_pool_observation(
+            _pool(),
+            snapshot_id="advancing-finality",
+            raw_path=raw_path,
+            client=AdvancingFinalizedV3Rpc(),
+            fixed_block_number=123,
+        )
+
+        self.assertIn(depth["status"], {"observed", "partial"})
+        self.assertTrue(
+            all(row["status"] in {"observed", "partial"} for row in execution)
+        )
+        raw = json.loads(raw_path.read_bytes())
+        finalized_headers = [
+            record["response"]
+            for record in raw["records"]
+            if record.get("request", {}).get("method") == "eth_getBlockByNumber"
+            and record["request"].get("block") == "finalized"
+        ]
+        self.assertEqual(
+            finalized_headers,
+            [
+                {
+                    "number": "0x9b",
+                    "hash": "0x" + "c" * 64,
+                    "parentHash": "0x" + "b" * 64,
+                    "timestamp": "0x65920880",
+                    "baseFeePerGas": "0x3b9aca00",
+                    "gasUsed": "0xe4e1c0",
+                    "gasLimit": "0x1c9c380",
+                }
+            ],
+        )
+        numeric_headers = [
+            record["response"]
+            for record in raw["records"]
+            if record.get("request", {}).get("method") == "eth_getBlockByNumber"
+            and record["request"].get("block") == "0x7b"
+        ]
+        self.assertTrue(numeric_headers)
+        self.assertTrue(
+            all(
+                header["number"] == "0x7b"
+                and header["hash"] == "0x" + "a" * 64
+                and header["timestamp"] == "0x65920080"
+                for header in numeric_headers
+            )
+        )
+        state_requests = [
+            record["request"]
+            for record in raw["records"]
+            if isinstance(record.get("request"), dict) and "to" in record["request"]
+        ]
+        self.assertTrue(state_requests)
+        self.assertEqual({request["block"] for request in state_requests}, {"0x7b"})
 
 
 if __name__ == "__main__":
