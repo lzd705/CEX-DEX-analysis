@@ -376,6 +376,7 @@ DEX_DEPTH_COLLECTION_FAILURE_REASON_CODES = frozenset(
         "parse",
         "validation",
         "collection_failed",
+        "rpc_endpoint_exhausted",
         "depth_usd_price_time_mismatch",
     }
 )
@@ -417,6 +418,10 @@ class RpcTransportError(RpcError):
         self.failover_eligible = failover_eligible
 
 
+class RpcEndpointExhausted(RpcError):
+    """Raised when every configured endpoint has failed for this run."""
+
+
 class UsdPriceTimeMismatch(ValueError):
     """Pool state and its USD conversion evidence are not time-aligned."""
 
@@ -425,6 +430,8 @@ def dex_depth_failure_reason_code(error: BaseException) -> str:
     """Classify typed DEX-depth failures without parsing raw messages."""
     if isinstance(error, UsdPriceTimeMismatch):
         return "depth_usd_price_time_mismatch"
+    if isinstance(error, RpcEndpointExhausted):
+        return "rpc_endpoint_exhausted"
     if isinstance(error, RpcTransportError) and error.http_status == 429:
         return "rate_limit"
     if isinstance(error, urllib.error.HTTPError):
@@ -1132,6 +1139,9 @@ class RpcClient:
         self._network_attempt_ordinal = 0
         self.endpoint_generation = 0
         self.selected_endpoint_id = endpoint_pool[0].endpoint_id
+        self._bound_fixed_block_identity: dict[str, Any] | None = None
+        self._validated_endpoint_generation: int | None = None
+        self._validating_endpoint = False
         self._open_endpoint_ids: set[str] = set()
         self._next_id = 1
 
@@ -1187,8 +1197,23 @@ class RpcClient:
         http_status: int | None = None,
     ) -> None:
         if len(self.endpoint_attempts) >= MAX_RPC_ATTEMPT_RECORDS:
+            replaceable = next(
+                (
+                    index
+                    for index, item in enumerate(self.endpoint_attempts)
+                    if item.get("outcome") == "success"
+                    and item.get("evidence_stage") == "rpc_request"
+                ),
+                None,
+            )
+            if (
+                replaceable is None
+                or (outcome == "success" and not self._validating_endpoint)
+            ):
+                self.endpoint_attempts_dropped += 1
+                return
+            self.endpoint_attempts.pop(replaceable)
             self.endpoint_attempts_dropped += 1
-            return
         record: dict[str, Any] = {
             "endpoint_id": endpoint.endpoint_id,
             "endpoint": endpoint.identity,
@@ -1202,10 +1227,77 @@ class RpcClient:
             "duration_seconds": round(max(0.0, duration_seconds), 6),
             "attempt_ordinal": attempt_ordinal,
             "endpoint_attempt": endpoint_attempt,
+            "evidence_stage": (
+                "fallback_identity_validation"
+                if self._validating_endpoint
+                else "rpc_request"
+            ),
         }
+        if self._validating_endpoint and self._bound_fixed_block_identity is not None:
+            record["fixed_block_identity"] = dict(self._bound_fixed_block_identity)
         if http_status is not None:
             record["http_status"] = http_status
         self.endpoint_attempts.append(record)
+
+    @property
+    def validated_endpoint_generation(self) -> int | None:
+        return self._validated_endpoint_generation
+
+    def bind_fixed_block_identity(
+        self,
+        *,
+        chain_id: int,
+        block: Mapping[str, Any],
+    ) -> None:
+        if type(chain_id) is not int or chain_id <= 0:
+            raise RpcConfigurationError("invalid_rpc_fixed_block_identity")
+        try:
+            block_number = int(str(block["number"]))
+            block_hash = str(block["hash"]).lower()
+            block_timestamp = str(block["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            raise RpcConfigurationError("invalid_rpc_fixed_block_identity") from None
+        if (
+            block_number < 0
+            or _V3_BLOCK_HASH.fullmatch(block_hash) is None
+            or not block_timestamp
+        ):
+            raise RpcConfigurationError("invalid_rpc_fixed_block_identity")
+        self._bound_fixed_block_identity = {
+            "chain_id": chain_id,
+            "number": block_number,
+            "hash": block_hash,
+            "timestamp": block_timestamp,
+        }
+        self._validated_endpoint_generation = self.endpoint_generation
+
+    def _validate_selected_endpoint_identity(self) -> None:
+        expected = self._bound_fixed_block_identity
+        if (
+            expected is None
+            or self._validating_endpoint
+            or self._validated_endpoint_generation == self.endpoint_generation
+        ):
+            return
+        self._validating_endpoint = True
+        try:
+            actual_chain_id = int(
+                canonical_rpc_quantity(self.chain_id(), "eth_chainId"),
+                16,
+            )
+            actual_block = exact_v3_block_identity(
+                self.block(hex(expected["number"])),
+                expected["number"],
+            )
+            if actual_chain_id != expected["chain_id"] or actual_block != {
+                "number": str(expected["number"]),
+                "hash": expected["hash"],
+                "timestamp": expected["timestamp"],
+            }:
+                raise RpcError("rpc_endpoint_identity_mismatch")
+            self._validated_endpoint_generation = self.endpoint_generation
+        finally:
+            self._validating_endpoint = False
 
     def _request_endpoint(
         self,
@@ -1246,7 +1338,11 @@ class RpcClient:
                 effective_deadline.require_remaining()
             endpoint = self._active_endpoint()
             if endpoint is None:
-                raise RpcError("rpc_endpoint_exhausted")
+                raise RpcEndpointExhausted("rpc_endpoint_exhausted")
+            self._validate_selected_endpoint_identity()
+            endpoint = self._active_endpoint()
+            if endpoint is None:
+                raise RpcEndpointExhausted("rpc_endpoint_exhausted")
             for attempt in range(self.max_retries):
                 self._network_attempt_ordinal += 1
                 attempt_ordinal = self._network_attempt_ordinal
@@ -1483,7 +1579,30 @@ class _DeadlineBoundRpcClient:
         self._client = client
         self._deadline = deadline
         self.records = client.records
-        self.endpoint = client.endpoint
+
+    @property
+    def endpoint(self) -> str:
+        return self._client.endpoint
+
+    @property
+    def attempt_ledger(self) -> list[dict[str, Any]]:
+        return getattr(self._client, "attempt_ledger", [])
+
+    @property
+    def endpoint_attempts_dropped(self) -> int:
+        return getattr(self._client, "endpoint_attempts_dropped", 0)
+
+    @property
+    def endpoint_generation(self) -> int | None:
+        return getattr(self._client, "endpoint_generation", None)
+
+    @property
+    def selected_endpoint_id(self) -> str | None:
+        return getattr(self._client, "selected_endpoint_id", None)
+
+    @property
+    def validated_endpoint_generation(self) -> int | None:
+        return getattr(self._client, "validated_endpoint_generation", None)
 
     def _call(self, operation: Callable[..., Any], *args: Any) -> Any:
         self._deadline.require_remaining()
@@ -5426,6 +5545,8 @@ def raw_transcript_bytes(
     block_number: int | None,
     endpoint: str,
     records: list[dict[str, Any]],
+    attempt_ledger: Iterable[Mapping[str, Any]] = (),
+    attempt_ledger_dropped: int = 0,
     error: Exception | None = None,
     v3_tick_scan_manifest: Mapping[str, Any] | None = None,
 ) -> bytes:
@@ -5439,6 +5560,8 @@ def raw_transcript_bytes(
         "block_number": block_number,
         "source_endpoint": endpoint,
         "records": records,
+        "attempt_ledger": [dict(item) for item in attempt_ledger],
+        "attempt_ledger_dropped": int(attempt_ledger_dropped),
     }
     if any(
         str(pool.get(field) or "").strip()
@@ -5463,10 +5586,82 @@ def raw_transcript_bytes(
         payload["v3_tick_scan_manifest"] = dict(v3_tick_scan_manifest)
     if error is not None:
         payload["error_type"] = type(error).__name__
-        payload["error"] = str(error)
+        payload["error"] = bounded_dex_error_text(error)
     return (
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
+
+
+def bounded_dex_error_text(error: BaseException) -> str:
+    """Return a bounded collector-owned error without transport secrets."""
+    if isinstance(error, RpcEndpointExhausted):
+        return "rpc_endpoint_exhausted"
+    if isinstance(error, RpcTransportError):
+        return "rpc_transport_failed"
+    if isinstance(error, RpcError):
+        if str(error) == "rpc_endpoint_identity_mismatch":
+            return "rpc_endpoint_identity_mismatch"
+        return "rpc_protocol_failed"
+    if isinstance(error, urllib.error.HTTPError):
+        return "rpc_http_failed"
+    if isinstance(error, (urllib.error.URLError, TimeoutError)):
+        return "rpc_network_failed"
+    return "{}: {}".format(type(error).__name__, str(error))
+
+
+def _make_chain_rpc_client(
+    chain: str,
+    rpc_url: str,
+    rpc_factory: Callable[[str, str], RpcClient],
+    deadline: CollectionDeadline | None,
+) -> RpcClient:
+    if rpc_factory is RpcClient:
+        return RpcClient(
+            chain,
+            rpc_url,
+            endpoints=rpc_endpoints_for_chain(chain),
+            deadline=deadline,
+        )
+    return rpc_factory(chain, rpc_url)
+
+
+def _bind_chain_fixed_block(
+    client: RpcClient,
+    chain: str,
+    block_number: int,
+    expected_identity: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    expected_chain_id = V3_CHAIN_ID_BY_NAME.get(chain)
+    if expected_chain_id is None:
+        raise ValueError("unsupported fixed-block chain")
+    actual_chain_id = int(
+        canonical_rpc_quantity(client.chain_id(), "fixed block chain id"),
+        16,
+    )
+    if actual_chain_id != expected_chain_id:
+        raise ValueError("fixed block chain identity does not match")
+    actual_identity = exact_v3_block_identity(
+        client.block(hex(block_number)),
+        block_number,
+    )
+    if expected_identity is not None and actual_identity != dict(expected_identity):
+        raise ValueError("fixed block header identity does not match")
+    if isinstance(client, RpcClient):
+        client.bind_fixed_block_identity(
+            chain_id=expected_chain_id,
+            block=actual_identity,
+        )
+    return actual_identity
+
+
+def _validated_endpoint_changed(client: Any, original_generation: Any) -> bool:
+    current_generation = getattr(client, "endpoint_generation", None)
+    return (
+        original_generation is not None
+        and current_generation != original_generation
+        and getattr(client, "validated_endpoint_generation", None)
+        == current_generation
+    )
 
 
 def collect_dex_pool_observation(
@@ -5480,6 +5675,7 @@ def collect_dex_pool_observation(
     fixed_block_timestamp: str = "",
     expected_v3_block_identity: Mapping[str, str] | None = None,
     deadline: CollectionDeadline | None = None,
+    preflight_error: Exception | None = None,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Collect one DEX pool with isolated client state unless one is supplied."""
     if deadline is not None:
@@ -5532,19 +5728,19 @@ def collect_dex_pool_observation(
         )
 
     if client is None:
-        if deadline is None:
-            client = rpc_factory(chain, rpc_url)
-        else:
-            client = rpc_factory(chain, rpc_url, deadline=deadline)
+        client = _make_chain_rpc_client(chain, rpc_url, rpc_factory, deadline)
     active_client = (
         _DeadlineBoundRpcClient(client, deadline)
         if deadline is not None
         else client
     )
     record_start = len(active_client.records)
+    endpoint_generation_start = getattr(active_client, "endpoint_generation", None)
     block_number = fixed_block_number
     block_timestamp = fixed_block_timestamp
     try:
+        if preflight_error is not None:
+            raise preflight_error
         exact_v3_approved = (
             protocol == "concentrated_liquidity_v3"
             and is_uniswap_v3_execution_approved(pool)
@@ -5623,12 +5819,30 @@ def collect_dex_pool_observation(
             protocol=protocol,
             expected_v3_block_identity=expected_v3_block_identity,
         )
+        if _validated_endpoint_changed(active_client, endpoint_generation_start):
+            return collect_dex_pool_observation(
+                pool,
+                snapshot_id=snapshot_id,
+                raw_path=raw_path,
+                rpc_factory=rpc_factory,
+                client=client,
+                fixed_block_number=fixed_block_number,
+                fixed_block_timestamp=fixed_block_timestamp,
+                expected_v3_block_identity=expected_v3_block_identity,
+                deadline=deadline,
+            )
         v3_tick_scan_manifest = row.get("_v3_tick_scan_manifest")
         transcript = raw_transcript_bytes(
             pool=pool,
             block_number=block_number,
             endpoint=active_client.endpoint,
             records=active_client.records[record_start:],
+            attempt_ledger=getattr(active_client, "attempt_ledger", ()),
+            attempt_ledger_dropped=getattr(
+                active_client,
+                "endpoint_attempts_dropped",
+                0,
+            ),
             v3_tick_scan_manifest=(
                 v3_tick_scan_manifest
                 if isinstance(v3_tick_scan_manifest, Mapping)
@@ -5644,11 +5858,29 @@ def collect_dex_pool_observation(
     except CollectionDeadlineExceeded:
         raise
     except Exception as error:
+        if _validated_endpoint_changed(active_client, endpoint_generation_start):
+            return collect_dex_pool_observation(
+                pool,
+                snapshot_id=snapshot_id,
+                raw_path=raw_path,
+                rpc_factory=rpc_factory,
+                client=client,
+                fixed_block_number=fixed_block_number,
+                fixed_block_timestamp=fixed_block_timestamp,
+                expected_v3_block_identity=expected_v3_block_identity,
+                deadline=deadline,
+            )
         transcript = raw_transcript_bytes(
             pool=pool,
             block_number=block_number,
             endpoint=active_client.endpoint,
             records=active_client.records[record_start:],
+            attempt_ledger=getattr(active_client, "attempt_ledger", ()),
+            attempt_ledger_dropped=getattr(
+                active_client,
+                "endpoint_attempts_dropped",
+                0,
+            ),
             error=error,
         )
         raw_path.write_bytes(transcript)
@@ -5676,7 +5908,7 @@ def collect_dex_pool_observation(
                 "raw_response_sha256": raw_hash,
                 "status": "failed",
                 "reason_code": dex_depth_failure_reason_code(error),
-                "error": f"{type(error).__name__}: {error}",
+                "error": bounded_dex_error_text(error),
             }
         )
         status_reason = (
@@ -5692,7 +5924,7 @@ def collect_dex_pool_observation(
             protocol=protocol,
             status="failed",
             status_reason=status_reason,
-            error=f"{type(error).__name__}: {error}",
+            error=bounded_dex_error_text(error),
             block_number=block_number,
             block_timestamp=block_timestamp,
             source_endpoint=active_client.endpoint,
@@ -5708,6 +5940,7 @@ def collect_dex_depth_with_execution(
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
     rpc_factory: Callable[[str, str], RpcClient] = RpcClient,
     allow_terminal_only: bool = False,
+    deadline: CollectionDeadline | None = None,
 ) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
     from datetime import datetime, timezone
 
@@ -5736,6 +5969,8 @@ def collect_dex_depth_with_execution(
     execution_rows: list[dict[str, str]] = []
 
     for index, pool in enumerate(pools, start=1):
+        if deadline is not None:
+            deadline.require_remaining()
         protocol, unsupported_reason = protocol_model(
             pool["dex"],
             pool["chain"],
@@ -5763,29 +5998,68 @@ def collect_dex_depth_with_execution(
                     flush=True,
                 )
             continue
-        client = clients.setdefault(chain, rpc_factory(chain, rpc_url))
+        client = clients.get(chain)
+        if client is None:
+            client = _make_chain_rpc_client(
+                chain,
+                rpc_url,
+                rpc_factory,
+                deadline,
+            )
+            clients[chain] = client
         block_number = blocks.get(chain)
         block_timestamp = block_timestamps.get(chain, "")
-        if block_number is None and chain in finalized_chains:
-            finalized_header = client.block("finalized")
-            finalized_number_raw = finalized_header.get("number")
-            if not isinstance(finalized_number_raw, str):
-                raise ValueError("finalized Ethereum block is unavailable")
-            block_number = int(
-                canonical_rpc_quantity(
-                    finalized_number_raw,
-                    "finalized Ethereum block number",
-                ),
-                16,
-            )
-            block_timestamp = block_timestamp_text(finalized_header)
-            block_identity = exact_v3_block_identity(
-                finalized_header,
-                block_number,
-            )
-            blocks[chain] = block_number
-            block_timestamps[chain] = block_timestamp
-            block_identities[chain] = block_identity
+        preflight_error = None
+        try:
+            if block_number is None and chain in finalized_chains:
+                finalized_header = client.block("finalized")
+                finalized_number_raw = finalized_header.get("number")
+                if not isinstance(finalized_number_raw, str):
+                    raise ValueError("finalized Ethereum block is unavailable")
+                block_number = int(
+                    canonical_rpc_quantity(
+                        finalized_number_raw,
+                        "finalized Ethereum block number",
+                    ),
+                    16,
+                )
+                block_timestamp = block_timestamp_text(finalized_header)
+                block_identity = exact_v3_block_identity(
+                    finalized_header,
+                    block_number,
+                )
+                blocks[chain] = block_number
+                block_timestamps[chain] = block_timestamp
+                block_identities[chain] = block_identity
+            if block_number is None:
+                block_number = client.block_number()
+                blocks[chain] = block_number
+            if isinstance(client, RpcClient) and chain not in block_identities:
+                block_identity = _bind_chain_fixed_block(
+                    client,
+                    chain,
+                    block_number,
+                )
+                block_timestamp = block_identity["timestamp"]
+                block_identities[chain] = block_identity
+                block_timestamps[chain] = block_timestamp
+            elif (
+                isinstance(client, RpcClient)
+                and client._bound_fixed_block_identity is None
+            ):
+                block_identity = _bind_chain_fixed_block(
+                    client,
+                    chain,
+                    block_number,
+                    block_identities.get(chain),
+                )
+                block_identities[chain] = block_identity
+                block_timestamp = block_identity["timestamp"]
+                block_timestamps[chain] = block_timestamp
+        except CollectionDeadlineExceeded:
+            raise
+        except Exception as error:
+            preflight_error = error
         row, pool_execution_rows = collect_dex_pool_observation(
             pool,
             snapshot_id=snapshot_id,
@@ -5795,6 +6069,8 @@ def collect_dex_depth_with_execution(
             fixed_block_number=block_number,
             fixed_block_timestamp=block_timestamp,
             expected_v3_block_identity=block_identities.get(chain),
+            deadline=deadline,
+            preflight_error=preflight_error,
         )
         if row["block_number"] and row["block_timestamp"]:
             blocks[chain] = int(row["block_number"])
@@ -5807,7 +6083,10 @@ def collect_dex_depth_with_execution(
             flush=True,
         )
         if index < len(pools) and sleep_seconds > 0:
-            time.sleep(sleep_seconds)
+            if deadline is not None:
+                deadline.sleep_before_retry(sleep_seconds)
+            else:
+                time.sleep(sleep_seconds)
 
     manifest = {
         "snapshot_id": snapshot_id,
@@ -5852,6 +6131,7 @@ def collect_dex_depth(
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
     rpc_factory: Callable[[str, str], RpcClient] = RpcClient,
     allow_terminal_only: bool = False,
+    deadline: CollectionDeadline | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
     """Backward-compatible depth-only return shape."""
     snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
@@ -5860,6 +6140,7 @@ def collect_dex_depth(
         sleep_seconds=sleep_seconds,
         rpc_factory=rpc_factory,
         allow_terminal_only=allow_terminal_only,
+        deadline=deadline,
     )
     return snapshot_id, rows
 
@@ -5892,7 +6173,11 @@ def validate_snapshot(
         supplied_reason = str(row.get("reason_code") or "").strip().lower()
         if "reason_code" in row and not supplied_reason:
             raise ValueError("DEX depth snapshot reason code is missing")
-        if supplied_reason and dex_depth_reason_code(supplied_reason) is None:
+        if (
+            supplied_reason
+            and supplied_reason != "rpc_endpoint_exhausted"
+            and dex_depth_reason_code(supplied_reason) is None
+        ):
             raise ValueError("DEX depth snapshot contains an invalid reason code")
         allowed_reasons = {
             "observed": {"observed"},

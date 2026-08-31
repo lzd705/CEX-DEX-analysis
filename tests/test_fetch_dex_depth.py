@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import os
 import tempfile
@@ -306,6 +307,97 @@ class ActualV2Transport:
             "id": payload["id"],
             "result": result,
         }
+
+
+class FailoverV2Transport:
+    """Literal JSON-RPC fixture for run-scoped fixed-block failover."""
+
+    def __init__(self, *, chain_id="0x38", fail_primary=True, fail_all=False):
+        self.chain_id = chain_id
+        self.fail_primary = fail_primary
+        self.fail_all = fail_all
+        self.calls = []
+
+    def __call__(
+        self,
+        url,
+        payload,
+        *,
+        deadline=None,
+        timeout_seconds=None,
+        max_retries=None,
+    ):
+        del deadline, timeout_seconds, max_retries
+        method = payload[0]["method"] if isinstance(payload, list) else payload["method"]
+        self.calls.append((url, method, payload))
+        if self.fail_all or (self.fail_primary and "primary" in url):
+            raise TimeoutError("private timeout from " + url)
+        if isinstance(payload, list):
+            response = [self._response(item) for item in payload]
+        else:
+            response = self._response(payload)
+        return response, json.dumps(response, sort_keys=True).encode("utf-8")
+
+    def _response(self, payload):
+        target = "0x1111111111111111111111111111111111111111"
+        quote = "0x2222222222222222222222222222222222222222"
+        method = payload["method"]
+        if method == "eth_chainId":
+            result = self.chain_id
+        elif method == "eth_blockNumber":
+            result = "0x7b"
+        elif method == "eth_getBlockByNumber":
+            result = {
+                "number": "0x7b",
+                "hash": "0x" + "a" * 64,
+                "parentHash": "0x" + "b" * 64,
+                "timestamp": "0x65920080",
+            }
+        elif method == "eth_call":
+            call = payload["params"][0]
+            selector = call["data"]
+            if selector == SELECTOR_TOKEN0:
+                result = address_result(target)
+            elif selector == SELECTOR_TOKEN1:
+                result = address_result(quote)
+            elif selector == SELECTOR_GET_RESERVES:
+                result = uint_result(100 * 10**18, 10_000 * 10**6, 0)
+            elif selector == SELECTOR_DECIMALS:
+                result = uint_result(18 if call["to"] == target else 6)
+            elif selector == SELECTOR_SYMBOL:
+                result = string_result("AAVE" if call["to"] == target else "USDC")
+            else:
+                raise AssertionError(selector)
+        else:
+            raise AssertionError(method)
+        return {
+            "jsonrpc": "2.0",
+            "id": payload["id"],
+            "result": result,
+        }
+
+
+class MidPoolFailoverV2Transport(FailoverV2Transport):
+    def __init__(self):
+        super().__init__(chain_id="0x1", fail_primary=False)
+        self.primary_eth_call_count = 0
+        self.failed = False
+
+    def __call__(self, url, payload, **kwargs):
+        method = payload[0]["method"] if isinstance(payload, list) else payload["method"]
+        if "primary" in url and method == "eth_call":
+            self.primary_eth_call_count += 1
+            if self.primary_eth_call_count == 2 and not self.failed:
+                self.failed = True
+                self.calls.append((url, method, payload))
+                raise urllib.error.HTTPError(
+                    url,
+                    403,
+                    "private mid-pool failure " + url,
+                    {},
+                    None,
+                )
+        return super().__call__(url, payload, **kwargs)
 
 
 class DexDepthMathTest(unittest.TestCase):
@@ -747,6 +839,231 @@ class DexDepthCollectionTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    def test_bsc_timeout_fails_over_once_binds_fixed_block_and_reuses_breaker(self):
+        from scripts.fetch_dex_depth import RpcClient
+
+        transport = FailoverV2Transport()
+        pools = []
+        for index in range(2):
+            pools.append(
+                {
+                    **self.pool,
+                    "chain": "bsc",
+                    "pool_address": "0x{:040x}".format(index + 3),
+                    "base_token_id": "bsc_" + self.target,
+                    "quote_token_id": "bsc_" + self.quote,
+                }
+            )
+        environment = {
+            "DEX_DEPTH_RPC_BSC": (
+                "https://user:primary-secret@primary.example.test/rpc?key=one"
+            ),
+            "DEX_DEPTH_RPC_BSC_FALLBACKS": json.dumps(
+                ["https://user:fallback-secret@fallback.example.test/rpc?key=two"]
+            ),
+        }
+
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            RpcClient,
+            "_default_one_attempt_request",
+            new=staticmethod(transport),
+        ):
+            snapshot_id, rows, execution = collect_dex_depth_with_execution(
+                pools,
+                raw_root=self.root,
+                sleep_seconds=0,
+            )
+
+        self.assertEqual({row["status"] for row in rows}, {"observed"})
+        self.assertEqual(len(execution), 20)
+        primary_calls = [call for call in transport.calls if "primary" in call[0]]
+        self.assertEqual(len(primary_calls), 4)
+        self.assertEqual({call[1] for call in primary_calls}, {"eth_blockNumber"})
+        fallback_methods = [call[1] for call in transport.calls if "fallback" in call[0]]
+        self.assertIn("eth_chainId", fallback_methods)
+        self.assertIn("eth_getBlockByNumber", fallback_methods)
+        raw_files = sorted((self.root / snapshot_id).glob("*.json"))
+        self.assertEqual(len(raw_files), 3)
+        transcripts = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in raw_files
+            if path.name != "manifest.json"
+        ]
+        self.assertTrue(all(item["block_number"] == 123 for item in transcripts))
+        self.assertTrue(all("attempt_ledger" in item for item in transcripts))
+        first_raw = next(
+            path.read_bytes()
+            for path in raw_files
+            if path.name != "manifest.json"
+        )
+        tampered = json.loads(first_raw)
+        tampered["attempt_ledger"][0]["decision"] = "tampered"
+        tampered_bytes = (
+            json.dumps(tampered, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        self.assertNotEqual(
+            hashlib.sha256(first_raw).hexdigest(),
+            hashlib.sha256(tampered_bytes).hexdigest(),
+        )
+        self.assertIn(
+            hashlib.sha256(first_raw).hexdigest(),
+            {row["raw_response_sha256"] for row in rows},
+        )
+        retained = json.dumps(transcripts, sort_keys=True)
+        for secret in ("primary-secret", "fallback-secret", "?key=one", "?key=two"):
+            self.assertNotIn(secret, retained)
+
+    def test_mid_pool_switch_replays_only_fallback_state_but_keeps_failed_attempt(self):
+        from scripts.fetch_dex_depth import RpcClient
+
+        transport = MidPoolFailoverV2Transport()
+        environment = {
+            "DEX_DEPTH_RPC_ETH": "https://primary.example.test/rpc?secret=one",
+            "DEX_DEPTH_RPC_ETH_FALLBACKS": json.dumps(
+                ["https://fallback.example.test/rpc?secret=two"]
+            ),
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            RpcClient,
+            "_default_one_attempt_request",
+            new=staticmethod(transport),
+        ), patch("scripts.fetch_dex_depth.validate_snapshot"):
+            snapshot_id, rows, _execution = collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root,
+                sleep_seconds=0,
+            )
+
+        self.assertEqual(rows[0]["status"], "observed")
+        transcript = json.loads(
+            next(
+                path
+                for path in (self.root / snapshot_id).glob("*.json")
+                if path.name != "manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        pool_state_records = [
+            record
+            for record in transcript["records"]
+            if isinstance(record.get("request"), list)
+            and any(
+                request["params"][0]["data"] == SELECTOR_GET_RESERVES
+                for request in record["request"]
+            )
+        ]
+        self.assertEqual(len(pool_state_records), 1)
+        self.assertTrue(
+            transcript["source_endpoint"].startswith("rpc-endpoint-sha256:")
+        )
+        self.assertIn(
+            "switch",
+            {attempt["decision"] for attempt in transcript["attempt_ledger"]},
+        )
+        fallback_state_calls = [
+            payload
+            for url, method, payload in transport.calls
+            if "fallback" in url and method == "eth_call" and isinstance(payload, list)
+            and any(
+                request["params"][0]["data"] == SELECTOR_GET_RESERVES
+                for request in payload
+            )
+        ]
+        self.assertEqual(len(fallback_state_calls), 1)
+
+    def test_endpoint_exhaustion_returns_bounded_failed_rows_and_private_transcripts(self):
+        from scripts.fetch_dex_depth import RpcClient
+
+        transport = FailoverV2Transport(fail_all=True)
+        environment = {
+            "DEX_DEPTH_RPC_BSC": (
+                "https://user:primary-secret@primary.example.test/rpc?key=one"
+            ),
+            "DEX_DEPTH_RPC_BSC_FALLBACKS": json.dumps(
+                ["https://user:fallback-secret@fallback.example.test/rpc?key=two"]
+            ),
+        }
+        pools = [
+            {
+                **self.pool,
+                "chain": "bsc",
+                "pool_address": "0x{:040x}".format(index + 31),
+                "base_token_id": "bsc_" + self.target,
+                "quote_token_id": "bsc_" + self.quote,
+            }
+            for index in range(2)
+        ]
+
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            RpcClient,
+            "_default_one_attempt_request",
+            new=staticmethod(transport),
+        ), patch("scripts.fetch_dex_depth.validate_snapshot"):
+            snapshot_id, rows, _execution = collect_dex_depth_with_execution(
+                pools,
+                raw_root=self.root,
+                sleep_seconds=0,
+                allow_terminal_only=True,
+            )
+
+        self.assertEqual({row["status"] for row in rows}, {"failed"})
+        self.assertEqual(
+            {row["reason_code"] for row in rows},
+            {"rpc_endpoint_exhausted"},
+        )
+        with self.assertRaisesRegex(ValueError, "terminal non-retryable"):
+            validate_depth_snapshot(pools, rows, allow_terminal_only=True)
+        retained = b"".join(
+            path.read_bytes() for path in sorted((self.root / snapshot_id).glob("*.json"))
+        ).decode("utf-8")
+        for secret in (
+            "primary-secret",
+            "fallback-secret",
+            "private timeout",
+            "?key=one",
+            "?key=two",
+        ):
+            self.assertNotIn(secret, retained)
+
+    def test_whole_collection_deadline_is_checked_before_inter_pool_sleep(self):
+        from scripts.collection_deadline import (
+            CollectionDeadline,
+            CollectionDeadlineExceeded,
+        )
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.now += seconds
+
+        clock = Clock()
+        deadline = CollectionDeadline.for_duration(
+            1,
+            clock=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+        calls = []
+
+        def factory(chain, url, /):
+            calls.append((chain, url))
+            return FakeV2Rpc(chain, url)
+
+        with self.assertRaisesRegex(
+            CollectionDeadlineExceeded,
+            "^collection deadline exceeded$",
+        ):
+            collect_dex_depth_with_execution(
+                [self.pool, {**self.pool, "pool_address": "0x" + "4" * 40}],
+                raw_root=self.root,
+                sleep_seconds=2,
+                rpc_factory=factory,
+                deadline=deadline,
+            )
+        self.assertEqual(len(calls), 1)
 
     def test_inventory_keeps_latest_unique_token_pool_row(self):
         path = self.root / "tvl.csv"
@@ -2250,6 +2567,8 @@ class DexDepthCollectionTest(unittest.TestCase):
 
         one_raw = (self.root / "one.json").read_bytes()
         expected_raw = """{
+  "attempt_ledger": [],
+  "attempt_ledger_dropped": 0,
   "block_number": 123,
   "pool": {
     "chain": "eth",
@@ -2364,8 +2683,8 @@ class DexDepthCollectionTest(unittest.TestCase):
             "source": "fixed-block EVM JSON-RPC eth_call",
             "source_endpoint": "https://rpc.example.test",
             "raw_response_sha256": (
-                "12c58bcfaf4d3a935b8234b035c6627e"
-                "2387f7e1d1a36dd0e3b1b29496ddbbc0"
+                "91c7e052604c7a0946a516c828b3afc2"
+                "59393e99aab5813f13ea370cb2ffcfa4"
             ),
             "status": "observed",
             "reason_code": "observed",
@@ -2422,8 +2741,8 @@ class DexDepthCollectionTest(unittest.TestCase):
             "source_endpoint": "https://rpc.example.test",
             "source_sequence": "123",
             "raw_response_sha256": (
-                "12c58bcfaf4d3a935b8234b035c6627e"
-                "2387f7e1d1a36dd0e3b1b29496ddbbc0"
+                "91c7e052604c7a0946a516c828b3afc2"
+                "59393e99aab5813f13ea370cb2ffcfa4"
             ),
             "error": "",
         }
@@ -2563,7 +2882,7 @@ class DexDepthCollectionTest(unittest.TestCase):
         self.assertEqual(one_raw, expected_raw)
         self.assertEqual(
             one_depth["raw_response_sha256"],
-            "12c58bcfaf4d3a935b8234b035c6627e2387f7e1d1a36dd0e3b1b29496ddbbc0",
+            "91c7e052604c7a0946a516c828b3afc259393e99aab5813f13ea370cb2ffcfa4",
         )
 
     def test_one_pool_fixed_block_and_client_transcript_are_isolated(self):
@@ -2968,6 +3287,82 @@ class RpcEndpointFailoverTest(unittest.TestCase):
         self.assertNotIn("primary-secret", retained)
         self.assertNotIn("fallback-secret", retained)
         self.assertNotIn("private failure", retained)
+
+    def test_fallback_must_prove_chain_and_exact_fixed_block_before_serving_call(self):
+        from scripts.fetch_dex_depth import RpcClient, RpcError
+
+        expected_block = {
+            "number": "0x7b",
+            "hash": "0x" + "a" * 64,
+            "timestamp": "0x65920080",
+        }
+        cases = {
+            "wrong_chain": {"chain_id": "0x38", "block": expected_block},
+            "missing_block": {"chain_id": "0x1", "block": None},
+            "wrong_hash": {
+                "chain_id": "0x1",
+                "block": {**expected_block, "hash": "0x" + "c" * 64},
+            },
+            "wrong_timestamp": {
+                "chain_id": "0x1",
+                "block": {**expected_block, "timestamp": "0x65920081"},
+            },
+        }
+        for name, fallback in cases.items():
+            calls = []
+            fail_primary = [False]
+
+            def request(url, payload):
+                method = payload["method"]
+                calls.append((url, method))
+                if fail_primary[0] and "primary" in url:
+                    raise urllib.error.HTTPError(
+                        url,
+                        403,
+                        "private provider error " + url,
+                        {},
+                        None,
+                    )
+                if method == "eth_chainId":
+                    result = fallback["chain_id"] if "fallback" in url else "0x1"
+                elif method == "eth_getBlockByNumber":
+                    result = fallback["block"] if "fallback" in url else expected_block
+                elif method == "eth_call":
+                    result = "0x1"
+                else:
+                    raise AssertionError(method)
+                response = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
+                return response, json.dumps(response).encode("utf-8")
+
+            with self.subTest(name=name):
+                client = RpcClient(
+                    "eth",
+                    self._endpoints()[0].url,
+                    endpoints=self._endpoints(),
+                    request=request,
+                )
+                client.bind_fixed_block_identity(
+                    chain_id=1,
+                    block={
+                        "number": "123",
+                        "hash": expected_block["hash"],
+                        "timestamp": "2024-01-01T00:00:00+00:00",
+                    },
+                )
+                fail_primary[0] = True
+                with self.assertRaises(RpcError):
+                    client.method("eth_call", [])
+                self.assertNotIn(
+                    (self._endpoints()[1].url, "eth_call"),
+                    calls,
+                )
+                retained = json.dumps(client.attempt_ledger, sort_keys=True)
+                for secret in (
+                    "primary-secret",
+                    "fallback-secret",
+                    "private provider error",
+                ):
+                    self.assertNotIn(secret, retained)
 
     def test_429_and_5xx_retry_one_endpoint_before_switching(self):
         from scripts.fetch_dex_depth import RpcClient

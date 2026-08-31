@@ -1547,6 +1547,62 @@ class UniswapV3ExactPublicationTest(unittest.TestCase):
         )
         self.assertFalse(arguments.output_dir.exists())
 
+    def test_rpc_endpoint_exhaustion_rejects_exact_gate_and_preserves_bundle(self):
+        publish_dir = self.root / "published-exhaustion"
+        publish_dir.mkdir()
+        protected = {
+            publish_dir / fetch_dex_depth.LATEST_FILENAME: b"old-depth\n",
+            publish_dir / fetch_dex_depth.EXECUTION_LATEST_FILENAME: b"old-execution\n",
+            publish_dir / fetch_dex_depth.UNISWAP_V3_EXACT_LATEST_FILENAME: b"old-receipt\n",
+        }
+        for path, payload in protected.items():
+            path.write_bytes(payload)
+        failed_depth = [
+            {
+                **row,
+                "status": "failed",
+                "reason_code": "rpc_endpoint_exhausted",
+                "error": "rpc_endpoint_exhausted",
+            }
+            for row in self.fixture.depth_rows
+        ]
+        arguments = SimpleNamespace(
+            tvl_csv=self.root / "inventory.csv",
+            output_dir=self.root / "processed-exhaustion",
+            raw_root=self.fixture.depth_raw_root,
+            tvl_raw_root=self.fixture.tvl_raw_root,
+            publish_local=False,
+            publish_dir=publish_dir,
+            sleep_seconds=0,
+            tokens=None,
+            chains=None,
+            market_id=None,
+            merge_publish=False,
+            require_uniswap_v3_exact_validation=True,
+        )
+
+        with patch.object(fetch_dex_depth, "parse_args", return_value=arguments), patch.object(
+            fetch_dex_depth,
+            "load_pool_inventory",
+            return_value=self.fixture.inventory,
+        ), patch.object(
+            fetch_dex_depth,
+            "collect_dex_depth_with_execution",
+            return_value=(
+                self.fixture.depth_snapshot_id,
+                failed_depth,
+                self.fixture.execution_rows,
+            ),
+        ), patch.object(
+            fetch_dex_depth,
+            "publish_full_publication_bundle",
+            side_effect=AssertionError("publication must not run"),
+        ):
+            with self.assertRaises(ValueError):
+                fetch_dex_depth.main()
+
+        self.assertEqual({path: path.read_bytes() for path in protected}, protected)
+
     def test_runner_enables_exact_gate_for_production_and_explicit_no_publish(self):
         data_dir = self.root / "runtime"
         production = build_step_commands(
