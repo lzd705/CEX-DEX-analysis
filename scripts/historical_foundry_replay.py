@@ -32,7 +32,8 @@ _RUN_FIELDS = frozenset((
     "schema", "run_id", "snapshot_run_id", "manifest_sha256",
     "policy_sha256", "authority_sha256",
     "toolchain_sha256", "scan_inventory_sha256", "selection", "selection_sha256",
-    "scenarios", "typed_members", "task7_selection_hex",
+    "scenarios", "typed_members", "task7_candidate_manifest_hex",
+    "task7_selection_hex",
     "task7_typed_manifest_hex", "evidence_sha256",
 ))
 _SELECTION_FIELDS = frozenset((
@@ -73,6 +74,18 @@ _TASK7_SELECTION_FIELDS = frozenset((
     "initial_replay_required_count", "selected_block",
     "selected_scenario_count", "selected_scenarios", "candidate_states",
     "unresolved_candidate_count",
+))
+_TASK7_CANDIDATE_MANIFEST_FIELDS = frozenset((
+    "schema", "staging_inventory_sha256", "prefilter_grid_digest",
+    "candidate_block_count", "scenario_denominator",
+    "initial_replay_required_count", "attempted_scenario_count",
+    "candidate_states", "scenarios",
+))
+_TASK7_CANDIDATE_SCENARIO_FIELDS = frozenset((
+    "scenario_key", "block_number", "status", "classification", "gas_used",
+    "effective_gas_price", "weth_delta_raw", "proof_inputs_hash",
+    "overlay_sha256", "receipt_sha256", "trace_sha256", "result_sha256",
+    "economics",
 ))
 _TASK7_BLOCK_FIELDS = frozenset((
     "number", "hash", "parent_hash", "state_root", "timestamp",
@@ -193,6 +206,12 @@ def _initialize_validated_historical_run_capability():
         }
         if _hash(value["evidence_sha256"], "evidence hash") != _digest(unsigned):
             raise ValueError("historical evidence hash differs")
+        task7_candidate_manifest_bytes, task7_candidate_manifest = (
+            _decode_task7_canonical_document(
+                value["task7_candidate_manifest_hex"],
+                "Task-7 candidate manifest",
+            )
+        )
         task7_selection_bytes, task7_selection = (
             _decode_task7_canonical_document(
                 value["task7_selection_hex"], "Task-7 selection"
@@ -205,8 +224,9 @@ def _initialize_validated_historical_run_capability():
         )
         expected_run_id = "run:" + hashlib.sha256(
             _TASK7_RUN_ID_DOMAIN
-            + task7_selection_bytes
+            + task7_candidate_manifest_bytes
             + task7_typed_manifest_bytes
+            + task7_selection_bytes
         ).hexdigest()
         if (
             value["run_id"] != expected_run_id
@@ -346,6 +366,10 @@ def _initialize_validated_historical_run_capability():
             scan_inventory_sha256=scan_inventory_sha256,
             expected_routes=expected_routes,
             scenarios=scenarios,
+        )
+        _validate_task7_candidate_manifest(
+            task7_candidate_manifest,
+            task7_selection=task7_selection,
         )
         _validate_task7_typed_manifest(
             task7_typed_manifest,
@@ -622,6 +646,118 @@ def _validate_task7_selection(
         or selected_states[0]["scenario_count"] != 10
     ):
         raise ValueError("Task-7 candidate closure differs")
+
+
+def _validate_task7_candidate_manifest(
+    value: Any, *, task7_selection: Mapping[str, Any],
+) -> None:
+    candidate = _exact_fields(
+        value, _TASK7_CANDIDATE_MANIFEST_FIELDS,
+        "Task-7 candidate manifest",
+    )
+    for field in (
+        "staging_inventory_sha256", "prefilter_grid_digest",
+        "candidate_block_count", "scenario_denominator",
+        "initial_replay_required_count", "candidate_states",
+    ):
+        if candidate[field] != task7_selection[field]:
+            raise ValueError("Task-7 candidate selection binding differs")
+    scenarios = candidate["scenarios"]
+    if (
+        candidate["schema"]
+        != "historical_foundry_candidate_manifest/v1"
+        or type(scenarios) is not list
+        or _task7_int(
+            candidate["attempted_scenario_count"],
+            "Task-7 attempted scenario count", minimum=0,
+        ) != len(scenarios)
+    ):
+        raise ValueError("Task-7 candidate manifest identity differs")
+    observed_counts = {}
+    observed_keys = set()
+    normalized = []
+    for scenario in scenarios:
+        row = _exact_fields(
+            scenario, _TASK7_CANDIDATE_SCENARIO_FIELDS,
+            "Task-7 candidate scenario",
+        )
+        block_number = _task7_int(
+            row["block_number"], "Task-7 candidate block", minimum=1
+        )
+        status = _task7_int(
+            row["status"], "Task-7 candidate status", minimum=0
+        )
+        scenario_key = row["scenario_key"]
+        if (
+            status not in {0, 1}
+            or type(scenario_key) is not str
+            or not scenario_key.startswith("{}:".format(block_number))
+            or scenario_key in observed_keys
+            or row["classification"]
+            != ("replay_success" if status == 1 else "closed_revert")
+            or _task7_int(
+                row["gas_used"], "Task-7 candidate gas", minimum=0
+            ) < 0
+            or _task7_int(
+                row["effective_gas_price"],
+                "Task-7 candidate gas price", minimum=0,
+            ) < 0
+            or type(row["weth_delta_raw"]) is not int
+            or (status == 0 and row["weth_delta_raw"] != 0)
+        ):
+            raise ValueError("Task-7 candidate scenario differs")
+        observed_keys.add(scenario_key)
+        observed_counts[block_number] = observed_counts.get(block_number, 0) + 1
+        for field in (
+            "overlay_sha256", "receipt_sha256", "trace_sha256",
+            "result_sha256",
+        ):
+            _hash(row[field], "Task-7 candidate {}".format(field))
+        if status == 0:
+            if (
+                row["proof_inputs_hash"] is not None
+                or row["economics"] is not None
+            ):
+                raise ValueError("Task-7 reverted economics differ")
+        else:
+            _hash(
+                row["proof_inputs_hash"],
+                "Task-7 candidate proof_inputs_hash",
+            )
+            economics = _exact_fields(
+                row["economics"], _TASK7_ECONOMICS_FIELDS,
+                "Task-7 candidate economics",
+            )
+            for field in _TASK7_ECONOMICS_FIELDS:
+                _validate_task7_fraction(
+                    economics[field], "Task-7 candidate {}".format(field)
+                )
+        normalized.append(dict(row))
+    states = task7_selection["candidate_states"]
+    state_blocks = set()
+    for state in states:
+        block_number = state["block_number"]
+        if (
+            block_number in state_blocks
+            or observed_counts.get(block_number, 0) != state["scenario_count"]
+        ):
+            raise ValueError("Task-7 candidate state inventory differs")
+        state_blocks.add(block_number)
+    if set(observed_counts) != {
+        state["block_number"] for state in states
+        if state["scenario_count"] != 0
+    }:
+        raise ValueError("Task-7 candidate block inventory differs")
+    selected_block = task7_selection["selected_block"]["number"]
+    selected_facts = [
+        row for row in normalized if row["block_number"] == selected_block
+    ]
+    expected_selected_facts = [{
+        key: item for key, item in row.items()
+        if key not in {"direction", "requested_notional_usd"}
+    } for row in task7_selection["selected_scenarios"]]
+    if selected_facts != expected_selected_facts:
+        raise ValueError("Task-7 selected candidate facts differ")
 
 
 def _validate_task7_typed_manifest(

@@ -255,6 +255,30 @@ def task7_selection_value():
     }
 
 
+def task7_candidate_manifest_value(selection):
+    scenarios = [{
+        key: value for key, value in row.items()
+        if key not in {"direction", "requested_notional_usd"}
+    } for row in selection["selected_scenarios"]]
+    return {
+        "schema": "historical_foundry_candidate_manifest/v1",
+        "staging_inventory_sha256": selection[
+            "staging_inventory_sha256"
+        ],
+        "prefilter_grid_digest": selection["prefilter_grid_digest"],
+        "candidate_block_count": selection["candidate_block_count"],
+        "scenario_denominator": selection["scenario_denominator"],
+        "initial_replay_required_count": selection[
+            "initial_replay_required_count"
+        ],
+        "attempted_scenario_count": len(scenarios),
+        "candidate_states": json.loads(canonical_bytes(
+            selection["candidate_states"]
+        ).decode("utf-8")),
+        "scenarios": scenarios,
+    }
+
+
 def task7_typed_manifest_value(evidence):
     markets = []
     global_members = []
@@ -298,9 +322,16 @@ def task7_typed_manifest_value(evidence):
 
 
 def replace_task7_run_preimage(
-    evidence, *, selection_value=None, typed_manifest_value=None,
+    evidence, *, candidate_manifest_value=None, selection_value=None,
+    typed_manifest_value=None, candidate_manifest_bytes=None,
     selection_bytes=None, typed_manifest_bytes=None,
 ):
+    if candidate_manifest_bytes is None:
+        if candidate_manifest_value is None:
+            candidate_manifest_value = json.loads(bytes.fromhex(
+                evidence["task7_candidate_manifest_hex"]
+            ).decode("utf-8"))
+        candidate_manifest_bytes = canonical_bytes(candidate_manifest_value)
     if selection_bytes is None:
         if selection_value is None:
             selection_value = json.loads(bytes.fromhex(
@@ -313,20 +344,25 @@ def replace_task7_run_preimage(
                 evidence["task7_typed_manifest_hex"]
             ).decode("utf-8"))
         typed_manifest_bytes = canonical_bytes(typed_manifest_value)
+    evidence["task7_candidate_manifest_hex"] = (
+        candidate_manifest_bytes.hex()
+    )
     evidence["task7_selection_hex"] = selection_bytes.hex()
     evidence["task7_typed_manifest_hex"] = typed_manifest_bytes.hex()
     run_id = "run:" + hashlib.sha256(
         b"historical_foundry_run_id/v1\0"
-        + selection_bytes + typed_manifest_bytes
+        + candidate_manifest_bytes + typed_manifest_bytes + selection_bytes
     ).hexdigest()
     evidence["run_id"] = run_id
     evidence["snapshot_run_id"] = run_id
 
 
 def install_task7_run_preimage(evidence):
+    selection = task7_selection_value()
     replace_task7_run_preimage(
         evidence,
-        selection_value=task7_selection_value(),
+        candidate_manifest_value=task7_candidate_manifest_value(selection),
+        selection_value=selection,
         typed_manifest_value=task7_typed_manifest_value(evidence),
     )
 
@@ -430,6 +466,132 @@ class HistoricalResearchUniverseTests(unittest.TestCase):
             validate_selected_historical_run(
                 config=self.config, run_evidence=value)
 
+    def test_task7_run_id_requires_candidate_typed_selection_order(self):
+        for label, order in (
+            ("candidate_omitted", ("typed", "selection")),
+            ("candidate_last", ("selection", "typed", "candidate")),
+            ("typed_last", ("candidate", "selection", "typed")),
+        ):
+            value = fixture(self.config)
+            parts = {
+                "candidate": bytes.fromhex(
+                    value["task7_candidate_manifest_hex"]
+                ),
+                "typed": bytes.fromhex(value["task7_typed_manifest_hex"]),
+                "selection": bytes.fromhex(value["task7_selection_hex"]),
+            }
+            bad_run_id = "run:" + hashlib.sha256(
+                b"historical_foundry_run_id/v1\0"
+                + b"".join(parts[name] for name in order)
+            ).hexdigest()
+            value["run_id"] = bad_run_id
+            value["snapshot_run_id"] = bad_run_id
+            reseal(value)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_selected_historical_run(
+                    config=self.config, run_evidence=value)
+
+    def test_task7_candidate_manifest_is_closed_against_selection(self):
+        def mutate_staging(candidate):
+            candidate["staging_inventory_sha256"] = "8" * 64
+
+        def mutate_attempted_count(candidate):
+            candidate["attempted_scenario_count"] -= 1
+
+        def mutate_state(candidate):
+            candidate["candidate_states"][0]["scenario_count"] -= 1
+
+        def mutate_selected_fact(candidate):
+            candidate["scenarios"][0]["result_sha256"] = "0" * 64
+
+        def mutate_scenario_order(candidate):
+            candidate["scenarios"].reverse()
+
+        def mutate_extra_field(candidate):
+            candidate["caller_note"] = "accepted"
+
+        for label, mutate in (
+            ("staging", mutate_staging),
+            ("attempted_count", mutate_attempted_count),
+            ("candidate_state", mutate_state),
+            ("selected_fact", mutate_selected_fact),
+            ("scenario_order", mutate_scenario_order),
+            ("extra_field", mutate_extra_field),
+        ):
+            value = fixture(self.config)
+            candidate = json.loads(bytes.fromhex(
+                value["task7_candidate_manifest_hex"]
+            ).decode("utf-8"))
+            mutate(candidate)
+            replace_task7_run_preimage(
+                value, candidate_manifest_value=candidate
+            )
+            reseal(value)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_selected_historical_run(
+                    config=self.config, run_evidence=value)
+
+        value = fixture(self.config)
+        candidate = json.loads(bytes.fromhex(
+            value["task7_candidate_manifest_hex"]
+        ).decode("utf-8"))
+        noncanonical = json.dumps(candidate, sort_keys=True).encode("utf-8")
+        replace_task7_run_preimage(
+            value, candidate_manifest_bytes=noncanonical
+        )
+        reseal(value)
+        with self.assertRaises(ValueError):
+            validate_selected_historical_run(
+                config=self.config, run_evidence=value)
+
+    def test_task7_candidate_manifest_accepts_prior_closed_revert(self):
+        value = fixture(self.config)
+        selected = json.loads(bytes.fromhex(
+            value["task7_selection_hex"]
+        ).decode("utf-8"))
+        selected["candidate_block_count"] = 2
+        selected["scenario_denominator"] = 20
+        selected["initial_replay_required_count"] = 10
+        selected["candidate_states"].insert(0, {
+            "block_number": 20_000_001,
+            "state": "nonpublishable_positive",
+            "transitions": [
+                "candidate", "replaying_required", "tentative_positive",
+                "completing_full_ten", "nonpublishable_positive",
+            ],
+            "scenario_count": 10,
+        })
+        candidate = task7_candidate_manifest_value(selected)
+        prior = copy.deepcopy(candidate["scenarios"])
+        for index, row in enumerate(prior):
+            row["block_number"] = 20_000_001
+            row["scenario_key"] = row["scenario_key"].replace(
+                "20000000:", "20000001:", 1
+            )
+            for field in (
+                "proof_inputs_hash", "overlay_sha256", "receipt_sha256",
+                "trace_sha256", "result_sha256",
+            ):
+                row[field] = hashlib.sha256(
+                    "prior:{}:{}".format(field, index).encode("ascii")
+                ).hexdigest()
+        prior[0].update({
+            "status": 0,
+            "classification": "closed_revert",
+            "weth_delta_raw": 0,
+            "proof_inputs_hash": None,
+            "economics": None,
+        })
+        candidate["scenarios"] = prior + candidate["scenarios"]
+        candidate["attempted_scenario_count"] = 20
+        replace_task7_run_preimage(
+            value, candidate_manifest_value=candidate,
+            selection_value=selected,
+        )
+        reseal(value)
+        validate_selected_historical_run(
+            config=self.config, run_evidence=value)
+
     def test_task7_selection_must_be_canonical_and_cross_bound(self):
         mutations = (
             ("selected_block", lambda selected: selected["selected_block"].__setitem__(
@@ -480,7 +642,13 @@ class HistoricalResearchUniverseTests(unittest.TestCase):
             row["economics"]["policy_net_edge_usd"] = {
                 "numerator": 0, "denominator": 1, "display": "0",
             }
-        replace_task7_run_preimage(value, selection_value=selected)
+        replace_task7_run_preimage(
+            value,
+            candidate_manifest_value=task7_candidate_manifest_value(
+                selected
+            ),
+            selection_value=selected,
+        )
         reseal(value)
         with self.assertRaises(ValueError):
             validate_selected_historical_run(
