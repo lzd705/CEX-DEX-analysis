@@ -1035,7 +1035,7 @@ def http_json_rpc(
 
 def _request_accepts_retry_controls(request: Callable[..., Any]) -> bool:
     try:
-        signature = inspect.signature(request)
+        signature = inspect.signature(request, follow_wrapped=False)
     except Exception:
         raise RpcConfigurationError("invalid_rpc_request_boundary") from None
     try:

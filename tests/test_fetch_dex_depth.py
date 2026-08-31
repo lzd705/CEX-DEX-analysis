@@ -3444,12 +3444,34 @@ class RpcEndpointFailoverTest(unittest.TestCase):
             },
         )
 
+    def test_two_positional_wraps_boundary_uses_actual_call_signature(self):
+        import functools
+
+        from scripts.fetch_dex_depth import RpcClient, http_json_rpc
+
+        calls = []
+
+        @functools.wraps(http_json_rpc)
+        def wrapped(url, payload):
+            calls.append((url, payload))
+            return self._result(payload)
+
+        client = RpcClient(
+            "eth",
+            "https://rpc.example.test",
+            request=wrapped,
+        )
+        self.assertEqual(client.method("eth_chainId", []), "0x1")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "https://rpc.example.test")
+        self.assertEqual(calls[0][1]["method"], "eth_chainId")
+
     def test_legacy_two_positional_request_keeps_exact_call_shape(self):
         from scripts.fetch_dex_depth import RpcClient
 
         calls = []
 
-        def legacy_request(url, payload):
+        def legacy_request(url, payload, /):
             calls.append((url, payload))
             return self._result(payload)
 
