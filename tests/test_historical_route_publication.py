@@ -189,6 +189,27 @@ class HistoricalCorePublicationTask7SeamTests(unittest.TestCase):
             "Task7 publication authority seam has not been cherry-picked",
         )
 
+    def test_task7_verification_subject_is_issued_only_from_bundle_view(self):
+        import scripts.historical_foundry_verifier as verifier
+        import scripts.historical_route_publication as publication
+
+        self.assertFalse(
+            hasattr(verifier, "issue_historical_verification_subject")
+        )
+        self.assertFalse(
+            hasattr(verifier, "_issue_historical_verification_subject")
+        )
+        forged = object.__new__(
+            publication.ValidatedHistoricalReplayBundleView
+        )
+        with self.assertRaises(publication.HistoricalRoutePublicationError):
+            forged.reread_unchanged()
+        with self.assertRaises(verifier.HistoricalVerificationError):
+            verifier.run_connected_historical_verification(
+                object.__new__(verifier.HistoricalVerificationSubject),
+                mode="publish",
+            )
+
 
 class HistoricalCorePublicationTests(unittest.TestCase):
     @staticmethod

@@ -4137,10 +4137,39 @@ def _initialize_validated_historical_replay_bundle_view():
                 )
             return material, scenario["proof_inputs_hash"]
 
+        def subject_material(
+            *, validated_view: ValidatedHistoricalReplayBundleView,
+        ) -> Dict[str, Any]:
+            record = require_record(
+                validated_view, validate_current=True
+            )
+            manifest = _plain(record["manifest"])
+            pointer_core = {
+                "schema": "route_historical_replay_pointer/v1",
+                "bundle_stage": _HISTORICAL_COMPLETE_STAGE,
+                "replay_id": manifest["replay_id"],
+                "route_cohort_id": manifest["route_cohort_id"],
+                "manifest_sha256": record["manifest_sha256"],
+            }
+            _validate_historical_expected_pointer_core(
+                expected=pointer_core, manifest=manifest,
+                manifest_sha256=record["manifest_sha256"],
+            )
+            return {
+                "validated_view": validated_view,
+                "data_dir": record["data_dir"],
+                "raw_root": record["raw_root"],
+                "bundle_path": record["bundle_path"],
+                "manifest": _plain(record["manifest"]),
+                "bundle": _plain(record["bundle"]),
+                "replay_evidence": _plain(record["replay_evidence"]),
+                "pointer_core": pointer_core,
+            }
+
         installed[0] = True
         return (
             ValidatedHistoricalReplayBundleView, validate,
-            published_material,
+            published_material, subject_material,
         )
 
     return bind_runtime
@@ -5388,12 +5417,17 @@ def stage_historical_replay_bundle(
                 "path": validated["path"],
                 "replay_id": payload["replay_id"],
                 "manifest_sha256": manifest_sha256,
+                "pointer_core": validated["pointer_core"],
+                "verification_subject": validated[
+                    "verification_subject"
+                ],
             })
-        finally:
+        except BaseException:
             try:
                 validated["validated_view"].close()
             except Exception:
                 pass
+            raise
     except BaseException as error:
         if installed_by_call and renamed:
             try:
@@ -5892,6 +5926,7 @@ def _validate_historical_replay_bundle_impl(
     ValidatedHistoricalReplayBundleView,
     _validate_historical_replay_bundle,
     _historical_published_cost_proof_material,
+    _historical_verification_subject_material,
 ) = _bind_historical_replay_bundle_view_runtime(
     validation_impl=_validate_historical_replay_bundle_impl,
     current_checker_function=(
@@ -5903,17 +5938,49 @@ del _bind_historical_replay_bundle_view_runtime
 del _validate_historical_replay_bundle_impl
 
 
+_historical_verification_subject_material.__name__ = (
+    "_historical_verification_subject_material"
+)
+
+import scripts.historical_foundry_verifier as _historical_verifier
+
+_issue_historical_verification_subject_from_view = (
+    _historical_verifier._bind_historical_verification_subject_material(
+        _historical_verification_subject_material
+    )
+)
+del _historical_verifier._bind_historical_verification_subject_material
+
+
 def validate_historical_replay_bundle(
     *, data_dir: Path, raw_root: Path, bundle_path: Path,
     expected_pointer_core: Optional[Mapping[str, Any]] = None,
 ) -> Mapping[str, Any]:
-    return _validate_historical_replay_bundle(
+    validated = _validate_historical_replay_bundle(
         data_dir=data_dir, raw_root=raw_root, bundle_path=bundle_path,
         expected_pointer_core=expected_pointer_core,
         expected_replay_id=None,
         require_directory_identity=True,
         issue_view=True,
     )
+    try:
+        subject = _issue_historical_verification_subject_from_view(
+            validated["validated_view"]
+        )
+        result = dict(validated)
+        result["pointer_core"] = MappingProxyType(dict(
+            _historical_verification_subject_material(
+                validated_view=validated["validated_view"]
+            )["pointer_core"]
+        ))
+        result["verification_subject"] = subject
+        return MappingProxyType(result)
+    except BaseException:
+        try:
+            validated["validated_view"].close()
+        except Exception:
+            pass
+        raise
 
 
 _load_historical_cost_proof_inputs_for_published_view = (
