@@ -1217,6 +1217,14 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
             },
         )
         self.assertEqual(manifest["files"], files)
+        decoded = route_publication._read_complete_representation_bytes(
+            file_bytes=representation,
+            route_cohort_id=bundle["route_cohort_id"],
+        )
+        self.assertEqual(decoded[0], bundle)
+        self.assertEqual(decoded[1], bundle["legs"])
+        self.assertEqual(decoded[2], bundle["cost_components"])
+        self.assertEqual(decoded[3], bundle["opportunities"])
 
     def test_complete_sqlite_reader_supports_legacy_sqlite_catalog_name(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"

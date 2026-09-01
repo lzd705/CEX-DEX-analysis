@@ -5340,6 +5340,79 @@ def _read_complete_sqlite(
     )
 
 
+def _read_complete_representation_bytes(
+    *, file_bytes: Mapping[str, bytes], route_cohort_id: str,
+) -> Tuple[
+    Dict[str, Any],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
+    if set(file_bytes) != _COMPLETE_MANIFEST_ARTIFACT_FILENAMES:
+        raise RoutePublicationError(
+            "complete representation file inventory is invalid"
+        )
+    raw_legs = _read_csv_rows_bytes(
+        file_bytes[ROUTE_LEGS_FILENAME], columns=LEG_COLUMNS,
+        label="complete route leg CSV",
+    )
+    raw_costs = _read_csv_rows_bytes(
+        file_bytes[COST_COMPONENTS_FILENAME], columns=COMPLETE_COST_COLUMNS,
+        label="complete cost CSV",
+    )
+    raw_opportunities = _read_csv_rows_bytes(
+        file_bytes[ROUTE_OPPORTUNITIES_FILENAME],
+        columns=COMPLETE_OPPORTUNITY_COLUMNS,
+        label="complete opportunity CSV",
+    )
+    legs = [
+        _decode_row_json(row["row_json"], "complete route leg CSV")
+        for row in raw_legs
+    ]
+    costs = [
+        _decode_row_json(row["row_json"], "complete cost CSV")
+        for row in raw_costs
+    ]
+    opportunities = [
+        _decode_row_json(row["row_json"], "complete opportunity CSV")
+        for row in raw_opportunities
+    ]
+    _validate_csv_projection(
+        raw_legs, legs, route_cohort_id=route_cohort_id,
+        projector=_leg_csv_row, label="complete route leg CSV",
+    )
+    if any(
+        dict(csv_row) != _complete_cost_csv_row(row)
+        for csv_row, row in zip(raw_costs, costs)
+    ):
+        raise RoutePublicationError("complete cost CSV projection mismatch")
+    if any(
+        dict(csv_row) != _complete_opportunity_csv_row(row)
+        for csv_row, row in zip(raw_opportunities, opportunities)
+    ):
+        raise RoutePublicationError(
+            "complete opportunity CSV projection mismatch"
+        )
+
+    (
+        bundle,
+        sqlite_legs,
+        sqlite_costs,
+        sqlite_opportunities,
+    ) = _read_complete_sqlite(
+        file_bytes[ROUTE_OPPORTUNITY_SQLITE_FILENAME],
+    )
+    if (
+        sqlite_legs != legs
+        or sqlite_costs != costs
+        or sqlite_opportunities != opportunities
+    ):
+        raise RoutePublicationError(
+            "complete CSV and SQLite inventories do not match"
+        )
+    return bundle, legs, costs, opportunities
+
+
 def _validate_complete_route_bundle_at(
     parent_fd: int,
     bundle_name: str,
@@ -5407,54 +5480,19 @@ def _validate_complete_route_bundle_at(
             } or details.get("sha256") != file_hashes[filename]:
                 raise RoutePublicationError("complete route file checksum is invalid")
 
-        raw_legs = _read_csv_rows_bytes(
-            file_bytes[ROUTE_LEGS_FILENAME], columns=LEG_COLUMNS,
-            label="complete route leg CSV",
-        )
-        raw_costs = _read_csv_rows_bytes(
-            file_bytes[COST_COMPONENTS_FILENAME], columns=COMPLETE_COST_COLUMNS,
-            label="complete cost CSV",
-        )
-        raw_opportunities = _read_csv_rows_bytes(
-            file_bytes[ROUTE_OPPORTUNITIES_FILENAME],
-            columns=COMPLETE_OPPORTUNITY_COLUMNS,
-            label="complete opportunity CSV",
-        )
-        legs = [_decode_row_json(row["row_json"], "complete route leg CSV") for row in raw_legs]
-        costs = [_decode_row_json(row["row_json"], "complete cost CSV") for row in raw_costs]
-        opportunities = [
-            _decode_row_json(row["row_json"], "complete opportunity CSV")
-            for row in raw_opportunities
-        ]
-        _validate_csv_projection(
-            raw_legs, legs, route_cohort_id=cohort_id,
-            projector=_leg_csv_row, label="complete route leg CSV",
-        )
-        if any(
-            dict(csv_row) != _complete_cost_csv_row(row)
-            for csv_row, row in zip(raw_costs, costs)
-        ):
-            raise RoutePublicationError("complete cost CSV projection mismatch")
-        if any(
-            dict(csv_row) != _complete_opportunity_csv_row(row)
-            for csv_row, row in zip(raw_opportunities, opportunities)
-        ):
-            raise RoutePublicationError("complete opportunity CSV projection mismatch")
-
-        (
-            bundle,
-            sqlite_legs,
-            sqlite_costs,
-            sqlite_opportunities,
-        ) = _read_complete_sqlite(
-            file_bytes[ROUTE_OPPORTUNITY_SQLITE_FILENAME],
+        representation = {
+            filename: file_bytes[filename]
+            for filename in _COMPLETE_MANIFEST_ARTIFACT_FILENAMES
+        }
+        bundle, legs, costs, opportunities = (
+            _read_complete_representation_bytes(
+                file_bytes=representation, route_cohort_id=cohort_id,
+            )
         )
         bundle = _validate_complete_logical_bundle(bundle)
         if (
             legs != bundle["legs"] or costs != bundle["cost_components"]
             or opportunities != bundle["opportunities"]
-            or sqlite_legs != legs or sqlite_costs != costs
-            or sqlite_opportunities != opportunities
         ):
             raise RoutePublicationError("complete CSV and SQLite inventories do not match")
         expected_files = {
