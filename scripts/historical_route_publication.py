@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, NoReturn, Tuple
+from typing import Any, Dict, Mapping, NoReturn, Optional, Tuple
 import fcntl
 import hashlib
 import json
@@ -61,6 +61,25 @@ _NOTIONALS = [1000, 5000, 10000, 50000, 100000]
 _VENUES = ("uniswap_v2", "sushiswap_v2")
 _MAX_MEMBER_BYTES = 8_388_608
 _MAX_DECODED_MEMBER_BYTES = 16_777_216
+_MAX_SCENARIO_TRACE_BYTES = 16_777_216
+_MAX_GZIP_MEMBER_BYTES = 16_842_752
+
+_HISTORICAL_COMPLETE_STAGE = "route_historical_foundry_replay/v1"
+_HISTORICAL_COMPLETE_MANIFEST_SCHEMA = (
+    "route_historical_replay_manifest/v1"
+)
+_HISTORICAL_REPLAY_EVIDENCE_SCHEMA = (
+    "historical_foundry_replay_evidence/v1"
+)
+_HISTORICAL_REPLAY_EVIDENCE_FILENAME = "replay_evidence.json"
+_HISTORICAL_COMPLETE_FILES = frozenset((
+    "manifest.json", "route_legs.csv", "cost_components.csv",
+    "route_opportunities.csv", "route_cohort.sqlite3",
+    _HISTORICAL_REPLAY_EVIDENCE_FILENAME,
+))
+_HISTORICAL_COMPLETE_ARTIFACT_FILES = frozenset(
+    _HISTORICAL_COMPLETE_FILES - {"manifest.json"}
+)
 
 _COST_PROOF_FIELDS = frozenset((
     "schema", "scenario_key", "policy_sha256", "receipt_sha256",
@@ -159,7 +178,13 @@ def _initialize_validated_historical_cost_proof_inputs():
                 )
         return record["object_value"]
 
-    def issue(proof: Mapping[str, Any]) -> Any:
+    def issue(proof: Mapping[str, Any], owner: object) -> Any:
+        try:
+            owner_reference = weakref.ref(owner)
+        except TypeError as error:
+            raise HistoricalRoutePublicationError(
+                "validated historical cost proof owner is invalid"
+            ) from error
         frozen = _freeze(_plain(proof))
         value = object.__new__(ValidatedHistoricalCostProofInputs)
         fields = {
@@ -170,7 +195,9 @@ def _initialize_validated_historical_cost_proof_inputs():
         for field, field_value in fields.items():
             object.__setattr__(value, field, field_value)
         value_id = id(value)
-        record = {"issuer": issuer, **fields}
+        record = {
+            "issuer": issuer, "owner_reference": owner_reference, **fields,
+        }
 
         def retire(reference: weakref.ReferenceType) -> None:
             current = registry.get(value_id)
@@ -179,6 +206,49 @@ def _initialize_validated_historical_cost_proof_inputs():
 
         registry[value_id] = (weakref.ref(value, retire), record)
         return value
+
+    def require_for_owner(value: Any, owner: object) -> Mapping[str, Any]:
+        proof = require(value)
+        entry = registry.get(id(value))
+        if entry is None or entry[1]["owner_reference"]() is not owner:
+            raise HistoricalRoutePublicationError(
+                "validated historical cost proof ancestry differs"
+            )
+        return proof
+
+    published_installed = [False]
+
+    def bind_published_loader(material_reader: Any) -> Any:
+        if (
+            published_installed[0]
+            or material_reader is not globals().get(
+                "_historical_published_cost_proof_material"
+            )
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical published proof loader installer is invalid"
+            )
+
+        def load(
+            *, validated_view: Any, scenario_key: str,
+        ) -> Any:
+            material, expected_hash = material_reader(
+                validated_view=validated_view,
+                scenario_key=scenario_key,
+            )
+            proof = issue(material["proof"], validated_view)
+            if proof.proof_inputs_hash != expected_hash:
+                raise HistoricalRoutePublicationError(
+                    "historical published proof hash differs"
+                )
+            require_for_owner(proof, validated_view)
+            return proof
+
+        published_installed[0] = True
+        globals().pop(
+            "_bind_historical_published_cost_proof_loader", None
+        )
+        return load
 
     installed = [False]
 
@@ -200,19 +270,24 @@ def _initialize_validated_historical_cost_proof_inputs():
                 context=context, scenario_key=scenario_key,
                 validate_context=True,
             )
-            return issue(material["proof"])
+            return issue(material["proof"], context)
 
         installed[0] = True
         globals().pop("_bind_historical_cost_proof_loader", None)
         return load
 
-    return ValidatedHistoricalCostProofInputs, bind_loader, require
+    return (
+        ValidatedHistoricalCostProofInputs, bind_loader, require,
+        require_for_owner, bind_published_loader,
+    )
 
 
 (
     ValidatedHistoricalCostProofInputs,
     _bind_historical_cost_proof_loader,
     _validated_historical_cost_proof_object,
+    _require_historical_cost_proof_owner,
+    _bind_historical_published_cost_proof_loader,
 ) = _initialize_validated_historical_cost_proof_inputs()
 del _initialize_validated_historical_cost_proof_inputs
 
@@ -332,12 +407,24 @@ def _read_source_member(
     source: object, members: Mapping[str, Mapping[str, Any]], path: str,
 ) -> bytes:
     descriptor = members.get(path)
+    path_parts = path.split("/") if type(path) is str else []
+    is_scenario_trace = (
+        len(path_parts) == 4
+        and path_parts[0] == "foundry"
+        and path_parts[3] == "trace.json.gz"
+    )
+    if is_scenario_trace:
+        maximum_size = _MAX_SCENARIO_TRACE_BYTES
+    elif type(path) is str and path.endswith(".json.gz"):
+        maximum_size = _MAX_GZIP_MEMBER_BYTES
+    else:
+        maximum_size = _MAX_MEMBER_BYTES
     if (
         type(descriptor) is not dict
         or set(descriptor) != {"path", "byte_count", "sha256"}
         or descriptor.get("path") != path
         or type(descriptor.get("byte_count")) is not int
-        or not 0 < descriptor["byte_count"] <= _MAX_MEMBER_BYTES
+        or not 0 < descriptor["byte_count"] <= maximum_size
         or type(descriptor.get("sha256")) is not str
         or re.fullmatch(r"[0-9a-f]{64}", descriptor["sha256"]) is None
     ):
@@ -1240,6 +1327,70 @@ def _validate_bundle(
             os.close(bundle_fd)
 
 
+def _historical_core_member_snapshots_at(
+    bundle_fd: int,
+) -> Mapping[str, os.stat_result]:
+    try:
+        if set(os.listdir(bundle_fd)) != _CORE_FILES:
+            raise HistoricalRoutePublicationError(
+                "historical immutable core file inventory differs"
+            )
+    except OSError as error:
+        raise HistoricalRoutePublicationError(
+            "historical immutable core file inventory differs"
+        ) from error
+    snapshots = {}
+    for name in sorted(_CORE_FILES):
+        member_fd = None
+        try:
+            member_fd, before = _route_publication._open_regular_file_at(
+                bundle_fd, name,
+                label="historical immutable core {}".format(name),
+            )
+            opened = os.fstat(member_fd)
+            current = os.stat(
+                name, dir_fd=bundle_fd, follow_symlinks=False
+            )
+            if (
+                _route_publication._stable_file_metadata(opened)
+                != _route_publication._stable_file_metadata(before)
+                or _route_publication._stable_file_metadata(current)
+                != _route_publication._stable_file_metadata(before)
+            ):
+                raise HistoricalRoutePublicationError(
+                    "historical immutable core member changed"
+                )
+            snapshots[name] = opened
+        except _route_publication.RoutePublicationError as error:
+            raise HistoricalRoutePublicationError(
+                "historical immutable core member identity differs"
+            ) from error
+        except OSError as error:
+            raise HistoricalRoutePublicationError(
+                "historical immutable core member identity differs"
+            ) from error
+        finally:
+            if member_fd is not None:
+                os.close(member_fd)
+    return MappingProxyType(snapshots)
+
+
+def _require_historical_core_member_snapshots_at(
+    bundle_fd: int,
+    expected: Mapping[str, os.stat_result],
+) -> None:
+    current = _historical_core_member_snapshots_at(bundle_fd)
+    if set(current) != _CORE_FILES or any(
+        _route_publication._stable_file_metadata(current[name])
+        != _route_publication._stable_file_metadata(expected[name])
+        for name in _CORE_FILES
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical immutable core member snapshot differs"
+        )
+    return None
+
+
 def _context_projection(
     *, manifest: Mapping[str, Any], manifest_sha256: str,
     pointer: Mapping[str, Any],
@@ -1264,7 +1415,7 @@ def _context_projection(
 def _issue_context(
     *, source: object, projection: Mapping[str, Any], owns_source: bool,
     stage_record: Any = None, stage_owner: Any = None,
-    published_record: Any = None,
+    published_record: Any = None, immutable_record: Any = None,
 ) -> "HistoricalReplayBuildContext":
     value = object.__new__(HistoricalReplayBuildContext)
     value_id = id(value)
@@ -1276,6 +1427,7 @@ def _issue_context(
         "owns_source": owns_source,
         "stage_record": stage_record, "stage_owner": stage_owner,
         "published_record": published_record,
+        "immutable_record": immutable_record,
     }
     if stage_record is not None:
         stage_record["borrow_count"] += 1
@@ -1831,11 +1983,111 @@ def _validate_published_context(record: Mapping[str, Any]) -> None:
             "historical route core held identity differs"
         ) from error
     finally:
-        if bundle_fd is not None:
-            os.close(bundle_fd)
-        if bundles_fd is not None:
-            os.close(bundles_fd)
-        os.close(core_fd)
+        _close_descriptors_robustly(bundle_fd, bundles_fd, core_fd)
+    return None
+
+
+def _validate_immutable_context(record: Mapping[str, Any]) -> None:
+    """Reread one pinned historical core without consulting core/latest."""
+    held = record["immutable_record"]
+    core_root, core_fd, current_core = (
+        _route_publication._open_verified_directory(
+            held["core_root"], "historical immutable core root"
+        )
+    )
+    bundles_fd = bundle_fd = None
+    try:
+        if not _route_publication._same_inode(
+            current_core, held["core_details"]
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable core root identity differs"
+            )
+        bundles_fd, current_bundles = _route_publication._open_directory_at(
+            core_fd, "bundles", "historical immutable core bundles"
+        )
+        if not _route_publication._same_inode(
+            current_bundles, held["bundles_details"]
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable core bundles identity differs"
+            )
+        bundle_fd, current_bundle = _route_publication._open_directory_at(
+            bundles_fd, held["bundle_name"],
+            "historical immutable core bundle",
+        )
+        if (
+            _route_publication._stable_file_metadata(current_bundle)
+            != _route_publication._stable_file_metadata(
+                held["bundle_details"]
+            )
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable core bundle changed"
+            )
+        _require_historical_core_member_snapshots_at(
+            bundle_fd, held["member_details"]
+        )
+        current = _derive_historical_core(
+            config=held["config"], source=record["source"]
+        )
+        if (
+            current["evidence"] != held["derived"]["evidence"]
+            or current["cohort"] != held["derived"]["cohort"]
+            or current["source_identity_sha256"]
+            != held["derived"]["source_identity_sha256"]
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable raw source changed"
+            )
+        expected_pointer = _pointer(
+            held["manifest"], held["manifest_sha256"]
+        )
+        if (
+            _sha(_json_file_bytes(expected_pointer))
+            != held["pointer_sha256"]
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable core pointer binding differs"
+            )
+        _validate_bundle(
+            bundle=held["bundle_path"],
+            expected_derived=held["derived"],
+            expected_manifest=held["manifest"],
+            expected_manifest_sha256=held["manifest_sha256"],
+            bundle_fd=bundle_fd,
+            expected_bundle_details=held["bundle_details"],
+        )
+        _require_historical_core_member_snapshots_at(
+            bundle_fd, held["member_details"]
+        )
+        _route_publication._verify_open_path_identity(
+            core_root, held["core_details"],
+            "historical immutable core root",
+        )
+        _route_publication._verify_directory_entry(
+            core_fd, "bundles", held["bundles_details"],
+            "historical immutable core bundles",
+        )
+        if (
+            _route_publication._stable_file_metadata(os.fstat(bundle_fd))
+            != _route_publication._stable_file_metadata(
+                held["bundle_details"]
+            )
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable core bundle changed during validation"
+            )
+        _route_publication._verify_directory_entry_snapshot(
+            bundles_fd, held["bundle_name"], held["bundle_details"],
+            "historical immutable core bundle",
+        )
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical immutable core held identity differs"
+        ) from error
+    finally:
+        _close_descriptors_robustly(bundle_fd, bundles_fd, core_fd)
     return None
 
 
@@ -1855,6 +2107,14 @@ def _validate_context_current(record: Mapping[str, Any]) -> None:
     elif record.get("published_record") is not None:
         _validate_published_context(record)
         held = record["published_record"]
+        expected = _context_projection(
+            manifest=held["manifest"],
+            manifest_sha256=held["manifest_sha256"],
+            pointer=_pointer(held["manifest"], held["manifest_sha256"]),
+        )
+    elif record.get("immutable_record") is not None:
+        _validate_immutable_context(record)
+        held = record["immutable_record"]
         expected = _context_projection(
             manifest=held["manifest"],
             manifest_sha256=held["manifest_sha256"],
@@ -2298,11 +2558,188 @@ def load_latest_historical_replay_core(
     finally:
         if source is not None:
             source.close()
-        if bundle_fd is not None:
-            os.close(bundle_fd)
-        if bundles_fd is not None:
-            os.close(bundles_fd)
-        os.close(core_fd)
+        _close_descriptors_robustly(bundle_fd, bundles_fd, core_fd)
+
+
+def _load_immutable_historical_replay_core(
+    *, data_dir: Path, route_cohort_id: str,
+    expected_manifest_sha256: str, expected_pointer_sha256: str,
+) -> HistoricalReplayBuildContext:
+    """Load one manifest-pinned core without reading the mutable pointer."""
+    if (
+        not isinstance(data_dir, Path)
+        or type(route_cohort_id) is not str
+        or re.fullmatch(r"cohort:[0-9a-f]{64}", route_cohort_id) is None
+        or type(expected_manifest_sha256) is not str
+        or re.fullmatch(
+            r"[0-9a-f]{64}", expected_manifest_sha256
+        ) is None
+        or type(expected_pointer_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", expected_pointer_sha256) is None
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical immutable core input is invalid"
+        )
+    core_root, core_fd, core_details = (
+        _route_publication._open_verified_directory(
+            data_dir / "routes" / "historical" / "core",
+            "historical immutable core root",
+        )
+    )
+    source = None
+    bundles_fd = bundle_fd = None
+    try:
+        bundles_fd, bundles_details = _route_publication._open_directory_at(
+            core_fd, "bundles", "historical immutable core bundles"
+        )
+        bundle_fd, bundle_details = _route_publication._open_directory_at(
+            bundles_fd, route_cohort_id,
+            "historical immutable core bundle",
+        )
+        bundle_path = core_root / "bundles" / route_cohort_id
+        manifest_bytes, manifest_sha256, _manifest_details = (
+            _route_publication._read_bounded_bytes_at(
+                bundle_fd, "manifest.json",
+                limit=_route_publication._MAX_JSON_BYTES,
+                label="historical immutable core manifest",
+            )
+        )
+        if manifest_sha256 != expected_manifest_sha256:
+            raise HistoricalRoutePublicationError(
+                "historical immutable core manifest hash differs"
+            )
+        try:
+            manifest = json.loads(manifest_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HistoricalRoutePublicationError(
+                "historical immutable core manifest is invalid"
+            ) from error
+        if (
+            type(manifest) is not dict
+            or manifest_bytes != _json_file_bytes(manifest)
+            or manifest.get("schema") != _MANIFEST_SCHEMA
+            or manifest.get("bundle_stage") != _BUNDLE_STAGE
+            or manifest.get("route_cohort_id") != route_cohort_id
+            or re.fullmatch(
+                r"run:[0-9a-f]{64}",
+                manifest.get("raw_evidence_run_id", ""),
+            ) is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                manifest.get("raw_run_manifest_sha256", ""),
+            ) is None
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable core manifest schema differs"
+            )
+        config = load_historical_foundry_config_set()
+        if any(
+            manifest.get("{}_sha256".format(role))
+            != getattr(config, role).physical_sha256
+            for role in ("policy", "authority", "toolchain")
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable core config binding differs"
+            )
+        source = _historical_storage.open_validated_run(
+            data_dir=data_dir,
+            run_id=manifest["raw_evidence_run_id"],
+            expected_manifest_sha256=manifest[
+                "raw_run_manifest_sha256"
+            ],
+        )
+        derived = _derive_historical_core(config=config, source=source)
+        artifacts, expected_manifest, rebuilt_manifest_sha256 = (
+            _build_artifacts(config=config, derived=derived)
+        )
+        del artifacts
+        if (
+            rebuilt_manifest_sha256 != expected_manifest_sha256
+            or manifest != expected_manifest
+            or manifest_bytes != _json_file_bytes(expected_manifest)
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable core manifest content differs"
+            )
+        expected_pointer = _pointer(
+            expected_manifest, rebuilt_manifest_sha256
+        )
+        if (
+            _sha(_json_file_bytes(expected_pointer))
+            != expected_pointer_sha256
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical immutable core pointer hash differs"
+            )
+        _validate_bundle(
+            bundle=bundle_path,
+            expected_derived=derived,
+            expected_manifest=expected_manifest,
+            expected_manifest_sha256=rebuilt_manifest_sha256,
+            bundle_fd=bundle_fd,
+            expected_bundle_details=bundle_details,
+        )
+        member_details = _historical_core_member_snapshots_at(bundle_fd)
+        _route_publication._verify_open_path_identity(
+            core_root, core_details, "historical immutable core root"
+        )
+        _route_publication._verify_directory_entry(
+            core_fd, "bundles", bundles_details,
+            "historical immutable core bundles",
+        )
+        _route_publication._verify_directory_entry_snapshot(
+            bundles_fd, route_cohort_id, bundle_details,
+            "historical immutable core bundle",
+        )
+        projection = _context_projection(
+            manifest=expected_manifest,
+            manifest_sha256=rebuilt_manifest_sha256,
+            pointer=expected_pointer,
+        )
+        immutable_record = {
+            "config": config,
+            "core_root": core_root,
+            "core_details": core_details,
+            "bundles_details": bundles_details,
+            "bundle_name": route_cohort_id,
+            "bundle_path": bundle_path,
+            "bundle_details": bundle_details,
+            "member_details": member_details,
+            "derived": derived,
+            "manifest": expected_manifest,
+            "manifest_sha256": rebuilt_manifest_sha256,
+            "pointer_sha256": expected_pointer_sha256,
+        }
+        context = _issue_context(
+            source=source,
+            projection=projection,
+            owns_source=True,
+            immutable_record=immutable_record,
+        )
+        context.reread_unchanged()
+        source = None
+        return context
+    except HistoricalRoutePublicationError:
+        raise
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical immutable core loading failed"
+        ) from error
+    except Exception as error:
+        raise HistoricalRoutePublicationError(
+            "historical immutable core loading failed"
+        ) from error
+    finally:
+        try:
+            if source is not None:
+                try:
+                    source.close()
+                except Exception:
+                    pass
+        finally:
+            _close_descriptors_robustly(
+                bundle_fd, bundles_fd, core_fd
+            )
 
 
 def _require_historical_replay_build_context(
@@ -3420,11 +3857,2183 @@ def _build_historical_scenario_for_publication(
         context=context, inputs=inputs, route=raw_inputs["route"],
         rows=rows,
     )
+    material = _historical_scenario_material(
+        context=context, scenario_key=scenario_key, validate_context=True,
+    )
+    if (
+        material["canonical_projection_bytes"]
+        != inputs.canonical_projection_bytes
+        or material["proof_inputs_hash"] != inputs.proof_inputs_hash
+        or material["source_descriptor_set_sha256"]
+        != inputs.source_descriptor_set_sha256
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical scenario source changed before serialization"
+        )
     return MappingProxyType({
         "schema": "historical_scenario_publication_build/v1",
         "scenario_key": scenario_key,
         "proof_inputs_hash": inputs.proof_inputs_hash,
         "canonical_projection_bytes": canonical_projection_bytes,
+        "canonical_input_bytes": inputs.canonical_projection_bytes,
+        "canonical_source_descriptor_bytes": _canonical_bytes(
+            material["descriptor_set"]
+        ),
         "opportunity": MappingProxyType(opportunity),
         "cost_components": tuple(MappingProxyType(row) for row in rows),
     })
+
+
+def _initialize_validated_historical_replay_bundle_view():
+    installed = [False]
+
+    def bind_runtime(
+        *, validation_impl: Any, current_checker_function: Any,
+        scenario_material_reader: Any,
+    ) -> Tuple[Any, Any, Any]:
+        if (
+            installed[0]
+            or validation_impl is not globals().get(
+                "_validate_historical_replay_bundle_impl"
+            )
+            or current_checker_function is not globals().get(
+                "_validate_historical_replay_bundle_view_current"
+            )
+            or scenario_material_reader is not globals().get(
+                "_historical_scenario_material"
+            )
+        ):
+            raise HistoricalRoutePublicationError(
+                "validated historical replay bundle installer is invalid"
+            )
+
+        record_fields = frozenset((
+            "replay_id", "route_cohort_id", "manifest_sha256",
+            "data_dir", "raw_root", "bundle_path", "parent_details",
+            "bundle_details", "read_specs", "file_bytes", "file_hashes",
+            "file_details", "manifest", "bundle", "replay_evidence",
+            "immutable_context",
+        ))
+
+        def close_context_silently(context: object) -> None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        def require_record(
+            value: object, *, validate_current: bool = True,
+        ) -> Mapping[str, Any]:
+            if type(value) is not ValidatedHistoricalReplayBundleView:
+                raise HistoricalRoutePublicationError(
+                    "validated historical replay bundle view is invalid"
+                )
+            try:
+                owner = object.__getattribute__(
+                    value, "_validated_record"
+                )
+                finalizer = object.__getattribute__(
+                    value, "_context_finalizer"
+                )
+            except AttributeError as error:
+                raise HistoricalRoutePublicationError(
+                    "validated historical replay bundle view is invalid"
+                ) from error
+            if (
+                type(owner) is not MappingProxyType
+                or set(owner) != {"owner_reference", "payload"}
+                or type(owner.get("owner_reference"))
+                is not weakref.ReferenceType
+                or owner["owner_reference"]() is not value
+                or type(owner.get("payload")) is not MappingProxyType
+                or type(finalizer) is not weakref.finalize
+                or not finalizer.alive
+            ):
+                raise HistoricalRoutePublicationError(
+                    "validated historical replay bundle view is invalid"
+                )
+            record = owner["payload"]
+            if set(record) != record_fields:
+                raise HistoricalRoutePublicationError(
+                    "validated historical replay bundle view is invalid"
+                )
+            finalizer_state = finalizer.peek()
+            if (
+                finalizer_state is None
+                or finalizer_state[0] is not value
+                or finalizer_state[1] is not close_context_silently
+                or finalizer_state[2]
+                != (record["immutable_context"],)
+                or finalizer_state[3] != {}
+            ):
+                raise HistoricalRoutePublicationError(
+                    "validated historical replay bundle view is invalid"
+                )
+            for field in (
+                "replay_id", "route_cohort_id", "manifest_sha256"
+            ):
+                try:
+                    current = object.__getattribute__(value, field)
+                except AttributeError as error:
+                    raise HistoricalRoutePublicationError(
+                        "validated historical replay bundle view is invalid"
+                    ) from error
+                if current != record[field]:
+                    raise HistoricalRoutePublicationError(
+                        "validated historical replay bundle view differs"
+                    )
+            if validate_current:
+                current_checker_function(record)
+            return record
+
+        class ValidatedHistoricalReplayBundleView:
+            """Identity-only handle for a fully validated immutable bundle."""
+
+            __slots__ = (
+                "replay_id", "route_cohort_id", "manifest_sha256",
+                "_validated_record", "_context_finalizer", "__weakref__",
+            )
+
+            def __new__(cls, *args: Any, **kwargs: Any) -> NoReturn:
+                del cls, args, kwargs
+                raise HistoricalRoutePublicationError(
+                    "validated historical replay bundle construction is private"
+                )
+
+            def __setattr__(self, name: str, value: Any) -> NoReturn:
+                del name, value
+                raise HistoricalRoutePublicationError(
+                    "validated historical replay bundle view is immutable"
+                )
+
+            def __delattr__(self, name: str) -> NoReturn:
+                del name
+                raise HistoricalRoutePublicationError(
+                    "validated historical replay bundle view is immutable"
+                )
+
+            def __repr__(self) -> str:
+                return "ValidatedHistoricalReplayBundleView(<redacted>)"
+
+            def __reduce_ex__(self, protocol: int) -> NoReturn:
+                del protocol
+                raise TypeError(
+                    "validated historical replay bundle is not serializable"
+                )
+
+            def reread_unchanged(self) -> None:
+                require_record(self, validate_current=True)
+
+            def close(self) -> None:
+                record = require_record(self, validate_current=False)
+                finalizer = object.__getattribute__(
+                    self, "_context_finalizer"
+                )
+                record["immutable_context"].close()
+                finalizer.detach()
+                object.__setattr__(self, "_validated_record", None)
+                object.__setattr__(self, "_context_finalizer", None)
+
+            def __enter__(self) -> "ValidatedHistoricalReplayBundleView":
+                require_record(self, validate_current=True)
+                return self
+
+            def __exit__(
+                self, error_type: Any, error: Any, traceback: Any,
+            ) -> None:
+                del error_type, traceback
+                try:
+                    return self.close()
+                except BaseException as cleanup_error:
+                    if error is not None and not isinstance(error, Exception):
+                        raise error
+                    raise cleanup_error
+
+        def issue(
+            record: Dict[str, Any],
+        ) -> ValidatedHistoricalReplayBundleView:
+            if type(record) is not dict or set(record) != record_fields:
+                raise HistoricalRoutePublicationError(
+                    "validated historical replay bundle record is invalid"
+                )
+            frozen = _freeze(record)
+            current_checker_function(frozen)
+            value = object.__new__(ValidatedHistoricalReplayBundleView)
+            owner = MappingProxyType({
+                "owner_reference": weakref.ref(value),
+                "payload": frozen,
+            })
+            finalizer = weakref.finalize(
+                value, close_context_silently,
+                frozen["immutable_context"],
+            )
+            try:
+                for field in (
+                    "replay_id", "route_cohort_id", "manifest_sha256"
+                ):
+                    object.__setattr__(value, field, frozen[field])
+                object.__setattr__(value, "_validated_record", owner)
+                object.__setattr__(value, "_context_finalizer", finalizer)
+                require_record(value, validate_current=False)
+            except BaseException:
+                finalizer.detach()
+                raise
+            return value
+
+        def validate(
+            *, data_dir: Path, raw_root: Path, bundle_path: Path,
+            expected_pointer_core: Optional[Mapping[str, Any]],
+            expected_replay_id: Optional[str],
+            require_directory_identity: bool, issue_view: bool,
+        ) -> Mapping[str, Any]:
+            return validation_impl(
+                data_dir=data_dir, raw_root=raw_root,
+                bundle_path=bundle_path,
+                expected_pointer_core=expected_pointer_core,
+                expected_replay_id=expected_replay_id,
+                require_directory_identity=require_directory_identity,
+                issue_view=issue_view, view_issuer=issue,
+            )
+
+        def published_material(
+            *, validated_view: ValidatedHistoricalReplayBundleView,
+            scenario_key: str,
+        ) -> Tuple[Mapping[str, Any], str]:
+            record = require_record(
+                validated_view, validate_current=True
+            )
+            scenarios = [
+                row for row in record["replay_evidence"]["scenarios"]
+                if row["scenario_key"] == scenario_key
+            ]
+            if len(scenarios) != 1:
+                raise HistoricalRoutePublicationError(
+                    "historical published scenario is invalid"
+                )
+            material = scenario_material_reader(
+                context=record["immutable_context"],
+                scenario_key=scenario_key, validate_context=True,
+            )
+            scenario = scenarios[0]
+            expected_sources = {
+                item["path"]: {
+                    "path": item["path"],
+                    "byte_count": item["byte_count"],
+                    "sha256": item["sha256"],
+                }
+                for item in scenario["source_members"]
+            }
+            material_sources = {
+                item["path"]: item for item in material["descriptor_set"]
+                if item["path"] in expected_sources
+            }
+            if (
+                material["proof_inputs_hash"]
+                != scenario["proof_inputs_hash"]
+                or material_sources != expected_sources
+            ):
+                raise HistoricalRoutePublicationError(
+                    "historical published proof source differs"
+                )
+            return material, scenario["proof_inputs_hash"]
+
+        installed[0] = True
+        return (
+            ValidatedHistoricalReplayBundleView, validate,
+            published_material,
+        )
+
+    return bind_runtime
+
+
+_bind_historical_replay_bundle_view_runtime = (
+    _initialize_validated_historical_replay_bundle_view()
+)
+del _initialize_validated_historical_replay_bundle_view
+
+
+def _historical_complete_roots(
+    *, data_dir: Path, raw_root: Path,
+) -> Tuple[Path, Path]:
+    if not isinstance(data_dir, Path) or not isinstance(raw_root, Path):
+        raise HistoricalRoutePublicationError(
+            "historical complete bundle input is invalid"
+        )
+    data = _route_publication._absolute_without_symlink_resolution(data_dir)
+    raw = _route_publication._absolute_without_symlink_resolution(raw_root)
+    expected_raw = _route_publication._absolute_without_symlink_resolution(
+        data / "raw" / "historical-foundry-replay"
+    )
+    if raw != expected_raw:
+        raise HistoricalRoutePublicationError(
+            "historical complete raw root differs"
+        )
+    return data, raw
+
+
+def _historical_context_held_record(
+    context: HistoricalReplayBuildContext,
+) -> Mapping[str, Any]:
+    record = _context_record(context)
+    _validate_context_current(record)
+    for name in ("stage_record", "published_record", "immutable_record"):
+        held = record.get(name)
+        if held is not None:
+            if (
+                type(held.get("derived")) is not dict
+                or type(held.get("config")) is not HistoricalFoundryConfigSet
+                or type(held.get("manifest")) is not dict
+            ):
+                raise HistoricalRoutePublicationError(
+                    "historical complete context ancestry differs"
+                )
+            return held
+    raise HistoricalRoutePublicationError(
+        "historical complete context ancestry is invalid"
+    )
+
+
+def _historical_complete_replay_id(
+    *, projection: Mapping[str, Any], route_cohort_id: str,
+    overlay_set_sha256: str, scenario_set_sha256: str,
+) -> str:
+    identity = {
+        "route_cohort_id": route_cohort_id,
+        "historical_core_manifest_sha256": projection[
+            "core_manifest_sha256"
+        ],
+        "historical_core_pointer_sha256": projection[
+            "core_pointer_sha256"
+        ],
+        "run_id": projection["run_id"],
+        "run_manifest_sha256": projection[
+            "run_manifest_sha256"
+        ],
+        "selection_sha256": projection["selection_sha256"],
+        "overlay_set_sha256": overlay_set_sha256,
+        "scenario_set_sha256": scenario_set_sha256,
+    }
+    return "replay:" + _sha(
+        b"route_historical_replay_identity/v1\0"
+        + _canonical_bytes(identity)
+    )
+
+
+def _historical_complete_input_generations(
+    *, cohort: Mapping[str, Any], projection: Mapping[str, Any],
+    facts: Mapping[str, Any], opportunities: Tuple[Mapping[str, Any], ...],
+    costs: Tuple[Mapping[str, Any], ...], source_identity_sha256: str,
+) -> Dict[str, Any]:
+    return {
+        "candidate_source_generation": cohort[
+            "candidate_source_generation"
+        ],
+        "collection_input_generation": cohort[
+            "collection_input_generation"
+        ],
+        "raw_evidence_run_id": projection["run_id"],
+        "raw_evidence_generation": projection["run_manifest_sha256"],
+        "quantity_quote_generation": _sha(
+            b"historical_quantity_quote_generation/v1\0"
+            + _canonical_bytes([
+                {
+                    "scenario_key": row["scenario_key"],
+                    "proof_inputs_hash": row["proof_inputs_hash"],
+                }
+                for row in facts["scenarios"]
+            ])
+        ),
+        "cost_component_generation": _sha(
+            b"historical_cost_component_generation/v1\0"
+            + _canonical_bytes(list(costs))
+        ),
+        "classified_opportunity_generation": _sha(
+            b"historical_classified_opportunity_generation/v1\0"
+            + _canonical_bytes(list(opportunities))
+        ),
+        "fee_profile_generation": projection["policy_sha256"],
+        "inventory_profile_generation": facts["scenario_set_sha256"],
+        "typed_source_generation": source_identity_sha256,
+        "adapter_versions": dict(
+            _route_publication._COMPLETE_ADAPTER_VERSIONS
+        ),
+    }
+
+
+def _validate_historical_replay_evidence_join(
+    *, bundle: Mapping[str, Any], evidence: Mapping[str, Any],
+) -> None:
+    expected_fields = {
+        "schema", "replay_id", "route_cohort_id", "run_id", "policy_id",
+        "policy_sha256", "authority_sha256", "toolchain_sha256",
+        "run_manifest_sha256", "selection_sha256", "temporal_scope",
+        "execution_claim", "selected_block", "overlay_set_sha256",
+        "scenario_count", "scenarios", "scenario_set_sha256",
+    }
+    scenarios = evidence.get("scenarios")
+    if (
+        type(evidence) is not dict
+        or set(evidence) != expected_fields
+        or evidence.get("schema") != _HISTORICAL_REPLAY_EVIDENCE_SCHEMA
+        or re.fullmatch(r"replay:[0-9a-f]{64}", evidence.get("replay_id", ""))
+        is None
+        or evidence.get("route_cohort_id") != bundle["route_cohort_id"]
+        or re.fullmatch(
+            r"run:[0-9a-f]{64}", evidence.get("run_id", "")
+        ) is None
+        or re.fullmatch(
+            r"policy:[0-9a-f]{64}", evidence.get("policy_id", "")
+        ) is None
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", evidence.get(field, ""))
+            is None
+            for field in (
+                "policy_sha256", "authority_sha256", "toolchain_sha256",
+                "run_manifest_sha256", "selection_sha256",
+                "overlay_set_sha256", "scenario_set_sha256",
+            )
+        )
+        or type(evidence.get("selected_block")) is not dict
+        or evidence.get("temporal_scope") != _TEMPORAL_SCOPE
+        or evidence.get("execution_claim") != _EXECUTION_CLAIM
+        or evidence.get("scenario_count") != 10
+        or type(scenarios) is not list
+        or len(scenarios) != 10
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical replay evidence schema differs"
+        )
+    if any(
+        type(row) is not dict
+        or type(row.get("route_id")) is not str
+        or type(row.get("requested_notional_usd")) is not int
+        for row in scenarios
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical replay scenario identity differs"
+        )
+    if scenarios != sorted(
+        scenarios,
+        key=lambda row: (
+            row.get("route_id", ""), row.get("requested_notional_usd", -1)
+        ),
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical replay evidence order differs"
+        )
+    opportunities = {
+        row["opportunity_id"]: row for row in bundle["opportunities"]
+    }
+    if len(opportunities) != 10:
+        raise HistoricalRoutePublicationError(
+            "historical opportunity inventory differs"
+        )
+    observed = set()
+    overlay_inventory = []
+    scenario_fields = {
+        "schema", "scenario_key", "opportunity_id", "route_id",
+        "direction", "requested_notional_usd", "receipt_status",
+        "opportunity_class", "core_manifest_sha256", "policy_sha256",
+        "authority_sha256", "toolchain_sha256",
+        "source_descriptor_set_sha256", "proof_inputs_hash",
+        "selected_block", "overlay_sha256", "receipt_sha256",
+        "trace_sha256", "result_sha256", "executor_creation_sha256",
+        "executor_runtime_sha256", "calldata_sha256", "transaction",
+        "receipt", "balances", "gross_edge_weth_raw",
+        "gross_buy_cost_usd", "gross_sell_proceeds_usd",
+        "gross_edge_usd", "research_net_edge_usd", "baseline",
+        "stress_25", "stress_50", "stress_robust",
+        "cost_component_set_sha256", "source_members",
+    }
+    selected_block_fields = {
+        "number", "hash", "parent_hash", "state_root", "timestamp",
+        "gas_limit", "gas_used", "base_fee_per_gas",
+        "synthetic_child_number", "synthetic_child_timestamp",
+        "synthetic_child_base_fee_per_gas",
+        "p50_priority_fee_per_gas", "p90_priority_fee_per_gas", "eth_usd",
+    }
+    transaction_fields = {
+        "sender", "executor", "type", "nonce", "gas_limit",
+        "access_list", "max_priority_fee_per_gas", "max_fee_per_gas",
+        "calldata", "calldata_sha256", "transaction_hash",
+        "transaction_index",
+    }
+    receipt_fields = {
+        "status", "block_number", "block_hash", "transaction_index",
+        "gas_used", "effective_gas_price", "max_fee_per_gas",
+        "max_priority_fee_per_gas", "transaction_hash",
+        "projection_sha256",
+    }
+    balance_fields = {
+        "initial_weth_raw", "initial_uni_raw", "input_weth_raw",
+        "intermediate_uni_raw", "final_weth_raw", "final_uni_raw",
+        "gross_weth_delta_raw",
+    }
+    economics_fields = {
+        "name", "priority_fee_percentile", "mev_bps", "gas_used",
+        "effective_gas_price", "gas_cost_usd", "mev_buffer_usd",
+        "research_net_edge_usd", "positive_research_net",
+    }
+    eth_usd_fields = {
+        "proxy_address", "round_id", "phase_id", "answer", "decimals",
+        "started_at", "updated_at", "answered_in_round", "valid_until",
+        "block_number", "block_hash",
+    }
+    selected_integer_fields = (
+        "number", "timestamp", "gas_limit", "gas_used",
+        "base_fee_per_gas", "synthetic_child_number",
+        "synthetic_child_timestamp", "synthetic_child_base_fee_per_gas",
+        "p50_priority_fee_per_gas", "p90_priority_fee_per_gas",
+    )
+    eth_usd_integer_fields = (
+        "round_id", "phase_id", "answer", "decimals", "started_at",
+        "updated_at", "answered_in_round", "valid_until", "block_number",
+    )
+    transaction_integer_fields = (
+        "nonce", "gas_limit", "max_priority_fee_per_gas",
+        "max_fee_per_gas", "transaction_index",
+    )
+    receipt_integer_fields = (
+        "status", "block_number", "transaction_index", "gas_used",
+        "effective_gas_price", "max_fee_per_gas",
+        "max_priority_fee_per_gas",
+    )
+    for row in scenarios:
+        if type(row) is not dict or set(row) != scenario_fields:
+            raise HistoricalRoutePublicationError(
+                "historical replay scenario is invalid"
+            )
+        selected_block = row["selected_block"]
+        transaction = row["transaction"]
+        receipt = row["receipt"]
+        balances = row["balances"]
+        source_members = row["source_members"]
+        eth_usd = (
+            selected_block.get("eth_usd")
+            if type(selected_block) is dict else None
+        )
+        calldata_bytes = None
+        if type(transaction) is dict:
+            calldata = transaction.get("calldata")
+            if (
+                type(calldata) is str
+                and calldata.startswith("0x")
+                and len(calldata[2:]) % 2 == 0
+            ):
+                try:
+                    calldata_bytes = bytes.fromhex(calldata[2:])
+                except ValueError:
+                    pass
+        try:
+            block_text, direction, notional_text = row[
+                "scenario_key"
+            ].split(":")
+            scenario_block = int(block_text)
+            scenario_notional = int(notional_text)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise HistoricalRoutePublicationError(
+                "historical replay scenario identity differs"
+            ) from error
+        if (
+            row["schema"]
+            != "historical_foundry_replay_publication_scenario_facts/v1"
+            or str(scenario_block) != block_text
+            or str(scenario_notional) != notional_text
+            or direction not in {
+                "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+            }
+            or row["direction"] != direction
+            or row["requested_notional_usd"] != scenario_notional
+            or type(row["receipt_status"]) is not int
+            or row["receipt_status"] != 1
+            or type(row["gross_edge_weth_raw"]) is not int
+            or type(row["stress_robust"]) is not bool
+            or type(selected_block) is not dict
+            or set(selected_block) != selected_block_fields
+            or selected_block != evidence["selected_block"]
+            or any(
+                type(selected_block[field]) is not int
+                or selected_block[field] < 0
+                for field in selected_integer_fields
+            )
+            or any(
+                re.fullmatch(
+                    r"0x[0-9a-f]{64}", selected_block[field]
+                    if type(selected_block[field]) is str else "",
+                ) is None
+                for field in ("hash", "parent_hash", "state_root")
+            )
+            or type(eth_usd) is not dict
+            or set(eth_usd) != eth_usd_fields
+            or re.fullmatch(
+                r"0x[0-9a-f]{40}", eth_usd["proxy_address"]
+                if type(eth_usd["proxy_address"]) is str else "",
+            ) is None
+            or any(
+                type(eth_usd[field]) is not str
+                or re.fullmatch(r"0|[1-9][0-9]*", eth_usd[field]) is None
+                for field in eth_usd_integer_fields
+            )
+            or int(eth_usd["answer"]) <= 0
+            or int(eth_usd["valid_until"]) <= int(eth_usd["updated_at"])
+            or eth_usd["block_number"] != str(selected_block["number"])
+            or eth_usd["block_hash"] != selected_block["hash"]
+            or scenario_block != selected_block["number"]
+            or type(transaction) is not dict
+            or set(transaction) != transaction_fields
+            or transaction["type"] != "0x2"
+            or transaction["access_list"] != []
+            or any(
+                type(transaction[field]) is not int
+                or transaction[field] < 0
+                for field in transaction_integer_fields
+            )
+            or transaction["gas_limit"] <= 0
+            or any(
+                re.fullmatch(
+                    r"0x[0-9a-f]{40}", transaction[field]
+                    if type(transaction[field]) is str else "",
+                ) is None
+                for field in ("sender", "executor")
+            )
+            or re.fullmatch(
+                r"0x[0-9a-f]{64}", transaction["transaction_hash"]
+                if type(transaction["transaction_hash"]) is str else "",
+            ) is None
+            or calldata_bytes is None
+            or _sha(calldata_bytes) != transaction["calldata_sha256"]
+            or type(receipt) is not dict
+            or set(receipt) != receipt_fields
+            or any(
+                type(receipt[field]) is not int or receipt[field] < 0
+                for field in receipt_integer_fields
+            )
+            or receipt["status"] != 1
+            or receipt["gas_used"] <= 0
+            or any(
+                re.fullmatch(
+                    r"0x[0-9a-f]{64}", receipt[field]
+                    if type(receipt[field]) is str else "",
+                ) is None
+                for field in ("block_hash", "transaction_hash")
+            )
+            or receipt["max_fee_per_gas"] != transaction["max_fee_per_gas"]
+            or receipt["max_priority_fee_per_gas"]
+            != transaction["max_priority_fee_per_gas"]
+            or type(balances) is not dict
+            or set(balances) != balance_fields
+            or any(type(value) is not int for value in balances.values())
+            or any(
+                type(row[name]) is not dict
+                or set(row[name]) != economics_fields
+                or type(row[name]["positive_research_net"]) is not bool
+                or type(row[name]["gas_used"]) is not int
+                or row[name]["gas_used"] <= 0
+                or type(row[name]["effective_gas_price"]) is not int
+                or row[name]["effective_gas_price"] < 0
+                for name in ("baseline", "stress_25", "stress_50")
+            )
+            or row["baseline"]["research_net_edge_usd"]
+            != row["research_net_edge_usd"]
+            or row["stress_robust"] is not (
+                row["stress_25"]["positive_research_net"]
+                and row["stress_50"]["positive_research_net"]
+            )
+            or row["policy_sha256"] != evidence["policy_sha256"]
+            or row["authority_sha256"] != evidence["authority_sha256"]
+            or row["toolchain_sha256"] != evidence["toolchain_sha256"]
+            or transaction["calldata_sha256"] != row["calldata_sha256"]
+            or transaction["transaction_hash"]
+            != receipt["transaction_hash"]
+            or transaction["transaction_index"]
+            != receipt["transaction_index"]
+            or receipt["projection_sha256"] != row["receipt_sha256"]
+            or receipt["status"] != row["receipt_status"]
+            or receipt["block_number"]
+            != selected_block["synthetic_child_number"]
+            or type(source_members) is not list
+            or len(source_members) != 4
+            or any(
+                type(item) is not dict
+                or set(item) != {"role", "path", "byte_count", "sha256"}
+                for item in source_members
+            )
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", row.get(field, "")) is None
+                for field in (
+                    "core_manifest_sha256", "policy_sha256",
+                    "authority_sha256", "toolchain_sha256",
+                    "source_descriptor_set_sha256", "proof_inputs_hash",
+                    "overlay_sha256", "receipt_sha256", "trace_sha256",
+                    "result_sha256", "executor_creation_sha256",
+                    "executor_runtime_sha256", "calldata_sha256",
+                    "cost_component_set_sha256",
+                )
+            )
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical replay scenario closure differs"
+            )
+        opportunity = opportunities.get(row.get("opportunity_id"))
+        expected_direction = (
+            "uniswap_to_sushiswap"
+            if ":uniswap_v2:" in opportunity.get("buy_market_id", "")
+            and ":sushiswap_v2:" in opportunity.get("sell_market_id", "")
+            else "sushiswap_to_uniswap"
+            if ":sushiswap_v2:" in opportunity.get("buy_market_id", "")
+            and ":uniswap_v2:" in opportunity.get("sell_market_id", "")
+            else None
+        ) if opportunity is not None else None
+        if (
+            opportunity is None
+            or row["opportunity_id"] in observed
+            or row.get("route_id") != opportunity["route_id"]
+            or str(row.get("requested_notional_usd"))
+            != opportunity["requested_notional_usd"]
+            or row.get("opportunity_class")
+            != opportunity["opportunity_class"]
+            or row.get("opportunity_class") != "research_estimate"
+            or row.get("receipt_status") != 1
+            or row.get("direction") != expected_direction
+            or row.get("core_manifest_sha256")
+            != bundle["core_manifest_sha256"]
+            or opportunity.get("buy_core_manifest_sha256")
+            != row.get("core_manifest_sha256")
+            or opportunity.get("sell_core_manifest_sha256")
+            != row.get("core_manifest_sha256")
+            or opportunity.get("inventory_profile_hash")
+            != row.get("proof_inputs_hash")
+            or opportunity.get("cost_component_set_sha256")
+            != row.get("cost_component_set_sha256")
+            or any(
+                opportunity.get(field) != row.get(field)
+                for field in (
+                    "gross_buy_cost_usd", "gross_sell_proceeds_usd",
+                    "gross_edge_usd", "research_net_edge_usd",
+                )
+            )
+            or [item.get("role") for item in source_members]
+            != ["overlay", "receipt", "trace", "result"]
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical replay evidence join differs"
+            )
+        observed.add(row["opportunity_id"])
+        source_root = "foundry/{}/{}".format(
+            selected_block["number"], row["scenario_key"]
+        )
+        expected_sources = (
+            ("overlay", "overlay.json", "overlay_sha256"),
+            ("receipt", "receipt.json", "receipt_sha256"),
+            ("trace", "trace.json.gz", "trace_sha256"),
+            ("result", "result.json", "result_sha256"),
+        )
+        if any(
+            item["path"] != "{}/{}".format(source_root, filename)
+            or item["sha256"] != row[hash_field]
+            or type(item["byte_count"]) is not int
+            or item["byte_count"] <= 0
+            for item, (_role, filename, hash_field) in zip(
+                source_members, expected_sources
+            )
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical replay source member differs"
+            )
+        overlay_inventory.append({
+            "scenario_key": row["scenario_key"],
+            "overlay_sha256": row["overlay_sha256"],
+        })
+    if observed != set(opportunities):
+        raise HistoricalRoutePublicationError(
+            "historical replay evidence inventory is not closed"
+        )
+    if (
+        evidence["overlay_set_sha256"]
+        != _sha(
+            b"historical_foundry_overlay_set/v1\0"
+            + _canonical_bytes(overlay_inventory)
+        )
+        or evidence["scenario_set_sha256"]
+        != _sha(
+            b"historical_foundry_scenario_set/v1\0"
+            + _canonical_bytes(scenarios)
+        )
+        or not any(
+            row.get("baseline", {}).get("positive_research_net") is True
+            for row in scenarios
+        )
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical replay evidence digest differs"
+        )
+
+
+def _build_historical_complete_payload(
+    *, context: HistoricalReplayBuildContext,
+) -> Mapping[str, Any]:
+    projection = dict(_require_historical_replay_build_context(
+        context=context
+    ))
+    held = _historical_context_held_record(context)
+    cohort = held["derived"]["cohort"]
+    route_cohort_id = projection["core_pointer"]["route_cohort_id"]
+    if (
+        cohort.get("route_cohort_id") != route_cohort_id
+        or projection.get("core_manifest_sha256")
+        != held["manifest_sha256"]
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical complete core lineage differs"
+        )
+    block_number = projection["selected_block"]["number"]
+    scenario_keys = tuple(
+        "{}:{}:{}".format(block_number, direction, notional)
+        for direction in (
+            "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+        )
+        for notional in _NOTIONALS
+    )
+    built = tuple(
+        _build_historical_scenario_for_publication(
+            context=context, scenario_key=scenario_key
+        )
+        for scenario_key in scenario_keys
+    )
+
+    def expected_fact_from_sealed(row: Mapping[str, Any]) -> Dict[str, Any]:
+        compact = json.loads(row["canonical_projection_bytes"])
+        raw = json.loads(row["canonical_input_bytes"])
+        descriptors = json.loads(row["canonical_source_descriptor_bytes"])
+        scenario_key = compact["scenario_key"]
+        block_text, direction, notional_text = scenario_key.split(":")
+        block_number = int(block_text)
+        notional = int(notional_text)
+        selected = raw["selected_block"]
+        synthetic = raw["overlay"]["synthetic_block"]
+        fee = raw["fee"]
+        price = raw["price"]
+        transaction = raw["overlay"]["transaction"]
+        receipt = raw["receipt"]
+        trace_balances = raw["trace"]["balances"]
+        trace_deltas = raw["trace"]["actual_deltas"]
+        proof_authority = raw["result"]["proof_authority"]
+        economics_authority = compact["economics_authority"]
+        opportunity = compact["opportunity"]
+        economics = compact["economics_scenarios"]
+        descriptor_by_path = {
+            descriptor["path"]: descriptor for descriptor in descriptors
+        }
+        source_members = []
+        for role, filename in (
+            ("overlay", "overlay.json"),
+            ("receipt", "receipt.json"),
+            ("trace", "trace.json.gz"),
+            ("result", "result.json"),
+        ):
+            path = "foundry/{}/{}/{}".format(
+                block_number, scenario_key, filename
+            )
+            source_members.append({
+                "role": role, **dict(descriptor_by_path[path])
+            })
+        transaction_fact = {
+            "sender": transaction["from"],
+            "executor": transaction["to"],
+            "type": transaction["type"],
+            "nonce": transaction["nonce"],
+            "gas_limit": transaction["gas"],
+            "access_list": list(transaction["accessList"]),
+            "max_priority_fee_per_gas": transaction[
+                "maxPriorityFeePerGas"
+            ],
+            "max_fee_per_gas": transaction["maxFeePerGas"],
+            "calldata": transaction["input"],
+            "calldata_sha256": transaction["calldata_sha256"],
+            "transaction_hash": receipt["transactionHash"],
+            "transaction_index": receipt["transactionIndex"],
+        }
+        receipt_fact = {
+            "status": receipt["status"],
+            "block_number": receipt["blockNumber"],
+            "block_hash": receipt["blockHash"],
+            "transaction_index": receipt["transactionIndex"],
+            "gas_used": receipt["gasUsed"],
+            "effective_gas_price": receipt["effectiveGasPrice"],
+            "max_fee_per_gas": receipt["maxFeePerGas"],
+            "max_priority_fee_per_gas": receipt[
+                "maxPriorityFeePerGas"
+            ],
+            "transaction_hash": receipt["transactionHash"],
+            "projection_sha256": compact["receipt_sha256"],
+        }
+        selected_block = {
+            **dict(selected),
+            "synthetic_child_number": synthetic["number"],
+            "synthetic_child_timestamp": synthetic["timestamp"],
+            "synthetic_child_base_fee_per_gas": synthetic[
+                "base_fee_per_gas"
+            ],
+            "p50_priority_fee_per_gas": fee[
+                "p50_priority_fee_per_gas"
+            ],
+            "p90_priority_fee_per_gas": fee[
+                "p90_priority_fee_per_gas"
+            ],
+            "eth_usd": {
+                field: price[field] for field in (
+                    "proxy_address", "round_id", "phase_id", "answer",
+                    "decimals", "started_at", "updated_at",
+                    "answered_in_round", "valid_until", "block_number",
+                    "block_hash",
+                )
+            },
+        }
+        return {
+            "schema": (
+                "historical_foundry_replay_publication_"
+                "scenario_facts/v1"
+            ),
+            "scenario_key": scenario_key,
+            "opportunity_id": opportunity["opportunity_id"],
+            "route_id": compact["route_id"],
+            "direction": direction,
+            "requested_notional_usd": notional,
+            "receipt_status": compact["receipt_status"],
+            "opportunity_class": opportunity["opportunity_class"],
+            "core_manifest_sha256": compact["core_manifest_sha256"],
+            "policy_sha256": proof_authority["policy_sha256"],
+            "authority_sha256": proof_authority["authority_sha256"],
+            "toolchain_sha256": proof_authority["toolchain_sha256"],
+            "source_descriptor_set_sha256": raw[
+                "source_descriptor_set_sha256"
+            ],
+            "proof_inputs_hash": compact["proof_inputs_hash"],
+            "selected_block": selected_block,
+            "overlay_sha256": compact["overlay_sha256"],
+            "receipt_sha256": compact["receipt_sha256"],
+            "trace_sha256": compact["trace_sha256"],
+            "result_sha256": compact["result_sha256"],
+            "executor_creation_sha256": proof_authority[
+                "adapter_proof_sha256"
+            ],
+            "executor_runtime_sha256": proof_authority[
+                "executor_runtime_sha256"
+            ],
+            "calldata_sha256": transaction_fact["calldata_sha256"],
+            "transaction": transaction_fact,
+            "receipt": receipt_fact,
+            "balances": {
+                "initial_weth_raw": trace_balances["initial_weth_raw"],
+                "initial_uni_raw": trace_balances["initial_uni_raw"],
+                "input_weth_raw": economics_authority[
+                    "first_weth_in_raw"
+                ],
+                "intermediate_uni_raw": economics_authority[
+                    "first_uni_out_raw"
+                ],
+                "final_weth_raw": trace_balances["final_weth_raw"],
+                "final_uni_raw": trace_balances["final_uni_raw"],
+                "gross_weth_delta_raw": trace_deltas["weth_raw"],
+            },
+            "gross_edge_weth_raw": compact["gross_edge_weth_raw"],
+            "gross_buy_cost_usd": opportunity["gross_buy_cost_usd"],
+            "gross_sell_proceeds_usd": opportunity[
+                "gross_sell_proceeds_usd"
+            ],
+            "gross_edge_usd": opportunity["gross_edge_usd"],
+            "research_net_edge_usd": opportunity[
+                "research_net_edge_usd"
+            ],
+            "baseline": economics[0],
+            "stress_25": economics[1],
+            "stress_50": economics[2],
+            "stress_robust": (
+                economics[1]["positive_research_net"]
+                and economics[2]["positive_research_net"]
+            ),
+            "cost_component_set_sha256": opportunity[
+                "cost_component_set_sha256"
+            ],
+            "source_members": source_members,
+        }
+
+    try:
+        expected_fact_scenarios = []
+        for row in built:
+            expected_fact_scenarios.append(expected_fact_from_sealed(row))
+        expected_fact_scenarios.sort(key=lambda row: (
+            row["route_id"], row["requested_notional_usd"]
+        ))
+        facts_bytes = (
+            _historical_replay.build_historical_replay_publication_facts(
+                tuple(row["canonical_projection_bytes"] for row in built),
+                tuple(row["canonical_input_bytes"] for row in built),
+                tuple(
+                    row["canonical_source_descriptor_bytes"] for row in built
+                ),
+            )
+        )
+        facts = json.loads(facts_bytes)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise HistoricalRoutePublicationError(
+            "historical replay publication facts are invalid"
+        ) from error
+    expected_fact_fields = {
+        "schema", "scenario_count", "core_manifest_sha256",
+        "overlay_set_sha256", "scenario_set_sha256", "scenarios",
+    }
+    header_fields = (
+        "number", "hash", "parent_hash", "state_root", "timestamp",
+        "gas_limit", "gas_used", "base_fee_per_gas",
+    )
+    authoritative_block = projection["selected_block"]
+
+    def selected_block_matches_context(row: Any) -> bool:
+        if type(row) is not dict:
+            return False
+        selected_block = row.get("selected_block")
+        if (
+            type(selected_block) is not dict
+            or any(field not in selected_block for field in header_fields)
+        ):
+            return False
+        header = {
+            field: selected_block[field] for field in header_fields
+        }
+        return (
+            selected_block.get("number") == authoritative_block["number"]
+            and selected_block.get("hash") == authoritative_block["hash"]
+            and type(selected_block.get("timestamp")) is int
+            and _rfc3339(selected_block["timestamp"])
+            == authoritative_block["timestamp"]
+            and _sha(_canonical_bytes(header))
+            == authoritative_block["header_sha256"]
+        )
+
+    fact_scenarios = facts.get("scenarios") if type(facts) is dict else None
+    expected_overlay_inventory = [
+        {
+            "scenario_key": row["scenario_key"],
+            "overlay_sha256": row["overlay_sha256"],
+        }
+        for row in expected_fact_scenarios
+    ]
+    if (
+        type(facts) is not dict
+        or set(facts) != expected_fact_fields
+        or facts_bytes != _canonical_bytes(facts)
+        or facts.get("schema")
+        != "historical_foundry_replay_publication_facts/v1"
+        or facts.get("scenario_count") != 10
+        or facts.get("core_manifest_sha256")
+        != projection["core_manifest_sha256"]
+        or type(fact_scenarios) is not list
+        or len(fact_scenarios) != 10
+        or fact_scenarios != expected_fact_scenarios
+        or facts.get("overlay_set_sha256")
+        != _sha(
+            b"historical_foundry_overlay_set/v1\0"
+            + _canonical_bytes(expected_overlay_inventory)
+        )
+        or facts.get("scenario_set_sha256")
+        != _sha(
+            b"historical_foundry_scenario_set/v1\0"
+            + _canonical_bytes(expected_fact_scenarios)
+        )
+        or any(
+            not selected_block_matches_context(row)
+            for row in fact_scenarios
+        )
+        or len({
+            _canonical_bytes(row["selected_block"])
+            for row in fact_scenarios
+        }) != 1
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical replay publication facts differ"
+        )
+    replay_id = _historical_complete_replay_id(
+        projection=projection, route_cohort_id=route_cohort_id,
+        overlay_set_sha256=facts["overlay_set_sha256"],
+        scenario_set_sha256=facts["scenario_set_sha256"],
+    )
+    config = held["config"]
+    evidence = {
+        "schema": _HISTORICAL_REPLAY_EVIDENCE_SCHEMA,
+        "replay_id": replay_id,
+        "route_cohort_id": route_cohort_id,
+        "run_id": projection["run_id"],
+        "policy_id": config.policy.policy_id,
+        "policy_sha256": projection["policy_sha256"],
+        "authority_sha256": projection["authority_sha256"],
+        "toolchain_sha256": projection["toolchain_sha256"],
+        "run_manifest_sha256": projection["run_manifest_sha256"],
+        "selection_sha256": projection["selection_sha256"],
+        "temporal_scope": _TEMPORAL_SCOPE,
+        "execution_claim": _EXECUTION_CLAIM,
+        "selected_block": facts["scenarios"][0]["selected_block"],
+        "overlay_set_sha256": facts["overlay_set_sha256"],
+        "scenario_count": 10,
+        "scenarios": facts["scenarios"],
+        "scenario_set_sha256": facts["scenario_set_sha256"],
+    }
+    opportunities = tuple(sorted(
+        (_plain(row["opportunity"]) for row in built),
+        key=_route_publication._complete_opportunity_sort_key,
+    ))
+    costs = tuple(sorted(
+        (
+            _plain(cost)
+            for row in built for cost in row["cost_components"]
+        ),
+        key=lambda row: (
+            row["opportunity_id"], row["leg"], row["component_type"]
+        ),
+    ))
+    bundle = {
+        "schema": _route_publication.ROUTE_OPPORTUNITY_BUNDLE_STAGE,
+        "route_cohort_id": route_cohort_id,
+        "core_manifest_sha256": projection["core_manifest_sha256"],
+        "core_pointer_sha256": projection["core_pointer_sha256"],
+        "core_context": {
+            field: cohort[field] for field in (
+                "candidate_source_generation",
+                "collection_input_generation", "raw_evidence_run_id",
+                "collection_completed_at", "collection_deadline_at",
+            )
+        },
+        "input_generations": _historical_complete_input_generations(
+            cohort=cohort, projection=projection, facts=facts,
+            opportunities=opportunities, costs=costs,
+            source_identity_sha256=held["derived"][
+                "source_identity_sha256"
+            ],
+        ),
+        "routes": sorted(
+            (_plain(row) for row in cohort["routes"]),
+            key=lambda row: row["route_id"],
+        ),
+        "legs": sorted(
+            (_plain(row) for row in cohort["legs"]),
+            key=lambda row: row["market_id"],
+        ),
+        "cost_components": list(costs),
+        "opportunities": list(opportunities),
+    }
+    try:
+        bundle = _route_publication._validate_complete_logical_bundle_shared(
+            bundle, historical_atomic=True
+        )
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical complete logical bundle is invalid"
+        ) from error
+    _validate_historical_replay_evidence_join(
+        bundle=bundle, evidence=evidence
+    )
+    context.reread_unchanged()
+    return MappingProxyType({
+        "replay_id": replay_id,
+        "bundle": bundle,
+        "replay_evidence": evidence,
+    })
+
+
+def _historical_complete_file_descriptors(
+    *, file_bytes: Mapping[str, bytes], bundle: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    return {
+        "route_legs.csv": _route_publication._artifact_details_bytes(
+            file_bytes["route_legs.csv"],
+            schema=_route_publication.ROUTE_LEG_CSV_SCHEMA,
+            logical_sha256=_route_publication._logical_rows_sha256(
+                _route_publication.ROUTE_LEG_CSV_SCHEMA, bundle["legs"]
+            ),
+            row_count=len(bundle["legs"]),
+        ),
+        "cost_components.csv": _route_publication._artifact_details_bytes(
+            file_bytes["cost_components.csv"],
+            schema=_route_publication.COST_COMPONENT_CSV_SCHEMA,
+            logical_sha256=_route_publication._logical_rows_sha256(
+                _route_publication.COST_COMPONENT_CSV_SCHEMA,
+                bundle["cost_components"],
+            ),
+            row_count=len(bundle["cost_components"]),
+        ),
+        "route_opportunities.csv": (
+            _route_publication._artifact_details_bytes(
+                file_bytes["route_opportunities.csv"],
+                schema=_route_publication.ROUTE_OPPORTUNITY_CSV_SCHEMA,
+                logical_sha256=_route_publication._logical_rows_sha256(
+                    _route_publication.ROUTE_OPPORTUNITY_CSV_SCHEMA,
+                    bundle["opportunities"],
+                ),
+                row_count=len(bundle["opportunities"]),
+            )
+        ),
+        "route_cohort.sqlite3": _route_publication._artifact_details_bytes(
+            file_bytes["route_cohort.sqlite3"],
+            schema=_route_publication.ROUTE_OPPORTUNITY_SQLITE_SCHEMA,
+            logical_sha256=(
+                _route_publication._complete_database_logical_sha256(bundle)
+            ),
+            row_count=(
+                len(bundle["legs"]) + len(bundle["cost_components"])
+                + len(bundle["opportunities"])
+            ),
+        ),
+        _HISTORICAL_REPLAY_EVIDENCE_FILENAME: (
+            _route_publication._artifact_details_bytes(
+                file_bytes[_HISTORICAL_REPLAY_EVIDENCE_FILENAME],
+                schema=_HISTORICAL_REPLAY_EVIDENCE_SCHEMA,
+                logical_sha256=_sha(_canonical_bytes(evidence)),
+                row_count=len(evidence["scenarios"]),
+            )
+        ),
+    }
+
+
+def _historical_complete_manifest(
+    *, payload: Mapping[str, Any],
+    files: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Any]:
+    bundle = payload["bundle"]
+    evidence = payload["replay_evidence"]
+    opportunities = bundle["opportunities"]
+    return {
+        "schema": _HISTORICAL_COMPLETE_MANIFEST_SCHEMA,
+        "bundle_stage": _HISTORICAL_COMPLETE_STAGE,
+        "replay_id": payload["replay_id"],
+        "route_cohort_id": bundle["route_cohort_id"],
+        "historical_core_manifest_sha256": bundle[
+            "core_manifest_sha256"
+        ],
+        "historical_core_pointer_sha256": bundle[
+            "core_pointer_sha256"
+        ],
+        "temporal_scope": _TEMPORAL_SCOPE,
+        "execution_claim": _EXECUTION_CLAIM,
+        "policy_sha256": evidence["policy_sha256"],
+        "authority_sha256": evidence["authority_sha256"],
+        "toolchain_sha256": evidence["toolchain_sha256"],
+        "run_id": evidence["run_id"],
+        "run_manifest_sha256": evidence["run_manifest_sha256"],
+        "selection_sha256": evidence["selection_sha256"],
+        "selected_block": evidence["selected_block"],
+        "requested_notionals_usd": list(_NOTIONALS),
+        "counts": {
+            "routes": len(bundle["routes"]),
+            "legs": len(bundle["legs"]),
+            "opportunities": len(opportunities),
+            "cost_components": len(bundle["cost_components"]),
+            "scenarios": len(evidence["scenarios"]),
+            "foundry_verified": sum(
+                row["receipt_status"] == 1
+                for row in evidence["scenarios"]
+            ),
+            "research_estimate": sum(
+                row["opportunity_class"] == "research_estimate"
+                for row in evidence["scenarios"]
+            ),
+            "unavailable": sum(
+                row["opportunity_class"] == "unavailable"
+                for row in evidence["scenarios"]
+            ),
+            "strict_eligible": sum(
+                row["strict_eligible"] is True for row in opportunities
+            ),
+            "executable_candidate": sum(
+                row["opportunity_class"] == "executable_candidate"
+                for row in opportunities
+            ),
+            "attested": sum(
+                row["publication_attestation_sha256"] is not None
+                for row in opportunities
+            ),
+            "positive_research_net": sum(
+                row["baseline"]["positive_research_net"] is True
+                for row in evidence["scenarios"]
+            ),
+        },
+        "files": {name: dict(files[name]) for name in sorted(files)},
+    }
+
+
+def _historical_complete_artifacts(
+    payload: Mapping[str, Any],
+) -> Tuple[Dict[str, bytes], Dict[str, Any]]:
+    try:
+        representation, _unused = (
+            _route_publication
+            ._complete_representation_artifact_bytes_from_validated_bundle(
+                payload["bundle"]
+            )
+        )
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical complete serialization failed"
+        ) from error
+    evidence_bytes = _json_file_bytes(payload["replay_evidence"])
+    file_bytes = {
+        **representation,
+        _HISTORICAL_REPLAY_EVIDENCE_FILENAME: evidence_bytes,
+    }
+    files = _historical_complete_file_descriptors(
+        file_bytes=file_bytes, bundle=payload["bundle"],
+        evidence=payload["replay_evidence"],
+    )
+    manifest = _historical_complete_manifest(payload=payload, files=files)
+    return {**file_bytes, "manifest.json": _json_file_bytes(manifest)}, manifest
+
+
+def _validate_historical_complete_artifact_bytes(
+    *, artifacts: Mapping[str, bytes], payload: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> None:
+    if set(artifacts) != _HISTORICAL_COMPLETE_FILES:
+        raise HistoricalRoutePublicationError(
+            "historical complete artifact inventory differs"
+        )
+    try:
+        representation = {
+            name: artifacts[name]
+            for name in _route_publication._COMPLETE_MANIFEST_ARTIFACT_FILENAMES
+        }
+        bundle, legs, costs, opportunities = (
+            _route_publication._read_complete_representation_bytes(
+                file_bytes=representation,
+                route_cohort_id=payload["bundle"]["route_cohort_id"],
+            )
+        )
+        bundle = _route_publication._validate_complete_logical_bundle_shared(
+            bundle, historical_atomic=True
+        )
+        evidence = json.loads(
+            artifacts[_HISTORICAL_REPLAY_EVIDENCE_FILENAME]
+        )
+    except (
+        _route_publication.RoutePublicationError, UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise HistoricalRoutePublicationError(
+            "historical complete representation is invalid"
+        ) from error
+    if (
+        bundle != payload["bundle"]
+        or legs != bundle["legs"]
+        or costs != bundle["cost_components"]
+        or opportunities != bundle["opportunities"]
+        or artifacts[_HISTORICAL_REPLAY_EVIDENCE_FILENAME]
+        != _json_file_bytes(evidence)
+        or evidence != payload["replay_evidence"]
+        or artifacts["manifest.json"] != _json_file_bytes(manifest)
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical complete representation differs"
+        )
+    _validate_historical_replay_evidence_join(
+        bundle=bundle, evidence=evidence
+    )
+
+
+def stage_historical_replay_bundle(
+    *, data_dir: Path, raw_root: Path,
+    context: HistoricalReplayBuildContext,
+) -> Mapping[str, Any]:
+    """Build, validate, and install one immutable unpointed replay bundle."""
+    data, raw = _historical_complete_roots(
+        data_dir=data_dir, raw_root=raw_root
+    )
+    payload = _build_historical_complete_payload(context=context)
+    artifacts, manifest = _historical_complete_artifacts(payload)
+    _validate_historical_complete_artifact_bytes(
+        artifacts=artifacts, payload=payload, manifest=manifest
+    )
+    manifest_sha256 = _sha(artifacts["manifest.json"])
+    historical_root = _route_publication._ensure_real_directory(
+        data / "routes" / "historical"
+    )
+    historical_root, historical_fd, historical_details = (
+        _route_publication._open_verified_directory(
+            historical_root, "historical complete root"
+        )
+    )
+    bundles_fd = stage_fd = None
+    stage_name = None
+    stage_details = None
+    renamed = False
+    installed_by_call = False
+    locked = False
+    result = None
+    try:
+        fcntl.flock(historical_fd, fcntl.LOCK_EX)
+        locked = True
+        pointer_before = _route_publication._optional_pointer_snapshot_at(
+            historical_fd
+        )
+        bundles_fd, bundles_details = _route_publication._ensure_directory_at(
+            historical_fd, "bundles", "historical complete bundles"
+        )
+        bundles = historical_root / "bundles"
+        replay_id = payload["replay_id"]
+        final_path = bundles / replay_id
+        if not _route_publication._entry_exists_at(bundles_fd, replay_id):
+            stage_name, stage_path, stage_fd, stage_details = (
+                _route_publication._make_unique_directory_at(
+                    bundles_fd, prefix=".historical-replay-",
+                    display_parent=bundles,
+                )
+            )
+            for filename in sorted(artifacts):
+                _route_publication._write_new_bytes_at(
+                    stage_fd, filename, artifacts[filename]
+                )
+            _route_publication._fsync_directory(
+                stage_path, directory_fd=stage_fd
+            )
+            for filename, expected in artifacts.items():
+                current, digest, _details = (
+                    _route_publication._read_bounded_bytes_at(
+                        stage_fd, filename,
+                        limit=(
+                            _route_publication._MAX_SQLITE_BYTES
+                            if filename.endswith(".sqlite3")
+                            else _route_publication._MAX_CSV_BYTES
+                            if filename.endswith(".csv")
+                            else _route_publication._MAX_JSON_BYTES
+                        ),
+                        label="historical complete staged member",
+                    )
+                )
+                if current != expected or digest != _sha(expected):
+                    raise HistoricalRoutePublicationError(
+                        "historical complete staged member differs"
+                    )
+            staged_validation = _validate_historical_replay_bundle(
+                data_dir=data, raw_root=raw, bundle_path=stage_path,
+                expected_pointer_core=None,
+                expected_replay_id=replay_id,
+                require_directory_identity=False,
+                issue_view=False,
+            )
+            if staged_validation["manifest_sha256"] != manifest_sha256:
+                raise HistoricalRoutePublicationError(
+                    "historical complete staged manifest differs"
+                )
+            _route_publication._rename_directory_noreplace_at(
+                bundles_fd, stage_name, bundles_fd, replay_id,
+                destination_display=final_path,
+            )
+            renamed = True
+            installed_by_call = True
+            try:
+                _route_publication._verify_directory_entry(
+                    bundles_fd, replay_id, stage_details,
+                    "historical complete bundle",
+                )
+                _route_publication._fsync_directory(
+                    bundles, directory_fd=bundles_fd
+                )
+                committed_validation = _validate_historical_replay_bundle(
+                    data_dir=data, raw_root=raw, bundle_path=final_path,
+                    expected_pointer_core=None,
+                    expected_replay_id=replay_id,
+                    require_directory_identity=True,
+                    issue_view=False,
+                )
+                if (
+                    committed_validation["manifest_sha256"]
+                    != manifest_sha256
+                ):
+                    raise HistoricalRoutePublicationError(
+                        "historical complete committed manifest differs"
+                    )
+            except BaseException:
+                _route_publication._remove_stage_directory_at(
+                    bundles_fd, replay_id, stage_details
+                )
+                _route_publication._fsync_directory(
+                    bundles, directory_fd=bundles_fd
+                )
+                renamed = False
+                raise
+        if not _snapshot_matches(
+            _route_publication._optional_pointer_snapshot_at(historical_fd),
+            pointer_before,
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical complete staging moved latest"
+            )
+        _route_publication._verify_directory_entry(
+            historical_fd, "bundles", bundles_details,
+            "historical complete bundles",
+        )
+        _route_publication._verify_open_path_identity(
+            historical_root, historical_details,
+            "historical complete root",
+        )
+        validated = validate_historical_replay_bundle(
+            data_dir=data, raw_root=raw,
+            bundle_path=(historical_root / "bundles" / payload["replay_id"]),
+        )
+        try:
+            if validated["manifest_sha256"] != manifest_sha256:
+                raise HistoricalRoutePublicationError(
+                    "historical complete committed manifest differs"
+                )
+            context.reread_unchanged()
+            result = MappingProxyType({
+                "path": validated["path"],
+                "replay_id": payload["replay_id"],
+                "manifest_sha256": manifest_sha256,
+            })
+        finally:
+            try:
+                validated["validated_view"].close()
+            except Exception:
+                pass
+    except BaseException as error:
+        if installed_by_call and renamed:
+            try:
+                _route_publication._remove_stage_directory_at(
+                    bundles_fd, payload["replay_id"], stage_details
+                )
+                _route_publication._fsync_directory(
+                    historical_root / "bundles", directory_fd=bundles_fd
+                )
+                renamed = False
+                installed_by_call = False
+            except Exception as rollback_error:
+                if not isinstance(error, Exception):
+                    raise error
+                raise HistoricalRoutePublicationError(
+                    "historical complete rollback failed"
+                ) from rollback_error
+        if isinstance(error, _route_publication.RoutePublicationError):
+            raise HistoricalRoutePublicationError(
+                "historical complete staging failed"
+            ) from error
+        raise
+    finally:
+        if (
+            not renamed and bundles_fd is not None and stage_name is not None
+            and stage_details is not None
+        ):
+            try:
+                _route_publication._remove_stage_directory_at(
+                    bundles_fd, stage_name, stage_details
+                )
+            except Exception:
+                pass
+        if locked:
+            try:
+                fcntl.flock(historical_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        _close_descriptors_robustly(stage_fd, bundles_fd, historical_fd)
+    if result is None:
+        raise HistoricalRoutePublicationError(
+            "historical complete staging result is missing"
+        )
+    return result
+
+
+def _validate_historical_expected_pointer_core(
+    *, expected: Optional[Mapping[str, Any]], manifest: Mapping[str, Any],
+    manifest_sha256: str,
+) -> None:
+    if expected is None:
+        return None
+    if (
+        not isinstance(expected, Mapping)
+        or set(expected) != {
+            "schema", "bundle_stage", "replay_id", "route_cohort_id",
+            "manifest_sha256",
+        }
+        or expected.get("schema") != "route_historical_replay_pointer/v1"
+        or expected.get("bundle_stage") != _HISTORICAL_COMPLETE_STAGE
+        or expected.get("replay_id") != manifest["replay_id"]
+        or expected.get("route_cohort_id") != manifest["route_cohort_id"]
+        or expected.get("manifest_sha256") != manifest_sha256
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical replay expected pointer core differs"
+        )
+
+
+def _validate_historical_replay_bundle_view_current(
+    record: Mapping[str, Any],
+) -> None:
+    context = record.get("immutable_context")
+    if type(context) is not HistoricalReplayBuildContext:
+        raise HistoricalRoutePublicationError(
+            "historical replay view core context is invalid"
+        )
+    context.reread_unchanged()
+    try:
+        source = _context_record(context)["source"]
+        source.reread_unchanged()
+    except Exception as error:
+        raise HistoricalRoutePublicationError(
+            "historical replay view raw source changed"
+        ) from error
+    parent, parent_fd, parent_details = (
+        _route_publication._open_verified_directory(
+            record["bundle_path"].parent,
+            "historical complete bundles",
+        )
+    )
+    bundle_fd = None
+    file_fds = {}
+    try:
+        _route_publication._verify_open_path_identity(
+            parent, record["parent_details"],
+            "historical complete bundles",
+        )
+        bundle_fd, current_bundle = _route_publication._open_directory_at(
+            parent_fd, record["replay_id"],
+            "historical complete bundle",
+        )
+        if (
+            _route_publication._stable_file_metadata(current_bundle)
+            != _route_publication._stable_file_metadata(
+                record["bundle_details"]
+            )
+            or set(os.listdir(bundle_fd)) != _HISTORICAL_COMPLETE_FILES
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical complete bundle changed"
+            )
+        for filename, (limit, label) in record["read_specs"].items():
+            descriptor, before = _route_publication._open_regular_file_at(
+                bundle_fd, filename, label=label
+            )
+            file_fds[filename] = descriptor
+            value, digest, after = _route_publication._read_bounded_open_file(
+                descriptor, before, limit=limit, label=label
+            )
+            if (
+                value != record["file_bytes"][filename]
+                or digest != record["file_hashes"][filename]
+                or _route_publication._stable_file_metadata(after)
+                != _route_publication._stable_file_metadata(
+                    record["file_details"][filename]
+                )
+            ):
+                raise HistoricalRoutePublicationError(
+                    "historical complete bundle member changed"
+                )
+        _route_publication._verify_bundle_file_snapshots(
+            bundle_fd, record["read_specs"], file_fds,
+            record["file_details"], record["file_bytes"],
+            record["file_hashes"], _HISTORICAL_COMPLETE_FILES,
+        )
+        _route_publication._verify_directory_entry_snapshot(
+            parent_fd, record["replay_id"], record["bundle_details"],
+            "historical complete bundle",
+        )
+        _route_publication._verify_open_path_identity(
+            parent, parent_details, "historical complete bundles"
+        )
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical replay view identity differs"
+        ) from error
+    finally:
+        _close_descriptors_robustly(
+            *tuple(file_fds.values()), bundle_fd, parent_fd
+        )
+
+
+def _validate_historical_replay_bundle_impl(
+    *, data_dir: Path, raw_root: Path, bundle_path: Path,
+    expected_pointer_core: Optional[Mapping[str, Any]],
+    expected_replay_id: Optional[str],
+    require_directory_identity: bool,
+    issue_view: bool,
+    view_issuer: Any,
+) -> Mapping[str, Any]:
+    """Fully reread one six-file replay against pinned core and raw proof."""
+    data, raw = _historical_complete_roots(
+        data_dir=data_dir, raw_root=raw_root
+    )
+    if (
+        not isinstance(bundle_path, Path)
+        or type(require_directory_identity) is not bool
+        or type(issue_view) is not bool
+        or expected_replay_id is not None
+        and (
+            type(expected_replay_id) is not str
+            or re.fullmatch(r"replay:[0-9a-f]{64}", expected_replay_id)
+            is None
+        )
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical complete bundle path is invalid"
+        )
+    bundle = _route_publication._absolute_without_symlink_resolution(
+        bundle_path
+    )
+    expected_parent = _route_publication._absolute_without_symlink_resolution(
+        data / "routes" / "historical" / "bundles"
+    )
+    if bundle.parent != expected_parent:
+        raise HistoricalRoutePublicationError(
+            "historical complete bundle root differs"
+        )
+    try:
+        _route_publication._require_relative_basename(
+            bundle.name, "historical complete replay ID"
+        )
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical complete replay ID is invalid"
+        ) from error
+    parent, parent_fd, parent_details = (
+        _route_publication._open_verified_directory(
+            expected_parent, "historical complete bundles"
+        )
+    )
+    bundle_fd = None
+    file_fds = {}
+    immutable_context = None
+    try:
+        bundle_fd, bundle_details = _route_publication._open_directory_at(
+            parent_fd, bundle.name, "historical complete bundle"
+        )
+        if set(os.listdir(bundle_fd)) != _HISTORICAL_COMPLETE_FILES:
+            raise HistoricalRoutePublicationError(
+                "historical complete file inventory differs"
+            )
+        read_specs = {
+            "manifest.json": (
+                _route_publication._MAX_JSON_BYTES,
+                "historical complete manifest",
+            ),
+            "route_legs.csv": (
+                _route_publication._MAX_CSV_BYTES,
+                "historical complete route legs",
+            ),
+            "cost_components.csv": (
+                _route_publication._MAX_CSV_BYTES,
+                "historical complete costs",
+            ),
+            "route_opportunities.csv": (
+                _route_publication._MAX_CSV_BYTES,
+                "historical complete opportunities",
+            ),
+            "route_cohort.sqlite3": (
+                _route_publication._MAX_SQLITE_BYTES,
+                "historical complete SQLite",
+            ),
+            _HISTORICAL_REPLAY_EVIDENCE_FILENAME: (
+                _route_publication._MAX_JSON_BYTES,
+                "historical replay evidence",
+            ),
+        }
+        file_bytes = {}
+        file_hashes = {}
+        file_details = {}
+        for filename, (limit, label) in read_specs.items():
+            descriptor, before = _route_publication._open_regular_file_at(
+                bundle_fd, filename, label=label
+            )
+            file_fds[filename] = descriptor
+            value, digest, after = _route_publication._read_bounded_open_file(
+                descriptor, before, limit=limit, label=label
+            )
+            current = os.stat(
+                filename, dir_fd=bundle_fd, follow_symlinks=False
+            )
+            if (
+                _route_publication._stable_file_metadata(current)
+                != _route_publication._stable_file_metadata(after)
+            ):
+                raise HistoricalRoutePublicationError(
+                    "historical complete member changed during validation"
+                )
+            file_bytes[filename] = value
+            file_hashes[filename] = digest
+            file_details[filename] = after
+        try:
+            manifest = json.loads(file_bytes["manifest.json"])
+            evidence = json.loads(
+                file_bytes[_HISTORICAL_REPLAY_EVIDENCE_FILENAME]
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HistoricalRoutePublicationError(
+                "historical complete JSON member is invalid"
+            ) from error
+        manifest_fields = {
+            "schema", "bundle_stage", "replay_id", "route_cohort_id",
+            "historical_core_manifest_sha256",
+            "historical_core_pointer_sha256", "temporal_scope",
+            "execution_claim", "policy_sha256", "authority_sha256",
+            "toolchain_sha256", "run_id", "run_manifest_sha256",
+            "selection_sha256", "selected_block",
+            "requested_notionals_usd", "counts", "files",
+        }
+        manifest_sha256 = file_hashes["manifest.json"]
+        if (
+            type(manifest) is not dict
+            or set(manifest) != manifest_fields
+            or file_bytes["manifest.json"] != _json_file_bytes(manifest)
+            or manifest.get("schema")
+            != _HISTORICAL_COMPLETE_MANIFEST_SCHEMA
+            or manifest.get("bundle_stage") != _HISTORICAL_COMPLETE_STAGE
+            or re.fullmatch(
+                r"replay:[0-9a-f]{64}", manifest.get("replay_id", "")
+            ) is None
+            or expected_replay_id is not None
+            and manifest.get("replay_id") != expected_replay_id
+            or require_directory_identity
+            and manifest.get("replay_id") != bundle.name
+            or re.fullmatch(
+                r"cohort:[0-9a-f]{64}",
+                manifest.get("route_cohort_id", ""),
+            ) is None
+            or manifest.get("requested_notionals_usd") != _NOTIONALS
+            or type(manifest.get("files")) is not dict
+            or set(manifest["files"])
+            != _HISTORICAL_COMPLETE_ARTIFACT_FILES
+            or file_bytes[_HISTORICAL_REPLAY_EVIDENCE_FILENAME]
+            != _json_file_bytes(evidence)
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical complete manifest schema differs"
+            )
+        for filename, details in manifest["files"].items():
+            if (
+                type(details) is not dict
+                or set(details) != {
+                    "schema", "sha256", "logical_sha256", "row_count"
+                }
+                or details.get("sha256") != file_hashes[filename]
+            ):
+                raise HistoricalRoutePublicationError(
+                    "historical complete file checksum differs"
+                )
+        representation = {
+            name: file_bytes[name]
+            for name in _route_publication._COMPLETE_MANIFEST_ARTIFACT_FILENAMES
+        }
+        try:
+            (
+                logical_bundle, legs, costs, opportunities,
+            ) = _route_publication._read_complete_representation_bytes(
+                file_bytes=representation,
+                route_cohort_id=manifest["route_cohort_id"],
+            )
+            logical_bundle = (
+                _route_publication._validate_complete_logical_bundle_shared(
+                    logical_bundle, historical_atomic=True
+                )
+            )
+        except _route_publication.RoutePublicationError as error:
+            raise HistoricalRoutePublicationError(
+                "historical complete economic representation is invalid"
+            ) from error
+        if (
+            legs != logical_bundle["legs"]
+            or costs != logical_bundle["cost_components"]
+            or opportunities != logical_bundle["opportunities"]
+            or logical_bundle["route_cohort_id"]
+            != manifest["route_cohort_id"]
+            or logical_bundle["core_manifest_sha256"]
+            != manifest["historical_core_manifest_sha256"]
+            or logical_bundle["core_pointer_sha256"]
+            != manifest["historical_core_pointer_sha256"]
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical complete economic lineage differs"
+            )
+        _validate_historical_replay_evidence_join(
+            bundle=logical_bundle, evidence=evidence
+        )
+        _validate_historical_expected_pointer_core(
+            expected=expected_pointer_core, manifest=manifest,
+            manifest_sha256=manifest_sha256,
+        )
+        immutable_context = _load_immutable_historical_replay_core(
+            data_dir=data,
+            route_cohort_id=manifest["route_cohort_id"],
+            expected_manifest_sha256=manifest[
+                "historical_core_manifest_sha256"
+            ],
+            expected_pointer_sha256=manifest[
+                "historical_core_pointer_sha256"
+            ],
+        )
+        rebuilt = _build_historical_complete_payload(
+            context=immutable_context
+        )
+        if (
+            rebuilt["replay_id"] != manifest["replay_id"]
+            or rebuilt["bundle"] != logical_bundle
+            or rebuilt["replay_evidence"] != evidence
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical complete raw proof reconstruction differs"
+            )
+        expected_files = _historical_complete_file_descriptors(
+            file_bytes={
+                name: file_bytes[name]
+                for name in _HISTORICAL_COMPLETE_ARTIFACT_FILES
+            },
+            bundle=logical_bundle, evidence=evidence,
+        )
+        expected_manifest = _historical_complete_manifest(
+            payload=rebuilt, files=expected_files
+        )
+        if manifest != expected_manifest:
+            raise HistoricalRoutePublicationError(
+                "historical complete manifest content differs"
+            )
+        _route_publication._verify_bundle_file_snapshots(
+            bundle_fd, read_specs, file_fds, file_details, file_bytes,
+            file_hashes, _HISTORICAL_COMPLETE_FILES,
+        )
+        _route_publication._verify_directory_entry_snapshot(
+            parent_fd, bundle.name, bundle_details,
+            "historical complete bundle",
+        )
+        _route_publication._verify_open_path_identity(
+            parent, parent_details, "historical complete bundles"
+        )
+        result = {
+            "path": bundle,
+            "manifest_sha256": manifest_sha256,
+            "manifest": _freeze(manifest),
+            "bundle": _freeze(logical_bundle),
+            "legs": tuple(_freeze(row) for row in legs),
+            "cost_components": tuple(_freeze(row) for row in costs),
+            "opportunities": tuple(_freeze(row) for row in opportunities),
+            "replay_evidence": _freeze(evidence),
+            "database_path": bundle / "route_cohort.sqlite3",
+        }
+        if issue_view:
+            view = view_issuer({
+                "replay_id": manifest["replay_id"],
+                "route_cohort_id": manifest["route_cohort_id"],
+                "manifest_sha256": manifest_sha256,
+                "data_dir": data, "raw_root": raw,
+                "bundle_path": bundle,
+                "parent_details": parent_details,
+                "bundle_details": bundle_details,
+                "read_specs": read_specs,
+                "file_bytes": file_bytes,
+                "file_hashes": file_hashes,
+                "file_details": file_details,
+                "manifest": manifest,
+                "bundle": logical_bundle,
+                "replay_evidence": evidence,
+                "immutable_context": immutable_context,
+            })
+            immutable_context = None
+            try:
+                routes_by_id = {
+                    row["route_id"]: row
+                    for row in logical_bundle["routes"]
+                }
+                opportunities_by_id = {
+                    row["opportunity_id"]: row
+                    for row in logical_bundle["opportunities"]
+                }
+                costs_by_opportunity = {}
+                for row in logical_bundle["cost_components"]:
+                    costs_by_opportunity.setdefault(
+                        row["opportunity_id"], []
+                    ).append(row)
+                for scenario in evidence["scenarios"]:
+                    opportunity = opportunities_by_id.get(
+                        scenario["opportunity_id"]
+                    )
+                    route = (
+                        routes_by_id.get(opportunity["route_id"])
+                        if opportunity is not None else None
+                    )
+                    scenario_rows = tuple(costs_by_opportunity.get(
+                        scenario["opportunity_id"], ()
+                    ))
+                    if route is None:
+                        raise HistoricalRoutePublicationError(
+                            "historical published cost route differs"
+                        )
+                    _validate_historical_cost_rows_for_published_view(
+                        validated_view=view,
+                        scenario_key=scenario["scenario_key"],
+                        route=route, rows=scenario_rows,
+                    )
+            except BaseException:
+                try:
+                    view.close()
+                except Exception:
+                    pass
+                raise
+            result["validated_view"] = view
+        return MappingProxyType(result)
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical complete bundle loading failed"
+        ) from error
+    finally:
+        try:
+            if immutable_context is not None:
+                immutable_context.close()
+        finally:
+            _close_descriptors_robustly(
+                *tuple(file_fds.values()), bundle_fd, parent_fd
+            )
+
+
+(
+    ValidatedHistoricalReplayBundleView,
+    _validate_historical_replay_bundle,
+    _historical_published_cost_proof_material,
+) = _bind_historical_replay_bundle_view_runtime(
+    validation_impl=_validate_historical_replay_bundle_impl,
+    current_checker_function=(
+        _validate_historical_replay_bundle_view_current
+    ),
+    scenario_material_reader=_historical_scenario_material,
+)
+del _bind_historical_replay_bundle_view_runtime
+del _validate_historical_replay_bundle_impl
+
+
+def validate_historical_replay_bundle(
+    *, data_dir: Path, raw_root: Path, bundle_path: Path,
+    expected_pointer_core: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, Any]:
+    return _validate_historical_replay_bundle(
+        data_dir=data_dir, raw_root=raw_root, bundle_path=bundle_path,
+        expected_pointer_core=expected_pointer_core,
+        expected_replay_id=None,
+        require_directory_identity=True,
+        issue_view=True,
+    )
+
+
+_load_historical_cost_proof_inputs_for_published_view = (
+    _bind_historical_published_cost_proof_loader(
+        _historical_published_cost_proof_material
+    )
+)
+
+
+def _validate_historical_cost_rows_for_published_view(
+    *, validated_view: ValidatedHistoricalReplayBundleView,
+    scenario_key: str, route: Mapping[str, Any],
+    rows: Tuple[Mapping[str, Any], ...],
+) -> None:
+    """Bind published cost rows to proof owned by the validated view."""
+    from scripts.route_opportunity import route_opportunity_id
+
+    proof_capability = _load_historical_cost_proof_inputs_for_published_view(
+        validated_view=validated_view, scenario_key=scenario_key,
+    )
+    proof = _require_historical_cost_proof_owner(
+        proof_capability, validated_view
+    )
+    try:
+        block_text, direction, notional_text = scenario_key.split(":")
+        block_number = int(block_text)
+        notional = int(notional_text)
+        proof_rows = proof["rows"]
+        expected = {
+            (row["grain"], row["component"]): row
+            for row in proof_rows
+        }
+        expected_direction = (
+            "uniswap_to_sushiswap"
+            if ":uniswap_v2:" in route["buy_market_id"]
+            and ":sushiswap_v2:" in route["sell_market_id"]
+            else "sushiswap_to_uniswap"
+            if ":sushiswap_v2:" in route["buy_market_id"]
+            and ":uniswap_v2:" in route["sell_market_id"]
+            else None
+        )
+        expected_keys = tuple(
+            (leg, component_type)
+            for leg, component_type, _status, _embedded
+            in HISTORICAL_ATOMIC_COMPONENT_MATRIX
+        )
+        row_by_key = {
+            (row["leg"], row["component_type"]): row for row in rows
+        }
+        ordered_rows = tuple(row_by_key[key] for key in expected_keys)
+        opportunity_id = route_opportunity_id(
+            route["route_id"], str(notional)
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise HistoricalRoutePublicationError(
+            "historical published cost projection is invalid"
+        ) from error
+    if (
+        type(scenario_key) is not str
+        or str(block_number) != block_text
+        or block_number <= 0
+        or str(notional) != notional_text
+        or notional <= 0
+        or direction != expected_direction
+        or type(route) is not dict
+        or type(rows) is not tuple
+        or len(rows) != len(HISTORICAL_ATOMIC_COMPONENT_MATRIX)
+        or len(row_by_key) != len(HISTORICAL_ATOMIC_COMPONENT_MATRIX)
+        or tuple(
+            (row["grain"], row["component"])
+            for row in proof_rows
+        ) != expected_keys
+        or proof["scenario_key"] != scenario_key
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical published cost ancestry differs"
+        )
+    try:
+        _validate_historical_atomic_cost_component_matrix(
+            route,
+            ordered_rows,
+            expected_cohort_id=validated_view.route_cohort_id,
+            expected_opportunity_id=opportunity_id,
+            expected_pool_fee_source_sha256_by_leg={
+                leg: expected[(leg, "pool_swap_fee")]["proof_sha256"]
+                for leg in ("buy", "sell")
+            },
+            expected_pool_fee_amount_usd_by_leg={
+                leg: expected[(leg, "pool_swap_fee")][
+                    "amount_usd_exact"
+                ]
+                for leg in ("buy", "sell")
+            },
+            expected_zero_fee_proof_sha256_by_key={
+                key: expected[key]["proof_sha256"]
+                for key in (
+                    ("buy", "router_or_integrator_fee"),
+                    ("buy", "token_transfer_tax"),
+                    ("sell", "router_or_integrator_fee"),
+                    ("sell", "token_transfer_tax"),
+                )
+            },
+            expected_gas_amount_usd=expected[
+                ("route", "network_gas")
+            ]["amount_usd_exact"],
+            expected_gas_source_sha256=expected[
+                ("route", "network_gas")
+            ]["proof_sha256"],
+            expected_transfer_source_sha256=expected[
+                ("route", "rebalancing_or_transfer")
+            ]["proof_sha256"],
+            expected_mev_amount_usd=expected[
+                ("route", "mev_buffer")
+            ]["amount_usd_exact"],
+            expected_policy_sha256=expected[
+                ("route", "mev_buffer")
+            ]["proof_sha256"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise HistoricalRoutePublicationError(
+            "historical published cost proof differs"
+        ) from error
+    return None

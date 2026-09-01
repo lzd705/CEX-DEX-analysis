@@ -11324,6 +11324,8 @@ def _initialize_historical_foundry_storage_types():
             else:
                 _raise_storage_error()
             try:
+                if record.get("kind") == "reopened":
+                    _verify_ancestry(record["chain"])
                 expected_files = set(record["members"])
                 expected_directories = set()
                 for path in expected_files:
@@ -11343,6 +11345,17 @@ def _initialize_historical_foundry_storage_types():
                     path, expected_sha256=row["sha256"],
                     max_bytes=row["cap"],
                 )
+            try:
+                if record.get("kind") == "reopened":
+                    _verify_ancestry(record["chain"])
+                if _task7_inventory_paths(root_fd) != (
+                    expected_files, expected_directories
+                ):
+                    raise _InternalFailure()
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                _raise_storage_error()
             return None
 
         def close(self) -> None:
@@ -11657,58 +11670,114 @@ def _initialize_historical_foundry_storage_types():
         publication_lease_registry.pop(id(lease), None)
         return None
 
-    def _task7_read_reopened_member(
+    def _task7_reopened_file_snapshot(
+        details: os.stat_result,
+    ) -> Tuple[Any, ...]:
+        return (
+            details.st_dev,
+            details.st_ino,
+            details.st_mode,
+            details.st_nlink,
+            details.st_uid,
+            details.st_gid,
+            details.st_size,
+            getattr(details, "st_mtime_ns", None),
+            getattr(details, "st_ctime_ns", None),
+            getattr(details, "st_birthtime_ns", None),
+            getattr(details, "st_flags", None),
+        )
+
+    def _task7_access_reopened_member(
         record: Dict[str, Any], relative_path: str,
         expected_size: Optional[int], maximum_size: int,
-    ) -> bytes:
+        *, capture_snapshot: bool,
+    ) -> Tuple[bytes, Tuple[Any, ...]]:
+        member = record.get("members", {}).get(relative_path)
         if (
             type(relative_path) is not str or not relative_path
             or relative_path.startswith("/") or "\\" in relative_path
+            or type(member) is not dict
+            or member.get("path") != relative_path
+            or not _exact_sha256(member.get("sha256"))
+            or type(capture_snapshot) is not bool
             or expected_size is not None and (
                 type(expected_size) is not int or expected_size <= 0
                 or expected_size > maximum_size
             )
         ):
             raise _InternalFailure()
+        expected_snapshot = member.get("snapshot")
+        if not capture_snapshot and type(expected_snapshot) is not tuple:
+            raise _InternalFailure()
         parts = relative_path.split("/")
         if not 1 <= len(parts) <= 8:
             raise _InternalFailure()
+        _verify_ancestry(record["chain"])
         parent_fd = record["chain"][-1][0]
         opened = []
+        opened_directories = []
         try:
             for component in parts[:-1]:
                 _require_relative_basename(component)
+                before = os.stat(
+                    component, dir_fd=parent_fd, follow_symlinks=False
+                )
                 fd = os.open(
                     component, _required_directory_flags(), dir_fd=parent_fd
                 )
                 opened.append(fd)
                 details = os.fstat(fd)
-                current = os.stat(
+                after = os.stat(
                     component, dir_fd=parent_fd, follow_symlinks=False
                 )
+                identity = _metadata_snapshot(details)
                 if (
-                    not stat.S_ISDIR(details.st_mode)
-                    or _metadata_snapshot(details) != _metadata_snapshot(current)
+                    not stat.S_ISDIR(before.st_mode)
+                    or not stat.S_ISDIR(details.st_mode)
+                    or not stat.S_ISDIR(after.st_mode)
+                    or _metadata_snapshot(before) != identity
+                    or _metadata_snapshot(after) != identity
+                    or details.st_uid != os.geteuid()
+                    or stat.S_IMODE(details.st_mode) & 0o022
+                    or os.get_inheritable(fd)
                 ):
                     raise _InternalFailure()
+                opened_directories.append(
+                    (fd, parent_fd, component, identity)
+                )
                 parent_fd = fd
             basename = parts[-1]
             _require_relative_basename(basename)
+            before = os.stat(
+                basename, dir_fd=parent_fd, follow_symlinks=False
+            )
             fd = os.open(
                 basename, _task4b_file_flags(create=False), dir_fd=parent_fd
             )
             opened.append(fd)
             details = os.fstat(fd)
-            current = os.stat(
+            after = os.stat(
                 basename, dir_fd=parent_fd, follow_symlinks=False
             )
+            observed_snapshot = _task7_reopened_file_snapshot(details)
+            frozen_snapshot = (
+                observed_snapshot if capture_snapshot else expected_snapshot
+            )
             if (
-                not stat.S_ISREG(details.st_mode)
-                or _file_identity(details) != _file_identity(current)
+                not stat.S_ISREG(before.st_mode)
+                or not stat.S_ISREG(details.st_mode)
+                or not stat.S_ISREG(after.st_mode)
+                or _task7_reopened_file_snapshot(before) != frozen_snapshot
+                or observed_snapshot != frozen_snapshot
+                or _task7_reopened_file_snapshot(after) != frozen_snapshot
+                or details.st_nlink != 1
+                or details.st_uid != os.geteuid()
+                or stat.S_IMODE(details.st_mode) & 0o022
                 or details.st_size <= 0
                 or details.st_size > maximum_size
                 or expected_size is not None
                 and details.st_size != expected_size
+                or os.get_inheritable(fd)
             ):
                 raise _InternalFailure()
             chunks = []
@@ -11721,13 +11790,64 @@ def _initialize_historical_foundry_storage_types():
                 remaining -= len(chunk)
             if os.read(fd, 1) != b"":
                 raise _InternalFailure()
-            return b"".join(chunks)
+            payload = b"".join(chunks)
+            final_details = os.fstat(fd)
+            final_entry = os.stat(
+                basename, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                _task7_reopened_file_snapshot(final_details)
+                != frozen_snapshot
+                or _task7_reopened_file_snapshot(final_entry)
+                != frozen_snapshot
+                or len(payload) != details.st_size
+                or hashlib.sha256(payload).hexdigest()
+                != member["sha256"]
+            ):
+                raise _InternalFailure()
+            for (
+                directory_fd, directory_parent_fd, component, identity
+            ) in opened_directories:
+                current_opened = os.fstat(directory_fd)
+                current_entry = os.stat(
+                    component,
+                    dir_fd=directory_parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(current_opened.st_mode)
+                    or not stat.S_ISDIR(current_entry.st_mode)
+                    or _metadata_snapshot(current_opened) != identity
+                    or _metadata_snapshot(current_entry) != identity
+                ):
+                    raise _InternalFailure()
+            _verify_ancestry(record["chain"])
+            return payload, frozen_snapshot
         finally:
             for fd in reversed(opened):
                 try:
                     os.close(fd)
                 except OSError:
                     pass
+
+    def _task7_read_reopened_member(
+        record: Dict[str, Any], relative_path: str,
+        expected_size: Optional[int], maximum_size: int,
+    ) -> bytes:
+        payload, _snapshot = _task7_access_reopened_member(
+            record, relative_path, expected_size, maximum_size,
+            capture_snapshot=False,
+        )
+        return payload
+
+    def _task7_capture_reopened_member(
+        record: Dict[str, Any], relative_path: str,
+        expected_size: Optional[int], maximum_size: int,
+    ) -> Tuple[bytes, Tuple[Any, ...]]:
+        return _task7_access_reopened_member(
+            record, relative_path, expected_size, maximum_size,
+            capture_snapshot=True,
+        )
 
     def open_validated_run(
         *,
@@ -11748,6 +11868,7 @@ def _initialize_historical_foundry_storage_types():
         ):
             _raise_storage_error()
         chain = None
+        snapshot = None
         try:
             canonical, _components = _canonical_data_dir(data_dir)
             suffix = run_id[4:]
@@ -11755,9 +11876,20 @@ def _initialize_historical_foundry_storage_types():
             target_canonical, target_components = _canonical_data_dir(target)
             chain = _open_ancestry(target_canonical, target_components, [])
             _require_private_leaf(chain)
-            provisional = {"chain": chain}
-            manifest_bytes = _task7_read_reopened_member(
-                provisional, "run_manifest.json", None, 8_388_608
+            provisional = {
+                "chain": chain,
+                "members": {
+                    "run_manifest.json": {
+                        "path": "run_manifest.json", "size": None,
+                        "sha256": expected_manifest_sha256,
+                        "cap": 8_388_608, "kind": "task6_json",
+                    },
+                },
+            }
+            manifest_bytes, _manifest_snapshot = (
+                _task7_capture_reopened_member(
+                    provisional, "run_manifest.json", None, 8_388_608
+                )
             )
             if (
                 len(manifest_bytes) > 8_388_608
@@ -11810,11 +11942,27 @@ def _initialize_historical_foundry_storage_types():
                     "selection_status": manifest.get("selection_status"),
                 },
             }
+            for relative_path, member in sorted(members.items()):
+                _payload, member_snapshot = (
+                    _task7_capture_reopened_member(
+                        record, relative_path, member["size"], member["cap"]
+                    )
+                )
+                member["snapshot"] = member_snapshot
             snapshot = _prepare_handle(HistoricalRunSnapshot, {})
             run_snapshot_registry[id(snapshot)] = (snapshot, record)
             snapshot.reread_unchanged()
             return snapshot
         except BaseException as error:
+            if snapshot is not None:
+                entry = run_snapshot_registry.get(id(snapshot))
+                if entry is not None and entry[0] is snapshot:
+                    entry[1]["state"] = "failed"
+                    _retire_nonowner_handle(
+                        snapshot,
+                        run_snapshot_registry,
+                        run_snapshot_tombstones,
+                    )
             if chain is not None:
                 for row in reversed(chain):
                     try:

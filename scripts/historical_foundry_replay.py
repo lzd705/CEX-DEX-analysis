@@ -2736,3 +2736,557 @@ def build_historical_replay_evidence(
         "historical_foundry_replay_evidence/v1", result
     )
     return _canonical_bytes(result)
+
+
+_HISTORICAL_PUBLICATION_INPUT_FIELDS = frozenset((
+    "schema", "scenario_key", "context_projection_sha256",
+    "core_manifest_sha256", "source_descriptor_set_sha256",
+    "proof_inputs_hash", "cohort_id", "route_id", "route",
+    "selected_block", "selection_scenario", "prefilter_scenario", "fee",
+    "policy_fees", "pools", "price", "feed_sha256_by_venue",
+    "v2_formula", "overlay", "receipt", "trace", "result",
+    "proof_inputs", "overlay_sha256", "receipt_sha256", "trace_sha256",
+    "result_sha256",
+))
+_HISTORICAL_PUBLICATION_TRANSACTION_FIELDS = frozenset((
+    "type", "from", "to", "nonce", "gas", "maxPriorityFeePerGas",
+    "maxFeePerGas", "accessList", "value", "input", "calldata_sha256",
+))
+_HISTORICAL_PUBLICATION_RECEIPT_FIELDS = frozenset((
+    "schema", "scenario_key", "status", "blockNumber", "blockHash",
+    "transactionIndex", "gasUsed", "effectiveGasPrice", "maxFeePerGas",
+    "maxPriorityFeePerGas", "transactionHash",
+))
+_HISTORICAL_PUBLICATION_BALANCE_FIELDS = frozenset((
+    "initial_weth_raw", "initial_uni_raw", "final_weth_raw", "final_uni_raw",
+))
+_HISTORICAL_PUBLICATION_DELTA_FIELDS = frozenset((
+    "first_leg_uni_raw", "weth_raw", "residual_uni_raw",
+))
+_HISTORICAL_PUBLICATION_SOURCE_DESCRIPTOR_FIELDS = frozenset((
+    "path", "byte_count", "sha256",
+))
+_HISTORICAL_PUBLICATION_SAFE_PATH = re.compile(
+    r"(?:[A-Za-z0-9._:-]+/)*[A-Za-z0-9._:-]+\Z"
+)
+_HISTORICAL_PUBLICATION_HASH32 = re.compile(r"0x[0-9a-f]{64}\Z")
+
+
+def _decode_historical_publication_bytes(
+    raw: Any, *, label: str, expected_type: Any,
+) -> Any:
+    if type(raw) is not bytes:
+        raise ValueError("{} bytes are invalid".format(label))
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("{} bytes are invalid".format(label)) from error
+    if type(value) is not expected_type or _canonical_bytes(value) != raw:
+        raise ValueError("{} is not canonical".format(label))
+    return value
+
+
+def _historical_publication_source_members(
+    *, raw: Mapping[str, Any], descriptor_bytes: bytes,
+) -> list:
+    descriptors = _decode_historical_publication_bytes(
+        descriptor_bytes,
+        label="historical publication source descriptors",
+        expected_type=list,
+    )
+    normalized = []
+    paths = set()
+    for item in descriptors:
+        descriptor = _exact_fields(
+            item, _HISTORICAL_PUBLICATION_SOURCE_DESCRIPTOR_FIELDS,
+            "historical publication source descriptor",
+        )
+        path = descriptor["path"]
+        if (
+            type(path) is not str
+            or _HISTORICAL_PUBLICATION_SAFE_PATH.fullmatch(path) is None
+            or any(part in ("", ".", "..") for part in path.split("/"))
+            or path in paths
+            or type(descriptor["byte_count"]) is not int
+            or descriptor["byte_count"] <= 0
+            or _SHA.fullmatch(descriptor["sha256"] or "") is None
+        ):
+            raise ValueError(
+                "historical publication source descriptor is invalid"
+            )
+        paths.add(path)
+        normalized.append(dict(descriptor))
+    if (
+        normalized != sorted(normalized, key=lambda item: item["path"])
+        or _digest(normalized) != raw["source_descriptor_set_sha256"]
+    ):
+        raise ValueError(
+            "historical publication source descriptor set differs"
+        )
+    block_number = raw["selected_block"]["number"]
+    scenario_key = raw["scenario_key"]
+    source_specs = (
+        ("overlay", "overlay.json", "overlay_sha256"),
+        ("receipt", "receipt.json", "receipt_sha256"),
+        ("trace", "trace.json.gz", "trace_sha256"),
+        ("result", "result.json", "result_sha256"),
+    )
+    result = []
+    for role, filename, hash_field in source_specs:
+        expected_path = "foundry/{}/{}/{}".format(
+            block_number, scenario_key, filename
+        )
+        matches = [
+            descriptor for descriptor in normalized
+            if descriptor["path"] == expected_path
+        ]
+        if (
+            len(matches) != 1
+            or matches[0]["sha256"] != raw[hash_field]
+            or role != "trace" and matches[0]["byte_count"]
+            != len(_canonical_bytes(raw[role]))
+        ):
+            raise ValueError(
+                "historical publication scenario source differs"
+            )
+        result.append({"role": role, **matches[0]})
+    return result
+
+
+def _historical_publication_selected_block(
+    raw: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    selected = _exact_fields(
+        raw["selected_block"], _TASK7_BLOCK_FIELDS,
+        "historical publication selected block",
+    )
+    overlay = raw["overlay"]
+    synthetic = _exact_fields(
+        overlay.get("synthetic_block"),
+        frozenset(("number", "timestamp", "base_fee_per_gas")),
+        "historical publication synthetic block",
+    )
+    fee = raw["fee"]
+    price = _exact_fields(
+        raw["price"], _USD_PAYLOAD_FIELDS,
+        "historical publication ETH/USD projection",
+    )
+    for field in (
+        "number", "timestamp", "gas_limit", "gas_used", "base_fee_per_gas",
+    ):
+        _task7_int(
+            selected[field], "historical publication block " + field,
+            minimum=0,
+        )
+    for field in ("hash", "parent_hash", "state_root"):
+        if (
+            type(selected[field]) is not str
+            or _HISTORICAL_PUBLICATION_HASH32.fullmatch(selected[field]) is None
+        ):
+            raise ValueError("historical publication block hash is invalid")
+    for field in ("number", "timestamp", "base_fee_per_gas"):
+        _task7_int(
+            synthetic[field], "historical publication synthetic " + field,
+            minimum=0,
+        )
+    p50 = fee.get("p50_priority_fee_per_gas")
+    p90 = fee.get("p90_priority_fee_per_gas")
+    price_integer_fields = (
+        "round_id", "phase_id", "answer", "decimals", "started_at",
+        "updated_at", "answered_in_round", "valid_until", "block_number",
+    )
+    if (
+        type(p50) is not int or p50 < 0
+        or type(p90) is not int or p90 < p50
+        or synthetic["number"] != selected["number"] + 1
+        or overlay.get("block_number") != selected["number"]
+        or overlay.get("block_hash") != selected["hash"]
+        or overlay.get("state_root") != selected["state_root"]
+        or raw["trace"].get("fork_header") != selected
+        or raw["result"].get("fork_header") != selected
+        or price["block_number"] != str(selected["number"])
+        or price["block_hash"] != selected["hash"]
+        or _ADDRESS.fullmatch(price["proxy_address"] or "") is None
+        or any(
+            type(price[field]) is not str
+            or re.fullmatch(r"0|[1-9][0-9]*", price[field]) is None
+            for field in price_integer_fields
+        )
+        or int(price["answer"]) <= 0
+        or int(price["valid_until"]) <= int(price["updated_at"])
+    ):
+        raise ValueError(
+            "historical publication selected block projection differs"
+        )
+    return {
+        **dict(selected),
+        "synthetic_child_number": synthetic["number"],
+        "synthetic_child_timestamp": synthetic["timestamp"],
+        "synthetic_child_base_fee_per_gas": synthetic["base_fee_per_gas"],
+        "p50_priority_fee_per_gas": p50,
+        "p90_priority_fee_per_gas": p90,
+        "eth_usd": {
+            field: price[field] for field in (
+                "proxy_address", "round_id", "phase_id", "answer", "decimals",
+                "started_at", "updated_at", "answered_in_round", "valid_until",
+                "block_number", "block_hash",
+            )
+        },
+    }
+
+
+def _historical_publication_transaction_and_receipt(
+    *, raw: Mapping[str, Any], compact: Mapping[str, Any],
+) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+    overlay = raw["overlay"]
+    transaction = _exact_fields(
+        overlay.get("transaction"),
+        _HISTORICAL_PUBLICATION_TRANSACTION_FIELDS,
+        "historical publication transaction",
+    )
+    receipt = _exact_fields(
+        raw["receipt"], _HISTORICAL_PUBLICATION_RECEIPT_FIELDS,
+        "historical publication receipt",
+    )
+    calldata = transaction["input"]
+    try:
+        calldata_bytes = bytes.fromhex(calldata[2:])
+    except (AttributeError, ValueError):
+        raise ValueError(
+            "historical publication transaction calldata is invalid"
+        ) from None
+    if (
+        transaction["type"] != "0x2"
+        or _ADDRESS.fullmatch(transaction["from"] or "") is None
+        or _ADDRESS.fullmatch(transaction["to"] or "") is None
+        or any(
+            type(transaction[field]) is not int
+            or transaction[field] < 0
+            for field in (
+                "nonce", "gas", "maxPriorityFeePerGas", "maxFeePerGas",
+            )
+        )
+        or transaction["gas"] <= 0
+        or transaction["accessList"] != []
+        or transaction["value"] != 0
+        or type(calldata) is not str
+        or not calldata.startswith("0x")
+        or _digest(receipt) != compact["receipt_sha256"]
+        or hashlib.sha256(calldata_bytes).hexdigest()
+        != transaction["calldata_sha256"]
+        or receipt["schema"] != "historical_foundry_receipt/v1"
+        or receipt["scenario_key"] != compact["scenario_key"]
+        or receipt["status"] != compact["receipt_status"]
+        or receipt["status"] != 1
+        or any(
+            type(receipt[field]) is not int or receipt[field] < 0
+            for field in (
+                "blockNumber", "transactionIndex", "gasUsed",
+                "effectiveGasPrice", "maxFeePerGas", "maxPriorityFeePerGas",
+            )
+        )
+        or receipt["gasUsed"] <= 0
+        or receipt["maxFeePerGas"] != transaction["maxFeePerGas"]
+        or receipt["maxPriorityFeePerGas"]
+        != transaction["maxPriorityFeePerGas"]
+        or _HISTORICAL_PUBLICATION_HASH32.fullmatch(
+            receipt["blockHash"] or ""
+        ) is None
+        or _HISTORICAL_PUBLICATION_HASH32.fullmatch(
+            receipt["transactionHash"] or ""
+        ) is None
+    ):
+        raise ValueError(
+            "historical publication transaction closure differs"
+        )
+    return ({
+        "sender": transaction["from"],
+        "executor": transaction["to"],
+        "type": transaction["type"],
+        "nonce": transaction["nonce"],
+        "gas_limit": transaction["gas"],
+        "access_list": [],
+        "max_priority_fee_per_gas": transaction["maxPriorityFeePerGas"],
+        "max_fee_per_gas": transaction["maxFeePerGas"],
+        "calldata": calldata,
+        "calldata_sha256": transaction["calldata_sha256"],
+        "transaction_hash": receipt["transactionHash"],
+        "transaction_index": receipt["transactionIndex"],
+    }, {
+        "status": receipt["status"],
+        "block_number": receipt["blockNumber"],
+        "block_hash": receipt["blockHash"],
+        "transaction_index": receipt["transactionIndex"],
+        "gas_used": receipt["gasUsed"],
+        "effective_gas_price": receipt["effectiveGasPrice"],
+        "max_fee_per_gas": receipt["maxFeePerGas"],
+        "max_priority_fee_per_gas": receipt["maxPriorityFeePerGas"],
+        "transaction_hash": receipt["transactionHash"],
+        "projection_sha256": compact["receipt_sha256"],
+    })
+
+
+def _historical_publication_balances(
+    *, raw: Mapping[str, Any], compact: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    trace = raw["trace"]
+    result = raw["result"]
+    balances = _exact_fields(
+        trace.get("balances"), _HISTORICAL_PUBLICATION_BALANCE_FIELDS,
+        "historical publication balances",
+    )
+    deltas = _exact_fields(
+        trace.get("actual_deltas"), _HISTORICAL_PUBLICATION_DELTA_FIELDS,
+        "historical publication balance deltas",
+    )
+    authority = compact["economics_authority"]
+    if (
+        result.get("balances") != balances
+        or result.get("actual_deltas") != deltas
+        or any(type(value) is not int for value in balances.values())
+        or any(type(value) is not int for value in deltas.values())
+        or balances["initial_weth_raw"] != authority["first_weth_in_raw"]
+        or balances["initial_uni_raw"] != 0
+        or deltas["first_leg_uni_raw"] != authority["first_uni_out_raw"]
+        or balances["final_weth_raw"] != authority["final_weth_out_raw"]
+        or balances["final_uni_raw"] != deltas["residual_uni_raw"]
+        or deltas["weth_raw"] != compact["gross_edge_weth_raw"]
+    ):
+        raise ValueError("historical publication balance closure differs")
+    return {
+        "initial_weth_raw": balances["initial_weth_raw"],
+        "initial_uni_raw": balances["initial_uni_raw"],
+        "input_weth_raw": authority["first_weth_in_raw"],
+        "intermediate_uni_raw": authority["first_uni_out_raw"],
+        "final_weth_raw": balances["final_weth_raw"],
+        "final_uni_raw": balances["final_uni_raw"],
+        "gross_weth_delta_raw": deltas["weth_raw"],
+    }
+
+
+def _historical_publication_scenario_facts(
+    *, compact: Mapping[str, Any], raw: Mapping[str, Any],
+    descriptor_bytes: bytes,
+) -> Mapping[str, Any]:
+    value = _exact_fields(
+        raw, _HISTORICAL_PUBLICATION_INPUT_FIELDS,
+        "historical publication scenario input",
+    )
+    try:
+        block_text, direction, notional_text = compact["scenario_key"].split(":")
+        block_number = int(block_text)
+        notional = int(notional_text)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError(
+            "historical publication scenario identity is invalid"
+        ) from None
+    selection = value["selection_scenario"]
+    opportunity = compact["opportunity"]
+    proof = compact["proof_inputs"]
+    result = value["result"]
+    proof_authority = result.get("proof_authority")
+    if (
+        value["schema"] != "historical_foundry_scenario_inputs/v1"
+        or value["scenario_key"] != compact["scenario_key"]
+        or value["core_manifest_sha256"] != compact["core_manifest_sha256"]
+        or value["route_id"] != compact["route_id"]
+        or value["selected_block"].get("number") != block_number
+        or value["proof_inputs_hash"] != compact["proof_inputs_hash"]
+        or value["proof_inputs"] != proof
+        or type(selection) is not dict
+        or selection.get("scenario_key") != compact["scenario_key"]
+        or selection.get("direction") != direction
+        or selection.get("requested_notional_usd") != notional
+        or selection.get("status") != 1
+        or selection.get("classification") != "replay_success"
+        or any(
+            value[field] != compact[field]
+            or selection.get(field) != compact[field]
+            for field in (
+                "overlay_sha256", "receipt_sha256", "trace_sha256",
+                "result_sha256",
+            )
+        )
+        or _SHA.fullmatch(value["context_projection_sha256"] or "") is None
+        or _SHA.fullmatch(value["source_descriptor_set_sha256"] or "") is None
+        or not isinstance(proof_authority, dict)
+        or proof.get("policy_sha256")
+        != proof_authority.get("policy_sha256")
+        or proof.get("adapter_proof_sha256")
+        != proof_authority.get("adapter_proof_sha256")
+        or result.get("schema") != "historical_foundry_replay_result/v1"
+        or result.get("scenario_key") != compact["scenario_key"]
+        or result.get("status") != 1
+        or result.get("classification") != "replay_success"
+        or result.get("overlay_sha256") != compact["overlay_sha256"]
+        or result.get("receipt_sha256") != compact["receipt_sha256"]
+        or result.get("trace_sha256") != compact["trace_sha256"]
+        or result.get("cost_proof_inputs") != proof
+        or _digest(value["overlay"]) != compact["overlay_sha256"]
+        or _digest(value["result"]) != compact["result_sha256"]
+        or _SHA.fullmatch(
+            proof_authority.get("authority_sha256") or ""
+        ) is None
+        or _SHA.fullmatch(
+            proof_authority.get("toolchain_sha256") or ""
+        ) is None
+        or _SHA.fullmatch(
+            proof_authority.get("adapter_proof_sha256") or ""
+        ) is None
+        or _SHA.fullmatch(
+            proof_authority.get("executor_runtime_sha256") or ""
+        ) is None
+    ):
+        raise ValueError(
+            "historical publication scenario input binding differs"
+        )
+    transaction, receipt = _historical_publication_transaction_and_receipt(
+        raw=value, compact=compact
+    )
+    source_members = _historical_publication_source_members(
+        raw=value, descriptor_bytes=descriptor_bytes
+    )
+    economics = compact["economics_scenarios"]
+    return {
+        "schema": "historical_foundry_replay_publication_scenario_facts/v1",
+        "scenario_key": compact["scenario_key"],
+        "opportunity_id": opportunity["opportunity_id"],
+        "route_id": compact["route_id"],
+        "direction": direction,
+        "requested_notional_usd": notional,
+        "receipt_status": compact["receipt_status"],
+        "opportunity_class": opportunity["opportunity_class"],
+        "core_manifest_sha256": compact["core_manifest_sha256"],
+        "policy_sha256": proof_authority["policy_sha256"],
+        "authority_sha256": proof_authority["authority_sha256"],
+        "toolchain_sha256": proof_authority["toolchain_sha256"],
+        "source_descriptor_set_sha256": value[
+            "source_descriptor_set_sha256"
+        ],
+        "proof_inputs_hash": compact["proof_inputs_hash"],
+        "selected_block": _historical_publication_selected_block(value),
+        "overlay_sha256": compact["overlay_sha256"],
+        "receipt_sha256": compact["receipt_sha256"],
+        "trace_sha256": compact["trace_sha256"],
+        "result_sha256": compact["result_sha256"],
+        "executor_creation_sha256": proof_authority[
+            "adapter_proof_sha256"
+        ],
+        "executor_runtime_sha256": proof_authority[
+            "executor_runtime_sha256"
+        ],
+        "calldata_sha256": transaction["calldata_sha256"],
+        "transaction": transaction,
+        "receipt": receipt,
+        "balances": _historical_publication_balances(
+            raw=value, compact=compact
+        ),
+        "gross_edge_weth_raw": compact["gross_edge_weth_raw"],
+        "gross_buy_cost_usd": opportunity["gross_buy_cost_usd"],
+        "gross_sell_proceeds_usd": opportunity[
+            "gross_sell_proceeds_usd"
+        ],
+        "gross_edge_usd": opportunity["gross_edge_usd"],
+        "research_net_edge_usd": opportunity["research_net_edge_usd"],
+        "baseline": economics[0],
+        "stress_25": economics[1],
+        "stress_50": economics[2],
+        "stress_robust": (
+            economics[1]["positive_research_net"]
+            and economics[2]["positive_research_net"]
+        ),
+        "cost_component_set_sha256": opportunity[
+            "cost_component_set_sha256"
+        ],
+        "source_members": source_members,
+    }
+
+
+def build_historical_replay_publication_facts(
+    canonical_scenario_projection_bytes: Tuple[bytes, ...],
+    canonical_scenario_input_bytes: Tuple[bytes, ...],
+    canonical_source_descriptor_bytes: Tuple[bytes, ...],
+) -> bytes:
+    """Build pure writer facts from compact, sealed-input, and source bytes."""
+    compact_evidence = _decode_historical_publication_bytes(
+        build_historical_replay_evidence(
+            canonical_scenario_projection_bytes
+        ),
+        label="historical compact replay evidence",
+        expected_type=dict,
+    )
+    if (
+        type(canonical_scenario_input_bytes) is not tuple
+        or len(canonical_scenario_input_bytes) != 10
+        or any(type(value) is not bytes for value in canonical_scenario_input_bytes)
+        or type(canonical_source_descriptor_bytes) is not tuple
+        or len(canonical_source_descriptor_bytes) != 10
+        or any(
+            type(value) is not bytes
+            for value in canonical_source_descriptor_bytes
+        )
+    ):
+        raise ValueError(
+            "historical publication fact inventory is not exact"
+        )
+    rows = []
+    for compact_bytes, input_bytes, descriptor_bytes in zip(
+        canonical_scenario_projection_bytes,
+        canonical_scenario_input_bytes,
+        canonical_source_descriptor_bytes,
+    ):
+        compact = _decode_historical_publication_bytes(
+            compact_bytes,
+            label="historical compact scenario",
+            expected_type=dict,
+        )
+        raw = _decode_historical_publication_bytes(
+            input_bytes,
+            label="historical publication scenario input",
+            expected_type=dict,
+        )
+        try:
+            rows.append(_historical_publication_scenario_facts(
+                compact=compact, raw=raw,
+                descriptor_bytes=descriptor_bytes,
+            ))
+        except (AttributeError, KeyError, TypeError) as error:
+            raise ValueError(
+                "historical publication scenario facts are invalid"
+            ) from error
+    rows.sort(key=lambda row: (
+        row["route_id"], row["requested_notional_usd"]
+    ))
+    if (
+        len({row["scenario_key"] for row in rows}) != 10
+        or len({row["opportunity_id"] for row in rows}) != 10
+        or len({
+            _canonical_bytes(row["selected_block"]) for row in rows
+        }) != 1
+        or {
+            row["core_manifest_sha256"] for row in rows
+        } != {compact_evidence["core_manifest_sha256"]}
+    ):
+        raise ValueError("historical publication scenario set differs")
+    overlay_inventory = [
+        {
+            "scenario_key": row["scenario_key"],
+            "overlay_sha256": row["overlay_sha256"],
+        }
+        for row in rows
+    ]
+    result = {
+        "schema": "historical_foundry_replay_publication_facts/v1",
+        "scenario_count": 10,
+        "core_manifest_sha256": compact_evidence[
+            "core_manifest_sha256"
+        ],
+        "overlay_set_sha256": _typed_digest(
+            "historical_foundry_overlay_set/v1", overlay_inventory
+        ),
+        "scenario_set_sha256": _typed_digest(
+            "historical_foundry_scenario_set/v1", rows
+        ),
+        "scenarios": rows,
+    }
+    return _canonical_bytes(result)

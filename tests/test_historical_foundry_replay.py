@@ -2108,6 +2108,299 @@ if getattr(
         finally:
             self._close_stage(run, finalized, stage, context)
 
+    def test_publication_facts_bind_ordered_overlays_and_raw_sources(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        build_facts = replay.build_historical_replay_publication_facts
+        run, finalized, stage, context = self._open_stage()
+        try:
+            compact_bytes = []
+            input_bytes = []
+            descriptor_bytes = []
+            raw_inputs = []
+            compact_values = []
+            descriptor_values = []
+            for direction in (
+                "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+            ):
+                for notional in (1000, 5000, 10000, 50000, 100000):
+                    scenario_key = "2:{}:{}".format(direction, notional)
+                    material = publication._historical_scenario_material(
+                        context=context, scenario_key=scenario_key,
+                        validate_context=True,
+                    )
+                    inputs = (
+                        publication._issue_validated_historical_scenario_inputs(
+                            context=context, scenario_key=scenario_key,
+                        )
+                    )
+                    self.assertEqual(
+                        inputs.canonical_projection_bytes,
+                        material["canonical_projection_bytes"],
+                    )
+                    compact = replay.build_historical_scenario_projection(
+                        inputs
+                    )
+                    descriptors = canonical_bytes(material["descriptor_set"])
+                    compact_bytes.append(compact)
+                    input_bytes.append(inputs.canonical_projection_bytes)
+                    descriptor_bytes.append(descriptors)
+                    raw_inputs.append(json.loads(inputs.canonical_projection_bytes))
+                    compact_values.append(json.loads(compact))
+                    descriptor_values.append(json.loads(descriptors))
+
+            payload_bytes = build_facts(
+                tuple(compact_bytes), tuple(input_bytes),
+                tuple(descriptor_bytes),
+            )
+            payload = json.loads(payload_bytes)
+            self.assertEqual(canonical_bytes(payload), payload_bytes)
+            self.assertEqual(set(payload), {
+                "schema", "scenario_count", "core_manifest_sha256",
+                "overlay_set_sha256", "scenario_set_sha256", "scenarios",
+            })
+            self.assertEqual(
+                payload["schema"],
+                "historical_foundry_replay_publication_facts/v1",
+            )
+            self.assertEqual(payload["scenario_count"], 10)
+            self.assertEqual(
+                payload["core_manifest_sha256"],
+                context.identity_projection()["core_manifest_sha256"],
+            )
+            expected_row_fields = {
+                "schema", "scenario_key", "opportunity_id", "route_id",
+                "direction", "requested_notional_usd", "receipt_status",
+                "opportunity_class", "core_manifest_sha256",
+                "policy_sha256", "authority_sha256", "toolchain_sha256",
+                "source_descriptor_set_sha256", "proof_inputs_hash",
+                "selected_block", "overlay_sha256", "receipt_sha256",
+                "trace_sha256", "result_sha256",
+                "executor_creation_sha256", "executor_runtime_sha256",
+                "calldata_sha256", "transaction", "receipt", "balances",
+                "gross_edge_weth_raw", "gross_buy_cost_usd",
+                "gross_sell_proceeds_usd", "gross_edge_usd",
+                "research_net_edge_usd", "baseline", "stress_25",
+                "stress_50", "stress_robust",
+                "cost_component_set_sha256", "source_members",
+            }
+            expected_selected_block_fields = {
+                "number", "hash", "parent_hash", "state_root", "timestamp",
+                "gas_limit", "gas_used", "base_fee_per_gas",
+                "synthetic_child_number", "synthetic_child_timestamp",
+                "synthetic_child_base_fee_per_gas",
+                "p50_priority_fee_per_gas", "p90_priority_fee_per_gas",
+                "eth_usd",
+            }
+            expected_eth_usd_fields = {
+                "proxy_address", "round_id", "phase_id", "answer",
+                "decimals", "started_at", "updated_at", "answered_in_round",
+                "valid_until", "block_number", "block_hash",
+            }
+            expected_transaction_fields = {
+                "sender", "executor", "type", "nonce", "gas_limit",
+                "access_list", "max_priority_fee_per_gas",
+                "max_fee_per_gas", "calldata", "calldata_sha256",
+                "transaction_hash", "transaction_index",
+            }
+            expected_receipt_fields = {
+                "status", "block_number", "block_hash", "transaction_index",
+                "gas_used", "effective_gas_price", "max_fee_per_gas",
+                "max_priority_fee_per_gas", "transaction_hash",
+                "projection_sha256",
+            }
+            expected_balance_fields = {
+                "initial_weth_raw", "initial_uni_raw", "input_weth_raw",
+                "intermediate_uni_raw", "final_weth_raw", "final_uni_raw",
+                "gross_weth_delta_raw",
+            }
+            expected_rows = sorted(
+                zip(compact_values, raw_inputs, descriptor_values),
+                key=lambda item: (
+                    item[0]["route_id"],
+                    item[0]["requested_notional_usd"],
+                ),
+            )
+            self.assertEqual(
+                [row["scenario_key"] for row in payload["scenarios"]],
+                [item[0]["scenario_key"] for item in expected_rows],
+            )
+            for row, (compact, raw, descriptors) in zip(
+                payload["scenarios"], expected_rows
+            ):
+                with self.subTest(scenario_key=row["scenario_key"]):
+                    self.assertEqual(set(row), expected_row_fields)
+                    self.assertEqual(
+                        set(row["selected_block"]),
+                        expected_selected_block_fields,
+                    )
+                    self.assertEqual(
+                        set(row["selected_block"]["eth_usd"]),
+                        expected_eth_usd_fields,
+                    )
+                    self.assertEqual(
+                        set(row["transaction"]), expected_transaction_fields
+                    )
+                    self.assertEqual(set(row["receipt"]), expected_receipt_fields)
+                    self.assertEqual(set(row["balances"]), expected_balance_fields)
+                    self.assertEqual(
+                        row["opportunity_id"],
+                        compact["opportunity"]["opportunity_id"],
+                    )
+                    self.assertEqual(
+                        row["source_descriptor_set_sha256"],
+                        raw["source_descriptor_set_sha256"],
+                    )
+                    expected_source_paths = {
+                        "overlay": "foundry/2/{}/overlay.json".format(
+                            row["scenario_key"]
+                        ),
+                        "receipt": "foundry/2/{}/receipt.json".format(
+                            row["scenario_key"]
+                        ),
+                        "trace": "foundry/2/{}/trace.json.gz".format(
+                            row["scenario_key"]
+                        ),
+                        "result": "foundry/2/{}/result.json".format(
+                            row["scenario_key"]
+                        ),
+                    }
+                    self.assertEqual(
+                        [member["role"] for member in row["source_members"]],
+                        ["overlay", "receipt", "trace", "result"],
+                    )
+                    descriptor_by_path = {
+                        item["path"]: item for item in descriptors
+                    }
+                    for member in row["source_members"]:
+                        self.assertEqual(
+                            set(member),
+                            {"role", "path", "byte_count", "sha256"},
+                        )
+                        self.assertEqual(
+                            member["path"], expected_source_paths[member["role"]]
+                        )
+                        self.assertEqual(
+                            {
+                                key: member[key]
+                                for key in ("path", "byte_count", "sha256")
+                            },
+                            descriptor_by_path[member["path"]],
+                        )
+                    self.assertEqual(
+                        [member["sha256"] for member in row["source_members"]],
+                        [
+                            compact["overlay_sha256"],
+                            compact["receipt_sha256"],
+                            compact["trace_sha256"],
+                            compact["result_sha256"],
+                        ],
+                    )
+                    self.assertEqual(row["baseline"], compact["economics_scenarios"][0])
+                    self.assertEqual(row["stress_25"], compact["economics_scenarios"][1])
+                    self.assertEqual(row["stress_50"], compact["economics_scenarios"][2])
+                    self.assertIs(
+                        row["stress_robust"],
+                        compact["economics_scenarios"][1]["positive_research_net"]
+                        and compact["economics_scenarios"][2][
+                            "positive_research_net"
+                        ],
+                    )
+            expected_overlay_inventory = [
+                {
+                    "scenario_key": row["scenario_key"],
+                    "overlay_sha256": row["overlay_sha256"],
+                }
+                for row in payload["scenarios"]
+            ]
+            self.assertEqual(
+                payload["overlay_set_sha256"],
+                typed_digest(
+                    "historical_foundry_overlay_set/v1",
+                    expected_overlay_inventory,
+                ),
+            )
+            self.assertEqual(
+                payload["scenario_set_sha256"],
+                typed_digest(
+                    "historical_foundry_scenario_set/v1",
+                    payload["scenarios"],
+                ),
+            )
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_publication_facts_reject_cross_block_and_rebound_source_size(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            compact_bytes = []
+            input_values = []
+            descriptor_values = []
+            for direction in (
+                "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+            ):
+                for notional in (1000, 5000, 10000, 50000, 100000):
+                    scenario_key = "2:{}:{}".format(direction, notional)
+                    material = publication._historical_scenario_material(
+                        context=context, scenario_key=scenario_key,
+                        validate_context=True,
+                    )
+                    inputs = (
+                        publication._issue_validated_historical_scenario_inputs(
+                            context=context, scenario_key=scenario_key,
+                        )
+                    )
+                    compact_bytes.append(
+                        replay.build_historical_scenario_projection(inputs)
+                    )
+                    input_values.append(json.loads(
+                        material["canonical_projection_bytes"]
+                    ))
+                    descriptor_values.append(copy.deepcopy(
+                        material["descriptor_set"]
+                    ))
+
+            cross_block_inputs = copy.deepcopy(input_values)
+            cross_block_inputs[1]["selected_block"]["parent_hash"] = (
+                "0x" + "f" * 64
+            )
+            with self.assertRaises(ValueError):
+                replay.build_historical_replay_publication_facts(
+                    tuple(compact_bytes),
+                    tuple(canonical_bytes(value) for value in cross_block_inputs),
+                    tuple(
+                        canonical_bytes(value) for value in descriptor_values
+                    ),
+                )
+
+            rebound_inputs = copy.deepcopy(input_values)
+            rebound_descriptors = copy.deepcopy(descriptor_values)
+            overlay_path = "foundry/2/{}/overlay.json".format(
+                rebound_inputs[0]["scenario_key"]
+            )
+            overlay_descriptor = next(
+                row for row in rebound_descriptors[0]
+                if row["path"] == overlay_path
+            )
+            overlay_descriptor["byte_count"] += 1
+            rebound_inputs[0]["source_descriptor_set_sha256"] = digest(
+                rebound_descriptors[0]
+            )
+            with self.assertRaises(ValueError):
+                replay.build_historical_replay_publication_facts(
+                    tuple(compact_bytes),
+                    tuple(canonical_bytes(value) for value in rebound_inputs),
+                    tuple(
+                        canonical_bytes(value) for value in rebound_descriptors
+                    ),
+                )
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
     def test_publication_rejects_transplanted_scenario_capability_before_pure_bridge(self):
         import scripts.historical_route_publication as publication
 
@@ -2258,6 +2551,30 @@ if getattr(
                 replay.build_historical_scenario_projection(item)
                 for item in all_inputs
             )
+            scenario_keys = tuple(
+                "2:{}:{}".format(direction, notional)
+                for direction in (
+                    "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+                )
+                for notional in (1000, 5000, 10000, 50000, 100000)
+            )
+            materials = tuple(
+                publication._historical_scenario_material(
+                    context=context, scenario_key=scenario_key,
+                    validate_context=True,
+                )
+                for scenario_key in scenario_keys
+            )
+            canonical_inputs = tuple(
+                item.canonical_projection_bytes for item in all_inputs
+            )
+            canonical_descriptors = tuple(
+                canonical_bytes(item["descriptor_set"])
+                for item in materials
+            )
+            facts = replay.build_historical_replay_publication_facts(
+                projections, canonical_inputs, canonical_descriptors
+            )
             projection = projections[0]
             denied = AssertionError("pure historical bridge attempted I/O")
             with ExitStack() as stack:
@@ -2276,6 +2593,13 @@ if getattr(
                         projection,
                     )
                     replay.build_historical_replay_evidence(projections)
+                    self.assertEqual(
+                        replay.build_historical_replay_publication_facts(
+                            projections, canonical_inputs,
+                            canonical_descriptors,
+                        ),
+                        facts,
+                    )
         finally:
             self._close_stage(run, finalized, stage, context)
 

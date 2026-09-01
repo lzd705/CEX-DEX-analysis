@@ -38,6 +38,7 @@ try:
         load_validated_fee_profile,
     )
     from scripts.execution_cost_components import (
+        COST_COMPONENT_CONTRACT_VERSION,
         COST_COMPONENT_COLUMNS,
         validate_cost_components,
     )
@@ -72,7 +73,10 @@ try:
         build_route_opportunity,
         route_opportunity_id,
     )
-    from scripts.route_cost_topology import live_complete_cost_component_keys
+    from scripts.route_cost_topology import (
+        HISTORICAL_ATOMIC_COMPONENT_MATRIX,
+        live_complete_cost_component_keys,
+    )
     from scripts.route_quantity import FeeSemantics, MarketRules, QuantityQuote
     from scripts.route_shadow_inputs import (
         TYPED_SOURCE_MANIFEST_FIELDS,
@@ -104,6 +108,7 @@ except ModuleNotFoundError:
         load_validated_fee_profile,
     )
     from execution_cost_components import (  # type: ignore[no-redef]
+        COST_COMPONENT_CONTRACT_VERSION,
         COST_COMPONENT_COLUMNS,
         validate_cost_components,
     )
@@ -139,6 +144,7 @@ except ModuleNotFoundError:
         route_opportunity_id,
     )
     from route_cost_topology import (  # type: ignore[no-redef]
+        HISTORICAL_ATOMIC_COMPONENT_MATRIX,
         live_complete_cost_component_keys,
     )
     from route_quantity import (  # type: ignore[no-redef]
@@ -4947,7 +4953,11 @@ def _complete_opportunity_sort_key(row: Any) -> Tuple[str, Decimal]:
     return str(row.get("route_id")), notional
 
 
-def _validate_complete_logical_bundle(bundle: Any) -> Dict[str, Any]:
+def _validate_complete_logical_bundle_shared(
+    bundle: Any, *, historical_atomic: bool = False,
+) -> Dict[str, Any]:
+    if type(historical_atomic) is not bool:
+        raise RoutePublicationError("complete route profile is invalid")
     if not isinstance(bundle, Mapping) or set(bundle) != _COMPLETE_BUNDLE_FIELDS:
         raise RoutePublicationError("complete route bundle schema is invalid")
     normalized = _clone_json(bundle)
@@ -5036,10 +5046,20 @@ def _validate_complete_logical_bundle(bundle: Any) -> Dict[str, Any]:
         ):
             raise RoutePublicationError("complete route leg inventory is not closed")
 
-    try:
-        validate_cost_components(costs)
-    except (TypeError, ValueError) as error:
-        raise RoutePublicationError("complete cost inventory is invalid") from error
+    if historical_atomic:
+        if any(
+            not isinstance(row, Mapping)
+            or set(row) != set(COST_COMPONENT_COLUMNS)
+            for row in costs
+        ):
+            raise RoutePublicationError("complete cost inventory is invalid")
+    else:
+        try:
+            validate_cost_components(costs)
+        except (TypeError, ValueError) as error:
+            raise RoutePublicationError(
+                "complete cost inventory is invalid"
+            ) from error
     costs_by_opportunity: Dict[str, List[Dict[str, Any]]] = {}
     for row in costs:
         costs_by_opportunity.setdefault(str(row["opportunity_id"]), []).append(row)
@@ -5093,11 +5113,76 @@ def _validate_complete_logical_bundle(bundle: Any) -> Dict[str, Any]:
             raise RoutePublicationError("route opportunity identity is invalid")
         opportunity_ids.add(opportunity_id)
         component_rows = costs_by_opportunity.get(opportunity_id, [])
+        expected_component_keys = (
+            frozenset(
+                (leg, component)
+                for leg, component, _status, _embedded
+                in HISTORICAL_ATOMIC_COMPONENT_MATRIX
+            )
+            if historical_atomic
+            else live_complete_cost_component_keys(route)
+        )
+        historical_order = tuple(
+            (leg, component)
+            for leg, component, _status, _embedded
+            in HISTORICAL_ATOMIC_COMPONENT_MATRIX
+        )
+        historical_rows = (
+            sorted(
+                (dict(item) for item in component_rows),
+                key=lambda item: historical_order.index(
+                    (item["leg"], item["component_type"])
+                ),
+            )
+            if historical_atomic
+            and {
+                (item["leg"], item["component_type"])
+                for item in component_rows
+            } == expected_component_keys
+            else []
+        )
+        expected_cost_binding = (
+            _canonical_input_sha256(historical_rows)
+            if historical_atomic
+            else _canonical_cost_set_sha256(component_rows)
+        )
         if (
             {(item["leg"], item["component_type"]) for item in component_rows}
-            != live_complete_cost_component_keys(route)
+            != expected_component_keys
+            or historical_atomic and (
+                len(component_rows) != len(HISTORICAL_ATOMIC_COMPONENT_MATRIX)
+                or any(
+                    type(item["embedded_in_leg_quote"]) is not bool
+                    for item in historical_rows
+                )
+                or tuple(
+                    (
+                        item["leg"], item["component_type"],
+                        item["value_status"],
+                        item["embedded_in_leg_quote"],
+                    )
+                    for item in historical_rows
+                ) != HISTORICAL_ATOMIC_COMPONENT_MATRIX
+                or any(
+                    item.get("contract_version")
+                    != COST_COMPONENT_CONTRACT_VERSION
+                    or item.get("cohort_id") != row["cohort_id"]
+                    or item.get("opportunity_id")
+                    != row["opportunity_id"]
+                    or item.get("requested_notional_usd")
+                    != row["requested_notional_usd"]
+                    or item.get("target_token_quantity")
+                    != row["target_token_quantity"]
+                    or item.get("market_id") != (
+                        row["buy_market_id"] if item["leg"] == "buy"
+                        else row["sell_market_id"]
+                        if item["leg"] == "sell" else ""
+                    )
+                    for item in historical_rows
+                )
+            )
             or row.get("cost_component_set_sha256")
-            != _canonical_cost_set_sha256(component_rows)
+            != expected_cost_binding
         ):
             raise RoutePublicationError("route opportunity cost binding is invalid")
         if row.get("strict_eligible"):
@@ -5151,6 +5236,11 @@ def _validate_complete_logical_bundle(bundle: Any) -> Dict[str, Any]:
     normalized["cost_components"] = costs
     normalized["opportunities"] = opportunities
     return normalized
+
+
+def _validate_complete_logical_bundle(bundle: Any) -> Dict[str, Any]:
+    """Validate the unchanged live complete-bundle logical contract."""
+    return _validate_complete_logical_bundle_shared(bundle)
 
 
 def _read_complete_sqlite(
