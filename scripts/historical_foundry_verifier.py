@@ -118,7 +118,7 @@ def _write_all(descriptor, value):
         offset += written
 
 
-def _read_report_at(directory_fd, filename):
+def _open_and_read_report_at(directory_fd, filename):
     descriptor, before = _route_publication._open_regular_file_at(
         directory_fd, filename, label="historical verification report",
     )
@@ -127,27 +127,36 @@ def _read_report_at(directory_fd, filename):
             descriptor, before, limit=_MAX_REPORT_BYTES,
             label="historical verification report",
         )
-    finally:
-        os.close(descriptor)
-    try:
         current = os.stat(
             filename, dir_fd=directory_fd, follow_symlinks=False,
         )
-    except OSError as error:
-        raise _historical_bundle_invalid(error)
-    if (
-        not stat.S_ISREG(current.st_mode)
-        or current.st_nlink != 1
-        or current.st_uid != os.geteuid()
-        or stat.S_IMODE(current.st_mode) != 0o600
-        or after.st_uid != os.geteuid()
-        or stat.S_IMODE(after.st_mode) != 0o600
-        or not _same_inode(after, current)
-        or _route_publication._stable_file_metadata(after)
-        != _route_publication._stable_file_metadata(current)
-    ):
-        raise _historical_bundle_invalid()
-    return value, digest, after
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_uid != os.geteuid()
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or after.st_uid != os.geteuid()
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or not _same_inode(after, current)
+            or _route_publication._stable_file_metadata(after)
+            != _route_publication._stable_file_metadata(current)
+            or os.get_inheritable(descriptor)
+        ):
+            raise _historical_bundle_invalid()
+        return value, digest, after, descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_report_at(directory_fd, filename):
+    value, digest, details, descriptor = _open_and_read_report_at(
+        directory_fd, filename
+    )
+    try:
+        return value, digest, details
+    finally:
+        os.close(descriptor)
 
 
 def _unlink_created_report_if_owned(directory_fd, filename, opened):
@@ -174,10 +183,115 @@ class VerificationReportInstallResult:
     disposition: str
 
 
-def install_historical_verification_report(
+class _HeldVerificationReportInstall:
+    __slots__ = (
+        "root", "root_fd", "root_details", "by_sha_fd",
+        "by_sha_details", "report_fd", "report_details", "filename",
+        "digest", "size", "locked", "closed",
+    )
+
+    def __init__(
+        self, *, root, root_fd, root_details, by_sha_fd, by_sha_details,
+        report_fd, report_details, filename, digest, size,
+    ):
+        self.root = root
+        self.root_fd = root_fd
+        self.root_details = root_details
+        self.by_sha_fd = by_sha_fd
+        self.by_sha_details = by_sha_details
+        self.report_fd = report_fd
+        self.report_details = report_details
+        self.filename = filename
+        self.digest = digest
+        self.size = size
+        self.locked = True
+        self.closed = False
+
+    def reread_unchanged(self, expected):
+        if self.closed or type(expected) is not bytes:
+            raise _historical_bundle_invalid()
+        before = os.fstat(self.report_fd)
+        if (
+            _route_publication._stable_file_metadata(before)
+            != _route_publication._stable_file_metadata(
+                self.report_details
+            )
+            or os.get_inheritable(self.report_fd)
+        ):
+            raise _historical_bundle_invalid()
+        os.lseek(self.report_fd, 0, os.SEEK_SET)
+        actual, digest, after = _route_publication._read_bounded_open_file(
+            self.report_fd, before, limit=_MAX_REPORT_BYTES,
+            label="historical verification report",
+        )
+        current = os.stat(
+            self.filename, dir_fd=self.by_sha_fd,
+            follow_symlinks=False,
+        )
+        if (
+            actual != expected
+            or digest != self.digest
+            or len(actual) != self.size
+            or self.filename != digest + ".json"
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or after.st_uid != os.geteuid()
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or _route_publication._stable_file_metadata(after)
+            != _route_publication._stable_file_metadata(
+                self.report_details
+            )
+            or _route_publication._stable_file_metadata(current)
+            != _route_publication._stable_file_metadata(
+                self.report_details
+            )
+        ):
+            raise _historical_bundle_invalid()
+        _route_publication._verify_directory_entry_snapshot(
+            self.root_fd, "by-sha256", self.by_sha_details,
+            "historical verification by-sha256",
+        )
+        _route_publication._verify_open_path_snapshot(
+            self.root, self.root_details,
+            "historical verification root",
+        )
+
+    def close(self):
+        if self.closed:
+            return None
+        self.closed = True
+        failure = None
+        if self.locked:
+            try:
+                fcntl.flock(self.by_sha_fd, fcntl.LOCK_UN)
+            except OSError as error:
+                failure = error
+            self.locked = False
+        for descriptor in (
+            self.report_fd, self.by_sha_fd, self.root_fd,
+        ):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            raise _historical_bundle_invalid(failure) from failure
+        return None
+
+
+def _reread_held_verification_report(held, expected):
+    try:
+        held.reread_unchanged(expected)
+    except HistoricalVerificationError:
+        raise
+    except Exception as error:
+        raise _historical_bundle_invalid(error) from error
+
+
+def _install_historical_verification_report_held(
     *, verification_root: Path, report_bytes: bytes,
-) -> VerificationReportInstallResult:
-    """Install one content-addressed report without replacing any object."""
+):
     if (
         not isinstance(verification_root, Path)
         or type(report_bytes) is not bytes
@@ -188,10 +302,11 @@ def install_historical_verification_report(
         raise _historical_bundle_invalid()
     digest = _sha256(report_bytes)
     filename = digest + ".json"
-    root_fd = by_sha_fd = descriptor = None
+    root_fd = by_sha_fd = descriptor = report_fd = None
     created_details = None
     created = False
     locked = False
+    transferred = False
     try:
         root = _route_publication._ensure_real_directory(verification_root)
         root, root_fd, root_details = (
@@ -202,6 +317,7 @@ def install_historical_verification_report(
         by_sha_fd, by_sha_details = _route_publication._ensure_directory_at(
             root_fd, "by-sha256", "historical verification by-sha256"
         )
+        os.fsync(root_fd)
         fcntl.flock(by_sha_fd, fcntl.LOCK_EX)
         locked = True
         flags = (
@@ -274,7 +390,9 @@ def install_historical_verification_report(
             os.fsync(by_sha_fd)
             disposition = "created"
 
-        actual, physical_sha256, read_details = _read_report_at(
+        (
+            actual, physical_sha256, read_details, report_fd,
+        ) = _open_and_read_report_at(
             by_sha_fd, filename
         )
         if (
@@ -285,17 +403,27 @@ def install_historical_verification_report(
             or created and not _same_inode(created_details, read_details)
         ):
             raise _historical_bundle_invalid()
-        _route_publication._verify_directory_entry(
+        root_details = os.fstat(root_fd)
+        by_sha_details = os.fstat(by_sha_fd)
+        _route_publication._verify_directory_entry_snapshot(
             root_fd, "by-sha256", by_sha_details,
             "historical verification by-sha256",
         )
-        _route_publication._verify_open_path_identity(
+        _route_publication._verify_open_path_snapshot(
             root, root_details, "historical verification root"
         )
-        return VerificationReportInstallResult(
+        result = VerificationReportInstallResult(
             path=root / "by-sha256" / filename,
             sha256=digest, size=len(actual), disposition=disposition,
         )
+        held = _HeldVerificationReportInstall(
+            root=root, root_fd=root_fd, root_details=root_details,
+            by_sha_fd=by_sha_fd, by_sha_details=by_sha_details,
+            report_fd=report_fd, report_details=read_details,
+            filename=filename, digest=digest, size=len(actual),
+        )
+        transferred = True
+        return result, held
     except BaseException as error:
         if created and by_sha_fd is not None and created_details is not None:
             _unlink_created_report_if_owned(
@@ -307,17 +435,42 @@ def install_historical_verification_report(
             raise
         raise _historical_bundle_invalid(error) from error
     finally:
-        if locked and by_sha_fd is not None:
+        if not transferred and locked and by_sha_fd is not None:
             try:
                 fcntl.flock(by_sha_fd, fcntl.LOCK_UN)
             except OSError:
                 pass
-        for value in (descriptor, by_sha_fd, root_fd):
+        for value in (descriptor, report_fd, by_sha_fd, root_fd):
+            if transferred and value in (report_fd, by_sha_fd, root_fd):
+                continue
             if value is not None:
                 try:
                     os.close(value)
                 except OSError:
                     pass
+
+
+def install_historical_verification_report(
+    *, verification_root: Path, report_bytes: bytes,
+) -> VerificationReportInstallResult:
+    """Install one content-addressed report without replacing any object."""
+    result, held = _install_historical_verification_report_held(
+        verification_root=verification_root, report_bytes=report_bytes,
+    )
+    failure = None
+    try:
+        _reread_held_verification_report(held, report_bytes)
+        return result
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            held.close()
+        except Exception as close_error:
+            if failure is None:
+                raise
+            raise failure from close_error
 
 
 def historical_replay_pointer_core(
@@ -569,10 +722,11 @@ del _initialize_historical_verification_subject
 
 def _initialize_connected_historical_verification_engine():
     engine = None
+    engine_kind = None
 
     def bind(value):
-        """One-shot private bind used by Task 8 or the local fixture harness."""
-        nonlocal engine
+        """One-shot production bind used only by the Task-8 entrypoint."""
+        nonlocal engine, engine_kind
         module_name = getattr(value, "__module__", None)
         module = sys.modules.get(module_name)
         namespace = getattr(value, "__globals__", None)
@@ -582,24 +736,8 @@ def _initialize_connected_historical_verification_engine():
             expected_file = Path(__file__).with_name(
                 "run_historical_foundry_replay.py"
             ).resolve()
-            trusted_test_code = None
-        elif module_name == "tests.test_historical_foundry_verifier":
-            expected_file = Path(__file__).parents[1] / "tests" / (
-                "test_historical_foundry_verifier.py"
-            )
-            test_class = getattr(
-                module, "HistoricalConnectedVerificationTests", None
-            )
-            descriptor = vars(test_class).get("setUpClass") if (
-                isinstance(test_class, type)
-            ) else None
-            trusted_test_code = (
-                descriptor.__func__.__code__
-                if isinstance(descriptor, classmethod) else None
-            )
         else:
             expected_file = None
-            trusted_test_code = None
         try:
             caller = sys._getframe(1)
             loaded_file = Path(loader.get_filename(module_name)).resolve()
@@ -611,13 +749,9 @@ def _initialize_connected_historical_verification_engine():
         authentic_call_edge = (
             caller is not None
             and caller.f_globals is namespace
-            and (
-                module_name == "scripts.run_historical_foundry_replay"
-                and caller.f_code.co_name == "<module>"
-                and caller.f_code == trusted_module_code
-                or module_name == "tests.test_historical_foundry_verifier"
-                and caller.f_code == trusted_test_code
-            )
+            and module_name == "scripts.run_historical_foundry_replay"
+            and caller.f_code.co_name == "<module>"
+            and caller.f_code == trusted_module_code
         )
         if (
             engine is not None
@@ -637,6 +771,7 @@ def _initialize_connected_historical_verification_engine():
                 "historical connected engine binder is invalid"
             )
         engine = value
+        engine_kind = "production_connected"
         globals().pop(
             "_bind_connected_historical_verification_engine", None
         )
@@ -646,7 +781,7 @@ def _initialize_connected_historical_verification_engine():
             raise HistoricalVerificationError(
                 "historical connected authority is unavailable"
             )
-        return engine(request)
+        return engine_kind, engine(request)
 
     return bind, invoke
 
@@ -739,6 +874,10 @@ def _typed_resolution(
     }
 
 
+def _close_connected_source(source):
+    source.close()
+
+
 def _build_retained_connected_projection(material):
     import scripts.historical_foundry_replay as replay
     import scripts.historical_foundry_storage as storage
@@ -788,6 +927,7 @@ def _build_retained_connected_projection(material):
         )
     except Exception as error:
         raise _historical_bundle_invalid(error)
+    failure = None
     try:
         config = load_historical_foundry_config_set()
         evidence, _source_identity_sha256 = (
@@ -979,15 +1119,22 @@ def _build_retained_connected_projection(material):
         if view is not None:
             view.reread_unchanged()
         return projection
-    except HistoricalVerificationError:
+    except HistoricalVerificationError as error:
+        failure = error
         raise
     except Exception as error:
-        raise _historical_bundle_invalid(error) from error
+        failure = _historical_bundle_invalid(error)
+        raise failure from error
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         try:
-            source.close()
-        except Exception:
-            pass
+            _close_connected_source(source)
+        except Exception as close_error:
+            if failure is None:
+                raise _historical_bundle_invalid(close_error) from close_error
+            raise failure from close_error
 
 
 def _connected_request_for_subject(subject):
@@ -1119,7 +1266,11 @@ def _verification_report(observation):
     projection = observation["projection"]
     base = {
         "schema": _REPORT_SCHEMA,
-        "status": "verified",
+        "status": (
+            "verified"
+            if observation["evidence_mode"] == "production_connected"
+            else "structurally_validated"
+        ),
         "evidence_mode": observation["evidence_mode"],
         "pointer_core_sha256": projection["pointer_core_sha256"],
         "replay_id": projection["replay_id"],
@@ -1189,28 +1340,45 @@ def _verification_report(observation):
     return {**base, "verification_id": verification_id}
 
 
-def _reread_install_result(result, expected):
-    parent, descriptor, details = _route_publication._open_verified_directory(
-        result.path.parent, "historical verification by-sha256"
-    )
+def _validate_retained_historical_verification_report(
+    *, report_bytes, pointer_core,
+):
+    if type(report_bytes) is not bytes or not isinstance(pointer_core, Mapping):
+        raise _historical_bundle_invalid()
     try:
-        actual, digest, _file_details = _read_report_at(
-            descriptor, result.path.name
-        )
-        _route_publication._verify_open_path_identity(
-            parent, details, "historical verification by-sha256"
-        )
-    except Exception as error:
+        report = json.loads(report_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise _historical_bundle_invalid(error)
-    finally:
-        os.close(descriptor)
+    base = dict(report) if type(report) is dict else None
+    verification_id = (
+        base.pop("verification_id", None) if base is not None else None
+    )
+    pointer = _plain(pointer_core)
     if (
-        actual != expected
-        or digest != result.sha256
-        or len(actual) != result.size
-        or result.path.name != digest + ".json"
+        base is None
+        or _canonical_bytes(report) != report_bytes
+        or report.get("schema") != _REPORT_SCHEMA
+        or report.get("status") != "verified"
+        or report.get("evidence_mode") != "production_connected"
+        or verification_id
+        != "verification:" + _sha256(_canonical_bytes(base))
+        or report.get("pointer_core_sha256")
+        != _sha256(_canonical_bytes(pointer))
+        or report.get("replay_id") != pointer.get("replay_id")
+        or report.get("route_cohort_id") != pointer.get("route_cohort_id")
+        or report.get("manifest_sha256")
+        != pointer.get("manifest_sha256")
     ):
         raise _historical_bundle_invalid()
+    return MappingProxyType(report)
+
+
+def _require_historical_verification_mode(mode):
+    if type(mode) is not str or mode not in ("staged", "publish", "audit"):
+        raise HistoricalVerificationError(
+            "historical verification mode is invalid"
+        )
+    return mode
 
 
 def run_connected_historical_verification(
@@ -1218,21 +1386,35 @@ def run_connected_historical_verification(
 ) -> Mapping[str, Any]:
     """Verify a sealed subject without selecting a block or moving a pointer."""
     record = _require_historical_verification_subject(subject)
-    if mode not in ("staged", "publish", "audit"):
-        raise HistoricalVerificationError(
-            "historical verification mode is invalid"
-        )
+    mode = _require_historical_verification_mode(mode)
     subject.reread_unchanged()
     request = _connected_request_for_subject(subject)
     try:
-        observation = _invoke_connected_historical_verification_engine(
+        engine_result = _invoke_connected_historical_verification_engine(
             request
         )
     except Exception as error:
         raise _historical_bundle_invalid(error) from error
+    if (
+        type(engine_result) is not tuple
+        or len(engine_result) != 2
+        or engine_result[0] not in (
+            "offline_test_fixture", "production_connected",
+        )
+        or type(engine_result[1]) is not dict
+        or engine_result[1].get("evidence_mode") != engine_result[0]
+    ):
+        raise _historical_bundle_invalid()
+    engine_kind, observation = engine_result
     observation = _validate_connected_historical_observation(
         subject=subject, observation=observation,
     )
+    if (
+        engine_kind != observation["evidence_mode"]
+        or mode in ("publish", "audit")
+        and engine_kind != "production_connected"
+    ):
+        raise _historical_bundle_invalid()
     report = _verification_report(observation)
     report_bytes = _canonical_bytes(report)
     try:
@@ -1241,37 +1423,64 @@ def run_connected_historical_verification(
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise _historical_bundle_invalid(error)
     report_sha256 = _sha256(report_bytes)
-    install_result = None
-    if mode == "publish":
-        verification_root = (
-            record["material"]["data_dir"] / "routes" / "historical"
-            / "verifications"
-        )
-        install_result = install_historical_verification_report(
-            verification_root=verification_root,
+    if engine_kind == "production_connected":
+        _validate_retained_historical_verification_report(
             report_bytes=report_bytes,
+            pointer_core=record["material"]["pointer_core"],
         )
-        _reread_install_result(install_result, report_bytes)
+    install_result = None
+    held_install = None
+    failure = None
+    try:
+        if mode == "publish":
+            verification_root = (
+                record["material"]["data_dir"] / "routes" / "historical"
+                / "verifications"
+            )
+            install_result, held_install = (
+                _install_historical_verification_report_held(
+                    verification_root=verification_root,
+                    report_bytes=report_bytes,
+                )
+            )
+            _reread_held_verification_report(
+                held_install, report_bytes
+            )
+            subject.reread_unchanged()
+        pointer_core = _plain(record["material"]["pointer_core"])
+        final_pointer = {
+            **pointer_core,
+            "verification_report_sha256": report_sha256,
+        }
+        if dict(historical_replay_pointer_core(final_pointer)) != pointer_core:
+            raise _historical_bundle_invalid()
+        final_pointer_bytes = _canonical_bytes(final_pointer)
+        if json.loads(final_pointer_bytes) != final_pointer:
+            raise _historical_bundle_invalid()
+        if held_install is not None:
+            _reread_held_verification_report(
+                held_install, report_bytes
+            )
         subject.reread_unchanged()
-    pointer_core = _plain(record["material"]["pointer_core"])
-    final_pointer = {
-        **pointer_core,
-        "verification_report_sha256": report_sha256,
-    }
-    if dict(historical_replay_pointer_core(final_pointer)) != pointer_core:
-        raise _historical_bundle_invalid()
-    final_pointer_bytes = _canonical_bytes(final_pointer)
-    if json.loads(final_pointer_bytes) != final_pointer:
-        raise _historical_bundle_invalid()
-    subject.reread_unchanged()
-    return MappingProxyType({
-        "schema": "historical_connected_verification_result/v1",
-        "mode": mode,
-        "report": _freeze(report),
-        "report_bytes": report_bytes,
-        "report_sha256": report_sha256,
-        "pointer_core": _freeze(pointer_core),
-        "final_pointer": _freeze(final_pointer),
-        "final_pointer_bytes": final_pointer_bytes,
-        "install_result": install_result,
-    })
+        return MappingProxyType({
+            "schema": "historical_connected_verification_result/v1",
+            "mode": mode,
+            "report": _freeze(report),
+            "report_bytes": report_bytes,
+            "report_sha256": report_sha256,
+            "pointer_core": _freeze(pointer_core),
+            "final_pointer": _freeze(final_pointer),
+            "final_pointer_bytes": final_pointer_bytes,
+            "install_result": install_result,
+        })
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if held_install is not None:
+            try:
+                held_install.close()
+            except Exception as close_error:
+                if failure is None:
+                    raise
+                raise failure from close_error

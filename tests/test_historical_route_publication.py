@@ -213,7 +213,7 @@ class HistoricalCorePublicationTask7SeamTests(unittest.TestCase):
 
 class HistoricalCorePublicationTests(unittest.TestCase):
     @staticmethod
-    def _open_real_task7_lease():
+    def _open_real_task7_lease(*, include_newer_mixed_rows=False):
         import scripts.historical_foundry_scan as scan
         import scripts.historical_foundry_storage as storage
         from tests.historical_foundry_task7_fixture import (
@@ -222,15 +222,62 @@ class HistoricalCorePublicationTests(unittest.TestCase):
         from tests.test_historical_foundry_scan import (
             HistoricalCandidateSelectionTests,
             HistoricalPrefilterGridTests,
+            _Task4bOfflineCapabilityFixture,
         )
 
-        fixture = HistoricalPrefilterGridTests._new_fixture(
-            pair_by_venue=historical_phase3_mainnet_pair_by_venue()
-        )
+        pair_by_venue = historical_phase3_mainnet_pair_by_venue()
+        if include_newer_mixed_rows:
+            unit = 10 ** 18
+            fixture = _Task4bOfflineCapabilityFixture(
+                split_reserve_root=False,
+                record_calls=False,
+                pair_by_venue=pair_by_venue,
+                reserve_by_target={
+                    pair_by_venue["uniswap_v2"]: {
+                        2: (2, unit),
+                        1: (4000 * unit, 1000 * unit),
+                    },
+                    pair_by_venue["sushiswap_v2"]: {
+                        2: (1, 10 * unit),
+                        1: (1000 * unit, 1000 * unit),
+                    },
+                },
+            )
+        else:
+            fixture = HistoricalPrefilterGridTests._new_fixture(
+                pair_by_venue=pair_by_venue
+            )
         run = HistoricalCandidateSelectionTests._open_replay_fixture(fixture)
         finalized = None
         try:
-            selection = HistoricalCandidateSelectionTests._complete_winner(run)
+            if include_newer_mixed_rows:
+                ledger = None
+                for _index in range(20):
+                    action = scan._advance_historical_selection_controller(
+                        snapshot=run["snapshot"], replay_ledger=ledger,
+                    )
+                    projection = scan._historical_selection_action_projection(
+                        action=action
+                    )
+                    row = next(
+                        row for row in run["rows"]
+                        if row["scenario_key"]
+                        == projection["scenario_key"]
+                    )
+                    ledger = HistoricalCandidateSelectionTests._commit_action(
+                        run, action,
+                        closed_revert=(
+                            row["block_number"] == 2
+                            and row["reason"] == "first_leg_zero_output"
+                        ),
+                    )
+                selection = scan.select_historical_replay_block(
+                    snapshot=run["snapshot"], replay_ledger=ledger,
+                )
+            else:
+                selection = HistoricalCandidateSelectionTests._complete_winner(
+                    run
+                )
             finalized = scan._finalize_historical_replay_run(
                 config=run["config"], snapshot=run["snapshot"],
                 selection=selection,

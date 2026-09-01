@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+from importlib.machinery import SourceFileLoader
 import inspect
 import json
 import multiprocessing
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import types
 import unittest
 
 
@@ -38,10 +40,23 @@ def _local_connected_engine(request):
     process.start()
     child.close()
     try:
+        if not parent.poll(60):
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+            raise AssertionError("local connected process timed out")
         observation = parent.recv()
     finally:
         parent.close()
-        process.join(timeout=60)
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
     if process.exitcode != 0:
         raise AssertionError("local connected process failed")
     if isinstance(observation, tuple) and observation[:1] == ("error",):
@@ -84,7 +99,83 @@ def _unbound_connected_worker(queue):
         queue.put((rejected_binding, ("unexpected_success", "")))
 
 
+def _forged_same_name_test_module_worker(queue):
+    import scripts.historical_foundry_verifier as verifier
+    import sys
+
+    module_name = "tests.test_historical_foundry_verifier"
+    genuine = sys.modules.get(module_name)
+    fake = types.ModuleType(module_name)
+    fake.__file__ = str(Path(__file__).resolve())
+    fake.__spec__ = type(genuine.__spec__)(
+        module_name,
+        SourceFileLoader(module_name, fake.__file__),
+        origin=fake.__file__,
+    )
+    exec(
+        "def _local_connected_engine(request):\n"
+        "    return {'attacker': True}\n"
+        "\n"
+        "class HistoricalConnectedVerificationTests:\n"
+        "    @classmethod\n"
+        "    def setUpClass(cls):\n"
+        "        import scripts.historical_foundry_verifier as verifier\n"
+        "        verifier._bind_connected_historical_verification_engine(\n"
+        "            _local_connected_engine\n"
+        "        )\n",
+        fake.__dict__,
+    )
+    sys.modules[module_name] = fake
+    try:
+        try:
+            fake.HistoricalConnectedVerificationTests.setUpClass()
+        except BaseException as error:
+            rejected = (type(error).__name__, str(error))
+        else:
+            rejected = None
+        try:
+            invoked = verifier._invoke_connected_historical_verification_engine(
+                {}
+            )
+        except BaseException as error:
+            invocation = (type(error).__name__, str(error))
+        else:
+            invocation = ("unexpected_success", invoked)
+        queue.put((rejected, invocation))
+    finally:
+        if genuine is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = genuine
+
+
 class HistoricalVerificationInterfaceTests(unittest.TestCase):
+    def test_mode_is_exactly_closed_to_three_plain_strings(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        class StringSubclass(str):
+            pass
+
+        class EqualityLookalike:
+            def __eq__(self, other):
+                return other == "publish"
+
+        for mode in ("staged", "publish", "audit"):
+            with self.subTest(valid=mode):
+                self.assertIs(
+                    verifier._require_historical_verification_mode(mode),
+                    mode,
+                )
+        for mode in (
+            StringSubclass("publish"), EqualityLookalike(), None, 1,
+        ):
+            with self.subTest(invalid=repr(mode)):
+                with self.assertRaisesRegex(
+                    verifier.HistoricalVerificationError,
+                    "historical verification mode is invalid",
+                ):
+                    verifier._require_historical_verification_mode(mode)
+
     def test_public_interfaces_are_exact_and_subject_is_private(self):
         import scripts.historical_foundry_verifier as verifier
 
@@ -122,6 +213,27 @@ class HistoricalVerificationInterfaceTests(unittest.TestCase):
         queue = context.Queue()
         process = context.Process(
             target=_unbound_connected_worker, args=(queue,)
+        )
+        process.start()
+        result = queue.get(timeout=30)
+        process.join(timeout=30)
+        self.assertEqual(process.exitcode, 0)
+        self.assertEqual(result, (
+            (
+                "HistoricalVerificationError",
+                "historical connected engine binder is invalid",
+            ),
+            (
+                "HistoricalVerificationError",
+                "historical connected authority is unavailable",
+            ),
+        ))
+
+    def test_forged_same_name_test_module_cannot_bind_connected_engine(self):
+        context = multiprocessing.get_context("spawn")
+        queue = context.Queue()
+        process = context.Process(
+            target=_forged_same_name_test_module_worker, args=(queue,)
         )
         process.start()
         result = queue.get(timeout=30)
@@ -234,6 +346,13 @@ class HistoricalVerificationReportInstallTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(actual).hexdigest(), result.sha256)
         self.assertEqual(result.path.stem, result.sha256)
 
+    def _assert_preexisting_policy(self, path):
+        details = os.lstat(str(path))
+        self.assertTrue(stat.S_ISREG(details.st_mode))
+        self.assertEqual(details.st_nlink, 1)
+        self.assertEqual(details.st_uid, os.geteuid())
+        self.assertEqual(stat.S_IMODE(details.st_mode), 0o600)
+
     def test_report_eexist_exact_bytes_is_idempotent(self):
         from scripts.historical_foundry_verifier import (
             install_historical_verification_report,
@@ -261,6 +380,8 @@ class HistoricalVerificationReportInstallTests(unittest.TestCase):
         target = self._target(requested)
         target.parent.mkdir(parents=True)
         target.write_bytes(self._report_bytes(marker="attacker"))
+        target.chmod(0o600)
+        self._assert_preexisting_policy(target)
         before = target.read_bytes()
         with self.assertRaisesRegex(
             HistoricalVerificationError, "historical_bundle_invalid"
@@ -280,6 +401,8 @@ class HistoricalVerificationReportInstallTests(unittest.TestCase):
         target = self._target(requested)
         target.parent.mkdir(parents=True)
         target.write_bytes(self._report_bytes(whitespace=True))
+        target.chmod(0o600)
+        self._assert_preexisting_policy(target)
         with self.assertRaisesRegex(
             HistoricalVerificationError, "historical_bundle_invalid"
         ):
@@ -348,6 +471,29 @@ class HistoricalVerificationReportInstallTests(unittest.TestCase):
                 )
         self._assert_physical(created, payload)
 
+    def test_report_eexist_hardlink_rejects(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        payload = self._report_bytes(marker="hardlink")
+        target = self._target(payload)
+        target.parent.mkdir(parents=True)
+        source = target.parent / "attacker-source.json"
+        source.write_bytes(payload)
+        source.chmod(0o600)
+        os.link(str(source), str(target))
+        self.assertEqual(os.lstat(str(source)).st_nlink, 2)
+        self.assertEqual(os.lstat(str(target)).st_nlink, 2)
+        with self.assertRaisesRegex(
+            verifier.HistoricalVerificationError,
+            "historical_bundle_invalid",
+        ):
+            verifier.install_historical_verification_report(
+                verification_root=self.root, report_bytes=payload,
+            )
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertEqual(os.lstat(str(target)).st_nlink, 2)
+
     def test_concurrent_report_install_accepts_only_exact_winner_bytes(self):
         payload = self._report_bytes(marker="concurrent")
         context = multiprocessing.get_context("spawn")
@@ -388,21 +534,32 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
     def setUpClass(cls):
         import scripts.historical_foundry_verifier as verifier
         import scripts.historical_route_publication as publication
-        from tests.test_historical_complete_bundle import (
-            HistoricalCompleteBundleTests,
+        from tests.test_historical_route_publication import (
+            HistoricalCorePublicationTests,
         )
 
-        verifier._bind_connected_historical_verification_engine(
-            _local_connected_engine
-        )
         cls.publication = publication
-        cls.helper = HistoricalCompleteBundleTests
+        cls.helper = HistoricalCorePublicationTests
         cls.run_fixture = cls.finalized = None
         cls.context = cls.subject = None
+        lease = core_stage = None
         try:
-            cls.run_fixture, cls.finalized, cls.context = (
-                cls.helper._open_published_core(publication)
+            cls.run_fixture, cls.finalized, lease, _identity = (
+                cls.helper._open_real_task7_lease(
+                    include_newer_mixed_rows=True
+                )
             )
+            core_stage = publication.stage_historical_replay_core(
+                data_dir=cls.run_fixture["fixture"].data_dir,
+                config=cls.run_fixture["config"],
+                publication_lease=lease,
+            )
+            lease = None
+            cls.context = publication.publish_historical_replay_core(
+                data_dir=cls.run_fixture["fixture"].data_dir,
+                staged_core=core_stage,
+            )
+            core_stage = None
             staged = publication.stage_historical_replay_bundle(
                 data_dir=cls.run_fixture["fixture"].data_dir,
                 raw_root=(
@@ -417,7 +574,14 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
                 cls.run_fixture["fixture"].data_dir / "routes" / "historical"
                 / "verifications"
             )
+            cls.offline_observation = _local_connected_engine(
+                verifier._connected_request_for_subject(cls.subject)
+            )
         except BaseException:
+            if core_stage is not None:
+                core_stage.close()
+            if lease is not None:
+                lease.close()
             cls.tearDownClass()
             raise
 
@@ -436,24 +600,185 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
                 pass
             cls.context = None
         if cls.run_fixture is not None:
-            cls.helper._close_published_core(
-                cls.run_fixture, cls.finalized, cls.context
+            cls.helper._close_real_task7_run(
+                cls.run_fixture, cls.finalized
             )
             cls.run_fixture = cls.finalized = None
+
+    def _run_with_observation(self, *, mode, observation=None):
+        import scripts.historical_foundry_verifier as verifier
+        from unittest import mock
+
+        if observation is None:
+            observation = self.offline_observation
+        detached = json.loads(json.dumps(observation))
+        with mock.patch.object(
+            verifier, "_invoke_connected_historical_verification_engine",
+            return_value=(detached["evidence_mode"], detached),
+        ):
+            return verifier.run_connected_historical_verification(
+                self.subject, mode=mode,
+            )
+
+    def _simulated_production_observation(self, marker=None):
+        """Exercise post-authority flow under a mock; never bind this fixture."""
+        observation = json.loads(json.dumps(self.offline_observation))
+        observation["evidence_mode"] = "production_connected"
+        if marker is not None:
+            observation["provider_identity_sha256"] = hashlib.sha256(
+                marker.encode("utf-8")
+            ).hexdigest()
+        return observation
+
+    @staticmethod
+    def _tree_snapshot(root):
+        if not root.exists():
+            return ()
+        rows = []
+        for path in sorted(root.rglob("*"), key=lambda value: str(value)):
+            details = os.lstat(str(path))
+            relative = str(path.relative_to(root))
+            if stat.S_ISREG(details.st_mode):
+                payload = path.read_bytes()
+                digest = hashlib.sha256(payload).hexdigest()
+            else:
+                digest = None
+            rows.append((
+                relative, details.st_mode, details.st_nlink,
+                details.st_uid, details.st_size,
+                getattr(details, "st_mtime_ns", None), digest,
+            ))
+        return tuple(rows)
+
+    def test_audit_returns_canonical_retained_reference_with_zero_mutation(self):
+        import scripts.historical_foundry_verifier as verifier
+        from unittest import mock
+
+        historical_root = (
+            self.run_fixture["fixture"].data_dir / "routes" / "historical"
+        )
+        before = self._tree_snapshot(historical_root)
+        with mock.patch.object(
+            verifier, "_install_historical_verification_report_held",
+            side_effect=AssertionError("audit called installer"),
+        ):
+            result = self._run_with_observation(
+                mode="audit",
+                observation=self._simulated_production_observation(),
+            )
+        after = self._tree_snapshot(historical_root)
+        self.assertEqual(after, before)
+        self.assertEqual(result["mode"], "audit")
+        self.assertIsNone(result["install_result"])
+        self.assertEqual(result["report"]["status"], "verified")
+        self.assertEqual(
+            json.dumps(
+                json.loads(result["report_bytes"]), sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8"),
+            result["report_bytes"],
+        )
+        retained = (
+            verifier._validate_retained_historical_verification_report(
+                report_bytes=result["report_bytes"],
+                pointer_core=result["pointer_core"],
+            )
+        )
+        self.assertEqual(dict(retained), dict(result["report"]))
+
+    def test_by_sha_directory_same_byte_swap_before_final_pointer_rejects(self):
+        import scripts.historical_foundry_verifier as verifier
+        from unittest import mock
+
+        real_pointer_core = verifier.historical_replay_pointer_core
+        pointer_path = (
+            self.run_fixture["fixture"].data_dir / "routes"
+            / "historical" / "latest.json"
+        )
+
+        def swap_directory(pointer):
+            checked = real_pointer_core(pointer)
+            by_sha = self.verification_root / "by-sha256"
+            target = by_sha / (
+                pointer["verification_report_sha256"] + ".json"
+            )
+            payload = target.read_bytes()
+            backup = self.verification_root / ".swapped-by-sha256"
+            by_sha.rename(backup)
+            by_sha.mkdir(mode=0o700)
+            replacement = by_sha / target.name
+            replacement.write_bytes(payload)
+            replacement.chmod(0o600)
+            return checked
+
+        with mock.patch.object(
+            verifier, "historical_replay_pointer_core",
+            side_effect=swap_directory,
+        ):
+            with self.assertRaisesRegex(
+                verifier.HistoricalVerificationError,
+                "historical_bundle_invalid",
+            ):
+                self._run_with_observation(
+                    mode="publish",
+                    observation=self._simulated_production_observation(
+                        "directory-swap"
+                    ),
+                )
+        self.assertFalse(pointer_path.exists())
+
+    def test_report_same_byte_inode_swap_before_final_pointer_rejects(self):
+        import scripts.historical_foundry_verifier as verifier
+        from unittest import mock
+
+        real_pointer_core = verifier.historical_replay_pointer_core
+        pointer_path = (
+            self.run_fixture["fixture"].data_dir / "routes"
+            / "historical" / "latest.json"
+        )
+
+        def swap_file(pointer):
+            checked = real_pointer_core(pointer)
+            target = (
+                self.verification_root / "by-sha256"
+                / (pointer["verification_report_sha256"] + ".json")
+            )
+            payload = target.read_bytes()
+            target.unlink()
+            target.write_bytes(payload)
+            target.chmod(0o600)
+            return checked
+
+        with mock.patch.object(
+            verifier, "historical_replay_pointer_core",
+            side_effect=swap_file,
+        ):
+            with self.assertRaisesRegex(
+                verifier.HistoricalVerificationError,
+                "historical_bundle_invalid",
+            ):
+                self._run_with_observation(
+                    mode="publish",
+                    observation=self._simulated_production_observation(
+                        "file-swap"
+                    ),
+                )
+        self.assertFalse(pointer_path.exists())
 
     def test_local_fresh_process_verifies_without_implying_external_rpc(self):
         import scripts.historical_foundry_scan as scan
         import scripts.historical_foundry_verifier as verifier
         from unittest import mock
 
+        verification_before = self._tree_snapshot(self.verification_root)
         with mock.patch.object(
             scan, "select_historical_replay_block",
             side_effect=AssertionError("verifier must not select"),
         ):
-            staged = verifier.run_connected_historical_verification(
-                self.subject, mode="staged"
-            )
-        self.assertEqual(staged["report"]["status"], "verified")
+            staged = self._run_with_observation(mode="staged")
+        self.assertEqual(
+            staged["report"]["status"], "structurally_validated"
+        )
         self.assertEqual(
             staged["report"]["schema"],
             "route_historical_replay_verification/v1",
@@ -462,9 +787,12 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
             staged["report"]["evidence_mode"], "offline_test_fixture"
         )
         self.assertEqual(
-            staged["report"]["verification_scenario_count"], 10
+            staged["report"]["verification_scenario_count"], 12
         )
-        self.assertFalse(self.verification_root.exists())
+        self.assertEqual(
+            self._tree_snapshot(self.verification_root),
+            verification_before,
+        )
         self.assertIsNone(staged["install_result"])
         self.assertEqual(
             dict(verifier.historical_replay_pointer_core(
@@ -473,9 +801,11 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
             self.pointer_core,
         )
 
-        published = verifier.run_connected_historical_verification(
-            self.subject, mode="publish"
+        published = self._run_with_observation(
+            mode="publish",
+            observation=self._simulated_production_observation(),
         )
+        self.assertEqual(published["report"]["status"], "verified")
         self.assertEqual(published["install_result"].disposition, "created")
         self.assertEqual(
             published["install_result"].sha256,
@@ -502,12 +832,50 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
 
         inspect_value(dict(published["report"]))
 
+    def test_offline_fixture_evidence_is_rejected_for_publish_and_audit(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        for mode in ("publish", "audit"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    verifier.HistoricalVerificationError,
+                    "historical_bundle_invalid",
+                ):
+                    self._run_with_observation(mode=mode)
+
+    def test_engine_kind_cannot_relabel_fixture_or_production_evidence(self):
+        import scripts.historical_foundry_verifier as verifier
+        from unittest import mock
+
+        cases = (
+            (
+                "production_connected",
+                json.loads(json.dumps(self.offline_observation)),
+            ),
+            (
+                "offline_test_fixture",
+                self._simulated_production_observation(),
+            ),
+        )
+        for engine_kind, observation in cases:
+            with self.subTest(engine_kind=engine_kind):
+                with mock.patch.object(
+                    verifier,
+                    "_invoke_connected_historical_verification_engine",
+                    return_value=(engine_kind, observation),
+                ):
+                    with self.assertRaisesRegex(
+                        verifier.HistoricalVerificationError,
+                        "historical_bundle_invalid",
+                    ):
+                        verifier.run_connected_historical_verification(
+                            self.subject, mode="staged",
+                        )
+
     def test_wrong_scenario_set_and_resolution_transplant_reject(self):
         import scripts.historical_foundry_verifier as verifier
 
-        request = verifier._connected_request_for_subject(self.subject)
-        observation = _local_connected_engine(request)
-        baseline = json.loads(json.dumps(observation))
+        baseline = json.loads(json.dumps(self.offline_observation))
         attacks = []
         wrong_set = json.loads(json.dumps(baseline))
         wrong_set["projection"]["verification_scenario_keys"].pop()
@@ -526,6 +894,104 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
                         subject=self.subject, observation=attack,
                     )
 
+    def test_newer_required_and_safe_exclusion_tamper_matrix(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        baseline = json.loads(json.dumps(self.offline_observation))
+        projection = baseline["projection"]
+        selected_number = projection["selected_block"]["number"]
+        newer_required = [
+            row for row in projection["prefilter_rows"]
+            if row["block_number"] > selected_number
+            and row["decision"] == "replay_required"
+        ]
+        newer_safe = [
+            row for row in projection["safe_exclusions"]
+            if row["block_number"] > selected_number
+        ]
+        self.assertEqual(len(newer_required), 2)
+        self.assertEqual(len(newer_safe), 8)
+        scenario_keys = projection["verification_scenario_keys"]
+        result_keys = [
+            row["scenario_key"] for row in projection["scenario_results"]
+        ]
+        self.assertEqual(len(scenario_keys), 12)
+        self.assertEqual(result_keys, scenario_keys)
+        self.assertTrue({
+            row["scenario_key"] for row in newer_required
+        }.issubset(set(scenario_keys)))
+        self.assertTrue({
+            row["scenario_key"] for row in newer_safe
+        }.isdisjoint(set(scenario_keys)))
+
+        attacks = {}
+        changed_required = json.loads(json.dumps(baseline))
+        next(
+            row for row in changed_required["projection"]["prefilter_rows"]
+            if row["scenario_key"] == newer_required[0]["scenario_key"]
+        )["decision"] = "safe_excluded"
+        attacks["changed_required_decision"] = changed_required
+        changed_safe = json.loads(json.dumps(baseline))
+        next(
+            row for row in changed_safe["projection"]["prefilter_rows"]
+            if row["scenario_key"] == newer_safe[0]["scenario_key"]
+        )["decision"] = "replay_required"
+        attacks["changed_safe_decision"] = changed_safe
+        omitted_key = json.loads(json.dumps(baseline))
+        omitted_key["projection"]["verification_scenario_keys"].remove(
+            newer_required[0]["scenario_key"]
+        )
+        attacks["omitted_newer_key"] = omitted_key
+        omitted_result = json.loads(json.dumps(baseline))
+        omitted_result["projection"]["scenario_results"] = [
+            row for row in omitted_result["projection"]["scenario_results"]
+            if row["scenario_key"] != newer_required[0]["scenario_key"]
+        ]
+        attacks["omitted_newer_result"] = omitted_result
+        transplanted = json.loads(json.dumps(baseline))
+        transplanted_results = transplanted["projection"][
+            "scenario_results"
+        ]
+        next(
+            row for row in transplanted_results
+            if row["scenario_key"] == newer_required[0]["scenario_key"]
+        )["resolution"] = transplanted_results[-1]["resolution"]
+        attacks["newer_resolution_transplant"] = transplanted
+        typed_mutation = json.loads(json.dumps(baseline))
+        next(
+            row for row in typed_mutation["projection"]["scenario_results"]
+            if row["scenario_key"] == newer_required[0]["scenario_key"]
+        )["resolution"]["result_typed_sha256"] = "f" * 64
+        attacks["newer_typed_result"] = typed_mutation
+
+        for label, attack in attacks.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    verifier.HistoricalVerificationError,
+                    "historical_bundle_invalid",
+                ):
+                    verifier._validate_connected_historical_observation(
+                        subject=self.subject, observation=attack,
+                    )
+
+    def test_connected_raw_source_close_failure_is_not_silenced(self):
+        import scripts.historical_foundry_verifier as verifier
+        from unittest import mock
+
+        def fail_after_close(source):
+            source.close()
+            raise RuntimeError("injected connected source close failure")
+
+        with mock.patch.object(
+            verifier, "_close_connected_source",
+            side_effect=fail_after_close,
+        ):
+            with self.assertRaisesRegex(
+                verifier.HistoricalVerificationError,
+                "historical_bundle_invalid",
+            ):
+                self._run_with_observation(mode="staged")
+
     def test_report_deletion_or_mutation_before_pointer_construction_rejects(self):
         import scripts.historical_foundry_verifier as verifier
         from unittest import mock
@@ -535,39 +1001,78 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
             / "historical" / "latest.json"
         )
         self.assertFalse(pointer.exists())
-        real_install = verifier.install_historical_verification_report
+        real_install = verifier._install_historical_verification_report_held
 
         for attack in ("delete", "mutate"):
             with self.subTest(attack=attack):
                 def attacked_install(**kwargs):
-                    installed = real_install(**kwargs)
+                    installed, held = real_install(**kwargs)
                     if attack == "delete":
                         installed.path.unlink()
                     else:
                         installed.path.write_bytes(b"attacker report bytes")
-                    return installed
+                    return installed, held
 
                 with mock.patch.object(
                     verifier,
-                    "install_historical_verification_report",
+                    "_install_historical_verification_report_held",
                     side_effect=attacked_install,
                 ):
                     with self.assertRaisesRegex(
                         verifier.HistoricalVerificationError,
                         "historical_bundle_invalid",
                     ):
-                        verifier.run_connected_historical_verification(
-                            self.subject, mode="publish"
+                        self._run_with_observation(
+                            mode="publish",
+                            observation=self._simulated_production_observation(
+                                "report-{}".format(attack)
+                            ),
                         )
                 self.assertFalse(pointer.exists())
+
+    def test_publish_holds_created_and_matched_report_through_pointer_bytes(self):
+        import scripts.historical_foundry_verifier as verifier
+        from unittest import mock
+
+        rereads = []
+        real_reread = (
+            verifier._HeldVerificationReportInstall.reread_unchanged
+        )
+
+        def record_reread(held, expected):
+            rereads.append(held.filename)
+            return real_reread(held, expected)
+
+        observation = self._simulated_production_observation(
+            "held-both-dispositions"
+        )
+        with mock.patch.object(
+            verifier._HeldVerificationReportInstall,
+            "reread_unchanged", new=record_reread,
+        ):
+            created = self._run_with_observation(
+                mode="publish", observation=observation,
+            )
+            matched = self._run_with_observation(
+                mode="publish", observation=observation,
+            )
+        self.assertEqual(created["install_result"].disposition, "created")
+        self.assertEqual(
+            matched["install_result"].disposition, "matched_existing"
+        )
+        self.assertEqual(len(rereads), 4)
+        self.assertTrue(all(name == rereads[0] for name in rereads))
 
     def test_report_install_precedes_final_pointer_construction(self):
         import scripts.historical_foundry_verifier as verifier
         from unittest import mock
 
         events = []
-        real_install = verifier.install_historical_verification_report
+        real_install = verifier._install_historical_verification_report_held
         real_pointer_core = verifier.historical_replay_pointer_core
+        real_reread = (
+            verifier._HeldVerificationReportInstall.reread_unchanged
+        )
 
         def recorded_install(**kwargs):
             events.append("report_installed")
@@ -577,18 +1082,32 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
             events.append("final_pointer_constructed")
             return real_pointer_core(pointer)
 
+        def recorded_reread(held, expected):
+            events.append("held_report_reread")
+            return real_reread(held, expected)
+
         with mock.patch.object(
-            verifier, "install_historical_verification_report",
+            verifier, "_install_historical_verification_report_held",
             side_effect=recorded_install,
         ), mock.patch.object(
             verifier, "historical_replay_pointer_core",
             side_effect=recorded_pointer,
+        ), mock.patch.object(
+            verifier._HeldVerificationReportInstall,
+            "reread_unchanged", new=recorded_reread,
         ):
-            result = verifier.run_connected_historical_verification(
-                self.subject, mode="publish"
+            result = self._run_with_observation(
+                mode="publish",
+                observation=self._simulated_production_observation(
+                    "event-order"
+                ),
             )
         self.assertEqual(
-            events, ["report_installed", "final_pointer_constructed"]
+            events,
+            [
+                "report_installed", "held_report_reread",
+                "final_pointer_constructed", "held_report_reread",
+            ],
         )
         self.assertEqual(
             result["install_result"].path.read_bytes(),
@@ -598,20 +1117,26 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
     def test_report_bytes_are_not_reusable_across_pointer_cores(self):
         import scripts.historical_foundry_verifier as verifier
 
-        observation = _local_connected_engine(
-            verifier._connected_request_for_subject(self.subject)
+        observation = self._simulated_production_observation()
+        report = verifier._verification_report(observation)
+        report_bytes = json.dumps(
+            report, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        retained = verifier._validate_retained_historical_verification_report(
+            report_bytes=report_bytes, pointer_core=self.pointer_core,
         )
-        baseline = verifier._verification_report(observation)
-        transplanted = json.loads(json.dumps(observation))
-        transplanted["projection"]["pointer_core_sha256"] = "f" * 64
-        changed = verifier._verification_report(transplanted)
-        self.assertNotEqual(
-            json.dumps(baseline, sort_keys=True),
-            json.dumps(changed, sort_keys=True),
-        )
-        self.assertNotEqual(
-            baseline["verification_id"], changed["verification_id"]
-        )
+        self.assertEqual(dict(retained), report)
+        transplanted_core = dict(self.pointer_core)
+        transplanted_core["replay_id"] = "replay:" + "f" * 64
+        with self.assertRaisesRegex(
+            verifier.HistoricalVerificationError,
+            "historical_bundle_invalid",
+        ):
+            verifier._validate_retained_historical_verification_report(
+                report_bytes=report_bytes,
+                pointer_core=transplanted_core,
+            )
 
 
 if __name__ == "__main__":
