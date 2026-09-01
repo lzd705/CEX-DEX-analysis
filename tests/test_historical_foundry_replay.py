@@ -1178,6 +1178,102 @@ class HistoricalOpportunityBridgeTests(unittest.TestCase):
         finally:
             self._close_stage(run, finalized, stage, context)
 
+    def test_preloaded_publication_module_cannot_capture_raw_mint(self):
+        import subprocess
+        import sys
+
+        attack = r'''\
+import importlib
+import importlib.machinery
+import sys
+import types
+from pathlib import Path
+
+publication_name = "scripts.historical_route_publication"
+publication_path = (
+    Path.cwd() / "scripts" / "historical_route_publication.py"
+).resolve()
+captured = {}
+alternate = types.ModuleType(publication_name)
+alternate.__file__ = str(publication_path)
+alternate.__loader__ = importlib.machinery.SourceFileLoader(
+    publication_name, str(publication_path),
+)
+alternate.__spec__ = importlib.machinery.ModuleSpec(
+    publication_name,
+    loader=alternate.__loader__,
+    origin=str(publication_path),
+)
+alternate.__dict__["captured"] = captured
+exec(compile(
+    "def _install_historical_scenario_capability(**authority):\n"
+    "    captured.update(authority)\n",
+    str(publication_path),
+    "exec",
+), alternate.__dict__)
+sys.modules[publication_name] = alternate
+
+replay = importlib.import_module("scripts.historical_foundry_replay")
+if captured:
+    raise SystemExit("preloaded publication captured scenario authority")
+binder = getattr(
+    replay, "_bind_historical_scenario_capability_to_publication", None
+)
+if binder is None:
+    raise SystemExit("replay binder disappeared before authentic publication")
+try:
+    binder(alternate._install_historical_scenario_capability)
+except ValueError:
+    pass
+else:
+    raise SystemExit("preloaded publication installer was accepted")
+if captured:
+    raise SystemExit("rejected publication captured scenario authority")
+
+del sys.modules[publication_name]
+publication = importlib.import_module(publication_name)
+if publication.ValidatedHistoricalScenarioInputs is not (
+    replay.ValidatedHistoricalScenarioInputs
+):
+    raise SystemExit("publication does not use the replay-owned capability")
+if getattr(
+    replay, "_bind_historical_scenario_capability_to_publication", None
+) is not None:
+    raise SystemExit("scenario capability binder remains after authentic import")
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", attack],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
+    def test_replay_rejects_canonical_projection_bytes_before_arithmetic(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            inputs = publication._issue_validated_historical_scenario_inputs(
+                context=context,
+                scenario_key="2:uniswap_to_sushiswap:1000",
+            )
+            with mock.patch.object(
+                replay,
+                "_run_historical_v2_exact_input_kat",
+                side_effect=AssertionError("arithmetic reached"),
+            ):
+                with self.assertRaises(ValueError):
+                    replay.build_historical_atomic_v2_cashflow(
+                        inputs.canonical_projection_bytes
+                    )
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
     def test_installed_scenario_issuer_captures_exact_material_validator(self):
         import scripts.historical_foundry_replay as replay
         import scripts.historical_route_publication as publication
@@ -1546,6 +1642,88 @@ class HistoricalOpportunityBridgeTests(unittest.TestCase):
             ):
                 with self.subTest(label=label), self.assertRaises(ValueError):
                     replay.build_historical_replay_evidence(attacked(mutate))
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
+    def test_compact_evidence_rejects_fully_rebound_final_output_attack(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            projections = list(
+                publication._build_historical_scenario_for_publication(
+                    context=context,
+                    scenario_key="2:{}:{}".format(direction, notional),
+                )["canonical_projection_bytes"]
+                for direction in (
+                    "uniswap_to_sushiswap", "sushiswap_to_uniswap"
+                )
+                for notional in (1000, 5000, 10000, 50000, 100000)
+            )
+            value = json.loads(projections[0])
+            authority = value["economics_authority"]
+            authority["final_weth_out_raw"] += 1
+            value["gross_edge_weth_raw"] = (
+                authority["final_weth_out_raw"]
+                - authority["first_weth_in_raw"]
+            )
+            usd_denominator = 10 ** (18 + authority["feed_decimals"])
+            gross_buy = Fraction(
+                authority["first_weth_in_raw"]
+                * authority["eth_usd_answer"],
+                usd_denominator,
+            )
+            gross_sell = Fraction(
+                authority["final_weth_out_raw"]
+                * authority["eth_usd_answer"],
+                usd_denominator,
+            )
+            gross_edge = gross_sell - gross_buy
+            opportunity = value["opportunity"]
+            bounded_cost = Fraction(Decimal(
+                opportunity["research_bounded_cost_usd"]
+            ))
+            assumed_cost = Fraction(Decimal(
+                opportunity["research_assumed_cost_usd"]
+            ))
+            research_net = gross_edge - bounded_cost - assumed_cost
+            opportunity["gross_sell_proceeds_usd"] = (
+                replay._exact_fraction_decimal(gross_sell)
+            )
+            opportunity["gross_edge_usd"] = replay._exact_fraction_decimal(
+                gross_edge
+            )
+            opportunity["strict_net_edge_usd"] = (
+                replay._exact_fraction_decimal(gross_edge)
+            )
+            opportunity["research_net_edge_usd"] = (
+                replay._exact_fraction_decimal(research_net)
+            )
+            for prefix, edge in (
+                ("gross", gross_edge),
+                ("strict_net", gross_edge),
+                ("research_net", research_net),
+            ):
+                bps, numerator, denominator = (
+                    replay._historical_ratio_fields(edge, gross_buy)
+                )
+                opportunity[prefix + "_edge_bps"] = bps
+                opportunity[prefix + "_edge_bps_numerator"] = numerator
+                opportunity[prefix + "_edge_bps_denominator"] = denominator
+            opportunity.pop("evidence_binding_sha256", None)
+            opportunity["evidence_binding_sha256"] = digest(opportunity)
+            for row in value["economics_scenarios"]:
+                gas = Fraction(Decimal(row["gas_cost_usd"]))
+                mev = Fraction(Decimal(row["mev_buffer_usd"]))
+                net = gross_edge - gas - mev
+                row["research_net_edge_usd"] = (
+                    replay._exact_fraction_decimal(net)
+                )
+                row["positive_research_net"] = net > 0
+            projections[0] = self._scenario_bytes(value)
+            with self.assertRaises(ValueError):
+                replay.build_historical_replay_evidence(tuple(projections))
         finally:
             self._close_stage(run, finalized, stage, context)
 

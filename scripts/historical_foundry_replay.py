@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 from fractions import Fraction
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Tuple
 
@@ -1306,17 +1308,40 @@ def _initialize_validated_historical_scenario_capability():
     installed = [False]
 
     def bind_publication(installer: Any) -> None:
-        publication = sys.modules.get(
-            "scripts.historical_route_publication"
-        )
+        publication_name = "scripts.historical_route_publication"
+        publication = sys.modules.get(publication_name)
+        namespace = getattr(installer, "__globals__", None)
+        spec = getattr(publication, "__spec__", None)
+        loader = getattr(spec, "loader", None)
+        expected_file = Path(__file__).with_name(
+            "historical_route_publication.py"
+        ).resolve()
+        try:
+            caller = sys._getframe(1)
+            loaded_file = Path(loader.get_filename(publication_name)).resolve()
+            trusted_module_code = loader.get_code(publication_name)
+        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+            caller = None
+            loaded_file = None
+            trusted_module_code = None
         if (
             installed[0]
+            or not callable(installer)
             or publication is None
             or installer is not getattr(
                 publication,
                 "_install_historical_scenario_capability",
                 None,
             )
+            or namespace is not getattr(publication, "__dict__", None)
+            or spec is None
+            or getattr(spec, "name", None) != publication_name
+            or type(loader) is not SourceFileLoader
+            or loaded_file != expected_file
+            or caller is None
+            or caller.f_globals is not namespace
+            or caller.f_code.co_name != "<module>"
+            or caller.f_code != trusted_module_code
         ):
             raise ValueError(
                 "historical scenario publication installer is invalid"
@@ -2214,12 +2239,31 @@ def _validate_historical_compact_scenario(
             economics_authority["next_base_fee_per_gas"]
             + economics_authority["p50_priority_fee_per_gas"]
         )
+    ):
+        raise ValueError("historical economics authority differs")
+    try:
+        recomputed_final_weth_out_raw = v2_exact_input_amount_out_raw(
+            reserve_in_raw=economics_authority[
+                "second_leg_reserve_uni_raw"
+            ],
+            reserve_out_raw=economics_authority[
+                "second_leg_reserve_weth_raw"
+            ],
+            amount_in_raw=economics_authority["first_uni_out_raw"],
+            fee_numerator=economics_authority["fee_numerator"],
+            fee_denominator=economics_authority["fee_denominator"],
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("historical final output is invalid") from error
+    if (
+        economics_authority["final_weth_out_raw"]
+        != recomputed_final_weth_out_raw
         or value["gross_edge_weth_raw"] != (
-            economics_authority["final_weth_out_raw"]
+            recomputed_final_weth_out_raw
             - economics_authority["first_weth_in_raw"]
         )
     ):
-        raise ValueError("historical economics authority differs")
+        raise ValueError("historical final output differs")
     usd_denominator = 10 ** (18 + economics_authority["feed_decimals"])
     answer = economics_authority["eth_usd_answer"]
     fee_units = (
