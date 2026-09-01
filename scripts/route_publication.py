@@ -4792,9 +4792,9 @@ def _complete_manifest_payload(
     }
 
 
-def _complete_artifact_bytes(
+def _complete_representation_artifact_bytes_from_validated_bundle(
     bundle: Mapping[str, Any],
-) -> Tuple[Dict[str, bytes], Dict[str, Any]]:
+) -> Tuple[Dict[str, bytes], Dict[str, Dict[str, Any]]]:
     leg_bytes = _csv_bytes(
         LEG_COLUMNS,
         (_leg_csv_row(bundle["route_cohort_id"], row) for row in bundle["legs"]),
@@ -4845,12 +4845,23 @@ def _complete_artifact_bytes(
             ),
         ),
     }
-    manifest = _complete_manifest_payload(bundle, files)
     return {
         ROUTE_LEGS_FILENAME: leg_bytes,
         COST_COMPONENTS_FILENAME: cost_bytes,
         ROUTE_OPPORTUNITIES_FILENAME: opportunity_bytes,
         ROUTE_OPPORTUNITY_SQLITE_FILENAME: database_bytes,
+    }, files
+
+
+def _complete_artifact_bytes(
+    bundle: Mapping[str, Any],
+) -> Tuple[Dict[str, bytes], Dict[str, Any]]:
+    representation, files = (
+        _complete_representation_artifact_bytes_from_validated_bundle(bundle)
+    )
+    manifest = _complete_manifest_payload(bundle, files)
+    return {
+        **representation,
         MANIFEST_FILENAME: json.dumps(
             manifest,
             ensure_ascii=False,

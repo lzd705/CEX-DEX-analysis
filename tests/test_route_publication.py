@@ -1176,6 +1176,48 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
             golden["artifacts"],
         )
 
+    def test_live_complete_bundle_uses_shared_representation_artifacts(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root,
+            raw_root,
+            Path(self.temporary.name) / "typed-sources",
+            Path(self.temporary.name) / "private-profiles",
+        )
+        bundle = route_publication.build_complete_route_bundle(
+            core_root=self.root,
+            raw_root=raw_root,
+            source_root=fixture["source_root"],
+            fee_profile_path=fixture["fee_profile_path"],
+            fee_profile_id=fixture["fee_profile_id"],
+            inventory_profile_path=fixture["inventory_profile_path"],
+            opportunity_inputs=fixture["opportunity_inputs"],
+        )
+
+        representation, files = (
+            route_publication
+            ._complete_representation_artifact_bytes_from_validated_bundle(
+                bundle
+            )
+        )
+        artifacts, manifest = route_publication._complete_artifact_bytes(
+            bundle
+        )
+
+        self.assertEqual(
+            set(representation),
+            route_publication.ROUTE_COMPLETE_FILENAMES
+            - {route_publication.MANIFEST_FILENAME},
+        )
+        self.assertEqual(
+            representation,
+            {
+                name: payload for name, payload in artifacts.items()
+                if name != route_publication.MANIFEST_FILENAME
+            },
+        )
+        self.assertEqual(manifest["files"], files)
+
     def test_complete_sqlite_reader_supports_legacy_sqlite_catalog_name(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"
         fixture = _task7_cex_inputs(
