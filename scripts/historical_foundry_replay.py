@@ -1232,6 +1232,9 @@ def _initialize_validated_historical_scenario_capability():
             or projection.get("scenario_key") != record["scenario_key"]
             or projection.get("context_projection_sha256")
             != record["context_projection_sha256"]
+            or _SHA.fullmatch(
+                projection.get("core_manifest_sha256") or ""
+            ) is None
             or projection.get("source_descriptor_set_sha256")
             != record["source_descriptor_set_sha256"]
             or projection.get("proof_inputs_hash")
@@ -1273,6 +1276,9 @@ def _initialize_validated_historical_scenario_capability():
             or projection.get("scenario_key") != scenario_key
             or projection.get("context_projection_sha256")
             != context_projection_sha256
+            or _SHA.fullmatch(
+                projection.get("core_manifest_sha256") or ""
+            ) is None
             or projection.get("source_descriptor_set_sha256")
             != source_descriptor_set_sha256
             or projection.get("proof_inputs_hash") != proof_inputs_hash
@@ -1962,8 +1968,8 @@ def build_historical_route_opportunity(
                 "proof_inputs_hash": projection["proof_inputs_hash"],
             },
         ),
-        "buy_core_manifest_sha256": projection["context_projection_sha256"],
-        "sell_core_manifest_sha256": projection["context_projection_sha256"],
+        "buy_core_manifest_sha256": projection["core_manifest_sha256"],
+        "sell_core_manifest_sha256": projection["core_manifest_sha256"],
     }
     if set(row) != set(OPPORTUNITY_FIELDS) - {"evidence_binding_sha256"}:
         raise ValueError("historical opportunity schema differs")
@@ -2042,6 +2048,7 @@ def build_historical_scenario_projection(
     value = {
         "schema": "historical_foundry_replay_scenario/v1",
         "scenario_key": projection["scenario_key"],
+        "core_manifest_sha256": projection["core_manifest_sha256"],
         "route_id": projection["route_id"],
         "requested_notional_usd": projection["selection_scenario"][
             "requested_notional_usd"
@@ -2113,7 +2120,8 @@ def _validate_historical_compact_scenario(
     expected_direction: str, expected_notional: int,
 ) -> Mapping[str, Any]:
     expected_fields = {
-        "schema", "scenario_key", "route_id", "requested_notional_usd",
+        "schema", "scenario_key", "core_manifest_sha256", "route_id",
+        "requested_notional_usd",
         "receipt_status", "proof_inputs_hash", "overlay_sha256",
         "receipt_sha256", "trace_sha256", "result_sha256",
         "gross_edge_weth_raw", "proof_inputs", "economics_authority",
@@ -2141,7 +2149,8 @@ def _validate_historical_compact_scenario(
         or any(
             _SHA.fullmatch(value.get(field) or "") is None
             for field in (
-                "proof_inputs_hash", "overlay_sha256", "receipt_sha256",
+                "core_manifest_sha256", "proof_inputs_hash",
+                "overlay_sha256", "receipt_sha256",
                 "trace_sha256", "result_sha256",
             )
         )
@@ -2363,7 +2372,9 @@ def _validate_historical_compact_scenario(
         or opportunity.get("buy_state_observed_at")
         != opportunity.get("sell_state_observed_at")
         or opportunity.get("buy_core_manifest_sha256")
-        != opportunity.get("sell_core_manifest_sha256")
+        != value["core_manifest_sha256"]
+        or opportunity.get("sell_core_manifest_sha256")
+        != value["core_manifest_sha256"]
         or opportunity.get("inventory_profile_hash")
         != value["proof_inputs_hash"]
         or opportunity.get("cost_component_set_sha256") != _digest(rows)
@@ -2614,6 +2625,7 @@ def _validate_historical_compact_scenario(
             raise ValueError("historical baseline economics differ")
     return {
         "scenario_key": expected_scenario_key,
+        "core_manifest_sha256": value["core_manifest_sha256"],
         "route_id": value["route_id"],
         "requested_notional_usd": expected_notional,
         "proof_inputs_hash": value["proof_inputs_hash"],
@@ -2686,6 +2698,9 @@ def build_historical_replay_evidence(
     )
     proof_hashes = {row["proof_inputs_hash"] for row in scenarios}
     policy_hashes = {row.pop("policy_sha256") for row in scenarios}
+    core_manifest_hashes = {
+        row.pop("core_manifest_sha256") for row in scenarios
+    }
     if (
         len(set(route_ids)) != 2
         or any(
@@ -2694,11 +2709,13 @@ def build_historical_replay_evidence(
         )
         or len(proof_hashes) != 10
         or len(policy_hashes) != 1
+        or len(core_manifest_hashes) != 1
         or not any(row["positive_research_net"] for row in scenarios)
     ):
         raise ValueError("historical replay scenario set differs")
     result = {
         "schema": "historical_foundry_replay_evidence/v1",
+        "core_manifest_sha256": next(iter(core_manifest_hashes)),
         "opportunity_counts": {
             "research_estimate": 10,
             "strict_eligible": 0,

@@ -3159,6 +3159,9 @@ def _historical_scenario_material(
         "schema": "historical_foundry_scenario_inputs/v1",
         "scenario_key": scenario_key,
         "context_projection_sha256": context_projection_sha256,
+        "core_manifest_sha256": context_projection[
+            "core_manifest_sha256"
+        ],
         "source_descriptor_set_sha256": source_descriptor_set_sha256,
         "proof_inputs_hash": proof["proof_inputs_hash"],
         "cohort_id": context_projection["core_pointer"]["route_cohort_id"],

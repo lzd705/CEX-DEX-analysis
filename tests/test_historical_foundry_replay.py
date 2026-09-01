@@ -1482,6 +1482,14 @@ if getattr(
                 values[index] = self._scenario_bytes(value)
                 return tuple(values)
 
+            def transplant_core_manifest(value):
+                value["core_manifest_sha256"] = "f" * 64
+                opportunity = value["opportunity"]
+                opportunity["buy_core_manifest_sha256"] = "f" * 64
+                opportunity["sell_core_manifest_sha256"] = "f" * 64
+                opportunity.pop("evidence_binding_sha256", None)
+                opportunity["evidence_binding_sha256"] = digest(opportunity)
+
             attacks = [
                 ("empty_costs", lambda: mutate_one(
                     0, lambda value: value.__setitem__("cost_components", [])
@@ -1499,6 +1507,9 @@ if getattr(
                         "proof_inputs_hash",
                         json.loads(projections[0])["proof_inputs_hash"],
                     )
+                )),
+                ("cross_core_manifest", lambda: mutate_one(
+                    1, transplant_core_manifest
                 )),
                 ("wrong_scenario_id", lambda: mutate_one(
                     0, lambda value: value.__setitem__(
@@ -1975,6 +1986,37 @@ if getattr(
         finally:
             self._close_stage(run, finalized, stage, context)
 
+    def test_historical_opportunity_binds_the_exact_core_manifest(self):
+        import scripts.historical_foundry_replay as replay
+        import scripts.historical_route_publication as publication
+
+        run, finalized, stage, context = self._open_stage()
+        try:
+            inputs = publication._issue_validated_historical_scenario_inputs(
+                context=context,
+                scenario_key="2:uniswap_to_sushiswap:1000",
+            )
+            expected = context.identity_projection()[
+                "core_manifest_sha256"
+            ]
+            raw_projection = json.loads(inputs.canonical_projection_bytes)
+            built = replay.build_historical_route_opportunity(inputs)
+            compact = json.loads(
+                replay.build_historical_scenario_projection(inputs)
+            )
+
+            self.assertEqual(raw_projection["core_manifest_sha256"], expected)
+            self.assertEqual(compact["core_manifest_sha256"], expected)
+            self.assertEqual(
+                built["opportunity"]["buy_core_manifest_sha256"], expected
+            )
+            self.assertEqual(
+                built["opportunity"]["sell_core_manifest_sha256"], expected
+            )
+            self.assertNotEqual(expected, inputs.context_projection_sha256)
+        finally:
+            self._close_stage(run, finalized, stage, context)
+
     def test_ten_scenarios_produce_ninety_costs_and_compact_evidence(self):
         import scripts.historical_foundry_replay as replay
         import scripts.historical_route_publication as publication
@@ -2046,6 +2088,10 @@ if getattr(
             )
             self.assertEqual(
                 evidence["schema"], "historical_foundry_replay_evidence/v1"
+            )
+            self.assertEqual(
+                evidence["core_manifest_sha256"],
+                context.identity_projection()["core_manifest_sha256"],
             )
             self.assertEqual(len(evidence["scenarios"]), 10)
             self.assertEqual(evidence["opportunity_counts"], {
