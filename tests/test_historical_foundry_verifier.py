@@ -149,6 +149,145 @@ def _forged_same_name_test_module_worker(queue):
             sys.modules[module_name] = genuine
 
 
+def _mutable_connected_loader_worker(queue):
+    import scripts.historical_foundry_verifier as verifier
+    import sys
+
+    module_name = "scripts.run_historical_foundry_replay"
+    expected_file = Path(verifier.__file__).with_name(
+        "run_historical_foundry_replay.py"
+    ).resolve()
+    module = types.ModuleType(module_name)
+    loader = SourceFileLoader(module_name, str(expected_file))
+    module.__file__ = str(expected_file)
+    module.__spec__ = type(verifier.__spec__)(
+        module_name, loader, origin=str(expected_file),
+    )
+    source = (
+        "replacement_calls = 0\n"
+        "def _replacement_engine(request):\n"
+        "    global replacement_calls\n"
+        "    replacement_calls += 1\n"
+        "    return {'replacement': True}\n"
+        "try:\n"
+        "    verifier._bind_connected_historical_verification_engine(\n"
+        "        _replacement_engine\n"
+        "    )\n"
+        "except BaseException as error:\n"
+        "    binding = (type(error).__name__, str(error))\n"
+        "else:\n"
+        "    binding = None\n"
+    )
+    replacement_code = compile(source, str(expected_file), "exec")
+    loader_calls = []
+
+    def replacement_get_filename(name):
+        loader_calls.append(("get_filename", name))
+        return str(expected_file)
+
+    def replacement_get_code(name):
+        loader_calls.append(("get_code", name))
+        return replacement_code
+
+    loader.get_filename = replacement_get_filename
+    loader.get_code = replacement_get_code
+    genuine = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        module.verifier = verifier
+        exec(replacement_code, module.__dict__)
+        try:
+            verifier._invoke_connected_historical_verification_engine({})
+        except BaseException as error:
+            invocation = (type(error).__name__, str(error))
+        else:
+            invocation = ("unexpected_success", "")
+        queue.put((
+            module.binding,
+            invocation,
+            module.replacement_calls,
+            tuple(loader_calls),
+        ))
+    finally:
+        if genuine is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = genuine
+
+
+def _mutable_material_loader_worker(queue):
+    import scripts.historical_foundry_verifier as verifier
+    import sys
+
+    module_name = "scripts.historical_route_publication"
+    expected_file = Path(verifier.__file__).with_name(
+        "historical_route_publication.py"
+    ).resolve()
+    module = types.ModuleType(module_name)
+    loader = SourceFileLoader(module_name, str(expected_file))
+    module.__file__ = str(expected_file)
+    module.__spec__ = type(verifier.__spec__)(
+        module_name, loader, origin=str(expected_file),
+    )
+    source = (
+        "replacement_calls = 0\n"
+        "def _historical_verification_subject_material(*, validated_view):\n"
+        "    global replacement_calls\n"
+        "    replacement_calls += 1\n"
+        "    return {\n"
+        "        'validated_view': validated_view,\n"
+        "        'data_dir': 'replacement',\n"
+        "        'raw_root': 'replacement',\n"
+        "        'bundle_path': 'replacement',\n"
+        "        'manifest': {},\n"
+        "        'bundle': {},\n"
+        "        'replay_evidence': {},\n"
+        "        'pointer_core': {},\n"
+        "    }\n"
+        "try:\n"
+        "    issue = verifier._bind_historical_verification_subject_material(\n"
+        "        _historical_verification_subject_material\n"
+        "    )\n"
+        "except BaseException as error:\n"
+        "    binding = (type(error).__name__, str(error))\n"
+        "else:\n"
+        "    binding = None\n"
+        "    class View:\n"
+        "        def close(self):\n"
+        "            pass\n"
+        "    subject = issue(View())\n"
+        "    subject.close()\n"
+    )
+    replacement_code = compile(source, str(expected_file), "exec")
+    loader_calls = []
+
+    def replacement_get_filename(name):
+        loader_calls.append(("get_filename", name))
+        return str(expected_file)
+
+    def replacement_get_code(name):
+        loader_calls.append(("get_code", name))
+        return replacement_code
+
+    loader.get_filename = replacement_get_filename
+    loader.get_code = replacement_get_code
+    genuine = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        module.verifier = verifier
+        exec(replacement_code, module.__dict__)
+        queue.put((
+            module.binding,
+            module.replacement_calls,
+            tuple(loader_calls),
+        ))
+    finally:
+        if genuine is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = genuine
+
+
 class HistoricalVerificationInterfaceTests(unittest.TestCase):
     def test_mode_is_exactly_closed_to_three_plain_strings(self):
         import scripts.historical_foundry_verifier as verifier
@@ -248,6 +387,48 @@ class HistoricalVerificationInterfaceTests(unittest.TestCase):
                 "HistoricalVerificationError",
                 "historical connected authority is unavailable",
             ),
+        ))
+
+    def test_mutable_loader_methods_cannot_bind_connected_engine(self):
+        context = multiprocessing.get_context("spawn")
+        queue = context.Queue()
+        process = context.Process(
+            target=_mutable_connected_loader_worker, args=(queue,)
+        )
+        process.start()
+        result = queue.get(timeout=30)
+        process.join(timeout=30)
+        self.assertEqual(process.exitcode, 0)
+        self.assertEqual(result, (
+            (
+                "HistoricalVerificationError",
+                "historical connected engine binder is invalid",
+            ),
+            (
+                "HistoricalVerificationError",
+                "historical connected authority is unavailable",
+            ),
+            0,
+            (),
+        ))
+
+    def test_mutable_loader_methods_cannot_bind_material_reader(self):
+        context = multiprocessing.get_context("spawn")
+        queue = context.Queue()
+        process = context.Process(
+            target=_mutable_material_loader_worker, args=(queue,)
+        )
+        process.start()
+        result = queue.get(timeout=30)
+        process.join(timeout=30)
+        self.assertEqual(process.exitcode, 0)
+        self.assertEqual(result, (
+            (
+                "HistoricalVerificationError",
+                "historical verification subject binder is invalid",
+            ),
+            0,
+            (),
         ))
 
     def test_pointer_core_removes_only_report_hash_and_keeps_schema(self):

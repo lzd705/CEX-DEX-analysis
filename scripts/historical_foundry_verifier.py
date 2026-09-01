@@ -47,6 +47,58 @@ _CONNECTED_REQUEST_SCHEMA = (
 )
 
 
+def _initialize_trusted_source_module_code_reader():
+    loader_type = SourceFileLoader
+    get_data = SourceFileLoader.get_data
+    source_to_code = SourceFileLoader.source_to_code
+
+    def read(loader, module_name, expected_file):
+        """Compile tracked source without dispatching through loader state."""
+        if type(loader) is not loader_type or type(module_name) is not str:
+            return None, None
+        try:
+            state = object.__getattribute__(loader, "__dict__")
+        except AttributeError:
+            return None, None
+        if type(state) is not dict or len(state) != 2:
+            return None, None
+        exact_state = {}
+        for key, value in state.items():
+            if (
+                type(key) is not str
+                or key not in ("name", "path")
+                or key in exact_state
+                or type(value) is not str
+            ):
+                return None, None
+            exact_state[key] = value
+        if exact_state.get("name") != module_name:
+            return None, None
+        try:
+            loaded_file = Path(exact_state["path"]).resolve()
+            expected_file = expected_file.resolve()
+            if loaded_file != expected_file:
+                return None, None
+            source = get_data(loader, str(expected_file))
+            code = source_to_code(
+                loader, source, str(expected_file),
+            )
+        except (
+            AttributeError, ImportError, OSError, SyntaxError, TypeError,
+            ValueError,
+        ):
+            return None, None
+        return loaded_file, code
+
+    return read
+
+
+_trusted_source_module_code = (
+    _initialize_trusted_source_module_code_reader()
+)
+del _initialize_trusted_source_module_code_reader
+
+
 def _historical_bundle_invalid(error=None):
     if error is None:
         return HistoricalVerificationError("historical_bundle_invalid")
@@ -511,6 +563,7 @@ def historical_replay_pointer_core(
 def _initialize_historical_verification_subject():
     issuer = object()
     installed = [False]
+    trusted_source_module_code = _trusted_source_module_code
 
     def close_view_silently(view):
         try:
@@ -655,14 +708,11 @@ def _initialize_historical_verification_subject():
         ).resolve()
         try:
             caller = sys._getframe(1)
-            loaded_file = Path(
-                loader.get_filename(publication_name)
-            ).resolve()
-            trusted_module_code = loader.get_code(publication_name)
-        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        except (AttributeError, ValueError):
             caller = None
-            loaded_file = None
-            trusted_module_code = None
+        loaded_file, trusted_module_code = trusted_source_module_code(
+            loader, publication_name, expected_file,
+        )
         if (
             installed[0]
             or not callable(material_reader)
@@ -723,6 +773,7 @@ del _initialize_historical_verification_subject
 def _initialize_connected_historical_verification_engine():
     engine = None
     engine_kind = None
+    trusted_source_module_code = _trusted_source_module_code
 
     def bind(value):
         """One-shot production bind used only by the Task-8 entrypoint."""
@@ -740,12 +791,11 @@ def _initialize_connected_historical_verification_engine():
             expected_file = None
         try:
             caller = sys._getframe(1)
-            loaded_file = Path(loader.get_filename(module_name)).resolve()
-            trusted_module_code = loader.get_code(module_name)
-        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        except (AttributeError, ValueError):
             caller = None
-            loaded_file = None
-            trusted_module_code = None
+        loaded_file, trusted_module_code = trusted_source_module_code(
+            loader, module_name, expected_file,
+        ) if expected_file is not None else (None, None)
         authentic_call_edge = (
             caller is not None
             and caller.f_globals is namespace
@@ -791,6 +841,7 @@ def _initialize_connected_historical_verification_engine():
     _invoke_connected_historical_verification_engine,
 ) = _initialize_connected_historical_verification_engine()
 del _initialize_connected_historical_verification_engine
+del _trusted_source_module_code
 
 
 def _source_member(source, members, relative_path):
