@@ -681,6 +681,115 @@ class HistoricalCorePublicationTests(unittest.TestCase):
                 lease.close()
             self._close_real_task7_run(run, finalized)
 
+    def test_core_stage_and_final_rename_hold_the_gc_root_lock(self):
+        import scripts.historical_route_publication as publication
+
+        run, finalized, lease, _identity = self._open_real_task7_lease()
+        stage = published = None
+        consumed_lease = None
+        held = [False]
+        events = []
+        real_flock = publication.fcntl.flock
+        real_consume = (
+            publication._historical_storage
+            ._consume_historical_run_publication_lease
+        )
+        real_make = (
+            publication._route_publication._make_unique_directory_at
+        )
+        real_rename = (
+            publication._route_publication._rename_directory_noreplace_at
+        )
+
+        def tracked_flock(descriptor, operation):
+            if operation == publication.fcntl.LOCK_EX:
+                self.assertFalse(held[0])
+                result = real_flock(descriptor, operation)
+                held[0] = True
+                events.append("lock")
+                return result
+            if operation == publication.fcntl.LOCK_UN:
+                self.assertTrue(held[0])
+                result = real_flock(descriptor, operation)
+                held[0] = False
+                events.append("unlock")
+                return result
+            return real_flock(descriptor, operation)
+
+        def make_while_locked(*args, **kwargs):
+            self.assertTrue(held[0])
+            events.append("stage")
+            return real_make(*args, **kwargs)
+
+        def consume_while_locked(*args, **kwargs):
+            self.assertTrue(held[0])
+            events.append("consume")
+            return real_consume(*args, **kwargs)
+
+        def rename_while_locked(*args, **kwargs):
+            self.assertTrue(held[0])
+            events.append("rename")
+            return real_rename(*args, **kwargs)
+
+        try:
+            consumed_lease = lease
+            lease = None
+            with mock.patch.object(
+                publication.fcntl, "flock", side_effect=tracked_flock
+            ), mock.patch.object(
+                publication._historical_storage,
+                "_consume_historical_run_publication_lease",
+                side_effect=consume_while_locked,
+            ), mock.patch.object(
+                publication._route_publication,
+                "_make_unique_directory_at",
+                side_effect=make_while_locked,
+            ):
+                stage = publication.stage_historical_replay_core(
+                    data_dir=run["fixture"].data_dir,
+                    config=run["config"],
+                    publication_lease=consumed_lease,
+                )
+            consumed_lease = None
+            self.assertFalse(held[0])
+            self.assertEqual(
+                events, ["lock", "consume", "stage", "unlock"]
+            )
+
+            events.clear()
+            with mock.patch.object(
+                publication.fcntl, "flock", side_effect=tracked_flock
+            ), mock.patch.object(
+                publication._route_publication,
+                "_rename_directory_noreplace_at",
+                side_effect=rename_while_locked,
+            ):
+                published = publication.publish_historical_replay_core(
+                    data_dir=run["fixture"].data_dir,
+                    staged_core=stage,
+                )
+            stage = None
+            self.assertFalse(held[0])
+            self.assertEqual(events, ["lock", "rename", "unlock"])
+        finally:
+            if held[0]:
+                self.fail("historical core GC root lock leaked")
+            if published is not None:
+                published.close()
+            if stage is not None:
+                try:
+                    stage.close()
+                except publication.HistoricalRoutePublicationError:
+                    pass
+            if lease is not None:
+                lease.close()
+            if consumed_lease is not None:
+                try:
+                    consumed_lease.close()
+                except Exception:
+                    pass
+            self._close_real_task7_run(run, finalized)
+
     def test_bounded_gzip_rejects_high_ratio_bomb_and_extra_stream_data(self):
         import scripts.historical_route_publication as publication
 

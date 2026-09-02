@@ -404,7 +404,7 @@ def _close_descriptors_robustly(*descriptors: Any) -> None:
                 pass
 
 
-def _install_pointer_cas(
+def _install_pointer_cas_held_lock(
     *, core_fd: int, core_root: Path, expected_snapshot: Any,
     pointer: Mapping[str, Any], after_install: Any,
 ) -> Any:
@@ -412,7 +412,6 @@ def _install_pointer_cas(
     installed = result = None
     pointer_bytes = _json_file_bytes(pointer)
     try:
-        fcntl.flock(core_fd, fcntl.LOCK_EX)
         current = _route_publication._optional_pointer_snapshot_at(core_fd)
         if not _snapshot_matches(current, expected_snapshot):
             raise HistoricalRoutePublicationError("publication_race")
@@ -482,11 +481,6 @@ def _install_pointer_cas(
                     "publication_race"
                 ) from rollback_error
         raise error
-    finally:
-        try:
-            fcntl.flock(core_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
 
 
 def _rfc3339(timestamp: int) -> str:
@@ -2239,11 +2233,12 @@ def stage_historical_replay_core(
     bundles = None
     stage_fd = None
     bundles_fd = None
+    core_fd = None
+    locked = False
     try:
-        source = _historical_storage._consume_historical_run_publication_lease(
+        _historical_storage._validate_historical_run_publication_lease(
             lease=publication_lease
         )
-        derived = _derive_historical_core(config=config, source=source)
         core_root = _route_publication._ensure_real_directory(
             data_dir / "routes" / "historical" / "core"
         )
@@ -2253,6 +2248,17 @@ def stage_historical_replay_core(
             )
         )
         try:
+            fcntl.flock(core_fd, fcntl.LOCK_EX)
+            locked = True
+            source = (
+                _historical_storage
+                ._consume_historical_run_publication_lease(
+                    lease=publication_lease
+                )
+            )
+            derived = _derive_historical_core(
+                config=config, source=source
+            )
             bundles_fd, _bundles_details = (
                 _route_publication._ensure_directory_at(
                     core_fd, "bundles", "historical route core bundles"
@@ -2310,24 +2316,29 @@ def stage_historical_replay_core(
             stage_path = None
             return stage
         finally:
-            if (
-                stage_path is not None
-                and bundles is not None
-                and bundles_fd is not None
-                and stage_name is not None
-                and stage_fd is not None
-                and initial_stage_details is not None
-            ):
-                _remove_partial_stage_at(
-                    bundles=bundles, bundles_fd=bundles_fd,
-                    stage_name=stage_name, stage_fd=stage_fd,
-                    initial_stage_details=initial_stage_details,
-                )
-            if stage_fd is not None:
-                os.close(stage_fd)
-            if bundles_fd is not None:
-                os.close(bundles_fd)
-            os.close(core_fd)
+            try:
+                if (
+                    stage_path is not None
+                    and bundles is not None
+                    and bundles_fd is not None
+                    and stage_name is not None
+                    and stage_fd is not None
+                    and initial_stage_details is not None
+                ):
+                    _remove_partial_stage_at(
+                        bundles=bundles, bundles_fd=bundles_fd,
+                        stage_name=stage_name, stage_fd=stage_fd,
+                        initial_stage_details=initial_stage_details,
+                    )
+            finally:
+                _close_descriptors_robustly(stage_fd, bundles_fd)
+                try:
+                    if locked:
+                        fcntl.flock(core_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                finally:
+                    _close_descriptors_robustly(core_fd)
     except BaseException as error:
         if source is not None:
             try:
@@ -2395,13 +2406,16 @@ def publish_historical_replay_core(
     core_fd = bundles_fd = None
     pre_source = fresh_context = None
     renamed = False
+    locked = False
     try:
-        _validate_held_stage(record)
         core_root, core_fd, current_core = (
             _route_publication._open_verified_directory(
                 record["core_root"], "historical route core root"
             )
         )
+        fcntl.flock(core_fd, fcntl.LOCK_EX)
+        locked = True
+        _validate_held_stage(record)
         if (
             _route_publication._stable_file_metadata(current_core)
             != _route_publication._stable_file_metadata(record["core_details"])
@@ -2481,7 +2495,7 @@ def publish_historical_replay_core(
                 context.close()
                 raise
 
-        fresh_context = _install_pointer_cas(
+        fresh_context = _install_pointer_cas_held_lock(
             core_fd=core_fd, core_root=core_root,
             expected_snapshot=record["pointer_snapshot"],
             pointer=record["pointer"],
@@ -2524,6 +2538,11 @@ def publish_historical_replay_core(
             "historical replay core publication failed"
         ) from error
     finally:
+        if locked:
+            try:
+                fcntl.flock(core_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
         _close_descriptors_robustly(bundles_fd, core_fd)
 
 
