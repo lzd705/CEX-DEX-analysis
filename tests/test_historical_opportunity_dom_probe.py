@@ -9,11 +9,12 @@ import scripts.check_dashboard_release as checker
 
 
 DISCLAIMER = (
-    "Historical Replay. Fixed-block counterfactual scenarios under a hash-bound "
-    "state override model for a prefunded, predeployed, preapproved executor. "
-    "Evidence status is shown per row. Values are research estimates at the "
-    "displayed Ethereum block; they are not current and are not executable "
-    "candidates."
+    "Historical Scenarios. Production rows are fixed-block counterfactual "
+    "replays under their declared execution model. Local demo rows are "
+    "deterministic synthetic fixture outputs; no live RPC, execution, or "
+    "Foundry verification is run. Evidence status is shown per row. Values "
+    "are research estimates at the displayed block or fixture reference; "
+    "they are not current and are not executable candidates."
 )
 GENERATION = "1" * 64
 REPLAY_ID = "replay:" + "2" * 64

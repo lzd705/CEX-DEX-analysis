@@ -22,6 +22,13 @@ if __package__ in {None, ""}:  # pragma: no cover - direct script bootstrap
         sys.path.insert(0, _PROJECT_ROOT_TEXT)
 
 from scripts.historical_opportunity_demo_fixture import (
+    DEMO_CONTRACT,
+    DEMO_EVIDENCE_MODE,
+    DEMO_EXECUTION_CLAIM,
+    DEMO_EXECUTOR_MODEL,
+    DEMO_SIMULATION_BASIS,
+    DEMO_TEMPORAL_SCOPE,
+    DEMO_VERIFICATION_STATUS,
     HistoricalOpportunityDemoFixture,
 )
 
@@ -264,16 +271,16 @@ def serve_demo(*, port: int, output: TextIO = sys.stdout) -> None:
                 print(
                     json.dumps(
                         {
-                            "contract_version": (
-                                "opportunity_historical_demo_summary/v1"
-                            ),
+                            "contract_version": DEMO_CONTRACT,
                             "demo_fixture": True,
-                            "evidence_mode": "offline_test_fixture",
+                            "evidence_mode": DEMO_EVIDENCE_MODE,
+                            "execution_claim": DEMO_EXECUTION_CLAIM,
+                            "execution_status": DEMO_EXECUTOR_MODEL,
                             "network_scope": "loopback_only",
                             "replay_id": fixture.pointer["replay_id"],
-                            "verification_status": (
-                                "structurally_validated"
-                            ),
+                            "simulation_basis": DEMO_SIMULATION_BASIS,
+                            "temporal_scope": DEMO_TEMPORAL_SCOPE,
+                            "verification_status": DEMO_VERIFICATION_STATUS,
                             "url": "http://{}:{}{}".format(
                                 DEMO_HOST, bound_port, HISTORICAL_DEMO_PATH
                             ),
@@ -317,10 +324,28 @@ def serve_demo(*, port: int, output: TextIO = sys.stdout) -> None:
             fixture.close()
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = parse_args(argv)
-    serve_demo(port=arguments.port)
+    try:
+        serve_demo(port=arguments.port)
+    except KeyboardInterrupt:
+        print(
+            "Local demo interrupted before the demo was ready; cleanup complete.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 130
+    except Exception as error:
+        print(
+            "Local demo could not start: {}: {}".format(
+                type(error).__name__, error
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

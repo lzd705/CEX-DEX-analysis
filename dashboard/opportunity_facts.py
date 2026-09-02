@@ -52,10 +52,6 @@ HISTORICAL_REPLAY_POINTER_ABSENT = "historical_replay_pointer_absent"
 OPPORTUNITY_BUNDLE_VALIDATION_FAILED = "opportunity_bundle_validation_failed"
 HISTORICAL_SIMULATION_BASIS = "hash_bound_state_override_next_block"
 HISTORICAL_EXECUTOR_MODEL = "prefunded_predeployed_preapproved"
-_HISTORICAL_VERIFICATION_EVIDENCE_PAIRS = frozenset({
-    ("verified", "production_connected"),
-    ("structurally_validated", "offline_test_fixture"),
-})
 MAX_ROUTE_AGE_SECONDS = Decimal(str(ROUTE_OPPORTUNITY_MAX_AGE_SECONDS))
 MAX_ROUTE_SKEW_SECONDS = Decimal(str(ROUTE_OPPORTUNITY_MAX_SKEW_SECONDS))
 ROUTE_VOLUME_BASIS = "minimum_leg_source_horizon_usd"
@@ -1678,15 +1674,7 @@ def _historical_block_timestamp(value: Any) -> str:
 
 def _historical_projected_rows(
     loaded: Mapping[str, Any],
-    *,
-    expected_verification_status: str = "verified",
-    expected_evidence_mode: str = "production_connected",
 ) -> List[Dict[str, Any]]:
-    if (
-        expected_verification_status,
-        expected_evidence_mode,
-    ) not in _HISTORICAL_VERIFICATION_EVIDENCE_PAIRS:
-        raise OpportunityBundleInvalid()
     try:
         manifest = loaded["manifest"]
         evidence = loaded["replay_evidence"]
@@ -1703,8 +1691,8 @@ def _historical_projected_rows(
             or len(opportunities) != 10
             or len(costs) != 90
             or evidence.get("scenario_count") != 10
-            or report.get("status") != expected_verification_status
-            or report.get("evidence_mode") != expected_evidence_mode
+            or report.get("status") != "verified"
+            or report.get("evidence_mode") != "production_connected"
             or manifest.get("temporal_scope") != "historical_replay"
             or manifest.get("execution_claim")
             != "historical_counterfactual_state_override_next_block"
@@ -1879,10 +1867,7 @@ def _historical_projected_rows(
                 "selected_block_hash": selected.get("hash"),
                 "selected_block_timestamp": selected_timestamp,
                 "state_age_seconds": state_age,
-                "foundry_verified": (
-                    expected_verification_status == "verified"
-                    and expected_evidence_mode == "production_connected"
-                ),
+                "foundry_verified": True,
                 "gas_used": receipt.get("gas_used"),
                 "receipt_sha256": _historical_sha256(
                     scenario.get("receipt_sha256")

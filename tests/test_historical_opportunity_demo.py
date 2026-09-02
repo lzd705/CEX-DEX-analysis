@@ -1,11 +1,15 @@
+import copy
+import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
+from decimal import Decimal
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,8 +108,12 @@ class HistoricalOpportunityDemoTests(unittest.TestCase):
                 "contract_version": "opportunity_historical_demo_summary/v1",
                 "demo_fixture": True,
                 "evidence_mode": "offline_test_fixture",
+                "execution_claim": "synthetic_fixture_no_execution",
+                "execution_status": "not_run",
                 "network_scope": "loopback_only",
                 "replay_id": "replay:" + "a" * 64,
+                "simulation_basis": "deterministic_repository_fixture",
+                "temporal_scope": "historical_demo_fixture",
                 "verification_status": "structurally_validated",
                 "url": (
                     "http://127.0.0.1:43210/opportunities"
@@ -138,6 +146,31 @@ class HistoricalOpportunityDemoTests(unittest.TestCase):
 
         http_server.server_close.assert_called_once_with()
         fixture.close.assert_called_once_with()
+
+    def test_main_handles_control_c_during_fixture_preparation(self):
+        errors = io.StringIO()
+
+        with patch.object(
+            demo, "serve_demo", side_effect=KeyboardInterrupt
+        ), redirect_stderr(errors):
+            exit_code = demo.main(["--port", "0"])
+
+        self.assertEqual(exit_code, 130)
+        self.assertIn("interrupted before the demo was ready", errors.getvalue().lower())
+        self.assertNotIn("traceback", errors.getvalue().lower())
+
+    def test_main_reports_startup_failure_without_a_traceback(self):
+        errors = io.StringIO()
+
+        with patch.object(
+            demo, "serve_demo", side_effect=RuntimeError("fixture unavailable")
+        ), redirect_stderr(errors):
+            exit_code = demo.main(["--port", "0"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("local demo could not start", errors.getvalue().lower())
+        self.assertIn("fixture unavailable", errors.getvalue().lower())
+        self.assertNotIn("traceback", errors.getvalue().lower())
 
     def test_demo_forces_inherited_write_surfaces_off_then_restores_them(self):
         fixture = Mock()
@@ -315,22 +348,70 @@ with demo._isolated_demo_environment(fixture):
             {"error": "Not found"}, HTTPStatus.NOT_FOUND
         )
 
-    def test_historical_projection_accepts_only_declared_evidence_pairs(self):
+    def test_production_historical_projection_rejects_evidence_mode_overrides(self):
         from dashboard import opportunity_facts as facts
 
-        class ExplodingLoaded(dict):
-            def __getitem__(self, _key):
-                raise AssertionError("loaded data must not be read")
-
-        with self.assertRaises(facts.OpportunityBundleInvalid):
+        with self.assertRaises(TypeError):
             facts._historical_projected_rows(
-                ExplodingLoaded(),
-                expected_verification_status="invented",
-                expected_evidence_mode="invented",
+                {},
+                expected_verification_status="structurally_validated",
+                expected_evidence_mode="offline_test_fixture",
             )
 
 
 class HistoricalOpportunityDemoFixtureTests(unittest.TestCase):
+    def test_fixture_builds_without_tests_submodules_or_ignored_toolchain(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "clean-source"
+            checkout.mkdir()
+            ignored = shutil.ignore_patterns("__pycache__", "*.pyc")
+            for directory in ("dashboard", "scripts"):
+                shutil.copytree(
+                    project_root / directory,
+                    checkout / directory,
+                    ignore=ignored,
+                )
+            self.assertFalse((checkout / "tests").exists())
+            self.assertFalse((checkout / "lib").exists())
+            self.assertFalse((checkout / ".historical-foundry").exists())
+
+            script = r"""
+import json
+from scripts.historical_opportunity_demo_fixture import (
+    HistoricalOpportunityDemoFixture,
+)
+
+with HistoricalOpportunityDemoFixture() as fixture:
+    payload = fixture.build_payload(notional_usd="1000")
+print(json.dumps({
+    "contract": payload["metadata"]["contract_version"],
+    "mode": payload["metadata"]["evidence_mode"],
+    "returned": payload["metadata"]["coverage"]["returned_count"],
+    "verified": payload["metadata"]["coverage"]["foundry_verified_count"],
+}, sort_keys=True))
+"""
+            environment = os.environ.copy()
+            environment.pop("DEX_DEPTH_RPC_ETH", None)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=checkout,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), {
+            "contract": "opportunity_historical_demo_summary/v1",
+            "mode": "offline_test_fixture",
+            "returned": 2,
+            "verified": 0,
+        })
+
     def test_fixture_payload_is_structural_and_never_claims_foundry_verification(self):
         with demo.HistoricalOpportunityDemoFixture() as fixture:
             payload = fixture.build_payload()
@@ -347,16 +428,37 @@ class HistoricalOpportunityDemoFixtureTests(unittest.TestCase):
         self.assertEqual(
             metadata["verification_status"], "structurally_validated"
         )
+        self.assertEqual(
+            metadata["validation_boundary"], "spawned_local_process"
+        )
+        self.assertEqual(metadata["temporal_scope"], "historical_demo_fixture")
+        self.assertEqual(
+            metadata["execution_claim"], "synthetic_fixture_no_execution"
+        )
+        self.assertEqual(metadata["execution_status"], "not_run")
+        self.assertEqual(
+            metadata["simulation_basis"], "deterministic_repository_fixture"
+        )
+        self.assertEqual(
+            metadata["reference_kind"], "synthetic_block_coordinate"
+        )
         self.assertEqual(coverage["scenario_count"], 10)
         self.assertEqual(coverage["returned_count"], 10)
         self.assertEqual(coverage["foundry_verified_count"], 0)
         self.assertEqual(coverage["strict_count"], 0)
         self.assertEqual(coverage["executable_count"], 0)
         self.assertEqual(coverage["attested_count"], 0)
+        self.assertEqual(coverage["positive_count"], 0)
         self.assertEqual(len(payload["routes"]), 10)
         self.assertTrue(all(
             row["foundry_verified"] is False
             and row["opportunity_class"] == "research_estimate"
+            and row["route_mode"] == "synthetic_fixture_no_execution"
+            and row["executor_model"] == "not_run"
+            and "gas_used" not in row
+            and type(row["gas_assumption"]) is int
+            and row["gas_assumption"] >= 0
+            and Decimal(row["research_net_edge_usd"]) <= 0
             for row in payload["routes"]
         ))
         self.assertNotIn("production_connected", json.dumps(payload))
@@ -367,6 +469,84 @@ class HistoricalOpportunityDemoFixtureTests(unittest.TestCase):
         self.assertEqual(
             filtered["metadata"]["coverage"]["returned_count"], 2
         )
+
+    def test_fixture_artifact_hashes_bind_content_and_reject_tampering(self):
+        from scripts import historical_opportunity_demo_fixture as fixture_module
+
+        def canonical_sha256(value):
+            payload = json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+            return hashlib.sha256(payload).hexdigest()
+
+        bundle = fixture_module._build_repository_fixture_bundle()
+        rows = fixture_module._validate_and_project_demo_bundle(bundle)
+        self.assertEqual(len(rows), 10)
+        scenario = bundle["evidence"]["scenarios"][0]
+        artifact_set = bundle["artifacts"][scenario["opportunity_id"]]
+        self.assertEqual(
+            scenario["receipt_sha256"],
+            canonical_sha256(artifact_set["receipt_record"]),
+        )
+        self.assertEqual(
+            scenario["trace_sha256"],
+            canonical_sha256(artifact_set["workflow_trace"]),
+        )
+        self.assertEqual(
+            scenario["result_sha256"],
+            canonical_sha256(artifact_set["result_record"]),
+        )
+        self.assertEqual(
+            scenario["proof_inputs_hash"],
+            canonical_sha256(artifact_set["proof_inputs"]),
+        )
+
+        def mutate_receipt(artifacts):
+            artifacts["receipt_record"]["gas_assumption"] += 1
+
+        def mutate_trace(artifacts):
+            artifacts["workflow_trace"]["steps"].append("invented_step")
+
+        def mutate_result(artifacts):
+            artifacts["result_record"]["research_net_edge_usd"] = "999"
+
+        def mutate_inputs(artifacts):
+            artifacts["proof_inputs"]["notional_usd"] = "999"
+
+        mutations = (
+            ("receipt", mutate_receipt),
+            ("trace", mutate_trace),
+            ("result", mutate_result),
+            ("proof_inputs", mutate_inputs),
+        )
+        for artifact_name, mutate in mutations:
+            with self.subTest(artifact=artifact_name):
+                tampered = copy.deepcopy(bundle)
+                tampered_scenario = tampered["evidence"]["scenarios"][0]
+                tampered_artifacts = tampered["artifacts"][
+                    tampered_scenario["opportunity_id"]
+                ]
+                mutate(tampered_artifacts)
+                with self.assertRaisesRegex(
+                    ValueError, "fixture artifact hash binding failed"
+                ):
+                    fixture_module._validate_and_project_demo_bundle(tampered)
+
+    def test_fixture_close_removes_temporary_tree_and_is_idempotent(self):
+        fixture = demo.HistoricalOpportunityDemoFixture()
+        temporary_root = Path(fixture.data_dir)
+        self.assertTrue(temporary_root.is_dir())
+
+        fixture.close()
+
+        self.assertFalse(temporary_root.exists())
+        with self.assertRaisesRegex(RuntimeError, "offline fixture is closed"):
+            fixture.build_payload()
+        fixture.close()
 
 
 if __name__ == "__main__":

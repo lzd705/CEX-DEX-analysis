@@ -148,11 +148,12 @@ STATIC_ASSET_GZIP_BUDGET = 220_000
 IMMUTABLE_STATIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
 STATIC_ASSET_GZIP_THRESHOLD_BYTES = 1024
 HISTORICAL_OPPORTUNITY_DISCLAIMER = (
-    "Historical Replay. Fixed-block counterfactual scenarios under a hash-bound "
-    "state override model for a prefunded, predeployed, preapproved executor. "
-    "Evidence status is shown per row. Values are research estimates at the "
-    "displayed Ethereum block; they are not current and are not executable "
-    "candidates."
+    "Historical Scenarios. Production rows are fixed-block counterfactual "
+    "replays under their declared execution model. Local demo rows are "
+    "deterministic synthetic fixture outputs; no live RPC, execution, or "
+    "Foundry verification is run. Evidence status is shown per row. Values "
+    "are research estimates at the displayed block or fixture reference; "
+    "they are not current and are not executable candidates."
 )
 _HISTORICAL_DIRECTIONS = (
     "uniswap_to_sushiswap",

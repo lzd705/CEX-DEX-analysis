@@ -627,6 +627,7 @@ function setActiveAppView(kind) {
   document.querySelectorAll("[data-app-view]").forEach((view) => {
     view.hidden = view.dataset.appView !== viewKind;
   });
+  if (kind !== "opportunities") restoreMarketFreshness();
 }
 
 function setActiveWorkspacePage(page) {
@@ -2378,6 +2379,7 @@ function historicalOpportunityRowMarkup(
   const researchNet = String(route.research_net_edge_usd);
   const receipt = String(route.receipt_sha256);
   const trace = String(route.trace_sha256);
+  const gasValue = demoFixture ? route.gas_assumption : route.gas_used;
   const blockHash = String(route.selected_block_hash);
   const blockTime = formatOpportunityTimestamp(route.selected_block_timestamp);
   const baselineNet = String(route.baseline_net_edge_usd);
@@ -2385,12 +2387,26 @@ function historicalOpportunityRowMarkup(
   const stress50 = String(route.stress_50_net_edge_usd);
   const verified = route.foundry_verified === true;
   const evidenceHeading = demoFixture
-    ? "Synthetic fixture evidence — verification not run"
+    ? "Synthetic fixture evidence — execution and verification not run"
     : verified ? "Foundry verified" : "Foundry unverified";
-  const receiptLabel = demoFixture ? "Fixture receipt digest" : "Receipt";
-  const traceLabel = demoFixture ? "Fixture trace digest" : "Trace";
-  const gasLabel = demoFixture ? "Fixture gas" : "Gas";
+  const referenceLabel = demoFixture ? "Fixture reference" : "Replay block";
+  const resultLabel = demoFixture
+    ? "Fixture model result"
+    : "Net result at replay block";
+  const stateAgeLabel = demoFixture
+    ? "Fixture state-age input"
+    : "State age at replay";
+  const evidenceLabel = demoFixture ? "Fixture evidence record" : "Replay evidence";
+  const receiptLabel = demoFixture ? "Receipt-record digest" : "Receipt";
+  const traceLabel = demoFixture ? "Workflow-trace digest" : "Trace";
+  const gasLabel = demoFixture ? "Fixture gas assumption" : "Gas";
+  const executorLabel = demoFixture ? "Execution not run" : route.executor_model;
+  const policyLabel = demoFixture ? "Fixture policy model" : "Policy baseline";
+  const baselineLabel = demoFixture ? "Fixture baseline model" : "Receipt baseline";
   const stressLabel = route.stress_robust === true ? "Stress robust" : "Stress sensitive";
+  const stressOutcomeLabel = demoFixture
+    ? "Fixture model stress outcome"
+    : "Stress outcome";
   return `<tr data-opportunity-id="${escapeHtml(opportunityId)}"
       data-api-generation="${escapeHtml(generation)}"
       data-replay-id="${escapeHtml(replayId)}"
@@ -2406,16 +2422,39 @@ function historicalOpportunityRowMarkup(
     <td data-label="Route"><span class="opportunity-route-id">${escapeHtml(routeId)}</span><span class="metric-note">${escapeHtml(route.buy_market_id)} → ${escapeHtml(route.sell_market_id)}</span></td>
     <td data-label="Direction">${escapeHtml(direction)}</td>
     <td data-label="Notional">${escapeHtml(formatHistoricalOpportunityUsd(notional))}</td>
-    <td data-label="Replay block"><strong>${escapeHtml(blockNumber)}</strong><span class="metric-note">${escapeHtml(blockHash)}</span><span class="metric-note">${escapeHtml(blockTime)}</span></td>
-    <td data-label="Net result at replay block"><strong>${escapeHtml(formatHistoricalOpportunityUsd(researchNet))}</strong><span class="metric-note">Policy baseline ${escapeHtml(formatHistoricalOpportunityUsd(policyNet))}</span><span class="metric-note">Receipt baseline ${escapeHtml(formatHistoricalOpportunityUsd(baselineNet))}</span></td>
-    <td data-label="State age at replay">${escapeHtml(formatOpportunitySeconds(route.state_age_seconds))} s</td>
-    <td data-label="Replay evidence"><strong>${escapeHtml(evidenceHeading)}</strong><span class="metric-note">${escapeHtml(gasLabel)} ${escapeHtml(rawVolume.format(route.gas_used))}</span><span class="metric-note">${escapeHtml(receiptLabel)} ${escapeHtml(receipt)}</span><span class="metric-note">${escapeHtml(traceLabel)} ${escapeHtml(trace)}</span><span class="metric-note">${escapeHtml(route.executor_model)}</span></td>
-    <td data-label="Stress outcome"><strong>${escapeHtml(stressLabel)}</strong><span class="metric-note">Stress 25 bps ${escapeHtml(formatHistoricalOpportunityUsd(stress25))}</span><span class="metric-note">Stress 50 bps ${escapeHtml(formatHistoricalOpportunityUsd(stress50))}</span></td>
+    <td data-label="${escapeHtml(referenceLabel)}"><strong>${escapeHtml(blockNumber)}</strong><span class="metric-note">${escapeHtml(blockHash)}</span><span class="metric-note">${escapeHtml(blockTime)}</span></td>
+    <td data-label="${escapeHtml(resultLabel)}"><strong>${escapeHtml(formatHistoricalOpportunityUsd(researchNet))}</strong><span class="metric-note">${escapeHtml(policyLabel)} ${escapeHtml(formatHistoricalOpportunityUsd(policyNet))}</span><span class="metric-note">${escapeHtml(baselineLabel)} ${escapeHtml(formatHistoricalOpportunityUsd(baselineNet))}</span></td>
+    <td data-label="${escapeHtml(stateAgeLabel)}">${escapeHtml(formatOpportunitySeconds(route.state_age_seconds))} s</td>
+    <td data-label="${escapeHtml(evidenceLabel)}"><strong>${escapeHtml(evidenceHeading)}</strong><span class="metric-note">${escapeHtml(gasLabel)} ${escapeHtml(rawVolume.format(gasValue))}</span><span class="metric-note">${escapeHtml(receiptLabel)} ${escapeHtml(receipt)}</span><span class="metric-note">${escapeHtml(traceLabel)} ${escapeHtml(trace)}</span><span class="metric-note">${escapeHtml(executorLabel)}</span></td>
+    <td data-label="${escapeHtml(stressOutcomeLabel)}"><strong>${escapeHtml(stressLabel)}</strong><span class="metric-note">Stress 25 bps ${escapeHtml(formatHistoricalOpportunityUsd(stress25))}</span><span class="metric-note">Stress 50 bps ${escapeHtml(formatHistoricalOpportunityUsd(stress50))}</span></td>
   </tr>`;
 }
 
 function opportunityScope(filters = {}) {
   return filters?.opportunityScope === "historical" ? "historical" : "current";
+}
+
+function setGlobalFreshness(message, status) {
+  const freshness = byId("freshness");
+  const cluster = byId("freshness-cluster");
+  if (freshness) freshness.textContent = message;
+  if (cluster) cluster.dataset.status = status;
+}
+
+function restoreMarketFreshness() {
+  const metadata = app.payload?.metadata;
+  const freshness = metadata?.freshness;
+  if (freshness) {
+    setGlobalFreshness([
+      `CEX ${freshness.cex_daily?.available_end || "unavailable"}`,
+      `DEX ${freshness.dex_daily?.available_end || "unavailable"}`,
+      `common ${freshness.common_comparable_end || "unavailable"}`,
+    ].join(" · "), freshness.overall_status || "unavailable");
+  } else if (metadata?.available_end) {
+    setGlobalFreshness(`Data through ${metadata.available_end}`, "unavailable");
+  } else {
+    setGlobalFreshness("Loading data", "loading");
+  }
 }
 
 function isLoopbackHistoricalDemoLocation() {
@@ -2466,9 +2505,14 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
   const routes = Array.isArray(payload?.routes) ? payload.routes : null;
   const demoFixture = metadata?.contract_version
     === "opportunity_historical_demo_summary/v1";
+  const demoLocation = isLoopbackHistoricalDemoLocation();
   const productionContract = metadata?.contract_version
     === "opportunity_historical_summary/v1"
     && metadata?.demo_fixture !== true
+    && !demoLocation
+    && metadata?.temporal_scope === "historical_replay"
+    && metadata?.execution_claim
+      === "historical_counterfactual_state_override_next_block"
     && (
       (
         metadata?.evidence_mode === undefined
@@ -2484,7 +2528,13 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
     && metadata?.demo_fixture === true
     && metadata?.evidence_mode === "offline_test_fixture"
     && metadata?.verification_status === "structurally_validated"
-    && isLoopbackHistoricalDemoLocation()
+    && metadata?.validation_boundary === "spawned_local_process"
+    && metadata?.temporal_scope === "historical_demo_fixture"
+    && metadata?.execution_claim === "synthetic_fixture_no_execution"
+    && metadata?.execution_status === "not_run"
+    && metadata?.simulation_basis === "deterministic_repository_fixture"
+    && metadata?.reference_kind === "synthetic_block_coordinate"
+    && demoLocation
   );
   if (
     !availability
@@ -2495,17 +2545,14 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
     || availability.reason !== null
     || !metadata
     || (!productionContract && !demoContract)
-    || metadata.temporal_scope !== "historical_replay"
-    || metadata.execution_claim
-      !== "historical_counterfactual_state_override_next_block"
     || !/^[0-9a-f]{64}$/.test(metadata.data_generation || "")
     || !/^replay:[0-9a-f]{64}$/.test(metadata.replay_id || "")
     || !Number.isSafeInteger(metadata.selected_block_number)
     || metadata.selected_block_number < 0
     || !metadata.coverage
     || metadata.coverage.scenario_count !== 10
-    || metadata.coverage.foundry_verified_count !== (demoFixture ? 0 : 10)
-    || (demoFixture && (
+    || metadata.coverage.foundry_verified_count !== (demoContract ? 0 : 10)
+    || (demoContract && (
       metadata.coverage.strict_count !== 0
       || metadata.coverage.executable_count !== 0
       || metadata.coverage.attested_count !== 0
@@ -2528,7 +2575,9 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
       && typeof route.buy_market_id === "string"
       && typeof route.sell_market_id === "string"
       && route.route_mode
-        === "historical_counterfactual_state_override_next_block"
+        === (demoContract
+          ? "synthetic_fixture_no_execution"
+          : "historical_counterfactual_state_override_next_block")
       && route.opportunity_class === "research_estimate"
       && route.availability?.status === "available"
       && ["uniswap_to_sushiswap", "sushiswap_to_uniswap"].includes(route.direction)
@@ -2542,12 +2591,23 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
       && typeof route.state_age_seconds === "number"
       && Number.isFinite(route.state_age_seconds)
       && route.state_age_seconds >= 0
-      && route.foundry_verified === !demoFixture
-      && Number.isSafeInteger(route.gas_used)
-      && route.gas_used >= 0
+      && route.foundry_verified === !demoContract
+      && (demoContract
+        ? (
+          route.gas_used === undefined
+          && Number.isSafeInteger(route.gas_assumption)
+          && route.gas_assumption >= 0
+        )
+        : (
+          route.gas_assumption === undefined
+          && Number.isSafeInteger(route.gas_used)
+          && route.gas_used >= 0
+        ))
       && /^[0-9a-f]{64}$/.test(route.receipt_sha256 || "")
       && /^[0-9a-f]{64}$/.test(route.trace_sha256 || "")
-      && route.executor_model === "prefunded_predeployed_preapproved"
+      && route.executor_model === (demoContract
+        ? "not_run"
+        : "prefunded_predeployed_preapproved")
       && historicalOpportunityDecimal(route.policy_net_edge_usd) !== null
       && historicalOpportunityDecimal(route.research_net_edge_usd) !== null
       && historicalOpportunityDecimal(route.baseline_net_edge_usd) !== null
@@ -2634,15 +2694,26 @@ function renderHistoricalOpportunities(payload) {
   );
   byId("historical-opportunity-empty").hidden = routes.length > 0;
   const badge = byId("opportunity-cohort-status");
-  badge.textContent = `${metadata.demo_fixture === true ? "Fixture block" : "Block"} ${metadata.selected_block_number}`;
+  badge.textContent = `${metadata.demo_fixture === true ? "Fixture reference" : "Block"} ${metadata.selected_block_number}`;
   badge.setAttribute("title", metadata.replay_id);
-  badge.setAttribute("aria-label", `Historical replay ${metadata.replay_id}`);
+  badge.setAttribute(
+    "aria-label",
+    metadata.demo_fixture === true
+      ? `Historical demo fixture ${metadata.replay_id}`
+      : `Historical replay ${metadata.replay_id}`,
+  );
   showStatus(
     byId("opportunity-status"),
     metadata.demo_fixture === true
-      ? `${routes.length} structurally validated repository fixture scenarios match the current filters; Foundry verification was not run.`
+      ? `${routes.length} structurally validated repository fixture scenarios match the current filters; execution and Foundry verification were not run.`
       : `${routes.length} Historical Foundry replay scenarios match the current filters.`,
     routes.length ? "success" : "warning",
+  );
+  setGlobalFreshness(
+    metadata.demo_fixture === true
+      ? `LOCAL DEMO FIXTURE · Foundry verification not run · fixture reference ${metadata.selected_block_number}`
+      : `Historical replay block ${metadata.selected_block_number}`,
+    "partial",
   );
   if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
@@ -2665,6 +2736,10 @@ function renderHistoricalOpportunityUnavailable(payload) {
   badge.textContent = "Historical replay unavailable";
   badge.removeAttribute("title");
   badge.setAttribute("aria-label", "Historical replay not published");
+  setGlobalFreshness(
+    "Historical replay unavailable",
+    "unavailable",
+  );
 }
 
 function opportunityInventoryVisibility(filters = {}) {
@@ -2726,6 +2801,12 @@ function clearHistoricalOpportunityInventory() {
 
 function prepareOpportunityScopeLoad(scope) {
   syncOpportunityScopePresentation(scope);
+  setGlobalFreshness(
+    scope === "historical"
+      ? "Loading historical replay"
+      : "Loading current opportunities",
+    "loading",
+  );
   if (scope === "historical") {
     clearCurrentOpportunityInventories();
     clearHistoricalOpportunityInventory();
@@ -2775,6 +2856,7 @@ function renderOpportunities(payload) {
       "Synchronized route opportunity publication is unavailable.",
       "warning",
     );
+    setGlobalFreshness("Current opportunities unavailable", "unavailable");
     if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
     return;
   }
@@ -2817,6 +2899,15 @@ function renderOpportunities(payload) {
     byId("opportunity-status"),
     `${routes.length} published route ${routes.length === 1 ? "scenario" : "scenarios"} match the current filters${checkedAt}${sla}.`,
     routes.length ? "success" : "warning",
+  );
+  const checkedAtFreshness = payload?.metadata?.checked_at
+    ? formatUtcTimestamp(payload.metadata.checked_at)
+    : null;
+  setGlobalFreshness(
+    checkedAtFreshness
+      ? `Current opportunities checked ${checkedAtFreshness}`
+      : "Current opportunities loaded",
+    "partial",
   );
   if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();
 }
@@ -2930,6 +3021,17 @@ function clearOpportunityFilterResult(errors) {
     byId(`${name}-opportunity-count`).textContent = "Unavailable";
   });
   clearHistoricalOpportunityInventory();
+  if (opportunityScope(app.route?.filters || {}) === "historical") {
+    setGlobalFreshness(
+      "Historical replay filters invalid",
+      "unavailable",
+    );
+  } else {
+    setGlobalFreshness(
+      "Current opportunity filters invalid",
+      "unavailable",
+    );
+  }
 }
 
 function opportunityRequestKey(filters) {
@@ -3122,7 +3224,10 @@ function invalidateOpportunityRequest() {
   return app.opportunityRequestId;
 }
 
-function clearOpportunityResult(message) {
+function clearOpportunityResult(
+  message,
+  scope = opportunityScope(app.route?.filters || {}),
+) {
   app.opportunities = null;
   byId("opportunities-view")?.setAttribute("aria-busy", "false");
   hideStatus(byId("opportunity-loading"));
@@ -3140,6 +3245,17 @@ function clearOpportunityResult(message) {
     byId(`${name}-opportunity-count`).textContent = "Unavailable";
   });
   clearHistoricalOpportunityInventory();
+  if (scope === "historical") {
+    setGlobalFreshness(
+      "Historical replay failed to load",
+      "unavailable",
+    );
+  } else {
+    setGlobalFreshness(
+      "Current opportunities failed to load",
+      "unavailable",
+    );
+  }
 }
 
 async function loadOpportunities(filters = app.route?.filters || {}) {
@@ -3199,6 +3315,7 @@ async function loadOpportunities(filters = app.route?.filters || {}) {
     }
     clearOpportunityResult(
       publicErrorMessage(error, "Opportunity publication failed to load."),
+      scope,
     );
     return false;
   } finally {

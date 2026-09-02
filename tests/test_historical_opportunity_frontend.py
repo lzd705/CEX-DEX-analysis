@@ -5,6 +5,9 @@ import subprocess
 import unittest
 from pathlib import Path
 
+from scripts.historical_opportunity_demo_fixture import (
+    HistoricalOpportunityDemoFixture,
+)
 from tests.test_opportunity_frontend import PAYLOAD_FIXTURE
 
 
@@ -16,11 +19,12 @@ STYLES_PATH = PROJECT_ROOT / "dashboard" / "static" / "styles.css"
 CURRENT_FRONTEND_TEST_PATH = PROJECT_ROOT / "tests" / "test_opportunity_frontend.py"
 
 HISTORICAL_DISCLAIMER = (
-    "Historical Replay. Fixed-block counterfactual scenarios under a hash-bound "
-    "state override model for a prefunded, predeployed, preapproved executor. "
-    "Evidence status is shown per row. Values are research estimates at the "
-    "displayed Ethereum block; they are not current and are not executable "
-    "candidates."
+    "Historical Scenarios. Production rows are fixed-block counterfactual "
+    "replays under their declared execution model. Local demo rows are "
+    "deterministic synthetic fixture outputs; no live RPC, execution, or "
+    "Foundry verification is run. Evidence status is shown per row. Values "
+    "are research estimates at the displayed block or fixture reference; "
+    "they are not current and are not executable candidates."
 )
 
 
@@ -80,6 +84,7 @@ const opportunityIds = [
   "opportunity-current-context", "opportunity-historical-context",
   "historical-opportunity-demo-label",
   "data-actions-nav",
+  "freshness", "freshness-cluster",
   "historical-opportunity-inventory", "historical-opportunity-count",
   "historical-opportunity-empty", "historical-opportunity-body",
   "strict-opportunities", "estimate-opportunities", "unavailable-opportunities",
@@ -92,6 +97,8 @@ const opportunityIds = [
 const opportunityElements = Object.fromEntries(
   opportunityIds.map((id) => [id, opportunityControl()]),
 );
+opportunityElements["freshness"].textContent = "Loading data";
+opportunityElements["freshness-cluster"].dataset.status = "loading";
 const opportunityScopeButtons = ["current", "historical"].map((scope) => {
   const button = opportunityControl();
   button.dataset.opportunityScope = scope;
@@ -186,6 +193,42 @@ const historicalPayload = {
 """
 
 
+DEMO_PAYLOAD_FIXTURE = r"""
+const demoPayload = JSON.parse(JSON.stringify(historicalPayload));
+Object.assign(demoPayload.metadata, {
+  contract_version: "opportunity_historical_demo_summary/v1",
+  demo_fixture: true,
+  evidence_mode: "offline_test_fixture",
+  verification_status: "structurally_validated",
+  validation_boundary: "spawned_local_process",
+  temporal_scope: "historical_demo_fixture",
+  execution_claim: "synthetic_fixture_no_execution",
+  execution_status: "not_run",
+  simulation_basis: "deterministic_repository_fixture",
+  reference_kind: "synthetic_block_coordinate",
+});
+demoPayload.metadata.coverage.foundry_verified_count = 0;
+demoPayload.metadata.coverage.positive_count = 0;
+demoPayload.freshness.reason_code = "historical_demo_fixture";
+demoPayload.routes.forEach((route) => {
+  route.route_mode = "synthetic_fixture_no_execution";
+  route.foundry_verified = false;
+  route.executor_model = "not_run";
+  route.gas_assumption = route.gas_used;
+  delete route.gas_used;
+  route.stress_robust = false;
+});
+Object.assign(demoPayload.routes[0], {
+  policy_net_edge_usd: "-0.25",
+  research_net_edge_usd: "-0.25",
+  net_edge_usd: "-0.25",
+  baseline_net_edge_usd: "-0.25",
+  stress_25_net_edge_usd: "-1.1",
+  stress_50_net_edge_usd: "-2.5",
+});
+"""
+
+
 class HistoricalOpportunityShellTests(unittest.TestCase):
     def test_node_harnesses_do_not_pin_a_private_tmp_worktree(self):
         harness = CURRENT_FRONTEND_TEST_PATH.read_text(encoding="utf-8")
@@ -209,6 +252,12 @@ class HistoricalOpportunityShellTests(unittest.TestCase):
         self.assertIn('id="historical-opportunity-body"', page)
         self.assertIn('id="historical-opportunity-count"', page)
         self.assertIn(HISTORICAL_DISCLAIMER, " ".join(page.split()))
+        self.assertIn("Historical / Fixture Scenarios", page)
+        self.assertIn("Block / fixture reference", page)
+        self.assertIn("Scenario result", page)
+        self.assertIn("State-age input", page)
+        self.assertIn("Evidence record", page)
+        self.assertNotIn("under a hash-bound state override model", page)
         self.assertNotIn("Foundry-verified", page)
         for attribute in (
             "data-api-generation",
@@ -348,14 +397,8 @@ console.log(JSON.stringify({
         result = run_app_javascript(
             HISTORICAL_DOM_FIXTURE
             + HISTORICAL_PAYLOAD_FIXTURE
+            + DEMO_PAYLOAD_FIXTURE
             + r"""
-const demoPayload = JSON.parse(JSON.stringify(historicalPayload));
-demoPayload.metadata.contract_version = "opportunity_historical_demo_summary/v1";
-demoPayload.metadata.demo_fixture = true;
-demoPayload.metadata.evidence_mode = "offline_test_fixture";
-demoPayload.metadata.verification_status = "structurally_validated";
-demoPayload.metadata.coverage.foundry_verified_count = 0;
-demoPayload.routes.forEach((route) => { route.foundry_verified = false; });
 const requested = normalizedOpportunityFilters({
   opportunityScope: "historical",
 });
@@ -369,13 +412,47 @@ global.window.location = {
 const loopbackAccepted = historicalOpportunityResponseMatchesRequest(
   demoPayload, requested,
 );
+const productionAcceptedOnDemoLocation = historicalOpportunityResponseMatchesRequest(
+  historicalPayload, requested,
+);
 const loopbackMarkup = historicalOpportunityRowMarkup(
   demoPayload.routes[0], historicalGeneration, historicalReplayId, true,
 );
+const semanticMutations = {
+  temporalScope(payload) { payload.metadata.temporal_scope = "historical_replay"; },
+  executionClaim(payload) {
+    payload.metadata.execution_claim = "historical_counterfactual_state_override_next_block";
+  },
+  executionStatus(payload) { payload.metadata.execution_status = "verified"; },
+  simulationBasis(payload) { payload.metadata.simulation_basis = "anvil_state_override"; },
+  referenceKind(payload) { payload.metadata.reference_kind = "ethereum_block"; },
+  validationBoundary(payload) { payload.metadata.validation_boundary = "same_process"; },
+  routeMode(payload) {
+    payload.routes[0].route_mode = "historical_counterfactual_state_override_next_block";
+  },
+  executorModel(payload) {
+    payload.routes[0].executor_model = "prefunded_predeployed_preapproved";
+  },
+  gasField(payload) {
+    payload.routes[0].gas_used = payload.routes[0].gas_assumption;
+    delete payload.routes[0].gas_assumption;
+  },
+};
+const semanticMutationAccepted = {};
+for (const [name, mutate] of Object.entries(semanticMutations)) {
+  const payload = JSON.parse(JSON.stringify(demoPayload));
+  mutate(payload);
+  semanticMutationAccepted[name] = historicalOpportunityResponseMatchesRequest(
+    payload, requested,
+  );
+}
 
 global.window.location.hostname = "production.example";
 const remoteAccepted = historicalOpportunityResponseMatchesRequest(
   demoPayload, requested,
+);
+const productionAcceptedRemotely = historicalOpportunityResponseMatchesRequest(
+  historicalPayload, requested,
 );
 const mislabeledProduction = JSON.parse(JSON.stringify(historicalPayload));
 mislabeledProduction.metadata.evidence_mode = "offline_test_fixture";
@@ -387,7 +464,10 @@ console.log(JSON.stringify({
   loopbackAccepted,
   loopbackMarkup,
   mislabeledProductionAccepted,
+  productionAcceptedOnDemoLocation,
+  productionAcceptedRemotely,
   remoteAccepted,
+  semanticMutationAccepted,
 }));
 """,
             prelude=navigation_prelude(),
@@ -396,15 +476,157 @@ console.log(JSON.stringify({
         self.assertTrue(result["loopbackAccepted"])
         self.assertFalse(result["remoteAccepted"])
         self.assertFalse(result["mislabeledProductionAccepted"])
+        self.assertFalse(result["productionAcceptedOnDemoLocation"])
+        self.assertTrue(result["productionAcceptedRemotely"])
+        self.assertEqual(result["semanticMutationAccepted"], {
+            "temporalScope": False,
+            "executionClaim": False,
+            "executionStatus": False,
+            "simulationBasis": False,
+            "referenceKind": False,
+            "validationBoundary": False,
+            "routeMode": False,
+            "executorModel": False,
+            "gasField": False,
+        })
         self.assertIn(
-            "Synthetic fixture evidence — verification not run",
+            "Synthetic fixture evidence — execution and verification not run",
             result["loopbackMarkup"],
         )
-        self.assertIn("Fixture gas", result["loopbackMarkup"])
-        self.assertIn("Fixture receipt digest", result["loopbackMarkup"])
-        self.assertIn("Fixture trace digest", result["loopbackMarkup"])
+        self.assertIn("Fixture gas assumption", result["loopbackMarkup"])
+        self.assertIn("Receipt-record digest", result["loopbackMarkup"])
+        self.assertIn("Workflow-trace digest", result["loopbackMarkup"])
+        self.assertIn("Fixture reference", result["loopbackMarkup"])
+        self.assertIn("Fixture model result", result["loopbackMarkup"])
+        self.assertIn("Fixture state-age input", result["loopbackMarkup"])
+        self.assertIn("Execution not run", result["loopbackMarkup"])
         self.assertIn('data-foundry-verified="false"', result["loopbackMarkup"])
         self.assertNotIn("Foundry verified", result["loopbackMarkup"])
+
+    def test_demo_success_resolves_global_loading_with_fixture_disclosure(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + HISTORICAL_PAYLOAD_FIXTURE
+            + DEMO_PAYLOAD_FIXTURE
+            + r"""
+global.window.location = {
+  pathname: "/opportunities",
+  search: "?opportunity_scope=historical",
+  hash: "#local-demo-fixture",
+  hostname: "127.0.0.1",
+};
+global.fetch = async () => ({
+  ok: true,
+  status: 200,
+  async json() { return demoPayload; },
+});
+(async () => {
+  const loaded = await applyOpportunitiesRoute({
+    kind: "opportunities",
+    filters: { opportunityScope: "historical" },
+  });
+  console.log(JSON.stringify({
+    loaded,
+    freshness: opportunityElements["freshness"].textContent,
+    freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
+  }));
+})();
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertEqual(result, {
+            "loaded": True,
+            "freshness": (
+                "LOCAL DEMO FIXTURE · Foundry verification not run · "
+                "fixture reference 18000000"
+            ),
+            "freshnessStatus": "partial",
+        })
+
+    def test_repository_demo_payload_is_accepted_and_rendered_on_loopback(self):
+        with HistoricalOpportunityDemoFixture() as fixture:
+            payload = fixture.build_payload()
+
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + "\nconst actualDemoPayload = "
+            + json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            + r""";
+global.window.location = {
+  pathname: "/opportunities",
+  search: "?opportunity_scope=historical",
+  hash: "#local-demo-fixture",
+  hostname: "127.0.0.1",
+};
+global.fetch = async () => ({
+  ok: true,
+  status: 200,
+  async json() { return actualDemoPayload; },
+});
+(async () => {
+  const loaded = await applyOpportunitiesRoute({
+    kind: "opportunities",
+    filters: { opportunityScope: "historical" },
+  });
+  const body = opportunityElements["historical-opportunity-body"].innerHTML;
+  console.log(JSON.stringify({
+    loaded,
+    rowCount: (body.match(/<tr /g) || []).length,
+    body,
+    freshness: opportunityElements["freshness"].textContent,
+    freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
+  }));
+})();
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertTrue(result["loaded"])
+        self.assertEqual(result["rowCount"], 10)
+        self.assertIn("Fixture reference", result["body"])
+        self.assertIn("Fixture model result", result["body"])
+        self.assertIn("Execution not run", result["body"])
+        self.assertNotIn("Foundry verified", result["body"])
+        self.assertEqual(
+            result["freshness"],
+            "LOCAL DEMO FIXTURE · Foundry verification not run · fixture reference 18000000",
+        )
+        self.assertEqual(result["freshnessStatus"], "partial")
+
+    def test_leaving_historical_for_screener_restores_market_freshness(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + HISTORICAL_PAYLOAD_FIXTURE
+            + r"""
+renderHistoricalOpportunities(historicalPayload);
+app.payload = {
+  metadata: {
+    freshness: {
+      cex_daily: { available_end: "2026-08-31" },
+      dex_daily: { available_end: "2026-08-30" },
+      common_comparable_end: "2026-08-30",
+      overall_status: "partial",
+    },
+  },
+};
+hydrateScreenerControls = () => ({ start: "", end: "" });
+syncTimeWindowControls = () => {};
+renderTable = () => {};
+syncMarketPayloadForWindow = () => {};
+applyScreenerRoute({ kind: "screener", filters: {} });
+console.log(JSON.stringify({
+  freshness: opportunityElements["freshness"].textContent,
+  freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
+}));
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertEqual(result, {
+            "freshness": "CEX 2026-08-31 · DEX 2026-08-30 · common 2026-08-30",
+            "freshnessStatus": "partial",
+        })
 
     def test_historical_decimal_strings_render_as_visible_currency_values(self):
         result = run_app_javascript(
@@ -476,8 +698,15 @@ const enteringCurrent = {
     .dataset.apiGeneration || "",
   currentContextHidden: opportunityElements["opportunity-current-context"].hidden,
   historicalContextHidden: opportunityElements["opportunity-historical-context"].hidden,
+  freshness: opportunityElements["freshness"].textContent,
+  freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
 };
-console.log(JSON.stringify({ enteringHistorical, enteringCurrent }));
+renderOpportunities(opportunityPayload);
+const currentResolved = {
+  freshness: opportunityElements["freshness"].textContent,
+  freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
+};
+console.log(JSON.stringify({ enteringHistorical, enteringCurrent, currentResolved }));
 """,
             prelude=navigation_prelude(),
         )
@@ -494,6 +723,77 @@ console.log(JSON.stringify({ enteringHistorical, enteringCurrent }));
             "generation": "",
             "currentContextHidden": False,
             "historicalContextHidden": True,
+            "freshness": "Loading current opportunities",
+            "freshnessStatus": "loading",
+        })
+        self.assertEqual(result["currentResolved"], {
+            "freshness": "Current opportunities checked 2026-08-01 00:00:30 UTC",
+            "freshnessStatus": "partial",
+        })
+
+    def test_current_unavailable_resolves_global_loading_state(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + PAYLOAD_FIXTURE
+            + r"""
+const unavailablePayload = JSON.parse(JSON.stringify(opportunityPayload));
+unavailablePayload.availability = {
+  status: "unavailable", reason: "complete_pointer_absent",
+};
+unavailablePayload.routes = [];
+unavailablePayload.metadata.coverage.returned_count = 0;
+global.fetch = async () => ({
+  ok: true,
+  status: 200,
+  async json() { return unavailablePayload; },
+});
+(async () => {
+  const loaded = await applyOpportunitiesRoute({
+    kind: "opportunities", filters: { notionalUsd: 10000 },
+  });
+  console.log(JSON.stringify({
+    loaded,
+    freshness: opportunityElements["freshness"].textContent,
+    freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
+  }));
+})();
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertEqual(result, {
+            "loaded": True,
+            "freshness": "Current opportunities unavailable",
+            "freshnessStatus": "unavailable",
+        })
+
+    def test_current_api_error_resolves_global_loading_state(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + r"""
+global.fetch = async () => ({
+  ok: false,
+  status: 503,
+  async json() { return { error: "Current opportunity service unavailable." }; },
+});
+(async () => {
+  const loaded = await applyOpportunitiesRoute({
+    kind: "opportunities", filters: {},
+  });
+  console.log(JSON.stringify({
+    loaded,
+    freshness: opportunityElements["freshness"].textContent,
+    freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
+  }));
+})();
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertEqual(result, {
+            "loaded": False,
+            "freshness": "Current opportunities failed to load",
+            "freshnessStatus": "unavailable",
         })
 
     def test_historical_scope_fetches_isolated_api_and_renders_all_audit_rows(self):
@@ -535,6 +835,8 @@ global.fetch = async (url) => {
       pressed: button.attributes["aria-pressed"],
       active: button.classList.contains("active"),
     })),
+    freshness: opportunityElements["freshness"].textContent,
+    freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
   }));
 })();
 """,
@@ -563,6 +865,10 @@ global.fetch = async (url) => {
         })
         self.assertEqual(result["count"], "10 scenarios")
         self.assertEqual(result["rowCount"], 10)
+        self.assertEqual(
+            result["freshness"], "Historical replay block 18000000"
+        )
+        self.assertEqual(result["freshnessStatus"], "partial")
         self.assertEqual(
             result["scopes"],
             [
@@ -727,6 +1033,8 @@ global.fetch = async () => ({
     error: opportunityElements["opportunity-error"].textContent,
     errorHidden: opportunityElements["opportunity-error"].hidden,
     badge: opportunityElements["opportunity-cohort-status"].textContent,
+    freshness: opportunityElements["freshness"].textContent,
+    freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
   }));
 })();
 """,
@@ -738,6 +1046,61 @@ global.fetch = async () => ({
         self.assertIn("No historical replay has been published yet", result["unavailable"])
         self.assertTrue(result["errorHidden"])
         self.assertNotIn("invalid", result["badge"].lower())
+        self.assertEqual(result["freshness"], "Historical replay unavailable")
+        self.assertEqual(result["freshnessStatus"], "unavailable")
+
+    def test_historical_api_error_resolves_global_loading_state(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + r"""
+global.fetch = async () => ({
+  ok: false,
+  status: 503,
+  async json() { return { error: "Historical replay service unavailable." }; },
+});
+(async () => {
+  const loaded = await applyOpportunitiesRoute({
+    kind: "opportunities", filters: { opportunityScope: "historical" },
+  });
+  console.log(JSON.stringify({
+    loaded,
+    error: opportunityElements["opportunity-error"].textContent,
+    freshness: opportunityElements["freshness"].textContent,
+    freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
+  }));
+})();
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertFalse(result["loaded"])
+        self.assertEqual(result["error"], "Historical replay service unavailable.")
+        self.assertEqual(result["freshness"], "Historical replay failed to load")
+        self.assertEqual(result["freshnessStatus"], "unavailable")
+
+    def test_invalid_historical_filters_resolve_global_loading_state(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + r"""
+(async () => {
+  const loaded = await applyOpportunitiesRoute({
+    kind: "opportunities",
+    filters: { opportunityScope: "historical", token: "bad token" },
+    validationErrors: [{ field: "token", reason: "invalid" }],
+  });
+  console.log(JSON.stringify({
+    loaded,
+    freshness: opportunityElements["freshness"].textContent,
+    freshnessStatus: opportunityElements["freshness-cluster"].dataset.status,
+  }));
+})();
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertFalse(result["loaded"])
+        self.assertEqual(result["freshness"], "Historical replay filters invalid")
+        self.assertEqual(result["freshnessStatus"], "unavailable")
 
     def test_other_historical_unavailable_reasons_fail_closed(self):
         result = run_app_javascript(

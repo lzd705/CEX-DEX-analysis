@@ -73,6 +73,24 @@ npm --prefix dashboard install
 ./scripts/run_dashboard.sh
 ```
 
+### Local Historical Opportunity demo
+
+From the repository root, start the self-contained, loopback-only demo with:
+
+```bash
+python3 scripts/run_historical_opportunity_demo.py --port 0
+```
+
+Open the URL printed by the command, apply an Opportunity notional filter, and
+press `Ctrl-C` when finished. The runner builds ten deterministic synthetic
+scenarios, validates their structure in a fresh local Python process, serves
+only the read-only historical demo API and dashboard assets on `127.0.0.1`,
+then removes its temporary fixture on exit. It does not require Foundry,
+`forge-std`, ignored local toolchains, current market data, or an RPC endpoint.
+The page labels all receipt-record, workflow-trace, gas-assumption, and result
+values as fixture evidence; they are not execution, verification, or profit
+claims.
+
 The application code and SQLite schemas are versioned in GitHub. Reviewed
 market CSV inputs and the generated `market_facts.sqlite3` runtime database
 live in the ignored `data/local/` directory, or an external directory selected

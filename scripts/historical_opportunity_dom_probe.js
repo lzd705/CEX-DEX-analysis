@@ -5,7 +5,7 @@ const vm = require("vm");
 
 const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 const MAX_MEMBER_BYTES = 4 * 1024 * 1024;
-const DISCLAIMER = "Historical Replay. Fixed-block counterfactual scenarios under a hash-bound state override model for a prefunded, predeployed, preapproved executor. Evidence status is shown per row. Values are research estimates at the displayed Ethereum block; they are not current and are not executable candidates.";
+const DISCLAIMER = "Historical Scenarios. Production rows are fixed-block counterfactual replays under their declared execution model. Local demo rows are deterministic synthetic fixture outputs; no live RPC, execution, or Foundry verification is run. Evidence status is shown per row. Values are research estimates at the displayed block or fixture reference; they are not current and are not executable candidates.";
 const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
 
 function fail() { process.exitCode = 1; }
@@ -336,7 +336,7 @@ async function main() {
   const html = htmlBytes.toString("utf8");
   if (Buffer.from(html, "utf8").compare(htmlBytes) !== 0) throw new Error("utf8");
   const document = parseHtml(html);
-  const requiredIds = ["opportunity-current-context", "opportunity-historical-context", "historical-opportunity-demo-label", "opportunities-view", "historical-opportunity-inventory", "historical-opportunity-title", "historical-opportunity-count", "historical-opportunity-empty", "historical-opportunity-body", "strict-opportunities", "strict-opportunity-body", "estimate-opportunities", "estimate-opportunity-body", "unavailable-opportunities", "unavailable-opportunity-body"];
+  const requiredIds = ["freshness", "freshness-cluster", "opportunity-current-context", "opportunity-historical-context", "historical-opportunity-demo-label", "opportunities-view", "historical-opportunity-inventory", "historical-opportunity-title", "historical-opportunity-count", "historical-opportunity-empty", "historical-opportunity-body", "strict-opportunities", "strict-opportunity-body", "estimate-opportunities", "estimate-opportunity-body", "unavailable-opportunities", "unavailable-opportunity-body"];
   if (requiredIds.some((id) => !document.getElementById(id))) throw new Error("missing DOM hook");
   const scopes = document.querySelectorAll("[data-opportunity-scope]");
   if (scopes.length !== 2 || html.split(DISCLAIMER).length - 1 !== 1) throw new Error("historical shell");
@@ -391,6 +391,9 @@ async function main() {
   const currentScope = scopes.find((element) => element.dataset.opportunityScope === "current");
   const historicalScope = scopes.find((element) => element.dataset.opportunityScope === "historical");
   if (root.hidden !== false || document.getElementById("opportunity-current-context").hidden !== true || document.getElementById("opportunity-historical-context").hidden !== false || !currentScope || currentScope.getAttribute("aria-pressed") !== "false" || !historicalScope || historicalScope.getAttribute("aria-pressed") !== "true") throw new Error("historical visibility");
+  const freshness = document.getElementById("freshness");
+  const freshnessCluster = document.getElementById("freshness-cluster");
+  if (freshness.textContent !== `Historical replay block ${input.api_payload.metadata.selected_block_number}` || freshnessCluster.dataset.status !== "partial") throw new Error("historical freshness");
   const surfaceBytes = Buffer.from(JSON.stringify({ api_data_generation: input.data_generation, application_sha: input.application_sha, asset_sha: input.asset_sha, html_sha256: input.historical_html_sha256 }));
   process.stdout.write(JSON.stringify({
     application_sha: input.application_sha,
