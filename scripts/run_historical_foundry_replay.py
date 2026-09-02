@@ -2047,6 +2047,142 @@ def _produce_historical_raw_run(*, data_dir: Path) -> Mapping[str, Any]:
         ) from error
 
 
+def _prepare_historical_replay_bundle(
+    *, data_dir: Path, raw_state: Mapping[str, Any], publish: bool,
+) -> Mapping[str, Any]:
+    """Stage the private core and complete bundle from one raw authority."""
+    import scripts.historical_route_publication as publication
+
+    if (
+        type(raw_state) is not dict
+        or type(publish) is not bool
+        or raw_state.get("run") is None
+        or raw_state.get("publication_lease") is None
+    ):
+        raise _entrypoint_error(
+            "historical publication preparation is invalid"
+        )
+    finalized = raw_state["run"]
+    publication_lease = raw_state["publication_lease"]
+    raw_state["run"] = None
+    raw_state["publication_lease"] = None
+    owned = [finalized, publication_lease]
+    try:
+        core_stage = publication.stage_historical_replay_core(
+            data_dir=data_dir,
+            config=raw_state["config"],
+            publication_lease=publication_lease,
+        )
+        owned = [finalized, core_stage]
+        staged_context = (
+            publication.load_validated_historical_replay_core_at(
+                staged_core=core_stage
+            )
+        )
+        owned = [finalized, core_stage, staged_context]
+        staged_projection_bytes = publication._canonical_bytes(
+            dict(staged_context.identity_projection())
+        )
+        staged_payload_bytes = publication._canonical_bytes(dict(
+            publication._build_historical_complete_payload(
+                context=staged_context
+            )
+        ))
+
+        if publish:
+            staged_context.close()
+            owned = [finalized, core_stage]
+            context = publication.publish_historical_replay_core(
+                data_dir=data_dir, staged_core=core_stage
+            )
+            core_stage = None
+            owned = [finalized, context]
+            if publication._canonical_bytes(
+                dict(context.identity_projection())
+            ) != staged_projection_bytes:
+                raise _entrypoint_error(
+                    "historical committed core differs from staged core"
+                )
+        else:
+            context = staged_context
+
+        authoritative_payload_bytes = publication._canonical_bytes(dict(
+            publication._build_historical_complete_payload(
+                context=context
+            )
+        ))
+        if authoritative_payload_bytes != staged_payload_bytes:
+            raise _entrypoint_error(
+                "historical opportunity economics changed after core staging"
+            )
+        bundle = publication.stage_historical_replay_bundle(
+            data_dir=data_dir,
+            raw_root=(data_dir / "raw" / "historical-foundry-replay"),
+            context=context,
+        )
+        if not isinstance(bundle, Mapping):
+            raise _entrypoint_error(
+                "historical complete bundle is invalid"
+            )
+        subject = bundle.get("verification_subject")
+        if subject is None:
+            raise _entrypoint_error(
+                "historical complete bundle is invalid"
+            )
+        owned.append(subject)
+        prepared = {
+            "mode": "publish" if publish else "dry-run",
+            "selection": raw_state["selection"],
+            "run_identity": raw_state["run_identity"],
+            "run": finalized,
+            "core_stage": core_stage,
+            "context": context,
+            "bundle": bundle,
+            "verification_subject": subject,
+            "_owned_resources": owned,
+        }
+        owned = []
+        return prepared
+    except BaseException as error:
+        cleanup_error = _close_historical_controller_resources(owned)
+        if not isinstance(error, Exception):
+            raise error from cleanup_error
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from error
+        if isinstance(error, HistoricalReplayEntrypointError):
+            raise error
+        raise _entrypoint_error(
+            "historical publication preparation failed"
+        ) from error
+
+
+def _close_prepared_historical_bundle(
+    prepared: Mapping[str, Any],
+) -> None:
+    if type(prepared) is not dict:
+        raise _entrypoint_error(
+            "historical publication cleanup is invalid"
+        )
+    resources = prepared.get("_owned_resources")
+    if type(resources) is not list:
+        if resources == ():
+            return None
+        raise _entrypoint_error(
+            "historical publication cleanup is invalid"
+        )
+    prepared["_owned_resources"] = ()
+    cleanup_error = _close_historical_controller_resources(resources)
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(
+            "historical publication cleanup failed"
+        ) from cleanup_error
+    return None
+
+
 def _invoke_production_controller(
     _arguments: argparse.Namespace, _preflight: Any,
 ) -> Mapping[str, Any]:

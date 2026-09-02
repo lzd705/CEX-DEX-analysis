@@ -2619,5 +2619,229 @@ class HistoricalReplayRawRunControllerTests(unittest.TestCase):
         self.assertEqual(events[-1], ("close", "capture"))
 
 
+class HistoricalReplayBundlePreparationTests(unittest.TestCase):
+    class Resource(HistoricalReplayRawRunControllerTests.Resource):
+        pass
+
+    class Context(Resource):
+        def __init__(self, name, events, projection):
+            super().__init__(name, events)
+            self.projection = copy.deepcopy(projection)
+
+        def identity_projection(self):
+            self.events.append(("identity", self.name))
+            return copy.deepcopy(self.projection)
+
+    def setUp(self):
+        self.module = _entrypoint()
+
+    def _fixture(self):
+        events = []
+        finalized = self.Resource("finalized", events)
+        lease = self.Resource("lease", events)
+        stage = self.Resource("core_stage", events)
+        subject = self.Resource("subject", events)
+        staged_projection = {
+            "schema": "historical_replay_build_context/v1",
+            "run_id": "run:" + "a" * 64,
+            "core_manifest_sha256": "b" * 64,
+            "core_pointer": {"route_cohort_id": "cohort:" + "c" * 64},
+        }
+        staged_context = self.Context(
+            "staged_context", events, staged_projection
+        )
+        committed_context = self.Context(
+            "committed_context", events, staged_projection
+        )
+        payload = {
+            "replay_id": "replay:" + "d" * 64,
+            "bundle": {"route_cohort_id": "cohort:" + "c" * 64},
+            "opportunities": tuple(range(10)),
+        }
+        bundle = {
+            "path": Path("/immutable-data/routes/historical/bundles")
+            / ("replay:" + "d" * 64),
+            "replay_id": "replay:" + "d" * 64,
+            "manifest_sha256": "e" * 64,
+            "pointer_core": {"schema": "route_historical_replay_pointer/v1"},
+            "verification_subject": subject,
+        }
+        raw = {
+            "config": object(),
+            "selection": {
+                "status": "found_publishable_profitable_block",
+                "selected_scenario_count": 10,
+                "unresolved_candidate_count": 0,
+            },
+            "run": finalized,
+            "run_identity": {
+                "run_id": "run:" + "a" * 64,
+                "run_manifest_sha256": "f" * 64,
+            },
+            "publication_lease": lease,
+        }
+        return {
+            "events": events,
+            "finalized": finalized,
+            "lease": lease,
+            "stage": stage,
+            "subject": subject,
+            "staged_context": staged_context,
+            "committed_context": committed_context,
+            "payload": payload,
+            "bundle": bundle,
+            "raw": raw,
+        }
+
+    def _patch_publication(self, fixture):
+        import scripts.historical_route_publication as publication
+
+        events = fixture["events"]
+
+        def stage_core(**keywords):
+            events.append(("stage_core", keywords))
+            return fixture["stage"]
+
+        def load_staged(**keywords):
+            events.append(("load_staged", keywords))
+            return fixture["staged_context"]
+
+        def publish_core(**keywords):
+            events.append(("publish_core", keywords))
+            return fixture["committed_context"]
+
+        def build_payload(*, context):
+            events.append(("build_payload", context.name))
+            return copy.deepcopy(fixture["payload"])
+
+        def stage_bundle(**keywords):
+            events.append(("stage_bundle", keywords))
+            return fixture["bundle"]
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(
+            publication,
+            "stage_historical_replay_core",
+            side_effect=stage_core,
+        ))
+        stack.enter_context(mock.patch.object(
+            publication,
+            "load_validated_historical_replay_core_at",
+            side_effect=load_staged,
+        ))
+        publish = stack.enter_context(mock.patch.object(
+            publication,
+            "publish_historical_replay_core",
+            side_effect=publish_core,
+        ))
+        stack.enter_context(mock.patch.object(
+            publication,
+            "_build_historical_complete_payload",
+            side_effect=build_payload,
+        ))
+        stack.enter_context(mock.patch.object(
+            publication,
+            "stage_historical_replay_bundle",
+            side_effect=stage_bundle,
+        ))
+        return stack, publish
+
+    def test_dry_run_keeps_staged_core_and_never_moves_its_pointer(self):
+        fixture = self._fixture()
+        patches, publish = self._patch_publication(fixture)
+        with patches:
+            prepared = self.module._prepare_historical_replay_bundle(
+                data_dir=Path("/immutable-data"),
+                raw_state=fixture["raw"],
+                publish=False,
+            )
+
+        publish.assert_not_called()
+        self.assertIs(prepared["core_stage"], fixture["stage"])
+        self.assertIs(prepared["context"], fixture["staged_context"])
+        self.assertIs(prepared["verification_subject"], fixture["subject"])
+        self.assertIsNone(fixture["raw"]["run"])
+        self.assertIsNone(fixture["raw"]["publication_lease"])
+        self.assertEqual(
+            [event[0] for event in fixture["events"]],
+            [
+                "stage_core", "load_staged", "identity",
+                "build_payload", "build_payload", "stage_bundle",
+            ],
+        )
+        self.module._close_prepared_historical_bundle(prepared)
+        self.assertEqual(
+            fixture["events"][-4:],
+            [
+                ("close", "subject"),
+                ("close", "staged_context"),
+                ("close", "core_stage"),
+                ("close", "finalized"),
+            ],
+        )
+
+    def test_publish_reloads_equal_committed_context_before_bundle(self):
+        fixture = self._fixture()
+        patches, publish = self._patch_publication(fixture)
+        with patches:
+            prepared = self.module._prepare_historical_replay_bundle(
+                data_dir=Path("/immutable-data"),
+                raw_state=fixture["raw"],
+                publish=True,
+            )
+
+        publish.assert_called_once_with(
+            data_dir=Path("/immutable-data"),
+            staged_core=fixture["stage"],
+        )
+        self.assertIsNone(prepared["core_stage"])
+        self.assertIs(prepared["context"], fixture["committed_context"])
+        self.assertEqual(
+            [event[0] for event in fixture["events"]],
+            [
+                "stage_core", "load_staged", "identity",
+                "build_payload", "close", "publish_core", "identity",
+                "build_payload", "stage_bundle",
+            ],
+        )
+        self.assertEqual(
+            fixture["events"][4], ("close", "staged_context")
+        )
+        self.module._close_prepared_historical_bundle(prepared)
+        self.assertEqual(
+            fixture["events"][-3:],
+            [
+                ("close", "subject"),
+                ("close", "committed_context"),
+                ("close", "finalized"),
+            ],
+        )
+
+    def test_committed_context_drift_fails_before_complete_bundle(self):
+        fixture = self._fixture()
+        fixture["committed_context"].projection[
+            "core_manifest_sha256"
+        ] = "0" * 64
+        patches, _publish = self._patch_publication(fixture)
+        with patches:
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "historical committed core differs from staged core",
+            ):
+                self.module._prepare_historical_replay_bundle(
+                    data_dir=Path("/immutable-data"),
+                    raw_state=fixture["raw"],
+                    publish=True,
+                )
+
+        self.assertNotIn(
+            "stage_bundle",
+            [event[0] for event in fixture["events"]],
+        )
+        self.assertEqual(fixture["subject"].closed, 0)
+        self.assertEqual(fixture["committed_context"].closed, 1)
+        self.assertEqual(fixture["finalized"].closed, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
