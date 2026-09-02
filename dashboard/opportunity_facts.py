@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import stat
@@ -34,13 +36,22 @@ from scripts.route_opportunity import (
     ROUTE_OPPORTUNITY_MODES,
     ROUTE_OPPORTUNITY_REASON_CODES,
 )
-from scripts.route_cost_topology import live_complete_cost_component_keys
+from scripts.route_cost_topology import (
+    HISTORICAL_ATOMIC_COMPONENT_MATRIX,
+    live_complete_cost_component_keys,
+)
 from scripts.timestamp_contract import parse_rfc3339_utc
 
 
 OPPORTUNITY_SUMMARY_CONTRACT = "opportunity_summary/v1"
+HISTORICAL_OPPORTUNITY_SUMMARY_CONTRACT = (
+    "opportunity_historical_summary/v1"
+)
 COMPLETE_POINTER_ABSENT = "complete_pointer_absent"
+HISTORICAL_REPLAY_POINTER_ABSENT = "historical_replay_pointer_absent"
 OPPORTUNITY_BUNDLE_VALIDATION_FAILED = "opportunity_bundle_validation_failed"
+HISTORICAL_SIMULATION_BASIS = "hash_bound_state_override_next_block"
+HISTORICAL_EXECUTOR_MODEL = "prefunded_predeployed_preapproved"
 MAX_ROUTE_AGE_SECONDS = Decimal(str(ROUTE_OPPORTUNITY_MAX_AGE_SECONDS))
 MAX_ROUTE_SKEW_SECONDS = Decimal(str(ROUTE_OPPORTUNITY_MAX_SKEW_SECONDS))
 ROUTE_VOLUME_BASIS = "minimum_leg_source_horizon_usd"
@@ -203,6 +214,47 @@ def load_latest_opportunities(
         )
     except (OSError, RoutePublicationError, TypeError, ValueError):
         raise OpportunityBundleInvalid() from None
+
+
+def load_latest_historical_opportunities(
+    routes_root: Optional[Path] = None,
+    raw_root: Optional[Path] = None,
+) -> Mapping[str, Any]:
+    """Load one fully verified, pointer-bound historical replay bundle."""
+
+    import scripts.historical_route_publication as publication
+
+    routes = resolve_opportunity_bundle(routes_root)
+    historical = routes / "historical"
+    raw = (
+        Path(raw_root)
+        if raw_root is not None
+        else routes.parent / "raw" / "historical-foundry-replay"
+    )
+    pointer_state = _pointer_state(historical)
+    if pointer_state == "missing":
+        raise OpportunityBundleUnavailable(
+            HISTORICAL_REPLAY_POINTER_ABSENT
+        )
+    if pointer_state != "present":
+        raise OpportunityBundleInvalid()
+    try:
+        loaded = publication.load_latest_historical_replay_bundle(
+            historical, raw_root=raw
+        )
+    except (
+        OSError,
+        publication.HistoricalRoutePublicationError,
+        RoutePublicationError,
+        TypeError,
+        ValueError,
+    ):
+        raise OpportunityBundleInvalid() from None
+    if loaded is None:
+        raise OpportunityBundleUnavailable(
+            HISTORICAL_REPLAY_POINTER_ABSENT
+        )
+    return loaded
 
 
 def _canonical_decimal_text(value: Any, label: str) -> str:
@@ -1465,6 +1517,566 @@ def build_unavailable_opportunity_payload(
                 "class_counts": {},
                 "availability_counts": {},
             },
+        },
+        "filters": filters,
+        "routes": [],
+    }
+
+
+def _reread_historical_publication(loaded: Mapping[str, Any]) -> None:
+    if not isinstance(loaded, Mapping):
+        raise OpportunityBundleInvalid()
+    view = loaded.get("validated_view")
+    reread = getattr(view, "reread_unchanged", None)
+    if not callable(reread):
+        raise OpportunityBundleInvalid()
+    try:
+        reread()
+    except Exception:
+        raise OpportunityBundleInvalid() from None
+
+
+def _historical_sha256(value: Any) -> str:
+    if not isinstance(value, str) or _HEX_SHA256.fullmatch(value) is None:
+        raise OpportunityBundleInvalid()
+    return value
+
+
+def _historical_generation_projection(
+    loaded: Mapping[str, Any],
+) -> Dict[str, Any]:
+    try:
+        manifest = loaded["manifest"]
+        signature = loaded["publication_signature"]
+        if not isinstance(manifest, Mapping) or isinstance(
+            signature, (str, bytes, Mapping)
+        ):
+            raise OpportunityBundleInvalid()
+        members = []
+        roles = set()
+        for signature_row in signature:
+            if (
+                not isinstance(signature_row, Sequence)
+                or isinstance(signature_row, (str, bytes))
+                or len(signature_row) < 3
+            ):
+                raise OpportunityBundleInvalid()
+            role, digest, size = signature_row[:3]
+            selected = (
+                isinstance(role, str)
+                and (
+                    (
+                        role.startswith("complete:")
+                        and role != "complete:manifest.json"
+                    )
+                    or role.startswith("raw:")
+                )
+            )
+            if not selected:
+                continue
+            if (
+                role in roles
+                or type(size) is not int
+                or size <= 0
+            ):
+                raise OpportunityBundleInvalid()
+            roles.add(role)
+            members.append([
+                role, _historical_sha256(digest), size,
+            ])
+        expected_complete = {
+            "complete:cost_components.csv",
+            "complete:replay_evidence.json",
+            "complete:route_cohort.sqlite3",
+            "complete:route_legs.csv",
+            "complete:route_opportunities.csv",
+        }
+        if (
+            {role for role in roles if role.startswith("complete:")}
+            != expected_complete
+            or "raw:run_manifest.json" not in roles
+        ):
+            raise OpportunityBundleInvalid()
+        return {
+            "contract_version": HISTORICAL_OPPORTUNITY_SUMMARY_CONTRACT,
+            "pointer_sha256": _historical_sha256(
+                loaded["pointer_sha256"]
+            ),
+            "verification_report_sha256": _historical_sha256(
+                loaded["verification_report_sha256"]
+            ),
+            "manifest_sha256": _historical_sha256(
+                loaded["manifest_sha256"]
+            ),
+            "historical_core_manifest_sha256": _historical_sha256(
+                manifest["historical_core_manifest_sha256"]
+            ),
+            "historical_core_pointer_sha256": _historical_sha256(
+                manifest["historical_core_pointer_sha256"]
+            ),
+            "members": members,
+        }
+    except (KeyError, TypeError, ValueError, OpportunityBundleInvalid):
+        raise OpportunityBundleInvalid() from None
+
+
+def historical_opportunity_data_generation(
+    loaded: Mapping[str, Any],
+) -> str:
+    """Hash the path-free logical identity of one historical publication."""
+
+    _reread_historical_publication(loaded)
+    projection = _historical_generation_projection(loaded)
+    encoded = json.dumps(
+        projection,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    generation = hashlib.sha256(encoded).hexdigest()
+    _reread_historical_publication(loaded)
+    return generation
+
+
+def _historical_decimal(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > _MAX_DECIMAL_TEXT_LENGTH
+    ):
+        raise OpportunityBundleInvalid()
+    try:
+        number = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError):
+        raise OpportunityBundleInvalid() from None
+    if not number.is_finite():
+        raise OpportunityBundleInvalid()
+    canonical = format(number, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    if number == 0:
+        canonical = "0"
+    if value != canonical:
+        raise OpportunityBundleInvalid()
+    return value
+
+
+def _historical_block_timestamp(value: Any) -> str:
+    if type(value) is not int or value < 0:
+        raise OpportunityBundleInvalid()
+    try:
+        result = datetime.fromtimestamp(value, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        raise OpportunityBundleInvalid() from None
+    return result.isoformat().replace("+00:00", "Z")
+
+
+def _historical_projected_rows(
+    loaded: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    try:
+        manifest = loaded["manifest"]
+        evidence = loaded["replay_evidence"]
+        routes = list(loaded["routes"])
+        opportunities = list(loaded["opportunities"])
+        costs = list(loaded["cost_components"])
+        report = loaded["verification_report"]
+        if not all(isinstance(item, Mapping) for item in (
+            manifest, evidence, report,
+        )):
+            raise OpportunityBundleInvalid()
+        if (
+            len(routes) != 2
+            or len(opportunities) != 10
+            or len(costs) != 90
+            or evidence.get("scenario_count") != 10
+            or report.get("status") != "verified"
+            or report.get("evidence_mode") != "production_connected"
+            or manifest.get("temporal_scope") != "historical_replay"
+            or manifest.get("execution_claim")
+            != "historical_counterfactual_state_override_next_block"
+        ):
+            raise OpportunityBundleInvalid()
+        selected = manifest["selected_block"]
+        if (
+            not isinstance(selected, Mapping)
+            or type(selected.get("number")) is not int
+            or type(selected.get("timestamp")) is not int
+            or type(selected.get("synthetic_child_number")) is not int
+            or type(selected.get("synthetic_child_timestamp")) is not int
+            or selected["synthetic_child_number"] != selected["number"] + 1
+            or selected["synthetic_child_timestamp"] < selected["timestamp"]
+            or evidence.get("selected_block") != selected
+        ):
+            raise OpportunityBundleInvalid()
+        state_age = (
+            selected["synthetic_child_timestamp"] - selected["timestamp"]
+        )
+        selected_timestamp = _historical_block_timestamp(
+            selected["timestamp"]
+        )
+        routes_by_id = {}
+        for route in routes:
+            if not isinstance(route, Mapping):
+                raise OpportunityBundleInvalid()
+            route_id = route.get("route_id")
+            if not isinstance(route_id, str) or route_id in routes_by_id:
+                raise OpportunityBundleInvalid()
+            routes_by_id[route_id] = route
+        scenario_rows = evidence.get("scenarios")
+        if isinstance(scenario_rows, (str, bytes, Mapping)) or not isinstance(
+            scenario_rows, Sequence
+        ):
+            raise OpportunityBundleInvalid()
+        scenarios_by_id = {}
+        for scenario in scenario_rows:
+            if not isinstance(scenario, Mapping):
+                raise OpportunityBundleInvalid()
+            opportunity_id = scenario.get("opportunity_id")
+            if (
+                not isinstance(opportunity_id, str)
+                or opportunity_id in scenarios_by_id
+            ):
+                raise OpportunityBundleInvalid()
+            scenarios_by_id[opportunity_id] = scenario
+        costs_by_id: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+        for cost in costs:
+            if not isinstance(cost, Mapping):
+                raise OpportunityBundleInvalid()
+            opportunity_id = cost.get("opportunity_id")
+            if not isinstance(opportunity_id, str):
+                raise OpportunityBundleInvalid()
+            costs_by_id[opportunity_id].append(cost)
+        opportunity_ids = {
+            row.get("opportunity_id")
+            for row in opportunities
+            if isinstance(row, Mapping)
+        }
+        if (
+            len(opportunity_ids) != 10
+            or None in opportunity_ids
+            or set(scenarios_by_id) != opportunity_ids
+            or set(costs_by_id) != opportunity_ids
+        ):
+            raise OpportunityBundleInvalid()
+        expected_matrix = {
+            (leg, component_type): (value_status, embedded)
+            for leg, component_type, value_status, embedded
+            in HISTORICAL_ATOMIC_COMPONENT_MATRIX
+        }
+        projected = []
+        coordinates = set()
+        for opportunity in opportunities:
+            opportunity_id = opportunity["opportunity_id"]
+            route_id = opportunity.get("route_id")
+            route = routes_by_id.get(route_id)
+            scenario = scenarios_by_id[opportunity_id]
+            component_rows = costs_by_id[opportunity_id]
+            observed_matrix = {
+                (row.get("leg"), row.get("component_type")): (
+                    row.get("value_status"),
+                    row.get("embedded_in_leg_quote"),
+                )
+                for row in component_rows
+            }
+            if (
+                route is None
+                or len(component_rows) != len(expected_matrix)
+                or observed_matrix != expected_matrix
+                or opportunity.get("opportunity_class") != "research_estimate"
+                or opportunity.get("strict_eligible") is not False
+                or opportunity.get("strict_ready_for_publication") is not False
+                or opportunity.get("publication_attestation_sha256") is not None
+                or scenario.get("opportunity_class") != "research_estimate"
+                or scenario.get("opportunity_id") != opportunity_id
+                or scenario.get("route_id") != route_id
+                or scenario.get("selected_block") != selected
+                or scenario.get("receipt_status") != 1
+                or scenario.get("policy_sha256") != manifest.get("policy_sha256")
+                or scenario.get("research_net_edge_usd")
+                != opportunity.get("research_net_edge_usd")
+            ):
+                raise OpportunityBundleInvalid()
+            direction = scenario.get("direction")
+            notional = str(scenario.get("requested_notional_usd"))
+            if (
+                direction not in {
+                    "sushiswap_to_uniswap", "uniswap_to_sushiswap"
+                }
+                or notional != opportunity.get("requested_notional_usd")
+            ):
+                raise OpportunityBundleInvalid()
+            coordinate = (direction, notional)
+            if coordinate in coordinates:
+                raise OpportunityBundleInvalid()
+            coordinates.add(coordinate)
+            receipt = scenario.get("receipt")
+            baseline = scenario.get("baseline")
+            stress_25 = scenario.get("stress_25")
+            stress_50 = scenario.get("stress_50")
+            if not all(isinstance(item, Mapping) for item in (
+                receipt, baseline, stress_25, stress_50,
+            )):
+                raise OpportunityBundleInvalid()
+            baseline_net = _historical_decimal(
+                baseline.get("research_net_edge_usd")
+            )
+            research_net = _historical_decimal(
+                opportunity.get("research_net_edge_usd")
+            )
+            if baseline_net != research_net:
+                raise OpportunityBundleInvalid()
+            projected.append({
+                "route_id": route_id,
+                "opportunity_id": opportunity_id,
+                "scenario_key": scenario.get("scenario_key"),
+                "token_symbol": opportunity.get("token_symbol"),
+                "buy_market_id": opportunity.get("buy_market_id"),
+                "sell_market_id": opportunity.get("sell_market_id"),
+                "leg_venues": {
+                    "buy": _canonical_leg_venue(
+                        opportunity.get("buy_market_id")
+                    ),
+                    "sell": _canonical_leg_venue(
+                        opportunity.get("sell_market_id")
+                    ),
+                },
+                "route_type": _route_type(opportunity),
+                "route_mode": manifest["execution_claim"],
+                "direction": direction,
+                "requested_notional_usd": notional,
+                "opportunity_class": "research_estimate",
+                "availability": {"status": "available", "reason": None},
+                "gross_edge_usd": _historical_decimal(
+                    opportunity.get("gross_edge_usd")
+                ),
+                "net_edge_usd": research_net,
+                "net_edge_bps": _historical_decimal(
+                    opportunity.get("research_net_edge_bps")
+                ),
+                "capacity_quantity": _historical_decimal(
+                    opportunity.get("maximum_proved_capacity_quantity")
+                ),
+                "skew_seconds": _historical_decimal(
+                    opportunity.get("skew_seconds")
+                ),
+                "route_age_seconds": state_age,
+                "route_volume_usd": route.get("route_volume_usd"),
+                "selected_block_number": selected["number"],
+                "selected_block_hash": selected.get("hash"),
+                "selected_block_timestamp": selected_timestamp,
+                "state_age_seconds": state_age,
+                "foundry_verified": True,
+                "gas_used": receipt.get("gas_used"),
+                "receipt_sha256": _historical_sha256(
+                    scenario.get("receipt_sha256")
+                ),
+                "trace_sha256": _historical_sha256(
+                    scenario.get("trace_sha256")
+                ),
+                "result_sha256": _historical_sha256(
+                    scenario.get("result_sha256")
+                ),
+                "proof_inputs_hash": _historical_sha256(
+                    scenario.get("proof_inputs_hash")
+                ),
+                "executor_model": HISTORICAL_EXECUTOR_MODEL,
+                "policy_net_edge_usd": baseline_net,
+                "research_net_edge_usd": research_net,
+                "baseline_net_edge_usd": baseline_net,
+                "stress_25_net_edge_usd": _historical_decimal(
+                    stress_25.get("research_net_edge_usd")
+                ),
+                "stress_50_net_edge_usd": _historical_decimal(
+                    stress_50.get("research_net_edge_usd")
+                ),
+                "stress_robust": scenario.get("stress_robust"),
+            })
+        expected_coordinates = {
+            (direction, notional)
+            for direction in (
+                "sushiswap_to_uniswap", "uniswap_to_sushiswap"
+            )
+            for notional in _COLLECTED_NOTIONALS
+        }
+        if coordinates != expected_coordinates:
+            raise OpportunityBundleInvalid()
+        return projected
+    except (KeyError, TypeError, ValueError, OpportunityBundleInvalid):
+        raise OpportunityBundleInvalid() from None
+
+
+def build_historical_opportunity_payload(
+    loaded: Mapping[str, Any],
+    *,
+    token: Optional[str] = None,
+    venue: Optional[str] = None,
+    notional_usd: Optional[str] = None,
+    opportunity_class: Optional[str] = None,
+    route_type: Optional[str] = None,
+    availability: Optional[str] = None,
+    sort: Optional[str] = None,
+    direction: Optional[str] = None,
+) -> Mapping[str, Any]:
+    """Project one immutable replay without applying live wall-clock rules."""
+
+    filters = _normalize_filters(
+        token=token,
+        venue=venue,
+        notional_usd=notional_usd,
+        opportunity_class=opportunity_class,
+        route_type=route_type,
+        availability=availability,
+        sort=sort,
+        direction=direction,
+    )
+    _reread_historical_publication(loaded)
+    rows = _historical_projected_rows(loaded)
+    manifest = loaded["manifest"]
+    evidence = loaded["replay_evidence"]
+    selected = manifest["selected_block"]
+    allowed_notionals = {
+        _canonical_decimal_text(item, "manifest notional")
+        for item in manifest.get("requested_notionals_usd", [])
+    }
+    if (
+        filters["notional_usd"] is not None
+        and filters["notional_usd"] not in allowed_notionals
+    ):
+        raise OpportunityQueryError(
+            "notional must be one of the collected opportunity notionals"
+        )
+    filtered = [row for row in rows if _matches_filters(row, filters)]
+    filtered = _sort_routes(
+        filtered, str(filters["sort"]), str(filters["direction"])
+    )
+    generation = historical_opportunity_data_generation(loaded)
+    positive_count = sum(
+        Decimal(row["research_net_edge_usd"]) > 0 for row in rows
+    )
+    payload = {
+        "availability": {"status": "available", "reason": None},
+        "metadata": {
+            "contract_version": HISTORICAL_OPPORTUNITY_SUMMARY_CONTRACT,
+            "temporal_scope": "historical_replay",
+            "execution_claim": manifest["execution_claim"],
+            "simulation_basis": HISTORICAL_SIMULATION_BASIS,
+            "data_generation": generation,
+            "replay_id": manifest["replay_id"],
+            "route_cohort_id": manifest["route_cohort_id"],
+            "manifest_sha256": loaded["manifest_sha256"],
+            "pointer_sha256": loaded["pointer_sha256"],
+            "verification_report_sha256": loaded[
+                "verification_report_sha256"
+            ],
+            "historical_core_manifest_sha256": manifest[
+                "historical_core_manifest_sha256"
+            ],
+            "historical_core_pointer_sha256": manifest[
+                "historical_core_pointer_sha256"
+            ],
+            "policy_sha256": manifest["policy_sha256"],
+            "run_id": manifest["run_id"],
+            "run_manifest_sha256": manifest["run_manifest_sha256"],
+            "selection_sha256": manifest["selection_sha256"],
+            "scenario_set_sha256": evidence["scenario_set_sha256"],
+            "selected_block_number": selected["number"],
+            "selected_block_hash": selected["hash"],
+            "selected_block_timestamp": _historical_block_timestamp(
+                selected["timestamp"]
+            ),
+            "simulation_block_number": selected[
+                "synthetic_child_number"
+            ],
+            "publication_status": "available",
+            "coverage": {
+                "route_count": len({row["route_id"] for row in rows}),
+                "scenario_count": len(rows),
+                "returned_count": len(filtered),
+                "foundry_verified_count": len(rows),
+                "research_estimate_count": len(rows),
+                "positive_count": positive_count,
+                "strict_count": 0,
+                "executable_count": 0,
+                "attested_count": 0,
+                "unavailable_count": 0,
+            },
+        },
+        "freshness": {
+            "applicable": False,
+            "reason_code": "historical_replay",
+            "next_deadline": None,
+        },
+        "filters": filters,
+        "routes": filtered,
+    }
+    _reread_historical_publication(loaded)
+    return payload
+
+
+def build_unavailable_historical_opportunity_payload(
+    *,
+    reason: str = HISTORICAL_REPLAY_POINTER_ABSENT,
+    token: Optional[str] = None,
+    venue: Optional[str] = None,
+    notional_usd: Optional[str] = None,
+    opportunity_class: Optional[str] = None,
+    route_type: Optional[str] = None,
+    availability: Optional[str] = None,
+    sort: Optional[str] = None,
+    direction: Optional[str] = None,
+) -> Mapping[str, Any]:
+    """Represent the sole non-error historical absence state."""
+
+    if reason != HISTORICAL_REPLAY_POINTER_ABSENT:
+        raise OpportunityBundleInvalid()
+    filters = _normalize_filters(
+        token=token,
+        venue=venue,
+        notional_usd=notional_usd,
+        opportunity_class=opportunity_class,
+        route_type=route_type,
+        availability=availability,
+        sort=sort,
+        direction=direction,
+    )
+    return {
+        "availability": {"status": "unavailable", "reason": reason},
+        "metadata": {
+            "contract_version": HISTORICAL_OPPORTUNITY_SUMMARY_CONTRACT,
+            "temporal_scope": "historical_replay",
+            "execution_claim": (
+                "historical_counterfactual_state_override_next_block"
+            ),
+            "simulation_basis": HISTORICAL_SIMULATION_BASIS,
+            "data_generation": None,
+            "replay_id": None,
+            "route_cohort_id": None,
+            "manifest_sha256": None,
+            "pointer_sha256": None,
+            "verification_report_sha256": None,
+            "policy_sha256": None,
+            "run_id": None,
+            "selected_block_number": None,
+            "publication_status": "missing",
+            "coverage": {
+                "route_count": 0,
+                "scenario_count": 0,
+                "returned_count": 0,
+                "foundry_verified_count": 0,
+                "research_estimate_count": 0,
+                "positive_count": 0,
+                "strict_count": 0,
+                "executable_count": 0,
+                "attested_count": 0,
+                "unavailable_count": 0,
+            },
+        },
+        "freshness": {
+            "applicable": False,
+            "reason_code": "historical_replay",
+            "next_deadline": None,
         },
         "filters": filters,
         "routes": [],
