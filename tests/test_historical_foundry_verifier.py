@@ -1053,98 +1053,31 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
                             self.subject, mode="staged",
                         )
 
-    def test_wrong_scenario_set_and_resolution_transplant_reject(self):
+    def test_connected_digest_or_count_substitution_rejects(self):
         import scripts.historical_foundry_verifier as verifier
 
         baseline = json.loads(json.dumps(self.offline_observation))
-        attacks = []
-        wrong_set = json.loads(json.dumps(baseline))
-        wrong_set["projection"]["verification_scenario_keys"].pop()
-        attacks.append(wrong_set)
-        transplanted = json.loads(json.dumps(baseline))
-        results = transplanted["projection"]["scenario_results"]
-        results[0]["resolution"] = results[-1]["resolution"]
-        attacks.append(transplanted)
-        for attack in attacks:
-            with self.subTest(attack=attacks.index(attack)):
-                with self.assertRaisesRegex(
-                    verifier.HistoricalVerificationError,
-                    "historical_bundle_invalid",
-                ):
-                    verifier._validate_connected_historical_observation(
-                        subject=self.subject, observation=attack,
-                    )
-
-    def test_newer_required_and_safe_exclusion_tamper_matrix(self):
-        import scripts.historical_foundry_verifier as verifier
-
-        baseline = json.loads(json.dumps(self.offline_observation))
-        projection = baseline["projection"]
-        selected_number = projection["selected_block"]["number"]
-        newer_required = [
-            row for row in projection["prefilter_rows"]
-            if row["block_number"] > selected_number
-            and row["decision"] == "replay_required"
-        ]
-        newer_safe = [
-            row for row in projection["safe_exclusions"]
-            if row["block_number"] > selected_number
-        ]
-        self.assertEqual(len(newer_required), 2)
-        self.assertEqual(len(newer_safe), 8)
-        scenario_keys = projection["verification_scenario_keys"]
-        result_keys = [
-            row["scenario_key"] for row in projection["scenario_results"]
-        ]
-        self.assertEqual(len(scenario_keys), 12)
-        self.assertEqual(result_keys, scenario_keys)
-        self.assertTrue({
-            row["scenario_key"] for row in newer_required
-        }.issubset(set(scenario_keys)))
-        self.assertTrue({
-            row["scenario_key"] for row in newer_safe
-        }.isdisjoint(set(scenario_keys)))
-
         attacks = {}
-        changed_required = json.loads(json.dumps(baseline))
-        next(
-            row for row in changed_required["projection"]["prefilter_rows"]
-            if row["scenario_key"] == newer_required[0]["scenario_key"]
-        )["decision"] = "safe_excluded"
-        attacks["changed_required_decision"] = changed_required
-        changed_safe = json.loads(json.dumps(baseline))
-        next(
-            row for row in changed_safe["projection"]["prefilter_rows"]
-            if row["scenario_key"] == newer_safe[0]["scenario_key"]
-        )["decision"] = "replay_required"
-        attacks["changed_safe_decision"] = changed_safe
-        omitted_key = json.loads(json.dumps(baseline))
-        omitted_key["projection"]["verification_scenario_keys"].remove(
-            newer_required[0]["scenario_key"]
-        )
-        attacks["omitted_newer_key"] = omitted_key
-        omitted_result = json.loads(json.dumps(baseline))
-        omitted_result["projection"]["scenario_results"] = [
-            row for row in omitted_result["projection"]["scenario_results"]
-            if row["scenario_key"] != newer_required[0]["scenario_key"]
-        ]
-        attacks["omitted_newer_result"] = omitted_result
-        transplanted = json.loads(json.dumps(baseline))
-        transplanted_results = transplanted["projection"][
-            "scenario_results"
-        ]
-        next(
-            row for row in transplanted_results
-            if row["scenario_key"] == newer_required[0]["scenario_key"]
-        )["resolution"] = transplanted_results[-1]["resolution"]
-        attacks["newer_resolution_transplant"] = transplanted
-        typed_mutation = json.loads(json.dumps(baseline))
-        next(
-            row for row in typed_mutation["projection"]["scenario_results"]
-            if row["scenario_key"] == newer_required[0]["scenario_key"]
-        )["resolution"]["result_typed_sha256"] = "f" * 64
-        attacks["newer_typed_result"] = typed_mutation
-
+        for field in (
+            "capture_rows_sha256",
+            "prefilter_rows_sha256",
+            "safe_exclusions_sha256",
+            "verification_scenario_set_sha256",
+            "scenario_results_sha256",
+            "candidate_resolution_sha256",
+        ):
+            attack = json.loads(json.dumps(baseline))
+            attack["projection"][field] = "f" * 64
+            attacks[field] = attack
+        for field in (
+            "prefilter_row_count",
+            "safe_exclusion_count",
+            "verification_scenario_count",
+            "scenario_result_count",
+        ):
+            attack = json.loads(json.dumps(baseline))
+            attack["projection"][field] += 1
+            attacks[field] = attack
         for label, attack in attacks.items():
             with self.subTest(label=label):
                 with self.assertRaisesRegex(
@@ -1154,6 +1087,38 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
                     verifier._validate_connected_historical_observation(
                         subject=self.subject, observation=attack,
                     )
+
+    def test_connected_projection_is_bounded_digest_only(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        baseline = json.loads(json.dumps(self.offline_observation))
+        projection = baseline["projection"]
+        self.assertTrue({
+            "capture_row_counts", "capture_rows_sha256",
+            "prefilter_row_count", "prefilter_rows_sha256",
+            "safe_exclusion_count", "safe_exclusions_sha256",
+            "verification_scenario_count",
+            "verification_scenario_set_sha256",
+            "scenario_result_count", "scenario_results_sha256",
+        }.issubset(projection))
+        self.assertTrue({
+            "capture_rows", "prefilter_rows", "safe_exclusions",
+            "verification_scenario_keys", "scenario_results",
+            "candidate_states",
+        }.isdisjoint(projection))
+        self.assertEqual(projection["verification_scenario_count"], 12)
+        self.assertEqual(projection["scenario_result_count"], 12)
+        self.assertEqual(
+            set(projection["capture_row_counts"]),
+            {"headers", "reserves", "prices", "fees"},
+        )
+        self.assertTrue(all(
+            type(value) is int and value > 0
+            for value in projection["capture_row_counts"].values()
+        ))
+        self.assertLessEqual(
+            len(verifier._canonical_bytes(projection)), 16_384
+        )
 
     def test_connected_raw_source_close_failure_is_not_silenced(self):
         import scripts.historical_foundry_verifier as verifier

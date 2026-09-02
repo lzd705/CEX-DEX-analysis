@@ -111,6 +111,7 @@ import selectors
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence, Tuple
@@ -127,13 +128,24 @@ def _require_safe_historical_startup() -> None:
 
 
 def _production_connected_historical_verification_engine(
-    _request: Mapping[str, Any],
+    request: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    """Fail closed until Task-8's connected production controller is complete."""
+    """Run the sealed verifier worker under the exact production runtime."""
     _require_safe_historical_startup()
-    raise HistoricalReplayEntrypointError(
-        "historical production controller is unavailable"
+    request_bytes = _encode_connected_worker_request(request)
+    runtime = (
+        _PROJECT_ROOT.parent / _SAFE_RUNTIME_BASENAME
+        / "bin" / "python3.8"
     )
+    response = _run_bounded_connected_worker_process(
+        command=(
+            str(runtime), *SAFE_HISTORICAL_REPLAY_STARTUP_FLAGS,
+            "-c", _CONNECTED_WORKER_BOOTSTRAP,
+        ),
+        cwd=_PROJECT_ROOT,
+        request_bytes=request_bytes,
+    )
+    return _decode_connected_worker_result(response)
 
 
 # This must remain a genuine canonical module-top call edge.  The verifier
@@ -257,6 +269,21 @@ _MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
 _MAX_TRACKED_SOURCE_BYTES = 1024 * 1024
 _GIT_TIMEOUT_SECONDS = 30.0
 _PROCESS_CLEANUP_SECONDS = 1.0
+_CONNECTED_WORKER_REQUEST_SCHEMA = (
+    "historical_foundry_connected_verification_request/v1"
+)
+_CONNECTED_WORKER_RESULT_SCHEMA = "historical_connected_worker_result/v1"
+_MAX_CONNECTED_WORKER_REQUEST_BYTES = 16 * 1024
+_MAX_CONNECTED_WORKER_OUTPUT_BYTES = 1024 * 1024
+_MAX_CONNECTED_WORKER_STDERR_BYTES = 64 * 1024
+_CONNECTED_WORKER_TIMEOUT_SECONDS = 21_600.0
+_CONNECTED_WORKER_BOOTSTRAP = (
+    "import os,sys\n"
+    "sys.path[:]=[os.getcwd(),sys.prefix+'/lib/python38.zip',"
+    "sys.prefix+'/lib/python3.8',sys.prefix+'/lib/python3.8/lib-dynload']\n"
+    "from scripts import run_historical_foundry_replay as worker\n"
+    "raise SystemExit(worker._connected_worker_main())\n"
+)
 
 
 @dataclass(frozen=True)
@@ -364,6 +391,317 @@ def _require_descriptor_noninheritable(descriptor: int) -> None:
         raise _entrypoint_error("live pointer snapshot is invalid") from error
     if inheritable is not False:
         raise _entrypoint_error("live pointer snapshot is invalid")
+
+
+def _canonical_connected_worker_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            value, allow_nan=False, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        ) from error
+
+
+def _connected_worker_pointer_core(value: Any) -> Mapping[str, Any]:
+    if (
+        type(value) is not dict
+        or set(value) != {
+            "schema", "bundle_stage", "replay_id", "route_cohort_id",
+            "manifest_sha256",
+        }
+        or value.get("schema") != "route_historical_replay_pointer/v1"
+        or value.get("bundle_stage")
+        != "route_historical_foundry_replay/v1"
+        or type(value.get("replay_id")) is not str
+        or re.fullmatch(r"replay:[0-9a-f]{64}", value["replay_id"])
+        is None
+        or type(value.get("route_cohort_id")) is not str
+        or re.fullmatch(
+            r"cohort:[0-9a-f]{64}", value["route_cohort_id"]
+        ) is None
+        or type(value.get("manifest_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["manifest_sha256"])
+        is None
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    return dict(value)
+
+
+def _connected_worker_paths(request: Mapping[str, Any]) -> Mapping[str, Path]:
+    paths = {}
+    for field in ("data_dir", "raw_root", "bundle_path"):
+        value = request.get(field)
+        if (
+            not isinstance(value, Path)
+            or not value.is_absolute()
+            or Path(os.path.normpath(str(value))) != value
+        ):
+            raise _entrypoint_error(
+                "historical connected verification input is invalid"
+            )
+        paths[field] = value
+    pointer = request["pointer_core"]
+    if paths["raw_root"] != (
+        paths["data_dir"] / "raw" / "historical-foundry-replay"
+    ) or paths["bundle_path"] != (
+        paths["data_dir"] / "routes" / "historical" / "bundles"
+        / pointer["replay_id"]
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    return paths
+
+
+def _encode_connected_worker_request(request: Mapping[str, Any]) -> bytes:
+    if (
+        type(request) is not dict
+        or set(request) != {
+            "schema", "data_dir", "raw_root", "bundle_path",
+            "pointer_core",
+        }
+        or request.get("schema") != _CONNECTED_WORKER_REQUEST_SCHEMA
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    pointer = _connected_worker_pointer_core(request.get("pointer_core"))
+    normalized = dict(request)
+    normalized["pointer_core"] = pointer
+    paths = _connected_worker_paths(normalized)
+    encoded = _canonical_connected_worker_bytes({
+        "schema": _CONNECTED_WORKER_REQUEST_SCHEMA,
+        "data_dir": str(paths["data_dir"]),
+        "raw_root": str(paths["raw_root"]),
+        "bundle_path": str(paths["bundle_path"]),
+        "pointer_core": pointer,
+    })
+    if not 0 < len(encoded) <= _MAX_CONNECTED_WORKER_REQUEST_BYTES:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    return encoded
+
+
+def _decode_connected_worker_request(payload: bytes) -> Mapping[str, Any]:
+    if (
+        type(payload) is not bytes
+        or not 0 < len(payload) <= _MAX_CONNECTED_WORKER_REQUEST_BYTES
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        ) from error
+    if type(value) is not dict or _canonical_connected_worker_bytes(value) != payload:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    converted = dict(value)
+    for field in ("data_dir", "raw_root", "bundle_path"):
+        if type(converted.get(field)) is not str:
+            raise _entrypoint_error(
+                "historical connected verification input is invalid"
+            )
+        converted[field] = Path(converted[field])
+    if _encode_connected_worker_request(converted) != payload:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    return converted
+
+
+def _decode_connected_worker_result(payload: bytes) -> Mapping[str, Any]:
+    failure = "historical connected worker failed"
+    if (
+        type(payload) is not bytes
+        or not 0 < len(payload) <= _MAX_CONNECTED_WORKER_OUTPUT_BYTES
+    ):
+        raise _entrypoint_error(failure)
+    try:
+        value = json.loads(payload)
+        canonical = _canonical_connected_worker_bytes(value)
+    except Exception:
+        raise _entrypoint_error(failure) from None
+    if (
+        canonical != payload
+        or type(value) is not dict
+        or set(value) != {"schema", "status", "observation"}
+        or value.get("schema") != _CONNECTED_WORKER_RESULT_SCHEMA
+        or value.get("status") != "ok"
+        or type(value.get("observation")) is not dict
+    ):
+        raise _entrypoint_error(failure)
+    return value["observation"]
+
+
+def _reap_connected_worker(process: Any) -> None:
+    try:
+        returncode = process.poll()
+    except BaseException:
+        returncode = None
+    if returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        returncode = process.poll()
+    if returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+    if process.poll() is None:
+        raise _entrypoint_error("historical connected worker failed")
+
+
+def _run_bounded_connected_worker_process(
+    *, command: Tuple[str, ...], cwd: Path, request_bytes: bytes,
+) -> bytes:
+    failure = "historical connected worker failed"
+    if (
+        type(command) is not tuple
+        or not command
+        or any(type(value) is not str for value in command)
+        or not isinstance(cwd, Path)
+        or not cwd.is_absolute()
+        or type(request_bytes) is not bytes
+        or not 0 < len(request_bytes) <= _MAX_CONNECTED_WORKER_REQUEST_BYTES
+    ):
+        raise _entrypoint_error(failure)
+    process = None
+    selector = None
+    streams = []
+    result = None
+    original_error = None
+    try:
+        with tempfile.TemporaryFile() as request_file:
+            request_file.write(request_bytes)
+            request_file.seek(0)
+            process = subprocess.Popen(
+                command, cwd=str(cwd), stdin=request_file,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True,
+            )
+            if process.stdout is None or process.stderr is None:
+                raise _entrypoint_error(failure)
+            streams = [process.stdout, process.stderr]
+            for stream in streams:
+                if os.get_inheritable(stream.fileno()) is not False:
+                    raise _entrypoint_error(failure)
+            selector = selectors.DefaultSelector()
+            selector.register(
+                process.stdout, selectors.EVENT_READ,
+                ("stdout", _MAX_CONNECTED_WORKER_OUTPUT_BYTES),
+            )
+            selector.register(
+                process.stderr, selectors.EVENT_READ,
+                ("stderr", _MAX_CONNECTED_WORKER_STDERR_BYTES),
+            )
+            buffers = {"stdout": [], "stderr": []}
+            sizes = {"stdout": 0, "stderr": 0}
+            deadline = time.monotonic() + _CONNECTED_WORKER_TIMEOUT_SECONDS
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _entrypoint_error(failure)
+                events = selector.select(remaining)
+                if not events:
+                    raise _entrypoint_error(failure)
+                for key, _mask in events:
+                    label, maximum = key.data
+                    allowance = maximum - sizes[label] + 1
+                    chunk = os.read(
+                        key.fileobj.fileno(), min(65_536, allowance)
+                    )
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    buffers[label].append(chunk)
+                    sizes[label] += len(chunk)
+                    if sizes[label] > maximum:
+                        raise _entrypoint_error(failure)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _entrypoint_error(failure)
+            returncode = process.wait(timeout=remaining)
+            stdout = b"".join(buffers["stdout"])
+            stderr = b"".join(buffers["stderr"])
+            if returncode != 0 or stderr:
+                raise _entrypoint_error(failure)
+            result = stdout
+    except BaseException as error:
+        original_error = error
+
+    cleanup_error = None
+    if selector is not None:
+        try:
+            selector.close()
+        except BaseException as error:
+            cleanup_error = error
+    for stream in streams:
+        try:
+            stream.close()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+    if process is not None:
+        try:
+            _reap_connected_worker(process)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+    if original_error is not None:
+        if not isinstance(original_error, Exception):
+            raise original_error from cleanup_error
+        raise _entrypoint_error(failure) from original_error
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(failure) from cleanup_error
+    if type(result) is not bytes:
+        raise _entrypoint_error(failure)
+    return result
+
+
+def _connected_worker_main() -> int:
+    if not _trusted_launch_is_exact():
+        return 1
+    try:
+        payload = sys.stdin.buffer.read(
+            _MAX_CONNECTED_WORKER_REQUEST_BYTES + 1
+        )
+        _decode_connected_worker_request(payload)
+        # The next slice replaces this failure with fresh RPC/Anvil evidence.
+        response = {
+            "schema": _CONNECTED_WORKER_RESULT_SCHEMA,
+            "status": "failed",
+        }
+    except Exception:
+        response = {
+            "schema": _CONNECTED_WORKER_RESULT_SCHEMA,
+            "status": "failed",
+        }
+    try:
+        sys.stdout.buffer.write(_canonical_connected_worker_bytes(response))
+        sys.stdout.buffer.flush()
+    except Exception:
+        return 1
+    return 0
 
 
 def _open_descriptor(

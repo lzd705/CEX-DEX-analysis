@@ -1159,28 +1159,30 @@ def _build_retained_connected_projection(material):
             )),
             "pointer_core": _plain(pointer_core),
             "pointer_core_sha256": _sha256(_canonical_bytes(pointer_core)),
-            "capture_rows": capture_rows,
+            "capture_row_counts": {
+                role: len(capture_rows[role])
+                for role in ("headers", "reserves", "prices", "fees")
+            },
             "capture_rows_sha256": _sha256(_canonical_bytes(capture_rows)),
             "prefilter_grid_digest": selection.get(
                 "prefilter_grid_digest"
             ),
-            "prefilter_rows": prefilter_rows,
+            "prefilter_row_count": len(prefilter_rows),
             "prefilter_rows_sha256": _sha256(_canonical_bytes(
                 prefilter_rows
             )),
-            "safe_exclusions": safe_exclusions,
+            "safe_exclusion_count": len(safe_exclusions),
             "safe_exclusions_sha256": _sha256(_canonical_bytes(
                 safe_exclusions
             )),
-            "verification_scenario_keys": scenario_keys,
+            "verification_scenario_count": len(scenario_keys),
             "verification_scenario_set_sha256": _sha256(_canonical_bytes(
                 scenario_keys
             )),
-            "scenario_results": results,
+            "scenario_result_count": len(results),
             "scenario_results_sha256": _sha256(_canonical_bytes(results)),
             "selection_status": selection.get("status"),
             "selected_block": selected_block,
-            "candidate_states": selection.get("candidate_states"),
             "candidate_resolution_sha256": _sha256(_canonical_bytes({
                 "candidate_manifest": candidate,
                 "candidate_states": selection.get("candidate_states"),
@@ -1397,9 +1399,9 @@ def _verification_report(observation):
         "verification_scenario_set_sha256": projection[
             "verification_scenario_set_sha256"
         ],
-        "verification_scenario_count": len(projection[
-            "verification_scenario_keys"
-        ]),
+        "verification_scenario_count": projection[
+            "verification_scenario_count"
+        ],
         "verification_scenario_results_sha256": projection[
             "scenario_results_sha256"
         ],

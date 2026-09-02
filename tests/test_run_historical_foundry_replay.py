@@ -477,12 +477,172 @@ class HistoricalReplayEntrypointImportAndParserTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             module.HistoricalReplayEntrypointError,
-            "historical production controller is unavailable",
+            "historical connected verification input is invalid",
         ):
             with mock.patch.object(
                 module, "_trusted_launch_is_exact", return_value=True
             ):
                 verifier._invoke_connected_historical_verification_engine({})
+
+
+class HistoricalReplayConnectedWorkerBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _entrypoint()
+        self.pointer_core = {
+            "schema": "route_historical_replay_pointer/v1",
+            "bundle_stage": "route_historical_foundry_replay/v1",
+            "replay_id": "replay:" + "1" * 64,
+            "route_cohort_id": "cohort:" + "2" * 64,
+            "manifest_sha256": "3" * 64,
+        }
+        self.request = {
+            "schema": (
+                "historical_foundry_connected_verification_request/v1"
+            ),
+            "data_dir": Path("/immutable-data"),
+            "raw_root": Path("/immutable-data/raw/historical-foundry-replay"),
+            "bundle_path": Path(
+                "/immutable-data/routes/historical/bundles/"
+                + self.pointer_core["replay_id"]
+            ),
+            "pointer_core": copy.deepcopy(self.pointer_core),
+        }
+
+    def test_engine_uses_exact_runtime_flags_and_canonical_closed_request(self):
+        observation = {"schema": "observation-sentinel"}
+        response = self.module._canonical_connected_worker_bytes({
+            "schema": "historical_connected_worker_result/v1",
+            "status": "ok",
+            "observation": observation,
+        })
+        with mock.patch.object(
+            self.module, "_trusted_launch_is_exact", return_value=True,
+        ), mock.patch.object(
+            self.module, "_run_bounded_connected_worker_process",
+            return_value=response,
+        ) as run, mock.patch.object(
+            self.module.os, "getenv",
+            side_effect=AssertionError("parent read environment"),
+        ):
+            observed = (
+                self.module
+                ._production_connected_historical_verification_engine(
+                    self.request
+                )
+            )
+        self.assertEqual(observed, observation)
+        run.assert_called_once()
+        call = run.call_args.kwargs
+        self.assertEqual(
+            call["command"],
+            (
+                str(_EXACT_PYTHON38),
+                *_EXPECTED_SAFE_STARTUP_FLAGS,
+                "-c",
+                self.module._CONNECTED_WORKER_BOOTSTRAP,
+            ),
+        )
+        self.assertEqual(call["cwd"], Path(__file__).resolve().parents[1])
+        decoded = json.loads(call["request_bytes"])
+        self.assertEqual(
+            call["request_bytes"],
+            self.module._canonical_connected_worker_bytes(decoded),
+        )
+        self.assertEqual(set(decoded), {
+            "schema", "data_dir", "raw_root", "bundle_path",
+            "pointer_core",
+        })
+        self.assertTrue(all(
+            type(decoded[field]) is str and decoded[field].startswith("/")
+            for field in ("data_dir", "raw_root", "bundle_path")
+        ))
+
+    def test_engine_rejects_invalid_request_before_starting_process(self):
+        attacks = []
+        missing = dict(self.request)
+        missing.pop("bundle_path")
+        attacks.append(missing)
+        relative = dict(self.request)
+        relative["bundle_path"] = Path("relative")
+        attacks.append(relative)
+        extra = dict(self.request, endpoint="https://forbidden.invalid")
+        attacks.append(extra)
+        for attack in attacks:
+            with self.subTest(fields=tuple(sorted(attack))):
+                with mock.patch.object(
+                    self.module, "_trusted_launch_is_exact", return_value=True,
+                ), mock.patch.object(
+                    self.module, "_run_bounded_connected_worker_process",
+                    side_effect=AssertionError("invalid request spawned worker"),
+                ):
+                    with self.assertRaisesRegex(
+                        self.module.HistoricalReplayEntrypointError,
+                        "historical connected verification input is invalid",
+                    ):
+                        self.module._production_connected_historical_verification_engine(
+                            attack
+                        )
+
+    def test_worker_result_requires_bounded_canonical_exact_schema(self):
+        valid = {
+            "schema": "historical_connected_worker_result/v1",
+            "status": "ok",
+            "observation": {"schema": "observation-sentinel"},
+        }
+        payload = self.module._canonical_connected_worker_bytes(valid)
+        self.assertEqual(
+            self.module._decode_connected_worker_result(payload),
+            valid["observation"],
+        )
+        attacks = (
+            payload + b"\n",
+            json.dumps(valid, indent=2).encode("utf-8"),
+            self.module._canonical_connected_worker_bytes(
+                dict(valid, unexpected=True)
+            ),
+            self.module._canonical_connected_worker_bytes({
+                "schema": valid["schema"], "status": "failed",
+            }),
+            b"x" * (self.module._MAX_CONNECTED_WORKER_OUTPUT_BYTES + 1),
+        )
+        for attack in attacks:
+            with self.subTest(size=len(attack)):
+                with self.assertRaisesRegex(
+                    self.module.HistoricalReplayEntrypointError,
+                    "historical connected worker failed",
+                ):
+                    self.module._decode_connected_worker_result(attack)
+
+    def test_exact_worker_bootstrap_fails_closed_with_canonical_output(self):
+        request_bytes = self.module._encode_connected_worker_request(
+            self.request
+        )
+        command = (
+            str(_EXACT_PYTHON38),
+            *_EXPECTED_SAFE_STARTUP_FLAGS,
+            "-c",
+            self.module._CONNECTED_WORKER_BOOTSTRAP,
+        )
+        with mock.patch.dict(
+            os.environ, _fixed_subprocess_environment(), clear=True
+        ):
+            response = self.module._run_bounded_connected_worker_process(
+                command=command,
+                cwd=Path(__file__).resolve().parents[1],
+                request_bytes=request_bytes,
+            )
+        self.assertEqual(
+            response,
+            self.module._canonical_connected_worker_bytes({
+                "schema": "historical_connected_worker_result/v1",
+                "status": "failed",
+            }),
+        )
+        with self.assertRaisesRegex(
+            self.module.HistoricalReplayEntrypointError,
+            "historical connected worker failed",
+        ):
+            self.module._decode_connected_worker_result(response)
 
     def test_fresh_canonical_import_has_no_operational_io(self):
         source = r'''
@@ -511,7 +671,7 @@ entrypoint._trusted_launch_is_exact = lambda: True
 try:
     verifier._invoke_connected_historical_verification_engine({})
 except entrypoint.HistoricalReplayEntrypointError as error:
-    assert str(error) == "historical production controller is unavailable"
+    assert str(error) == "historical connected verification input is invalid"
 else:
     raise AssertionError("bound engine did not fail closed")
 print("canonical-import-ok")
