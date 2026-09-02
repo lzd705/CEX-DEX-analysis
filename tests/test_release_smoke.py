@@ -15,6 +15,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from dashboard import server
+import dashboard.opportunity_facts as opportunity_facts
 from dashboard.opportunity_facts import (
     build_opportunity_payload,
     build_unavailable_opportunity_payload,
@@ -1889,6 +1890,47 @@ class _DashboardReleaseSmokeMixin:
             self.assertEqual(args.opportunity_raw_max, 2_000_000)
             self.assertEqual(args.opportunity_gzip_max, 300_000)
 
+    def test_release_cli_historical_gate_is_explicit_and_independent(self):
+        cases = (
+            ([], False, False),
+            (["--require-route-opportunities"], True, False),
+            (["--require-historical-foundry-replay"], False, True),
+        )
+        for flags, route_required, historical_required in cases:
+            with self.subTest(flags=flags), patch(
+                "sys.argv", ["check_dashboard_release.py", *flags]
+            ):
+                args = release_checker.parse_args()
+            self.assertIs(args.require_route_cohort, route_required)
+            self.assertIs(
+                args.require_historical_foundry_replay,
+                historical_required,
+            )
+
+    def test_flag_absent_never_enters_historical_release_gate(self):
+        args = argparse.Namespace(
+            base_url="https://dashboard.test",
+            timeout=1.0,
+            require_route_cohort=False,
+            require_historical_foundry_replay=False,
+            summary_raw_max=100_000,
+            summary_gzip_max=25_000,
+            token_raw_max=250_000,
+            token_gzip_max=50_000,
+        )
+        with patch.object(
+            release_checker,
+            "validate_historical_foundry_replay_release",
+            side_effect=AssertionError("historical gate must stay cold"),
+        ) as historical_gate, patch.object(
+            release_checker,
+            "validate_route_opportunity_release",
+            side_effect=ReleaseCheckError("stop before ordinary HTTP"),
+        ):
+            with self.assertRaisesRegex(ReleaseCheckError, "stop before"):
+                release_check(args)
+        historical_gate.assert_not_called()
+
     def test_release_checks_required_complete_bundle_before_remote_requests(self):
         args = argparse.Namespace(
             base_url="https://dashboard.test",
@@ -2335,6 +2377,266 @@ class ReleaseAssetTests(unittest.TestCase):
                             fetch_static_asset_bundle(
                                 "https://dashboard.test", version, timeout=1.0
                             )
+
+
+class HistoricalFoundryReplayReleaseTests(unittest.TestCase):
+    class TrackingView:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.closed = False
+
+        def reread_unchanged(self):
+            return self.wrapped.reread_unchanged()
+
+        def close(self):
+            if not self.closed:
+                self.wrapped.close()
+                self.closed = True
+
+    @classmethod
+    def setUpClass(cls):
+        from tests.historical_replay_fixture import (
+            PublishedHistoricalReplayFixture,
+        )
+
+        cls.fixture = PublishedHistoricalReplayFixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture.close()
+
+    def _copy_publication(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        data_dir = Path(temporary.name) / "data"
+        shutil.copytree(self.fixture.data_dir, data_dir)
+        return data_dir
+
+    def _local_payload(self, routes_root):
+        with patch.dict(
+            opportunity_facts.os.environ,
+            {"MARKET_ROUTE_DATA_DIR": str(routes_root)},
+        ):
+            loaded = opportunity_facts.load_latest_historical_opportunities()
+            try:
+                return opportunity_facts.build_historical_opportunity_payload(
+                    loaded,
+                    opportunity_class="all",
+                    route_type="all",
+                    availability="all",
+                    sort="net_edge_usd",
+                    direction="desc",
+                )
+            finally:
+                loaded["validated_view"].close()
+
+    def _release_surface(self, payload):
+        application_sha = "a" * 40
+        asset_sha = server.static_asset_sha()
+        asset_version = "{}-{}".format(
+            application_sha[:12], asset_sha[:12]
+        )
+        raw_assets = {
+            filename: server._STATIC_REPRESENTATIONS["/" + filename].raw
+            for filename in STATIC_ASSET_FILENAMES
+        }
+        asset_metrics = tuple(
+            ResponseMetrics(
+                path="/{}?v={}".format(filename, asset_version),
+                elapsed_ms=0.1,
+                wire_bytes=len(raw_assets[filename]),
+                raw_bytes=len(raw_assets[filename]),
+                compressed=False,
+                content_length=len(raw_assets[filename]),
+            )
+            for filename in STATIC_ASSET_FILENAMES
+        )
+        assets = release_checker.StaticAssetSnapshot(
+            asset_sha=asset_sha,
+            asset_version=asset_version,
+            raw_assets=raw_assets,
+            metrics=asset_metrics,
+        )
+        html = (server.STATIC_ROOT / "index.html").read_bytes().replace(
+            b"__ASSET_VERSION__", asset_version.encode("ascii")
+        )
+        html_metrics = ResponseMetrics(
+            path="/opportunities?opportunity_scope=historical",
+            elapsed_ms=0.1,
+            wire_bytes=len(html),
+            raw_bytes=len(html),
+            compressed=False,
+            content_length=len(html),
+        )
+        html_snapshot = release_checker.HistoricalHtmlSnapshot(
+            request_path=html_metrics.path,
+            raw_html=html,
+            html_sha256=hashlib.sha256(html).hexdigest(),
+            application_sha=application_sha,
+            asset_sha=asset_sha,
+            asset_version=asset_version,
+            metrics=html_metrics,
+        )
+        raw_api = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        api_metrics = ResponseMetrics(
+            path=(
+                "/api/markets/opportunities/historical?class=all&"
+                "route_type=all&availability=all&sort=net_edge_usd&dir=desc"
+            ),
+            elapsed_ms=0.1,
+            wire_bytes=len(raw_api),
+            raw_bytes=len(raw_api),
+            compressed=False,
+            content_length=len(raw_api),
+        )
+        api_snapshot = release_checker._HistoricalApiSnapshot(
+            request_path=api_metrics.path,
+            raw_json=raw_api,
+            payload=payload,
+            metrics=api_metrics,
+        )
+        return (
+            application_sha,
+            asset_sha,
+            asset_version,
+            assets,
+            html_snapshot,
+            api_snapshot,
+        )
+
+    def test_gate_validates_real_reader_api_dom_and_closes_every_view(self):
+        data_dir = self._copy_publication()
+        routes_root = data_dir / "routes"
+        payload = self._local_payload(routes_root)
+        (
+            application_sha,
+            asset_sha,
+            asset_version,
+            assets,
+            html,
+            api,
+        ) = self._release_surface(payload)
+        health_metrics = ResponseMetrics(
+            path="/health",
+            elapsed_ms=0.1,
+            wire_bytes=2,
+            raw_bytes=2,
+            compressed=False,
+            content_length=2,
+        )
+        original_loader = (
+            opportunity_facts.load_latest_historical_opportunities
+        )
+        tracked_views = []
+
+        def tracked_loader():
+            loaded = original_loader()
+            tracked = self.TrackingView(loaded["validated_view"])
+            self.addCleanup(tracked.close)
+            tracked_views.append(tracked)
+            projected = dict(loaded)
+            projected["validated_view"] = tracked
+            return projected
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(
+                release_checker.os.environ,
+                {"MARKET_ROUTE_DATA_DIR": str(routes_root)},
+            ))
+            stack.enter_context(patch.object(
+                opportunity_facts,
+                "load_latest_historical_opportunities",
+                side_effect=tracked_loader,
+            ))
+            static_fetch = stack.enter_context(patch.object(
+                release_checker,
+                "fetch_static_asset_snapshot",
+                return_value=assets,
+            ))
+            html_fetch = stack.enter_context(patch.object(
+                release_checker,
+                "fetch_historical_html_snapshot",
+                return_value=html,
+            ))
+            api_fetch = stack.enter_context(patch.object(
+                release_checker,
+                "_fetch_historical_api_snapshot",
+                return_value=api,
+            ))
+            stack.enter_context(patch.object(
+                release_checker,
+                "fetch_json",
+                return_value=({}, health_metrics),
+            ))
+            health_validator = stack.enter_context(patch.object(
+                release_checker,
+                "validate_release_health",
+                return_value=(application_sha, asset_sha, asset_version),
+            ))
+
+            result, metrics = (
+                release_checker.validate_historical_foundry_replay_release(
+                    "https://dashboard.test",
+                    application_sha=application_sha,
+                    asset_sha=asset_sha,
+                    asset_version=asset_version,
+                    timeout=2.0,
+                )
+            )
+
+        self.assertEqual(result["status"], "validated")
+        self.assertEqual(result["scenario_count"], 10)
+        self.assertEqual(
+            result["data_generation"],
+            payload["metadata"]["data_generation"],
+        )
+        self.assertEqual(len(tracked_views), 2)
+        self.assertTrue(all(view.closed for view in tracked_views))
+        self.assertEqual(len(metrics), len(STATIC_ASSET_FILENAMES) * 2 + 5)
+        self.assertEqual(static_fetch.call_count, 2)
+        self.assertEqual(html_fetch.call_count, 2)
+        self.assertEqual(api_fetch.call_count, 2)
+        health_validator.assert_called_once_with(
+            {},
+            expected_application_sha=application_sha,
+            expected_asset_sha=asset_sha,
+        )
+
+    def test_gate_closes_reader_view_when_local_projection_fails(self):
+        class FailingProjectionView:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        view = FailingProjectionView()
+        with patch.object(
+            opportunity_facts,
+            "load_latest_historical_opportunities",
+            return_value={"validated_view": view},
+        ), patch.object(
+            opportunity_facts,
+            "historical_opportunity_data_generation",
+            side_effect=ValueError("invalid local publication"),
+        ), self.assertRaisesRegex(
+            ReleaseCheckError,
+            "Historical publication validation failed",
+        ):
+            release_checker.validate_historical_foundry_replay_release(
+                "https://dashboard.test",
+                application_sha="a" * 40,
+                asset_sha="b" * 64,
+                asset_version="a" * 12 + "-" + "b" * 12,
+                timeout=2.0,
+            )
+
+        self.assertTrue(view.closed)
 
 
 class DashboardReleaseSmokeTest(_DashboardReleaseSmokeMixin, unittest.TestCase):

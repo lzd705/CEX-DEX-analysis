@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import gzip
 import hashlib
@@ -11,6 +12,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import unicodedata
@@ -21,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
@@ -107,6 +111,33 @@ class ResponseMetrics:
     content_length: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class StaticAssetSnapshot:
+    asset_sha: str
+    asset_version: str
+    raw_assets: Mapping[str, bytes]
+    metrics: tuple[ResponseMetrics, ...]
+
+
+@dataclass(frozen=True)
+class HistoricalHtmlSnapshot:
+    request_path: str
+    raw_html: bytes
+    html_sha256: str
+    application_sha: str
+    asset_sha: str
+    asset_version: str
+    metrics: ResponseMetrics
+
+
+@dataclass(frozen=True)
+class _HistoricalApiSnapshot:
+    request_path: str
+    raw_json: bytes
+    payload: Mapping[str, Any]
+    metrics: ResponseMetrics
+
+
 class ReleaseCheckError(RuntimeError):
     """One release contract or request failed."""
 
@@ -116,11 +147,280 @@ MAX_STATIC_ASSET_BYTES = 4 * 1024 * 1024
 STATIC_ASSET_GZIP_BUDGET = 220_000
 IMMUTABLE_STATIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
 STATIC_ASSET_GZIP_THRESHOLD_BYTES = 1024
+HISTORICAL_OPPORTUNITY_DISCLAIMER = (
+    "Historical Foundry Replay. Fixed-block counterfactual simulation under "
+    "a hash-bound state override modelling a prefunded, predeployed, "
+    "preapproved executor. Successful values are research estimates at the "
+    "displayed Ethereum block; they are not current and are not executable "
+    "candidates."
+)
+_HISTORICAL_DIRECTIONS = (
+    "uniswap_to_sushiswap",
+    "sushiswap_to_uniswap",
+)
+_HISTORICAL_NOTIONALS = ("1000", "5000", "10000", "50000", "100000")
 
 
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ReleaseCheckError(message)
+
+
+def historical_surface_binding_sha256(
+    *,
+    application_sha: str,
+    asset_sha: str,
+    html_sha256: str,
+    api_data_generation: str,
+) -> str:
+    values = {
+        "api_data_generation": api_data_generation,
+        "application_sha": application_sha,
+        "asset_sha": asset_sha,
+        "html_sha256": html_sha256,
+    }
+    require(
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", application_sha or "")
+        is not None
+        and re.fullmatch(r"[0-9a-f]{64}", asset_sha or "") is not None
+        and re.fullmatch(r"[0-9a-f]{64}", html_sha256 or "") is not None
+        and re.fullmatch(r"[0-9a-f]{64}", api_data_generation or "")
+        is not None,
+        "Historical surface identity is invalid",
+    )
+    encoded = json.dumps(
+        values, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(
+        b"historical_opportunity_surface_binding/v1\0" + encoded
+    ).hexdigest()
+
+
+def _historical_api_rows(payload: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    metadata = payload.get("metadata")
+    routes = payload.get("routes")
+    require(type(metadata) is dict, "Historical API metadata is invalid")
+    require(type(routes) is list, "Historical API routes are invalid")
+    require(
+        metadata.get("contract_version") == "opportunity_historical_summary/v1"
+        and metadata.get("temporal_scope") == "historical_replay"
+        and metadata.get("execution_claim")
+        == "historical_counterfactual_state_override_next_block",
+        "Historical API contract is invalid",
+    )
+    generation = metadata.get("data_generation")
+    replay_id = metadata.get("replay_id")
+    block_number = metadata.get("selected_block_number")
+    coverage = metadata.get("coverage")
+    require(
+        type(generation) is str
+        and re.fullmatch(r"[0-9a-f]{64}", generation) is not None
+        and type(replay_id) is str
+        and re.fullmatch(r"replay:[0-9a-f]{64}", replay_id) is not None
+        and type(block_number) is int
+        and block_number >= 0
+        and type(coverage) is dict
+        and coverage.get("scenario_count") == 10
+        and coverage.get("returned_count") == 10
+        and len(routes) == 10,
+        "Historical API identity or scenario count is invalid",
+    )
+    rows = []
+    identities = set()
+    coordinates = set()
+    for route in routes:
+        require(type(route) is dict, "Historical API route is invalid")
+        opportunity_id = route.get("opportunity_id")
+        direction = route.get("direction")
+        notional = route.get("requested_notional_usd")
+        receipt = route.get("receipt_sha256")
+        trace = route.get("trace_sha256")
+        require(
+            type(opportunity_id) is str
+            and bool(opportunity_id)
+            and opportunity_id not in identities
+            and direction in _HISTORICAL_DIRECTIONS
+            and type(notional) is str
+            and notional in _HISTORICAL_NOTIONALS
+            and route.get("selected_block_number") == block_number
+            and route.get("foundry_verified") is True
+            and type(route.get("policy_net_edge_usd")) is str
+            and type(route.get("research_net_edge_usd")) is str
+            and re.fullmatch(r"[0-9a-f]{64}", receipt or "") is not None
+            and re.fullmatch(r"[0-9a-f]{64}", trace or "") is not None,
+            "Historical API route projection is invalid",
+        )
+        identities.add(opportunity_id)
+        coordinates.add((direction, notional))
+        rows.append({
+            "opportunity_id": opportunity_id,
+            "direction": direction,
+            "notional_usd": notional,
+            "foundry_verified": True,
+            "policy_net_edge_usd": route["policy_net_edge_usd"],
+            "research_net_edge_usd": route["research_net_edge_usd"],
+            "receipt_sha256": receipt,
+            "trace_sha256": trace,
+        })
+    require(
+        coordinates == {
+            (direction, notional)
+            for direction in _HISTORICAL_DIRECTIONS
+            for notional in _HISTORICAL_NOTIONALS
+        },
+        "Historical API route coordinates are incomplete",
+    )
+    return tuple(rows)
+
+
+def validate_historical_dom_api_parity(
+    *,
+    api_payload: Mapping[str, Any],
+    dom_result: Mapping[str, Any],
+    expected_application_sha: str,
+    expected_asset_sha: str,
+    expected_html_sha256: str,
+    expected_data_generation: str,
+) -> Mapping[str, Any]:
+    require(type(dom_result) is dict, "Historical DOM result is invalid")
+    expected_surface = historical_surface_binding_sha256(
+        application_sha=expected_application_sha,
+        asset_sha=expected_asset_sha,
+        html_sha256=expected_html_sha256,
+        api_data_generation=expected_data_generation,
+    )
+    require(
+        dom_result.get("application_sha") == expected_application_sha
+        and dom_result.get("asset_sha") == expected_asset_sha
+        and dom_result.get("html_sha256") == expected_html_sha256
+        and dom_result.get("surface_binding_sha256") == expected_surface
+        and dom_result.get("data_generation") == expected_data_generation,
+        "Historical DOM surface identity differs",
+    )
+    metadata = api_payload.get("metadata")
+    require(type(metadata) is dict, "Historical API metadata is invalid")
+    require(
+        dom_result.get("replay_id") == metadata.get("replay_id")
+        and dom_result.get("selected_block_number")
+        == metadata.get("selected_block_number")
+        and dom_result.get("scenario_count") == 10
+        and dom_result.get("strict_hidden") is True
+        and dom_result.get("disclaimer")
+        == HISTORICAL_OPPORTUNITY_DISCLAIMER,
+        "Historical DOM replay presentation differs",
+    )
+    api_rows = _historical_api_rows(api_payload)
+    dom_rows = dom_result.get("rows")
+    require(type(dom_rows) is list and len(dom_rows) == 10,
+            "Historical DOM must contain exactly ten rows")
+    require(
+        len({row.get("opportunity_id") for row in dom_rows
+             if type(row) is dict}) == 10,
+        "Historical DOM opportunity identities are not unique",
+    )
+    require(
+        dom_rows == list(api_rows),
+        "Historical DOM rows differ from the API projection",
+    )
+    return MappingProxyType(dict(dom_result))
+
+
+def run_historical_opportunity_dom_probe(
+    *,
+    historical_html: bytes,
+    navigation_js: bytes,
+    app_js: bytes,
+    api_payload: Mapping[str, Any],
+    expected_application_sha: str,
+    expected_asset_sha: str,
+    expected_html_sha256: str,
+    expected_data_generation: str,
+    timeout: float,
+) -> Mapping[str, Any]:
+    byte_fields = (historical_html, navigation_js, app_js)
+    require(
+        all(type(value) is bytes and 0 < len(value) <= MAX_STATIC_ASSET_BYTES
+            for value in byte_fields)
+        and type(api_payload) is dict
+        and type(timeout) in (int, float)
+        and 0 < timeout <= 120,
+        "Historical DOM probe input is invalid",
+    )
+    require(
+        hashlib.sha256(historical_html).hexdigest() == expected_html_sha256,
+        "Historical DOM probe HTML SHA differs",
+    )
+    historical_surface_binding_sha256(
+        application_sha=expected_application_sha,
+        asset_sha=expected_asset_sha,
+        html_sha256=expected_html_sha256,
+        api_data_generation=expected_data_generation,
+    )
+    try:
+        historical_text = historical_html.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ReleaseCheckError("Historical DOM probe HTML is not UTF-8") from error
+    asset_version = "{}-{}".format(
+        expected_application_sha[:12], expected_asset_sha[:12],
+    )
+    for reference in (
+        "/styles.css?v={}".format(asset_version),
+        "/vendor/lucide.js?v={}".format(asset_version),
+        "/navigation.js?v={}".format(asset_version),
+        "/app.js?v={}".format(asset_version),
+    ):
+        require(
+            historical_text.count(reference) == 1,
+            "Historical DOM probe asset URL differs",
+        )
+    _historical_api_rows(api_payload)
+    node = shutil.which("node")
+    require(node is not None, "Node is required for the historical DOM probe")
+    probe_path = Path(__file__).with_name("historical_opportunity_dom_probe.js")
+    require(probe_path.is_file(), "Historical DOM probe script is missing")
+    payload = {
+        "historical_html_base64": base64.b64encode(historical_html).decode("ascii"),
+        "historical_html_sha256": expected_html_sha256,
+        "navigation_js_base64": base64.b64encode(navigation_js).decode("ascii"),
+        "navigation_js_sha256": hashlib.sha256(navigation_js).hexdigest(),
+        "app_js_base64": base64.b64encode(app_js).decode("ascii"),
+        "app_js_sha256": hashlib.sha256(app_js).hexdigest(),
+        "api_payload": api_payload,
+        "application_sha": expected_application_sha,
+        "asset_sha": expected_asset_sha,
+        "data_generation": expected_data_generation,
+    }
+    try:
+        completed = subprocess.run(
+            [node, str(probe_path)],
+            input=json.dumps(
+                payload, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=float(timeout),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ReleaseCheckError("Historical DOM probe failed") from error
+    require(
+        completed.returncode == 0
+        and completed.stderr == b""
+        and 0 < len(completed.stdout) <= 1_000_000
+        and completed.stdout.count(b"\n") <= 1,
+        "Historical DOM probe failed closed",
+    )
+    try:
+        output_text = completed.stdout.decode("utf-8", errors="strict")
+        result, output_end = json.JSONDecoder().raw_decode(output_text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseCheckError("Historical DOM probe output is invalid") from error
+    require(
+        output_end == len(output_text),
+        "Historical DOM probe output is invalid",
+    )
+    require(type(result) is dict, "Historical DOM probe output is invalid")
+    return result
 
 
 _ROUTE_STRICT_VALUE_STATUSES = frozenset(
@@ -3744,13 +4044,13 @@ def _bounded_static_gzip_decompress(body: bytes, path: str) -> bytes:
     return raw
 
 
-def fetch_static_asset_bundle(
+def fetch_static_asset_snapshot(
     base_url: str,
     asset_version: str,
     *,
     timeout: float,
     gzip_budget: int = STATIC_ASSET_GZIP_BUDGET,
-) -> tuple[str, list[ResponseMetrics]]:
+) -> StaticAssetSnapshot:
     """Fetch the versioned first-party assets and recompute their exact hash."""
     require(
         isinstance(asset_version, str)
@@ -3764,6 +4064,7 @@ def fetch_static_asset_bundle(
     )
     digest = hashlib.sha256()
     metrics: list[ResponseMetrics] = []
+    raw_assets: dict[str, bytes] = {}
     for filename in STATIC_ASSET_FILENAMES:
         path = "/{}?v={}".format(filename, asset_version)
         requested_url = "{}{}".format(base_url.rstrip("/"), path)
@@ -3830,6 +4131,7 @@ def fetch_static_asset_bundle(
         digest.update(b"\0")
         digest.update(raw)
         digest.update(b"\0")
+        raw_assets[filename] = bytes(raw)
         metrics.append(
             ResponseMetrics(
                 path=path,
@@ -3848,7 +4150,344 @@ def fetch_static_asset_bundle(
             total_wire_bytes, gzip_budget
         ),
     )
-    return digest.hexdigest(), metrics
+    return StaticAssetSnapshot(
+        asset_sha=digest.hexdigest(),
+        asset_version=asset_version,
+        raw_assets=MappingProxyType(dict(raw_assets)),
+        metrics=tuple(metrics),
+    )
+
+
+def fetch_static_asset_bundle(
+    base_url: str,
+    asset_version: str,
+    *,
+    timeout: float,
+    gzip_budget: int = STATIC_ASSET_GZIP_BUDGET,
+) -> tuple[str, list[ResponseMetrics]]:
+    """Compatibility projection for callers that do not need served bytes."""
+    snapshot = fetch_static_asset_snapshot(
+        base_url, asset_version, timeout=timeout, gzip_budget=gzip_budget,
+    )
+    return snapshot.asset_sha, list(snapshot.metrics)
+
+
+def fetch_historical_html_snapshot(
+    base_url: str,
+    *,
+    application_sha: str,
+    asset_sha: str,
+    asset_version: str,
+    timeout: float,
+) -> HistoricalHtmlSnapshot:
+    request_path = "/opportunities?opportunity_scope=historical"
+    require(
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", application_sha or "")
+        is not None
+        and re.fullmatch(r"[0-9a-f]{64}", asset_sha or "") is not None
+        and asset_version
+        == "{}-{}".format(application_sha[:12], asset_sha[:12]),
+        "Historical HTML deployment identity is invalid",
+    )
+    requested_url = base_url.rstrip("/") + request_path
+    request = Request(requested_url, headers={"Accept": "text/html"})
+    started = time.perf_counter()
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            body = response.read(MAX_STATIC_ASSET_BYTES + 1)
+            status = response.status
+            final_url = response.geturl()
+            content_types = response.headers.get_all("Content-Type") or []
+            content_lengths = response.headers.get_all("Content-Length") or []
+            content_encodings = response.headers.get_all("Content-Encoding") or []
+    except HTTPError as error:
+        raise ReleaseCheckError(
+            "Historical HTML returned HTTP {}".format(error.code)
+        ) from error
+    except URLError as error:
+        raise ReleaseCheckError(
+            "Historical HTML request failed: {}".format(error.reason)
+        ) from error
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    require(status == 200, "Historical HTML returned HTTP {}".format(status))
+    require(final_url == requested_url, "Historical HTML redirected")
+    require(not content_encodings, "Historical HTML encoding is invalid")
+    require(
+        content_types == ["text/html; charset=utf-8"],
+        "Historical HTML Content-Type is invalid",
+    )
+    require(
+        content_lengths == [str(len(body))]
+        and 0 < len(body) <= MAX_STATIC_ASSET_BYTES,
+        "Historical HTML Content-Length is invalid",
+    )
+    try:
+        html_text = body.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ReleaseCheckError("Historical HTML is not UTF-8") from error
+    required_refs = (
+        "/styles.css?v={}".format(asset_version),
+        "/vendor/lucide.js?v={}".format(asset_version),
+        "/navigation.js?v={}".format(asset_version),
+        "/app.js?v={}".format(asset_version),
+    )
+    for reference in required_refs:
+        require(
+            html_text.count(reference) == 1,
+            "Historical HTML asset reference is missing or duplicated",
+        )
+    public_reference = re.compile(
+        r"(?:src|href)=[\"'](/(?:styles\.css|vendor/lucide\.js|"
+        r"navigation\.js|app\.js)(?:\?[^\"']*)?)[\"']"
+    )
+    require(
+        tuple(match.group(1) for match in public_reference.finditer(html_text))
+        == required_refs,
+        "Historical HTML carries a wrong or reordered public asset URL",
+    )
+    for hook in (
+        'data-opportunity-scope="current"',
+        'data-opportunity-scope="historical"',
+        'id="historical-opportunity-inventory"',
+        'id="historical-opportunity-body"',
+        HISTORICAL_OPPORTUNITY_DISCLAIMER,
+    ):
+        require(
+            html_text.count(hook) == 1,
+            "Historical HTML scope hook is missing or duplicated",
+        )
+    return HistoricalHtmlSnapshot(
+        request_path=request_path,
+        raw_html=bytes(body),
+        html_sha256=hashlib.sha256(body).hexdigest(),
+        application_sha=application_sha,
+        asset_sha=asset_sha,
+        asset_version=asset_version,
+        metrics=ResponseMetrics(
+            path=request_path,
+            elapsed_ms=elapsed_ms,
+            wire_bytes=len(body),
+            raw_bytes=len(body),
+            compressed=False,
+            content_length=len(body),
+        ),
+    )
+
+
+def _fetch_historical_api_snapshot(
+    base_url: str, *, timeout: float,
+) -> _HistoricalApiSnapshot:
+    request_path = (
+        "/api/markets/opportunities/historical?class=all&route_type=all&"
+        "availability=all&sort=net_edge_usd&dir=desc"
+    )
+    requested_url = base_url.rstrip("/") + request_path
+    request = Request(
+        requested_url,
+        headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+    )
+    started = time.perf_counter()
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            body = response.read(DEFAULT_OPPORTUNITY_RAW_MAX + 1)
+            status = response.status
+            final_url = response.geturl()
+            content_types = response.headers.get_all("Content-Type") or []
+            content_lengths = response.headers.get_all("Content-Length") or []
+            content_encodings = response.headers.get_all("Content-Encoding") or []
+    except HTTPError as error:
+        raise ReleaseCheckError(
+            "Historical API returned HTTP {}".format(error.code)
+        ) from error
+    except URLError as error:
+        raise ReleaseCheckError(
+            "Historical API request failed: {}".format(error.reason)
+        ) from error
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    require(status == 200, "Historical API returned HTTP {}".format(status))
+    require(final_url == requested_url, "Historical API redirected")
+    require(not content_encodings, "Historical API encoding is invalid")
+    require(
+        content_types == ["application/json; charset=utf-8"]
+        and content_lengths == [str(len(body))]
+        and 0 < len(body) <= DEFAULT_OPPORTUNITY_RAW_MAX,
+        "Historical API response envelope is invalid",
+    )
+    try:
+        payload = json.loads(body.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseCheckError("Historical API JSON is invalid") from error
+    require(type(payload) is dict, "Historical API JSON is invalid")
+    return _HistoricalApiSnapshot(
+        request_path=request_path,
+        raw_json=bytes(body),
+        payload=MappingProxyType(dict(payload)),
+        metrics=ResponseMetrics(
+            path=request_path, elapsed_ms=elapsed_ms,
+            wire_bytes=len(body), raw_bytes=len(body), compressed=False,
+            content_length=len(body),
+        ),
+    )
+
+
+def validate_historical_foundry_replay_release(
+    base_url: str,
+    *,
+    application_sha: str,
+    asset_sha: str,
+    asset_version: str,
+    timeout: float,
+) -> tuple[Mapping[str, Any], tuple[ResponseMetrics, ...]]:
+    try:
+        from dashboard.opportunity_facts import (
+            build_historical_opportunity_payload,
+            historical_opportunity_data_generation,
+            load_latest_historical_opportunities,
+        )
+    except (ImportError, AttributeError) as error:
+        raise ReleaseCheckError(
+            "Historical public reader is unavailable"
+        ) from error
+
+    def close_local_publication(loaded: Mapping[str, Any]) -> None:
+        view = loaded.get("validated_view") if hasattr(loaded, "get") else None
+        close = getattr(view, "close", None)
+        require(
+            callable(close),
+            "Historical public reader validation view is invalid",
+        )
+        try:
+            close()
+        except Exception as error:
+            raise ReleaseCheckError(
+                "Historical publication validation view could not be closed"
+            ) from error
+
+    def local_projection() -> tuple[Mapping[str, Any], str]:
+        loaded = None
+        try:
+            loaded = load_latest_historical_opportunities()
+            generation = historical_opportunity_data_generation(loaded)
+            payload = build_historical_opportunity_payload(
+                loaded,
+                opportunity_class="all",
+                route_type="all",
+                availability="all",
+                sort="net_edge_usd",
+                direction="desc",
+            )
+        except Exception as error:
+            raise ReleaseCheckError(
+                "Historical publication validation failed"
+            ) from error
+        finally:
+            if loaded is not None:
+                close_local_publication(loaded)
+        require(type(payload) in (dict, MappingProxyType),
+                "Historical local projection is invalid")
+        require(
+            type(generation) is str
+            and re.fullmatch(r"[0-9a-f]{64}", generation) is not None,
+            "Historical data generation is invalid",
+        )
+        _historical_api_rows(payload)
+        return payload, generation
+
+    local_payload, generation = local_projection()
+    require(
+        local_payload.get("metadata", {}).get("data_generation") == generation,
+        "Historical local generation differs",
+    )
+    api = _fetch_historical_api_snapshot(base_url, timeout=timeout)
+    require(dict(api.payload) == dict(local_payload),
+            "Historical API differs from the validated publication")
+    assets = fetch_static_asset_snapshot(
+        base_url, asset_version, timeout=timeout,
+    )
+    require(assets.asset_sha == asset_sha,
+            "Historical served asset SHA differs")
+    html = fetch_historical_html_snapshot(
+        base_url,
+        application_sha=application_sha,
+        asset_sha=asset_sha,
+        asset_version=asset_version,
+        timeout=timeout,
+    )
+    try:
+        navigation_js = assets.raw_assets["navigation.js"]
+        app_js = assets.raw_assets["app.js"]
+    except KeyError as error:
+        raise ReleaseCheckError("Historical served JavaScript is missing") from error
+    dom = run_historical_opportunity_dom_probe(
+        historical_html=html.raw_html,
+        navigation_js=navigation_js,
+        app_js=app_js,
+        api_payload=dict(api.payload),
+        expected_application_sha=application_sha,
+        expected_asset_sha=asset_sha,
+        expected_html_sha256=html.html_sha256,
+        expected_data_generation=generation,
+        timeout=timeout,
+    )
+    validated_dom = validate_historical_dom_api_parity(
+        api_payload=dict(api.payload), dom_result=dom,
+        expected_application_sha=application_sha,
+        expected_asset_sha=asset_sha,
+        expected_html_sha256=html.html_sha256,
+        expected_data_generation=generation,
+    )
+
+    final_health, health_metrics = fetch_json(
+        base_url, "/health", timeout=timeout,
+    )
+    final_application, final_asset, final_version = validate_release_health(
+        final_health,
+        expected_application_sha=application_sha,
+        expected_asset_sha=asset_sha,
+    )
+    require(
+        (final_application, final_asset, final_version)
+        == (application_sha, asset_sha, asset_version),
+        "Historical application identity changed after the DOM probe",
+    )
+    final_assets = fetch_static_asset_snapshot(
+        base_url, asset_version, timeout=timeout,
+    )
+    final_html = fetch_historical_html_snapshot(
+        base_url,
+        application_sha=application_sha,
+        asset_sha=asset_sha,
+        asset_version=asset_version,
+        timeout=timeout,
+    )
+    final_api = _fetch_historical_api_snapshot(base_url, timeout=timeout)
+    final_local, final_generation = local_projection()
+    require(
+        final_assets.asset_sha == assets.asset_sha
+        and dict(final_assets.raw_assets) == dict(assets.raw_assets)
+        and final_html.raw_html == html.raw_html
+        and final_html.html_sha256 == html.html_sha256
+        and final_api.raw_json == api.raw_json
+        and dict(final_api.payload) == dict(api.payload)
+        and dict(final_local) == dict(local_payload)
+        and final_generation == generation,
+        "Historical publication or served surface changed after the DOM probe",
+    )
+    metrics = (
+        *assets.metrics, html.metrics, api.metrics, health_metrics,
+        *final_assets.metrics, final_html.metrics, final_api.metrics,
+    )
+    return MappingProxyType({
+        "status": "validated",
+        "data_generation": generation,
+        "replay_id": validated_dom["replay_id"],
+        "selected_block_number": validated_dom["selected_block_number"],
+        "scenario_count": validated_dom["scenario_count"],
+        "html_sha256": html.html_sha256,
+        "surface_binding_sha256": validated_dom[
+            "surface_binding_sha256"
+        ],
+    }), tuple(metrics)
 
 
 def validate_summary(
@@ -6372,6 +7011,18 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         served_asset_sha == asset_sha,
         "Versioned served assets do not match the deployed asset SHA",
     )
+    historical_release_validation = None
+    if getattr(args, "require_historical_foundry_replay", False):
+        historical_release_validation, historical_metrics = (
+            validate_historical_foundry_replay_release(
+                args.base_url,
+                application_sha=application_sha,
+                asset_sha=asset_sha,
+                asset_version=asset_version,
+                timeout=args.timeout,
+            )
+        )
+        metrics.extend(historical_metrics)
 
     summary, summary_metrics = fetch_json(
         args.base_url,
@@ -6810,7 +7461,7 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
         freshness_checked_at=final_freshness_checked_at,
     )
 
-    return {
+    result = {
         "status": "ok",
         "base_url": args.base_url,
         "token": token,
@@ -6851,6 +7502,11 @@ def release_check(args: argparse.Namespace) -> dict[str, Any]:
             for item in metrics
         ],
     }
+    if historical_release_validation is not None:
+        result["historical_foundry_replay"] = dict(
+            historical_release_validation
+        )
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -6889,6 +7545,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Fail unless the complete public route-opportunity pointer and "
             "all-in cost bundle are available and valid"
+        ),
+    )
+    parser.add_argument(
+        "--require-historical-foundry-replay",
+        action="store_true",
+        help=(
+            "Fail unless the dedicated historical Foundry replay surface, "
+            "API, publication and DOM bindings are complete and stable"
         ),
     )
     return parser.parse_args()
