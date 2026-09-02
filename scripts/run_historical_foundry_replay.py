@@ -1,8 +1,8 @@
 """Sealed command boundary for historical Foundry replay operations.
 
-Checkpoint 1 intentionally leaves the production controller unavailable.  It
-does, however, establish the canonical import/binding boundary, the exact CLI
-grammar, and the live-pointer invariant that later orchestration must use.
+The module owns the canonical import/binding boundary, exact CLI grammar,
+live-pointer invariant, and fail-closed scan/publication orchestration.
+Audit-only verification remains a separate command path.
 """
 
 from __future__ import annotations
@@ -2341,14 +2341,196 @@ def _publish_verified_historical_bundle(
 
 
 def _invoke_production_controller(
-    _arguments: argparse.Namespace, _preflight: Any,
+    arguments: argparse.Namespace, preflight: Any,
 ) -> Mapping[str, Any]:
-    raise _entrypoint_error("historical production controller is unavailable")
+    if (
+        type(arguments) is not argparse.Namespace
+        or arguments.command != "scan"
+        or set(vars(arguments))
+        != {"command", "data_dir", "publish", "dry_run"}
+        or not isinstance(arguments.data_dir, Path)
+        or type(arguments.publish) is not bool
+        or type(arguments.dry_run) is not bool
+        or arguments.publish == arguments.dry_run
+    ):
+        raise _entrypoint_error(
+            "historical production controller is unavailable"
+        )
+    try:
+        source_identity = preflight.identity_projection
+    except Exception as error:
+        raise _entrypoint_error(
+            "historical production controller input is invalid"
+        ) from error
+    if not isinstance(source_identity, Mapping):
+        raise _entrypoint_error(
+            "historical production controller input is invalid"
+        )
+
+    publish = arguments.publish
+    raw_state = None
+    prepared = None
+    result = None
+    original_error = None
+    try:
+        raw_state = _produce_historical_raw_run(
+            data_dir=arguments.data_dir
+        )
+        if type(raw_state) is not dict:
+            raise _entrypoint_error(
+                "historical raw controller result is invalid"
+            )
+        selection = raw_state.get("selection")
+        run_identity = raw_state.get("run_identity")
+        if (
+            type(selection) is not dict
+            or type(run_identity) is not dict
+        ):
+            raise _entrypoint_error(
+                "historical raw controller result is invalid"
+            )
+        status = selection.get("status")
+        result_base = {
+            "schema": "historical_replay_command_result/v1",
+            "command": "scan",
+            "mode": "publish" if publish else "dry-run",
+            "status": status,
+            "source_identity": dict(source_identity),
+            "selection": dict(selection),
+            "run_identity": dict(run_identity),
+        }
+        if status == "no_publishable_profitable_block":
+            if (
+                raw_state.get("run") is not None
+                or raw_state.get("publication_lease") is not None
+            ):
+                raise _entrypoint_error(
+                    "historical raw controller result is invalid"
+                )
+            result = MappingProxyType({
+                **result_base,
+                "bundle": None,
+                "verification": None,
+                "published_pointer": None,
+            })
+        elif status == "found_publishable_profitable_block":
+            if (
+                raw_state.get("run") is None
+                or raw_state.get("publication_lease") is None
+            ):
+                raise _entrypoint_error(
+                    "historical raw controller result is invalid"
+                )
+            prepared = _prepare_historical_replay_bundle(
+                data_dir=arguments.data_dir,
+                raw_state=raw_state,
+                publish=publish,
+            )
+            if type(prepared) is not dict:
+                raise _entrypoint_error(
+                    "historical publication preparation is invalid"
+                )
+            verification = _verify_prepared_historical_bundle(
+                prepared=prepared, publish=publish
+            )
+            published_pointer = _publish_verified_historical_bundle(
+                prepared=prepared,
+                verification=verification,
+                publish=publish,
+            )
+            bundle = prepared.get("bundle")
+            final_pointer = verification.get("final_pointer")
+            if (
+                not isinstance(bundle, Mapping)
+                or not isinstance(verification, Mapping)
+                or not isinstance(final_pointer, Mapping)
+                or type(bundle.get("replay_id")) is not str
+                or type(bundle.get("manifest_sha256")) is not str
+                or not isinstance(bundle.get("pointer_core"), Mapping)
+                or type(verification.get("report_sha256")) is not str
+                or publish
+                and (
+                    not isinstance(published_pointer, Mapping)
+                    or dict(published_pointer) != dict(final_pointer)
+                )
+                or not publish and published_pointer is not None
+            ):
+                raise _entrypoint_error(
+                    "historical production controller result is invalid"
+                )
+            result = MappingProxyType({
+                **result_base,
+                "bundle": {
+                    "replay_id": bundle["replay_id"],
+                    "manifest_sha256": bundle["manifest_sha256"],
+                    "pointer_core": dict(bundle["pointer_core"]),
+                },
+                "verification": {
+                    "report_sha256": verification["report_sha256"],
+                    "final_pointer": dict(final_pointer),
+                },
+                "published_pointer": (
+                    dict(published_pointer) if publish else None
+                ),
+            })
+        else:
+            raise _entrypoint_error(
+                "historical replay selection is invalid"
+            )
+    except BaseException as error:
+        original_error = error
+
+    cleanup_error = None
+    if prepared is not None:
+        try:
+            _close_prepared_historical_bundle(prepared)
+        except BaseException as error:
+            cleanup_error = error
+    if type(raw_state) is dict:
+        raw_resources = [
+            raw_state.get("run"), raw_state.get("publication_lease")
+        ]
+        raw_state["run"] = None
+        raw_state["publication_lease"] = None
+        raw_cleanup_error = _close_historical_controller_resources(
+            raw_resources
+        )
+        if cleanup_error is None or (
+            isinstance(cleanup_error, Exception)
+            and raw_cleanup_error is not None
+            and not isinstance(raw_cleanup_error, Exception)
+        ):
+            cleanup_error = raw_cleanup_error
+
+    if original_error is not None:
+        if not isinstance(original_error, Exception):
+            raise original_error from cleanup_error
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from original_error
+        if isinstance(original_error, HistoricalReplayEntrypointError):
+            raise original_error
+        raise _entrypoint_error(
+            "historical production controller failed"
+        ) from original_error
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(
+            "historical production controller cleanup failed"
+        ) from cleanup_error
+    if result is None:
+        raise _entrypoint_error(
+            "historical production controller is unavailable"
+        )
+    return result
 
 
 def _execute(arguments: argparse.Namespace) -> Mapping[str, Any]:
     _require_safe_historical_startup()
-    with _LivePointerGuard(data_dir=arguments.data_dir):
+    guard = _LivePointerGuard(data_dir=arguments.data_dir)
+    with guard:
         preflight = verify_clean_tracked_historical_source()
         original_error = None
         result = None
@@ -2384,7 +2566,25 @@ def _execute(arguments: argparse.Namespace) -> Mapping[str, Any]:
             raise _entrypoint_error(
                 "historical production controller is unavailable"
             )
-        return result
+    if (
+        not isinstance(result, Mapping)
+        or "live_pointers_before" in result
+        or "live_pointers_after" in result
+        or guard.before is None
+        or guard.after is None
+    ):
+        raise _entrypoint_error(
+            "historical production controller result is invalid"
+        )
+    return MappingProxyType({
+        **dict(result),
+        "live_pointers_before": project_live_pointer_snapshots(
+            guard.before
+        ),
+        "live_pointers_after": project_live_pointer_snapshots(
+            guard.after
+        ),
+    })
 
 
 def main(arguments: Optional[Sequence[str]] = None) -> int:

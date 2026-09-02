@@ -681,7 +681,7 @@ print("module-trampoline-ok")
         self.assertEqual(raised.exception.code, 2)
         forbidden.assert_not_called()
 
-    def test_valid_cli_fails_closed_without_production_evidence(self):
+    def test_valid_cli_enters_controller_and_fails_without_production_evidence(self):
         module = _entrypoint()
 
         class HeldSource:
@@ -711,7 +711,7 @@ print("module-trampoline-ok")
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(
             stderr.getvalue(),
-            "historical production controller is unavailable\n",
+            "historical production scan failed\n",
         )
 
 
@@ -1071,6 +1071,61 @@ class HistoricalReplayOutermostGuardTests(unittest.TestCase):
                 pass
         self.assertEqual(capture.call_count, 2)
         self.assertEqual(guard.before, guard.after)
+
+    def test_execute_result_retains_exact_live_pointer_before_and_after(self):
+        class Source:
+            def __init__(self):
+                self.rereads = 0
+                self.closed = 0
+
+            def reread_unchanged(self):
+                self.rereads += 1
+
+            def close(self):
+                self.closed += 1
+
+        source = Source()
+        routes = self.data_dir / "routes"
+        (routes / "core").mkdir(parents=True)
+        (routes / "core" / "latest.json").write_bytes(b"core")
+        (routes / "latest.json").write_bytes(b"complete")
+        arguments = self.module._parse_arguments([
+            "scan", "--data-dir", str(self.data_dir), "--dry-run",
+        ])
+        with mock.patch.object(
+            self.module,
+            "_require_safe_historical_startup",
+        ), mock.patch.object(
+            self.module,
+            "verify_clean_tracked_historical_source",
+            return_value=source,
+        ), mock.patch.object(
+            self.module,
+            "_invoke_production_controller",
+            return_value={"schema": "test-result/v1", "status": "ok"},
+        ):
+            result = self.module._execute(arguments)
+
+        self.assertEqual(result["schema"], "test-result/v1")
+        self.assertEqual(
+            result["live_pointers_before"],
+            result["live_pointers_after"],
+        )
+        self.assertEqual(
+            tuple(row["relative_path"] for row in result[
+                "live_pointers_before"
+            ]),
+            ("routes/core/latest.json", "routes/latest.json"),
+        )
+        self.assertEqual(
+            tuple(
+                base64.b64decode(row["bytes_base64"])
+                for row in result["live_pointers_before"]
+            ),
+            (b"core", b"complete"),
+        )
+        self.assertEqual(source.rereads, 2)
+        self.assertEqual(source.closed, 1)
 
     def test_guard_recaptures_and_compares_in_exception_finally_path(self):
         real_capture = self.module.capture_live_pointer_snapshots
@@ -3052,6 +3107,272 @@ class HistoricalReplayConnectedVerificationControllerTests(unittest.TestCase):
                     publish=True,
                 )
         publish_pointer.assert_not_called()
+
+
+class HistoricalReplayProductionControllerTests(unittest.TestCase):
+    class Resource:
+        def __init__(self, name, events):
+            self.name = name
+            self.events = events
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+            self.events.append(("close", self.name))
+
+    class Preflight:
+        @property
+        def identity_projection(self):
+            return {
+                "schema": "historical_clean_source_identity/v1",
+                "head": "a" * 40,
+            }
+
+    def setUp(self):
+        self.module = _entrypoint()
+
+    def _fixture(self, *, publish, status):
+        events = []
+        run = self.Resource("run", events)
+        lease = self.Resource("lease", events)
+        pointer_core = {
+            "schema": "route_historical_replay_pointer/v1",
+            "bundle_stage": "route_historical_foundry_replay/v1",
+            "replay_id": "replay:" + "1" * 64,
+            "route_cohort_id": "cohort:" + "2" * 64,
+            "manifest_sha256": "3" * 64,
+        }
+        selection = {
+            "status": status,
+            "selected_scenario_count": (
+                10
+                if status == "found_publishable_profitable_block"
+                else 0
+            ),
+            "unresolved_candidate_count": 0,
+        }
+        raw = {
+            "config": object(),
+            "selection": selection,
+            "run": (
+                run
+                if status == "found_publishable_profitable_block"
+                else None
+            ),
+            "run_identity": {
+                "run_id": "run:" + "4" * 64,
+                "run_manifest_sha256": "5" * 64,
+            },
+            "publication_lease": (
+                lease
+                if status == "found_publishable_profitable_block"
+                else None
+            ),
+        }
+        prepared = {
+            "mode": "publish" if publish else "dry-run",
+            "bundle": {
+                "replay_id": pointer_core["replay_id"],
+                "manifest_sha256": pointer_core["manifest_sha256"],
+                "pointer_core": pointer_core,
+            },
+        }
+        final_pointer = {
+            **pointer_core,
+            "verification_report_sha256": "6" * 64,
+        }
+        verification = {
+            "report_sha256": "6" * 64,
+            "final_pointer": final_pointer,
+        }
+        published_pointer = final_pointer if publish else None
+        arguments = self.module._parse_arguments([
+            "scan", "--data-dir", "/immutable-data",
+            "--publish" if publish else "--dry-run",
+        ])
+        return {
+            "events": events,
+            "run": run,
+            "lease": lease,
+            "raw": raw,
+            "prepared": prepared,
+            "verification": verification,
+            "published_pointer": published_pointer,
+            "arguments": arguments,
+        }
+
+    def _patch_pipeline(self, fixture):
+        events = fixture["events"]
+
+        def produce(**keywords):
+            events.append(("produce", keywords))
+            return fixture["raw"]
+
+        def prepare(**keywords):
+            events.append(("prepare", keywords))
+            fixture["raw"]["run"] = None
+            fixture["raw"]["publication_lease"] = None
+            return fixture["prepared"]
+
+        def verify(**keywords):
+            events.append(("verify", keywords))
+            return fixture["verification"]
+
+        def publish_bundle(**keywords):
+            events.append(("publish", keywords))
+            return fixture["published_pointer"]
+
+        def close(prepared):
+            events.append(("close_prepared", prepared))
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(
+            self.module,
+            "_produce_historical_raw_run",
+            side_effect=produce,
+        ))
+        stack.enter_context(mock.patch.object(
+            self.module,
+            "_prepare_historical_replay_bundle",
+            side_effect=prepare,
+        ))
+        verify_mock = stack.enter_context(mock.patch.object(
+            self.module,
+            "_verify_prepared_historical_bundle",
+            side_effect=verify,
+        ))
+        publish_mock = stack.enter_context(mock.patch.object(
+            self.module,
+            "_publish_verified_historical_bundle",
+            side_effect=publish_bundle,
+        ))
+        stack.enter_context(mock.patch.object(
+            self.module,
+            "_close_prepared_historical_bundle",
+            side_effect=close,
+        ))
+        return stack, verify_mock, publish_mock
+
+    def test_publish_scan_runs_full_pipeline_then_closes_prepared_state(self):
+        fixture = self._fixture(
+            publish=True,
+            status="found_publishable_profitable_block",
+        )
+        patches, verify, publish_bundle = self._patch_pipeline(fixture)
+        with patches:
+            result = self.module._invoke_production_controller(
+                fixture["arguments"], self.Preflight()
+            )
+
+        self.assertEqual(
+            [event[0] for event in fixture["events"]],
+            ["produce", "prepare", "verify", "publish", "close_prepared"],
+        )
+        verify.assert_called_once_with(
+            prepared=fixture["prepared"], publish=True
+        )
+        publish_bundle.assert_called_once_with(
+            prepared=fixture["prepared"],
+            verification=fixture["verification"],
+            publish=True,
+        )
+        self.assertEqual(result["status"], fixture["raw"]["selection"]["status"])
+        self.assertEqual(
+            result["published_pointer"], fixture["published_pointer"]
+        )
+        self.assertEqual(result["bundle"]["replay_id"], "replay:" + "1" * 64)
+
+    def test_dry_run_validates_full_pipeline_without_publishing_pointer(self):
+        fixture = self._fixture(
+            publish=False,
+            status="found_publishable_profitable_block",
+        )
+        patches, _verify, publish_bundle = self._patch_pipeline(fixture)
+        with patches:
+            result = self.module._invoke_production_controller(
+                fixture["arguments"], self.Preflight()
+            )
+
+        publish_bundle.assert_called_once_with(
+            prepared=fixture["prepared"],
+            verification=fixture["verification"],
+            publish=False,
+        )
+        self.assertIsNone(result["published_pointer"])
+        self.assertEqual(result["mode"], "dry-run")
+
+    def test_resolved_no_opportunity_stops_before_publication_pipeline(self):
+        fixture = self._fixture(
+            publish=True,
+            status="no_publishable_profitable_block",
+        )
+        patches, verify, publish_bundle = self._patch_pipeline(fixture)
+        with patches:
+            result = self.module._invoke_production_controller(
+                fixture["arguments"], self.Preflight()
+            )
+
+        self.assertEqual(
+            [event[0] for event in fixture["events"]], ["produce"]
+        )
+        verify.assert_not_called()
+        publish_bundle.assert_not_called()
+        self.assertEqual(result["status"], "no_publishable_profitable_block")
+        self.assertIsNone(result["bundle"])
+        self.assertIsNone(result["verification"])
+
+    def test_verification_failure_closes_prepared_state_and_never_publishes(self):
+        fixture = self._fixture(
+            publish=True,
+            status="found_publishable_profitable_block",
+        )
+        patches, _verify, publish_bundle = self._patch_pipeline(fixture)
+        with patches, mock.patch.object(
+            self.module,
+            "_verify_prepared_historical_bundle",
+            side_effect=self.module.HistoricalReplayEntrypointError(
+                "verification failed"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "verification failed",
+            ):
+                self.module._invoke_production_controller(
+                    fixture["arguments"], self.Preflight()
+                )
+
+        publish_bundle.assert_not_called()
+        self.assertEqual(fixture["events"][-1][0], "close_prepared")
+
+    def test_preparation_failure_closes_untransferred_raw_authority(self):
+        fixture = self._fixture(
+            publish=True,
+            status="found_publishable_profitable_block",
+        )
+        with mock.patch.object(
+            self.module,
+            "_produce_historical_raw_run",
+            return_value=fixture["raw"],
+        ), mock.patch.object(
+            self.module,
+            "_prepare_historical_replay_bundle",
+            side_effect=self.module.HistoricalReplayEntrypointError(
+                "preparation failed"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "preparation failed",
+            ):
+                self.module._invoke_production_controller(
+                    fixture["arguments"], self.Preflight()
+                )
+
+        self.assertEqual(
+            fixture["events"],
+            [("close", "lease"), ("close", "run")],
+        )
 
 
 if __name__ == "__main__":
