@@ -129,6 +129,98 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+def _initialize_historical_complete_pointer_publication():
+    provenance = object()
+    registry = {}
+
+    class _HistoricalCompletePointerPublication:
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> NoReturn:
+            del cls, args, kwargs
+            raise HistoricalRoutePublicationError(
+                "historical complete pointer publication is private"
+            )
+
+        def __repr__(self) -> str:
+            return "_HistoricalCompletePointerPublication(<sealed>)"
+
+        def __reduce_ex__(self, protocol: int) -> NoReturn:
+            del protocol
+            raise TypeError(
+                "historical complete pointer publication is not serializable"
+            )
+
+        def __setattr__(self, name: str, value: Any) -> NoReturn:
+            del name, value
+            raise AttributeError(
+                "historical complete pointer publication is immutable"
+            )
+
+        def close(self) -> None:
+            record = require(self, allow_terminal=True)
+            if record["state"] == "held":
+                record["state"] = "closed"
+            return None
+
+    def issue(record: Dict[str, Any]) -> _HistoricalCompletePointerPublication:
+        value = object.__new__(_HistoricalCompletePointerPublication)
+        value_id = id(value)
+        record["provenance"] = provenance
+        record["state"] = "held"
+
+        def retire(reference: weakref.ReferenceType) -> None:
+            current = registry.get(value_id)
+            if current is not None and current[0] is reference:
+                registry.pop(value_id, None)
+
+        registry[value_id] = (weakref.ref(value, retire), record)
+        return value
+
+    def require(
+        value: object, *, allow_terminal: bool = False,
+    ) -> Dict[str, Any]:
+        entry = registry.get(id(value))
+        if (
+            type(value) is not _HistoricalCompletePointerPublication
+            or entry is None
+            or entry[0]() is not value
+            or entry[1].get("provenance") is not provenance
+            or (
+                not allow_terminal
+                and entry[1].get("state") != "held"
+            )
+            or (
+                allow_terminal
+                and entry[1].get("state")
+                not in ("held", "closed", "consumed")
+            )
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical complete pointer publication is invalid"
+            )
+        return entry[1]
+
+    def consume(value: object) -> Dict[str, Any]:
+        record = require(value)
+        record["state"] = "consumed"
+        return record
+
+    return (
+        _HistoricalCompletePointerPublication,
+        issue,
+        consume,
+    )
+
+
+(
+    _HistoricalCompletePointerPublication,
+    _issue_historical_complete_pointer_publication,
+    _consume_historical_complete_pointer_publication,
+) = _initialize_historical_complete_pointer_publication()
+del _initialize_historical_complete_pointer_publication
+
+
 def _initialize_validated_historical_cost_proof_inputs():
     issuer = object()
     registry = {}
@@ -5446,6 +5538,18 @@ def stage_historical_replay_bundle(
                     "historical complete committed manifest differs"
                 )
             context.reread_unchanged()
+            pointer_publication = (
+                _issue_historical_complete_pointer_publication({
+                    "data_dir": data,
+                    "raw_root": raw,
+                    "historical_root": historical_root,
+                    "bundle_path": validated["path"],
+                    "replay_id": payload["replay_id"],
+                    "manifest_sha256": manifest_sha256,
+                    "pointer_core": dict(validated["pointer_core"]),
+                    "pointer_before": pointer_before,
+                })
+            )
             result = MappingProxyType({
                 "path": validated["path"],
                 "replay_id": payload["replay_id"],
@@ -5454,6 +5558,7 @@ def stage_historical_replay_bundle(
                 "verification_subject": validated[
                     "verification_subject"
                 ],
+                "pointer_publication": pointer_publication,
             })
         except BaseException:
             try:
@@ -6059,6 +6164,293 @@ def validate_historical_replay_bundle(
         issue_view=True,
     )
     return _attach_historical_verification_subject(validated)
+
+
+def _reread_historical_verification_report(
+    *, data_dir: Path, final_pointer: Mapping[str, Any],
+) -> bytes:
+    import scripts.historical_foundry_verifier as verifier
+
+    pointer_core = verifier.historical_replay_pointer_core(final_pointer)
+    report_sha256 = final_pointer["verification_report_sha256"]
+    root = by_sha_fd = None
+    try:
+        verification_root, root, root_details = (
+            _route_publication._open_verified_directory(
+                data_dir / "routes" / "historical" / "verifications",
+                "historical verification root",
+            )
+        )
+        by_sha_fd, by_sha_details = _route_publication._open_directory_at(
+            root, "by-sha256", "historical verification reports"
+        )
+        report_bytes, physical_sha256, _details = (
+            _route_publication._read_bounded_bytes_at(
+                by_sha_fd,
+                report_sha256 + ".json",
+                limit=verifier._MAX_REPORT_BYTES,
+                label="historical verification report",
+            )
+        )
+        if (
+            physical_sha256 != report_sha256
+            or _sha(report_bytes) != report_sha256
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical verification report differs"
+            )
+        verifier._validate_retained_historical_verification_report(
+            report_bytes=report_bytes, pointer_core=pointer_core
+        )
+        _route_publication._verify_directory_entry_snapshot(
+            root,
+            "by-sha256",
+            by_sha_details,
+            "historical verification reports",
+        )
+        _route_publication._verify_open_path_identity(
+            verification_root,
+            root_details,
+            "historical verification root",
+        )
+        return report_bytes
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical verification report loading failed"
+        ) from error
+    finally:
+        _close_descriptors_robustly(by_sha_fd, root)
+
+
+def _reread_historical_complete_for_publication(
+    record: Mapping[str, Any],
+) -> None:
+    validated = validate_historical_replay_bundle(
+        data_dir=record["data_dir"],
+        raw_root=record["raw_root"],
+        bundle_path=record["bundle_path"],
+        expected_pointer_core=record["pointer_core"],
+    )
+    subject = validated["verification_subject"]
+    failure = None
+    try:
+        subject.reread_unchanged()
+        if (
+            validated["path"] != record["bundle_path"]
+            or validated["manifest_sha256"]
+            != record["manifest_sha256"]
+            or dict(validated["pointer_core"])
+            != record["pointer_core"]
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical complete publication bundle differs"
+            )
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            subject.close()
+        except BaseException as close_error:
+            if failure is None:
+                raise
+            if not isinstance(failure, Exception):
+                raise failure from close_error
+    return None
+
+
+def _restore_historical_complete_pointer(
+    *, historical_fd: int, historical_root: Path,
+    expected_snapshot: Any, committed_snapshot: Any,
+) -> None:
+    current = _route_publication._optional_pointer_snapshot_at(
+        historical_fd
+    )
+    if _snapshot_matches(current, expected_snapshot):
+        return None
+    if (
+        committed_snapshot is None
+        or not _snapshot_matches(current, committed_snapshot)
+    ):
+        raise HistoricalRoutePublicationError("publication_race")
+    if expected_snapshot is None:
+        os.unlink("latest.json", dir_fd=historical_fd)
+    else:
+        _route_publication._replace_pointer_bytes_at(
+            historical_fd, expected_snapshot[0]
+        )
+    _route_publication._fsync_directory(
+        historical_root, directory_fd=historical_fd
+    )
+    restored = _route_publication._optional_pointer_snapshot_at(
+        historical_fd
+    )
+    if (
+        expected_snapshot is None and restored is not None
+        or expected_snapshot is not None
+        and (restored is None or restored[0] != expected_snapshot[0])
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical complete pointer rollback failed"
+        )
+    return None
+
+
+def publish_historical_replay_bundle(
+    *, data_dir: Path,
+    pointer_publication: _HistoricalCompletePointerPublication,
+    final_pointer_bytes: bytes,
+) -> Mapping[str, Any]:
+    """CAS-install only the fully verified historical complete pointer."""
+    import scripts.historical_foundry_verifier as verifier
+
+    if (
+        not isinstance(data_dir, Path)
+        or type(final_pointer_bytes) is not bytes
+        or not 0 < len(final_pointer_bytes) <= _route_publication._MAX_JSON_BYTES
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical complete pointer input is invalid"
+        )
+    try:
+        final_pointer = json.loads(final_pointer_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HistoricalRoutePublicationError(
+            "historical complete pointer input is invalid"
+        ) from error
+    if (
+        type(final_pointer) is not dict
+        or _canonical_bytes(final_pointer) != final_pointer_bytes
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical complete pointer input is invalid"
+        )
+    try:
+        pointer_core = dict(
+            verifier.historical_replay_pointer_core(final_pointer)
+        )
+    except verifier.HistoricalVerificationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical complete pointer input is invalid"
+        ) from error
+    record = _consume_historical_complete_pointer_publication(
+        pointer_publication
+    )
+    data = _route_publication._absolute_without_symlink_resolution(data_dir)
+    if (
+        data != record["data_dir"]
+        or pointer_core != record["pointer_core"]
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical complete pointer authority differs"
+        )
+    expected_report_sha256 = final_pointer[
+        "verification_report_sha256"
+    ]
+    historical_fd = None
+    locked = False
+    replaced = False
+    committed_snapshot = None
+    try:
+        historical_root, historical_fd, historical_details = (
+            _route_publication._open_verified_directory(
+                record["historical_root"],
+                "historical complete root",
+            )
+        )
+        try:
+            fcntl.flock(historical_fd, fcntl.LOCK_EX)
+            locked = True
+        except Exception as error:
+            raise HistoricalRoutePublicationError(
+                "historical complete pointer lock failed"
+            ) from error
+        current = _route_publication._optional_pointer_snapshot_at(
+            historical_fd
+        )
+        if not _snapshot_matches(current, record["pointer_before"]):
+            raise HistoricalRoutePublicationError("publication_race")
+        report_before = _reread_historical_verification_report(
+            data_dir=data, final_pointer=final_pointer
+        )
+        if _sha(report_before) != expected_report_sha256:
+            raise HistoricalRoutePublicationError(
+                "historical verification report differs"
+            )
+        _reread_historical_complete_for_publication(record)
+        _route_publication._verify_open_path_identity(
+            historical_root,
+            historical_details,
+            "historical complete root",
+        )
+        _route_publication._replace_pointer_bytes_at(
+            historical_fd, final_pointer_bytes
+        )
+        replaced = True
+        committed_snapshot = (
+            _route_publication._optional_pointer_snapshot_at(historical_fd)
+        )
+        if (
+            committed_snapshot is None
+            or committed_snapshot[0] != final_pointer_bytes
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical complete pointer state is uncertain"
+            )
+        _route_publication._fsync_directory(
+            historical_root, directory_fd=historical_fd
+        )
+        if not _snapshot_matches(
+            _route_publication._optional_pointer_snapshot_at(historical_fd),
+            committed_snapshot,
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical complete pointer state is uncertain"
+            )
+        report_after = _reread_historical_verification_report(
+            data_dir=data, final_pointer=final_pointer
+        )
+        if report_after != report_before:
+            raise HistoricalRoutePublicationError(
+                "historical verification report changed"
+            )
+        _reread_historical_complete_for_publication(record)
+        installed = _route_publication._optional_pointer_snapshot_at(
+            historical_fd
+        )
+        if (
+            not _snapshot_matches(installed, committed_snapshot)
+            or installed[0] != final_pointer_bytes
+        ):
+            raise HistoricalRoutePublicationError("publication_race")
+        return MappingProxyType(dict(final_pointer))
+    except BaseException as error:
+        if replaced:
+            try:
+                _restore_historical_complete_pointer(
+                    historical_fd=historical_fd,
+                    historical_root=record["historical_root"],
+                    expected_snapshot=record["pointer_before"],
+                    committed_snapshot=committed_snapshot,
+                )
+            except Exception as rollback_error:
+                if not isinstance(error, Exception):
+                    raise error
+                raise HistoricalRoutePublicationError(
+                    "publication_race"
+                ) from rollback_error
+        if isinstance(error, _route_publication.RoutePublicationError):
+            raise HistoricalRoutePublicationError(
+                "historical complete pointer publication failed"
+            ) from error
+        raise
+    finally:
+        if locked:
+            try:
+                fcntl.flock(historical_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        _close_descriptors_robustly(historical_fd)
 
 
 _load_historical_cost_proof_inputs_for_published_view = (

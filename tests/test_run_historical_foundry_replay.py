@@ -2641,6 +2641,9 @@ class HistoricalReplayBundlePreparationTests(unittest.TestCase):
         lease = self.Resource("lease", events)
         stage = self.Resource("core_stage", events)
         subject = self.Resource("subject", events)
+        pointer_publication = self.Resource(
+            "pointer_publication", events
+        )
         staged_projection = {
             "schema": "historical_replay_build_context/v1",
             "run_id": "run:" + "a" * 64,
@@ -2665,6 +2668,7 @@ class HistoricalReplayBundlePreparationTests(unittest.TestCase):
             "manifest_sha256": "e" * 64,
             "pointer_core": {"schema": "route_historical_replay_pointer/v1"},
             "verification_subject": subject,
+            "pointer_publication": pointer_publication,
         }
         raw = {
             "config": object(),
@@ -2686,6 +2690,7 @@ class HistoricalReplayBundlePreparationTests(unittest.TestCase):
             "lease": lease,
             "stage": stage,
             "subject": subject,
+            "pointer_publication": pointer_publication,
             "staged_context": staged_context,
             "committed_context": committed_context,
             "payload": payload,
@@ -2760,6 +2765,10 @@ class HistoricalReplayBundlePreparationTests(unittest.TestCase):
         self.assertIs(prepared["core_stage"], fixture["stage"])
         self.assertIs(prepared["context"], fixture["staged_context"])
         self.assertIs(prepared["verification_subject"], fixture["subject"])
+        self.assertIs(
+            prepared["pointer_publication"],
+            fixture["pointer_publication"],
+        )
         self.assertIsNone(fixture["raw"]["run"])
         self.assertIsNone(fixture["raw"]["publication_lease"])
         self.assertEqual(
@@ -2771,8 +2780,9 @@ class HistoricalReplayBundlePreparationTests(unittest.TestCase):
         )
         self.module._close_prepared_historical_bundle(prepared)
         self.assertEqual(
-            fixture["events"][-4:],
+            fixture["events"][-5:],
             [
+                ("close", "pointer_publication"),
                 ("close", "subject"),
                 ("close", "staged_context"),
                 ("close", "core_stage"),
@@ -2809,8 +2819,9 @@ class HistoricalReplayBundlePreparationTests(unittest.TestCase):
         )
         self.module._close_prepared_historical_bundle(prepared)
         self.assertEqual(
-            fixture["events"][-3:],
+            fixture["events"][-4:],
             [
+                ("close", "pointer_publication"),
                 ("close", "subject"),
                 ("close", "committed_context"),
                 ("close", "finalized"),
@@ -2883,8 +2894,10 @@ class HistoricalReplayConnectedVerificationControllerTests(unittest.TestCase):
         subject = HistoricalReplayConnectedVerificationControllerTests.Subject()
         prepared = {
             "mode": mode,
+            "data_dir": Path("/immutable-data"),
             "bundle": {"pointer_core": copy.deepcopy(pointer_core)},
             "verification_subject": subject,
+            "pointer_publication": object(),
         }
         result = {
             "schema": "historical_connected_verification_result/v1",
@@ -2975,6 +2988,70 @@ class HistoricalReplayConnectedVerificationControllerTests(unittest.TestCase):
                 self.module._verify_prepared_historical_bundle(
                     prepared=prepared, publish=True
                 )
+
+    def test_verified_publish_handoff_installs_exact_pointer_once(self):
+        import scripts.historical_route_publication as publication
+
+        prepared, result = self._fixture(mode="publish")
+        prepared["verification"] = result
+        installed = copy.deepcopy(result["final_pointer"])
+        with mock.patch.object(
+            publication,
+            "publish_historical_replay_bundle",
+            return_value=installed,
+        ) as publish_pointer:
+            observed = self.module._publish_verified_historical_bundle(
+                prepared=prepared,
+                verification=result,
+                publish=True,
+            )
+        publish_pointer.assert_called_once_with(
+            data_dir=prepared["data_dir"],
+            pointer_publication=prepared["pointer_publication"],
+            final_pointer_bytes=result["final_pointer_bytes"],
+        )
+        self.assertIs(observed, installed)
+        self.assertIs(prepared["complete_pointer"], installed)
+        self.assertEqual(prepared["verification_subject"].rereads, 2)
+
+    def test_verified_dry_run_handoff_never_installs_pointer(self):
+        import scripts.historical_route_publication as publication
+
+        prepared, result = self._fixture(mode="dry-run")
+        prepared["verification"] = result
+        with mock.patch.object(
+            publication,
+            "publish_historical_replay_bundle",
+        ) as publish_pointer:
+            observed = self.module._publish_verified_historical_bundle(
+                prepared=prepared,
+                verification=result,
+                publish=False,
+            )
+        self.assertIsNone(observed)
+        publish_pointer.assert_not_called()
+        self.assertNotIn("complete_pointer", prepared)
+
+    def test_verified_publish_handoff_rejects_substituted_result(self):
+        import scripts.historical_route_publication as publication
+
+        prepared, result = self._fixture(mode="publish")
+        prepared["verification"] = result
+        substituted = dict(result)
+        with mock.patch.object(
+            publication,
+            "publish_historical_replay_bundle",
+        ) as publish_pointer:
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "publication handoff is invalid",
+            ):
+                self.module._publish_verified_historical_bundle(
+                    prepared=prepared,
+                    verification=substituted,
+                    publish=True,
+                )
+        publish_pointer.assert_not_called()
 
 
 if __name__ == "__main__":

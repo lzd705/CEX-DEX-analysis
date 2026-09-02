@@ -2125,13 +2125,16 @@ def _prepare_historical_replay_bundle(
                 "historical complete bundle is invalid"
             )
         subject = bundle.get("verification_subject")
-        if subject is None:
+        pointer_publication = bundle.get("pointer_publication")
+        if subject is None or pointer_publication is None:
             raise _entrypoint_error(
                 "historical complete bundle is invalid"
             )
         owned.append(subject)
+        owned.append(pointer_publication)
         prepared = {
             "mode": "publish" if publish else "dry-run",
+            "data_dir": data_dir,
             "selection": raw_state["selection"],
             "run_identity": raw_state["run_identity"],
             "run": finalized,
@@ -2139,6 +2142,7 @@ def _prepare_historical_replay_bundle(
             "context": context,
             "bundle": bundle,
             "verification_subject": subject,
+            "pointer_publication": pointer_publication,
             "_owned_resources": owned,
         }
         owned = []
@@ -2269,6 +2273,70 @@ def _verify_prepared_historical_bundle(
             raise
         raise _entrypoint_error(
             "historical connected verification failed"
+        ) from error
+
+
+def _publish_verified_historical_bundle(
+    *, prepared: Mapping[str, Any], verification: Mapping[str, Any],
+    publish: bool,
+) -> Optional[Mapping[str, Any]]:
+    """Hand the exact connected-verification result to the pointer CAS."""
+    import scripts.historical_route_publication as publication
+
+    expected_prepared_mode = "publish" if publish else "dry-run"
+    expected_verification_mode = "publish" if publish else "staged"
+    if (
+        type(prepared) is not dict
+        or type(publish) is not bool
+        or prepared.get("mode") != expected_prepared_mode
+        or verification is not prepared.get("verification")
+        or not isinstance(verification, Mapping)
+        or verification.get("mode") != expected_verification_mode
+    ):
+        raise _entrypoint_error(
+            "historical complete publication handoff is invalid"
+        )
+    if not publish:
+        return None
+    subject = prepared.get("verification_subject")
+    data_dir = prepared.get("data_dir")
+    authority = prepared.get("pointer_publication")
+    final_pointer = verification.get("final_pointer")
+    final_pointer_bytes = verification.get("final_pointer_bytes")
+    if (
+        subject is None
+        or not isinstance(data_dir, Path)
+        or authority is None
+        or not isinstance(final_pointer, Mapping)
+        or type(final_pointer_bytes) is not bytes
+    ):
+        raise _entrypoint_error(
+            "historical complete publication handoff is invalid"
+        )
+    try:
+        subject.reread_unchanged()
+        installed = publication.publish_historical_replay_bundle(
+            data_dir=data_dir,
+            pointer_publication=authority,
+            final_pointer_bytes=final_pointer_bytes,
+        )
+        subject.reread_unchanged()
+        if (
+            not isinstance(installed, Mapping)
+            or dict(installed) != dict(final_pointer)
+        ):
+            raise _entrypoint_error(
+                "historical complete pointer result is invalid"
+            )
+        prepared["complete_pointer"] = installed
+        return installed
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, HistoricalReplayEntrypointError):
+            raise
+        raise _entrypoint_error(
+            "historical complete pointer publication failed"
         ) from error
 
 

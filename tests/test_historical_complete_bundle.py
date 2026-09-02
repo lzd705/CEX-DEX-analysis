@@ -342,6 +342,164 @@ class HistoricalCompleteBundleTests(unittest.TestCase):
                 run, finalized
             )
 
+    def test_complete_pointer_publication_is_exact_one_shot_cas(self):
+        import scripts.historical_route_publication as publication
+
+        run, finalized, context = self._open_published_core(publication)
+        subject = None
+        data_dir = run["fixture"].data_dir
+        latest = data_dir / "routes" / "historical" / "latest.json"
+        try:
+            staged = publication.stage_historical_replay_bundle(
+                data_dir=data_dir,
+                raw_root=(
+                    data_dir / "raw" / "historical-foundry-replay"
+                ),
+                context=context,
+            )
+            subject = staged["verification_subject"]
+            authority = staged["pointer_publication"]
+            report_bytes = b"sealed-report-bytes"
+            final_pointer = {
+                **dict(staged["pointer_core"]),
+                "verification_report_sha256": hashlib.sha256(
+                    report_bytes
+                ).hexdigest(),
+            }
+            final_pointer_bytes = publication._canonical_bytes(
+                final_pointer
+            )
+            with mock.patch.object(
+                publication,
+                "_reread_historical_verification_report",
+                return_value=report_bytes,
+                create=True,
+            ) as reread:
+                published = publication.publish_historical_replay_bundle(
+                    data_dir=data_dir,
+                    pointer_publication=authority,
+                    final_pointer_bytes=final_pointer_bytes,
+                )
+            self.assertEqual(dict(published), final_pointer)
+            self.assertEqual(latest.read_bytes(), final_pointer_bytes)
+            self.assertGreaterEqual(reread.call_count, 2)
+            with self.assertRaises(
+                publication.HistoricalRoutePublicationError
+            ):
+                publication.publish_historical_replay_bundle(
+                    data_dir=data_dir,
+                    pointer_publication=authority,
+                    final_pointer_bytes=final_pointer_bytes,
+                )
+        finally:
+            if subject is not None:
+                subject.close()
+            self._close_published_core(run, finalized, context)
+
+    def test_complete_pointer_cas_rejects_intervening_writer(self):
+        import scripts.historical_route_publication as publication
+
+        run, finalized, context = self._open_published_core(publication)
+        subject = None
+        data_dir = run["fixture"].data_dir
+        latest = data_dir / "routes" / "historical" / "latest.json"
+        try:
+            staged = publication.stage_historical_replay_bundle(
+                data_dir=data_dir,
+                raw_root=(
+                    data_dir / "raw" / "historical-foundry-replay"
+                ),
+                context=context,
+            )
+            subject = staged["verification_subject"]
+            authority = staged["pointer_publication"]
+            attacker_bytes = b'{"attacker":"won"}'
+            latest.write_bytes(attacker_bytes)
+            report_bytes = b"sealed-report-bytes"
+            final_pointer = {
+                **dict(staged["pointer_core"]),
+                "verification_report_sha256": hashlib.sha256(
+                    report_bytes
+                ).hexdigest(),
+            }
+            with mock.patch.object(
+                publication,
+                "_reread_historical_verification_report",
+                return_value=report_bytes,
+                create=True,
+            ):
+                with self.assertRaisesRegex(
+                    publication.HistoricalRoutePublicationError,
+                    "publication_race",
+                ):
+                    publication.publish_historical_replay_bundle(
+                        data_dir=data_dir,
+                        pointer_publication=authority,
+                        final_pointer_bytes=publication._canonical_bytes(
+                            final_pointer
+                        ),
+                    )
+            self.assertEqual(latest.read_bytes(), attacker_bytes)
+        finally:
+            if subject is not None:
+                subject.close()
+            self._close_published_core(run, finalized, context)
+
+    def test_complete_pointer_rolls_back_when_post_install_evidence_changes(self):
+        import scripts.historical_route_publication as publication
+
+        run, finalized, context = self._open_published_core(publication)
+        subject = None
+        data_dir = run["fixture"].data_dir
+        latest = data_dir / "routes" / "historical" / "latest.json"
+        previous_bytes = b'{"previous":"pointer"}'
+        latest.write_bytes(previous_bytes)
+        try:
+            staged = publication.stage_historical_replay_bundle(
+                data_dir=data_dir,
+                raw_root=(
+                    data_dir / "raw" / "historical-foundry-replay"
+                ),
+                context=context,
+            )
+            subject = staged["verification_subject"]
+            report_bytes = b"sealed-report-bytes"
+            final_pointer = {
+                **dict(staged["pointer_core"]),
+                "verification_report_sha256": hashlib.sha256(
+                    report_bytes
+                ).hexdigest(),
+            }
+            with mock.patch.object(
+                publication,
+                "_reread_historical_verification_report",
+                side_effect=(
+                    report_bytes,
+                    publication.HistoricalRoutePublicationError(
+                        "historical verification report changed"
+                    ),
+                ),
+                create=True,
+            ):
+                with self.assertRaisesRegex(
+                    publication.HistoricalRoutePublicationError,
+                    "historical verification report changed",
+                ):
+                    publication.publish_historical_replay_bundle(
+                        data_dir=data_dir,
+                        pointer_publication=staged[
+                            "pointer_publication"
+                        ],
+                        final_pointer_bytes=publication._canonical_bytes(
+                            final_pointer
+                        ),
+                    )
+            self.assertEqual(latest.read_bytes(), previous_bytes)
+        finally:
+            if subject is not None:
+                subject.close()
+            self._close_published_core(run, finalized, context)
+
     def test_old_bundle_validates_after_historical_core_latest_advances(self):
         import scripts.historical_route_publication as publication
 
