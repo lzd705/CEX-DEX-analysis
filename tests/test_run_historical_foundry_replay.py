@@ -644,6 +644,87 @@ class HistoricalReplayConnectedWorkerBoundaryTests(unittest.TestCase):
         ):
             self.module._decode_connected_worker_result(response)
 
+    def test_production_observation_uses_fresh_run_and_never_fixture_adapter(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        events = []
+
+        class Resource:
+            def __init__(self, name):
+                self.name = name
+                self.closed = 0
+
+            def close(self):
+                self.closed += 1
+                events.append(("close", self.name))
+
+        class Preflight(Resource):
+            @property
+            def identity_projection(self):
+                return {"schema": "clean-source"}
+
+        preflight = Preflight("preflight")
+        run = Resource("run")
+        lease = Resource("lease")
+        retained = {
+            "capture_anchor": {"number": 123},
+            "toolchain_sha256": "4" * 64,
+            "run_id": "run:" + "5" * 64,
+        }
+        fresh = {
+            "provider_identity_sha256": "6" * 64,
+            "run_id": "run:" + "7" * 64,
+        }
+        raw = {
+            "config": object(), "run": run,
+            "publication_lease": lease,
+        }
+        with mock.patch.object(
+            self.module, "verify_clean_tracked_historical_source",
+            return_value=preflight,
+        ), mock.patch.object(
+            verifier, "_build_retained_connected_projection_for_request",
+            return_value=retained,
+        ), mock.patch.object(
+            verifier, "_build_connected_observation_for_retained_fixture",
+            side_effect=AssertionError("fixture adapter entered production"),
+        ), mock.patch.object(
+            self.module, "_produce_historical_raw_run", return_value=raw,
+        ) as produce, mock.patch.object(
+            verifier, "_build_connected_raw_projection_for_verification",
+            return_value=fresh,
+        ), mock.patch.object(
+            verifier, "_require_connected_raw_projection_parity",
+            return_value=None,
+        ) as parity, mock.patch.object(
+            self.module.os, "getenv",
+            side_effect=AssertionError("parent read RPC environment"),
+        ):
+            observation = (
+                self.module
+                ._build_production_connected_historical_observation(
+                    self.request
+                )
+            )
+        produce.assert_called_once()
+        self.assertEqual(
+            produce.call_args.kwargs["_connected_anchor"],
+            retained["capture_anchor"],
+        )
+        self.assertIsInstance(produce.call_args.kwargs["data_dir"], Path)
+        parity.assert_called_once_with(retained=retained, fresh=fresh)
+        self.assertEqual(observation["evidence_mode"], "production_connected")
+        self.assertTrue(observation["fresh_process"])
+        self.assertTrue(observation["fresh_connection"])
+        self.assertEqual(observation["projection"], retained)
+        self.assertEqual(
+            observation["provider_identity_sha256"],
+            fresh["provider_identity_sha256"],
+        )
+        self.assertEqual(run.closed, 1)
+        self.assertEqual(lease.closed, 1)
+        self.assertEqual(preflight.closed, 1)
+
     def test_fresh_canonical_import_has_no_operational_io(self):
         source = r'''
 import argparse
@@ -2783,6 +2864,35 @@ class HistoricalReplayRawRunControllerTests(unittest.TestCase):
             run_id="run:" + "a" * 64,
             expected_manifest_sha256="b" * 64,
         )
+
+    def test_connected_scan_uses_exact_anchor_rpc_opener(self):
+        import scripts.historical_foundry_rpc as rpc
+
+        (
+            patches, events, resources, _config, _selection, _acquire,
+        ) = self._patched_controller(
+            selection_status="found_publishable_profitable_block"
+        )
+        anchor = {"number": 123, "hash": "0x" + "1" * 64}
+
+        def open_connected(*, anchor_header):
+            events.append(("open_connected_rpc", anchor_header))
+            return resources["rpc_context"]
+
+        with patches, mock.patch.object(
+            rpc,
+            "_open_production_archive_rpc_run_for_connected_verification",
+            side_effect=open_connected,
+        ) as connected:
+            result = self.module._produce_historical_raw_run(
+                data_dir=Path("/immutable-data"),
+                _connected_anchor=anchor,
+            )
+
+        self.assertIs(result["run"], resources["finalized"])
+        connected.assert_called_once_with(anchor_header=anchor)
+        self.assertEqual(events[2], ("open_connected_rpc", anchor))
+        self.assertNotIn("open_rpc", [event[0] for event in events])
 
     def test_resolved_no_opportunity_closes_run_and_never_requests_lease(self):
         (

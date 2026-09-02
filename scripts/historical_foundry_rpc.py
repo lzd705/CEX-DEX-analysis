@@ -6257,7 +6257,18 @@ class _ArchiveNoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def _activate_production_archive_rpc_run(
     preflight: _ProductionArchivePreflight,
+    *, _connected_anchor: Optional[Mapping[str, Any]] = None,
 ) -> "_ProductionArchiveRpcRunContext":
+    connected_anchor = None
+    if _connected_anchor is not None:
+        try:
+            import scripts.historical_foundry_scan as scan
+
+            connected_anchor = scan._validate_normalized_header(
+                dict(_connected_anchor)
+            )
+        except Exception:
+            _raise_archive_error(("authority_mismatch", "request_invalid"))
     started = _initial_clock_sample(time.monotonic)
     if started is None:
         preflight.close()
@@ -6320,7 +6331,7 @@ def _activate_production_archive_rpc_run(
         preflight.close()
         _raise_archive_error(("authority_mismatch", "context_invalid"))
 
-    def operation(body: bytes, timeout: float) -> Any:
+    def upstream_operation(body: bytes, timeout: float) -> Any:
         request = urllib.request.Request(
             connection_url,
             data=body,
@@ -6335,6 +6346,51 @@ def _activate_production_archive_rpc_run(
             return opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as error:
             return error
+
+    anchor_rewrite_used = [False]
+
+    def operation(body: bytes, timeout: float) -> Any:
+        outbound = body
+        if connected_anchor is not None:
+            try:
+                decoded = json.loads(body)
+                if _archive_canonical_bytes(decoded) != body:
+                    raise ValueError("archive request is not canonical")
+                expected = [
+                    {
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "eth_chainId", "params": [],
+                    },
+                    {
+                        "jsonrpc": "2.0", "id": 2,
+                        "method": "eth_getBlockByNumber",
+                        "params": ["finalized", False],
+                    },
+                ]
+                matches = [
+                    row for row in decoded
+                    if type(row) is dict
+                    and row.get("method") == "eth_getBlockByNumber"
+                    and row.get("params") == ["finalized", False]
+                ] if type(decoded) is list else []
+                if not anchor_rewrite_used[0]:
+                    if len(matches) != 1 or decoded != expected:
+                        raise ValueError("connected anchor request differs")
+                    rewritten = [dict(row) for row in decoded]
+                    rewritten[1]["params"] = [
+                        hex(connected_anchor["number"]), False
+                    ]
+                    outbound = _archive_canonical_bytes(rewritten)
+                    anchor_rewrite_used[0] = True
+                elif matches:
+                    raise ValueError("connected anchor request repeated")
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                _raise_archive_error((
+                    "authority_mismatch", "request_invalid"
+                ))
+        return upstream_operation(outbound, timeout)
 
     def relay_operation(body: bytes, timeout: float) -> bytes:
         response = operation(body, timeout)
@@ -6424,6 +6480,38 @@ def _open_production_archive_rpc_run_core() -> "_ProductionArchiveRpcRunContext"
         raise
 
 
+def _open_production_archive_rpc_run_for_connected_verification_core(
+    *, anchor_header: Mapping[str, Any],
+) -> "_ProductionArchiveRpcRunContext":
+    try:
+        import scripts.historical_foundry_scan as scan
+
+        checked_anchor = scan._validate_normalized_header(
+            dict(anchor_header)
+        )
+    except Exception:
+        _raise_archive_error(("authority_mismatch", "request_invalid"))
+    preflight = _perform_production_preflight()
+    if preflight is None:
+        _raise_archive_error(("authority_mismatch", "preflight_invalid"))
+    try:
+        return _activate_production_archive_rpc_run(
+            preflight, _connected_anchor=checked_anchor
+        )
+    except BaseException as body_error:
+        cleanup_control = None
+        try:
+            preflight.close()
+        except BaseException as cleanup_error:
+            if not isinstance(cleanup_error, Exception):
+                cleanup_control = cleanup_error
+        if not isinstance(body_error, Exception):
+            raise
+        if cleanup_control is not None:
+            raise cleanup_control
+        raise
+
+
 def _make_production_archive_rpc_run_opener(
     core: Callable[[], "_ProductionArchiveRpcRunContext"],
     marker: Callable[
@@ -6437,11 +6525,33 @@ def _make_production_archive_rpc_run_opener(
     return open_run
 
 
+def _make_connected_archive_rpc_run_opener(
+    core: Callable[..., "_ProductionArchiveRpcRunContext"],
+    marker: Callable[
+        ["_ProductionArchiveRpcRunContext"],
+        "_ProductionArchiveRpcRunContext",
+    ],
+) -> Callable[..., "_ProductionArchiveRpcRunContext"]:
+    def open_run(
+        *, anchor_header: Mapping[str, Any],
+    ) -> "_ProductionArchiveRpcRunContext":
+        return marker(core(anchor_header=anchor_header))
+
+    return open_run
+
+
 _open_production_archive_rpc_run = _make_production_archive_rpc_run_opener(
     _open_production_archive_rpc_run_core,
     _mark_fresh_production_archive_rpc_run_for_historical_window,
 )
+_open_production_archive_rpc_run_for_connected_verification = (
+    _make_connected_archive_rpc_run_opener(
+        _open_production_archive_rpc_run_for_connected_verification_core,
+        _mark_fresh_production_archive_rpc_run_for_historical_window,
+    )
+)
 del _make_production_archive_rpc_run_opener
+del _make_connected_archive_rpc_run_opener
 del _mark_fresh_production_archive_rpc_run_for_historical_window
 
 

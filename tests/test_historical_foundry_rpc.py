@@ -659,6 +659,84 @@ class HistoricalFoundryRpcTask3bClaimTests(unittest.TestCase):
             context = rpc._open_production_archive_rpc_run()
         return context, preflight, calls
 
+    def test_connected_opener_rewrites_only_finalized_anchor_to_exact_block(self):
+        anchor = {
+            "number": 123,
+            "hash": "0x" + "12" * 32,
+            "parent_hash": "0x" + "34" * 32,
+            "state_root": "0x" + "56" * 32,
+            "timestamp": 1_700_000_000,
+            "gas_limit": 30_000_000,
+            "gas_used": 15_000_000,
+            "base_fee_per_gas": 1_000_000_000,
+        }
+        calls = []
+        preflight = self._Preflight()
+
+        class Response:
+            pass
+
+        class Opener:
+            addheaders = []
+
+            def open(self, request, timeout):
+                calls.append((request.data, timeout))
+                return Response()
+
+        with mock.patch.object(
+            rpc, "_perform_production_preflight", return_value=preflight
+        ), mock.patch.object(
+            rpc.time, "monotonic", return_value=10.0
+        ), mock.patch.object(
+            rpc.os, "urandom", return_value=b"z" * 32
+        ), mock.patch.object(
+            rpc.os, "environ", self._Environment()
+        ), mock.patch.object(
+            rpc.urllib.request, "build_opener", return_value=Opener()
+        ):
+            context = (
+                rpc
+                ._open_production_archive_rpc_run_for_connected_verification(
+                    anchor_header=anchor
+                )
+            )
+        original = rpc._archive_canonical_bytes([
+            {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
+            {
+                "jsonrpc": "2.0", "id": 2,
+                "method": "eth_getBlockByNumber",
+                "params": ["finalized", False],
+            },
+        ])
+        early_exact = rpc._archive_canonical_bytes({
+            "jsonrpc": "2.0", "id": 3,
+            "method": "eth_getBlockByNumber",
+            "params": [hex(anchor["number"]), False],
+        })
+        wrong_first_row = rpc._archive_canonical_bytes([
+            {"jsonrpc": "2.0", "id": 1, "method": "net_version", "params": []},
+            {
+                "jsonrpc": "2.0", "id": 2,
+                "method": "eth_getBlockByNumber",
+                "params": ["finalized", False],
+            },
+        ])
+        for attack in (early_exact, wrong_first_row):
+            with self.subTest(attack=json.loads(attack)):
+                with self.assertRaises(rpc._ArchiveRpcError):
+                    context._operation(attack, 7.0)
+        self.assertEqual(calls, [])
+        self.assertIsInstance(context._operation(original, 7.0), Response)
+        self.assertEqual(len(calls), 1)
+        sent = json.loads(calls[0][0])
+        self.assertEqual(sent[0]["params"], [])
+        self.assertEqual(sent[1]["params"], [hex(anchor["number"]), False])
+        self.assertEqual(calls[0][1], 7.0)
+        self.assertEqual(json.loads(original)[1]["params"], ["finalized", False])
+        with self.assertRaises(rpc._ArchiveRpcError):
+            context._operation(original, 7.0)
+        rpc._abandon_archive_context(context)
+
     def assertPair(self, callable_object, expected):
         with self.assertRaises(rpc._ArchiveRpcError) as caught:
             callable_object()

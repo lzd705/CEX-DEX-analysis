@@ -1094,7 +1094,7 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
         baseline = json.loads(json.dumps(self.offline_observation))
         projection = baseline["projection"]
         self.assertTrue({
-            "capture_row_counts", "capture_rows_sha256",
+            "capture_anchor", "capture_row_counts", "capture_rows_sha256",
             "prefilter_row_count", "prefilter_rows_sha256",
             "safe_exclusion_count", "safe_exclusions_sha256",
             "verification_scenario_count",
@@ -1119,6 +1119,64 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
         self.assertLessEqual(
             len(verifier._canonical_bytes(projection)), 16_384
         )
+
+    def test_fresh_raw_projection_matches_every_retained_replay_digest(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        fresh = verifier._build_connected_raw_projection_for_verification(
+            source=self.finalized,
+            config=self.run_fixture["config"],
+        )
+        self.assertIsNone(
+            verifier._require_connected_raw_projection_parity(
+                retained=self.offline_observation["projection"],
+                fresh=fresh,
+            )
+        )
+        self.assertRegex(
+            fresh["provider_identity_sha256"], r"^[0-9a-f]{64}$"
+        )
+        for field in verifier._CONNECTED_RAW_PARITY_FIELDS:
+            attack = json.loads(json.dumps(fresh))
+            if field.endswith("_count"):
+                attack[field] += 1
+            elif field == "capture_row_counts":
+                attack[field]["headers"] += 1
+            elif field in ("capture_anchor", "selected_block"):
+                attack[field]["number"] += 1
+            elif field == "selection_status":
+                attack[field] = "no_publishable_profitable_block"
+            else:
+                attack[field] = "f" * 64
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    verifier.HistoricalVerificationError,
+                    "historical_bundle_invalid",
+                ):
+                    verifier._require_connected_raw_projection_parity(
+                        retained=self.offline_observation["projection"],
+                        fresh=attack,
+                    )
+
+    def test_published_scenario_key_substitution_rejects(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        material = dict(
+            verifier._require_historical_verification_subject(
+                self.subject
+            )["material"]
+        )
+        material["replay_evidence"] = verifier._plain(
+            material["replay_evidence"]
+        )
+        material["replay_evidence"]["scenarios"][0][
+            "scenario_key"
+        ] = "substituted-scenario"
+        with self.assertRaisesRegex(
+            verifier.HistoricalVerificationError,
+            "historical_bundle_invalid",
+        ):
+            verifier._build_retained_connected_projection(material)
 
     def test_connected_raw_source_close_failure_is_not_silenced(self):
         import scripts.historical_foundry_verifier as verifier
@@ -1324,6 +1382,7 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
         audit.update({
             "process_identity_sha256": "7" * 64,
             "connection_identity_sha256": "8" * 64,
+            "provider_identity_sha256": "6" * 64,
             "started_at": "2026-09-02T00:00:00.000000Z",
             "finished_at": "2026-09-02T00:00:01.000000Z",
         })

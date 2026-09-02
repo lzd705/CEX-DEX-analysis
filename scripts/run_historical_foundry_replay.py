@@ -113,6 +113,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence, Tuple
 import weakref
@@ -685,11 +686,14 @@ def _connected_worker_main() -> int:
         payload = sys.stdin.buffer.read(
             _MAX_CONNECTED_WORKER_REQUEST_BYTES + 1
         )
-        _decode_connected_worker_request(payload)
-        # The next slice replaces this failure with fresh RPC/Anvil evidence.
+        request = _decode_connected_worker_request(payload)
+        observation = _build_production_connected_historical_observation(
+            request
+        )
         response = {
             "schema": _CONNECTED_WORKER_RESULT_SCHEMA,
-            "status": "failed",
+            "status": "ok",
+            "observation": observation,
         }
     except Exception:
         response = {
@@ -697,7 +701,13 @@ def _connected_worker_main() -> int:
             "status": "failed",
         }
     try:
-        sys.stdout.buffer.write(_canonical_connected_worker_bytes(response))
+        encoded = _canonical_connected_worker_bytes(response)
+        if not 0 < len(encoded) <= _MAX_CONNECTED_WORKER_OUTPUT_BYTES:
+            encoded = _canonical_connected_worker_bytes({
+                "schema": _CONNECTED_WORKER_RESULT_SCHEMA,
+                "status": "failed",
+            })
+        sys.stdout.buffer.write(encoded)
         sys.stdout.buffer.flush()
     except Exception:
         return 1
@@ -2272,7 +2282,10 @@ def _close_historical_controller_resources(
     return first_error
 
 
-def _produce_historical_raw_run(*, data_dir: Path) -> Mapping[str, Any]:
+def _produce_historical_raw_run(
+    *, data_dir: Path,
+    _connected_anchor: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, Any]:
     """Execute capture through immutable raw-run finalization once."""
     import scripts.historical_foundry_anvil as anvil
     import scripts.historical_foundry_contracts as contracts
@@ -2287,7 +2300,15 @@ def _produce_historical_raw_run(*, data_dir: Path) -> Mapping[str, Any]:
             data_dir=data_dir
         )
         owned = [spool]
-        rpc_context = rpc._open_production_archive_rpc_run()
+        if _connected_anchor is None:
+            rpc_context = rpc._open_production_archive_rpc_run()
+        else:
+            rpc_context = (
+                rpc
+                ._open_production_archive_rpc_run_for_connected_verification(
+                    anchor_header=_connected_anchor
+                )
+            )
         owned = [spool, rpc_context]
         claim = (
             rpc._claim_fresh_production_archive_rpc_run_for_historical_window(
@@ -2385,6 +2406,158 @@ def _produce_historical_raw_run(*, data_dir: Path) -> Mapping[str, Any]:
         raise _entrypoint_error(
             "historical production scan failed"
         ) from error
+
+
+def _build_production_connected_historical_observation(
+    request: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Rebuild retained evidence through a fresh RPC and fresh Anvil run."""
+    import scripts.historical_foundry_verifier as verifier
+
+    started = datetime.now(timezone.utc)
+    preflight = None
+    raw_state = None
+    result = None
+    original_error = None
+    try:
+        preflight = verify_clean_tracked_historical_source()
+        source_identity = preflight.identity_projection
+        if not isinstance(source_identity, Mapping):
+            raise _entrypoint_error(
+                "historical connected verification failed"
+            )
+        retained = (
+            verifier._build_retained_connected_projection_for_request(
+                request
+            )
+        )
+        if (
+            not isinstance(retained, Mapping)
+            or not isinstance(retained.get("capture_anchor"), Mapping)
+            or type(retained.get("toolchain_sha256")) is not str
+        ):
+            raise _entrypoint_error(
+                "historical connected verification failed"
+            )
+        with tempfile.TemporaryDirectory(
+            prefix="historical-connected-verification-", dir="/tmp"
+        ) as temporary:
+            raw_error = None
+            cleanup_error = None
+            try:
+                raw_state = _produce_historical_raw_run(
+                    data_dir=Path(temporary),
+                    _connected_anchor=retained["capture_anchor"],
+                )
+                if (
+                    type(raw_state) is not dict
+                    or raw_state.get("run") is None
+                    or raw_state.get("publication_lease") is None
+                ):
+                    raise _entrypoint_error(
+                        "historical connected verification failed"
+                    )
+                fresh = (
+                    verifier
+                    ._build_connected_raw_projection_for_verification(
+                        source=raw_state["run"],
+                        config=raw_state["config"],
+                    )
+                )
+                verifier._require_connected_raw_projection_parity(
+                    retained=retained, fresh=fresh
+                )
+                provider_identity = fresh.get(
+                    "provider_identity_sha256"
+                )
+                fresh_run_id = fresh.get("run_id")
+                if (
+                    type(provider_identity) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", provider_identity)
+                    is None
+                    or type(fresh_run_id) is not str
+                ):
+                    raise _entrypoint_error(
+                        "historical connected verification failed"
+                    )
+                process_id = os.getpid()
+                connection_identity = hashlib.sha256(
+                    _canonical_connected_worker_bytes({
+                        "schema": (
+                            "historical_connected_connection_identity/v1"
+                        ),
+                        "process_id": process_id,
+                        "provider_identity_sha256": provider_identity,
+                        "fresh_run_id": fresh_run_id,
+                    })
+                ).hexdigest()
+                try:
+                    verifier_source = Path(verifier.__file__).read_bytes()
+                except (OSError, TypeError) as error:
+                    raise _entrypoint_error(
+                        "historical connected verification failed"
+                    ) from error
+                finished = datetime.now(timezone.utc)
+                result = {
+                    "schema": (
+                        "historical_foundry_connected_verification_"
+                        "observation/v1"
+                    ),
+                    "evidence_mode": "production_connected",
+                    "fresh_process": True,
+                    "fresh_connection": True,
+                    "process_id": process_id,
+                    "process_identity_sha256": hashlib.sha256(
+                        str(process_id).encode("ascii")
+                    ).hexdigest(),
+                    "connection_identity_sha256": connection_identity,
+                    "provider_identity_sha256": provider_identity,
+                    "verifier_source_sha256": hashlib.sha256(
+                        verifier_source
+                    ).hexdigest(),
+                    "verifier_toolchain_sha256": retained[
+                        "toolchain_sha256"
+                    ],
+                    "started_at": started.strftime(
+                        "%Y-%m-%dT%H:%M:%S.%fZ"
+                    ),
+                    "finished_at": finished.strftime(
+                        "%Y-%m-%dT%H:%M:%S.%fZ"
+                    ),
+                    "projection": dict(retained),
+                }
+            except BaseException as error:
+                raw_error = error
+            if raw_state is not None:
+                cleanup_error = _close_historical_controller_resources((
+                    raw_state.get("run"),
+                    raw_state.get("publication_lease"),
+                ))
+                raw_state = None
+            if raw_error is not None:
+                _raise_after_cleanup(raw_error, cleanup_error)
+            if cleanup_error is not None:
+                if not isinstance(cleanup_error, Exception):
+                    raise cleanup_error
+                raise _entrypoint_error(
+                    "historical connected verification failed"
+                ) from cleanup_error
+    except BaseException as error:
+        original_error = error
+    cleanup_error = _close_historical_controller_resources((preflight,))
+    if original_error is not None:
+        _raise_after_cleanup(original_error, cleanup_error)
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(
+            "historical connected verification failed"
+        ) from cleanup_error
+    if not isinstance(result, Mapping):
+        raise _entrypoint_error(
+            "historical connected verification failed"
+        )
+    return result
 
 
 def _prepare_historical_replay_bundle(

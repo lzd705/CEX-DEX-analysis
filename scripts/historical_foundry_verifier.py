@@ -66,8 +66,19 @@ _REPORT_FIELDS = frozenset((
 ))
 _AUDIT_FRESH_REPORT_FIELDS = frozenset((
     "verification_id", "process_identity_sha256",
-    "connection_identity_sha256", "started_at", "finished_at",
+    "connection_identity_sha256", "provider_identity_sha256",
+    "started_at", "finished_at",
 ))
+_CONNECTED_RAW_PARITY_FIELDS = (
+    "capture_anchor", "capture_row_counts", "capture_rows_sha256",
+    "prefilter_grid_digest", "prefilter_row_count",
+    "prefilter_rows_sha256", "safe_exclusion_count",
+    "safe_exclusions_sha256", "verification_scenario_count",
+    "verification_scenario_set_sha256", "scenario_result_count",
+    "scenario_results_sha256", "selection_status", "selected_block",
+    "candidate_resolution_sha256", "selected_scenarios_sha256",
+    "selected_scenario_keys_sha256",
+)
 
 
 def _initialize_trusted_source_module_code_reader():
@@ -952,8 +963,220 @@ def _close_connected_source(source):
     source.close()
 
 
-def _build_retained_connected_projection(material):
+def _build_connected_raw_projection(*, source, config):
     import scripts.historical_foundry_replay as replay
+    import scripts.historical_route_publication as publication
+
+    evidence, _source_identity_sha256 = (
+        publication._build_run_evidence_from_source(
+            config=config, source=source
+        )
+    )
+    validated = replay.validate_selected_historical_run(
+        config=config, run_evidence=evidence
+    )
+    identity = dict(source.identity_projection())
+    run_manifest = _decode_json(
+        source.read_member(
+            "run_manifest.json",
+            expected_sha256=identity["run_manifest_sha256"],
+            max_bytes=8_388_608,
+        ),
+        "historical connected run manifest",
+    )
+    member_rows = run_manifest.get("members")
+    if type(member_rows) is not list:
+        raise _historical_bundle_invalid()
+    members = {
+        row.get("path"): row for row in member_rows
+        if type(row) is dict
+    }
+    if len(members) != len(member_rows):
+        raise _historical_bundle_invalid()
+    selection = _decode_json(
+        _source_member(source, members, "selection.json"),
+        "historical connected selection",
+    )
+    candidate = _decode_json(
+        _source_member(source, members, "candidate_manifest.json"),
+        "historical connected candidates",
+    )
+    capture = _decode_json(
+        _source_member(source, members, "scan/capture_inventory.json"),
+        "historical connected capture inventory",
+    )
+    prefilter_inventory = _decode_json(
+        _source_member(
+            source, members, "scan/prefilter_inventory.json"
+        ),
+        "historical connected prefilter inventory",
+    )
+    capture_rows = {
+        "headers": [], "reserves": [], "prices": [], "fees": [],
+    }
+    descriptors = capture.get("typed_chunks")
+    if type(descriptors) is not list:
+        raise _historical_bundle_invalid()
+    for descriptor in descriptors:
+        role = descriptor.get("role") if type(descriptor) is dict else None
+        if role in capture_rows:
+            capture_rows[role].extend(
+                _decoded_chunk(source, members, descriptor)
+            )
+    if any(not capture_rows[role] for role in capture_rows):
+        raise _historical_bundle_invalid()
+    prefilter_descriptors = prefilter_inventory.get("prefilter_chunks")
+    if type(prefilter_descriptors) is not list or not prefilter_descriptors:
+        raise _historical_bundle_invalid()
+    prefilter_rows = []
+    for descriptor in prefilter_descriptors:
+        prefilter_rows.extend(_decoded_chunk(source, members, descriptor))
+    selected_block = selection.get("selected_block")
+    selected_scenarios = selection.get("selected_scenarios")
+    if (
+        type(selected_block) is not dict
+        or type(selected_block.get("number")) is not int
+        or type(selected_scenarios) is not list
+        or len(selected_scenarios) != 10
+    ):
+        raise _historical_bundle_invalid()
+    selected_keys = {
+        row.get("scenario_key") for row in selected_scenarios
+        if type(row) is dict
+        and type(row.get("scenario_key")) is str
+        and row["scenario_key"]
+    }
+    if len(selected_keys) != 10:
+        raise _historical_bundle_invalid()
+    scenario_keys = []
+    for row in prefilter_rows:
+        if type(row) is not dict:
+            raise _historical_bundle_invalid()
+        if (
+            type(row.get("scenario_key")) is not str
+            or not row["scenario_key"]
+            or type(row.get("block_number")) is not int
+        ):
+            raise _historical_bundle_invalid()
+        if (
+            row["block_number"] == selected_block["number"]
+            or row["block_number"] > selected_block["number"]
+            and row.get("decision") == "replay_required"
+        ):
+            scenario_keys.append(row.get("scenario_key"))
+    if (
+        len(scenario_keys) != len(set(scenario_keys))
+        or not selected_keys.issubset(set(scenario_keys))
+    ):
+        raise _historical_bundle_invalid()
+    safe_exclusions = [
+        row for row in prefilter_rows
+        if row.get("decision") == "safe_excluded"
+    ]
+    row_by_key = {row["scenario_key"]: row for row in prefilter_rows}
+    results = []
+    for scenario_key in scenario_keys:
+        row = row_by_key.get(scenario_key)
+        if row is None:
+            raise _historical_bundle_invalid()
+        results.append(_typed_resolution(
+            source=source, members=members,
+            scenario_key=scenario_key,
+            block_number=row["block_number"],
+        ))
+    candidate_fields = (
+        "schema", "prefilter_grid_digest", "candidate_block_count",
+        "scenario_denominator", "initial_replay_required_count",
+        "attempted_scenario_count", "candidate_states", "scenarios",
+    )
+    if type(candidate) is not dict or any(
+        field not in candidate for field in candidate_fields
+    ):
+        raise _historical_bundle_invalid()
+    source_identity = capture.get("source_identity")
+    endpoint_identity = (
+        source_identity.get("endpoint_identity")
+        if type(source_identity) is dict else None
+    )
+    provider_identity = (
+        endpoint_identity.get("endpoint_hmac_sha256")
+        if type(endpoint_identity) is dict else None
+    )
+    if (
+        type(provider_identity) is not str
+        or _HEX_SHA256.fullmatch(provider_identity) is None
+    ):
+        raise _historical_bundle_invalid()
+    projection = {
+        "run_id": validated["run_id"],
+        "run_manifest_sha256": validated["manifest_sha256"],
+        "raw_run_projection_sha256": _sha256(_canonical_bytes(
+            _plain(validated)
+        )),
+        "provider_identity_sha256": provider_identity,
+        "capture_anchor": _plain(capture_rows["headers"][-1]),
+        "capture_row_counts": {
+            role: len(capture_rows[role])
+            for role in ("headers", "reserves", "prices", "fees")
+        },
+        "capture_rows_sha256": _sha256(_canonical_bytes(capture_rows)),
+        "prefilter_grid_digest": selection.get("prefilter_grid_digest"),
+        "prefilter_row_count": len(prefilter_rows),
+        "prefilter_rows_sha256": _sha256(_canonical_bytes(prefilter_rows)),
+        "safe_exclusion_count": len(safe_exclusions),
+        "safe_exclusions_sha256": _sha256(_canonical_bytes(
+            safe_exclusions
+        )),
+        "verification_scenario_count": len(scenario_keys),
+        "verification_scenario_set_sha256": _sha256(_canonical_bytes(
+            scenario_keys
+        )),
+        "scenario_result_count": len(results),
+        "scenario_results_sha256": _sha256(_canonical_bytes(results)),
+        "selection_status": selection.get("status"),
+        "selected_block": _plain(selected_block),
+        "candidate_resolution_sha256": _sha256(_canonical_bytes({
+            "candidate_manifest": {
+                field: candidate[field] for field in candidate_fields
+            },
+            "candidate_states": selection.get("candidate_states"),
+        })),
+        "selected_scenarios_sha256": _sha256(_canonical_bytes(
+            selected_scenarios
+        )),
+        "selected_scenario_keys_sha256": _sha256(_canonical_bytes(
+            sorted(selected_keys)
+        )),
+    }
+    source.reread_unchanged()
+    return projection
+
+
+def _build_connected_raw_projection_for_verification(*, source, config):
+    try:
+        return _build_connected_raw_projection(
+            source=source, config=config
+        )
+    except HistoricalVerificationError:
+        raise
+    except Exception as error:
+        raise _historical_bundle_invalid(error) from error
+
+
+def _require_connected_raw_projection_parity(*, retained, fresh):
+    if not isinstance(retained, Mapping) or not isinstance(fresh, Mapping):
+        raise _historical_bundle_invalid()
+    if any(
+        field not in retained
+        or field not in fresh
+        or _plain(retained[field]) != _plain(fresh[field])
+        for field in _CONNECTED_RAW_PARITY_FIELDS
+    ):
+        raise _historical_bundle_invalid()
+    return None
+
+
+def _build_retained_connected_projection(material):
     import scripts.historical_foundry_storage as storage
     import scripts.historical_route_publication as publication
     from scripts.historical_foundry_contracts import (
@@ -1003,145 +1226,33 @@ def _build_retained_connected_projection(material):
         raise _historical_bundle_invalid(error)
     failure = None
     try:
-        config = load_historical_foundry_config_set()
-        evidence, _source_identity_sha256 = (
-            publication._build_run_evidence_from_source(
-                config=config, source=source
-            )
+        raw = _build_connected_raw_projection(
+            source=source, config=load_historical_foundry_config_set()
         )
-        validated = replay.validate_selected_historical_run(
-            config=config, run_evidence=evidence
-        )
-        identity = dict(source.identity_projection())
-        run_manifest_bytes = source.read_member(
-            "run_manifest.json",
-            expected_sha256=identity["run_manifest_sha256"],
-            max_bytes=8_388_608,
-        )
-        run_manifest = _decode_json(
-            run_manifest_bytes, "historical connected run manifest"
-        )
-        member_rows = run_manifest.get("members")
-        if type(member_rows) is not list:
-            raise _historical_bundle_invalid()
-        members = {
-            row.get("path"): row for row in member_rows
+        published_scenarios = replay_evidence.get("scenarios")
+        published_keys = {
+            row.get("scenario_key") for row in published_scenarios
             if type(row) is dict
-        }
-        if len(members) != len(member_rows):
-            raise _historical_bundle_invalid()
-        selection = _decode_json(
-            _source_member(source, members, "selection.json"),
-            "historical connected selection",
-        )
-        candidate = _decode_json(
-            _source_member(source, members, "candidate_manifest.json"),
-            "historical connected candidates",
-        )
-        capture = _decode_json(
-            _source_member(
-                source, members, "scan/capture_inventory.json"
-            ),
-            "historical connected capture inventory",
-        )
-        prefilter_inventory = _decode_json(
-            _source_member(
-                source, members, "scan/prefilter_inventory.json"
-            ),
-            "historical connected prefilter inventory",
-        )
-        capture_rows = {
-            "headers": [], "reserves": [], "prices": [], "fees": [],
-        }
-        descriptors = capture.get("typed_chunks")
-        if type(descriptors) is not list:
-            raise _historical_bundle_invalid()
-        for descriptor in descriptors:
-            role = descriptor.get("role") if type(descriptor) is dict else None
-            if role in capture_rows:
-                capture_rows[role].extend(
-                    _decoded_chunk(source, members, descriptor)
-                )
-        if any(not capture_rows[role] for role in capture_rows):
-            raise _historical_bundle_invalid()
-        prefilter_descriptors = prefilter_inventory.get(
-            "prefilter_chunks"
-        )
-        if type(prefilter_descriptors) is not list or not prefilter_descriptors:
-            raise _historical_bundle_invalid()
-        prefilter_rows = []
-        for descriptor in prefilter_descriptors:
-            prefilter_rows.extend(
-                _decoded_chunk(source, members, descriptor)
-            )
-        selected_block = selection.get("selected_block")
-        selected_scenarios = selection.get("selected_scenarios")
+            and type(row.get("scenario_key")) is str
+            and row["scenario_key"]
+        } if type(published_scenarios) is list else set()
         if (
-            type(selected_block) is not dict
-            or type(selected_block.get("number")) is not int
-            or type(selected_scenarios) is not list
-            or len(selected_scenarios) != 10
-        ):
-            raise _historical_bundle_invalid()
-        selected_number = selected_block["number"]
-        selected_keys = {
-            row.get("scenario_key") for row in selected_scenarios
-            if type(row) is dict
-        }
-        if len(selected_keys) != 10:
-            raise _historical_bundle_invalid()
-        scenario_keys = []
-        for row in prefilter_rows:
-            if type(row) is not dict:
-                raise _historical_bundle_invalid()
-            key = row.get("scenario_key")
-            if (
-                row.get("block_number") == selected_number
-                or row.get("block_number", -1) > selected_number
-                and row.get("decision") == "replay_required"
-            ):
-                scenario_keys.append(key)
-        if (
-            len(scenario_keys) != len(set(scenario_keys))
-            or not selected_keys.issubset(set(scenario_keys))
-        ):
-            raise _historical_bundle_invalid()
-        safe_exclusions = [
-            row for row in prefilter_rows
-            if row.get("decision") == "safe_excluded"
-        ]
-        results = []
-        row_by_key = {
-            row["scenario_key"]: row for row in prefilter_rows
-        }
-        for scenario_key in scenario_keys:
-            row = row_by_key.get(scenario_key)
-            if row is None:
-                raise _historical_bundle_invalid()
-            results.append(_typed_resolution(
-                source=source, members=members,
-                scenario_key=scenario_key,
-                block_number=row["block_number"],
-            ))
-        published_scenarios = replay_evidence.get(
-            "scenarios"
-        )
-        if (
-            type(published_scenarios) is not list
+            raw["run_id"] != run_id
+            or raw["run_manifest_sha256"] != run_manifest_sha256
+            or type(published_scenarios) is not list
             or len(published_scenarios) != 10
-            or {row.get("scenario_key") for row in published_scenarios}
-            != selected_keys
-            or validated["run_id"] != run_id
-            or validated["manifest_sha256"] != run_manifest_sha256
+            or len(published_keys) != 10
+            or raw["selected_scenario_keys_sha256"] != _sha256(
+                _canonical_bytes(sorted(published_keys))
+            )
         ):
             raise _historical_bundle_invalid()
         projection = {
             "schema": _CONNECTED_PROJECTION_SCHEMA,
-            "run_id": run_id,
-            "run_manifest_sha256": run_manifest_sha256,
-            "raw_run_projection_sha256": _sha256(_canonical_bytes(
-                _plain(validated)
-            )),
+            **{
+                key: _plain(value) for key, value in raw.items()
+                if key != "provider_identity_sha256"
+            },
             "policy_sha256": manifest.get("policy_sha256"),
             "authority_sha256": manifest.get("authority_sha256"),
             "toolchain_sha256": manifest.get("toolchain_sha256"),
@@ -1159,34 +1270,6 @@ def _build_retained_connected_projection(material):
             )),
             "pointer_core": _plain(pointer_core),
             "pointer_core_sha256": _sha256(_canonical_bytes(pointer_core)),
-            "capture_row_counts": {
-                role: len(capture_rows[role])
-                for role in ("headers", "reserves", "prices", "fees")
-            },
-            "capture_rows_sha256": _sha256(_canonical_bytes(capture_rows)),
-            "prefilter_grid_digest": selection.get(
-                "prefilter_grid_digest"
-            ),
-            "prefilter_row_count": len(prefilter_rows),
-            "prefilter_rows_sha256": _sha256(_canonical_bytes(
-                prefilter_rows
-            )),
-            "safe_exclusion_count": len(safe_exclusions),
-            "safe_exclusions_sha256": _sha256(_canonical_bytes(
-                safe_exclusions
-            )),
-            "verification_scenario_count": len(scenario_keys),
-            "verification_scenario_set_sha256": _sha256(_canonical_bytes(
-                scenario_keys
-            )),
-            "scenario_result_count": len(results),
-            "scenario_results_sha256": _sha256(_canonical_bytes(results)),
-            "selection_status": selection.get("status"),
-            "selected_block": selected_block,
-            "candidate_resolution_sha256": _sha256(_canonical_bytes({
-                "candidate_manifest": candidate,
-                "candidate_states": selection.get("candidate_states"),
-            })),
             "published_scenarios_sha256": _sha256(_canonical_bytes(
                 published_scenarios
             )),
@@ -1226,8 +1309,7 @@ def _connected_request_for_subject(subject):
     }
 
 
-def _build_connected_observation_for_retained_fixture(request):
-    """Local-process fixture adapter; it never claims an external RPC fetch."""
+def _connected_material_for_request(request):
     import scripts.historical_route_publication as publication
 
     if (
@@ -1250,7 +1332,7 @@ def _build_connected_observation_for_retained_fixture(request):
         expected_replay_id=request["pointer_core"]["replay_id"],
         require_directory_identity=True, issue_view=False,
     )
-    material = {
+    return {
         "validated_view": None,
         "data_dir": request["data_dir"],
         "raw_root": request["raw_root"],
@@ -1260,8 +1342,23 @@ def _build_connected_observation_for_retained_fixture(request):
         "replay_evidence": _plain(validated["replay_evidence"]),
         "pointer_core": _plain(request["pointer_core"]),
     }
+
+
+def _build_retained_connected_projection_for_request(request):
+    try:
+        return _build_retained_connected_projection(
+            _connected_material_for_request(request)
+        )
+    except HistoricalVerificationError:
+        raise
+    except Exception as error:
+        raise _historical_bundle_invalid(error) from error
+
+
+def _build_connected_observation_for_retained_fixture(request):
+    """Local-process fixture adapter; it never claims an external RPC fetch."""
     started = datetime.now(timezone.utc)
-    projection = _build_retained_connected_projection(material)
+    projection = _build_retained_connected_projection_for_request(request)
     finished = datetime.now(timezone.utc)
     connection_nonce = os.urandom(32)
     try:
