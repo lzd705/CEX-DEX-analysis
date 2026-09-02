@@ -2843,5 +2843,139 @@ class HistoricalReplayBundlePreparationTests(unittest.TestCase):
         self.assertEqual(fixture["finalized"].closed, 1)
 
 
+class HistoricalReplayConnectedVerificationControllerTests(unittest.TestCase):
+    class Subject:
+        def __init__(self):
+            self.rereads = 0
+
+        def reread_unchanged(self):
+            self.rereads += 1
+
+    def setUp(self):
+        self.module = _entrypoint()
+
+    @staticmethod
+    def _fixture(*, mode, evidence_mode="production_connected"):
+        import scripts.historical_foundry_verifier as verifier
+
+        pointer_core = {
+            "schema": "route_historical_replay_pointer/v1",
+            "bundle_stage": "route_historical_foundry_replay/v1",
+            "replay_id": "replay:" + "1" * 64,
+            "route_cohort_id": "cohort:" + "2" * 64,
+            "manifest_sha256": "3" * 64,
+        }
+        report = {
+            "schema": "route_historical_replay_verification/v1",
+            "evidence_mode": evidence_mode,
+            "status": (
+                "verified"
+                if evidence_mode == "production_connected"
+                else "structurally_validated"
+            ),
+        }
+        report_bytes = verifier._canonical_bytes(report)
+        report_sha256 = hashlib.sha256(report_bytes).hexdigest()
+        final_pointer = {
+            **pointer_core,
+            "verification_report_sha256": report_sha256,
+        }
+        subject = HistoricalReplayConnectedVerificationControllerTests.Subject()
+        prepared = {
+            "mode": mode,
+            "bundle": {"pointer_core": copy.deepcopy(pointer_core)},
+            "verification_subject": subject,
+        }
+        result = {
+            "schema": "historical_connected_verification_result/v1",
+            "mode": "publish" if mode == "publish" else "staged",
+            "report": report,
+            "report_bytes": report_bytes,
+            "report_sha256": report_sha256,
+            "pointer_core": copy.deepcopy(pointer_core),
+            "final_pointer": final_pointer,
+            "final_pointer_bytes": verifier._canonical_bytes(final_pointer),
+            "install_result": object() if mode == "publish" else None,
+        }
+        return prepared, result
+
+    def test_dry_run_requires_connected_evidence_but_installs_no_report(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        prepared, result = self._fixture(mode="dry-run")
+        with mock.patch.object(
+            verifier,
+            "run_connected_historical_verification",
+            return_value=result,
+        ) as run:
+            observed = self.module._verify_prepared_historical_bundle(
+                prepared=prepared, publish=False
+            )
+        run.assert_called_once_with(
+            prepared["verification_subject"], mode="staged"
+        )
+        self.assertIs(observed, result)
+        self.assertIs(prepared["verification"], result)
+        self.assertEqual(prepared["verification_subject"].rereads, 2)
+
+    def test_publish_requires_installed_report_and_exact_final_pointer(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        prepared, result = self._fixture(mode="publish")
+        with mock.patch.object(
+            verifier,
+            "run_connected_historical_verification",
+            return_value=result,
+        ):
+            observed = self.module._verify_prepared_historical_bundle(
+                prepared=prepared, publish=True
+            )
+        self.assertIs(observed, result)
+        self.assertIsNotNone(result["install_result"])
+        self.assertEqual(
+            dict(verifier.historical_replay_pointer_core(
+                result["final_pointer"]
+            )),
+            result["pointer_core"],
+        )
+
+    def test_staged_offline_fixture_cannot_satisfy_production_command(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        prepared, result = self._fixture(
+            mode="dry-run", evidence_mode="offline_test_fixture"
+        )
+        with mock.patch.object(
+            verifier,
+            "run_connected_historical_verification",
+            return_value=result,
+        ):
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "production-connected evidence is required",
+            ):
+                self.module._verify_prepared_historical_bundle(
+                    prepared=prepared, publish=False
+                )
+
+    def test_pointer_core_mismatch_is_rejected_before_publication(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        prepared, result = self._fixture(mode="publish")
+        prepared["bundle"]["pointer_core"]["manifest_sha256"] = "0" * 64
+        with mock.patch.object(
+            verifier,
+            "run_connected_historical_verification",
+            return_value=result,
+        ):
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "connected verification result is invalid",
+            ):
+                self.module._verify_prepared_historical_bundle(
+                    prepared=prepared, publish=True
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2183,6 +2183,95 @@ def _close_prepared_historical_bundle(
     return None
 
 
+def _verify_prepared_historical_bundle(
+    *, prepared: Mapping[str, Any], publish: bool,
+) -> Mapping[str, Any]:
+    """Run the sealed connected verifier and validate its handoff bytes."""
+    import scripts.historical_foundry_verifier as verifier
+
+    if (
+        type(prepared) is not dict
+        or type(publish) is not bool
+        or prepared.get("mode")
+        != ("publish" if publish else "dry-run")
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    subject = prepared.get("verification_subject")
+    try:
+        subject.reread_unchanged()
+        result = verifier.run_connected_historical_verification(
+            subject, mode="publish" if publish else "staged"
+        )
+        subject.reread_unchanged()
+        if not isinstance(result, Mapping):
+            raise _entrypoint_error(
+                "historical connected verification result is invalid"
+            )
+        report = result.get("report")
+        report_bytes = result.get("report_bytes")
+        report_sha256 = result.get("report_sha256")
+        pointer_core = result.get("pointer_core")
+        final_pointer = result.get("final_pointer")
+        final_pointer_bytes = result.get("final_pointer_bytes")
+        bundle = prepared.get("bundle")
+        bundle_pointer_core = (
+            bundle.get("pointer_core")
+            if isinstance(bundle, Mapping)
+            else None
+        )
+        expected_mode = "publish" if publish else "staged"
+        if (
+            result.get("schema")
+            != "historical_connected_verification_result/v1"
+            or result.get("mode") != expected_mode
+            or not isinstance(report, Mapping)
+            or report.get("schema")
+            != "route_historical_replay_verification/v1"
+            or report.get("status") != "verified"
+            or report.get("evidence_mode") != "production_connected"
+            or type(report_bytes) is not bytes
+            or type(report_sha256) is not str
+            or hashlib.sha256(report_bytes).hexdigest() != report_sha256
+            or not isinstance(pointer_core, Mapping)
+            or not isinstance(bundle_pointer_core, Mapping)
+            or dict(pointer_core) != dict(bundle_pointer_core)
+            or not isinstance(final_pointer, Mapping)
+            or type(final_pointer_bytes) is not bytes
+            or final_pointer_bytes
+            != verifier._canonical_bytes(dict(final_pointer))
+            or final_pointer.get("verification_report_sha256")
+            != report_sha256
+            or dict(verifier.historical_replay_pointer_core(
+                final_pointer
+            )) != dict(pointer_core)
+            or publish and result.get("install_result") is None
+            or not publish and result.get("install_result") is not None
+        ):
+            if (
+                isinstance(report, Mapping)
+                and report.get("evidence_mode")
+                != "production_connected"
+            ):
+                raise _entrypoint_error(
+                    "historical production-connected evidence is required"
+                )
+            raise _entrypoint_error(
+                "historical connected verification result is invalid"
+            )
+        prepared["verification"] = result
+        return result
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, HistoricalReplayEntrypointError):
+            raise
+        raise _entrypoint_error(
+            "historical connected verification failed"
+        ) from error
+
+
 def _invoke_production_controller(
     _arguments: argparse.Namespace, _preflight: Any,
 ) -> Mapping[str, Any]:
