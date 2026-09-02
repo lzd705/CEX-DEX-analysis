@@ -45,6 +45,29 @@ _CONNECTED_PROJECTION_SCHEMA = (
 _CONNECTED_REQUEST_SCHEMA = (
     "historical_foundry_connected_verification_request/v1"
 )
+_REPORT_FIELDS = frozenset((
+    "schema", "status", "evidence_mode", "pointer_core_sha256",
+    "replay_id", "route_cohort_id", "manifest_sha256", "run_id",
+    "run_manifest_sha256", "raw_run_projection_sha256",
+    "policy_sha256", "authority_sha256", "toolchain_sha256",
+    "historical_core_manifest_sha256",
+    "historical_core_pointer_sha256", "replay_evidence_sha256",
+    "connected_projection_sha256", "process_identity_sha256",
+    "connection_identity_sha256", "verifier_source_sha256",
+    "verifier_toolchain_sha256", "provider_identity_sha256",
+    "coverage_sha256", "prefilter_grid_digest",
+    "prefilter_rows_sha256", "safe_exclusions_sha256",
+    "candidate_resolution_sha256",
+    "verification_scenario_set_sha256",
+    "verification_scenario_count",
+    "verification_scenario_results_sha256", "selected_block",
+    "published_scenarios_sha256", "started_at", "finished_at",
+    "verification_id",
+))
+_AUDIT_FRESH_REPORT_FIELDS = frozenset((
+    "verification_id", "process_identity_sha256",
+    "connection_identity_sha256", "started_at", "finished_at",
+))
 
 
 def _initialize_trusted_source_module_code_reader():
@@ -1391,10 +1414,10 @@ def _verification_report(observation):
     return {**base, "verification_id": verification_id}
 
 
-def _validate_retained_historical_verification_report(
-    *, report_bytes, pointer_core,
-):
-    if type(report_bytes) is not bytes or not isinstance(pointer_core, Mapping):
+def _validate_exact_historical_verification_report(report_bytes):
+    if type(report_bytes) is not bytes or not 0 < len(
+        report_bytes
+    ) <= _MAX_REPORT_BYTES:
         raise _historical_bundle_invalid()
     try:
         report = json.loads(report_bytes)
@@ -1404,15 +1427,53 @@ def _validate_retained_historical_verification_report(
     verification_id = (
         base.pop("verification_id", None) if base is not None else None
     )
-    pointer = _plain(pointer_core)
     if (
         base is None
+        or set(report) != _REPORT_FIELDS
         or _canonical_bytes(report) != report_bytes
         or report.get("schema") != _REPORT_SCHEMA
-        or report.get("status") != "verified"
-        or report.get("evidence_mode") != "production_connected"
+        or (
+            report.get("status"), report.get("evidence_mode")
+        ) not in (
+            ("verified", "production_connected"),
+            ("structurally_validated", "offline_test_fixture"),
+        )
         or verification_id
         != "verification:" + _sha256(_canonical_bytes(base))
+        or type(report.get("verification_scenario_count")) is not int
+        or report["verification_scenario_count"] < 0
+        or not isinstance(report.get("selected_block"), Mapping)
+        or type(report.get("replay_id")) is not str
+        or _REPLAY_ID.fullmatch(report["replay_id"]) is None
+        or type(report.get("route_cohort_id")) is not str
+        or _COHORT_ID.fullmatch(report["route_cohort_id"]) is None
+        or type(report.get("run_id")) is not str
+        or re.fullmatch(r"run:[0-9a-f]{64}", report["run_id"]) is None
+        or any(
+            type(report.get(field)) is not str
+            or _HEX_SHA256.fullmatch(report[field]) is None
+            for field in _REPORT_FIELDS
+            if field.endswith("_sha256")
+        )
+    ):
+        raise _historical_bundle_invalid()
+    started = _rfc3339(report["started_at"])
+    finished = _rfc3339(report["finished_at"])
+    if finished < started:
+        raise _historical_bundle_invalid()
+    return MappingProxyType(report)
+
+
+def _validate_retained_historical_verification_report(
+    *, report_bytes, pointer_core,
+):
+    if not isinstance(pointer_core, Mapping):
+        raise _historical_bundle_invalid()
+    report = _validate_exact_historical_verification_report(report_bytes)
+    pointer = _plain(pointer_core)
+    if (
+        report.get("status") != "verified"
+        or report.get("evidence_mode") != "production_connected"
         or report.get("pointer_core_sha256")
         != _sha256(_canonical_bytes(pointer))
         or report.get("replay_id") != pointer.get("replay_id")
@@ -1421,7 +1482,36 @@ def _validate_retained_historical_verification_report(
         != pointer.get("manifest_sha256")
     ):
         raise _historical_bundle_invalid()
-    return MappingProxyType(report)
+    return report
+
+
+def _require_historical_audit_report_parity(
+    *, retained_report_bytes, audit_report,
+):
+    retained = _validate_exact_historical_verification_report(
+        retained_report_bytes
+    )
+    if not isinstance(audit_report, Mapping):
+        raise _historical_bundle_invalid()
+    audit = _validate_exact_historical_verification_report(
+        _canonical_bytes(_plain(audit_report))
+    )
+    if (
+        retained.get("status") != "verified"
+        or retained.get("evidence_mode") != "production_connected"
+        or audit.get("status") != "verified"
+        or audit.get("evidence_mode") != "production_connected"
+        or {
+            key: retained[key]
+            for key in _REPORT_FIELDS - _AUDIT_FRESH_REPORT_FIELDS
+        }
+        != {
+            key: audit[key]
+            for key in _REPORT_FIELDS - _AUDIT_FRESH_REPORT_FIELDS
+        }
+    ):
+        raise _historical_bundle_invalid()
+    return None
 
 
 def _require_historical_verification_mode(mode):

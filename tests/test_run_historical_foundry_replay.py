@@ -3514,6 +3514,12 @@ class HistoricalReplayAuditControllerTests(unittest.TestCase):
                 else lambda _subject, *, mode: verification
             ),
         ))
+        stack.enter_context(mock.patch.object(
+            verifier,
+            "_require_historical_audit_report_parity",
+            return_value=None,
+            create=True,
+        ))
         return stack, subject, verification, validate, reread, run
 
     def test_audit_pins_current_bundle_and_retains_zero_mutation(self):

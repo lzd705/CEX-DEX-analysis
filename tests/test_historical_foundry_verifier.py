@@ -1319,6 +1319,77 @@ class HistoricalConnectedVerificationTests(unittest.TestCase):
                 pointer_core=transplanted_core,
             )
 
+    def test_retained_report_rejects_added_or_missing_stable_fields(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        baseline = verifier._verification_report(
+            self._simulated_production_observation()
+        )
+        attacks = []
+        added = dict(baseline)
+        added["unexpected"] = "field"
+        attacks.append(added)
+        missing = dict(baseline)
+        missing.pop("coverage_sha256")
+        attacks.append(missing)
+        for attack in attacks:
+            attack.pop("verification_id", None)
+            attack["verification_id"] = (
+                "verification:" + hashlib.sha256(
+                    verifier._canonical_bytes(attack)
+                ).hexdigest()
+            )
+            with self.subTest(fields=tuple(sorted(attack))):
+                with self.assertRaisesRegex(
+                    verifier.HistoricalVerificationError,
+                    "historical_bundle_invalid",
+                ):
+                    verifier._validate_retained_historical_verification_report(
+                        report_bytes=verifier._canonical_bytes(attack),
+                        pointer_core=self.pointer_core,
+                    )
+
+    def test_audit_report_parity_allows_only_fresh_process_fields(self):
+        import scripts.historical_foundry_verifier as verifier
+
+        retained = verifier._verification_report(
+            self._simulated_production_observation("same-provider")
+        )
+        audit = dict(retained)
+        audit.update({
+            "process_identity_sha256": "7" * 64,
+            "connection_identity_sha256": "8" * 64,
+            "started_at": "2026-09-02T00:00:00.000000Z",
+            "finished_at": "2026-09-02T00:00:01.000000Z",
+        })
+        audit.pop("verification_id")
+        audit["verification_id"] = (
+            "verification:" + hashlib.sha256(
+                verifier._canonical_bytes(audit)
+            ).hexdigest()
+        )
+        self.assertIsNone(
+            verifier._require_historical_audit_report_parity(
+                retained_report_bytes=verifier._canonical_bytes(retained),
+                audit_report=audit,
+            )
+        )
+        audit["coverage_sha256"] = "9" * 64
+        audit.pop("verification_id")
+        audit["verification_id"] = (
+            "verification:" + hashlib.sha256(
+                verifier._canonical_bytes(audit)
+            ).hexdigest()
+        )
+        with self.assertRaisesRegex(
+            verifier.HistoricalVerificationError,
+            "historical_bundle_invalid",
+        ):
+            verifier._require_historical_audit_report_parity(
+                retained_report_bytes=verifier._canonical_bytes(retained),
+                audit_report=audit,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

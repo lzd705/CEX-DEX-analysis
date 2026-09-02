@@ -2491,6 +2491,10 @@ def _audit_latest_historical_replay_bundle(
             raise _entrypoint_error(
                 "historical audit verification result is invalid"
             )
+        verifier._require_historical_audit_report_parity(
+            retained_report_bytes=report_before,
+            audit_report=audit_report,
+        )
         report_after = publication._reread_historical_verification_report(
             data_dir=data, final_pointer=pointer
         )
