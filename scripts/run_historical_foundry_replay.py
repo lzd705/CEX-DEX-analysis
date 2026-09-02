@@ -1844,6 +1844,64 @@ verify_clean_tracked_historical_source = _initialize_clean_source_verifier()
 del _initialize_clean_source_verifier
 
 
+def _drive_historical_candidate_replay(
+    *, snapshot: Any, replay_context: Any,
+) -> Mapping[str, Any]:
+    """Consume the sealed newest-first selection protocol to one terminal."""
+    import scripts.historical_foundry_anvil as anvil
+    import scripts.historical_foundry_scan as scan
+
+    replay_ledger = None
+    while True:
+        step = scan._advance_historical_selection_controller(
+            snapshot=snapshot, replay_ledger=replay_ledger
+        )
+        if isinstance(step, Mapping):
+            status = step.get("status")
+            if status in (
+                "found_publishable_profitable_block",
+                "no_publishable_profitable_block",
+            ):
+                return step
+            if status == "candidate_unresolved":
+                raise _entrypoint_error(
+                    "historical replay candidate is unresolved"
+                )
+            raise _entrypoint_error(
+                "historical replay selection is invalid"
+            )
+
+        action = step
+        scenario = scan._consume_historical_selection_action(
+            action=action, context=replay_context
+        )
+        sink = anvil._open_scenario_evidence_sink(
+            context=replay_context, scenario=scenario
+        )
+        try:
+            anvil._replay_historical_scenario(
+                context=replay_context, scenario=scenario, sink=sink
+            )
+        except anvil.HistoricalReplayError as error:
+            scan._record_historical_selection_failure(
+                action=action, error=error
+            )
+            terminal = scan._advance_historical_selection_controller(
+                snapshot=snapshot, replay_ledger=replay_ledger
+            )
+            if (
+                not isinstance(terminal, Mapping)
+                or terminal.get("status") != "candidate_unresolved"
+            ):
+                raise _entrypoint_error(
+                    "historical replay selection is invalid"
+                )
+            raise _entrypoint_error(
+                "historical replay candidate is unresolved"
+            ) from None
+        replay_ledger = sink.validated_ledger()
+
+
 def _invoke_production_controller(
     _arguments: argparse.Namespace, _preflight: Any,
 ) -> Mapping[str, Any]:

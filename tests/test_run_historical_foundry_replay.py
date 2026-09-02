@@ -2237,5 +2237,161 @@ class HistoricalReplayCleanSourcePreflightTests(unittest.TestCase):
         controller.assert_not_called()
 
 
+class HistoricalReplayCandidateDriverTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _entrypoint()
+
+    def test_drives_each_action_to_the_exact_terminal_selection(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+
+        snapshot = object()
+        context = object()
+        first_action = object()
+        second_action = object()
+        first_ledger = object()
+        second_ledger = object()
+        terminal = {
+            "status": "found_publishable_profitable_block",
+            "selected_scenario_count": 10,
+            "unresolved_candidate_count": 0,
+        }
+        events = []
+
+        class Sink:
+            def __init__(self, ledger):
+                self._ledger = ledger
+
+            def validated_ledger(self):
+                events.append(("ledger", self._ledger))
+                return self._ledger
+
+        def advance(*, snapshot: object, replay_ledger: object):
+            events.append(("advance", snapshot, replay_ledger))
+            if replay_ledger is None:
+                return first_action
+            if replay_ledger is first_ledger:
+                return second_action
+            if replay_ledger is second_ledger:
+                return terminal
+            raise AssertionError("unexpected replay ledger")
+
+        def consume(*, action: object, context: object):
+            events.append(("consume", action, context))
+            return "scenario-one" if action is first_action else "scenario-two"
+
+        def open_sink(*, context: object, scenario: object):
+            events.append(("open", context, scenario))
+            return Sink(
+                first_ledger if scenario == "scenario-one" else second_ledger
+            )
+
+        def replay(*, context: object, scenario: object, sink: object):
+            events.append(("replay", context, scenario, sink._ledger))
+
+        with mock.patch.object(
+            scan,
+            "_advance_historical_selection_controller",
+            side_effect=advance,
+        ), mock.patch.object(
+            scan,
+            "_consume_historical_selection_action",
+            side_effect=consume,
+        ), mock.patch.object(
+            anvil, "_open_scenario_evidence_sink", side_effect=open_sink
+        ), mock.patch.object(
+            anvil, "_replay_historical_scenario", side_effect=replay
+        ):
+            result = self.module._drive_historical_candidate_replay(
+                snapshot=snapshot, replay_context=context
+            )
+
+        self.assertIs(result, terminal)
+        self.assertEqual(
+            events,
+            [
+                ("advance", snapshot, None),
+                ("consume", first_action, context),
+                ("open", context, "scenario-one"),
+                ("replay", context, "scenario-one", first_ledger),
+                ("ledger", first_ledger),
+                ("advance", snapshot, first_ledger),
+                ("consume", second_action, context),
+                ("open", context, "scenario-two"),
+                ("replay", context, "scenario-two", second_ledger),
+                ("ledger", second_ledger),
+                ("advance", snapshot, second_ledger),
+            ],
+        )
+
+    def test_typed_replay_failure_is_recorded_and_never_becomes_no_opportunity(self):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_scan as scan
+
+        snapshot = object()
+        context = object()
+        action = object()
+        scenario = object()
+        sink = mock.Mock()
+        failure = anvil.HistoricalReplayError("archive")
+        unresolved = {
+            "status": "candidate_unresolved",
+            "closed_reason": "archive",
+            "unresolved_candidate_count": 1,
+        }
+        advance = mock.Mock(side_effect=(action, unresolved))
+        record = mock.Mock()
+
+        with mock.patch.object(
+            scan,
+            "_advance_historical_selection_controller",
+            advance,
+        ), mock.patch.object(
+            scan,
+            "_consume_historical_selection_action",
+            return_value=scenario,
+        ), mock.patch.object(
+            scan, "_record_historical_selection_failure", record
+        ), mock.patch.object(
+            anvil, "_open_scenario_evidence_sink", return_value=sink
+        ), mock.patch.object(
+            anvil, "_replay_historical_scenario", side_effect=failure
+        ):
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "historical replay candidate is unresolved",
+            ):
+                self.module._drive_historical_candidate_replay(
+                    snapshot=snapshot, replay_context=context
+                )
+
+        self.assertEqual(
+            advance.call_args_list,
+            [
+                mock.call(snapshot=snapshot, replay_ledger=None),
+                mock.call(snapshot=snapshot, replay_ledger=None),
+            ],
+        )
+        record.assert_called_once_with(action=action, error=failure)
+        sink.validated_ledger.assert_not_called()
+
+    def test_rejects_any_unrecognized_terminal_state(self):
+        import scripts.historical_foundry_scan as scan
+
+        terminal = {"status": "weaker_partial_result"}
+        with mock.patch.object(
+            scan,
+            "_advance_historical_selection_controller",
+            return_value=terminal,
+        ):
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "historical replay selection is invalid",
+            ):
+                self.module._drive_historical_candidate_replay(
+                    snapshot=object(), replay_context=object()
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
