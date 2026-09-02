@@ -101,7 +101,9 @@ if __name__ == "__main__":
 import argparse
 import base64
 from dataclasses import dataclass
+import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -2340,19 +2342,270 @@ def _publish_verified_historical_bundle(
         ) from error
 
 
+def _audit_latest_historical_replay_bundle(
+    *, data_dir: Path, bundle_path: Path,
+) -> Mapping[str, Any]:
+    """Audit only the bundle pinned by the current historical pointer."""
+    import scripts.historical_foundry_verifier as verifier
+    import scripts.historical_route_publication as publication
+    import scripts.route_publication as route_publication
+
+    if (
+        not isinstance(data_dir, Path)
+        or not isinstance(bundle_path, Path)
+        or not bundle_path.is_absolute()
+    ):
+        raise _entrypoint_error("historical audit input is invalid")
+    historical_fd = None
+    locked = False
+    subject = None
+    result = None
+    original_error = None
+    try:
+        data = route_publication._absolute_without_symlink_resolution(
+            data_dir
+        )
+        requested_bundle = (
+            route_publication._absolute_without_symlink_resolution(
+                bundle_path
+            )
+        )
+        historical_root, historical_fd, historical_details = (
+            route_publication._open_verified_directory(
+                data / "routes" / "historical",
+                "historical audit root",
+            )
+        )
+        fcntl.flock(historical_fd, fcntl.LOCK_SH)
+        locked = True
+        pointer_before = route_publication._optional_pointer_snapshot_at(
+            historical_fd
+        )
+        if pointer_before is None:
+            raise _entrypoint_error(
+                "current historical pointer is missing"
+            )
+        pointer_bytes = pointer_before[0]
+        try:
+            pointer = json.loads(pointer_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise _entrypoint_error(
+                "current historical pointer is invalid"
+            ) from error
+        if (
+            type(pointer) is not dict
+            or publication._canonical_bytes(pointer) != pointer_bytes
+        ):
+            raise _entrypoint_error(
+                "current historical pointer is invalid"
+            )
+        pointer_core = dict(
+            verifier.historical_replay_pointer_core(pointer)
+        )
+        expected_bundle = (
+            historical_root / "bundles" / pointer_core["replay_id"]
+        )
+        if requested_bundle != expected_bundle:
+            raise _entrypoint_error(
+                "bundle is not the current historical pointer directory"
+            )
+        validated = publication.validate_historical_replay_bundle(
+            data_dir=data,
+            raw_root=(data / "raw" / "historical-foundry-replay"),
+            bundle_path=requested_bundle,
+            expected_pointer_core=pointer_core,
+        )
+        if not isinstance(validated, Mapping):
+            raise _entrypoint_error(
+                "historical audit bundle is invalid"
+            )
+        subject = validated.get("verification_subject")
+        manifest = validated.get("manifest")
+        if (
+            subject is None
+            or validated.get("path") != requested_bundle
+            or validated.get("replay_id") != pointer_core["replay_id"]
+            or validated.get("manifest_sha256")
+            != pointer_core["manifest_sha256"]
+            or not isinstance(validated.get("pointer_core"), Mapping)
+            or dict(validated["pointer_core"]) != pointer_core
+            or not isinstance(manifest, Mapping)
+        ):
+            raise _entrypoint_error(
+                "historical audit bundle is invalid"
+            )
+        report_before = (
+            publication._reread_historical_verification_report(
+                data_dir=data, final_pointer=pointer
+            )
+        )
+        if (
+            type(report_before) is not bytes
+            or hashlib.sha256(report_before).hexdigest()
+            != pointer["verification_report_sha256"]
+        ):
+            raise _entrypoint_error(
+                "historical retained verification report is invalid"
+            )
+        subject.reread_unchanged()
+        verification = verifier.run_connected_historical_verification(
+            subject, mode="audit"
+        )
+        subject.reread_unchanged()
+        if not isinstance(verification, Mapping):
+            raise _entrypoint_error(
+                "historical audit verification result is invalid"
+            )
+        audit_report = verification.get("report")
+        audit_report_bytes = verification.get("report_bytes")
+        audit_report_sha256 = verification.get("report_sha256")
+        audit_pointer = verification.get("final_pointer")
+        audit_pointer_bytes = verification.get("final_pointer_bytes")
+        if (
+            verification.get("schema")
+            != "historical_connected_verification_result/v1"
+            or verification.get("mode") != "audit"
+            or verification.get("install_result") is not None
+            or not isinstance(audit_report, Mapping)
+            or audit_report.get("status") != "verified"
+            or audit_report.get("evidence_mode")
+            != "production_connected"
+            or type(audit_report_bytes) is not bytes
+            or verifier._canonical_bytes(dict(audit_report))
+            != audit_report_bytes
+            or type(audit_report_sha256) is not str
+            or hashlib.sha256(audit_report_bytes).hexdigest()
+            != audit_report_sha256
+            or not isinstance(verification.get("pointer_core"), Mapping)
+            or dict(verification["pointer_core"]) != pointer_core
+            or not isinstance(audit_pointer, Mapping)
+            or type(audit_pointer_bytes) is not bytes
+            or publication._canonical_bytes(dict(audit_pointer))
+            != audit_pointer_bytes
+            or audit_pointer.get("verification_report_sha256")
+            != audit_report_sha256
+            or dict(verifier.historical_replay_pointer_core(
+                audit_pointer
+            )) != pointer_core
+        ):
+            raise _entrypoint_error(
+                "historical audit verification result is invalid"
+            )
+        report_after = publication._reread_historical_verification_report(
+            data_dir=data, final_pointer=pointer
+        )
+        pointer_after = route_publication._optional_pointer_snapshot_at(
+            historical_fd
+        )
+        route_publication._verify_open_path_identity(
+            historical_root,
+            historical_details,
+            "historical audit root",
+        )
+        if (
+            report_after != report_before
+            or not publication._snapshot_matches(
+                pointer_after, pointer_before
+            )
+        ):
+            raise _entrypoint_error(
+                "historical audit changed during verification"
+            )
+        run_id = manifest.get("run_id")
+        run_manifest_sha256 = manifest.get("run_manifest_sha256")
+        if type(run_id) is not str or type(run_manifest_sha256) is not str:
+            raise _entrypoint_error(
+                "historical audit bundle is invalid"
+            )
+        result = MappingProxyType({
+            "status": "verified",
+            "run_identity": {
+                "run_id": run_id,
+                "run_manifest_sha256": run_manifest_sha256,
+            },
+            "bundle": {
+                "replay_id": pointer_core["replay_id"],
+                "manifest_sha256": pointer_core["manifest_sha256"],
+                "pointer_core": pointer_core,
+            },
+            "verification": {
+                "retained_report_sha256": pointer[
+                    "verification_report_sha256"
+                ],
+                "audit_report_sha256": audit_report_sha256,
+                "audit_final_pointer": dict(audit_pointer),
+            },
+            "published_pointer": dict(pointer),
+        })
+    except BaseException as error:
+        original_error = error
+
+    cleanup_error = _close_historical_controller_resources((subject,))
+    if locked and historical_fd is not None:
+        try:
+            fcntl.flock(historical_fd, fcntl.LOCK_UN)
+        except BaseException as error:
+            if cleanup_error is None or (
+                isinstance(cleanup_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                cleanup_error = error
+    if historical_fd is not None:
+        try:
+            os.close(historical_fd)
+        except BaseException as error:
+            if cleanup_error is None or (
+                isinstance(cleanup_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                cleanup_error = error
+    if original_error is not None:
+        if not isinstance(original_error, Exception):
+            raise original_error from cleanup_error
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from original_error
+        if isinstance(original_error, HistoricalReplayEntrypointError):
+            raise original_error
+        raise _entrypoint_error("historical audit failed") from original_error
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(
+            "historical audit cleanup failed"
+        ) from cleanup_error
+    if result is None:
+        raise _entrypoint_error("historical audit failed")
+    return result
+
+
 def _invoke_production_controller(
     arguments: argparse.Namespace, preflight: Any,
 ) -> Mapping[str, Any]:
-    if (
-        type(arguments) is not argparse.Namespace
-        or arguments.command != "scan"
-        or set(vars(arguments))
-        != {"command", "data_dir", "publish", "dry_run"}
-        or not isinstance(arguments.data_dir, Path)
-        or type(arguments.publish) is not bool
-        or type(arguments.dry_run) is not bool
-        or arguments.publish == arguments.dry_run
-    ):
+    if type(arguments) is not argparse.Namespace:
+        raise _entrypoint_error(
+            "historical production controller is unavailable"
+        )
+    if arguments.command == "scan":
+        valid_arguments = (
+            set(vars(arguments))
+            == {"command", "data_dir", "publish", "dry_run"}
+            and isinstance(arguments.data_dir, Path)
+            and type(arguments.publish) is bool
+            and type(arguments.dry_run) is bool
+            and arguments.publish != arguments.dry_run
+        )
+    elif arguments.command == "verify":
+        valid_arguments = (
+            set(vars(arguments)) == {"command", "data_dir", "bundle"}
+            and isinstance(arguments.data_dir, Path)
+            and isinstance(arguments.bundle, Path)
+            and arguments.bundle.is_absolute()
+        )
+    else:
+        valid_arguments = False
+    if not valid_arguments:
         raise _entrypoint_error(
             "historical production controller is unavailable"
         )
@@ -2366,6 +2619,27 @@ def _invoke_production_controller(
         raise _entrypoint_error(
             "historical production controller input is invalid"
         )
+
+    if arguments.command == "verify":
+        audit = _audit_latest_historical_replay_bundle(
+            data_dir=arguments.data_dir,
+            bundle_path=arguments.bundle,
+        )
+        if not isinstance(audit, Mapping):
+            raise _entrypoint_error(
+                "historical audit controller result is invalid"
+            )
+        return MappingProxyType({
+            "schema": "historical_replay_command_result/v1",
+            "command": "verify",
+            "mode": "audit",
+            "status": audit.get("status"),
+            "source_identity": dict(source_identity),
+            "run_identity": audit.get("run_identity"),
+            "bundle": audit.get("bundle"),
+            "verification": audit.get("verification"),
+            "published_pointer": audit.get("published_pointer"),
+        })
 
     publish = arguments.publish
     raw_state = None

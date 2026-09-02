@@ -3375,5 +3375,285 @@ class HistoricalReplayProductionControllerTests(unittest.TestCase):
         )
 
 
+class HistoricalReplayAuditControllerTests(unittest.TestCase):
+    class Subject:
+        def __init__(self):
+            self.rereads = 0
+            self.closed = 0
+
+        def reread_unchanged(self):
+            self.rereads += 1
+
+        def close(self):
+            self.closed += 1
+
+    class Preflight:
+        @property
+        def identity_projection(self):
+            return {
+                "schema": "historical_clean_source_identity/v1",
+                "head": "a" * 40,
+            }
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.temporary.name).resolve()
+        self.module = _entrypoint()
+        self.replay_id = "replay:" + "1" * 64
+        self.pointer_core = {
+            "schema": "route_historical_replay_pointer/v1",
+            "bundle_stage": "route_historical_foundry_replay/v1",
+            "replay_id": self.replay_id,
+            "route_cohort_id": "cohort:" + "2" * 64,
+            "manifest_sha256": "3" * 64,
+        }
+        self.retained_report = b"retained-report"
+        self.pointer = {
+            **self.pointer_core,
+            "verification_report_sha256": hashlib.sha256(
+                self.retained_report
+            ).hexdigest(),
+        }
+        self.historical_root = (
+            self.data_dir / "routes" / "historical"
+        )
+        self.bundle_path = (
+            self.historical_root / "bundles" / self.replay_id
+        )
+        self.bundle_path.mkdir(parents=True)
+        self.latest = self.historical_root / "latest.json"
+        self.latest.write_bytes(json.dumps(
+            self.pointer,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"))
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _tree_snapshot(self):
+        rows = []
+        for path in sorted(
+            self.historical_root.rglob("*"), key=lambda item: str(item)
+        ):
+            if path.is_file():
+                rows.append((str(path.relative_to(self.historical_root)), path.read_bytes()))
+            else:
+                rows.append((str(path.relative_to(self.historical_root)), None))
+        return tuple(rows)
+
+    def _patched_audit_dependencies(self, *, run_side_effect=None):
+        import scripts.historical_foundry_verifier as verifier
+        import scripts.historical_route_publication as publication
+
+        subject = self.Subject()
+        validated = {
+            "path": self.bundle_path,
+            "replay_id": self.replay_id,
+            "manifest_sha256": self.pointer_core["manifest_sha256"],
+            "pointer_core": copy.deepcopy(self.pointer_core),
+            "manifest": {
+                "run_id": "run:" + "4" * 64,
+                "run_manifest_sha256": "5" * 64,
+            },
+            "verification_subject": subject,
+        }
+        audit_report = {
+            "schema": "route_historical_replay_verification/v1",
+            "status": "verified",
+            "evidence_mode": "production_connected",
+        }
+        audit_report_bytes = json.dumps(
+            audit_report,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        audit_sha256 = hashlib.sha256(audit_report_bytes).hexdigest()
+        audit_pointer = {
+            **self.pointer_core,
+            "verification_report_sha256": audit_sha256,
+        }
+        verification = {
+            "schema": "historical_connected_verification_result/v1",
+            "mode": "audit",
+            "report": audit_report,
+            "report_bytes": audit_report_bytes,
+            "report_sha256": audit_sha256,
+            "pointer_core": copy.deepcopy(self.pointer_core),
+            "final_pointer": audit_pointer,
+            "final_pointer_bytes": json.dumps(
+                audit_pointer,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            "install_result": None,
+        }
+        stack = contextlib.ExitStack()
+        validate = stack.enter_context(mock.patch.object(
+            publication,
+            "validate_historical_replay_bundle",
+            return_value=validated,
+        ))
+        reread = stack.enter_context(mock.patch.object(
+            publication,
+            "_reread_historical_verification_report",
+            return_value=self.retained_report,
+        ))
+        run = stack.enter_context(mock.patch.object(
+            verifier,
+            "run_connected_historical_verification",
+            side_effect=(
+                run_side_effect
+                if run_side_effect is not None
+                else lambda _subject, *, mode: verification
+            ),
+        ))
+        return stack, subject, verification, validate, reread, run
+
+    def test_audit_pins_current_bundle_and_retains_zero_mutation(self):
+        before = self._tree_snapshot()
+        (
+            patches, subject, verification, validate, reread, run,
+        ) = self._patched_audit_dependencies()
+        with patches:
+            result = self.module._audit_latest_historical_replay_bundle(
+                data_dir=self.data_dir,
+                bundle_path=self.bundle_path,
+            )
+
+        self.assertEqual(self._tree_snapshot(), before)
+        validate.assert_called_once_with(
+            data_dir=self.data_dir,
+            raw_root=(
+                self.data_dir / "raw" / "historical-foundry-replay"
+            ),
+            bundle_path=self.bundle_path,
+            expected_pointer_core=self.pointer_core,
+        )
+        run.assert_called_once_with(subject, mode="audit")
+        self.assertGreaterEqual(reread.call_count, 2)
+        self.assertGreaterEqual(subject.rereads, 2)
+        self.assertEqual(subject.closed, 1)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(
+            result["verification"]["audit_report_sha256"],
+            verification["report_sha256"],
+        )
+        self.assertEqual(result["published_pointer"], self.pointer)
+
+    def test_audit_rejects_bundle_that_is_not_current_pointer_directory(self):
+        other = self.historical_root / "bundles" / ("replay:" + "9" * 64)
+        other.mkdir()
+        patches, subject, _verification, validate, _reread, run = (
+            self._patched_audit_dependencies()
+        )
+        with patches:
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "current historical pointer",
+            ):
+                self.module._audit_latest_historical_replay_bundle(
+                    data_dir=self.data_dir, bundle_path=other,
+                )
+        validate.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(subject.closed, 0)
+
+    def test_audit_detects_intervening_pointer_writer_without_rollback(self):
+        attacker_bytes = b'{"attacker":"won"}'
+
+        def replace_pointer(_subject, *, mode):
+            self.assertEqual(mode, "audit")
+            self.latest.write_bytes(attacker_bytes)
+            return verification
+
+        patches, subject, verification, _validate, _reread, _run = (
+            self._patched_audit_dependencies(
+                run_side_effect=replace_pointer
+            )
+        )
+        with patches:
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "historical audit changed",
+            ):
+                self.module._audit_latest_historical_replay_bundle(
+                    data_dir=self.data_dir,
+                    bundle_path=self.bundle_path,
+                )
+        self.assertEqual(self.latest.read_bytes(), attacker_bytes)
+        self.assertEqual(subject.closed, 1)
+
+    def test_audit_rejects_noncanonical_report_handoff(self):
+        patches, subject, verification, _validate, _reread, _run = (
+            self._patched_audit_dependencies()
+        )
+        verification["report_bytes"] += b"\n"
+        replacement_sha256 = hashlib.sha256(
+            verification["report_bytes"]
+        ).hexdigest()
+        verification["report_sha256"] = replacement_sha256
+        verification["final_pointer"][
+            "verification_report_sha256"
+        ] = replacement_sha256
+        verification["final_pointer_bytes"] = json.dumps(
+            verification["final_pointer"],
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        with patches:
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "audit verification result is invalid",
+            ):
+                self.module._audit_latest_historical_replay_bundle(
+                    data_dir=self.data_dir,
+                    bundle_path=self.bundle_path,
+                )
+        self.assertEqual(subject.closed, 1)
+
+    def test_verify_command_routes_only_to_audit_controller(self):
+        arguments = self.module._parse_arguments([
+            "verify", "--data-dir", str(self.data_dir),
+            "--bundle", str(self.bundle_path),
+        ])
+        audit_result = {
+            "status": "verified",
+            "run_identity": {
+                "run_id": "run:" + "4" * 64,
+                "run_manifest_sha256": "5" * 64,
+            },
+            "bundle": {"replay_id": self.replay_id},
+            "verification": {"audit_report_sha256": "6" * 64},
+            "published_pointer": self.pointer,
+        }
+        with mock.patch.object(
+            self.module,
+            "_audit_latest_historical_replay_bundle",
+            return_value=audit_result,
+        ) as audit, mock.patch.object(
+            self.module,
+            "_produce_historical_raw_run",
+            side_effect=AssertionError("verify entered scan"),
+        ):
+            result = self.module._invoke_production_controller(
+                arguments, self.Preflight()
+            )
+        audit.assert_called_once_with(
+            data_dir=self.data_dir, bundle_path=self.bundle_path
+        )
+        self.assertEqual(result["command"], "verify")
+        self.assertEqual(result["mode"], "audit")
+        self.assertEqual(result["source_identity"]["head"], "a" * 40)
+
+
 if __name__ == "__main__":
     unittest.main()
