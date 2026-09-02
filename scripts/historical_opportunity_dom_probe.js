@@ -260,9 +260,23 @@ function parseHtml(html) {
   };
 }
 
-function rowProjection(markup, generation, replayId, blockNumber) {
+function historicalOpportunityUsd(value) {
+  if (typeof value !== "string" || !/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value)) throw new Error("visible decimal");
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) throw new Error("visible number");
+  return `$${new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 12,
+    maximumSignificantDigits: 12,
+  }).format(numericValue)}`;
+}
+
+function rowProjection(markup, generation, replayId, blockNumber, apiRows) {
   const fragment = parseHtml(`<table><tbody>${markup}</tbody></table>`);
   const rows = fragment.querySelectorAll("tr");
+  if (!Array.isArray(apiRows)) throw new Error("API rows");
+  const apiById = new Map(apiRows.map((row) => [row.opportunity_id, row]));
+  if (apiById.size !== apiRows.length) throw new Error("API row identities");
   const required = [
     "data-opportunity-id", "data-api-generation", "data-replay-id",
     "data-block-number", "data-direction", "data-notional-usd",
@@ -272,6 +286,26 @@ function rowProjection(markup, generation, replayId, blockNumber) {
   return rows.map((row) => {
     if (Object.keys(row.attributes).length !== required.length || required.some((name) => !row.hasAttribute(name))) throw new Error("row attributes");
     if (row.getAttribute("data-api-generation") !== generation || row.getAttribute("data-replay-id") !== replayId || row.getAttribute("data-block-number") !== blockNumber) throw new Error("row identity");
+    const apiRow = apiById.get(row.getAttribute("data-opportunity-id"));
+    if (!apiRow) throw new Error("API row identity");
+    const cells = row.querySelectorAll("td");
+    const cellByLabel = (label) => cells.find((cell) => cell.getAttribute("data-label") === label);
+    const notionalCell = cellByLabel("Notional");
+    const netCell = cellByLabel("Net result at replay block");
+    const stressCell = cellByLabel("Stress outcome");
+    const netNotes = netCell?.querySelectorAll(".metric-note") || [];
+    const stressNotes = stressCell?.querySelectorAll(".metric-note") || [];
+    if (
+      notionalCell?.textContent !== historicalOpportunityUsd(apiRow.requested_notional_usd)
+      || netCell?.querySelector("strong")?.textContent !== historicalOpportunityUsd(apiRow.research_net_edge_usd)
+      || netNotes.length !== 2
+      || netNotes[0].textContent !== `Policy baseline ${historicalOpportunityUsd(apiRow.policy_net_edge_usd)}`
+      || netNotes[1].textContent !== `Receipt baseline ${historicalOpportunityUsd(apiRow.baseline_net_edge_usd)}`
+      || stressCell?.querySelector("strong")?.textContent !== (apiRow.stress_robust === true ? "Stress robust" : "Stress sensitive")
+      || stressNotes.length !== 2
+      || stressNotes[0].textContent !== `Stress 25 bps ${historicalOpportunityUsd(apiRow.stress_25_net_edge_usd)}`
+      || stressNotes[1].textContent !== `Stress 50 bps ${historicalOpportunityUsd(apiRow.stress_50_net_edge_usd)}`
+    ) throw new Error("visible row values");
     return {
       opportunity_id: row.getAttribute("data-opportunity-id"),
       direction: row.getAttribute("data-direction"),
@@ -351,7 +385,7 @@ async function main() {
   if (fetchCount !== 1) throw new Error("fetch count");
 
   const root = document.getElementById("historical-opportunity-inventory");
-  const rows = rowProjection(document.getElementById("historical-opportunity-body").innerHTML, root.getAttribute("data-api-generation"), root.getAttribute("data-replay-id"), root.getAttribute("data-selected-block-number"));
+  const rows = rowProjection(document.getElementById("historical-opportunity-body").innerHTML, root.getAttribute("data-api-generation"), root.getAttribute("data-replay-id"), root.getAttribute("data-selected-block-number"), input.api_payload.routes);
   const strictHidden = ["strict-opportunities", "estimate-opportunities", "unavailable-opportunities"].every((id) => document.getElementById(id).hidden === true);
   const currentScope = scopes.find((element) => element.dataset.opportunityScope === "current");
   const historicalScope = scopes.find((element) => element.dataset.opportunityScope === "historical");
@@ -367,6 +401,7 @@ async function main() {
     selected_block_number: Number(root.getAttribute("data-selected-block-number")),
     scenario_count: Number(root.getAttribute("data-scenario-count")),
     strict_hidden: strictHidden,
+    visible_value_row_count: rows.length,
     disclaimer: DISCLAIMER,
     rows,
   }));

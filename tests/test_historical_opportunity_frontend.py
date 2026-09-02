@@ -213,6 +213,44 @@ class HistoricalOpportunityShellTests(unittest.TestCase):
 
 
 class HistoricalOpportunityRendererTests(unittest.TestCase):
+    def test_historical_decimal_strings_render_as_visible_currency_values(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + HISTORICAL_PAYLOAD_FIXTURE
+            + r"""
+const positive = historicalOpportunityRowMarkup(
+  historicalRows[0], historicalGeneration, historicalReplayId,
+);
+const negative = historicalOpportunityRowMarkup(
+  historicalRows[1], historicalGeneration, historicalReplayId,
+);
+console.log(JSON.stringify({ positive, negative }));
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertIn(
+            '<td data-label="Notional">$1,000</td>', result["positive"]
+        )
+        self.assertIn(
+            '<td data-label="Net result at replay block"><strong>$3.25</strong>',
+            result["positive"],
+        )
+        self.assertIn("Policy baseline $3.25", result["positive"])
+        self.assertIn("Stress 25 bps $1.1", result["positive"])
+        self.assertIn(
+            '<td data-label="Notional">$5,000</td>', result["negative"]
+        )
+        self.assertIn(
+            '<td data-label="Net result at replay block"><strong>$-1.25</strong>',
+            result["negative"],
+        )
+        self.assertNotIn('data-label="Notional">N/A', result["positive"])
+        self.assertNotIn(
+            'data-label="Net result at replay block"><strong>N/A',
+            result["negative"],
+        )
+
     def test_scope_switch_hides_and_clears_the_losing_scope_before_fetch_finishes(self):
         result = run_app_javascript(
             HISTORICAL_DOM_FIXTURE

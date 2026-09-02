@@ -2357,6 +2357,13 @@ function historicalOpportunityDecimal(value) {
   return value;
 }
 
+function formatHistoricalOpportunityUsd(value) {
+  const decimal = historicalOpportunityDecimal(value);
+  if (decimal === null) return "N/A";
+  const numericValue = Number(decimal);
+  return Number.isFinite(numericValue) ? `$${rawUsd.format(numericValue)}` : "N/A";
+}
+
 function historicalOpportunityRowMarkup(route, generation, replayId) {
   const opportunityId = String(route.opportunity_id);
   const routeId = String(route.route_id);
@@ -2389,12 +2396,12 @@ function historicalOpportunityRowMarkup(route, generation, replayId) {
     <td data-label="Token"><strong>${escapeHtml(token)}</strong></td>
     <td data-label="Route"><span class="opportunity-route-id">${escapeHtml(routeId)}</span><span class="metric-note">${escapeHtml(route.buy_market_id)} → ${escapeHtml(route.sell_market_id)}</span></td>
     <td data-label="Direction">${escapeHtml(direction)}</td>
-    <td data-label="Notional">${escapeHtml(formatRawUsd(notional))}</td>
+    <td data-label="Notional">${escapeHtml(formatHistoricalOpportunityUsd(notional))}</td>
     <td data-label="Replay block"><strong>${escapeHtml(blockNumber)}</strong><span class="metric-note">${escapeHtml(blockHash)}</span><span class="metric-note">${escapeHtml(blockTime)}</span></td>
-    <td data-label="Net result at replay block"><strong>${escapeHtml(formatRawUsd(researchNet))}</strong><span class="metric-note">Policy baseline ${escapeHtml(formatRawUsd(policyNet))}</span><span class="metric-note">Receipt baseline ${escapeHtml(formatRawUsd(baselineNet))}</span></td>
+    <td data-label="Net result at replay block"><strong>${escapeHtml(formatHistoricalOpportunityUsd(researchNet))}</strong><span class="metric-note">Policy baseline ${escapeHtml(formatHistoricalOpportunityUsd(policyNet))}</span><span class="metric-note">Receipt baseline ${escapeHtml(formatHistoricalOpportunityUsd(baselineNet))}</span></td>
     <td data-label="State age at replay">${escapeHtml(formatOpportunitySeconds(route.state_age_seconds))} s</td>
     <td data-label="Foundry evidence"><strong>${verified ? "Foundry verified" : "Foundry unverified"}</strong><span class="metric-note">Gas ${escapeHtml(rawVolume.format(route.gas_used))}</span><span class="metric-note">Receipt ${escapeHtml(receipt)}</span><span class="metric-note">Trace ${escapeHtml(trace)}</span><span class="metric-note">${escapeHtml(route.executor_model)}</span></td>
-    <td data-label="Stress outcome"><strong>${escapeHtml(stressLabel)}</strong><span class="metric-note">Stress 25 bps ${escapeHtml(formatRawUsd(stress25))}</span><span class="metric-note">Stress 50 bps ${escapeHtml(formatRawUsd(stress50))}</span></td>
+    <td data-label="Stress outcome"><strong>${escapeHtml(stressLabel)}</strong><span class="metric-note">Stress 25 bps ${escapeHtml(formatHistoricalOpportunityUsd(stress25))}</span><span class="metric-note">Stress 50 bps ${escapeHtml(formatHistoricalOpportunityUsd(stress50))}</span></td>
   </tr>`;
 }
 

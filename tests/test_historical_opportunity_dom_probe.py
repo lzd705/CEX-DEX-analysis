@@ -116,6 +116,7 @@ def dom_projection():
         "selected_block_number": 12345678,
         "scenario_count": 10,
         "strict_hidden": True,
+        "visible_value_row_count": 10,
         "disclaimer": DISCLAIMER,
         "rows": rows,
     }
@@ -256,6 +257,7 @@ class HistoricalOpportunityDomProbeTests(unittest.TestCase):
         self.assertEqual(len(result["rows"]), 10)
         self.assertEqual(result["replay_id"], REPLAY_ID)
         self.assertTrue(result["strict_hidden"])
+        self.assertEqual(result.get("visible_value_row_count"), 10)
 
         replaced = html.replace(
             b'id="historical-opportunity-body"',
@@ -376,6 +378,7 @@ class HistoricalOpportunityDomProbeTests(unittest.TestCase):
             ("asset_sha", "e" * 64),
             ("data_generation", "f" * 64),
             ("strict_hidden", False),
+            ("visible_value_row_count", 9),
             ("disclaimer", DISCLAIMER + " altered"),
         ):
             mutation = json.loads(json.dumps(dom_projection()))
