@@ -2263,6 +2263,27 @@ def load_validated_historical_replay_core_at(
     )
 
 
+def _clone_staged_historical_replay_context(
+    context: HistoricalReplayBuildContext,
+) -> HistoricalReplayBuildContext:
+    """Issue an independently closeable borrow of one held staged core."""
+    record = _context_record(context)
+    stage_record = record.get("stage_record")
+    stage_owner = record.get("stage_owner")
+    if stage_record is None or stage_owner is None:
+        raise HistoricalRoutePublicationError(
+            "historical staged replay context is invalid"
+        )
+    _validate_context_current(record)
+    return _issue_context(
+        source=record["source"],
+        projection=json.loads(record["projection_bytes"]),
+        owns_source=False,
+        stage_record=stage_record,
+        stage_owner=stage_owner,
+    )
+
+
 def publish_historical_replay_core(
     *,
     data_dir: Path,
@@ -4085,6 +4106,9 @@ def _initialize_validated_historical_replay_bundle_view():
             expected_pointer_core: Optional[Mapping[str, Any]],
             expected_replay_id: Optional[str],
             require_directory_identity: bool, issue_view: bool,
+            trusted_staged_context: Optional[
+                HistoricalReplayBuildContext
+            ] = None,
         ) -> Mapping[str, Any]:
             return validation_impl(
                 data_dir=data_dir, raw_root=raw_root,
@@ -4093,6 +4117,7 @@ def _initialize_validated_historical_replay_bundle_view():
                 expected_replay_id=expected_replay_id,
                 require_directory_identity=require_directory_identity,
                 issue_view=issue_view, view_issuer=issue,
+                trusted_staged_context=trusted_staged_context,
             )
 
         def published_material(
@@ -5276,6 +5301,11 @@ def stage_historical_replay_bundle(
         data_dir=data_dir, raw_root=raw_root
     )
     payload = _build_historical_complete_payload(context=context)
+    trusted_staged_context = (
+        context
+        if _context_record(context).get("stage_record") is not None
+        else None
+    )
     artifacts, manifest = _historical_complete_artifacts(payload)
     _validate_historical_complete_artifact_bytes(
         artifacts=artifacts, payload=payload, manifest=manifest
@@ -5346,6 +5376,7 @@ def stage_historical_replay_bundle(
                 expected_replay_id=replay_id,
                 require_directory_identity=False,
                 issue_view=False,
+                trusted_staged_context=trusted_staged_context,
             )
             if staged_validation["manifest_sha256"] != manifest_sha256:
                 raise HistoricalRoutePublicationError(
@@ -5371,6 +5402,7 @@ def stage_historical_replay_bundle(
                     expected_replay_id=replay_id,
                     require_directory_identity=True,
                     issue_view=False,
+                    trusted_staged_context=trusted_staged_context,
                 )
                 if (
                     committed_validation["manifest_sha256"]
@@ -5403,9 +5435,10 @@ def stage_historical_replay_bundle(
             historical_root, historical_details,
             "historical complete root",
         )
-        validated = validate_historical_replay_bundle(
+        validated = _validate_historical_replay_bundle_for_context(
             data_dir=data, raw_root=raw,
             bundle_path=(historical_root / "bundles" / payload["replay_id"]),
+            context=context,
         )
         try:
             if validated["manifest_sha256"] != manifest_sha256:
@@ -5588,6 +5621,7 @@ def _validate_historical_replay_bundle_impl(
     require_directory_identity: bool,
     issue_view: bool,
     view_issuer: Any,
+    trusted_staged_context: Optional[HistoricalReplayBuildContext],
 ) -> Mapping[str, Any]:
     """Fully reread one six-file replay against pinned core and raw proof."""
     data, raw = _historical_complete_roots(
@@ -5633,6 +5667,7 @@ def _validate_historical_replay_bundle_impl(
     bundle_fd = None
     file_fds = {}
     immutable_context = None
+    owns_immutable_context = False
     try:
         bundle_fd, bundle_details = _route_publication._open_directory_at(
             parent_fd, bundle.name, "historical complete bundle"
@@ -5790,16 +5825,31 @@ def _validate_historical_replay_bundle_impl(
             expected=expected_pointer_core, manifest=manifest,
             manifest_sha256=manifest_sha256,
         )
-        immutable_context = _load_immutable_historical_replay_core(
-            data_dir=data,
-            route_cohort_id=manifest["route_cohort_id"],
-            expected_manifest_sha256=manifest[
-                "historical_core_manifest_sha256"
-            ],
-            expected_pointer_sha256=manifest[
-                "historical_core_pointer_sha256"
-            ],
-        )
+        if trusted_staged_context is None:
+            immutable_context = _load_immutable_historical_replay_core(
+                data_dir=data,
+                route_cohort_id=manifest["route_cohort_id"],
+                expected_manifest_sha256=manifest[
+                    "historical_core_manifest_sha256"
+                ],
+                expected_pointer_sha256=manifest[
+                    "historical_core_pointer_sha256"
+                ],
+            )
+            owns_immutable_context = True
+        else:
+            if type(trusted_staged_context) is not HistoricalReplayBuildContext:
+                raise HistoricalRoutePublicationError(
+                    "historical staged replay context is invalid"
+                )
+            if issue_view:
+                immutable_context = _clone_staged_historical_replay_context(
+                    trusted_staged_context
+                )
+                owns_immutable_context = True
+            else:
+                trusted_staged_context.reread_unchanged()
+                immutable_context = trusted_staged_context
         rebuilt = _build_historical_complete_payload(
             context=immutable_context
         )
@@ -5866,6 +5916,7 @@ def _validate_historical_replay_bundle_impl(
                 "immutable_context": immutable_context,
             })
             immutable_context = None
+            owns_immutable_context = False
             try:
                 routes_by_id = {
                     row["route_id"]: row
@@ -5914,7 +5965,7 @@ def _validate_historical_replay_bundle_impl(
         ) from error
     finally:
         try:
-            if immutable_context is not None:
+            if immutable_context is not None and owns_immutable_context:
                 immutable_context.close()
         finally:
             _close_descriptors_robustly(
@@ -5952,17 +6003,9 @@ _issue_historical_verification_subject_from_view = (
 del _historical_verifier._bind_historical_verification_subject_material
 
 
-def validate_historical_replay_bundle(
-    *, data_dir: Path, raw_root: Path, bundle_path: Path,
-    expected_pointer_core: Optional[Mapping[str, Any]] = None,
+def _attach_historical_verification_subject(
+    validated: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    validated = _validate_historical_replay_bundle(
-        data_dir=data_dir, raw_root=raw_root, bundle_path=bundle_path,
-        expected_pointer_core=expected_pointer_core,
-        expected_replay_id=None,
-        require_directory_identity=True,
-        issue_view=True,
-    )
     try:
         subject = _issue_historical_verification_subject_from_view(
             validated["validated_view"]
@@ -5981,6 +6024,41 @@ def validate_historical_replay_bundle(
         except Exception:
             pass
         raise
+
+
+def _validate_historical_replay_bundle_for_context(
+    *, data_dir: Path, raw_root: Path, bundle_path: Path,
+    context: HistoricalReplayBuildContext,
+) -> Mapping[str, Any]:
+    if _context_record(context).get("stage_record") is None:
+        return validate_historical_replay_bundle(
+            data_dir=data_dir,
+            raw_root=raw_root,
+            bundle_path=bundle_path,
+        )
+    validated = _validate_historical_replay_bundle(
+        data_dir=data_dir, raw_root=raw_root, bundle_path=bundle_path,
+        expected_pointer_core=None,
+        expected_replay_id=None,
+        require_directory_identity=True,
+        issue_view=True,
+        trusted_staged_context=context,
+    )
+    return _attach_historical_verification_subject(validated)
+
+
+def validate_historical_replay_bundle(
+    *, data_dir: Path, raw_root: Path, bundle_path: Path,
+    expected_pointer_core: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, Any]:
+    validated = _validate_historical_replay_bundle(
+        data_dir=data_dir, raw_root=raw_root, bundle_path=bundle_path,
+        expected_pointer_core=expected_pointer_core,
+        expected_replay_id=None,
+        require_directory_identity=True,
+        issue_view=True,
+    )
+    return _attach_historical_verification_subject(validated)
 
 
 _load_historical_cost_proof_inputs_for_published_view = (

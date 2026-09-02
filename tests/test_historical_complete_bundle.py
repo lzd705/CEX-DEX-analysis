@@ -290,6 +290,58 @@ class HistoricalCompleteBundleTests(unittest.TestCase):
             self._close_validated_view(validated)
             self._close_published_core(run, finalized, context)
 
+    def test_staged_core_context_supports_full_dry_run_bundle_without_pointers(self):
+        import scripts.historical_route_publication as publication
+        from tests.test_historical_route_publication import (
+            HistoricalCorePublicationTests,
+        )
+
+        run, finalized, lease, _identity = (
+            HistoricalCorePublicationTests._open_real_task7_lease()
+        )
+        core_stage = context = subject = None
+        data_dir = run["fixture"].data_dir
+        core_latest = (
+            data_dir / "routes" / "historical" / "core" / "latest.json"
+        )
+        complete_latest = data_dir / "routes" / "historical" / "latest.json"
+        try:
+            core_stage = publication.stage_historical_replay_core(
+                data_dir=data_dir,
+                config=run["config"],
+                publication_lease=lease,
+            )
+            lease = None
+            context = publication.load_validated_historical_replay_core_at(
+                staged_core=core_stage
+            )
+            staged = publication.stage_historical_replay_bundle(
+                data_dir=data_dir,
+                raw_root=(
+                    data_dir / "raw" / "historical-foundry-replay"
+                ),
+                context=context,
+            )
+            subject = staged["verification_subject"]
+            context.close()
+            context = None
+            subject.reread_unchanged()
+            self.assertTrue(staged["path"].is_dir())
+            self.assertFalse(core_latest.exists())
+            self.assertFalse(complete_latest.exists())
+        finally:
+            if subject is not None:
+                subject.close()
+            if context is not None:
+                context.close()
+            if core_stage is not None:
+                core_stage.close()
+            if lease is not None:
+                lease.close()
+            HistoricalCorePublicationTests._close_real_task7_run(
+                run, finalized
+            )
+
     def test_old_bundle_validates_after_historical_core_latest_advances(self):
         import scripts.historical_route_publication as publication
 
