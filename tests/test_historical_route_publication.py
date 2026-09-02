@@ -9,6 +9,7 @@ import pickle
 import gc
 import gzip
 import hashlib
+import tempfile
 from pathlib import Path
 import shutil
 import unittest
@@ -1168,6 +1169,144 @@ class HistoricalCorePublicationTests(unittest.TestCase):
             if lease is not None:
                 lease.close()
             self._close_real_task7_run(run, finalized)
+
+class HistoricalPublishedReaderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from tests.historical_replay_fixture import (
+            PublishedHistoricalReplayFixture,
+        )
+
+        cls.fixture = PublishedHistoricalReplayFixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture.close()
+
+    def test_missing_pointer_is_the_only_none_state(self):
+        import scripts.historical_route_publication as publication
+
+        with tempfile.TemporaryDirectory() as name:
+            data_dir = Path(name)
+            historical_root = data_dir / "routes" / "historical"
+            raw_root = data_dir / "raw" / "historical-foundry-replay"
+            historical_root.mkdir(parents=True)
+            raw_root.mkdir(parents=True)
+            self.assertIsNone(
+                publication.load_latest_historical_replay_bundle(
+                    historical_root, raw_root=raw_root
+                )
+            )
+            self.assertIsNone(
+                publication.historical_replay_publication_signature(
+                    historical_root, raw_root=raw_root
+                )
+            )
+
+    def test_latest_reader_returns_closed_bundle_and_physical_signature(self):
+        import scripts.historical_route_publication as publication
+
+        loaded = publication.load_latest_historical_replay_bundle(
+            self.fixture.historical_root,
+            raw_root=self.fixture.raw_root,
+        )
+        self.assertIsNotNone(loaded)
+        view = loaded["validated_view"]
+        try:
+            self.assertEqual(
+                loaded["pointer"]["replay_id"],
+                loaded["manifest"]["replay_id"],
+            )
+            self.assertEqual(len(loaded["opportunities"]), 10)
+            self.assertEqual(len(loaded["cost_components"]), 90)
+            self.assertEqual(
+                loaded["verification_report"]["status"], "verified"
+            )
+            signature = loaded["publication_signature"]
+            roles = {row[0] for row in signature}
+            self.assertIn("pointer:latest.json", roles)
+            self.assertIn("verification:report.json", roles)
+            self.assertIn("complete:manifest.json", roles)
+            self.assertIn("core:manifest.json", roles)
+            self.assertIn("raw:run_manifest.json", roles)
+            self.assertTrue(all(
+                type(row) is tuple
+                and len(row) >= 5
+                and type(row[0]) is str
+                and type(row[1]) is str
+                and len(row[1]) == 64
+                and type(row[2]) is int
+                and row[2] > 0
+                for row in signature
+            ))
+            view.reread_unchanged()
+        finally:
+            view.close()
+
+    def test_signature_adapter_closes_its_temporary_view(self):
+        import scripts.historical_route_publication as publication
+
+        signature = publication.historical_replay_publication_signature(
+            self.fixture.historical_root,
+            raw_root=self.fixture.raw_root,
+        )
+        self.assertIsInstance(signature, tuple)
+        self.assertGreater(len(signature), 10)
+
+    def _copy_publication(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        copied = Path(temporary.name) / "data"
+        shutil.copytree(self.fixture.data_dir, copied)
+        return (
+            copied / "routes" / "historical",
+            copied / "raw" / "historical-foundry-replay",
+        )
+
+    def test_same_bytes_new_member_inode_changes_physical_signature(self):
+        import scripts.historical_route_publication as publication
+
+        historical_root, raw_root = self._copy_publication()
+        first = publication.load_latest_historical_replay_bundle(
+            historical_root, raw_root=raw_root
+        )
+        first_signature = first["publication_signature"]
+        pointer_sha256 = first["pointer_sha256"]
+        replay_id = first["pointer"]["replay_id"]
+        first["validated_view"].close()
+        target = (
+            historical_root / "bundles" / replay_id / "route_legs.csv"
+        )
+        payload = target.read_bytes()
+        target.unlink()
+        target.write_bytes(payload)
+        second = publication.load_latest_historical_replay_bundle(
+            historical_root, raw_root=raw_root
+        )
+        try:
+            self.assertEqual(second["pointer_sha256"], pointer_sha256)
+            self.assertNotEqual(
+                second["publication_signature"], first_signature
+            )
+        finally:
+            second["validated_view"].close()
+
+    def test_deleted_pointer_bound_report_fails_closed(self):
+        import scripts.historical_route_publication as publication
+
+        historical_root, raw_root = self._copy_publication()
+        pointer = json.loads((historical_root / "latest.json").read_bytes())
+        report = (
+            historical_root / "verifications" / "by-sha256"
+            / (pointer["verification_report_sha256"] + ".json")
+        )
+        report.unlink()
+        with self.assertRaises(
+            publication.HistoricalRoutePublicationError
+        ):
+            publication.load_latest_historical_replay_bundle(
+                historical_root, raw_root=raw_root
+            )
 
 
 if __name__ == "__main__":

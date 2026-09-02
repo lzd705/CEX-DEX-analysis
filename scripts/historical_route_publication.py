@@ -6593,3 +6593,359 @@ def _validate_historical_cost_rows_for_published_view(
             "historical published cost proof differs"
         ) from error
     return None
+
+
+HistoricalPublicationSignature = Tuple[Tuple[Any, ...], ...]
+
+
+def _historical_publication_file_signature(
+    *, path: Path, role: str, expected_sha256: str,
+    expected_size: Optional[int] = None,
+) -> Tuple[Any, ...]:
+    if (
+        not isinstance(path, Path)
+        or type(role) is not str
+        or not role
+        or type(expected_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or expected_size is not None
+        and (type(expected_size) is not int or expected_size <= 0)
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical publication signature input is invalid"
+        )
+    parent_fd = descriptor = None
+    try:
+        parent, parent_fd, parent_details = (
+            _route_publication._open_verified_directory(
+                path.parent, "historical publication signature parent"
+            )
+        )
+        descriptor, before = _route_publication._open_regular_file_at(
+            parent_fd, path.name,
+            label="historical publication signature member",
+        )
+        opened = os.fstat(descriptor)
+        current = os.stat(
+            path.name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        stable = _route_publication._stable_file_metadata(opened)
+        if (
+            stable != _route_publication._stable_file_metadata(before)
+            or stable != _route_publication._stable_file_metadata(current)
+            or expected_size is not None
+            and opened.st_size != expected_size
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical publication signature member changed"
+            )
+        _route_publication._verify_open_path_identity(
+            parent, parent_details,
+            "historical publication signature parent",
+        )
+        return (
+            role, expected_sha256, opened.st_size, *stable,
+        )
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "historical publication signature member is invalid"
+        ) from error
+    finally:
+        _close_descriptors_robustly(descriptor, parent_fd)
+
+
+def _historical_publication_manifest_bytes(
+    *, path: Path, expected_sha256: str, maximum: int, label: str,
+) -> bytes:
+    parent_fd = None
+    try:
+        parent, parent_fd, parent_details = (
+            _route_publication._open_verified_directory(path.parent, label)
+        )
+        payload, digest, _details = (
+            _route_publication._read_bounded_bytes_at(
+                parent_fd, path.name, limit=maximum, label=label
+            )
+        )
+        _route_publication._verify_open_path_identity(
+            parent, parent_details, label
+        )
+        if digest != expected_sha256:
+            raise HistoricalRoutePublicationError(
+                "{} hash differs".format(label)
+            )
+        return payload
+    except _route_publication.RoutePublicationError as error:
+        raise HistoricalRoutePublicationError(
+            "{} is invalid".format(label)
+        ) from error
+    finally:
+        _close_descriptors_robustly(parent_fd)
+
+
+def _historical_publication_roots(
+    historical_root: Path, raw_root: Path,
+) -> Tuple[Path, Path, Path]:
+    if not isinstance(historical_root, Path) or not isinstance(raw_root, Path):
+        raise HistoricalRoutePublicationError(
+            "historical publication roots are invalid"
+        )
+    historical = _route_publication._absolute_without_symlink_resolution(
+        historical_root
+    )
+    raw = _route_publication._absolute_without_symlink_resolution(raw_root)
+    data = historical.parent.parent
+    if (
+        historical != data / "routes" / "historical"
+        or raw != data / "raw" / "historical-foundry-replay"
+    ):
+        raise HistoricalRoutePublicationError(
+            "historical publication roots differ"
+        )
+    return data, historical, raw
+
+
+def load_latest_historical_replay_bundle(
+    historical_root: Path, *, raw_root: Path,
+) -> Optional[Mapping[str, Any]]:
+    """Load one pointer-bound verified replay and its physical signature."""
+    import scripts.historical_foundry_verifier as verifier
+
+    data, historical, raw = _historical_publication_roots(
+        historical_root, raw_root
+    )
+    historical_fd = None
+    validated = None
+    try:
+        opened_root, historical_fd, root_details = (
+            _route_publication._open_verified_directory(
+                historical, "historical published replay root"
+            )
+        )
+        pointer_snapshot = _route_publication._optional_pointer_snapshot_at(
+            historical_fd
+        )
+        if pointer_snapshot is None:
+            return None
+        pointer_bytes, pointer_details = pointer_snapshot
+        try:
+            pointer = json.loads(pointer_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HistoricalRoutePublicationError(
+                "historical published pointer is invalid"
+            ) from error
+        if (
+            type(pointer) is not dict
+            or _canonical_bytes(pointer) != pointer_bytes
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical published pointer is invalid"
+            )
+        pointer_core = dict(
+            verifier.historical_replay_pointer_core(pointer)
+        )
+        report_bytes = _reread_historical_verification_report(
+            data_dir=data, final_pointer=pointer
+        )
+        report = verifier._validate_retained_historical_verification_report(
+            report_bytes=report_bytes, pointer_core=pointer_core,
+        )
+        bundle_path = (
+            historical / "bundles" / pointer_core["replay_id"]
+        )
+        validated = _validate_historical_replay_bundle(
+            data_dir=data, raw_root=raw, bundle_path=bundle_path,
+            expected_pointer_core=pointer_core,
+            expected_replay_id=pointer_core["replay_id"],
+            require_directory_identity=True, issue_view=True,
+            trusted_staged_context=None,
+        )
+        view = validated["validated_view"]
+        view.reread_unchanged()
+        manifest = _plain(validated["manifest"])
+        signature = [(
+            "pointer:latest.json",
+            _sha(pointer_bytes),
+            len(pointer_bytes),
+            *_route_publication._stable_file_metadata(pointer_details),
+        )]
+        report_path = (
+            historical / "verifications" / "by-sha256"
+            / (pointer["verification_report_sha256"] + ".json")
+        )
+        signature.append(_historical_publication_file_signature(
+            path=report_path, role="verification:report.json",
+            expected_sha256=pointer["verification_report_sha256"],
+            expected_size=len(report_bytes),
+        ))
+        for filename in sorted(_HISTORICAL_COMPLETE_FILES):
+            expected_digest = (
+                validated["manifest_sha256"]
+                if filename == "manifest.json"
+                else manifest["files"][filename]["sha256"]
+            )
+            signature.append(_historical_publication_file_signature(
+                path=bundle_path / filename,
+                role="complete:" + filename,
+                expected_sha256=expected_digest,
+            ))
+        core_path = (
+            historical / "core" / "bundles"
+            / manifest["route_cohort_id"]
+        )
+        core_manifest_path = core_path / "manifest.json"
+        core_manifest_bytes = _historical_publication_manifest_bytes(
+            path=core_manifest_path,
+            expected_sha256=manifest[
+                "historical_core_manifest_sha256"
+            ],
+            maximum=_route_publication._MAX_JSON_BYTES,
+            label="historical published core manifest",
+        )
+        try:
+            core_manifest = json.loads(core_manifest_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HistoricalRoutePublicationError(
+                "historical published core manifest is invalid"
+            ) from error
+        if (
+            type(core_manifest) is not dict
+            or _json_file_bytes(core_manifest) != core_manifest_bytes
+            or type(core_manifest.get("files")) is not dict
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical published core manifest is invalid"
+            )
+        for filename in sorted(_CORE_FILES):
+            expected_digest = (
+                manifest["historical_core_manifest_sha256"]
+                if filename == "manifest.json"
+                else core_manifest["files"][filename]["sha256"]
+            )
+            signature.append(_historical_publication_file_signature(
+                path=core_path / filename,
+                role="core:" + filename,
+                expected_sha256=expected_digest,
+            ))
+        run_id = manifest["run_id"]
+        raw_run_path = raw / run_id[4:]
+        raw_manifest_path = raw_run_path / "run_manifest.json"
+        raw_manifest_bytes = _historical_publication_manifest_bytes(
+            path=raw_manifest_path,
+            expected_sha256=manifest["run_manifest_sha256"],
+            maximum=8_388_608,
+            label="historical published raw manifest",
+        )
+        try:
+            raw_manifest = json.loads(raw_manifest_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HistoricalRoutePublicationError(
+                "historical published raw manifest is invalid"
+            ) from error
+        members = raw_manifest.get("members")
+        if (
+            type(raw_manifest) is not dict
+            or _canonical_bytes(raw_manifest) != raw_manifest_bytes
+            or raw_manifest.get("run_id") != run_id
+            or type(members) is not list
+            or raw_manifest.get("member_count") != len(members)
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical published raw manifest is invalid"
+            )
+        raw_rows = [{
+            "path": "run_manifest.json",
+            "byte_count": len(raw_manifest_bytes),
+            "sha256": manifest["run_manifest_sha256"],
+        }]
+        raw_rows.extend(members)
+        seen = set()
+        for row in raw_rows:
+            relative = row.get("path") if type(row) is dict else None
+            parts = relative.split("/") if type(relative) is str else []
+            if (
+                type(row) is not dict
+                or set(row) != {"path", "byte_count", "sha256"}
+                or relative in seen
+                or not 1 <= len(parts) <= 8
+                or any(
+                    not part or part in (".", "..") or "\\" in part
+                    for part in parts
+                )
+                or type(row.get("byte_count")) is not int
+                or not 0 < row["byte_count"] <= 16_842_752
+                or type(row.get("sha256")) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", row["sha256"])
+                is None
+            ):
+                raise HistoricalRoutePublicationError(
+                    "historical published raw inventory is invalid"
+                )
+            seen.add(relative)
+            signature.append(_historical_publication_file_signature(
+                path=raw_run_path.joinpath(*parts),
+                role="raw:" + relative,
+                expected_sha256=row["sha256"],
+                expected_size=row["byte_count"],
+            ))
+        view.reread_unchanged()
+        report_after = _reread_historical_verification_report(
+            data_dir=data, final_pointer=pointer
+        )
+        pointer_after = _route_publication._optional_pointer_snapshot_at(
+            historical_fd
+        )
+        _route_publication._verify_open_path_identity(
+            opened_root, root_details,
+            "historical published replay root",
+        )
+        if (
+            report_after != report_bytes
+            or not _snapshot_matches(pointer_after, pointer_snapshot)
+        ):
+            raise HistoricalRoutePublicationError(
+                "historical publication changed while loading"
+            )
+        return MappingProxyType({
+            "manifest_sha256": validated["manifest_sha256"],
+            "manifest": validated["manifest"],
+            "bundle": validated["bundle"],
+            "routes": validated["bundle"]["routes"],
+            "legs": validated["legs"],
+            "cost_components": validated["cost_components"],
+            "opportunities": validated["opportunities"],
+            "replay_evidence": validated["replay_evidence"],
+            "pointer": MappingProxyType(dict(pointer)),
+            "pointer_core": MappingProxyType(pointer_core),
+            "pointer_sha256": _sha(pointer_bytes),
+            "verification_report": report,
+            "verification_report_sha256": pointer[
+                "verification_report_sha256"
+            ],
+            "publication_signature": tuple(signature),
+            "validated_view": view,
+        })
+    except BaseException:
+        if validated is not None:
+            try:
+                validated["validated_view"].close()
+            except Exception:
+                pass
+        raise
+    finally:
+        _close_descriptors_robustly(historical_fd)
+
+
+def historical_replay_publication_signature(
+    historical_root: Path, *, raw_root: Path,
+) -> Optional[HistoricalPublicationSignature]:
+    loaded = load_latest_historical_replay_bundle(
+        historical_root, raw_root=raw_root
+    )
+    if loaded is None:
+        return None
+    view = loaded["validated_view"]
+    try:
+        return tuple(loaded["publication_signature"])
+    finally:
+        view.close()
