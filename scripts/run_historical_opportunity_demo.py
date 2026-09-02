@@ -22,7 +22,9 @@ from tests.historical_replay_fixture import PublishedHistoricalReplayFixture
 
 DEMO_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-HISTORICAL_DEMO_PATH = "/opportunities?opportunity_scope=historical"
+HISTORICAL_DEMO_PATH = (
+    "/opportunities?opportunity_scope=historical#local-demo-fixture"
+)
 
 
 def _port(value: str) -> int:

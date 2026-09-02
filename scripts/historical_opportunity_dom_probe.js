@@ -336,7 +336,7 @@ async function main() {
   const html = htmlBytes.toString("utf8");
   if (Buffer.from(html, "utf8").compare(htmlBytes) !== 0) throw new Error("utf8");
   const document = parseHtml(html);
-  const requiredIds = ["opportunity-current-context", "opportunity-historical-context", "opportunities-view", "historical-opportunity-inventory", "historical-opportunity-title", "historical-opportunity-count", "historical-opportunity-empty", "historical-opportunity-body", "strict-opportunities", "strict-opportunity-body", "estimate-opportunities", "estimate-opportunity-body", "unavailable-opportunities", "unavailable-opportunity-body"];
+  const requiredIds = ["opportunity-current-context", "opportunity-historical-context", "historical-opportunity-demo-label", "opportunities-view", "historical-opportunity-inventory", "historical-opportunity-title", "historical-opportunity-count", "historical-opportunity-empty", "historical-opportunity-body", "strict-opportunities", "strict-opportunity-body", "estimate-opportunities", "estimate-opportunity-body", "unavailable-opportunities", "unavailable-opportunity-body"];
   if (requiredIds.some((id) => !document.getElementById(id))) throw new Error("missing DOM hook");
   const scopes = document.querySelectorAll("[data-opportunity-scope]");
   if (scopes.length !== 2 || html.split(DISCLAIMER).length - 1 !== 1) throw new Error("historical shell");
@@ -387,6 +387,7 @@ async function main() {
   const root = document.getElementById("historical-opportunity-inventory");
   const rows = rowProjection(document.getElementById("historical-opportunity-body").innerHTML, root.getAttribute("data-api-generation"), root.getAttribute("data-replay-id"), root.getAttribute("data-selected-block-number"), input.api_payload.routes);
   const strictHidden = ["strict-opportunities", "estimate-opportunities", "unavailable-opportunities"].every((id) => document.getElementById(id).hidden === true);
+  const demoFixtureHidden = document.getElementById("historical-opportunity-demo-label").hidden === true;
   const currentScope = scopes.find((element) => element.dataset.opportunityScope === "current");
   const historicalScope = scopes.find((element) => element.dataset.opportunityScope === "historical");
   if (root.hidden !== false || document.getElementById("opportunity-current-context").hidden !== true || document.getElementById("opportunity-historical-context").hidden !== false || !currentScope || currentScope.getAttribute("aria-pressed") !== "false" || !historicalScope || historicalScope.getAttribute("aria-pressed") !== "true") throw new Error("historical visibility");
@@ -401,6 +402,7 @@ async function main() {
     selected_block_number: Number(root.getAttribute("data-selected-block-number")),
     scenario_count: Number(root.getAttribute("data-scenario-count")),
     strict_hidden: strictHidden,
+    demo_fixture_hidden: demoFixtureHidden,
     visible_value_row_count: rows.length,
     disclaimer: DISCLAIMER,
     rows,

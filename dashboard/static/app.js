@@ -594,6 +594,7 @@ function replaceCurrentRoute({
 }
 
 function navigateTo(path, { replace = false } = {}) {
+  path = preserveHistoricalDemoFragment(path);
   invalidateSnapshotRefreshRequest({ clearFeedback: true });
   if (replace) window.history.replaceState({}, "", path);
   else window.history.pushState({}, "", path);
@@ -2409,6 +2410,15 @@ function opportunityScope(filters = {}) {
   return filters?.opportunityScope === "historical" ? "historical" : "current";
 }
 
+function preserveHistoricalDemoFragment(path) {
+  const fragment = "#local-demo-fixture";
+  return (
+    globalThis.window?.location?.hash === fragment
+    && String(path).startsWith("/opportunities")
+    && !String(path).includes("#")
+  ) ? `${path}${fragment}` : path;
+}
+
 function syncOpportunityScopePresentation(scope) {
   const historical = scope === "historical";
   document.querySelectorAll("[data-opportunity-scope]").forEach((button) => {
@@ -2418,8 +2428,15 @@ function syncOpportunityScopePresentation(scope) {
   });
   const currentContext = byId("opportunity-current-context");
   const historicalContext = byId("opportunity-historical-context");
+  const demoLabel = byId("historical-opportunity-demo-label");
   if (currentContext) currentContext.hidden = historical;
   if (historicalContext) historicalContext.hidden = !historical;
+  if (demoLabel) {
+    demoLabel.hidden = !(
+      historical
+      && globalThis.window?.location?.hash === "#local-demo-fixture"
+    );
+  }
 }
 
 function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) {

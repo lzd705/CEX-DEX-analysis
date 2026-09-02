@@ -74,7 +74,7 @@ class HistoricalOpportunityDemoTests(unittest.TestCase):
                 "replay_id": "replay:" + "a" * 64,
                 "url": (
                     "http://127.0.0.1:43210/opportunities"
-                    "?opportunity_scope=historical"
+                    "?opportunity_scope=historical#local-demo-fixture"
                 ),
             },
         )

@@ -2200,6 +2200,27 @@ th.sticky-token { z-index: 12; background: #1c2027; }
   border-color: #806335;
 }
 .historical-opportunity-table { min-width: 1180px; }
+.historical-opportunity-table td:nth-child(2) {
+  max-width: 420px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.historical-opportunity-table td:nth-child(5) {
+  max-width: 280px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.historical-opportunity-table td:nth-child(8) {
+  max-width: 340px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.historical-opportunity-table .opportunity-route-id { display: block; }
+.opportunity-demo-chip {
+  border-color: #a98245;
+  background: #312616;
+  color: #f2cf91;
+}
 .opportunity-unavailable-state {
   border-color: #806335;
   background: #362a17;

@@ -305,6 +305,7 @@ def validate_historical_dom_api_parity(
         == metadata.get("selected_block_number")
         and dom_result.get("scenario_count") == 10
         and dom_result.get("strict_hidden") is True
+        and dom_result.get("demo_fixture_hidden") is True
         and dom_result.get("visible_value_row_count") == 10
         and dom_result.get("disclaimer")
         == HISTORICAL_OPPORTUNITY_DISCLAIMER,

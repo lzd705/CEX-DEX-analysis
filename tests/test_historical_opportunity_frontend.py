@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = PROJECT_ROOT / "dashboard" / "static" / "index.html"
 APP_PATH = PROJECT_ROOT / "dashboard" / "static" / "app.js"
 NAVIGATION_PATH = PROJECT_ROOT / "dashboard" / "static" / "navigation.js"
+STYLES_PATH = PROJECT_ROOT / "dashboard" / "static" / "styles.css"
 CURRENT_FRONTEND_TEST_PATH = PROJECT_ROOT / "tests" / "test_opportunity_frontend.py"
 
 HISTORICAL_DISCLAIMER = (
@@ -76,6 +77,7 @@ const opportunityIds = [
   "opportunity-cohort-status", "opportunity-loading", "opportunity-status",
   "opportunity-error", "opportunity-bundle-unavailable", "opportunities-view",
   "opportunity-current-context", "opportunity-historical-context",
+  "historical-opportunity-demo-label",
   "historical-opportunity-inventory", "historical-opportunity-count",
   "historical-opportunity-empty", "historical-opportunity-body",
   "strict-opportunities", "estimate-opportunities", "unavailable-opportunities",
@@ -199,6 +201,8 @@ class HistoricalOpportunityShellTests(unittest.TestCase):
         self.assertIn('data-opportunity-scope="historical"', page)
         self.assertIn('id="opportunity-current-context"', page)
         self.assertIn('id="opportunity-historical-context"', page)
+        self.assertIn('id="historical-opportunity-demo-label"', page)
+        self.assertIn("LOCAL DEMO FIXTURE", page)
         self.assertIn('id="historical-opportunity-inventory"', page)
         self.assertIn('id="historical-opportunity-body"', page)
         self.assertIn('id="historical-opportunity-count"', page)
@@ -211,8 +215,62 @@ class HistoricalOpportunityShellTests(unittest.TestCase):
         ):
             self.assertIn(attribute, page)
 
+    def test_historical_route_identity_wraps_before_hiding_value_columns(self):
+        styles = STYLES_PATH.read_text(encoding="utf-8")
+        route_rule = re.search(
+            r"\.historical-opportunity-table td:nth-child\(2\)\s*\{([^}]+)\}",
+            styles,
+        )
+
+        self.assertIsNotNone(route_rule)
+        self.assertIn("max-width:", route_rule.group(1))
+        self.assertIn("white-space: normal", route_rule.group(1))
+        self.assertIn("overflow-wrap: anywhere", route_rule.group(1))
+
 
 class HistoricalOpportunityRendererTests(unittest.TestCase):
+    def test_local_demo_fragment_labels_historical_scope_and_survives_filters(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + r"""
+global.window.location = {
+  pathname: "/opportunities",
+  search: "?opportunity_scope=historical",
+  hash: "#local-demo-fixture",
+};
+syncOpportunityScopePresentation("historical");
+const historical = {
+  labelHidden: opportunityElements["historical-opportunity-demo-label"].hidden,
+  preservedPath: preserveHistoricalDemoFragment(
+    "/opportunities?opportunity_scope=historical&notional=1000",
+  ),
+};
+syncOpportunityScopePresentation("current");
+const current = {
+  labelHidden: opportunityElements["historical-opportunity-demo-label"].hidden,
+};
+global.window.location.hash = "";
+syncOpportunityScopePresentation("historical");
+const ordinaryHistorical = {
+  labelHidden: opportunityElements["historical-opportunity-demo-label"].hidden,
+};
+console.log(JSON.stringify({ historical, current, ordinaryHistorical }));
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertEqual(result, {
+            "historical": {
+                "labelHidden": False,
+                "preservedPath": (
+                    "/opportunities?opportunity_scope=historical&notional=1000"
+                    "#local-demo-fixture"
+                ),
+            },
+            "current": {"labelHidden": True},
+            "ordinaryHistorical": {"labelHidden": True},
+        })
+
     def test_historical_decimal_strings_render_as_visible_currency_values(self):
         result = run_app_javascript(
             HISTORICAL_DOM_FIXTURE

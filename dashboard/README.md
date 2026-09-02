@@ -35,8 +35,9 @@ or any external RPC call, run:
 python3 scripts/run_historical_opportunity_demo.py
 ```
 
-Open the printed `/opportunities?opportunity_scope=historical` URL. The command
-builds and validates a disposable repository fixture, publishes ten fixed
+Open the printed Historical Opportunity URL. Its `LOCAL DEMO FIXTURE` label
+stays visible while filters are applied. The command builds and validates a
+disposable repository fixture, publishes ten fixed
 replay scenarios through the normal historical API, and serves the normal
 dashboard on `127.0.0.1` only. Allow up to about a minute for the fixture checks
 on a laptop. Press `Ctrl-C` to stop the server and remove the fixture.
