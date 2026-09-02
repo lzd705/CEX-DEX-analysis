@@ -21,7 +21,7 @@
         <a href="/opportunities" data-app-route="opportunities">Opportunities</a>
         <a href="/tokens/AAVE/markets" data-app-route="markets">Markets</a>
         <a href="/tokens/AAVE/compare" data-app-route="research">Token Research</a>
-        <a href="/actions.html">Data Actions</a>
+        <a id="data-actions-nav" href="/actions.html">Data Actions</a>
       </nav>
       <div
         id="freshness-cluster"
@@ -924,9 +924,9 @@
               </details>
             </div>
             <div id="opportunity-historical-context" class="module-context historical-opportunity-context" hidden>
-              <span id="historical-opportunity-demo-label" class="module-chip opportunity-demo-chip" hidden>LOCAL DEMO FIXTURE · repository-only · no live RPC</span>
-              <span class="module-chip opportunity-class-chip estimate">Historical Foundry Replay</span>
-              <p>Historical Foundry Replay. Fixed-block counterfactual simulation under a hash-bound state override modelling a prefunded, predeployed, preapproved executor. Successful values are research estimates at the displayed Ethereum block; they are not current and are not executable candidates.</p>
+              <span id="historical-opportunity-demo-label" class="module-chip opportunity-demo-chip" hidden>LOCAL DEMO FIXTURE · synthetic evidence · verification not run · no live RPC</span>
+              <span class="module-chip opportunity-class-chip estimate">Historical Replay</span>
+              <p>Historical Replay. Fixed-block counterfactual scenarios under a hash-bound state override model for a prefunded, predeployed, preapproved executor. Evidence status is shown per row. Values are research estimates at the displayed Ethereum block; they are not current and are not executable candidates.</p>
             </div>
           </div>
           <div id="opportunity-cohort-status" class="contract-badge">Cohort not loaded</div>
@@ -1024,16 +1024,16 @@
           >
             <div class="opportunity-section-heading">
               <div>
-                <h3 id="historical-opportunity-title">Historical Foundry Replays</h3>
-                <p>Fixed-block, Foundry-verified counterfactual research scenarios.</p>
+                <h3 id="historical-opportunity-title">Historical Replay Scenarios</h3>
+                <p>Fixed-block counterfactual research scenarios with explicit per-row evidence status.</p>
               </div>
               <span id="historical-opportunity-count" class="contract-badge">0 scenarios</span>
             </div>
             <div id="historical-opportunity-empty" class="status-banner opportunity-empty" hidden>No historical replay scenarios match the current filters.</div>
-            <div class="opportunity-table-scroll" role="region" aria-label="Historical Foundry replay scenarios" tabindex="0">
+            <div class="opportunity-table-scroll" role="region" aria-label="Historical replay scenarios" tabindex="0">
               <table class="opportunity-table historical-opportunity-table">
-                <caption>Historical Foundry replay research estimates at one selected Ethereum block.</caption>
-                <thead><tr><th scope="col">Token</th><th scope="col">Route</th><th scope="col">Direction</th><th scope="col">Notional</th><th scope="col">Replay block</th><th scope="col">Net result at replay block</th><th scope="col">State age at replay</th><th scope="col">Foundry evidence</th><th scope="col">Stress outcome</th></tr></thead>
+                <caption>Historical replay research estimates and their evidence status at one selected Ethereum block.</caption>
+                <thead><tr><th scope="col">Token</th><th scope="col">Route</th><th scope="col">Direction</th><th scope="col">Notional</th><th scope="col">Replay block</th><th scope="col">Net result at replay block</th><th scope="col">State age at replay</th><th scope="col">Replay evidence</th><th scope="col">Stress outcome</th></tr></thead>
                 <tbody id="historical-opportunity-body"></tbody>
               </table>
             </div>

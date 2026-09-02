@@ -2365,7 +2365,9 @@ function formatHistoricalOpportunityUsd(value) {
   return Number.isFinite(numericValue) ? `$${rawUsd.format(numericValue)}` : "N/A";
 }
 
-function historicalOpportunityRowMarkup(route, generation, replayId) {
+function historicalOpportunityRowMarkup(
+  route, generation, replayId, demoFixture = false,
+) {
   const opportunityId = String(route.opportunity_id);
   const routeId = String(route.route_id);
   const token = String(route.token_symbol);
@@ -2382,6 +2384,12 @@ function historicalOpportunityRowMarkup(route, generation, replayId) {
   const stress25 = String(route.stress_25_net_edge_usd);
   const stress50 = String(route.stress_50_net_edge_usd);
   const verified = route.foundry_verified === true;
+  const evidenceHeading = demoFixture
+    ? "Synthetic fixture evidence — verification not run"
+    : verified ? "Foundry verified" : "Foundry unverified";
+  const receiptLabel = demoFixture ? "Fixture receipt digest" : "Receipt";
+  const traceLabel = demoFixture ? "Fixture trace digest" : "Trace";
+  const gasLabel = demoFixture ? "Fixture gas" : "Gas";
   const stressLabel = route.stress_robust === true ? "Stress robust" : "Stress sensitive";
   return `<tr data-opportunity-id="${escapeHtml(opportunityId)}"
       data-api-generation="${escapeHtml(generation)}"
@@ -2401,7 +2409,7 @@ function historicalOpportunityRowMarkup(route, generation, replayId) {
     <td data-label="Replay block"><strong>${escapeHtml(blockNumber)}</strong><span class="metric-note">${escapeHtml(blockHash)}</span><span class="metric-note">${escapeHtml(blockTime)}</span></td>
     <td data-label="Net result at replay block"><strong>${escapeHtml(formatHistoricalOpportunityUsd(researchNet))}</strong><span class="metric-note">Policy baseline ${escapeHtml(formatHistoricalOpportunityUsd(policyNet))}</span><span class="metric-note">Receipt baseline ${escapeHtml(formatHistoricalOpportunityUsd(baselineNet))}</span></td>
     <td data-label="State age at replay">${escapeHtml(formatOpportunitySeconds(route.state_age_seconds))} s</td>
-    <td data-label="Foundry evidence"><strong>${verified ? "Foundry verified" : "Foundry unverified"}</strong><span class="metric-note">Gas ${escapeHtml(rawVolume.format(route.gas_used))}</span><span class="metric-note">Receipt ${escapeHtml(receipt)}</span><span class="metric-note">Trace ${escapeHtml(trace)}</span><span class="metric-note">${escapeHtml(route.executor_model)}</span></td>
+    <td data-label="Replay evidence"><strong>${escapeHtml(evidenceHeading)}</strong><span class="metric-note">${escapeHtml(gasLabel)} ${escapeHtml(rawVolume.format(route.gas_used))}</span><span class="metric-note">${escapeHtml(receiptLabel)} ${escapeHtml(receipt)}</span><span class="metric-note">${escapeHtml(traceLabel)} ${escapeHtml(trace)}</span><span class="metric-note">${escapeHtml(route.executor_model)}</span></td>
     <td data-label="Stress outcome"><strong>${escapeHtml(stressLabel)}</strong><span class="metric-note">Stress 25 bps ${escapeHtml(formatHistoricalOpportunityUsd(stress25))}</span><span class="metric-note">Stress 50 bps ${escapeHtml(formatHistoricalOpportunityUsd(stress50))}</span></td>
   </tr>`;
 }
@@ -2410,10 +2418,19 @@ function opportunityScope(filters = {}) {
   return filters?.opportunityScope === "historical" ? "historical" : "current";
 }
 
+function isLoopbackHistoricalDemoLocation() {
+  const location = globalThis.window?.location;
+  const hostname = String(location?.hostname || "").toLowerCase();
+  return (
+    location?.hash === "#local-demo-fixture"
+    && ["127.0.0.1", "localhost", "::1", "[::1]"].includes(hostname)
+  );
+}
+
 function preserveHistoricalDemoFragment(path) {
   const fragment = "#local-demo-fixture";
   return (
-    globalThis.window?.location?.hash === fragment
+    isLoopbackHistoricalDemoLocation()
     && String(path).startsWith("/opportunities")
     && !String(path).includes("#")
   ) ? `${path}${fragment}` : path;
@@ -2429,13 +2446,17 @@ function syncOpportunityScopePresentation(scope) {
   const currentContext = byId("opportunity-current-context");
   const historicalContext = byId("opportunity-historical-context");
   const demoLabel = byId("historical-opportunity-demo-label");
+  const dataActionsNav = byId("data-actions-nav");
   if (currentContext) currentContext.hidden = historical;
   if (historicalContext) historicalContext.hidden = !historical;
   if (demoLabel) {
     demoLabel.hidden = !(
       historical
-      && globalThis.window?.location?.hash === "#local-demo-fixture"
+      && isLoopbackHistoricalDemoLocation()
     );
+  }
+  if (dataActionsNav) {
+    dataActionsNav.hidden = isLoopbackHistoricalDemoLocation();
   }
 }
 
@@ -2443,6 +2464,28 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
   const availability = payload?.availability;
   const metadata = payload?.metadata;
   const routes = Array.isArray(payload?.routes) ? payload.routes : null;
+  const demoFixture = metadata?.contract_version
+    === "opportunity_historical_demo_summary/v1";
+  const productionContract = metadata?.contract_version
+    === "opportunity_historical_summary/v1"
+    && metadata?.demo_fixture !== true
+    && (
+      (
+        metadata?.evidence_mode === undefined
+        && metadata?.verification_status === undefined
+      )
+      || (
+        metadata?.evidence_mode === "production_connected"
+        && metadata?.verification_status === "verified"
+      )
+    );
+  const demoContract = (
+    demoFixture
+    && metadata?.demo_fixture === true
+    && metadata?.evidence_mode === "offline_test_fixture"
+    && metadata?.verification_status === "structurally_validated"
+    && isLoopbackHistoricalDemoLocation()
+  );
   if (
     !availability
     || typeof availability !== "object"
@@ -2451,7 +2494,7 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
     || availability.status !== "available"
     || availability.reason !== null
     || !metadata
-    || metadata.contract_version !== "opportunity_historical_summary/v1"
+    || (!productionContract && !demoContract)
     || metadata.temporal_scope !== "historical_replay"
     || metadata.execution_claim
       !== "historical_counterfactual_state_override_next_block"
@@ -2461,6 +2504,12 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
     || metadata.selected_block_number < 0
     || !metadata.coverage
     || metadata.coverage.scenario_count !== 10
+    || metadata.coverage.foundry_verified_count !== (demoFixture ? 0 : 10)
+    || (demoFixture && (
+      metadata.coverage.strict_count !== 0
+      || metadata.coverage.executable_count !== 0
+      || metadata.coverage.attested_count !== 0
+    ))
     || routes === null
     || metadata.coverage.returned_count !== routes.length
     || !opportunityResponseFiltersMatch(payload?.filters, requestedFilters)
@@ -2493,7 +2542,7 @@ function historicalOpportunityResponseMatchesRequest(payload, requestedFilters) 
       && typeof route.state_age_seconds === "number"
       && Number.isFinite(route.state_age_seconds)
       && route.state_age_seconds >= 0
-      && route.foundry_verified === true
+      && route.foundry_verified === !demoFixture
       && Number.isSafeInteger(route.gas_used)
       && route.gas_used >= 0
       && /^[0-9a-f]{64}$/.test(route.receipt_sha256 || "")
@@ -2577,6 +2626,7 @@ function renderHistoricalOpportunities(payload) {
   byId("historical-opportunity-body").innerHTML = routes.map((route) => (
     historicalOpportunityRowMarkup(
       route, metadata.data_generation, metadata.replay_id,
+      metadata.demo_fixture === true,
     )
   )).join("");
   byId("historical-opportunity-count").textContent = (
@@ -2584,12 +2634,14 @@ function renderHistoricalOpportunities(payload) {
   );
   byId("historical-opportunity-empty").hidden = routes.length > 0;
   const badge = byId("opportunity-cohort-status");
-  badge.textContent = `Block ${metadata.selected_block_number}`;
+  badge.textContent = `${metadata.demo_fixture === true ? "Fixture block" : "Block"} ${metadata.selected_block_number}`;
   badge.setAttribute("title", metadata.replay_id);
   badge.setAttribute("aria-label", `Historical replay ${metadata.replay_id}`);
   showStatus(
     byId("opportunity-status"),
-    `${routes.length} Historical Foundry replay scenarios match the current filters.`,
+    metadata.demo_fixture === true
+      ? `${routes.length} structurally validated repository fixture scenarios match the current filters; Foundry verification was not run.`
+      : `${routes.length} Historical Foundry replay scenarios match the current filters.`,
     routes.length ? "success" : "warning",
   );
   if (globalThis.window?.lucide) globalThis.window.lucide.createIcons();

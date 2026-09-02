@@ -5,7 +5,7 @@ const vm = require("vm");
 
 const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 const MAX_MEMBER_BYTES = 4 * 1024 * 1024;
-const DISCLAIMER = "Historical Foundry Replay. Fixed-block counterfactual simulation under a hash-bound state override modelling a prefunded, predeployed, preapproved executor. Successful values are research estimates at the displayed Ethereum block; they are not current and are not executable candidates.";
+const DISCLAIMER = "Historical Replay. Fixed-block counterfactual scenarios under a hash-bound state override model for a prefunded, predeployed, preapproved executor. Evidence status is shown per row. Values are research estimates at the displayed Ethereum block; they are not current and are not executable candidates.";
 const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
 
 function fail() { process.exitCode = 1; }

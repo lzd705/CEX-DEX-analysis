@@ -661,7 +661,8 @@ def load_local_environment(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
-load_local_environment(PROJECT_ROOT / ".env")
+if not environment_flag("DASHBOARD_SKIP_LOCAL_ENV"):
+    load_local_environment(PROJECT_ROOT / ".env")
 ADMIN_SERVICE = AdminService()
 PUBLIC_ACTION_POLICY = PublicActionPolicy()
 TRUST_LOOPBACK_PROXY_CLIENT_IP = environment_flag(

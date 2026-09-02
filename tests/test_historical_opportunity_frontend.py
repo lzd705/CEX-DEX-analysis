@@ -16,10 +16,11 @@ STYLES_PATH = PROJECT_ROOT / "dashboard" / "static" / "styles.css"
 CURRENT_FRONTEND_TEST_PATH = PROJECT_ROOT / "tests" / "test_opportunity_frontend.py"
 
 HISTORICAL_DISCLAIMER = (
-    "Historical Foundry Replay. Fixed-block counterfactual simulation under a "
-    "hash-bound state override modelling a prefunded, predeployed, preapproved "
-    "executor. Successful values are research estimates at the displayed "
-    "Ethereum block; they are not current and are not executable candidates."
+    "Historical Replay. Fixed-block counterfactual scenarios under a hash-bound "
+    "state override model for a prefunded, predeployed, preapproved executor. "
+    "Evidence status is shown per row. Values are research estimates at the "
+    "displayed Ethereum block; they are not current and are not executable "
+    "candidates."
 )
 
 
@@ -78,6 +79,7 @@ const opportunityIds = [
   "opportunity-error", "opportunity-bundle-unavailable", "opportunities-view",
   "opportunity-current-context", "opportunity-historical-context",
   "historical-opportunity-demo-label",
+  "data-actions-nav",
   "historical-opportunity-inventory", "historical-opportunity-count",
   "historical-opportunity-empty", "historical-opportunity-body",
   "strict-opportunities", "estimate-opportunities", "unavailable-opportunities",
@@ -207,6 +209,7 @@ class HistoricalOpportunityShellTests(unittest.TestCase):
         self.assertIn('id="historical-opportunity-body"', page)
         self.assertIn('id="historical-opportunity-count"', page)
         self.assertIn(HISTORICAL_DISCLAIMER, " ".join(page.split()))
+        self.assertNotIn("Foundry-verified", page)
         for attribute in (
             "data-api-generation",
             "data-replay-id",
@@ -237,10 +240,12 @@ global.window.location = {
   pathname: "/opportunities",
   search: "?opportunity_scope=historical",
   hash: "#local-demo-fixture",
+  hostname: "127.0.0.1",
 };
 syncOpportunityScopePresentation("historical");
 const historical = {
   labelHidden: opportunityElements["historical-opportunity-demo-label"].hidden,
+  dataActionsHidden: opportunityElements["data-actions-nav"].hidden,
   preservedPath: preserveHistoricalDemoFragment(
     "/opportunities?opportunity_scope=historical&notional=1000",
   ),
@@ -262,6 +267,7 @@ console.log(JSON.stringify({ historical, current, ordinaryHistorical }));
         self.assertEqual(result, {
             "historical": {
                 "labelHidden": False,
+                "dataActionsHidden": True,
                 "preservedPath": (
                     "/opportunities?opportunity_scope=historical&notional=1000"
                     "#local-demo-fixture"
@@ -270,6 +276,135 @@ console.log(JSON.stringify({ historical, current, ordinaryHistorical }));
             "current": {"labelHidden": True},
             "ordinaryHistorical": {"labelHidden": True},
         })
+
+    def test_filter_form_navigation_retains_local_demo_fragment(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + r"""
+global.window.location = {
+  pathname: "/opportunities",
+  search: "?opportunity_scope=historical",
+  hash: "#local-demo-fixture",
+  hostname: "127.0.0.1",
+};
+let pushedPath = null;
+let routeApplicationCount = 0;
+global.window.history = {
+  pushState(_state, _title, path) { pushedPath = path; },
+  replaceState(_state, _title, path) { pushedPath = path; },
+};
+global.window.scrollTo = () => {};
+applyRouteFromLocation = () => { routeApplicationCount += 1; };
+app.route = {
+  kind: "opportunities",
+  filters: { opportunityScope: "historical" },
+};
+opportunityElements["opportunity-notional"].value = "1000";
+bindOpportunityFilterEvents();
+opportunityElements["opportunity-filter-form"].listeners.submit({
+  preventDefault() {},
+});
+console.log(JSON.stringify({ pushedPath, routeApplicationCount }));
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertEqual(result["routeApplicationCount"], 1)
+        self.assertIn("notional=1000", result["pushedPath"])
+        self.assertIn("opportunity_scope=historical", result["pushedPath"])
+        self.assertTrue(result["pushedPath"].endswith("#local-demo-fixture"))
+
+    def test_demo_fragment_is_ignored_outside_an_exact_loopback_origin(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + r"""
+global.window.location = {
+  pathname: "/opportunities",
+  search: "?opportunity_scope=historical",
+  hash: "#local-demo-fixture",
+  hostname: "production.example",
+};
+syncOpportunityScopePresentation("historical");
+console.log(JSON.stringify({
+  labelHidden: opportunityElements["historical-opportunity-demo-label"].hidden,
+  dataActionsHidden: opportunityElements["data-actions-nav"].hidden,
+  preservedPath: preserveHistoricalDemoFragment(
+    "/opportunities?opportunity_scope=historical&notional=1000",
+  ),
+}));
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertEqual(result, {
+            "labelHidden": True,
+            "dataActionsHidden": False,
+            "preservedPath": (
+                "/opportunities?opportunity_scope=historical&notional=1000"
+            ),
+        })
+
+    def test_structural_demo_evidence_is_only_accepted_and_labelled_on_loopback(self):
+        result = run_app_javascript(
+            HISTORICAL_DOM_FIXTURE
+            + HISTORICAL_PAYLOAD_FIXTURE
+            + r"""
+const demoPayload = JSON.parse(JSON.stringify(historicalPayload));
+demoPayload.metadata.contract_version = "opportunity_historical_demo_summary/v1";
+demoPayload.metadata.demo_fixture = true;
+demoPayload.metadata.evidence_mode = "offline_test_fixture";
+demoPayload.metadata.verification_status = "structurally_validated";
+demoPayload.metadata.coverage.foundry_verified_count = 0;
+demoPayload.routes.forEach((route) => { route.foundry_verified = false; });
+const requested = normalizedOpportunityFilters({
+  opportunityScope: "historical",
+});
+
+global.window.location = {
+  pathname: "/opportunities",
+  search: "?opportunity_scope=historical",
+  hash: "#local-demo-fixture",
+  hostname: "127.0.0.1",
+};
+const loopbackAccepted = historicalOpportunityResponseMatchesRequest(
+  demoPayload, requested,
+);
+const loopbackMarkup = historicalOpportunityRowMarkup(
+  demoPayload.routes[0], historicalGeneration, historicalReplayId, true,
+);
+
+global.window.location.hostname = "production.example";
+const remoteAccepted = historicalOpportunityResponseMatchesRequest(
+  demoPayload, requested,
+);
+const mislabeledProduction = JSON.parse(JSON.stringify(historicalPayload));
+mislabeledProduction.metadata.evidence_mode = "offline_test_fixture";
+mislabeledProduction.metadata.verification_status = "structurally_validated";
+const mislabeledProductionAccepted = historicalOpportunityResponseMatchesRequest(
+  mislabeledProduction, requested,
+);
+console.log(JSON.stringify({
+  loopbackAccepted,
+  loopbackMarkup,
+  mislabeledProductionAccepted,
+  remoteAccepted,
+}));
+""",
+            prelude=navigation_prelude(),
+        )
+
+        self.assertTrue(result["loopbackAccepted"])
+        self.assertFalse(result["remoteAccepted"])
+        self.assertFalse(result["mislabeledProductionAccepted"])
+        self.assertIn(
+            "Synthetic fixture evidence — verification not run",
+            result["loopbackMarkup"],
+        )
+        self.assertIn("Fixture gas", result["loopbackMarkup"])
+        self.assertIn("Fixture receipt digest", result["loopbackMarkup"])
+        self.assertIn("Fixture trace digest", result["loopbackMarkup"])
+        self.assertIn('data-foundry-verified="false"', result["loopbackMarkup"])
+        self.assertNotIn("Foundry verified", result["loopbackMarkup"])
 
     def test_historical_decimal_strings_render_as_visible_currency_values(self):
         result = run_app_javascript(

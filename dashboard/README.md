@@ -32,18 +32,23 @@ To demonstrate the end-to-end historical workflow without current market data
 or any external RPC call, run:
 
 ```bash
-python3 scripts/run_historical_opportunity_demo.py
+python3 scripts/run_historical_opportunity_demo.py --port 0
 ```
 
 Open the printed Historical Opportunity URL. Its `LOCAL DEMO FIXTURE` label
-stays visible while filters are applied. The command builds and validates a
-disposable repository fixture, publishes ten fixed
-replay scenarios through the normal historical API, and serves the normal
-dashboard on `127.0.0.1` only. Allow up to about a minute for the fixture checks
-on a laptop. Press `Ctrl-C` to stop the server and remove the fixture.
+stays visible while filters are applied. The command builds and structurally
+validates ten fixed repository scenarios, exposes them through the dedicated
+read-only `opportunity_historical_demo_summary/v1` API contract, and serves the
+normal dashboard on `127.0.0.1` only. The fixture evidence is synthetic:
+Foundry verification and external RPC access are not run. The runner skips the
+ambient `.env`, isolates all runtime/admin paths inside the disposable fixture,
+forces administrator and public write actions off, and rejects every admin,
+mutation, and non-demo API route. Allow up to about a minute for the fixture
+checks on a laptop. Press `Ctrl-C` to stop the server and remove the fixture.
 
 This workflow is for local presentation and contract testing. Its displayed
-values are not live or current, and they are not an execution or profit claim.
+values are not live or current, its receipt/trace values are fixture artifact
+digests, and they are not a Foundry-verification, execution, or profit claim.
 No result needs to be positive to demonstrate the publication, API, filtering,
 rendering, evidence, and cleanup path.
 

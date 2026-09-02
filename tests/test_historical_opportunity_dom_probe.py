@@ -9,9 +9,9 @@ import scripts.check_dashboard_release as checker
 
 
 DISCLAIMER = (
-    "Historical Foundry Replay. Fixed-block counterfactual simulation under "
-    "a hash-bound state override modelling a prefunded, predeployed, "
-    "preapproved executor. Successful values are research estimates at the "
+    "Historical Replay. Fixed-block counterfactual scenarios under a hash-bound "
+    "state override model for a prefunded, predeployed, preapproved executor. "
+    "Evidence status is shown per row. Values are research estimates at the "
     "displayed Ethereum block; they are not current and are not executable "
     "candidates."
 )
@@ -72,7 +72,11 @@ def api_payload():
             "data_generation": GENERATION,
             "replay_id": REPLAY_ID,
             "selected_block_number": 12345678,
-            "coverage": {"scenario_count": 10, "returned_count": 10},
+            "coverage": {
+                "scenario_count": 10,
+                "returned_count": 10,
+                "foundry_verified_count": 10,
+            },
         },
         "filters": {
             "token": None,

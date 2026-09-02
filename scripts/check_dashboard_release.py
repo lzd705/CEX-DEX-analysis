@@ -148,9 +148,9 @@ STATIC_ASSET_GZIP_BUDGET = 220_000
 IMMUTABLE_STATIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
 STATIC_ASSET_GZIP_THRESHOLD_BYTES = 1024
 HISTORICAL_OPPORTUNITY_DISCLAIMER = (
-    "Historical Foundry Replay. Fixed-block counterfactual simulation under "
-    "a hash-bound state override modelling a prefunded, predeployed, "
-    "preapproved executor. Successful values are research estimates at the "
+    "Historical Replay. Fixed-block counterfactual scenarios under a hash-bound "
+    "state override model for a prefunded, predeployed, preapproved executor. "
+    "Evidence status is shown per row. Values are research estimates at the "
     "displayed Ethereum block; they are not current and are not executable "
     "candidates."
 )
