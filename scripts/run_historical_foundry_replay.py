@@ -2342,6 +2342,573 @@ def _publish_verified_historical_bundle(
         ) from error
 
 
+def _invalid_historical_reference_gc_inventory() -> Mapping[str, Any]:
+    return {
+        "schema": "historical_reference_gc_validated_inventory/v1",
+        "status": "invalid",
+        "complete_bundles": (),
+        "core_bundles": (),
+        "historical_pointers": {"core": None, "complete": None},
+        "raw_runs": (),
+        "verification_reports": (),
+    }
+
+
+def _build_validated_historical_reference_gc_inventory(
+    *, data_dir: Path,
+) -> Mapping[str, Any]:
+    """Fully validate retained historical references without mutating them."""
+    import scripts.historical_foundry_storage as storage
+    import scripts.historical_foundry_verifier as verifier
+    import scripts.historical_route_publication as publication
+    import scripts.route_publication as route_publication
+
+    def invalid(reason: str) -> None:
+        del reason
+        raise _entrypoint_error("historical GC inventory is invalid")
+
+    def exact_sha256(value: Any) -> bool:
+        return (
+            type(value) is str
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+
+    def exact_json(
+        payload: bytes, encoder: Any,
+    ) -> Mapping[str, Any]:
+        try:
+            value = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            invalid("JSON decode failed")
+        if type(value) is not dict or encoder(value) != payload:
+            invalid("JSON is not canonical")
+        return value
+
+    def close_child(descriptor: int, original_error: Any = None) -> None:
+        if original_error is not None:
+            _close_after_error((descriptor,), original_error)
+        _close_descriptor_inventory((descriptor,))
+
+    if not isinstance(data_dir, Path):
+        return _invalid_historical_reference_gc_inventory()
+
+    descriptors = []
+    handles = []
+    result = None
+    original_error = None
+    cleanup_error = None
+    try:
+        data = route_publication._absolute_without_symlink_resolution(
+            data_dir
+        )
+        raw_root, raw_fd, raw_details = (
+            route_publication._open_verified_directory(
+                data / "raw" / "historical-foundry-replay",
+                "historical raw run inventory",
+            )
+        )
+        descriptors.append(raw_fd)
+        historical_root, historical_fd, historical_details = (
+            route_publication._open_verified_directory(
+                data / "routes" / "historical",
+                "historical reference inventory root",
+            )
+        )
+        descriptors.append(historical_fd)
+        fcntl.flock(historical_fd, fcntl.LOCK_SH)
+        complete_fd, complete_details = (
+            route_publication._open_directory_at(
+                historical_fd, "bundles",
+                "historical complete bundle inventory",
+            )
+        )
+        descriptors.append(complete_fd)
+        core_fd, core_details = route_publication._open_directory_at(
+            historical_fd, "core", "historical core inventory"
+        )
+        descriptors.append(core_fd)
+        fcntl.flock(core_fd, fcntl.LOCK_SH)
+        core_bundles_fd, core_bundles_details = (
+            route_publication._open_directory_at(
+                core_fd, "bundles", "historical core bundle inventory"
+            )
+        )
+        descriptors.append(core_bundles_fd)
+        verification_fd, verification_details = (
+            route_publication._open_directory_at(
+                historical_fd, "verifications",
+                "historical verification inventory",
+            )
+        )
+        descriptors.append(verification_fd)
+        reports_fd, reports_details = route_publication._open_directory_at(
+            verification_fd, "by-sha256",
+            "historical verification report inventory",
+        )
+        descriptors.append(reports_fd)
+
+        complete_pointer_snapshot = (
+            route_publication._optional_pointer_snapshot_at(historical_fd)
+        )
+        core_pointer_snapshot = (
+            route_publication._optional_pointer_snapshot_at(core_fd)
+        )
+        complete_pointer = None
+        complete_pointer_core = None
+        if complete_pointer_snapshot is not None:
+            complete_pointer = exact_json(
+                complete_pointer_snapshot[0], verifier._canonical_bytes
+            )
+            complete_pointer_core = dict(
+                verifier.historical_replay_pointer_core(complete_pointer)
+            )
+        core_pointer = None
+        if core_pointer_snapshot is not None:
+            core_pointer = exact_json(
+                core_pointer_snapshot[0], publication._json_file_bytes
+            )
+            if (
+                set(core_pointer) != {
+                    "schema", "bundle_stage", "route_cohort_id",
+                    "manifest_sha256",
+                }
+                or core_pointer.get("schema")
+                != "route_historical_replay_core_pointer/v1"
+                or core_pointer.get("bundle_stage")
+                != "route_historical_replay_core/v1"
+                or re.fullmatch(
+                    r"cohort:[0-9a-f]{64}",
+                    core_pointer.get("route_cohort_id", ""),
+                ) is None
+                or not exact_sha256(core_pointer.get("manifest_sha256"))
+            ):
+                invalid("core pointer schema differs")
+
+        raw_names = tuple(sorted(os.listdir(raw_fd)))
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}", name) is None
+            for name in raw_names
+        ):
+            invalid("raw run name differs")
+        raw_rows = []
+        for name in raw_names:
+            run_fd = None
+            try:
+                run_fd, run_details = route_publication._open_directory_at(
+                    raw_fd, name, "historical raw run"
+                )
+                _manifest_bytes, manifest_sha256, _manifest_details = (
+                    route_publication._read_bounded_bytes_at(
+                        run_fd, "run_manifest.json", limit=8_388_608,
+                        label="historical raw run manifest",
+                    )
+                )
+                run_id = "run:" + name
+                snapshot = storage.open_validated_run(
+                    data_dir=data, run_id=run_id,
+                    expected_manifest_sha256=manifest_sha256,
+                )
+                handles.append(snapshot)
+                snapshot.reread_unchanged()
+                projection = dict(snapshot.identity_projection())
+                if (
+                    projection.get("run_id") != run_id
+                    or projection.get("run_manifest_sha256")
+                    != manifest_sha256
+                ):
+                    invalid("raw run projection differs")
+                route_publication._verify_directory_entry_snapshot(
+                    raw_fd, name, run_details, "historical raw run"
+                )
+                raw_rows.append({
+                    "run_id": run_id,
+                    "run_manifest_sha256": manifest_sha256,
+                })
+            except BaseException as error:
+                if run_fd is not None:
+                    close_child(run_fd, error)
+                raise
+            if run_fd is not None:
+                close_child(run_fd)
+
+        complete_names = tuple(sorted(os.listdir(complete_fd)))
+        if any(
+            re.fullmatch(r"replay:[0-9a-f]{64}", name) is None
+            for name in complete_names
+        ):
+            invalid("complete bundle name differs")
+        complete_rows = []
+        complete_pointer_cores = {}
+        for replay_id in complete_names:
+            bundle_fd = None
+            try:
+                bundle_fd, bundle_details = (
+                    route_publication._open_directory_at(
+                        complete_fd, replay_id,
+                        "historical complete bundle",
+                    )
+                )
+                bundle_path = (
+                    historical_root / "bundles" / replay_id
+                )
+                validated = publication.validate_historical_replay_bundle(
+                    data_dir=data, raw_root=raw_root,
+                    bundle_path=bundle_path,
+                    expected_pointer_core=None,
+                )
+                subject = validated.get("verification_subject")
+                if subject is not None:
+                    handles.append(subject)
+                if subject is None:
+                    invalid("complete subject is missing")
+                subject.reread_unchanged()
+                manifest = validated.get("manifest")
+                pointer_core = validated.get("pointer_core")
+                manifest_sha256 = validated.get("manifest_sha256")
+                if (
+                    validated.get("path") != bundle_path
+                    or not isinstance(manifest, Mapping)
+                    or manifest.get("replay_id") != replay_id
+                    or re.fullmatch(
+                        r"cohort:[0-9a-f]{64}",
+                        manifest.get("route_cohort_id", ""),
+                    ) is None
+                    or re.fullmatch(
+                        r"run:[0-9a-f]{64}",
+                        manifest.get("run_id", ""),
+                    ) is None
+                    or not exact_sha256(
+                        manifest.get("run_manifest_sha256")
+                    )
+                    or not exact_sha256(manifest_sha256)
+                    or not isinstance(pointer_core, Mapping)
+                    or dict(pointer_core) != {
+                        "schema": "route_historical_replay_pointer/v1",
+                        "bundle_stage": (
+                            "route_historical_foundry_replay/v1"
+                        ),
+                        "replay_id": replay_id,
+                        "route_cohort_id": manifest["route_cohort_id"],
+                        "manifest_sha256": manifest_sha256,
+                    }
+                ):
+                    invalid("complete bundle projection differs")
+                complete_rows.append({
+                    "replay_id": replay_id,
+                    "run_id": manifest["run_id"],
+                    "run_manifest_sha256": manifest[
+                        "run_manifest_sha256"
+                    ],
+                })
+                complete_pointer_cores[replay_id] = dict(pointer_core)
+                route_publication._verify_directory_entry_snapshot(
+                    complete_fd, replay_id, bundle_details,
+                    "historical complete bundle",
+                )
+            except BaseException as error:
+                if bundle_fd is not None:
+                    close_child(bundle_fd, error)
+                raise
+            if bundle_fd is not None:
+                close_child(bundle_fd)
+
+        core_names = tuple(sorted(os.listdir(core_bundles_fd)))
+        if any(
+            re.fullmatch(r"cohort:[0-9a-f]{64}", name) is None
+            for name in core_names
+        ):
+            invalid("core bundle name differs")
+        core_rows = []
+        core_projections = {}
+        for route_cohort_id in core_names:
+            bundle_fd = None
+            try:
+                bundle_fd, bundle_details = (
+                    route_publication._open_directory_at(
+                        core_bundles_fd, route_cohort_id,
+                        "historical core bundle",
+                    )
+                )
+                manifest_bytes, manifest_sha256, _manifest_details = (
+                    route_publication._read_bounded_bytes_at(
+                        bundle_fd, "manifest.json",
+                        limit=route_publication._MAX_JSON_BYTES,
+                        label="historical core manifest",
+                    )
+                )
+                manifest = exact_json(
+                    manifest_bytes, publication._json_file_bytes
+                )
+                if (
+                    manifest.get("schema")
+                    != "route_historical_replay_core_manifest/v1"
+                    or manifest.get("bundle_stage")
+                    != "route_historical_replay_core/v1"
+                    or manifest.get("route_cohort_id") != route_cohort_id
+                    or re.fullmatch(
+                        r"run:[0-9a-f]{64}",
+                        manifest.get("raw_evidence_run_id", ""),
+                    ) is None
+                    or not exact_sha256(
+                        manifest.get("raw_run_manifest_sha256")
+                    )
+                ):
+                    invalid("core manifest schema differs")
+                expected_pointer = publication._pointer(
+                    manifest, manifest_sha256
+                )
+                expected_pointer_sha256 = hashlib.sha256(
+                    publication._json_file_bytes(expected_pointer)
+                ).hexdigest()
+                context = (
+                    publication._load_immutable_historical_replay_core(
+                        data_dir=data,
+                        route_cohort_id=route_cohort_id,
+                        expected_manifest_sha256=manifest_sha256,
+                        expected_pointer_sha256=expected_pointer_sha256,
+                    )
+                )
+                handles.append(context)
+                context.reread_unchanged()
+                projection = dict(context.identity_projection())
+                if (
+                    projection.get("run_id")
+                    != manifest["raw_evidence_run_id"]
+                    or projection.get("run_manifest_sha256")
+                    != manifest["raw_run_manifest_sha256"]
+                    or projection.get("core_manifest_sha256")
+                    != manifest_sha256
+                    or projection.get("core_pointer_sha256")
+                    != expected_pointer_sha256
+                    or not isinstance(
+                        projection.get("core_pointer"), Mapping
+                    )
+                    or dict(projection["core_pointer"])
+                    != expected_pointer
+                ):
+                    invalid("core projection differs")
+                core_rows.append({
+                    "route_cohort_id": route_cohort_id,
+                    "run_id": manifest["raw_evidence_run_id"],
+                    "run_manifest_sha256": manifest[
+                        "raw_run_manifest_sha256"
+                    ],
+                })
+                core_projections[route_cohort_id] = projection
+                route_publication._verify_directory_entry_snapshot(
+                    core_bundles_fd, route_cohort_id, bundle_details,
+                    "historical core bundle",
+                )
+            except BaseException as error:
+                if bundle_fd is not None:
+                    close_child(bundle_fd, error)
+                raise
+            if bundle_fd is not None:
+                close_child(bundle_fd)
+
+        report_names = tuple(sorted(os.listdir(reports_fd)))
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}\.json", name) is None
+            for name in report_names
+        ):
+            invalid("verification report name differs")
+        report_rows = []
+        report_payloads = {}
+        report_details_by_sha = {}
+        for filename in report_names:
+            report_sha256 = filename[:-5]
+            report_bytes, physical_sha256, report_details = (
+                route_publication._read_bounded_bytes_at(
+                    reports_fd, filename, limit=verifier._MAX_REPORT_BYTES,
+                    label="historical verification report",
+                )
+            )
+            if physical_sha256 != report_sha256:
+                invalid("verification report hash differs")
+            report = verifier._validate_exact_historical_verification_report(
+                report_bytes
+            )
+            if not isinstance(report, Mapping):
+                invalid("verification report projection differs")
+            report_pointer_core = {
+                "schema": "route_historical_replay_pointer/v1",
+                "bundle_stage": "route_historical_foundry_replay/v1",
+                "replay_id": report.get("replay_id"),
+                "route_cohort_id": report.get("route_cohort_id"),
+                "manifest_sha256": report.get("manifest_sha256"),
+            }
+            verifier._validate_retained_historical_verification_report(
+                report_bytes=report_bytes,
+                pointer_core=report_pointer_core,
+            )
+            report_rows.append({"sha256": report_sha256})
+            report_payloads[report_sha256] = report_bytes
+            report_details_by_sha[report_sha256] = report_details
+
+        core_pointer_row = None
+        if core_pointer is not None:
+            route_cohort_id = core_pointer["route_cohort_id"]
+            if (
+                route_cohort_id not in core_projections
+                or core_projections[route_cohort_id].get(
+                    "core_manifest_sha256"
+                ) != core_pointer["manifest_sha256"]
+                or dict(core_projections[route_cohort_id].get(
+                    "core_pointer", {}
+                )) != core_pointer
+            ):
+                invalid("current core target differs")
+            current_context = (
+                publication.load_latest_historical_replay_core(
+                    data_dir=data
+                )
+            )
+            handles.append(current_context)
+            current_context.reread_unchanged()
+            current_projection = dict(
+                current_context.identity_projection()
+            )
+            if (
+                current_projection.get("core_manifest_sha256")
+                != core_pointer["manifest_sha256"]
+                or not isinstance(
+                    current_projection.get("core_pointer"), Mapping
+                )
+                or dict(current_projection["core_pointer"])
+                != core_pointer
+            ):
+                invalid("current core projection differs")
+            core_pointer_row = {"route_cohort_id": route_cohort_id}
+
+        complete_pointer_row = None
+        if complete_pointer is not None:
+            replay_id = complete_pointer["replay_id"]
+            report_sha256 = complete_pointer[
+                "verification_report_sha256"
+            ]
+            if (
+                replay_id not in complete_pointer_cores
+                or complete_pointer_cores[replay_id]
+                != complete_pointer_core
+                or report_sha256 not in report_payloads
+            ):
+                invalid("current complete target differs")
+            retained_report = (
+                publication._reread_historical_verification_report(
+                    data_dir=data, final_pointer=complete_pointer
+                )
+            )
+            if retained_report != report_payloads[report_sha256]:
+                invalid("current verification report differs")
+            complete_pointer_row = {
+                "replay_id": replay_id,
+                "verification_report_sha256": report_sha256,
+            }
+
+        for handle in handles:
+            handle.reread_unchanged()
+        for report_sha256, expected_payload in report_payloads.items():
+            payload, physical_sha256, details = (
+                route_publication._read_bounded_bytes_at(
+                    reports_fd, report_sha256 + ".json",
+                    limit=verifier._MAX_REPORT_BYTES,
+                    label="historical verification report",
+                )
+            )
+            if (
+                payload != expected_payload
+                or physical_sha256 != report_sha256
+                or route_publication._stable_file_metadata(details)
+                != route_publication._stable_file_metadata(
+                    report_details_by_sha[report_sha256]
+                )
+            ):
+                invalid("verification report changed")
+        if (
+            tuple(sorted(os.listdir(raw_fd))) != raw_names
+            or tuple(sorted(os.listdir(complete_fd))) != complete_names
+            or tuple(sorted(os.listdir(core_bundles_fd))) != core_names
+            or tuple(sorted(os.listdir(reports_fd))) != report_names
+            or not publication._snapshot_matches(
+                route_publication._optional_pointer_snapshot_at(
+                    historical_fd
+                ),
+                complete_pointer_snapshot,
+            )
+            or not publication._snapshot_matches(
+                route_publication._optional_pointer_snapshot_at(core_fd),
+                core_pointer_snapshot,
+            )
+        ):
+            invalid("historical inventory changed")
+        route_publication._verify_open_path_snapshot(
+            raw_root, raw_details, "historical raw run inventory"
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "bundles", complete_details,
+            "historical complete bundle inventory",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "core", core_details,
+            "historical core inventory",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            core_fd, "bundles", core_bundles_details,
+            "historical core bundle inventory",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "verifications", verification_details,
+            "historical verification inventory",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            verification_fd, "by-sha256", reports_details,
+            "historical verification report inventory",
+        )
+        route_publication._verify_open_path_snapshot(
+            historical_root, historical_details,
+            "historical reference inventory root",
+        )
+        result = {
+            "schema": "historical_reference_gc_validated_inventory/v1",
+            "status": "validated",
+            "complete_bundles": tuple(complete_rows),
+            "core_bundles": tuple(core_rows),
+            "historical_pointers": {
+                "core": core_pointer_row,
+                "complete": complete_pointer_row,
+            },
+            "raw_runs": tuple(raw_rows),
+            "verification_reports": tuple(report_rows),
+        }
+    except BaseException as error:
+        original_error = error
+    finally:
+        cleanup_error = _close_historical_controller_resources(handles)
+        try:
+            _close_descriptor_inventory(descriptors)
+        except BaseException as error:
+            if cleanup_error is None or (
+                isinstance(cleanup_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                cleanup_error = error
+    if original_error is not None:
+        if not isinstance(original_error, Exception):
+            _raise_after_cleanup(original_error, cleanup_error)
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from original_error
+        return _invalid_historical_reference_gc_inventory()
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        return _invalid_historical_reference_gc_inventory()
+    if result is None:
+        return _invalid_historical_reference_gc_inventory()
+    return result
+
+
 def _plan_historical_reference_gc_inventory(
     inventory: Mapping[str, Any],
 ) -> Mapping[str, Any]:

@@ -3804,5 +3804,352 @@ class HistoricalReplayReferenceGcPlannerTests(unittest.TestCase):
                 self.assertEqual(plan["delete_reports"], ())
 
 
+class HistoricalReplayReferenceGcInventoryAdapterTests(unittest.TestCase):
+    class Handle:
+        def __init__(self, projection=None):
+            self.projection = projection
+            self.reread_count = 0
+            self.closed = False
+
+        def identity_projection(self):
+            if self.projection is None:
+                raise AssertionError("projection was not configured")
+            return dict(self.projection)
+
+        def reread_unchanged(self):
+            if self.closed:
+                raise AssertionError("closed inventory handle was reread")
+            self.reread_count += 1
+
+        def close(self):
+            if self.closed:
+                raise AssertionError("inventory handle was closed twice")
+            self.closed = True
+
+    def setUp(self):
+        self.module = _entrypoint()
+        self.publication = importlib.import_module(
+            "scripts.historical_route_publication"
+        )
+        self.verifier = importlib.import_module(
+            "scripts.historical_foundry_verifier"
+        )
+        self.storage = importlib.import_module(
+            "scripts.historical_foundry_storage"
+        )
+        self.route_publication = importlib.import_module(
+            "scripts.route_publication"
+        )
+        self.temporary = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.temporary.name)
+        self.canonical_data_dir = (
+            self.route_publication._absolute_without_symlink_resolution(
+                self.data_dir
+            )
+        )
+        self.raw_root = (
+            self.data_dir / "raw" / "historical-foundry-replay"
+        )
+        self.historical_root = (
+            self.data_dir / "routes" / "historical"
+        )
+        self.complete_root = self.historical_root / "bundles"
+        self.core_root = self.historical_root / "core"
+        self.core_bundles = self.core_root / "bundles"
+        self.report_root = (
+            self.historical_root / "verifications" / "by-sha256"
+        )
+        for directory in (
+            self.raw_root, self.complete_root, self.core_bundles,
+            self.report_root,
+        ):
+            directory.mkdir(parents=True)
+
+        self.run_id = "run:" + "1" * 64
+        self.orphan_run_id = "run:" + "2" * 64
+        self.run_manifest_bytes = b"validated-run-manifest"
+        self.orphan_manifest_bytes = b"validated-orphan-manifest"
+        self.run_manifest_sha256 = hashlib.sha256(
+            self.run_manifest_bytes
+        ).hexdigest()
+        self.orphan_manifest_sha256 = hashlib.sha256(
+            self.orphan_manifest_bytes
+        ).hexdigest()
+        for run_id, payload in (
+            (self.run_id, self.run_manifest_bytes),
+            (self.orphan_run_id, self.orphan_manifest_bytes),
+        ):
+            directory = self.raw_root / run_id[4:]
+            directory.mkdir()
+            (directory / "run_manifest.json").write_bytes(payload)
+
+        self.replay_id = "replay:" + "3" * 64
+        self.route_cohort_id = "cohort:" + "4" * 64
+        (self.complete_root / self.replay_id).mkdir()
+        (self.core_bundles / self.route_cohort_id).mkdir()
+        self.core_manifest = {
+            "schema": "route_historical_replay_core_manifest/v1",
+            "bundle_stage": "route_historical_replay_core/v1",
+            "route_cohort_id": self.route_cohort_id,
+            "raw_evidence_run_id": self.run_id,
+            "raw_run_manifest_sha256": self.run_manifest_sha256,
+        }
+        self.core_manifest_bytes = self.publication._json_file_bytes(
+            self.core_manifest
+        )
+        self.core_manifest_sha256 = hashlib.sha256(
+            self.core_manifest_bytes
+        ).hexdigest()
+        (
+            self.core_bundles / self.route_cohort_id / "manifest.json"
+        ).write_bytes(self.core_manifest_bytes)
+        self.core_pointer = self.publication._pointer(
+            self.core_manifest, self.core_manifest_sha256
+        )
+        self.core_pointer_bytes = self.publication._json_file_bytes(
+            self.core_pointer
+        )
+        self.core_pointer_sha256 = hashlib.sha256(
+            self.core_pointer_bytes
+        ).hexdigest()
+        (self.core_root / "latest.json").write_bytes(
+            self.core_pointer_bytes
+        )
+
+        self.complete_manifest_sha256 = "5" * 64
+        self.current_report_bytes = b"validated-current-report"
+        self.orphan_report_bytes = b"validated-orphan-report"
+        self.current_report_sha256 = hashlib.sha256(
+            self.current_report_bytes
+        ).hexdigest()
+        self.orphan_report_sha256 = hashlib.sha256(
+            self.orphan_report_bytes
+        ).hexdigest()
+        for digest, payload in (
+            (self.current_report_sha256, self.current_report_bytes),
+            (self.orphan_report_sha256, self.orphan_report_bytes),
+        ):
+            (self.report_root / (digest + ".json")).write_bytes(payload)
+        self.complete_pointer_core = {
+            "schema": "route_historical_replay_pointer/v1",
+            "bundle_stage": "route_historical_foundry_replay/v1",
+            "replay_id": self.replay_id,
+            "route_cohort_id": self.route_cohort_id,
+            "manifest_sha256": self.complete_manifest_sha256,
+        }
+        self.complete_pointer = {
+            **self.complete_pointer_core,
+            "verification_report_sha256": self.current_report_sha256,
+        }
+        self.complete_pointer_bytes = self.verifier._canonical_bytes(
+            self.complete_pointer
+        )
+        (self.historical_root / "latest.json").write_bytes(
+            self.complete_pointer_bytes
+        )
+        self.handles = []
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _handle(self, projection=None):
+        handle = self.Handle(projection)
+        self.handles.append(handle)
+        return handle
+
+    def _run_adapter(self, *, complete_callback=None):
+        raw_identities = {
+            self.run_id: self.run_manifest_sha256,
+            self.orphan_run_id: self.orphan_manifest_sha256,
+        }
+
+        def open_run(*, data_dir, run_id, expected_manifest_sha256):
+            self.assertEqual(data_dir, self.canonical_data_dir)
+            self.assertEqual(
+                raw_identities[run_id], expected_manifest_sha256
+            )
+            return self._handle({
+                "run_id": run_id,
+                "run_manifest_sha256": expected_manifest_sha256,
+            })
+
+        def validate_complete(
+            *, data_dir, raw_root, bundle_path,
+            expected_pointer_core=None,
+        ):
+            self.assertEqual(data_dir, self.canonical_data_dir)
+            self.assertEqual(
+                raw_root,
+                self.canonical_data_dir
+                / "raw" / "historical-foundry-replay",
+            )
+            self.assertEqual(
+                bundle_path,
+                self.canonical_data_dir
+                / "routes" / "historical" / "bundles" / self.replay_id,
+            )
+            self.assertIsNone(expected_pointer_core)
+            if complete_callback is not None:
+                complete_callback()
+            return {
+                "path": bundle_path,
+                "manifest_sha256": self.complete_manifest_sha256,
+                "manifest": {
+                    "replay_id": self.replay_id,
+                    "route_cohort_id": self.route_cohort_id,
+                    "run_id": self.run_id,
+                    "run_manifest_sha256": self.run_manifest_sha256,
+                },
+                "pointer_core": dict(self.complete_pointer_core),
+                "verification_subject": self._handle(),
+            }
+
+        core_projection = {
+            "run_id": self.run_id,
+            "run_manifest_sha256": self.run_manifest_sha256,
+            "core_manifest_sha256": self.core_manifest_sha256,
+            "core_pointer_sha256": self.core_pointer_sha256,
+            "core_pointer": dict(self.core_pointer),
+        }
+
+        def load_core(**kwargs):
+            self.assertEqual(kwargs, {
+                "data_dir": self.canonical_data_dir,
+                "route_cohort_id": self.route_cohort_id,
+                "expected_manifest_sha256": self.core_manifest_sha256,
+                "expected_pointer_sha256": self.core_pointer_sha256,
+            })
+            return self._handle(core_projection)
+
+        def load_latest_core(*, data_dir):
+            self.assertEqual(data_dir, self.canonical_data_dir)
+            return self._handle(core_projection)
+
+        report_records = {
+            self.current_report_bytes: {
+                "replay_id": self.replay_id,
+                "route_cohort_id": self.route_cohort_id,
+                "manifest_sha256": self.complete_manifest_sha256,
+            },
+            self.orphan_report_bytes: {
+                "replay_id": "replay:" + "6" * 64,
+                "route_cohort_id": "cohort:" + "7" * 64,
+                "manifest_sha256": "8" * 64,
+            },
+        }
+
+        def validate_report(report_bytes):
+            return dict(report_records[report_bytes])
+
+        def validate_retained(*, report_bytes, pointer_core):
+            report = report_records[report_bytes]
+            self.assertEqual(pointer_core, {
+                "schema": "route_historical_replay_pointer/v1",
+                "bundle_stage": "route_historical_foundry_replay/v1",
+                **report,
+            })
+            return dict(report)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                self.storage, "open_validated_run", side_effect=open_run
+            ))
+            stack.enter_context(mock.patch.object(
+                self.publication, "validate_historical_replay_bundle",
+                side_effect=validate_complete,
+            ))
+            stack.enter_context(mock.patch.object(
+                self.publication,
+                "_load_immutable_historical_replay_core",
+                side_effect=load_core,
+            ))
+            stack.enter_context(mock.patch.object(
+                self.publication, "load_latest_historical_replay_core",
+                side_effect=load_latest_core,
+            ))
+            stack.enter_context(mock.patch.object(
+                self.verifier,
+                "_validate_exact_historical_verification_report",
+                side_effect=validate_report,
+            ))
+            stack.enter_context(mock.patch.object(
+                self.verifier,
+                "_validate_retained_historical_verification_report",
+                side_effect=validate_retained,
+            ))
+            stack.enter_context(mock.patch.object(
+                self.publication,
+                "_reread_historical_verification_report",
+                return_value=self.current_report_bytes,
+            ))
+            return self.module._build_validated_historical_reference_gc_inventory(
+                data_dir=self.data_dir
+            )
+
+    def test_descriptor_inventory_drives_only_unreferenced_candidates(self):
+        inventory = self._run_adapter()
+        self.assertEqual(inventory["status"], "validated")
+        self.assertEqual(inventory["complete_bundles"], ({
+            "replay_id": self.replay_id,
+            "run_id": self.run_id,
+            "run_manifest_sha256": self.run_manifest_sha256,
+        },))
+        self.assertEqual(inventory["core_bundles"], ({
+            "route_cohort_id": self.route_cohort_id,
+            "run_id": self.run_id,
+            "run_manifest_sha256": self.run_manifest_sha256,
+        },))
+        plan = self.module._plan_historical_reference_gc_inventory(
+            inventory
+        )
+        self.assertEqual(plan["status"], "planned")
+        self.assertEqual(plan["delete_runs"], ({
+            "run_id": self.orphan_run_id,
+            "run_manifest_sha256": self.orphan_manifest_sha256,
+        },))
+        self.assertEqual(plan["delete_reports"], ({
+            "sha256": self.orphan_report_sha256,
+        },))
+        self.assertTrue(self.handles)
+        self.assertTrue(all(handle.closed for handle in self.handles))
+        self.assertTrue(all(
+            handle.reread_count >= 2 for handle in self.handles
+        ))
+
+    def test_symlinked_run_directory_blocks_every_deletion(self):
+        os.symlink(
+            str(self.raw_root / self.run_id[4:]),
+            str(self.raw_root / ("0" * 64)),
+        )
+        inventory = self._run_adapter()
+        self.assertEqual(inventory["status"], "invalid")
+        plan = self.module._plan_historical_reference_gc_inventory(
+            inventory
+        )
+        self.assertEqual(plan["status"], "blocked_invalid_inventory")
+        self.assertEqual(plan["delete_runs"], ())
+        self.assertEqual(plan["delete_reports"], ())
+
+    def test_same_byte_pointer_replacement_blocks_every_deletion(self):
+        def replace_pointer():
+            temporary = self.historical_root / ".same-byte-race"
+            temporary.write_bytes(self.complete_pointer_bytes)
+            os.replace(
+                str(temporary),
+                str(self.historical_root / "latest.json"),
+            )
+
+        inventory = self._run_adapter(
+            complete_callback=replace_pointer
+        )
+        self.assertEqual(inventory["status"], "invalid")
+        plan = self.module._plan_historical_reference_gc_inventory(
+            inventory
+        )
+        self.assertEqual(plan["status"], "blocked_invalid_inventory")
+        self.assertEqual(plan["delete_runs"], ())
+        self.assertEqual(plan["delete_reports"], ())
+
+
 if __name__ == "__main__":
     unittest.main()
