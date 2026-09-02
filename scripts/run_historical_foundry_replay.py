@@ -2342,6 +2342,194 @@ def _publish_verified_historical_bundle(
         ) from error
 
 
+def _plan_historical_reference_gc_inventory(
+    inventory: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Derive deletion candidates only from a closed validated inventory."""
+
+    def blocked() -> Mapping[str, Any]:
+        return MappingProxyType({
+            "schema": "historical_reference_gc_plan/v1",
+            "status": "blocked_invalid_inventory",
+            "protected_runs": (),
+            "delete_runs": (),
+            "protected_reports": (),
+            "delete_reports": (),
+        })
+
+    def exact_sha256(value: Any) -> bool:
+        return (
+            type(value) is str
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+
+    def exact_run(row: Any) -> bool:
+        return (
+            type(row) is dict
+            and set(row) == {"run_id", "run_manifest_sha256"}
+            and type(row.get("run_id")) is str
+            and re.fullmatch(r"run:[0-9a-f]{64}", row["run_id"])
+            is not None
+            and exact_sha256(row.get("run_manifest_sha256"))
+        )
+
+    try:
+        if (
+            type(inventory) is not dict
+            or set(inventory) != {
+                "schema", "status", "complete_bundles", "core_bundles",
+                "historical_pointers", "raw_runs",
+                "verification_reports",
+            }
+            or inventory.get("schema")
+            != "historical_reference_gc_validated_inventory/v1"
+            or inventory.get("status") != "validated"
+            or type(inventory.get("complete_bundles")) is not tuple
+            or type(inventory.get("core_bundles")) is not tuple
+            or type(inventory.get("raw_runs")) is not tuple
+            or type(inventory.get("verification_reports")) is not tuple
+            or type(inventory.get("historical_pointers")) is not dict
+            or set(inventory["historical_pointers"])
+            != {"core", "complete"}
+        ):
+            return blocked()
+
+        complete_by_id = {}
+        referenced_runs = set()
+        for row in inventory["complete_bundles"]:
+            if (
+                type(row) is not dict
+                or set(row) != {
+                    "replay_id", "run_id", "run_manifest_sha256"
+                }
+                or type(row.get("replay_id")) is not str
+                or re.fullmatch(
+                    r"replay:[0-9a-f]{64}", row["replay_id"]
+                ) is None
+                or not exact_run({
+                    "run_id": row.get("run_id"),
+                    "run_manifest_sha256": row.get(
+                        "run_manifest_sha256"
+                    ),
+                })
+                or row["replay_id"] in complete_by_id
+            ):
+                return blocked()
+            complete_by_id[row["replay_id"]] = row
+            referenced_runs.add((
+                row["run_id"], row["run_manifest_sha256"]
+            ))
+
+        core_by_id = {}
+        for row in inventory["core_bundles"]:
+            if (
+                type(row) is not dict
+                or set(row) != {
+                    "route_cohort_id", "run_id", "run_manifest_sha256"
+                }
+                or type(row.get("route_cohort_id")) is not str
+                or re.fullmatch(
+                    r"cohort:[0-9a-f]{64}", row["route_cohort_id"]
+                ) is None
+                or not exact_run({
+                    "run_id": row.get("run_id"),
+                    "run_manifest_sha256": row.get(
+                        "run_manifest_sha256"
+                    ),
+                })
+                or row["route_cohort_id"] in core_by_id
+            ):
+                return blocked()
+            core_by_id[row["route_cohort_id"]] = row
+            referenced_runs.add((
+                row["run_id"], row["run_manifest_sha256"]
+            ))
+
+        raw_by_id = {}
+        for row in inventory["raw_runs"]:
+            if not exact_run(row) or row["run_id"] in raw_by_id:
+                return blocked()
+            raw_by_id[row["run_id"]] = row
+        if any(
+            run_id not in raw_by_id
+            or raw_by_id[run_id]["run_manifest_sha256"] != manifest_sha
+            for run_id, manifest_sha in referenced_runs
+        ):
+            return blocked()
+
+        reports = {}
+        for row in inventory["verification_reports"]:
+            if (
+                type(row) is not dict
+                or set(row) != {"sha256"}
+                or not exact_sha256(row.get("sha256"))
+                or row["sha256"] in reports
+            ):
+                return blocked()
+            reports[row["sha256"]] = row
+
+        pointers = inventory["historical_pointers"]
+        core_pointer = pointers["core"]
+        if core_pointer is not None and (
+            type(core_pointer) is not dict
+            or set(core_pointer) != {"route_cohort_id"}
+            or core_pointer.get("route_cohort_id") not in core_by_id
+        ):
+            return blocked()
+        complete_pointer = pointers["complete"]
+        referenced_reports = set()
+        if complete_pointer is not None:
+            if (
+                type(complete_pointer) is not dict
+                or set(complete_pointer)
+                != {"replay_id", "verification_report_sha256"}
+                or complete_pointer.get("replay_id") not in complete_by_id
+                or not exact_sha256(complete_pointer.get(
+                    "verification_report_sha256"
+                ))
+                or complete_pointer["verification_report_sha256"]
+                not in reports
+            ):
+                return blocked()
+            referenced_reports.add(
+                complete_pointer["verification_report_sha256"]
+            )
+
+        protected_runs = tuple(
+            {
+                "run_id": run_id,
+                "run_manifest_sha256": manifest_sha,
+            }
+            for run_id, manifest_sha in sorted(referenced_runs)
+        )
+        delete_runs = tuple(
+            dict(raw_by_id[run_id])
+            for run_id in sorted(raw_by_id)
+            if (
+                run_id,
+                raw_by_id[run_id]["run_manifest_sha256"],
+            ) not in referenced_runs
+        )
+        protected_reports = tuple(
+            {"sha256": digest}
+            for digest in sorted(referenced_reports)
+        )
+        delete_reports = tuple(
+            {"sha256": digest}
+            for digest in sorted(set(reports) - referenced_reports)
+        )
+        return MappingProxyType({
+            "schema": "historical_reference_gc_plan/v1",
+            "status": "planned",
+            "protected_runs": protected_runs,
+            "delete_runs": delete_runs,
+            "protected_reports": protected_reports,
+            "delete_reports": delete_reports,
+        })
+    except Exception:
+        return blocked()
+
+
 def _audit_latest_historical_replay_bundle(
     *, data_dir: Path, bundle_path: Path,
 ) -> Mapping[str, Any]:

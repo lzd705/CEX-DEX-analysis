@@ -3661,5 +3661,148 @@ class HistoricalReplayAuditControllerTests(unittest.TestCase):
         self.assertEqual(result["source_identity"]["head"], "a" * 40)
 
 
+class HistoricalReplayReferenceGcPlannerTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _entrypoint()
+        self.run_a = {
+            "run_id": "run:" + "1" * 64,
+            "run_manifest_sha256": "2" * 64,
+        }
+        self.run_b = {
+            "run_id": "run:" + "3" * 64,
+            "run_manifest_sha256": "4" * 64,
+        }
+        self.orphan_run = {
+            "run_id": "run:" + "5" * 64,
+            "run_manifest_sha256": "6" * 64,
+        }
+        self.replay_a = "replay:" + "7" * 64
+        self.replay_b = "replay:" + "8" * 64
+        self.cohort_a = "cohort:" + "9" * 64
+        self.cohort_b = "cohort:" + "a" * 64
+        self.report_a = "b" * 64
+        self.orphan_report = "c" * 64
+
+    def _inventory(self):
+        return {
+            "schema": "historical_reference_gc_validated_inventory/v1",
+            "status": "validated",
+            "complete_bundles": (
+                {
+                    "replay_id": self.replay_a,
+                    **self.run_a,
+                },
+                {
+                    "replay_id": self.replay_b,
+                    **self.run_b,
+                },
+            ),
+            "core_bundles": (
+                {
+                    "route_cohort_id": self.cohort_a,
+                    **self.run_a,
+                },
+                {
+                    "route_cohort_id": self.cohort_b,
+                    **self.run_b,
+                },
+            ),
+            "historical_pointers": {
+                "core": {"route_cohort_id": self.cohort_a},
+                "complete": {
+                    "replay_id": self.replay_a,
+                    "verification_report_sha256": self.report_a,
+                },
+            },
+            "raw_runs": (self.run_a, self.run_b, self.orphan_run),
+            "verification_reports": (
+                {"sha256": self.report_a},
+                {"sha256": self.orphan_report},
+            ),
+        }
+
+    def test_only_unreferenced_raw_runs_and_reports_are_candidates(self):
+        plan = self.module._plan_historical_reference_gc_inventory(
+            self._inventory()
+        )
+        self.assertEqual(plan["status"], "planned")
+        self.assertEqual(plan["delete_runs"], (self.orphan_run,))
+        self.assertEqual(
+            plan["protected_runs"], (self.run_a, self.run_b)
+        )
+        self.assertEqual(
+            plan["delete_reports"], ({"sha256": self.orphan_report},)
+        )
+        self.assertEqual(
+            plan["protected_reports"], ({"sha256": self.report_a},)
+        )
+
+    def test_retained_noncurrent_bundles_still_pin_their_raw_runs(self):
+        inventory = self._inventory()
+        inventory["historical_pointers"] = {
+            "core": None,
+            "complete": None,
+        }
+        plan = self.module._plan_historical_reference_gc_inventory(
+            inventory
+        )
+        self.assertEqual(plan["status"], "planned")
+        self.assertEqual(plan["protected_runs"], (self.run_a, self.run_b))
+        self.assertEqual(plan["delete_runs"], (self.orphan_run,))
+        self.assertEqual(plan["protected_reports"], ())
+        self.assertEqual(
+            plan["delete_reports"],
+            ({"sha256": self.report_a}, {"sha256": self.orphan_report}),
+        )
+
+    def test_any_invalid_inventory_produces_an_empty_deletion_set(self):
+        attacks = []
+        invalid_status = self._inventory()
+        invalid_status["status"] = "invalid"
+        attacks.append(invalid_status)
+        missing_pointer_target = self._inventory()
+        missing_pointer_target["historical_pointers"]["core"] = {
+            "route_cohort_id": "cohort:" + "f" * 64
+        }
+        attacks.append(missing_pointer_target)
+        missing_raw = self._inventory()
+        missing_raw["raw_runs"] = (
+            self.run_a, self.orphan_run
+        )
+        attacks.append(missing_raw)
+        conflicting_duplicate = self._inventory()
+        conflicting_duplicate["raw_runs"] = (
+            *conflicting_duplicate["raw_runs"],
+            {
+                "run_id": self.run_a["run_id"],
+                "run_manifest_sha256": "d" * 64,
+            },
+        )
+        attacks.append(conflicting_duplicate)
+        missing_report = self._inventory()
+        missing_report["verification_reports"] = (
+            {"sha256": self.orphan_report},
+        )
+        attacks.append(missing_report)
+        extra_field = self._inventory()
+        extra_field["raw_runs"] = (
+            {**self.run_a, "path": "/must-not-be-trusted"},
+            self.run_b,
+            self.orphan_run,
+        )
+        attacks.append(extra_field)
+
+        for inventory in attacks:
+            with self.subTest(attack=attacks.index(inventory)):
+                plan = self.module._plan_historical_reference_gc_inventory(
+                    inventory
+                )
+                self.assertEqual(
+                    plan["status"], "blocked_invalid_inventory"
+                )
+                self.assertEqual(plan["delete_runs"], ())
+                self.assertEqual(plan["delete_reports"], ())
+
+
 if __name__ == "__main__":
     unittest.main()
