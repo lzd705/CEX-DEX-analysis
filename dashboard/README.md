@@ -26,6 +26,26 @@ npm --prefix dashboard install
 
 Open `http://127.0.0.1:8765`.
 
+### Local Historical Opportunity demo
+
+To demonstrate the end-to-end historical workflow without current market data
+or any external RPC call, run:
+
+```bash
+python3 scripts/run_historical_opportunity_demo.py
+```
+
+Open the printed `/opportunities?opportunity_scope=historical` URL. The command
+builds and validates a disposable repository fixture, publishes ten fixed
+replay scenarios through the normal historical API, and serves the normal
+dashboard on `127.0.0.1` only. Allow up to about a minute for the fixture checks
+on a laptop. Press `Ctrl-C` to stop the server and remove the fixture.
+
+This workflow is for local presentation and contract testing. Its displayed
+values are not live or current, and they are not an execution or profit claim.
+No result needs to be positive to demonstrate the publication, API, filtering,
+rendering, evidence, and cleanup path.
+
 Local startup binds to `127.0.0.1` by default. Keep the host process on
 loopback in production; the Nginx reverse proxy is the only public listener.
 The container image binds inside its own network namespace, so publish its
