@@ -44,11 +44,16 @@ try:
         route_opportunity_freshness,
     )
     from dashboard.opportunity_facts import (
+        HISTORICAL_OPPORTUNITY_SUMMARY_CONTRACT,
         OpportunityBundleInvalid,
         OpportunityBundleUnavailable,
         OpportunityQueryError,
+        build_historical_opportunity_payload,
         build_opportunity_payload,
+        build_unavailable_historical_opportunity_payload,
         build_unavailable_opportunity_payload,
+        historical_opportunity_data_generation,
+        load_latest_historical_opportunities,
         load_latest_opportunities,
         normalize_opportunity_filters,
         opportunity_publication_health,
@@ -112,11 +117,16 @@ except ModuleNotFoundError:
         route_opportunity_freshness,
     )
     from opportunity_facts import (  # type: ignore[no-redef]
+        HISTORICAL_OPPORTUNITY_SUMMARY_CONTRACT,
         OpportunityBundleInvalid,
         OpportunityBundleUnavailable,
         OpportunityQueryError,
+        build_historical_opportunity_payload,
         build_opportunity_payload,
+        build_unavailable_historical_opportunity_payload,
         build_unavailable_opportunity_payload,
+        historical_opportunity_data_generation,
+        load_latest_historical_opportunities,
         load_latest_opportunities,
         normalize_opportunity_filters,
         opportunity_publication_health,
@@ -498,8 +508,13 @@ SERIALIZED_RESPONSE_CACHE_SIZE = 64
 OPPORTUNITY_RESPONSE_MAX_PROJECTIONS = 3
 CATALOG_SUMMARY_VERSION = 3
 SourceSignature = Tuple[Tuple[Any, ...], ...]
+HistoricalPublicationSignature = Tuple[Tuple[Any, ...], ...]
 PUBLIC_API_ROUTE_LOCKS = defaultdict(threading.RLock)
 SOURCE_CACHE_GENERATION_LOCK = threading.RLock()
+HISTORICAL_PUBLICATION_IDENTITY_LOCK = threading.RLock()
+_HISTORICAL_POINTER_PUBLICATION_IDENTITIES: dict[
+    str, HistoricalPublicationSignature
+] = {}
 _SOURCE_CACHE_GENERATION: SourceSignature | None = None
 _PUBLIC_RESPONSE_CACHE_GENERATION: (
     tuple[SourceSignature, int] | None
@@ -532,7 +547,71 @@ PUBLIC_API_QUERY_FIELDS = {
         "sort",
         "dir",
     ),
+    "opportunities_historical": (
+        "token",
+        "venue",
+        "notional",
+        "class",
+        "route_type",
+        "availability",
+        "sort",
+        "dir",
+    ),
 }
+
+
+def require_stable_historical_pointer_publication_identity(
+    *,
+    pointer_sha256: str,
+    publication_signature: HistoricalPublicationSignature,
+) -> None:
+    """Permanently bind one observed pointer hash to its physical descendants."""
+
+    if (
+        not isinstance(pointer_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", pointer_sha256) is None
+        or type(publication_signature) is not tuple
+        or not publication_signature
+    ):
+        raise OpportunityBundleInvalid()
+    roles = set()
+    pointer_digest = None
+    for row in publication_signature:
+        if (
+            type(row) is not tuple
+            or len(row) < 5
+            or not isinstance(row[0], str)
+            or not row[0]
+            or row[0] in roles
+            or not isinstance(row[1], str)
+            or re.fullmatch(r"[0-9a-f]{64}", row[1]) is None
+            or type(row[2]) is not int
+            or row[2] <= 0
+        ):
+            raise OpportunityBundleInvalid()
+        roles.add(row[0])
+        if row[0] == "pointer:latest.json":
+            pointer_digest = row[1]
+    if pointer_digest != pointer_sha256:
+        raise OpportunityBundleInvalid()
+    with HISTORICAL_PUBLICATION_IDENTITY_LOCK:
+        prior = _HISTORICAL_POINTER_PUBLICATION_IDENTITIES.get(
+            pointer_sha256
+        )
+        if prior is None:
+            _HISTORICAL_POINTER_PUBLICATION_IDENTITIES[
+                pointer_sha256
+            ] = publication_signature
+            return
+        if prior != publication_signature:
+            raise OpportunityBundleInvalid()
+
+
+def _reset_historical_pointer_publication_identities_for_tests() -> None:
+    """Reset the process guard only for an isolated test process."""
+
+    with HISTORICAL_PUBLICATION_IDENTITY_LOCK:
+        _HISTORICAL_POINTER_PUBLICATION_IDENTITIES.clear()
 
 
 class SourceGenerationChanged(FileNotFoundError):
@@ -6585,6 +6664,157 @@ def build_route_opportunities(
         raise PublicClientRequestError(str(error)) from None
 
 
+def _historical_opportunity_arguments(
+    query_items: tuple[tuple[str, str], ...],
+) -> dict[str, str | None]:
+    query = dict(query_items)
+    return {
+        "token": query.get("token"),
+        "venue": query.get("venue"),
+        "notional_usd": query.get("notional"),
+        "opportunity_class": query.get("class"),
+        "route_type": query.get("route_type"),
+        "availability": query.get("availability"),
+        "sort": query.get("sort"),
+        "direction": query.get("dir"),
+    }
+
+
+def _close_historical_opportunity_view(loaded: Any) -> None:
+    if isinstance(loaded, dict) or hasattr(loaded, "get"):
+        view = loaded.get("validated_view")
+        close = getattr(view, "close", None)
+        if callable(close):
+            close()
+
+
+def _historical_loaded_publication_identity(
+    loaded: Any,
+) -> tuple[str, HistoricalPublicationSignature, str]:
+    if not hasattr(loaded, "get"):
+        raise OpportunityBundleInvalid()
+    pointer_sha256 = loaded.get("pointer_sha256")
+    publication_signature = loaded.get("publication_signature")
+    if type(publication_signature) is not tuple:
+        raise OpportunityBundleInvalid()
+    generation = historical_opportunity_data_generation(loaded)
+    require_stable_historical_pointer_publication_identity(
+        pointer_sha256=pointer_sha256,
+        publication_signature=publication_signature,
+    )
+    return pointer_sha256, publication_signature, generation
+
+
+@lru_cache(maxsize=SERIALIZED_RESPONSE_CACHE_SIZE)
+def _build_historical_opportunity_response_cached(
+    query_items: tuple[tuple[str, str], ...],
+    expected_pointer_sha256: str,
+    expected_signature: HistoricalPublicationSignature,
+    expected_generation: str,
+    expected_contract: str,
+    encoding: str,
+) -> tuple[bytes, bool]:
+    """Build one response only from the exact pre-cache publication identity."""
+
+    if expected_contract != HISTORICAL_OPPORTUNITY_SUMMARY_CONTRACT:
+        raise OpportunityBundleInvalid()
+    try:
+        loaded = load_latest_historical_opportunities()
+    except OpportunityBundleUnavailable:
+        raise SourceGenerationChanged() from None
+    try:
+        pointer, signature, generation = (
+            _historical_loaded_publication_identity(loaded)
+        )
+        if pointer != expected_pointer_sha256:
+            raise SourceGenerationChanged()
+        if signature != expected_signature or generation != expected_generation:
+            raise OpportunityBundleInvalid()
+        try:
+            payload = build_historical_opportunity_payload(
+                loaded,
+                **_historical_opportunity_arguments(query_items),
+            )
+        except OpportunityQueryError as error:
+            raise PublicClientRequestError(str(error)) from None
+        if (
+            payload.get("metadata", {}).get("data_generation")
+            != expected_generation
+        ):
+            raise OpportunityBundleInvalid()
+        public_payload = _public_payload_projection(payload)
+        return encode_json_payload(
+            public_payload, "gzip" if encoding == "gzip" else ""
+        )
+    finally:
+        _close_historical_opportunity_view(loaded)
+
+
+def _build_stable_historical_opportunity_response(
+    query_items: tuple[tuple[str, str], ...],
+    accepts_gzip: bool,
+) -> tuple[bytes, bool]:
+    """Probe before cache lookup and again before returning any historical row."""
+
+    encoding = "gzip" if accepts_gzip else "identity"
+    for _attempt in range(3):
+        try:
+            loaded = load_latest_historical_opportunities()
+        except OpportunityBundleUnavailable as error:
+            try:
+                payload = build_unavailable_historical_opportunity_payload(
+                    reason=error.reason,
+                    **_historical_opportunity_arguments(query_items),
+                )
+            except OpportunityQueryError as query_error:
+                raise PublicClientRequestError(str(query_error)) from None
+            try:
+                appeared = load_latest_historical_opportunities()
+            except OpportunityBundleUnavailable:
+                return encode_json_payload(
+                    _public_payload_projection(payload),
+                    "gzip" if accepts_gzip else "",
+                )
+            else:
+                _close_historical_opportunity_view(appeared)
+                continue
+        try:
+            pointer, signature, generation = (
+                _historical_loaded_publication_identity(loaded)
+            )
+        finally:
+            _close_historical_opportunity_view(loaded)
+        try:
+            response = _build_historical_opportunity_response_cached(
+                query_items,
+                pointer,
+                signature,
+                generation,
+                HISTORICAL_OPPORTUNITY_SUMMARY_CONTRACT,
+                encoding,
+            )
+        except SourceGenerationChanged:
+            continue
+        try:
+            after = load_latest_historical_opportunities()
+        except OpportunityBundleUnavailable:
+            continue
+        try:
+            after_pointer, after_signature, after_generation = (
+                _historical_loaded_publication_identity(after)
+            )
+        finally:
+            _close_historical_opportunity_view(after)
+        if after_pointer != pointer:
+            continue
+        if after_signature != signature or after_generation != generation:
+            raise OpportunityBundleInvalid()
+        return response
+    raise SourceGenerationChanged(
+        "Historical publication changed repeatedly during response assembly"
+    )
+
+
 def api_source_signature() -> SourceSignature:
     """Return one signature covering every source that can change public facts."""
     database_path = resolve_database_path()
@@ -7053,6 +7283,7 @@ def clear_runtime_caches() -> None:
             _build_market_catalog_cached,
             _build_summary_core_cached,
             _build_public_api_response_cached,
+            _build_historical_opportunity_response_cached,
         ):
             cached_builder.cache_clear()
         _SOURCE_CACHE_GENERATION = None
@@ -7197,6 +7428,10 @@ def build_public_api_response(
 ) -> tuple[bytes, bool]:
     """Single-flight one route without blocking independent public endpoints."""
     with PUBLIC_API_ROUTE_LOCKS[route]:
+        if route == "opportunities_historical":
+            return _build_stable_historical_opportunity_response(
+                query_items, accepts_gzip
+            )
         for _attempt in range(3):
             source_signature = api_source_signature()
             freshness_bucket = api_freshness_bucket()
@@ -7268,7 +7503,7 @@ def public_api_query_items(
     fields = PUBLIC_API_QUERY_FIELDS.get(route)
     if fields is None:
         raise ValueError(f"Unknown public API route: {route}")
-    if route == "opportunities":
+    if route in {"opportunities", "opportunities_historical"}:
         raw = {
             name: (
                 query[name][0]
@@ -7313,7 +7548,13 @@ def public_api_query_items(
         return tuple(
             (name, str(normalized_by_query_name[name]))
             for name in fields
-            if name in query and normalized_by_query_name[name] is not None
+            if (
+                normalized_by_query_name[name] is not None
+                and (
+                    route == "opportunities_historical"
+                    or name in query
+                )
+            )
         )
     if route == "catalog" and "token" not in query:
         fields = ()
@@ -8153,6 +8394,17 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     status=HTTPStatus.METHOD_NOT_ALLOWED,
                 )
             )
+            return
+        if parsed.path == "/api/markets/opportunities/historical":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            try:
+                self.send_public_api("opportunities_historical", query)
+            except PublicClientRequestError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except (OpportunityBundleInvalid, SourceGenerationChanged):
+                self.send_opportunity_data_validation_error()
+            except (FileNotFoundError, TypeError, ValueError):
+                self.send_opportunity_data_validation_error()
             return
         if parsed.path == "/api/markets/opportunities":
             query = parse_qs(parsed.query, keep_blank_values=True)
