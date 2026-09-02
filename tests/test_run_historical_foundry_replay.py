@@ -3881,7 +3881,10 @@ class HistoricalReplayReferenceGcInventoryAdapterTests(unittest.TestCase):
         ):
             directory = self.raw_root / run_id[4:]
             directory.mkdir()
-            (directory / "run_manifest.json").write_bytes(payload)
+            directory.chmod(0o700)
+            manifest_path = directory / "run_manifest.json"
+            manifest_path.write_bytes(payload)
+            manifest_path.chmod(0o600)
 
         self.replay_id = "replay:" + "3" * 64
         self.route_cohort_id = "cohort:" + "4" * 64
@@ -3929,7 +3932,9 @@ class HistoricalReplayReferenceGcInventoryAdapterTests(unittest.TestCase):
             (self.current_report_sha256, self.current_report_bytes),
             (self.orphan_report_sha256, self.orphan_report_bytes),
         ):
-            (self.report_root / (digest + ".json")).write_bytes(payload)
+            report_path = self.report_root / (digest + ".json")
+            report_path.write_bytes(payload)
+            report_path.chmod(0o600)
         self.complete_pointer_core = {
             "schema": "route_historical_replay_pointer/v1",
             "bundle_stage": "route_historical_foundry_replay/v1",
@@ -3957,7 +3962,7 @@ class HistoricalReplayReferenceGcInventoryAdapterTests(unittest.TestCase):
         self.handles.append(handle)
         return handle
 
-    def _run_adapter(self, *, complete_callback=None):
+    def _run_with_validators(self, operation, *, complete_callback=None):
         raw_identities = {
             self.run_id: self.run_manifest_sha256,
             self.orphan_run_id: self.orphan_manifest_sha256,
@@ -4082,9 +4087,24 @@ class HistoricalReplayReferenceGcInventoryAdapterTests(unittest.TestCase):
                 "_reread_historical_verification_report",
                 return_value=self.current_report_bytes,
             ))
-            return self.module._build_validated_historical_reference_gc_inventory(
+            return operation()
+
+    def _run_adapter(self, *, complete_callback=None):
+        return self._run_with_validators(
+            lambda: self.module
+            ._build_validated_historical_reference_gc_inventory(
                 data_dir=self.data_dir
-            )
+            ),
+            complete_callback=complete_callback,
+        )
+
+    def _apply_gc(self, *, complete_callback=None):
+        return self._run_with_validators(
+            lambda: self.module._apply_historical_reference_gc(
+                data_dir=self.data_dir
+            ),
+            complete_callback=complete_callback,
+        )
 
     def test_descriptor_inventory_drives_only_unreferenced_candidates(self):
         inventory = self._run_adapter()
@@ -4149,6 +4169,197 @@ class HistoricalReplayReferenceGcInventoryAdapterTests(unittest.TestCase):
         self.assertEqual(plan["status"], "blocked_invalid_inventory")
         self.assertEqual(plan["delete_runs"], ())
         self.assertEqual(plan["delete_reports"], ())
+
+    def test_one_shot_gc_removes_only_planned_orphans(self):
+        nested = self.raw_root / self.orphan_run_id[4:] / "nested"
+        nested.mkdir(mode=0o700)
+        nested_member = nested / "evidence.json"
+        nested_member.write_bytes(b"orphan-evidence")
+        nested_member.chmod(0o600)
+        pointer_before = (
+            self.historical_root / "latest.json"
+        ).read_bytes()
+
+        result = self._apply_gc()
+
+        self.assertEqual(result, {
+            "schema": "historical_reference_gc_result/v1",
+            "status": "applied",
+            "deleted_runs": ({
+                "run_id": self.orphan_run_id,
+                "run_manifest_sha256": self.orphan_manifest_sha256,
+            },),
+            "deleted_reports": ({
+                "sha256": self.orphan_report_sha256,
+            },),
+        })
+        self.assertTrue((self.raw_root / self.run_id[4:]).is_dir())
+        self.assertFalse(
+            (self.raw_root / self.orphan_run_id[4:]).exists()
+        )
+        self.assertTrue((
+            self.report_root / (self.current_report_sha256 + ".json")
+        ).is_file())
+        self.assertFalse((
+            self.report_root / (self.orphan_report_sha256 + ".json")
+        ).exists())
+        self.assertEqual(
+            (self.historical_root / "latest.json").read_bytes(),
+            pointer_before,
+        )
+        self.assertFalse(any(
+            name.startswith(".historical-gc-")
+            for name in os.listdir(self.raw_root)
+        ))
+        self.assertFalse(any(
+            name.startswith(".historical-gc-")
+            for name in os.listdir(self.report_root)
+        ))
+
+    def test_gc_preflight_hardlink_failure_leaves_every_orphan(self):
+        orphan = self.raw_root / self.orphan_run_id[4:]
+        first = orphan / "linked-evidence.json"
+        second = orphan / "linked-evidence-copy.json"
+        first.write_bytes(b"must-remain")
+        first.chmod(0o600)
+        os.link(str(first), str(second))
+
+        result = self._apply_gc()
+
+        self.assertEqual(result["status"], "blocked_validation")
+        self.assertEqual(result["deleted_runs"], ())
+        self.assertEqual(result["deleted_reports"], ())
+        self.assertTrue(orphan.is_dir())
+        self.assertTrue(first.is_file())
+        self.assertTrue(second.is_file())
+        self.assertTrue((
+            self.report_root / (self.orphan_report_sha256 + ".json")
+        ).is_file())
+
+    def test_gc_pointer_race_leaves_every_orphan(self):
+        def replace_pointer():
+            temporary = self.historical_root / ".gc-pointer-race"
+            temporary.write_bytes(self.complete_pointer_bytes)
+            os.replace(
+                str(temporary),
+                str(self.historical_root / "latest.json"),
+            )
+
+        result = self._apply_gc(complete_callback=replace_pointer)
+
+        self.assertEqual(result["status"], "blocked_invalid_inventory")
+        self.assertEqual(result["deleted_runs"], ())
+        self.assertEqual(result["deleted_reports"], ())
+        self.assertTrue(
+            (self.raw_root / self.orphan_run_id[4:]).is_dir()
+        )
+        self.assertTrue((
+            self.report_root / (self.orphan_report_sha256 + ".json")
+        ).is_file())
+
+    def test_gc_post_isolation_pointer_race_rolls_candidates_back(self):
+        real_rename = (
+            self.route_publication._rename_directory_noreplace_at
+        )
+
+        def rename_then_race(*args, **kwargs):
+            result = real_rename(*args, **kwargs)
+            if args[1] == self.orphan_report_sha256 + ".json":
+                temporary = self.historical_root / ".post-isolation-race"
+                temporary.write_bytes(self.complete_pointer_bytes)
+                os.replace(
+                    str(temporary),
+                    str(self.historical_root / "latest.json"),
+                )
+            return result
+
+        with mock.patch.object(
+            self.route_publication,
+            "_rename_directory_noreplace_at",
+            side_effect=rename_then_race,
+        ):
+            result = self._apply_gc()
+
+        self.assertEqual(result["status"], "blocked_validation")
+        self.assertEqual(result["deleted_runs"], ())
+        self.assertEqual(result["deleted_reports"], ())
+        self.assertTrue(
+            (self.raw_root / self.orphan_run_id[4:]).is_dir()
+        )
+        self.assertTrue((
+            self.report_root / (self.orphan_report_sha256 + ".json")
+        ).is_file())
+        self.assertFalse(any(
+            name.startswith(".historical-gc-")
+            for name in os.listdir(self.raw_root)
+        ))
+        self.assertFalse(any(
+            name.startswith(".historical-gc-")
+            for name in os.listdir(self.report_root)
+        ))
+
+    def test_gc_post_rename_stat_failure_rolls_candidate_back(self):
+        real_stat = self.module.os.stat
+        injected = [False]
+
+        def fail_first_isolated_stat(path, *args, **kwargs):
+            if (
+                not injected[0]
+                and type(path) is str
+                and path.startswith(".historical-gc-run-")
+            ):
+                injected[0] = True
+                raise OSError("controlled post-rename stat failure")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(
+            self.module.os, "stat", side_effect=fail_first_isolated_stat
+        ):
+            result = self._apply_gc()
+
+        self.assertTrue(injected[0])
+        self.assertEqual(result["status"], "blocked_validation")
+        self.assertTrue(
+            (self.raw_root / self.orphan_run_id[4:]).is_dir()
+        )
+        self.assertTrue((
+            self.report_root / (self.orphan_report_sha256 + ".json")
+        ).is_file())
+        self.assertFalse(any(
+            name.startswith(".historical-gc-")
+            for name in os.listdir(self.raw_root)
+        ))
+
+    def test_isolated_tree_inventory_drift_prevents_recursive_delete(self):
+        candidate = self.raw_root / self.orphan_run_id[4:]
+        parent_fd = os.open(
+            str(self.raw_root),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            details, inventory = (
+                self.module._preflight_historical_gc_tree_at(
+                    parent_fd=parent_fd,
+                    name=self.orphan_run_id[4:],
+                )
+            )
+            added = candidate / "late-private-file.json"
+            added.write_bytes(b"must-not-be-deleted")
+            added.chmod(0o600)
+            with self.assertRaises(
+                self.module.HistoricalReplayEntrypointError
+            ):
+                self.module._remove_historical_gc_tree_at(
+                    parent_fd=parent_fd,
+                    name=self.orphan_run_id[4:],
+                    expected=details,
+                    expected_inventory=inventory,
+                )
+        finally:
+            os.close(parent_fd)
+        self.assertTrue(candidate.is_dir())
+        self.assertTrue(added.is_file())
+        self.assertTrue((candidate / "run_manifest.json").is_file())
 
 
 if __name__ == "__main__":

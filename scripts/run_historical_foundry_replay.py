@@ -2357,6 +2357,14 @@ def _invalid_historical_reference_gc_inventory() -> Mapping[str, Any]:
 def _build_validated_historical_reference_gc_inventory(
     *, data_dir: Path,
 ) -> Mapping[str, Any]:
+    return _build_validated_historical_reference_gc_inventory_impl(
+        data_dir=data_dir, acquire_root_locks=True
+    )
+
+
+def _build_validated_historical_reference_gc_inventory_impl(
+    *, data_dir: Path, acquire_root_locks: bool,
+) -> Mapping[str, Any]:
     """Fully validate retained historical references without mutating them."""
     import scripts.historical_foundry_storage as storage
     import scripts.historical_foundry_verifier as verifier
@@ -2389,7 +2397,10 @@ def _build_validated_historical_reference_gc_inventory(
             _close_after_error((descriptor,), original_error)
         _close_descriptor_inventory((descriptor,))
 
-    if not isinstance(data_dir, Path):
+    if (
+        not isinstance(data_dir, Path)
+        or type(acquire_root_locks) is not bool
+    ):
         return _invalid_historical_reference_gc_inventory()
 
     descriptors = []
@@ -2415,7 +2426,8 @@ def _build_validated_historical_reference_gc_inventory(
             )
         )
         descriptors.append(historical_fd)
-        fcntl.flock(historical_fd, fcntl.LOCK_SH)
+        if acquire_root_locks:
+            fcntl.flock(historical_fd, fcntl.LOCK_SH)
         complete_fd, complete_details = (
             route_publication._open_directory_at(
                 historical_fd, "bundles",
@@ -2427,7 +2439,8 @@ def _build_validated_historical_reference_gc_inventory(
             historical_fd, "core", "historical core inventory"
         )
         descriptors.append(core_fd)
-        fcntl.flock(core_fd, fcntl.LOCK_SH)
+        if acquire_root_locks:
+            fcntl.flock(core_fd, fcntl.LOCK_SH)
         core_bundles_fd, core_bundles_details = (
             route_publication._open_directory_at(
                 core_fd, "bundles", "historical core bundle inventory"
@@ -3095,6 +3108,803 @@ def _plan_historical_reference_gc_inventory(
         })
     except Exception:
         return blocked()
+
+
+def _historical_reference_gc_result(
+    *, status: str, deleted_runs: tuple = (),
+    deleted_reports: tuple = (),
+) -> Mapping[str, Any]:
+    return {
+        "schema": "historical_reference_gc_result/v1",
+        "status": status,
+        "deleted_runs": deleted_runs,
+        "deleted_reports": deleted_reports,
+    }
+
+
+def _validate_historical_gc_private_file(
+    details: os.stat_result,
+) -> None:
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_nlink != 1
+        or details.st_uid != os.geteuid()
+        or stat.S_IMODE(details.st_mode) != 0o600
+    ):
+        raise _entrypoint_error("historical GC candidate is unsafe")
+
+
+def _preflight_historical_gc_tree_at(
+    *, parent_fd: int, name: str,
+) -> Tuple[os.stat_result, Mapping[str, Any]]:
+    """Reject every link, special file, broad mode, and oversized tree."""
+    import scripts.route_publication as route_publication
+
+    visited = [0]
+    inventory = {}
+
+    def walk(directory_fd: int, depth: int, prefix: str) -> None:
+        if depth > 32:
+            raise _entrypoint_error(
+                "historical GC candidate is unsafe"
+            )
+        for entry in sorted(os.listdir(directory_fd)):
+            route_publication._require_relative_basename(
+                entry, "historical GC candidate member"
+            )
+            visited[0] += 1
+            if visited[0] > 250_000:
+                raise _entrypoint_error(
+                    "historical GC candidate is unsafe"
+                )
+            details = os.stat(
+                entry, dir_fd=directory_fd, follow_symlinks=False
+            )
+            relative_path = prefix + entry
+            if stat.S_ISDIR(details.st_mode):
+                if (
+                    details.st_uid != os.geteuid()
+                    or stat.S_IMODE(details.st_mode) != 0o700
+                ):
+                    raise _entrypoint_error(
+                        "historical GC candidate is unsafe"
+                    )
+                child_fd, opened = route_publication._open_directory_at(
+                    directory_fd, entry,
+                    "historical GC candidate directory",
+                )
+                try:
+                    if (
+                        route_publication._stable_file_metadata(opened)
+                        != route_publication._stable_file_metadata(details)
+                    ):
+                        raise _entrypoint_error(
+                            "historical GC candidate is unsafe"
+                        )
+                    walk(child_fd, depth + 1, relative_path + "/")
+                    route_publication._verify_directory_entry_snapshot(
+                        directory_fd, entry, opened,
+                        "historical GC candidate directory",
+                    )
+                    inventory[relative_path] = (
+                        "directory",
+                        route_publication._stable_file_metadata(opened),
+                    )
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(details.st_mode):
+                file_fd, opened = route_publication._open_regular_file_at(
+                    directory_fd, entry,
+                    label="historical GC candidate member",
+                )
+                try:
+                    _validate_historical_gc_private_file(opened)
+                    current = os.stat(
+                        entry, dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        route_publication._stable_file_metadata(current)
+                        != route_publication._stable_file_metadata(opened)
+                    ):
+                        raise _entrypoint_error(
+                            "historical GC candidate is unsafe"
+                        )
+                    inventory[relative_path] = (
+                        "file",
+                        route_publication._stable_file_metadata(opened),
+                    )
+                finally:
+                    os.close(file_fd)
+            else:
+                raise _entrypoint_error(
+                    "historical GC candidate is unsafe"
+                )
+
+    root_fd, root_details = route_publication._open_directory_at(
+        parent_fd, name, "historical GC candidate run"
+    )
+    try:
+        if (
+            root_details.st_uid != os.geteuid()
+            or stat.S_IMODE(root_details.st_mode) != 0o700
+        ):
+            raise _entrypoint_error(
+                "historical GC candidate is unsafe"
+            )
+        walk(root_fd, 0, "")
+        route_publication._verify_directory_entry_snapshot(
+            parent_fd, name, root_details,
+            "historical GC candidate run",
+        )
+        return root_details, MappingProxyType(dict(inventory))
+    finally:
+        os.close(root_fd)
+
+
+def _remove_historical_gc_tree_at(
+    *, parent_fd: int, name: str,
+    expected: os.stat_result, expected_inventory: Mapping[str, Any],
+) -> None:
+    """Remove only the already isolated private directory generation."""
+    import scripts.route_publication as route_publication
+
+    visited = [0]
+
+    def remove_contents(directory_fd: int, depth: int) -> None:
+        if depth > 32:
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            )
+        for entry in sorted(os.listdir(directory_fd)):
+            route_publication._require_relative_basename(
+                entry, "historical GC isolated member"
+            )
+            visited[0] += 1
+            if visited[0] > 250_000:
+                raise _entrypoint_error(
+                    "historical GC deletion is uncertain"
+                )
+            details = os.stat(
+                entry, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if stat.S_ISDIR(details.st_mode):
+                if (
+                    details.st_uid != os.geteuid()
+                    or stat.S_IMODE(details.st_mode) != 0o700
+                ):
+                    raise _entrypoint_error(
+                        "historical GC deletion is uncertain"
+                    )
+                child_fd, opened = route_publication._open_directory_at(
+                    directory_fd, entry,
+                    "historical GC isolated directory",
+                )
+                try:
+                    if (
+                        opened.st_dev != details.st_dev
+                        or opened.st_ino != details.st_ino
+                    ):
+                        raise _entrypoint_error(
+                            "historical GC deletion is uncertain"
+                        )
+                    remove_contents(child_fd, depth + 1)
+                    if os.listdir(child_fd):
+                        raise _entrypoint_error(
+                            "historical GC deletion is uncertain"
+                        )
+                finally:
+                    os.close(child_fd)
+                current = os.stat(
+                    entry, dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or current.st_dev != details.st_dev
+                    or current.st_ino != details.st_ino
+                ):
+                    raise _entrypoint_error(
+                        "historical GC deletion is uncertain"
+                    )
+                os.rmdir(entry, dir_fd=directory_fd)
+            elif stat.S_ISREG(details.st_mode):
+                file_fd, opened = route_publication._open_regular_file_at(
+                    directory_fd, entry,
+                    label="historical GC isolated member",
+                )
+                try:
+                    _validate_historical_gc_private_file(opened)
+                    current = os.stat(
+                        entry, dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        route_publication._stable_file_metadata(current)
+                        != route_publication._stable_file_metadata(opened)
+                    ):
+                        raise _entrypoint_error(
+                            "historical GC deletion is uncertain"
+                        )
+                    os.unlink(entry, dir_fd=directory_fd)
+                    if os.fstat(file_fd).st_nlink != 0:
+                        raise _entrypoint_error(
+                            "historical GC deletion is uncertain"
+                        )
+                finally:
+                    os.close(file_fd)
+            else:
+                raise _entrypoint_error(
+                    "historical GC deletion is uncertain"
+                )
+        os.fsync(directory_fd)
+
+    current, current_inventory = _preflight_historical_gc_tree_at(
+        parent_fd=parent_fd, name=name
+    )
+    if dict(current_inventory) != dict(expected_inventory):
+        raise _entrypoint_error("historical GC deletion is uncertain")
+    root_fd, opened_root = route_publication._open_directory_at(
+        parent_fd, name, "historical GC isolated run"
+    )
+    try:
+        if (
+            current.st_dev != expected.st_dev
+            or current.st_ino != expected.st_ino
+            or opened_root.st_dev != current.st_dev
+            or opened_root.st_ino != current.st_ino
+        ):
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            )
+        remove_contents(root_fd, 0)
+        if os.listdir(root_fd):
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            )
+    finally:
+        os.close(root_fd)
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != expected.st_dev
+        or current.st_ino != expected.st_ino
+    ):
+        raise _entrypoint_error("historical GC deletion is uncertain")
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def _apply_historical_reference_gc(
+    *, data_dir: Path,
+) -> Mapping[str, Any]:
+    """Inventory, plan, isolate, and delete unreferenced evidence once."""
+    import scripts.historical_foundry_storage as storage
+    import scripts.historical_foundry_verifier as verifier
+    import scripts.historical_route_publication as publication
+    import scripts.route_publication as route_publication
+
+    if not isinstance(data_dir, Path):
+        return _historical_reference_gc_result(
+            status="blocked_invalid_inventory"
+        )
+
+    descriptors = []
+    moved = []
+    deletion_started = False
+
+    def close_descriptors() -> None:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def references_unchanged(
+        *, historical_fd: int, core_fd: int,
+        complete_fd: int, core_bundles_fd: int,
+        complete_pointer_snapshot: Any,
+        core_pointer_snapshot: Any,
+        complete_names: tuple, core_names: tuple,
+    ) -> bool:
+        return (
+            tuple(sorted(os.listdir(complete_fd))) == complete_names
+            and tuple(sorted(os.listdir(core_bundles_fd))) == core_names
+            and publication._snapshot_matches(
+                route_publication._optional_pointer_snapshot_at(
+                    historical_fd
+                ),
+                complete_pointer_snapshot,
+            )
+            and publication._snapshot_matches(
+                route_publication._optional_pointer_snapshot_at(core_fd),
+                core_pointer_snapshot,
+            )
+        )
+
+    def rollback_moves() -> None:
+        rollback_error = None
+        for row in reversed(moved):
+            try:
+                current = os.stat(
+                    row["hidden"], dir_fd=row["parent_fd"],
+                    follow_symlinks=False,
+                )
+                if (
+                    current.st_dev != row["details"].st_dev
+                    or current.st_ino != row["details"].st_ino
+                ):
+                    raise _entrypoint_error(
+                        "historical GC rollback is uncertain"
+                    )
+                route_publication._rename_directory_noreplace_at(
+                    row["parent_fd"], row["hidden"],
+                    row["parent_fd"], row["original"],
+                    destination_display=row["display_parent"]
+                    / row["original"],
+                )
+            except BaseException as error:
+                if rollback_error is None or (
+                    isinstance(rollback_error, Exception)
+                    and not isinstance(error, Exception)
+                ):
+                    rollback_error = error
+        for parent_fd in {row["parent_fd"] for row in moved}:
+            try:
+                os.fsync(parent_fd)
+            except BaseException as error:
+                if rollback_error is None or (
+                    isinstance(rollback_error, Exception)
+                    and not isinstance(error, Exception)
+                ):
+                    rollback_error = error
+        moved[:] = []
+        if rollback_error is not None:
+            if not isinstance(rollback_error, Exception):
+                raise rollback_error
+            raise _entrypoint_error(
+                "historical GC rollback is uncertain"
+            ) from rollback_error
+
+    try:
+        data = route_publication._absolute_without_symlink_resolution(
+            data_dir
+        )
+        historical_root, historical_fd, historical_details = (
+            route_publication._open_verified_directory(
+                data / "routes" / "historical",
+                "historical GC root",
+            )
+        )
+        descriptors.append(historical_fd)
+        fcntl.flock(historical_fd, fcntl.LOCK_EX)
+        core_fd, core_details = route_publication._open_directory_at(
+            historical_fd, "core", "historical GC core root"
+        )
+        descriptors.append(core_fd)
+        fcntl.flock(core_fd, fcntl.LOCK_EX)
+        complete_fd, complete_details = (
+            route_publication._open_directory_at(
+                historical_fd, "bundles",
+                "historical GC complete bundles",
+            )
+        )
+        descriptors.append(complete_fd)
+        core_bundles_fd, core_bundles_details = (
+            route_publication._open_directory_at(
+                core_fd, "bundles", "historical GC core bundles"
+            )
+        )
+        descriptors.append(core_bundles_fd)
+        complete_pointer_snapshot = (
+            route_publication._optional_pointer_snapshot_at(historical_fd)
+        )
+        core_pointer_snapshot = (
+            route_publication._optional_pointer_snapshot_at(core_fd)
+        )
+
+        inventory = (
+            _build_validated_historical_reference_gc_inventory_impl(
+                data_dir=data, acquire_root_locks=False
+            )
+        )
+        plan = _plan_historical_reference_gc_inventory(inventory)
+        if plan.get("status") != "planned":
+            return _historical_reference_gc_result(
+                status="blocked_invalid_inventory"
+            )
+        complete_names = tuple(sorted(
+            row["replay_id"] for row in inventory["complete_bundles"]
+        ))
+        core_names = tuple(sorted(
+            row["route_cohort_id"]
+            for row in inventory["core_bundles"]
+        ))
+        if not references_unchanged(
+            historical_fd=historical_fd, core_fd=core_fd,
+            complete_fd=complete_fd,
+            core_bundles_fd=core_bundles_fd,
+            complete_pointer_snapshot=complete_pointer_snapshot,
+            core_pointer_snapshot=core_pointer_snapshot,
+            complete_names=complete_names, core_names=core_names,
+        ):
+            return _historical_reference_gc_result(
+                status="blocked_validation"
+            )
+
+        raw_root, raw_fd, raw_details = (
+            route_publication._open_verified_directory(
+                data / "raw" / "historical-foundry-replay",
+                "historical GC raw root",
+            )
+        )
+        descriptors.append(raw_fd)
+        verification_fd, verification_details = (
+            route_publication._open_directory_at(
+                historical_fd, "verifications",
+                "historical GC verification root",
+            )
+        )
+        descriptors.append(verification_fd)
+        reports_fd, reports_details = route_publication._open_directory_at(
+            verification_fd, "by-sha256",
+            "historical GC verification reports",
+        )
+        descriptors.append(reports_fd)
+        raw_inventory_names = tuple(sorted(
+            row["run_id"][4:] for row in inventory["raw_runs"]
+        ))
+        report_inventory_names = tuple(sorted(
+            row["sha256"] + ".json"
+            for row in inventory["verification_reports"]
+        ))
+        if (
+            tuple(sorted(os.listdir(raw_fd))) != raw_inventory_names
+            or tuple(sorted(os.listdir(reports_fd)))
+            != report_inventory_names
+        ):
+            return _historical_reference_gc_result(
+                status="blocked_validation"
+            )
+
+        raw_candidates = []
+        for row in plan["delete_runs"]:
+            name = row["run_id"][4:]
+            candidate_details, candidate_inventory = (
+                _preflight_historical_gc_tree_at(
+                parent_fd=raw_fd, name=name
+                )
+            )
+            run_fd, opened = route_publication._open_directory_at(
+                raw_fd, name, "historical GC raw candidate"
+            )
+            try:
+                _payload, manifest_sha256, _manifest_details = (
+                    route_publication._read_bounded_bytes_at(
+                        run_fd, "run_manifest.json", limit=8_388_608,
+                        label="historical GC raw manifest",
+                    )
+                )
+            finally:
+                os.close(run_fd)
+            if (
+                manifest_sha256 != row["run_manifest_sha256"]
+                or route_publication._stable_file_metadata(opened)
+                != route_publication._stable_file_metadata(
+                    candidate_details
+                )
+            ):
+                raise _entrypoint_error(
+                    "historical GC candidate changed"
+                )
+            snapshot = storage.open_validated_run(
+                data_dir=data, run_id=row["run_id"],
+                expected_manifest_sha256=row["run_manifest_sha256"],
+            )
+            try:
+                snapshot.reread_unchanged()
+                projection = dict(snapshot.identity_projection())
+                if (
+                    projection.get("run_id") != row["run_id"]
+                    or projection.get("run_manifest_sha256")
+                    != row["run_manifest_sha256"]
+                ):
+                    raise _entrypoint_error(
+                        "historical GC candidate changed"
+                    )
+                snapshot.reread_unchanged()
+            finally:
+                snapshot.close()
+            raw_candidates.append({
+                "row": dict(row), "name": name,
+                "details": candidate_details,
+                "inventory": candidate_inventory,
+            })
+
+        report_candidates = []
+        for row in plan["delete_reports"]:
+            report_sha256 = row["sha256"]
+            filename = report_sha256 + ".json"
+            report_bytes, physical_sha256, report_details = (
+                route_publication._read_bounded_bytes_at(
+                    reports_fd, filename,
+                    limit=verifier._MAX_REPORT_BYTES,
+                    label="historical GC verification report",
+                )
+            )
+            _validate_historical_gc_private_file(report_details)
+            if physical_sha256 != report_sha256:
+                raise _entrypoint_error(
+                    "historical GC report changed"
+                )
+            report = verifier._validate_exact_historical_verification_report(
+                report_bytes
+            )
+            report_pointer_core = {
+                "schema": "route_historical_replay_pointer/v1",
+                "bundle_stage": "route_historical_foundry_replay/v1",
+                "replay_id": report.get("replay_id"),
+                "route_cohort_id": report.get("route_cohort_id"),
+                "manifest_sha256": report.get("manifest_sha256"),
+            }
+            verifier._validate_retained_historical_verification_report(
+                report_bytes=report_bytes,
+                pointer_core=report_pointer_core,
+            )
+            report_candidates.append({
+                "row": dict(row), "name": filename,
+                "details": report_details, "bytes": report_bytes,
+            })
+
+        if not references_unchanged(
+            historical_fd=historical_fd, core_fd=core_fd,
+            complete_fd=complete_fd,
+            core_bundles_fd=core_bundles_fd,
+            complete_pointer_snapshot=complete_pointer_snapshot,
+            core_pointer_snapshot=core_pointer_snapshot,
+            complete_names=complete_names, core_names=core_names,
+        ):
+            return _historical_reference_gc_result(
+                status="blocked_validation"
+            )
+        route_publication._verify_open_path_snapshot(
+            raw_root, raw_details, "historical GC raw root"
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "bundles", complete_details,
+            "historical GC complete bundles",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "core", core_details,
+            "historical GC core root",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            core_fd, "bundles", core_bundles_details,
+            "historical GC core bundles",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "verifications", verification_details,
+            "historical GC verification root",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            verification_fd, "by-sha256", reports_details,
+            "historical GC verification reports",
+        )
+        route_publication._verify_open_path_identity(
+            historical_root, historical_details, "historical GC root"
+        )
+
+        for candidate in raw_candidates:
+            current, current_inventory = (
+                _preflight_historical_gc_tree_at(
+                parent_fd=raw_fd, name=candidate["name"]
+                )
+            )
+            if (
+                route_publication._stable_file_metadata(current)
+                != route_publication._stable_file_metadata(
+                    candidate["details"]
+                )
+                or dict(current_inventory)
+                != dict(candidate["inventory"])
+            ):
+                raise _entrypoint_error(
+                    "historical GC candidate changed"
+                )
+            hidden = ".historical-gc-run-" + candidate["name"]
+            route_publication._rename_directory_noreplace_at(
+                raw_fd, candidate["name"], raw_fd, hidden,
+                destination_display=raw_root / hidden,
+            )
+            moved_row = {
+                "kind": "run", "parent_fd": raw_fd,
+                "display_parent": raw_root,
+                "original": candidate["name"], "hidden": hidden,
+                "details": current, "candidate": candidate,
+                "inventory": current_inventory,
+            }
+            moved.append(moved_row)
+            isolated = os.stat(
+                hidden, dir_fd=raw_fd, follow_symlinks=False
+            )
+            if (
+                isolated.st_dev != current.st_dev
+                or isolated.st_ino != current.st_ino
+            ):
+                raise _entrypoint_error(
+                    "historical GC isolation is uncertain"
+                )
+            moved_row["details"] = isolated
+
+        for candidate in report_candidates:
+            filename = candidate["name"]
+            file_fd, current = route_publication._open_regular_file_at(
+                reports_fd, filename,
+                label="historical GC report candidate",
+            )
+            try:
+                if (
+                    route_publication._stable_file_metadata(current)
+                    != route_publication._stable_file_metadata(
+                        candidate["details"]
+                    )
+                ):
+                    raise _entrypoint_error(
+                        "historical GC report changed"
+                    )
+            finally:
+                os.close(file_fd)
+            hidden = ".historical-gc-report-" + filename
+            route_publication._rename_directory_noreplace_at(
+                reports_fd, filename, reports_fd, hidden,
+                destination_display=(
+                    historical_root / "verifications" / "by-sha256"
+                    / hidden
+                ),
+            )
+            moved_row = {
+                "kind": "report", "parent_fd": reports_fd,
+                "display_parent": (
+                    historical_root / "verifications" / "by-sha256"
+                ),
+                "original": filename, "hidden": hidden,
+                "details": current, "candidate": candidate,
+            }
+            moved.append(moved_row)
+            isolated = os.stat(
+                hidden, dir_fd=reports_fd, follow_symlinks=False
+            )
+            if (
+                isolated.st_dev != current.st_dev
+                or isolated.st_ino != current.st_ino
+            ):
+                raise _entrypoint_error(
+                    "historical GC isolation is uncertain"
+                )
+            moved_row["details"] = isolated
+        os.fsync(raw_fd)
+        os.fsync(reports_fd)
+
+        if not references_unchanged(
+            historical_fd=historical_fd, core_fd=core_fd,
+            complete_fd=complete_fd,
+            core_bundles_fd=core_bundles_fd,
+            complete_pointer_snapshot=complete_pointer_snapshot,
+            core_pointer_snapshot=core_pointer_snapshot,
+            complete_names=complete_names, core_names=core_names,
+        ):
+            raise _entrypoint_error(
+                "historical GC references changed"
+            )
+
+        for row in moved:
+            if row["kind"] == "run":
+                isolated, isolated_inventory = (
+                    _preflight_historical_gc_tree_at(
+                        parent_fd=raw_fd, name=row["hidden"]
+                    )
+                )
+                if (
+                    isolated.st_dev != row["details"].st_dev
+                    or isolated.st_ino != row["details"].st_ino
+                    or dict(isolated_inventory)
+                    != dict(row["inventory"])
+                ):
+                    raise _entrypoint_error(
+                        "historical GC isolation is uncertain"
+                    )
+            else:
+                candidate = row["candidate"]
+                payload, digest, isolated = (
+                    route_publication._read_bounded_bytes_at(
+                        reports_fd, row["hidden"],
+                        limit=verifier._MAX_REPORT_BYTES,
+                        label="historical GC isolated report",
+                    )
+                )
+                _validate_historical_gc_private_file(isolated)
+                if (
+                    payload != candidate["bytes"]
+                    or digest != candidate["row"]["sha256"]
+                    or isolated.st_dev != row["details"].st_dev
+                    or isolated.st_ino != row["details"].st_ino
+                ):
+                    raise _entrypoint_error(
+                        "historical GC isolation is uncertain"
+                    )
+
+        deletion_started = True
+        for row in tuple(moved):
+            if row["kind"] == "report":
+                candidate = row["candidate"]
+                payload, digest, current = (
+                    route_publication._read_bounded_bytes_at(
+                        reports_fd, row["hidden"],
+                        limit=verifier._MAX_REPORT_BYTES,
+                        label="historical GC isolated report",
+                    )
+                )
+                if (
+                    payload != candidate["bytes"]
+                    or digest != candidate["row"]["sha256"]
+                    or current.st_dev != row["details"].st_dev
+                    or current.st_ino != row["details"].st_ino
+                ):
+                    raise _entrypoint_error(
+                        "historical GC deletion is uncertain"
+                    )
+                _validate_historical_gc_private_file(current)
+                os.unlink(row["hidden"], dir_fd=reports_fd)
+                os.fsync(reports_fd)
+            else:
+                _remove_historical_gc_tree_at(
+                    parent_fd=raw_fd, name=row["hidden"],
+                    expected=row["details"],
+                    expected_inventory=row["inventory"],
+                )
+            moved.remove(row)
+        route_publication._verify_open_path_identity(
+            historical_root, historical_details, "historical GC root"
+        )
+        if not references_unchanged(
+            historical_fd=historical_fd, core_fd=core_fd,
+            complete_fd=complete_fd,
+            core_bundles_fd=core_bundles_fd,
+            complete_pointer_snapshot=complete_pointer_snapshot,
+            core_pointer_snapshot=core_pointer_snapshot,
+            complete_names=complete_names, core_names=core_names,
+        ):
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            )
+        return _historical_reference_gc_result(
+            status="applied",
+            deleted_runs=tuple(dict(row) for row in plan["delete_runs"]),
+            deleted_reports=tuple(
+                dict(row) for row in plan["delete_reports"]
+            ),
+        )
+    except BaseException as error:
+        if moved and not deletion_started:
+            try:
+                rollback_moves()
+            except BaseException as rollback_error:
+                if not isinstance(error, Exception):
+                    raise error from rollback_error
+                raise rollback_error from error
+        if not isinstance(error, Exception):
+            raise
+        if deletion_started:
+            if isinstance(error, HistoricalReplayEntrypointError):
+                raise
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            ) from error
+        return _historical_reference_gc_result(
+            status="blocked_validation"
+        )
+    finally:
+        close_descriptors()
 
 
 def _audit_latest_historical_replay_bundle(
