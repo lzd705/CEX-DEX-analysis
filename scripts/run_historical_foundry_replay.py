@@ -1902,6 +1902,151 @@ def _drive_historical_candidate_replay(
         replay_ledger = sink.validated_ledger()
 
 
+def _close_historical_controller_resources(
+    resources: Sequence[Any],
+) -> Optional[BaseException]:
+    first_error = None
+    closed = set()
+    for resource in reversed(tuple(resources)):
+        if resource is None or id(resource) in closed:
+            continue
+        closed.add(id(resource))
+        closer = getattr(resource, "close", None)
+        if not callable(closer):
+            exit_method = getattr(resource, "__exit__", None)
+            closer = (
+                (lambda method=exit_method: method(None, None, None))
+                if callable(exit_method)
+                else None
+            )
+        if not callable(closer):
+            continue
+        try:
+            closer()
+        except BaseException as error:
+            if first_error is None or (
+                isinstance(first_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                first_error = error
+    return first_error
+
+
+def _produce_historical_raw_run(*, data_dir: Path) -> Mapping[str, Any]:
+    """Execute capture through immutable raw-run finalization once."""
+    import scripts.historical_foundry_anvil as anvil
+    import scripts.historical_foundry_contracts as contracts
+    import scripts.historical_foundry_rpc as rpc
+    import scripts.historical_foundry_scan as scan
+    import scripts.historical_foundry_storage as storage
+
+    owned = []
+    try:
+        config = contracts.load_historical_foundry_config_set()
+        spool = storage._open_historical_window_exchange_spool(
+            data_dir=data_dir
+        )
+        owned = [spool]
+        rpc_context = rpc._open_production_archive_rpc_run()
+        owned = [spool, rpc_context]
+        claim = (
+            rpc._claim_fresh_production_archive_rpc_run_for_historical_window(
+                context=rpc_context
+            )
+        )
+        owned = [spool, claim]
+        capability = scan._capture_production_historical_window(
+            claim=claim, spool=spool
+        )
+        owned = [capability]
+        capture = scan._materialize_historical_window_staging_snapshot(
+            capability=capability
+        )
+        owned = [capture]
+        window = scan.open_validated_historical_window(
+            config=config, staging=capture
+        )
+        rows = scan.build_historical_prefilter_grid(
+            config=config, window=window
+        )
+        prefilter = storage._freeze_historical_prefilter_grid(
+            staging=capture, rows=rows
+        )
+        owned = [prefilter]
+        snapshot = scan.open_validated_historical_scan_snapshot(
+            config=config, staging=prefilter
+        )
+        artifact = contracts.build_validated_executor_artifact(config)
+        replay_context = anvil.open_historical_replay_context(
+            config=config,
+            staging=prefilter,
+            window=snapshot.validated_window,
+            grid=snapshot.validated_grid,
+            executor_artifact=artifact,
+        )
+        owned = [replay_context]
+        selection = _drive_historical_candidate_replay(
+            snapshot=snapshot, replay_context=replay_context
+        )
+        finalized = scan._finalize_historical_replay_run(
+            config=config, snapshot=snapshot, selection=selection
+        )
+        owned = [replay_context, finalized]
+        run_identity = dict(finalized.identity_projection())
+        replay_context.close()
+        owned = [finalized]
+        selection_projection = dict(selection)
+        if selection_projection.get("status") == (
+            "no_publishable_profitable_block"
+        ):
+            finalized.close()
+            owned = []
+            return {
+                "config": config,
+                "selection": selection_projection,
+                "run": None,
+                "run_identity": run_identity,
+                "publication_lease": None,
+            }
+        if selection_projection.get("status") != (
+            "found_publishable_profitable_block"
+        ):
+            raise _entrypoint_error(
+                "historical replay selection is invalid"
+            )
+        publication_lease = (
+            storage._acquire_historical_run_publication_lease(
+                run_id=run_identity["run_id"],
+                expected_manifest_sha256=run_identity[
+                    "run_manifest_sha256"
+                ],
+            )
+        )
+        owned = [finalized, publication_lease]
+        result = {
+            "config": config,
+            "selection": selection_projection,
+            "run": finalized,
+            "run_identity": run_identity,
+            "publication_lease": publication_lease,
+        }
+        owned = []
+        return result
+    except BaseException as error:
+        cleanup_error = _close_historical_controller_resources(owned)
+        if not isinstance(error, Exception):
+            raise error from cleanup_error
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from error
+        if isinstance(error, HistoricalReplayEntrypointError):
+            raise error
+        raise _entrypoint_error(
+            "historical production scan failed"
+        ) from error
+
+
 def _invoke_production_controller(
     _arguments: argparse.Namespace, _preflight: Any,
 ) -> Mapping[str, Any]:

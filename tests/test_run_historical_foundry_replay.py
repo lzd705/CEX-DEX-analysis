@@ -2393,5 +2393,231 @@ class HistoricalReplayCandidateDriverTests(unittest.TestCase):
                 )
 
 
+class HistoricalReplayRawRunControllerTests(unittest.TestCase):
+    class Resource:
+        def __init__(self, name, events):
+            self.name = name
+            self.events = events
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+            self.events.append(("close", self.name))
+
+    class Finalized(Resource):
+        def identity_projection(self):
+            self.events.append(("identity", self.name))
+            return {
+                "run_id": "run:" + "a" * 64,
+                "run_manifest_sha256": "b" * 64,
+                "stage": "complete",
+            }
+
+    def setUp(self):
+        self.module = _entrypoint()
+
+    def _patched_controller(self, *, selection_status):
+        import scripts.historical_foundry_anvil as anvil
+        import scripts.historical_foundry_contracts as contracts
+        import scripts.historical_foundry_rpc as rpc
+        import scripts.historical_foundry_scan as scan
+        import scripts.historical_foundry_storage as storage
+
+        events = []
+        resources = {
+            name: self.Resource(name, events)
+            for name in (
+                "rpc_context", "claim", "spool", "capability",
+                "capture", "prefilter", "replay_context", "lease",
+            )
+        }
+        resources["finalized"] = self.Finalized("finalized", events)
+        config = object()
+        window = object()
+        rows = (object(),)
+        grid = object()
+        snapshot = types.SimpleNamespace(
+            validated_window=window, validated_grid=grid
+        )
+        artifact = object()
+        selection = {
+            "status": selection_status,
+            "selected_scenario_count": (
+                10
+                if selection_status
+                == "found_publishable_profitable_block"
+                else 0
+            ),
+            "unresolved_candidate_count": 0,
+        }
+
+        def operation(name, value):
+            def call(*args, **kwargs):
+                events.append((name, args, kwargs))
+                return value
+
+            return call
+
+        patches = contextlib.ExitStack()
+        patches.enter_context(mock.patch.object(
+            contracts,
+            "load_historical_foundry_config_set",
+            side_effect=operation("load_config", config),
+        ))
+        patches.enter_context(mock.patch.object(
+            storage,
+            "_open_historical_window_exchange_spool",
+            side_effect=operation("open_spool", resources["spool"]),
+        ))
+        patches.enter_context(mock.patch.object(
+            rpc,
+            "_open_production_archive_rpc_run",
+            side_effect=operation("open_rpc", resources["rpc_context"]),
+        ))
+        patches.enter_context(mock.patch.object(
+            rpc,
+            "_claim_fresh_production_archive_rpc_run_for_historical_window",
+            side_effect=operation("claim", resources["claim"]),
+        ))
+        patches.enter_context(mock.patch.object(
+            scan,
+            "_capture_production_historical_window",
+            side_effect=operation("capture", resources["capability"]),
+        ))
+        patches.enter_context(mock.patch.object(
+            scan,
+            "_materialize_historical_window_staging_snapshot",
+            side_effect=operation("materialize", resources["capture"]),
+        ))
+        patches.enter_context(mock.patch.object(
+            scan,
+            "open_validated_historical_window",
+            side_effect=operation("open_window", window),
+        ))
+        patches.enter_context(mock.patch.object(
+            scan,
+            "build_historical_prefilter_grid",
+            side_effect=operation("build_grid", rows),
+        ))
+        patches.enter_context(mock.patch.object(
+            storage,
+            "_freeze_historical_prefilter_grid",
+            side_effect=operation("freeze_grid", resources["prefilter"]),
+        ))
+        patches.enter_context(mock.patch.object(
+            scan,
+            "open_validated_historical_scan_snapshot",
+            side_effect=operation("open_snapshot", snapshot),
+        ))
+        patches.enter_context(mock.patch.object(
+            contracts,
+            "build_validated_executor_artifact",
+            side_effect=operation("build_artifact", artifact),
+        ))
+        patches.enter_context(mock.patch.object(
+            anvil,
+            "open_historical_replay_context",
+            side_effect=operation(
+                "open_replay", resources["replay_context"]
+            ),
+        ))
+        patches.enter_context(mock.patch.object(
+            self.module,
+            "_drive_historical_candidate_replay",
+            side_effect=operation("drive", selection),
+        ))
+        patches.enter_context(mock.patch.object(
+            scan,
+            "_finalize_historical_replay_run",
+            side_effect=operation("finalize", resources["finalized"]),
+        ))
+        acquire = patches.enter_context(mock.patch.object(
+            storage,
+            "_acquire_historical_run_publication_lease",
+            side_effect=operation("acquire_lease", resources["lease"]),
+        ))
+        return patches, events, resources, config, selection, acquire
+
+    def test_positive_scan_runs_steps_three_through_ten_in_order(self):
+        (
+            patches, events, resources, config, selection, acquire,
+        ) = self._patched_controller(
+            selection_status="found_publishable_profitable_block"
+        )
+        with patches:
+            result = self.module._produce_historical_raw_run(
+                data_dir=Path("/immutable-data")
+            )
+
+        self.assertIs(result["config"], config)
+        self.assertEqual(result["selection"], selection)
+        self.assertIs(result["run"], resources["finalized"])
+        self.assertIs(result["publication_lease"], resources["lease"])
+        self.assertEqual(
+            [event[0] for event in events],
+            [
+                "load_config", "open_spool", "open_rpc", "claim",
+                "capture", "materialize", "open_window", "build_grid",
+                "freeze_grid", "open_snapshot", "build_artifact",
+                "open_replay", "drive", "finalize", "identity",
+                "close", "acquire_lease",
+            ],
+        )
+        self.assertEqual(events[-2], ("close", "replay_context"))
+        acquire.assert_called_once_with(
+            run_id="run:" + "a" * 64,
+            expected_manifest_sha256="b" * 64,
+        )
+
+    def test_resolved_no_opportunity_closes_run_and_never_requests_lease(self):
+        (
+            patches, events, resources, _config, selection, acquire,
+        ) = self._patched_controller(
+            selection_status="no_publishable_profitable_block"
+        )
+        with patches:
+            result = self.module._produce_historical_raw_run(
+                data_dir=Path("/immutable-data")
+            )
+
+        self.assertEqual(result["selection"], selection)
+        self.assertIsNone(result["run"])
+        self.assertIsNone(result["publication_lease"])
+        acquire.assert_not_called()
+        self.assertEqual(resources["replay_context"].closed, 1)
+        self.assertEqual(resources["finalized"].closed, 1)
+        self.assertEqual(
+            events[-2:],
+            [("close", "replay_context"), ("close", "finalized")],
+        )
+
+    def test_failure_before_grid_freeze_closes_the_last_owned_snapshot(self):
+        import scripts.historical_foundry_scan as scan
+
+        (
+            patches, events, resources, _config, _selection, acquire,
+        ) = self._patched_controller(
+            selection_status="found_publishable_profitable_block"
+        )
+        with patches, mock.patch.object(
+            scan,
+            "build_historical_prefilter_grid",
+            side_effect=ValueError("invalid grid"),
+        ):
+            with self.assertRaisesRegex(
+                self.module.HistoricalReplayEntrypointError,
+                "historical production scan failed",
+            ):
+                self.module._produce_historical_raw_run(
+                    data_dir=Path("/immutable-data")
+                )
+
+        acquire.assert_not_called()
+        self.assertEqual(resources["capture"].closed, 1)
+        self.assertEqual(resources["prefilter"].closed, 0)
+        self.assertEqual(resources["replay_context"].closed, 0)
+        self.assertEqual(events[-1], ("close", "capture"))
+
+
 if __name__ == "__main__":
     unittest.main()
