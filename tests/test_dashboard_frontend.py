@@ -2348,9 +2348,19 @@ if (typeof openCustomWindowEditor !== "function") {
         index = INDEX_PATH.read_text(encoding="utf-8")
         styles = STYLES_PATH.read_text(encoding="utf-8")
 
-        self.assertIn("<h3>Token Market Coverage</h3>", index)
+        self.assertIn("<h3>Token Market Inventory</h3>", index)
         self.assertNotIn("Where this Token trades", index)
         self.assertIn('class="module-chip"', index)
+        self.assertIn("Daily Close Coverage", index)
+        self.assertIn(
+            "valid positive daily closes ÷ eligible UTC calendar days",
+            index,
+        )
+        self.assertIn("market's first valid close", index)
+        self.assertIn(
+            "not venue breadth, liquidity, volume, or freshness",
+            index,
+        )
 
         disclosures = index.count('<details class="context-info">')
         self.assertGreaterEqual(disclosures, 8)
@@ -2379,6 +2389,154 @@ if (typeof openCustomWindowEditor !== "function") {
         )
         self.assertIn("@media (max-width: 700px)", styles)
         self.assertIn("max-height: 52vh", styles)
+
+    def test_daily_close_coverage_names_the_ratio_and_missing_days(self):
+        result = run_app_javascript(
+            """
+const disclosure = {
+  token: "AAVE",
+  marketLabel: "CEX · binance · AAVE/USDT",
+  factLabel: "daily close coverage",
+};
+console.log(JSON.stringify({
+  partial: dailyCoverageMarkup({
+    observation_count: 3,
+    requested_window_days: 4,
+    coverage_ratio: 0.75,
+  }, disclosure),
+  complete: dailyCoverageMarkup({
+    observation_count: 4,
+    requested_window_days: 4,
+    coverage_ratio: 1,
+  }, disclosure),
+  unavailable: dailyCoverageMarkup({
+    coverage_ratio: 1,
+  }, disclosure),
+}));
+"""
+        )
+
+        self.assertIn("3 valid closes / 4 eligible UTC days", result["partial"])
+        self.assertIn("75%", result["partial"])
+        self.assertIn("1 eligible UTC day has no finite positive daily close", result["partial"])
+        self.assertIn("4 valid closes / 4 eligible UTC days", result["complete"])
+        self.assertIn("100%", result["complete"])
+        self.assertIn(
+            "All eligible UTC days have a finite positive daily close",
+            result["complete"],
+        )
+        self.assertIn("N/A", result["unavailable"])
+        self.assertIn(
+            "valid-close numerator or eligible-day denominator was not published",
+            result["unavailable"],
+        )
+
+    def test_market_inventory_quality_status_discloses_exact_reasons(self):
+        result = run_app_javascript(
+            """
+function control(value = "") {
+  return { value, innerHTML: "" };
+}
+const nodes = {
+  "workspace-market-body": control(),
+  "facts-token": control("AAVE"),
+  "facts-market-a": control(""),
+  "facts-market-b": control(""),
+};
+global.document = { getElementById(id) { return nodes[id] || null; } };
+app.payload = {
+  metadata: { start_date: "2026-07-01", end_date: "2026-07-30" },
+  tokens: [],
+};
+app.catalog = {
+  metadata: { market_quality_thresholds: {} },
+  markets: [{
+    market_id: "cex:binance:AAVE/USDT",
+    market_type: "cex",
+    token_symbol: "AAVE",
+    venue: "binance",
+    instrument: "AAVE/USDT",
+    total_depth_100bps_usd: 1250000,
+    depth_100bps_complete: true,
+    depth_status: "observed",
+    quality_status: "ok",
+    quality_flags: ["daily_source_no_observation"],
+    quality_flag_details: [{
+      code: "daily_source_no_observation",
+      severity: "info",
+      category: "data_health",
+      message: "The source returned no candle for one eligible UTC day.",
+      observed_value: "source_no_observation",
+      threshold: null,
+    }],
+    window_metrics: {
+      price_usd: 123.45,
+      volume_usd: 5000000,
+      observation_count: 3,
+      requested_window_days: 4,
+      coverage_ratio: 0.75,
+    },
+  }, {
+    market_id: "cex:bitget:AAVE/USDT",
+    market_type: "cex",
+    token_symbol: "AAVE",
+    venue: "bitget",
+    instrument: "AAVE/USDT",
+    total_depth_100bps_usd: 900000,
+    depth_100bps_complete: true,
+    depth_status: "observed",
+    quality_status: "ok",
+    quality_flags: [],
+    quality_flag_details: [],
+    window_metrics: {
+      price_usd: 123.40,
+      volume_usd: 4000000,
+      observation_count: 4,
+      requested_window_days: 4,
+      coverage_ratio: 1,
+    },
+  }],
+};
+app.workspaceMarketType = "all";
+renderWorkspaceMarkets();
+console.log(JSON.stringify({ html: nodes["workspace-market-body"].innerHTML }));
+""",
+            prelude="""
+globalThis.MarketMonitorNavigation = require("./dashboard/static/navigation.js");
+""",
+        )
+
+        html = result["html"]
+        self.assertIn("3 valid closes / 4 eligible UTC days", html)
+        self.assertIn("75%", html)
+        self.assertEqual(html.count('class="market-quality-details"'), 1)
+        self.assertIn('data-severity="info"', html)
+        self.assertIn("Informational", html)
+        self.assertIn("1 reason", html)
+        self.assertIn(
+            "only low-severity context is active; no Warning or Critical reason is active",
+            html,
+        )
+        self.assertIn("Daily source returned no candle", html)
+        self.assertIn("The source returned no candle for one eligible UTC day.", html)
+        self.assertIn("Open full Data Quality", html)
+        self.assertIn("/tokens/AAVE/quality?", html)
+        self.assertIn("start=2026-07-01", html)
+        self.assertIn("end=2026-07-30", html)
+        self.assertIn("scope=all", html)
+        self.assertNotIn("origin=screener", html)
+        self.assertIn("No active alerts", html)
+        self.assertIn("0 reasons", html)
+
+    def test_market_quality_reason_panel_stays_within_mobile_card(self):
+        styles = STYLES_PATH.read_text(encoding="utf-8")
+        mobile = styles[styles.index("@media (max-width: 700px)"):]
+        selector = "#workspace-market-table .market-quality-panel"
+
+        self.assertIn(selector, mobile)
+        panel_rule = mobile[mobile.index(selector):]
+        panel_rule = panel_rule[:panel_rule.index("}")]
+        self.assertIn("width: 100%;", panel_rule)
 
     def test_execution_timing_is_visible_and_distinct_from_market_state_skew(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
@@ -4330,7 +4488,7 @@ console.log(JSON.stringify({
         self.assertGreaterEqual(router.count("setWorkspaceDataUnavailable("), 3)
         self.assertIn('setAttribute("aria-busy", "false")', unavailable)
         self.assertNotIn("Loading", unavailable)
-        self.assertIn("formatRatio(row?.coverage_ratio)", workspace_markets)
+        self.assertIn("dailyCoverageMarkup(row", workspace_markets)
         self.assertNotIn("formatRatio(market.coverage_ratio)", workspace_markets)
         self.assertIn('byId("export-csv").disabled = true;', loader)
         self.assertNotIn('byId("date-start").value =', loader)

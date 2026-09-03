@@ -264,18 +264,20 @@
           <div class="page-heading">
             <div>
               <span class="eyebrow">Market inventory</span>
-              <h3>Token Market Coverage</h3>
-              <div class="module-context" aria-label="Market coverage module scope">
+              <h3>Token Market Inventory</h3>
+              <div class="module-context" aria-label="Token market inventory scope">
                 <span class="module-chip">Full catalog</span>
                 <span class="module-chip">CEX + DEX</span>
                 <span class="module-chip">A/B selectable</span>
                 <details class="context-info">
-                  <summary aria-label="Token market coverage details">
+                  <summary aria-label="Daily close coverage definition">
                     <i data-lucide="info"></i>
                   </summary>
                   <div class="context-tooltip" role="tooltip">
-                    <strong>Market coverage</strong>
-                    <p>Review every cataloged CEX instrument and DEX pool for the selected Token. Set any two distinct markets as A and B before moving to comparison or execution analysis.</p>
+                    <strong>Daily Close Coverage</strong>
+                    <p>Daily Close Coverage is valid positive daily closes ÷ eligible UTC calendar days. Eligible days normally run from the later of the selected start and that source's available-history start through the selected end. When All spans the full dataset, they begin no earlier than the market's first valid close.</p>
+                    <p>It measures daily-price availability, not venue breadth, liquidity, volume, or freshness. No missing days are filled.</p>
+                    <p>This inventory includes every cataloged CEX instrument and DEX pool for the selected Token. Set any two distinct markets as A and B before moving to comparison or execution analysis.</p>
                   </div>
                 </details>
               </div>
@@ -297,7 +299,7 @@
                   <th scope="col">Window Volume</th>
                   <th scope="col">TVL</th>
                   <th scope="col">±100 bps Depth</th>
-                  <th scope="col">Coverage</th>
+                  <th scope="col">Daily Close Coverage</th>
                   <th scope="col">Status</th>
                   <th scope="col">Pair Actions</th>
                 </tr>

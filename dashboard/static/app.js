@@ -2122,6 +2122,33 @@ function naFactMarkup(reason, {
   </details>`;
 }
 
+function dailyCoverageMarkup(row, disclosureOptions = {}) {
+  const observed = row?.observation_count;
+  const expected = row?.requested_window_days;
+  const ratio = row?.coverage_ratio;
+  if (
+    !Number.isInteger(observed)
+    || observed < 0
+    || !Number.isInteger(expected)
+    || expected <= 0
+    || observed > expected
+    || !finite(ratio)
+  ) {
+    return naFactMarkup(
+      "Daily close coverage is unavailable because the valid-close numerator or eligible-day denominator was not published.",
+      disclosureOptions,
+    );
+  }
+  const missing = expected - observed;
+  const detail = missing === 0
+    ? "All eligible UTC days have a finite positive daily close"
+    : `${missing} eligible UTC day${missing === 1 ? "" : "s"} `
+      + `${missing === 1 ? "has" : "have"} no finite positive daily close`;
+  return `<strong>${observed} valid close${observed === 1 ? "" : "s"} / `
+    + `${expected} eligible UTC day${expected === 1 ? "" : "s"}</strong>`
+    + `<span class="metric-note">${formatRatio(ratio)} · ${detail}</span>`;
+}
+
 function opportunityNumber(value) {
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
   if (typeof value !== "string" || !value.trim()) return null;
@@ -3303,6 +3330,53 @@ function qualityStateMarkup(status, label = "", tooltip = "") {
   return `<span class="quality-state" data-state="${escapeHtml(normalized)}"${tooltipAttributes}>${escapeHtml(display)}</span>`;
 }
 
+function marketQualityStatusMarkup(token, market, status, label, flags) {
+  const reasons = Array.isArray(flags) ? flags : [];
+  const statusMarkup = qualityStateMarkup(status, label);
+  const reasonCount = reasons.length;
+  const reasonLabel = `${reasonCount} reason${reasonCount === 1 ? "" : "s"}`;
+  if (!reasonCount) {
+    return `${statusMarkup}<span class="metric-note">${reasonLabel}</span>`;
+  }
+  const normalizedStatus = String(status || "info").toLowerCase();
+  const displayStatus = label || normalizedStatus.replaceAll("_", " ");
+  const statusMeaning = normalizedStatus === "info"
+    ? "Informational means only low-severity context is active; no Warning or Critical reason is active."
+    : normalizedStatus === "warning"
+      ? "Warning means at least one data-quality reason needs attention, with no Critical reason active."
+      : "Critical means at least one high-severity data-quality reason is active.";
+  const marketLabel = factsMarketLabel(market);
+  // Inventory reasons use the default catalog-quality projection, not the
+  // separate Screener projection selected by origin=screener.
+  const qualityPath = navigation
+    ? navigation.buildWorkspacePath(token, "quality", {
+      ...currentSummaryWindowRouteState(),
+      scope: "all",
+    })
+    : "#";
+  const items = reasons.map((flag) => {
+    const explanation = flag.explanation || "No additional explanation was supplied.";
+    const measurement = qualityFlagMeasurement(flag);
+    return `<li data-severity="${escapeHtml(flag.severity || normalizedStatus)}">`
+      + `<strong>${escapeHtml(qualityFlagLabel(flag))}</strong>`
+      + `<span>${escapeHtml(explanation)}</span>`
+      + `${measurement ? `<small>${escapeHtml(measurement)}</small>` : ""}`
+      + "</li>";
+  }).join("");
+  return `<details class="market-quality-details" data-severity="${escapeHtml(normalizedStatus)}">
+    <summary aria-label="View ${escapeHtml(reasonLabel)} behind the ${escapeHtml(displayStatus)} status for ${escapeHtml(marketLabel)}">
+      ${statusMarkup}
+      <span class="metric-note market-quality-count">${reasonLabel} · View</span>
+    </summary>
+    <div class="market-quality-panel">
+      <strong>Why this is ${escapeHtml(displayStatus)}</strong>
+      <p class="market-quality-meaning">${escapeHtml(statusMeaning)}</p>
+      <ul>${items}</ul>
+      <a class="market-quality-link" href="${escapeHtml(qualityPath)}" data-workspace-page="quality">Open full Data Quality</a>
+    </div>
+  </details>`;
+}
+
 function renderWorkspaceContext() {
   if (!app.catalog || !app.payload) return;
   const token = selectedWorkspaceToken();
@@ -3453,15 +3527,19 @@ function renderWorkspaceMarkets() {
             )}</td>
           <td data-label="TVL">${tvl}</td>
           <td data-label="±100 bps depth">${depth}<span class="metric-note">${escapeHtml(market.depth_status || "unavailable")}</span></td>
-          <td data-label="Coverage">${finite(row?.coverage_ratio)
-            ? formatRatio(row?.coverage_ratio)
-            : naFactMarkup(
-              "Coverage is unavailable because no valid daily observation count was published.",
-              { token, marketLabel: factsMarketLabel(market), factLabel: "daily coverage" },
-            )}</td>
+          <td data-label="Daily Close Coverage">${dailyCoverageMarkup(row, {
+            token,
+            marketLabel: factsMarketLabel(market),
+            factLabel: "daily close coverage",
+          })}</td>
           <td data-label="Quality">
-            ${qualityStateMarkup(rowQualityStatus, rowQualityLabel)}
-            <span class="metric-note">${flags.length} reason${flags.length === 1 ? "" : "s"}</span>
+            ${marketQualityStatusMarkup(
+              token,
+              market,
+              rowQualityStatus,
+              rowQualityLabel,
+              flags,
+            )}
           </td>
           <td data-label="Pair selection">
             <span class="pair-actions">
