@@ -771,6 +771,22 @@ class DexDepthMathTest(unittest.TestCase):
             protocol_model("orca", "solana", "solana-address")[0],
             "unsupported",
         )
+        self.assertEqual(
+            protocol_model("uniswap_v2", "eth", "0x" + "0" * 40),
+            ("unsupported", "pool_is_not_an_evm_contract_address"),
+        )
+        for chain, dex in (
+            ("bsc", "uniswap_v2"),
+            ("zksync", "shibaswap"),
+            ("bsc", "uniswap_v3"),
+        ):
+            with self.subTest(chain=chain, dex=dex):
+                self.assertEqual(
+                    protocol_model(dex, chain, "0x" + "1" * 40),
+                    ("unsupported", "unsupported_chain_protocol:{}:{}".format(
+                        chain, dex
+                    )),
+                )
 
 
 class DexDepthCollectionTest(unittest.TestCase):
@@ -848,10 +864,18 @@ class DexDepthCollectionTest(unittest.TestCase):
 
         self.assertEqual(row["status"], "observed")
         self.assertEqual(len(execution_rows), 10)
-        self.assertEqual(len(members), 1)
-        self.assertEqual(set(members[0]), {"role", "payload"})
-        self.assertEqual(members[0]["role"], "dex_pool_state")
-        payload_bytes = members[0]["payload"]
+        self.assertEqual(
+            {member["role"] for member in members},
+            {"dex_market_rules", "dex_pool_state"},
+        )
+        self.assertTrue(
+            all(set(member) == {"role", "payload"} for member in members)
+        )
+        payload_bytes = next(
+            member["payload"]
+            for member in members
+            if member["role"] == "dex_pool_state"
+        )
         self.assertIsInstance(payload_bytes, bytes)
         payload = json.loads(payload_bytes.decode("utf-8"))
         self.assertEqual(
@@ -912,6 +936,180 @@ class DexDepthCollectionTest(unittest.TestCase):
             ).hexdigest(),
         )
 
+    def test_observed_dex_typed_sink_retains_directional_rules_and_usd_conversion(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        raw_path = self.root / "typed-directional-evidence.json"
+        members = []
+        row, _execution_rows = collect_dex_pool_observation(
+            {
+                **self.pool,
+                "source": "GeckoTerminal API v2",
+                "source_endpoint": "https://api.example.test/pools",
+                "raw_response_sha256": "e" * 64,
+            },
+            snapshot_id="typed-directional-evidence",
+            raw_path=raw_path,
+            rpc_factory=FakeV2Rpc,
+            fixed_block_number=123,
+            fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+            fixed_chain_id="0x1",
+            fixed_block_header=self._fixed_block_header(),
+            typed_source_payload_sink=members.append,
+        )
+
+        self.assertEqual(row["status"], "observed")
+        by_role = {
+            member["role"]: json.loads(member["payload"].decode("utf-8"))
+            for member in members
+        }
+        self.assertEqual(
+            set(by_role),
+            {"dex_market_rules", "dex_pool_state", "dex_usd_conversion"},
+        )
+        self.assertEqual(by_role["dex_market_rules"], {
+            "base_asset": "AAVE",
+            "base_increment": "0.000000000000000001",
+            "base_token_address": self.target,
+            "base_unit_decimals": 18,
+            "increment_source": "fixed_block_token_decimals",
+            "market_id": (
+                "dex:eth:uniswap_v2:"
+                "0x3333333333333333333333333333333333333333:AAVE"
+            ),
+            "min_base_quantity": "0",
+            "min_quote_notional": "0",
+            "minimum_source": "dex_protocol_no_additional_order_minimum",
+            "observed_at": "2024-01-01T00:00:00+00:00",
+            "quote_asset": "USDC",
+            "quote_increment": "0.000001",
+            "quote_token_address": self.quote,
+            "quote_unit_decimals": 6,
+            "raw_response_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+            "schema": "route_dex_market_rules_source/v1",
+            "valid_until": "2024-01-01T00:02:00+00:00",
+        })
+        self.assertEqual(by_role["dex_usd_conversion"], {
+            "market_id": (
+                "dex:eth:uniswap_v2:"
+                "0x3333333333333333333333333333333333333333:AAVE"
+            ),
+            "observed_at": "2024-01-01T00:00:00+00:00",
+            "quote_asset": "USDC",
+            "quote_token_address": self.quote,
+            "schema": "route_dex_usd_conversion_source/v1",
+            "source": "GeckoTerminal API v2",
+            "source_raw_response_sha256": "e" * 64,
+            "source_snapshot_id": "tvl-1",
+            "state_observed_at": "2024-01-01T00:00:00+00:00",
+            "state_raw_response_sha256": hashlib.sha256(
+                raw_path.read_bytes()
+            ).hexdigest(),
+            "target_asset": "AAVE",
+            "target_token_address": self.target,
+            "usd_per_quote": "1",
+            "valid_until": "2024-01-01T02:00:00+00:00",
+            "value_status": "measured",
+        })
+
+    def test_mixed_case_erc20_symbols_are_canonicalized_with_raw_lineage(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        class MixedCaseSymbolRpc(FakeV2Rpc):
+            def eth_calls(self, to, data_values, block_tag):
+                values = super().eth_calls(to, data_values, block_tag)
+                if to == self_target:
+                    return [values[0], string_result("aAvE")]
+                if to == self_quote:
+                    return [values[0], string_result("uSdC")]
+                return values
+
+        self_target = self.target
+        self_quote = self.quote
+        raw_path = self.root / "mixed-case-symbols.json"
+        members = []
+        row, _execution_rows = collect_dex_pool_observation(
+            {
+                **self.pool,
+                "source": "GeckoTerminal API v2",
+                "source_endpoint": "https://api.example.test/pools",
+                "raw_response_sha256": "e" * 64,
+            },
+            snapshot_id="mixed-case-symbols",
+            raw_path=raw_path,
+            rpc_factory=MixedCaseSymbolRpc,
+            fixed_block_number=123,
+            fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+            fixed_chain_id="0x1",
+            fixed_block_header=self._fixed_block_header(),
+            typed_source_payload_sink=members.append,
+        )
+
+        self.assertEqual(row["token0_symbol"], "AAVE")
+        self.assertEqual(row["token1_symbol"], "USDC")
+        rules = json.loads(next(
+            member["payload"]
+            for member in members
+            if member["role"] == "dex_market_rules"
+        ))
+        self.assertEqual(rules["base_asset"], "AAVE")
+        self.assertEqual(rules["quote_asset"], "USDC")
+        self.assertTrue(raw_path.read_bytes())
+        self.assertEqual(
+            row["raw_response_sha256"],
+            hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+        )
+
+    def test_missing_dex_price_source_never_synthesizes_conversion_from_pool_name(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        pool = {
+            **self.pool,
+            "pool_name": "AAVE / USDC",
+            "source": "",
+            "raw_response_sha256": "",
+        }
+        members = []
+        row, _execution_rows = collect_dex_pool_observation(
+            pool,
+            snapshot_id="typed-missing-price-source",
+            raw_path=self.root / "typed-missing-price-source.json",
+            rpc_factory=FakeV2Rpc,
+            fixed_block_number=123,
+            fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+            fixed_chain_id="0x1",
+            fixed_block_header=self._fixed_block_header(),
+            typed_source_payload_sink=members.append,
+        )
+
+        self.assertEqual(row["status"], "observed")
+        roles = {member["role"] for member in members}
+        self.assertIn("dex_market_rules", roles)
+        self.assertIn("dex_pool_state", roles)
+        self.assertNotIn("dex_usd_conversion", roles)
+
+    def test_public_single_pool_collector_does_not_degrade_usd_by_default(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        stale_pool = {
+            **self.pool,
+            "observed_at": "2023-12-31T20:00:00+00:00",
+            "response_received_at": "2023-12-31T20:00:00+00:00",
+        }
+        row, _execution_rows = collect_dex_pool_observation(
+            stale_pool,
+            snapshot_id="default-no-degraded-usd",
+            raw_path=self.root / "default-no-degraded-usd.json",
+            rpc_factory=FakeV2Rpc,
+            fixed_block_number=123,
+            fixed_block_timestamp="2024-01-01T00:00:00+00:00",
+            fixed_chain_id="0x1",
+            fixed_block_header=self._fixed_block_header(),
+        )
+
+        self.assertEqual(row["status"], "failed")
+        self.assertNotEqual(row.get("reason_code"), "measurement_limit")
+
     def test_missing_chain_or_cross_block_header_only_disables_typed_pool_state(self):
         from scripts.fetch_dex_depth import collect_dex_pool_observation
 
@@ -945,7 +1143,10 @@ class DexDepthCollectionTest(unittest.TestCase):
                 )
                 self.assertEqual(row["status"], "observed")
                 self.assertEqual(len(execution_rows), 10)
-                self.assertEqual(members, [])
+                self.assertEqual(
+                    [member["role"] for member in members],
+                    ["dex_market_rules"],
+                )
 
     def test_get_reserves_third_word_must_be_a_uint32_for_typed_and_depth(self):
         from scripts.fetch_dex_depth import collect_dex_pool_observation
@@ -1863,9 +2064,9 @@ class DexDepthCollectionTest(unittest.TestCase):
         self.assertEqual(row["usd_price_source_snapshot_id"], "tvl-1")
         self.assertEqual(
             row["usd_price_observed_at"],
-            "2024-01-01T00:00:01+00:00",
+            "2024-01-01T00:00:00+00:00",
         )
-        self.assertEqual(row["usd_price_skew_seconds"], "1")
+        self.assertEqual(row["usd_price_skew_seconds"], "0")
         self.assertEqual(row["usd_price_freshness_status"], "current")
         self.assertGreater(Decimal(row["total_depth_100bps_usd"]), 0)
         self.assertEqual(row["depth_100bps_complete"], "1")
@@ -1941,6 +2142,7 @@ class DexDepthCollectionTest(unittest.TestCase):
         stale_pool = {
             **self.pool,
             "pool_address": "0x5555555555555555555555555555555555555555",
+            "observed_at": "2023-12-31T21:59:59+00:00",
             "response_received_at": "2023-12-31T21:59:59+00:00",
         }
         _snapshot_id, depth_rows, execution_rows = (
@@ -2005,6 +2207,10 @@ class DexDepthCollectionTest(unittest.TestCase):
         cases = (
             ("unsupported_chain:solana", "unsupported_chain"),
             ("unsupported_pool_model:curve", "unsupported_protocol"),
+            (
+                "unsupported_chain_protocol:bsc:uniswap_v2",
+                "unsupported_protocol",
+            ),
             ("pool_is_not_an_evm_contract_address", "unsupported_method"),
             ("missing_rpc_endpoint:eth", "unsupported_source"),
         )
@@ -2018,6 +2224,32 @@ class DexDepthCollectionTest(unittest.TestCase):
                     reason=raw_reason,
                 )
                 self.assertEqual(row["reason_code"], expected)
+
+    def test_unregistered_chain_protocol_stops_before_rpc_or_typed_emission(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+
+        rpc_calls = []
+        typed_members = []
+
+        def forbidden_rpc_factory(*args, **kwargs):
+            rpc_calls.append((args, kwargs))
+            self.fail("an unregistered chain/protocol pair reached RPC")
+
+        raw_path = self.root / "wrong-chain-protocol.json"
+        row, execution_rows = collect_dex_pool_observation(
+            {**self.pool, "chain": "bsc", "dex": "uniswap_v2"},
+            snapshot_id="wrong-chain-protocol",
+            raw_path=raw_path,
+            rpc_factory=forbidden_rpc_factory,
+            typed_source_payload_sink=typed_members.append,
+        )
+
+        self.assertEqual(row["status"], "unsupported")
+        self.assertEqual(row["reason_code"], "unsupported_protocol")
+        self.assertTrue(all(item["status"] == "unsupported" for item in execution_rows))
+        self.assertEqual(rpc_calls, [])
+        self.assertEqual(typed_members, [])
+        self.assertFalse(raw_path.exists())
 
     def test_validator_accepts_legacy_missing_reason_but_rejects_unknown_reason(self):
         _snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
@@ -2571,8 +2803,8 @@ class DexDepthCollectionTest(unittest.TestCase):
             "source_target_price_usd": "100",
             "price_difference_bps": "0",
             "usd_price_source_snapshot_id": "tvl-1",
-            "usd_price_observed_at": "2024-01-01T00:00:01+00:00",
-            "usd_price_skew_seconds": "1",
+            "usd_price_observed_at": "2024-01-01T00:00:00+00:00",
+            "usd_price_skew_seconds": "0",
             "usd_price_freshness_status": "current",
             "usd_price_source": "",
             "usd_price_source_endpoint": "",
@@ -2643,7 +2875,7 @@ class DexDepthCollectionTest(unittest.TestCase):
             "quote_to_usd": "1",
             "reference_price_usd_per_token": "100",
             "usd_price_source_snapshot_id": "tvl-1",
-            "usd_price_observed_at": "2024-01-01T00:00:01+00:00",
+            "usd_price_observed_at": "2024-01-01T00:00:00+00:00",
             "fee_status": "included_protocol_fee",
             "fee_rate_bps": "30",
             "fee_amount_usd": "",

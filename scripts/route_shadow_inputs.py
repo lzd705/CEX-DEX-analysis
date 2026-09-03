@@ -100,6 +100,7 @@ MAX_CONFIG_BYTES = 4 * 1024 * 1024
 MAX_AGGREGATE_SOURCE_BYTES = 256 * 1024 * 1024
 
 TYPED_SOURCE_LINEAGE_SCHEMA = "route_leg_typed_source_lineage/v1"
+TYPED_SOURCE_LINEAGE_SCHEMA_V2 = "route_leg_typed_source_lineage/v2"
 TYPED_SOURCE_MANIFEST_SCHEMA = "route_typed_source_manifest/v1"
 TYPED_SOURCE_LINEAGE_FIELDS = frozenset({"schema", "members"})
 TYPED_SOURCE_MEMBER_FIELDS = frozenset({
@@ -150,6 +151,18 @@ TYPED_SOURCE_ROLE_CONTRACTS = MappingProxyType({
         "content_schema": "route_v2_pool_state/v1",
         "max_bytes": 1024 * 1024,
     }),
+    "dex_market_rules": MappingProxyType({
+        "market_type": "dex",
+        "adapter_id": "route_dex_market_rules_source/v1",
+        "content_schema": "route_dex_market_rules_source/v1",
+        "max_bytes": 256 * 1024,
+    }),
+    "dex_usd_conversion": MappingProxyType({
+        "market_type": "dex",
+        "adapter_id": "route_dex_usd_conversion_source/v1",
+        "content_schema": "route_dex_usd_conversion_source/v1",
+        "max_bytes": 256 * 1024,
+    }),
     "dex_usd_price_context": MappingProxyType({
         "market_type": "dex",
         "adapter_id": "route_dex_usd_price_context/v1",
@@ -158,12 +171,21 @@ TYPED_SOURCE_ROLE_CONTRACTS = MappingProxyType({
     }),
 })
 
-_TYPED_ROLES_BY_MARKET_TYPE = MappingProxyType({
-    market_type: tuple(sorted(
-        role for role, contract in TYPED_SOURCE_ROLE_CONTRACTS.items()
-        if contract["market_type"] == market_type
-    ))
-    for market_type in ("cex", "dex")
+_TYPED_ROLES_BY_LINEAGE_SCHEMA = MappingProxyType({
+    TYPED_SOURCE_LINEAGE_SCHEMA: MappingProxyType({
+        "cex": (
+            "cex_market_rules",
+            "cex_raw_book_response",
+            "quote_usd_conversion",
+        ),
+        "dex": ("dex_pool_state", "dex_usd_price_context"),
+    }),
+    TYPED_SOURCE_LINEAGE_SCHEMA_V2: MappingProxyType({
+        "dex": tuple(sorted(
+            role for role, contract in TYPED_SOURCE_ROLE_CONTRACTS.items()
+            if contract["market_type"] == "dex"
+        )),
+    }),
 })
 _TYPED_BASENAME = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", flags=re.ASCII
@@ -222,16 +244,19 @@ def validate_typed_source_lineage(
     value: Mapping[str, Any], *, market_type: str
 ) -> Dict[str, Any]:
     """Validate and return a detached canonical typed-source lineage object."""
-    if market_type not in _TYPED_ROLES_BY_MARKET_TYPE:
+    if market_type not in {"cex", "dex"}:
         raise ValueError("typed-source market type is invalid")
+    schema = value.get("schema") if isinstance(value, Mapping) else None
+    roles_by_market_type = _TYPED_ROLES_BY_LINEAGE_SCHEMA.get(schema)
     if (
         not isinstance(value, Mapping)
         or set(value) != TYPED_SOURCE_LINEAGE_FIELDS
-        or value.get("schema") != TYPED_SOURCE_LINEAGE_SCHEMA
+        or roles_by_market_type is None
+        or market_type not in roles_by_market_type
         or not isinstance(value.get("members"), list)
     ):
         raise ValueError("typed-source lineage schema is invalid")
-    expected_roles = _TYPED_ROLES_BY_MARKET_TYPE[market_type]
+    expected_roles = roles_by_market_type[market_type]
     raw_members = value["members"]
     if len(raw_members) > 5:
         raise ValueError("typed-source member count is invalid")
@@ -296,7 +321,7 @@ def validate_typed_source_lineage(
         )})
     if aggregate_size > MAX_TYPED_SOURCE_AGGREGATE_BYTES:
         raise ValueError("typed-source aggregate bytes exceed the bound")
-    return {"schema": TYPED_SOURCE_LINEAGE_SCHEMA, "members": members}
+    return {"schema": schema, "members": members}
 
 
 def typed_source_lineage_observed_members(
@@ -306,13 +331,15 @@ def typed_source_lineage_observed_members(
     if market_type is None:
         if not isinstance(value, Mapping) or not isinstance(value.get("members"), list):
             raise ValueError("typed-source lineage is invalid")
+        schema = value.get("schema")
+        roles_by_market_type = _TYPED_ROLES_BY_LINEAGE_SCHEMA.get(schema, {})
         roles = {
             member.get("role")
             for member in value["members"]
             if isinstance(member, Mapping)
         }
         candidates = [
-            kind for kind, expected in _TYPED_ROLES_BY_MARKET_TYPE.items()
+            kind for kind, expected in roles_by_market_type.items()
             if roles == set(expected)
         ]
         if len(candidates) != 1:
@@ -827,6 +854,18 @@ def _chain_native_token_id(value: Any, *, chain: str, field: str) -> str:
         raise ValueError("collector Token identity is invalid") from error
     if canonical_address != address:
         raise ValueError("collector Token identity is non-canonical")
+    if (
+        (
+            canonical_address.startswith("0x")
+            and canonical_address[2:]
+            and not canonical_address[2:].strip("0")
+        )
+        or (
+            canonical_chain == "solana"
+            and not canonical_address.strip("1")
+        )
+    ):
+        raise ValueError("collector Token identity uses the zero address")
     return canonical_address
 
 
@@ -852,9 +891,10 @@ def _safe_source_endpoint(value: Any) -> str:
     safe_host = "[{}]".format(hostname) if ":" in hostname else hostname
     if port is not None:
         safe_host = "{}:{}".format(safe_host, port)
-    if urlunsplit((parsed.scheme, safe_host, parsed.path, "", "")) != text:
+    origin = urlunsplit((parsed.scheme, safe_host, "", "", ""))
+    if not text.startswith(origin):
         raise ValueError("source_endpoint is non-canonical")
-    return text
+    return origin
 
 
 def _cex_market_id(row: Mapping[str, Any]) -> str:

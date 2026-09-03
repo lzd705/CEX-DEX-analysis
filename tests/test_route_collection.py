@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,8 @@ from unittest.mock import patch
 from scripts.collect_route_cohort import (
     _ForkProcessExecutor,
     _RouteCollectionResult,
+    _attachment_authority_bytes,
+    _validated_attachment_authority,
     _safe_leg_projection,
     _validated_universe,
     collect_route_cohort as _collect_route_cohort,
@@ -31,6 +34,7 @@ from scripts.collect_route_cohort import (
 )
 from scripts.fetch_dex_depth import (
     ROUTE_V2_FEE_PROOF_SHA256,
+    freeze_v2_pool_state,
 )
 from scripts.fetch_cex_depth import collect_cex_market_observation
 from scripts.route_publication import load_latest_route_cohort
@@ -40,12 +44,222 @@ from scripts.route_quantity import V2PoolState, V2_FEE_FORMULA
 _TEST_RAW_DIRECTORY = tempfile.TemporaryDirectory(prefix="route-cohort-tests-")
 
 
+def _install_attachment_authority_fixture(
+    accepted: Path,
+    cohort: _RouteCollectionResult,
+    market_id: str,
+) -> None:
+    """Give hand-built attachment tests the same persisted trust boundary."""
+    cohort.setdefault("collection_input_generation", "fixture-input")
+    leg = next(
+        row for row in cohort["legs"] if row["market_id"] == market_id
+    )
+    leg.setdefault("leg_id", market_id)
+    raw = (accepted / "response.json").read_bytes()
+    authority = _attachment_authority_bytes(
+        market_id=market_id,
+        trusted_leg=leg,
+        collector_row=leg,
+        accepted_raw_sha256=hashlib.sha256(raw).hexdigest(),
+        collection_input_generation=cohort["collection_input_generation"],
+        validated_specs=cohort._typed_source_payloads[market_id],
+    )
+    (accepted / "attachment-authority.json").write_bytes(authority)
+
+
 def _child_reports_closed_descriptor(descriptor):
     try:
         os.fstat(descriptor)
     except OSError:
         return True
     return False
+
+
+def _typed_v2_pool_payload(
+    *,
+    pool_address="0x" + "3" * 40,
+    token0_address="0x" + "1" * 40,
+    token1_address="0x" + "2" * 40,
+    token0_decimals=18,
+    token1_decimals=6,
+    observed_at="2024-01-01T00:00:00+00:00",
+    raw_response_sha256="d" * 64,
+):
+    state = V2PoolState(
+        chain="eth",
+        chain_id=1,
+        dex="uniswap_v2",
+        pool_address=pool_address,
+        token0_address=token0_address,
+        token1_address=token1_address,
+        token0_decimals=token0_decimals,
+        token1_decimals=token1_decimals,
+        reserve0_raw=100 * 10**18,
+        reserve1_raw=10_000 * 10**6,
+        reserve_timestamp_last_raw=1_704_067_200,
+        fee_bps=30,
+        fee_numerator=9_970,
+        fee_denominator=10_000,
+        fee_formula=V2_FEE_FORMULA,
+        fee_proof_sha256=ROUTE_V2_FEE_PROOF_SHA256,
+        block_number=123,
+        block_hash="0x" + "a" * 64,
+        block_header_sha256="b" * 64,
+        observed_at=observed_at,
+        raw_response_sha256=raw_response_sha256,
+    )
+    integer_fields = {
+        "chain_id", "token0_decimals", "token1_decimals", "reserve0_raw",
+        "reserve1_raw", "reserve_timestamp_last_raw", "fee_bps",
+        "fee_numerator", "fee_denominator", "block_number",
+    }
+    return {
+        "schema": "route_v2_pool_state/v1",
+        **{
+            field: str(getattr(state, field)) if field in integer_fields
+            else getattr(state, field)
+            for field in (
+                "chain", "chain_id", "dex", "pool_address",
+                "token0_address", "token1_address", "token0_decimals",
+                "token1_decimals", "reserve0_raw", "reserve1_raw",
+                "reserve_timestamp_last_raw", "fee_bps", "fee_numerator",
+                "fee_denominator", "fee_formula", "fee_proof_sha256",
+                "block_number", "block_hash", "block_header_sha256",
+                "observed_at", "raw_response_sha256", "state_id",
+            )
+        },
+    }
+
+
+def _typed_dex_inventory_fixture():
+    market_id = (
+        "dex:eth:uniswap_v2:"
+        "0x3333333333333333333333333333333333333333:AAVE"
+    )
+    target = "0x" + "1" * 40
+    quote = "0x" + "2" * 40
+    state_hash = "d" * 64
+    source_hash = "e" * 64
+    context = {
+        "schema": "route_collector_context/v1",
+        "snapshot_id": "tvl-1",
+        "request_started_at": "2023-12-31T23:59:59+00:00",
+        "observed_at": "2024-01-01T00:00:01+00:00",
+        "response_received_at": "2024-01-01T00:00:01+00:00",
+        "status": "observed",
+        "reason_code": "observed",
+        "pool_name": "AAVE / USDC",
+        "base_token_id": "eth_" + target,
+        "quote_token_id": "eth_" + quote,
+        "base_token_price_usd": "100",
+        "quote_token_price_usd": "1",
+        "tvl_method": "geckoterminal_reserve_in_usd",
+        "source": "GeckoTerminal API v2",
+        "source_endpoint": "https://api.example.test/pools",
+        "raw_response_sha256": source_hash,
+    }
+    leg = {
+        "market_id": market_id,
+        "market_type": "dex",
+        "token_symbol": "AAVE",
+        "target_token_address": target,
+        "target_token_side": "base",
+        "collector_context": context,
+    }
+    row = {
+        "market_id": market_id,
+        "market_type": "dex",
+        "status": "observed",
+        "token_symbol": "AAVE",
+        "chain": "eth",
+        "dex": "uniswap_v2",
+        "pool_address": "0x" + "3" * 40,
+        "block_timestamp": "2024-01-01T00:00:00+00:00",
+        "target_token_position": "token0",
+        "target_token_address": target,
+        "token0_address": target,
+        "token0_symbol": "AAVE",
+        "token0_decimals": "18",
+        "token0_price_usd": "100",
+        "token1_address": quote,
+        "token1_symbol": "USDC",
+        "token1_decimals": "6",
+        "token1_price_usd": "1",
+        "usd_price_source_snapshot_id": "tvl-1",
+        "usd_price_observed_at": "2024-01-01T00:00:01+00:00",
+        "usd_price_source": "GeckoTerminal API v2",
+        "usd_price_source_endpoint": "https://api.example.test/pools",
+        "usd_price_raw_response_sha256": source_hash,
+        "raw_response_sha256": state_hash,
+    }
+    rules = {
+        "schema": "route_dex_market_rules_source/v1",
+        "market_id": market_id,
+        "base_asset": "AAVE",
+        "quote_asset": "USDC",
+        "base_token_address": target,
+        "quote_token_address": quote,
+        "base_unit_decimals": 18,
+        "quote_unit_decimals": 6,
+        "base_increment": "0.000000000000000001",
+        "quote_increment": "0.000001",
+        "min_base_quantity": "0",
+        "min_quote_notional": "0",
+        "increment_source": "fixed_block_token_decimals",
+        "minimum_source": "dex_protocol_no_additional_order_minimum",
+        "observed_at": "2024-01-01T00:00:00+00:00",
+        "valid_until": "2024-01-01T00:02:00+00:00",
+        "raw_response_sha256": state_hash,
+    }
+    conversion = {
+        "schema": "route_dex_usd_conversion_source/v1",
+        "market_id": market_id,
+        "target_asset": "AAVE",
+        "target_token_address": target,
+        "quote_asset": "USDC",
+        "quote_token_address": quote,
+        "usd_per_quote": "1",
+        "value_status": "measured",
+        "observed_at": "2024-01-01T00:00:01+00:00",
+        "valid_until": "2024-01-01T02:00:01+00:00",
+        "state_observed_at": "2024-01-01T00:00:00+00:00",
+        "source": "GeckoTerminal API v2",
+        "source_snapshot_id": "tvl-1",
+        "source_raw_response_sha256": source_hash,
+        "state_raw_response_sha256": state_hash,
+    }
+    return leg, row, _typed_v2_pool_payload(), rules, conversion
+
+
+def _typed_payload_values(pool, rules, conversion):
+    return [
+        {
+            "role": role,
+            "payload": json.dumps(
+                payload, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8"),
+        }
+        for role, payload in (
+            ("dex_pool_state", pool),
+            ("dex_market_rules", rules),
+            ("dex_usd_conversion", conversion),
+        )
+    ]
+
+
+def _validate_cex_typed_payloads(market_id, values):
+    from scripts.collect_route_cohort import _validated_typed_payload_inventory
+
+    raw_sha256 = "a" * 64
+    return _validated_typed_payload_inventory(
+        trusted_leg={"market_id": market_id, "market_type": "cex"},
+        collector_row={
+            "status": "observed",
+            "raw_response_sha256": raw_sha256,
+        },
+        accepted_raw_sha256=raw_sha256,
+        values=values,
+    )
 
 
 class ForkProcessCloseFdContractTests(unittest.TestCase):
@@ -93,6 +307,121 @@ class ForkProcessCloseFdContractTests(unittest.TestCase):
 
 
 class TypedSourceProducerTests(unittest.TestCase):
+    def test_attachment_authority_never_retains_endpoint_credentials(self):
+        market_id = "cex:okx:UNI/USDT"
+        raw_sha = "d" * 64
+        endpoint = "https://example.test/v2/APIKEY-very-secret"
+        leg = {
+            "market_id": market_id,
+            "market_type": "cex",
+            "source_endpoint": endpoint,
+        }
+        row = {
+            "market_id": market_id,
+            "market_type": "cex",
+            "status": "observed",
+            "raw_response_sha256": raw_sha,
+            "source_endpoint": endpoint,
+        }
+
+        encoded = _attachment_authority_bytes(
+            market_id=market_id,
+            trusted_leg=leg,
+            collector_row=row,
+            accepted_raw_sha256=raw_sha,
+            collection_input_generation="input-a",
+            validated_specs=(),
+        )
+        authority = json.loads(encoded)
+
+        self.assertNotIn(b"secret", encoded)
+        self.assertEqual(
+            authority["collector_row"]["source_endpoint"],
+            "https://example.test",
+        )
+
+    def test_shadow_collector_context_reduces_endpoint_path_to_origin(self):
+        from tests.test_route_shadow_inputs import ProductionInputFixture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ProductionInputFixture(temporary)
+            path = fixture.data_dir / "dex_pool_tvl_latest.csv"
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                fields = list(reader.fieldnames or [])
+                rows = list(reader)
+            rows[0]["source_endpoint"] = (
+                "https://api.example.test/v2/APIKEY-very-secret"
+            )
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=fields, lineterminator="\n"
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            universe, _manifest = fixture.build()
+
+        dex_leg = next(
+            leg for leg in universe["selected_legs"]
+            if leg["market_type"] == "dex"
+        )
+        self.assertEqual(
+            dex_leg["collector_context"]["source_endpoint"],
+            "https://api.example.test",
+        )
+        self.assertNotIn(
+            "APIKEY-very-secret", json.dumps(universe, sort_keys=True)
+        )
+
+    def test_attach_rejects_in_place_response_rewrite_after_authority_read(self):
+        market_id = "cex:okx:UNI/USDT"
+        cohort = _RouteCollectionResult({
+            "raw_evidence_run_id": "response-rewrite-run",
+            "legs": [{
+                "market_id": market_id,
+                "market_type": "cex",
+                "status": "observed",
+                "raw_response_sha256": hashlib.sha256(
+                    b'{"book":1}'
+                ).hexdigest(),
+            }],
+        }, {market_id: ()})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            raw_root = Path(temporary)
+            accepted = (
+                raw_root / "response-rewrite-run" / "accepted"
+                / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
+            )
+            accepted.mkdir(parents=True)
+            response_path = accepted / "response.json"
+            response_path.write_bytes(b'{"book":1}')
+            _install_attachment_authority_fixture(
+                accepted, cohort, market_id
+            )
+            response_inode = response_path.stat().st_ino
+
+            def rewrite_after_authority_read(payload, **kwargs):
+                validated = _validated_attachment_authority(
+                    payload, **kwargs
+                )
+                response_path.write_bytes(b'{"book":2}')
+                self.assertEqual(response_path.stat().st_ino, response_inode)
+                return validated
+
+            with patch(
+                "scripts.collect_route_cohort._validated_attachment_authority",
+                side_effect=rewrite_after_authority_read,
+            ), self.assertRaisesRegex(
+                ValueError, "accepted|source|changed|invalid"
+            ):
+                attach_typed_source_lineage(cohort, raw_root=raw_root)
+
+            self.assertFalse((raw_root / "response-rewrite-run/typed").exists())
+            self.assertFalse(
+                (raw_root / "response-rewrite-run/typed-manifest.json").exists()
+            )
+
     def test_cex_producer_flows_through_fork_capability_and_attach(self):
         left = "cex:binance:UNI/USDT"
         right = "cex:bybit:UNI/USDT"
@@ -271,6 +600,462 @@ class TypedSourceProducerTests(unittest.TestCase):
             self.assertLessEqual(observed, cohort_now)
             self.assertLess(cohort_now, valid_until)
 
+    def test_built_universe_dex_leg_reaches_default_collector_from_context(self):
+        from scripts.fetch_dex_depth import (
+            SELECTOR_DECIMALS,
+            SELECTOR_GET_RESERVES,
+            SELECTOR_SYMBOL,
+            SELECTOR_TOKEN0,
+            SELECTOR_TOKEN1,
+            collect_dex_pool_observation,
+        )
+        from tests.test_route_shadow_inputs import (
+            BLOCK_TIME,
+            POOL,
+            ProductionInputFixture,
+        )
+
+        target = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+        quote = "0x" + "2" * 40
+        case = self
+
+        def word(value):
+            return "{:064x}".format(value % (1 << 256))
+
+        def address_result(address):
+            return "0x" + ("0" * 24) + address[2:]
+
+        def uint_result(*values):
+            return "0x" + "".join(word(value) for value in values)
+
+        def string_result(value):
+            encoded = value.encode("utf-8")
+            padded = encoded.hex().ljust(
+                ((len(encoded) + 31) // 32) * 64, "0"
+            )
+            return "0x" + word(32) + word(len(encoded)) + padded
+
+        class FixtureRpc:
+            endpoint = "https://rpc.example.test"
+
+            def __init__(self):
+                self.records = []
+
+            def eth_calls(self, to, data_values, block_tag):
+                self.records.append({
+                    "request": {
+                        "to": to,
+                        "data": data_values,
+                        "block": block_tag,
+                    },
+                    "response": "fixture",
+                })
+                if data_values == [
+                    SELECTOR_TOKEN0,
+                    SELECTOR_TOKEN1,
+                    SELECTOR_GET_RESERVES,
+                ]:
+                    return [
+                        address_result(target),
+                        address_result(quote),
+                        uint_result(100 * 10**18, 10_000 * 10**6, 0),
+                    ]
+                if to == target:
+                    case.assertEqual(
+                        data_values, [SELECTOR_DECIMALS, SELECTOR_SYMBOL]
+                    )
+                    return [uint_result(18), string_result("UNI")]
+                if to == quote:
+                    case.assertEqual(
+                        data_values, [SELECTOR_DECIMALS, SELECTOR_SYMBOL]
+                    )
+                    return [uint_result(6), string_result("USDC")]
+                case.fail("unexpected RPC target: {}".format(to))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ProductionInputFixture(temporary)
+            universe, _manifest = fixture.build()
+            for leg in universe["selected_legs"]:
+                volume_field = (
+                    "dex_24h_usd"
+                    if leg["market_type"] == "dex"
+                    else "cex_selected_window_usd"
+                )
+                leg["selection_inputs"][volume_field] = "1"
+            for route in universe["routes"]:
+                route["buy_reference_volume_usd"] = "1"
+                route["sell_reference_volume_usd"] = "1"
+                route["route_volume_usd"] = "1"
+            raw_root = Path(temporary) / "route-raw"
+            captured = {}
+            rpc = FixtureRpc()
+
+            def default_dex(
+                leg,
+                *,
+                typed_source_payload_sink,
+                **kwargs
+            ):
+                captured.update(leg)
+                return collect_dex_pool_observation(
+                    leg,
+                    client=rpc,
+                    typed_source_payload_sink=typed_source_payload_sink,
+                    **kwargs
+                )
+
+            def collect_cex(leg, *, raw_path, **_kwargs):
+                payload = b'{"fixture":"cex"}'
+                raw_path.write_bytes(payload)
+                return {
+                    "market_id": leg["market_id"],
+                    "status": "observed",
+                    "observed_at": "2026-08-02T12:00:00+00:00",
+                    "state_observed_at": "2026-08-02T12:00:00+00:00",
+                    "exchange": "binance",
+                    "cex_symbol": "UNI/USDT",
+                    "token_symbol": "UNI",
+                    "raw_response_sha256": hashlib.sha256(payload).hexdigest(),
+                }
+
+            block_epoch = int(datetime.fromisoformat(BLOCK_TIME).timestamp())
+            header = {
+                "number": "0x7b",
+                "hash": "0x" + "a" * 64,
+                "parent_hash": "0x" + "b" * 64,
+                "timestamp": hex(block_epoch),
+                "base_fee_per_gas": "0x3b9aca00",
+                "gas_used": "0xe4e1c0",
+                "gas_limit": "0x1c9c380",
+            }
+            wall = iter([
+                datetime(2026, 8, 2, 12, 0, 1, tzinfo=timezone.utc),
+                datetime(2026, 8, 2, 12, 0, 2, tzinfo=timezone.utc),
+            ])
+            result = _collect_route_cohort(
+                universe,
+                cex_collector=collect_cex,
+                dex_collector=default_dex,
+                dex_block_resolver=lambda *_args, **_kwargs: {
+                    "block_number": 123,
+                    "block_timestamp": BLOCK_TIME,
+                    "chain_id": "0x1",
+                    "block_header": header,
+                },
+                raw_root=raw_root,
+                snapshot_id="built-universe-default-dex",
+                executor_factory=ThreadPoolExecutor,
+                source_generation_reader=lambda: universe[
+                    "candidate_source_generation"
+                ],
+                expected_source_generation=universe[
+                    "candidate_source_generation"
+                ],
+                wall_clock=lambda: next(wall),
+            )
+
+            dex_id = "dex:eth:uniswap_v2:{}:UNI".format(POOL)
+            original_legs = json.loads(json.dumps(result["legs"]))
+            original_payloads = result._typed_source_payloads
+            attacked_legs = []
+            for leg in result["legs"]:
+                if leg["market_id"] != dex_id:
+                    attacked_legs.append(leg)
+                    continue
+                context = {
+                    **leg["collector_context"],
+                    "pool_name": "forged pool",
+                    "quote_token_price_usd": "999",
+                    "raw_response_sha256": "f" * 64,
+                }
+                attacked_legs.append({
+                    **leg,
+                    "collector_context": context,
+                    "pool_name": "forged pool",
+                    "token1_price_usd": "999",
+                    "usd_price_raw_response_sha256": "f" * 64,
+                })
+            attacked_members = []
+            for member in original_payloads[dex_id]:
+                if member["role"] != "dex_usd_conversion":
+                    attacked_members.append(member)
+                    continue
+                conversion = {
+                    **json.loads(member["payload"]),
+                    "usd_per_quote": "999",
+                    "source_raw_response_sha256": "f" * 64,
+                }
+                payload = json.dumps(
+                    conversion, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                attacked_members.append({
+                    **member,
+                    "payload": payload,
+                    "logical_generation": hashlib.sha256(payload).hexdigest(),
+                })
+            self.assertIn(
+                "dex_usd_conversion",
+                {member["role"] for member in attacked_members},
+            )
+            result["legs"] = attacked_legs
+            result._typed_source_payloads = {
+                **original_payloads,
+                dex_id: tuple(attacked_members),
+            }
+            with self.assertRaisesRegex(
+                ValueError, "typed-source.*invalid|authority"
+            ):
+                attach_typed_source_lineage(result, raw_root=raw_root)
+            result["legs"] = original_legs
+            result._typed_source_payloads = original_payloads
+
+        dex_row = next(
+            row for row in result["legs"] if row["market_id"] == dex_id
+        )
+        self.assertEqual(
+            dex_row["status"], "observed", msg=json.dumps(dex_row, sort_keys=True)
+        )
+        self.assertEqual(captured["token_symbol"], "UNI")
+        self.assertEqual(captured["chain"], "eth")
+        self.assertEqual(captured["dex"], "uniswap_v2")
+        self.assertEqual(captured["pool_address"], POOL)
+        self.assertEqual(captured["base_token_id"], "eth_" + target)
+        self.assertEqual(captured["quote_token_id"], "eth_" + quote)
+        self.assertEqual(captured["base_token_price_usd"], "100")
+        self.assertEqual(captured["quote_token_price_usd"], "1")
+
+    def test_built_universe_rejects_zero_dex_collector_token_address(self):
+        from tests.test_route_shadow_inputs import ProductionInputFixture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ProductionInputFixture(temporary)
+            path = fixture.data_dir / "dex_pool_tvl_latest.csv"
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                fieldnames = reader.fieldnames
+                rows = list(reader)
+            rows[0]["quote_token_id"] = "eth_0x" + "0" * 40
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=fieldnames, lineterminator="\n"
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+
+            with self.assertRaisesRegex(ValueError, "zero address"):
+                fixture.build()
+
+    def test_missing_and_stale_usd_context_retain_fixed_block_rules_only(self):
+        from scripts.fetch_dex_depth import collect_dex_pool_observation
+        from tests.test_fetch_dex_depth import FakeV2Rpc
+
+        target = "0x" + "1" * 40
+        quote = "0x" + "2" * 40
+        left = "dex:eth:uniswap_v2:0x" + "3" * 40 + ":AAVE"
+        right = "dex:eth:uniswap_v2:0x" + "4" * 40 + ":AAVE"
+
+        def missing_context(pool_name):
+            return {
+                "schema": "route_collector_context/v1",
+                "snapshot_id": "tvl-missing",
+                "request_started_at": "2023-12-31T23:59:58+00:00",
+                "observed_at": "2023-12-31T23:59:59+00:00",
+                "response_received_at": "2024-01-01T00:00:00+00:00",
+                "status": "missing",
+                "reason_code": "source_no_tvl_observation",
+                "pool_name": pool_name,
+                "base_token_id": None,
+                "quote_token_id": None,
+                "base_token_price_usd": None,
+                "quote_token_price_usd": None,
+                "tvl_method": "geckoterminal_reserve_in_usd",
+                "source": "GeckoTerminal API v2",
+                "source_endpoint": "https://api.example.test/pools",
+                "raw_response_sha256": "e" * 64,
+            }
+
+        def stale_context(pool_name):
+            return {
+                **missing_context(pool_name),
+                "request_started_at": "2023-12-31T20:59:58+00:00",
+                "observed_at": "2023-12-31T20:59:59+00:00",
+                "response_received_at": "2023-12-31T21:00:00+00:00",
+                "status": "observed",
+                "reason_code": "observed",
+                "base_token_id": "eth_" + target,
+                "quote_token_id": "eth_" + quote,
+                "base_token_price_usd": "100",
+                "quote_token_price_usd": "1",
+            }
+
+        universe = {
+            "candidate_source_generation": "generation-a",
+            "selected_legs": [
+                {
+                    "market_id": market_id,
+                    "market_type": "dex",
+                    "token_symbol": "AAVE",
+                    "target_token_address": target,
+                    "target_token_side": (
+                        None if market_id == left else "base"
+                    ),
+                    "collector_context": (
+                        missing_context("AAVE / unknown")
+                        if market_id == left
+                        else stale_context("AAVE / USDC")
+                    ),
+                }
+                for market_id in (left, right)
+            ],
+            "routes": [_strict_route(
+                "AAVE", left, right, "atomic_onchain"
+            )],
+        }
+        header = {
+            "number": "0x7b",
+            "hash": "0x" + "a" * 64,
+            "parent_hash": "0x" + "b" * 64,
+            "timestamp": "0x65920080",
+            "base_fee_per_gas": "0x3b9aca00",
+            "gas_used": "0xe4e1c0",
+            "gas_limit": "0x1c9c380",
+        }
+
+        def default_dex(
+            leg,
+            *,
+            typed_source_payload_sink,
+            allow_degraded_usd_context=False,
+            **kwargs
+        ):
+            self.assertTrue(allow_degraded_usd_context)
+            return collect_dex_pool_observation(
+                leg,
+                rpc_factory=lambda chain, url, **_kwargs: FakeV2Rpc(
+                    chain, url
+                ),
+                typed_source_payload_sink=typed_source_payload_sink,
+                allow_degraded_usd_context=allow_degraded_usd_context,
+                **kwargs,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            raw_root = Path(temporary) / "raw"
+            wall = iter([
+                datetime(2024, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+                datetime(2024, 1, 1, 0, 0, 2, tzinfo=timezone.utc),
+            ])
+            cohort = _collect_route_cohort(
+                universe,
+                cex_collector=lambda *_args, **_kwargs: self.fail(
+                    "unexpected CEX"
+                ),
+                dex_collector=default_dex,
+                dex_block_resolver=lambda *_args, **_kwargs: {
+                    "block_number": 123,
+                    "block_timestamp": "2024-01-01T00:00:00+00:00",
+                    "chain_id": "0x1",
+                    "block_header": header,
+                },
+                raw_root=raw_root,
+                snapshot_id="missing-usd-context",
+                executor_factory=ThreadPoolExecutor,
+                source_generation_reader=lambda: "generation-a",
+                expected_source_generation="generation-a",
+                wall_clock=lambda: next(wall),
+            )
+
+            original_legs = [dict(leg) for leg in cohort["legs"]]
+            original_payloads = cohort._typed_source_payloads
+            attacked_market = left
+            attacked_members = []
+            for member in original_payloads[attacked_market]:
+                payload = json.loads(member["payload"])
+                if member["role"] == "dex_pool_state":
+                    payload["token1_decimals"] = "8"
+                    state = freeze_v2_pool_state({
+                        **payload,
+                        **{
+                            field: int(payload[field])
+                            for field in (
+                                "chain_id", "token0_decimals",
+                                "token1_decimals", "reserve0_raw",
+                                "reserve1_raw", "reserve_timestamp_last_raw",
+                                "fee_bps", "fee_numerator",
+                                "fee_denominator", "block_number",
+                            )
+                        },
+                    })
+                    payload["state_id"] = state.state_id
+                elif member["role"] == "dex_market_rules":
+                    payload["quote_unit_decimals"] = 8
+                    payload["quote_increment"] = "0.00000001"
+                encoded = json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                attacked_members.append({
+                    **member,
+                    "payload": encoded,
+                    "logical_generation": (
+                        payload["state_id"].split(":", 1)[1]
+                        if member["role"] == "dex_pool_state"
+                        else hashlib.sha256(encoded).hexdigest()
+                    ),
+                })
+            cohort["legs"] = [
+                {
+                    **leg,
+                    **(
+                        {"token1_decimals": "8"}
+                        if leg["market_id"] == attacked_market
+                        else {}
+                    ),
+                }
+                for leg in cohort["legs"]
+            ]
+            cohort._typed_source_payloads = {
+                **original_payloads,
+                attacked_market: tuple(attacked_members),
+            }
+            with self.assertRaisesRegex(
+                ValueError, "typed-source.*invalid|authority"
+            ):
+                attach_typed_source_lineage(cohort, raw_root=raw_root)
+
+            cohort["legs"] = original_legs
+            cohort._typed_source_payloads = original_payloads
+            normalized, publication = attach_typed_source_lineage(
+                cohort, raw_root=raw_root
+            )
+
+        self.assertTrue(all(
+            leg["status"] == "partial" and leg["available"] is False
+            for leg in cohort["legs"]
+        ), msg=cohort["legs"])
+        self.assertTrue(all(
+            leg["token0_price_usd"] is None
+            and leg["token1_price_usd"] is None
+            and leg["total_depth_100bps_usd"] == ""
+            for leg in cohort["legs"]
+        ))
+        self.assertEqual(
+            cohort["route_rows"][0]["timing_status"], "unavailable"
+        )
+        self.assertEqual(
+            cohort["route_rows"][0]["reason_code"], "buy_leg_unavailable"
+        )
+        self.assertEqual(publication["manifest"]["member_count"], 6)
+        for leg in normalized["legs"]:
+            by_role = {
+                member["role"]: member
+                for member in leg["typed_source_lineage"]["members"]
+            }
+            self.assertEqual(by_role["dex_pool_state"]["status"], "observed")
+            self.assertEqual(by_role["dex_market_rules"]["status"], "observed")
+            self.assertEqual(by_role["dex_usd_conversion"]["status"], "unavailable")
+
     def test_pipeline_installs_typed_inventory_and_attaches_exact_core_lineage(self):
         with tempfile.TemporaryDirectory() as temporary:
             raw_root = Path(temporary) / "raw"
@@ -332,6 +1117,9 @@ class TypedSourceProducerTests(unittest.TestCase):
                 "adapter_id": "route_usd_conversion_source/v1",
                 "content_schema": "route_usd_conversion_source/v1",
             })})
+            _install_attachment_authority_fixture(
+                accepted, cohort, market_id
+            )
             normalized, publication = attach_typed_source_lineage(
                 cohort, raw_root=raw_root
             )
@@ -380,6 +1168,9 @@ class TypedSourceProducerTests(unittest.TestCase):
                     "quote_conversion_method": "caller supplied",
                 }],
             }, {market_id: ()})
+            _install_attachment_authority_fixture(
+                accepted, cohort, market_id
+            )
 
             normalized, publication = attach_typed_source_lineage(
                 cohort, raw_root=raw_root
@@ -431,6 +1222,51 @@ class TypedSourceProducerTests(unittest.TestCase):
             "typed_source_adapter_unsupported",
         )
 
+    def test_unavailable_dex_leg_never_publishes_mutable_collector_context(self):
+        market_id = (
+            "dex:eth:uniswap_v2:"
+            "0x3333333333333333333333333333333333333333:AAVE"
+        )
+        cohort = _RouteCollectionResult({
+            "raw_evidence_run_id": "run-terminal-dex-context",
+            "legs": [{
+                "market_id": market_id,
+                "market_type": "dex",
+                "status": "failed",
+                "available": False,
+                "reason_code": "collection_failed",
+                "collector_context": {
+                    "schema": "route_collector_context/v1",
+                    "snapshot_id": "forged",
+                    "request_started_at": "2024-01-01T00:00:00Z",
+                    "observed_at": "2024-01-01T00:00:00Z",
+                    "response_received_at": "2024-01-01T00:00:00Z",
+                    "status": "observed",
+                    "reason_code": "observed",
+                    "pool_name": "forged pool",
+                    "base_token_id": "eth_0x" + "1" * 40,
+                    "quote_token_id": "eth_0x" + "2" * 40,
+                    "base_token_price_usd": "999",
+                    "quote_token_price_usd": "999",
+                    "tvl_method": "forged",
+                    "source": "forged",
+                    "source_endpoint": "https://example.test/forged",
+                    "raw_response_sha256": "f" * 64,
+                },
+            }],
+        }, {})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            normalized, publication = attach_typed_source_lineage(
+                cohort, raw_root=Path(temporary)
+            )
+
+        self.assertEqual(publication["manifest"]["member_count"], 0)
+        self.assertFalse(any(
+            member["status"] == "observed"
+            for member in normalized["legs"][0]["typed_source_lineage"]["members"]
+        ))
+
     def test_supported_cex_missing_one_typed_member_marks_only_that_role_failed(self):
         with tempfile.TemporaryDirectory() as temporary:
             raw_root = Path(temporary) / "raw"
@@ -474,6 +1310,9 @@ class TypedSourceProducerTests(unittest.TestCase):
                 "adapter_id": "route_quantity_quote_for_book/v1",
                 "content_schema": "route_market_rules_source/v1",
             },)})
+            _install_attachment_authority_fixture(
+                accepted, cohort, market_id
+            )
 
             normalized, publication = attach_typed_source_lineage(
                 cohort, raw_root=raw_root
@@ -551,8 +1390,6 @@ class TypedSourceProducerTests(unittest.TestCase):
             "valid_until": "2026-08-01T12:01:00Z",
             "source": "USDT=USD proxy",
         }
-        from scripts.collect_route_cohort import _validated_typed_payload_inventory
-
         mutations = (
             ("rules-extra", "cex_market_rules", {**rules, "extra": True}),
             ("rules-zero", "cex_market_rules", {**rules, "base_increment": "0"}),
@@ -577,9 +1414,8 @@ class TypedSourceProducerTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(
                 ValueError, "typed-source worker inventory"
             ):
-                _validated_typed_payload_inventory(
+                _validate_cex_typed_payloads(
                     market_id,
-                    "cex",
                     [{
                         "role": role,
                         "payload": json.dumps(
@@ -593,9 +1429,8 @@ class TypedSourceProducerTests(unittest.TestCase):
             "min_base_quantity": "0",
             "min_quote_notional": "0",
         }
-        inventory = _validated_typed_payload_inventory(
+        inventory = _validate_cex_typed_payloads(
             market_id,
-            "cex",
             [{
                 "role": "cex_market_rules",
                 "payload": json.dumps(
@@ -609,9 +1444,8 @@ class TypedSourceProducerTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "typed-source worker inventory"
         ):
-            _validated_typed_payload_inventory(
+            _validate_cex_typed_payloads(
                 unsupported_market_id,
-                "cex",
                 [{
                     "role": "cex_market_rules",
                     "payload": json.dumps(
@@ -621,6 +1455,477 @@ class TypedSourceProducerTests(unittest.TestCase):
                     ).encode("utf-8"),
                 }],
             )
+
+    def test_dex_typed_payloads_require_exact_directional_identity_and_lineage(self):
+        from scripts.collect_route_cohort import _validated_typed_payload_inventory
+
+        market_id = (
+            "dex:eth:uniswap_v2:"
+            "0x3333333333333333333333333333333333333333:AAVE"
+        )
+        trusted_leg, collector_row, _pool, _rules, _conversion = (
+            _typed_dex_inventory_fixture()
+        )
+        target = "0x" + "1" * 40
+        quote = "0x" + "2" * 40
+        state_hash = "d" * 64
+        rules = {
+            "schema": "route_dex_market_rules_source/v1",
+            "market_id": market_id,
+            "base_asset": "AAVE",
+            "quote_asset": "USDC",
+            "base_token_address": target,
+            "quote_token_address": quote,
+            "base_unit_decimals": 18,
+            "quote_unit_decimals": 6,
+            "base_increment": "0.000000000000000001",
+            "quote_increment": "0.000001",
+            "min_base_quantity": "0",
+            "min_quote_notional": "0",
+            "increment_source": "fixed_block_token_decimals",
+            "minimum_source": "dex_protocol_no_additional_order_minimum",
+            "observed_at": "2024-01-01T00:00:00+00:00",
+            "valid_until": "2024-01-01T00:02:00+00:00",
+            "raw_response_sha256": state_hash,
+        }
+        conversion = {
+            "schema": "route_dex_usd_conversion_source/v1",
+            "market_id": market_id,
+            "target_asset": "AAVE",
+            "target_token_address": target,
+            "quote_asset": "USDC",
+            "quote_token_address": quote,
+            "usd_per_quote": "1",
+            "value_status": "measured",
+            "observed_at": "2024-01-01T00:00:01+00:00",
+            "valid_until": "2024-01-01T02:00:01+00:00",
+            "state_observed_at": "2024-01-01T00:00:00+00:00",
+            "source": "GeckoTerminal API v2",
+            "source_snapshot_id": "tvl-1",
+            "source_raw_response_sha256": "e" * 64,
+            "state_raw_response_sha256": state_hash,
+        }
+
+        inventory = _validated_typed_payload_inventory(
+            trusted_leg=trusted_leg,
+            collector_row=collector_row,
+            accepted_raw_sha256=state_hash,
+            values=[
+                {
+                    "role": "dex_market_rules",
+                    "payload": json.dumps(
+                        rules, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8"),
+                },
+                {
+                    "role": "dex_usd_conversion",
+                    "payload": json.dumps(
+                        conversion, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8"),
+                },
+            ],
+        )
+        self.assertEqual(
+            [member["role"] for member in inventory],
+            ["dex_market_rules", "dex_usd_conversion"],
+        )
+
+        mutations = (
+            ("rules-wrong-address", {**rules, "quote_token_address": "0x" + "3" * 40}, conversion),
+            ("rules-guessed-symbol", {**rules, "quote_asset": "QUOTE"}, conversion),
+            ("rules-fake-minimum", {**rules, "min_base_quantity": "1"}, conversion),
+            ("rules-window", {**rules, "valid_until": "2024-01-01T00:03:00+00:00"}, conversion),
+            ("conversion-wrong-address", rules, {**conversion, "quote_token_address": "0x" + "3" * 40}),
+            ("conversion-wrong-state-hash", rules, {**conversion, "state_raw_response_sha256": "f" * 64}),
+            ("conversion-window", rules, {**conversion, "valid_until": "2024-01-01T01:00:01+00:00"}),
+        )
+        for name, candidate_rules, candidate_conversion in mutations:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, "typed-source worker inventory"
+            ):
+                _validated_typed_payload_inventory(
+                    trusted_leg=trusted_leg,
+                    collector_row=collector_row,
+                    accepted_raw_sha256=state_hash,
+                    values=[
+                        {
+                            "role": "dex_market_rules",
+                            "payload": json.dumps(
+                                candidate_rules,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8"),
+                        },
+                        {
+                            "role": "dex_usd_conversion",
+                            "payload": json.dumps(
+                                candidate_conversion,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8"),
+                        },
+                    ],
+                )
+
+    def test_dex_typed_inventory_binds_trusted_leg_row_context_and_raw(self):
+        from scripts.collect_route_cohort import _validated_typed_payload_inventory
+
+        leg, row, pool, rules, conversion = _typed_dex_inventory_fixture()
+
+        def validate(
+            candidate_leg=leg,
+            candidate_row=row,
+            accepted_sha="d" * 64,
+            candidate_pool=pool,
+            candidate_rules=rules,
+            candidate_conversion=conversion,
+        ):
+            return _validated_typed_payload_inventory(
+                trusted_leg=candidate_leg,
+                collector_row=candidate_row,
+                accepted_raw_sha256=accepted_sha,
+                values=_typed_payload_values(
+                    candidate_pool, candidate_rules, candidate_conversion
+                ),
+            )
+
+        self.assertEqual(
+            [member["role"] for member in validate()],
+            ["dex_market_rules", "dex_pool_state", "dex_usd_conversion"],
+        )
+        other = "0x" + "4" * 40
+        binding_mismatches = {
+            "accepted-raw": {"accepted_sha": "f" * 64},
+            "target-address": {
+                "candidate_pool": _typed_v2_pool_payload(
+                    token0_address=other
+                ),
+                "candidate_rules": {
+                    **rules,
+                    "base_token_address": other,
+                },
+                "candidate_conversion": {
+                    **conversion,
+                    "target_token_address": other,
+                },
+            },
+            "quote-address": {
+                "candidate_pool": _typed_v2_pool_payload(
+                    token1_address=other
+                ),
+                "candidate_rules": {
+                    **rules,
+                    "quote_token_address": other,
+                },
+                "candidate_conversion": {
+                    **conversion,
+                    "quote_token_address": other,
+                },
+            },
+            "quote-decimals": {
+                "candidate_pool": _typed_v2_pool_payload(token1_decimals=8),
+                "candidate_rules": {
+                    **rules,
+                    "quote_unit_decimals": 8,
+                    "quote_increment": "0.00000001",
+                },
+            },
+            "state-time": {
+                "candidate_pool": _typed_v2_pool_payload(
+                    observed_at="2024-01-01T00:00:30+00:00"
+                ),
+                "candidate_rules": {
+                    **rules,
+                    "observed_at": "2024-01-01T00:00:30+00:00",
+                    "valid_until": "2024-01-01T00:02:30+00:00",
+                },
+                "candidate_conversion": {
+                    **conversion,
+                    "state_observed_at": "2024-01-01T00:00:30+00:00",
+                },
+            },
+            "state-hash": {
+                "candidate_pool": _typed_v2_pool_payload(
+                    raw_response_sha256="f" * 64
+                ),
+                "candidate_rules": {
+                    **rules,
+                    "raw_response_sha256": "f" * 64,
+                },
+                "candidate_conversion": {
+                    **conversion,
+                    "state_raw_response_sha256": "f" * 64,
+                },
+            },
+            "usd-rate": {
+                "candidate_conversion": {
+                    **conversion,
+                    "usd_per_quote": "2",
+                },
+            },
+            "usd-source": {
+                "candidate_conversion": {
+                    **conversion,
+                    "source": "other source",
+                },
+            },
+            "usd-snapshot": {
+                "candidate_conversion": {
+                    **conversion,
+                    "source_snapshot_id": "other-snapshot",
+                },
+            },
+            "usd-source-hash": {
+                "candidate_conversion": {
+                    **conversion,
+                    "source_raw_response_sha256": "f" * 64,
+                },
+            },
+            "usd-time": {
+                "candidate_conversion": {
+                    **conversion,
+                    "observed_at": "2024-01-01T00:00:02+00:00",
+                    "valid_until": "2024-01-01T02:00:02+00:00",
+                },
+            },
+            "row-context-price": {
+                "candidate_row": {**row, "token1_price_usd": "2"},
+                "candidate_conversion": {
+                    **conversion,
+                    "usd_per_quote": "2",
+                },
+            },
+        }
+        for name, arguments in binding_mismatches.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, "typed-source worker inventory"
+            ):
+                validate(**arguments)
+
+    def test_missing_dex_usd_lineage_keeps_independently_valid_rules(self):
+        from scripts.collect_route_cohort import _validated_typed_payload_inventory
+
+        leg, row, pool, rules, conversion = _typed_dex_inventory_fixture()
+        row_without_usd_lineage = {
+            **row,
+            "usd_price_source_snapshot_id": "",
+            "usd_price_observed_at": "",
+            "usd_price_source": "",
+            "usd_price_source_endpoint": "",
+            "usd_price_raw_response_sha256": "",
+        }
+
+        inventory = _validated_typed_payload_inventory(
+            trusted_leg=leg,
+            collector_row=row_without_usd_lineage,
+            accepted_raw_sha256="d" * 64,
+            values=_typed_payload_values(pool, rules, conversion)[:2],
+        )
+
+        self.assertEqual(
+            [member["role"] for member in inventory],
+            ["dex_market_rules", "dex_pool_state"],
+        )
+
+    def test_directional_dex_sources_without_pool_state_require_supported_evm(self):
+        from scripts.collect_route_cohort import _validated_typed_payload_inventory
+
+        leg, row, _pool, rules, conversion = _typed_dex_inventory_fixture()
+        unsupported_id = (
+            "dex:solana:orca:"
+            "0x3333333333333333333333333333333333333333:AAVE"
+        )
+        unsupported_context = {
+            **leg["collector_context"],
+            "base_token_id": "solana_" + "0x" + "1" * 40,
+            "quote_token_id": "solana_" + "0x" + "2" * 40,
+        }
+        unsupported_leg = {
+            **leg,
+            "market_id": unsupported_id,
+            "collector_context": unsupported_context,
+        }
+        unsupported_row = {
+            **row,
+            "market_id": unsupported_id,
+            "chain": "solana",
+            "dex": "orca",
+        }
+        values = _typed_payload_values(
+            _typed_v2_pool_payload(),
+            {**rules, "market_id": unsupported_id},
+            {**conversion, "market_id": unsupported_id},
+        )[1:]
+        with self.assertRaisesRegex(
+            ValueError, "typed-source worker inventory"
+        ):
+            _validated_typed_payload_inventory(
+                trusted_leg=unsupported_leg,
+                collector_row=unsupported_row,
+                accepted_raw_sha256="d" * 64,
+                values=values,
+            )
+
+        zero_target_rules = {
+            **rules,
+            "base_token_address": "0x" + "0" * 40,
+        }
+        zero_target_conversion = {
+            **conversion,
+            "target_token_address": "0x" + "0" * 40,
+        }
+        with self.assertRaisesRegex(
+            ValueError, "typed-source worker inventory"
+        ):
+            _validated_typed_payload_inventory(
+                trusted_leg=leg,
+                collector_row=row,
+                accepted_raw_sha256="d" * 64,
+                values=_typed_payload_values(
+                    _pool, zero_target_rules, zero_target_conversion
+                )[1:],
+            )
+
+    def test_dex_directional_payloads_cannot_mix_with_another_valid_pool_state(self):
+        from scripts.collect_route_cohort import _validated_typed_payload_inventory
+
+        market_id = (
+            "dex:eth:uniswap_v2:"
+            "0x3333333333333333333333333333333333333333:AAVE"
+        )
+        trusted_leg, collector_row, _pool, _rules, _conversion = (
+            _typed_dex_inventory_fixture()
+        )
+        rules = {
+            "schema": "route_dex_market_rules_source/v1",
+            "market_id": market_id,
+            "base_asset": "AAVE",
+            "quote_asset": "USDC",
+            "base_token_address": "0x" + "1" * 40,
+            "quote_token_address": "0x" + "2" * 40,
+            "base_unit_decimals": 18,
+            "quote_unit_decimals": 6,
+            "base_increment": "0.000000000000000001",
+            "quote_increment": "0.000001",
+            "min_base_quantity": "0",
+            "min_quote_notional": "0",
+            "increment_source": "fixed_block_token_decimals",
+            "minimum_source": "dex_protocol_no_additional_order_minimum",
+            "observed_at": "2024-01-01T00:00:00+00:00",
+            "valid_until": "2024-01-01T00:02:00+00:00",
+            "raw_response_sha256": "d" * 64,
+        }
+        conversion = {
+            "schema": "route_dex_usd_conversion_source/v1",
+            "market_id": market_id,
+            "target_asset": "AAVE",
+            "target_token_address": "0x" + "1" * 40,
+            "quote_asset": "USDC",
+            "quote_token_address": "0x" + "2" * 40,
+            "usd_per_quote": "1",
+            "value_status": "measured",
+            "observed_at": "2024-01-01T00:00:01+00:00",
+            "valid_until": "2024-01-01T02:00:01+00:00",
+            "state_observed_at": "2024-01-01T00:00:00+00:00",
+            "source": "GeckoTerminal API v2",
+            "source_snapshot_id": "tvl-1",
+            "source_raw_response_sha256": "e" * 64,
+            "state_raw_response_sha256": "d" * 64,
+        }
+
+        def validate(pool):
+            return _validated_typed_payload_inventory(
+                trusted_leg=trusted_leg,
+                collector_row=collector_row,
+                accepted_raw_sha256="d" * 64,
+                values=[
+                    {
+                        "role": "dex_pool_state",
+                        "payload": json.dumps(
+                            pool, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                    },
+                    {
+                        "role": "dex_market_rules",
+                        "payload": json.dumps(
+                            rules, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                    },
+                    {
+                        "role": "dex_usd_conversion",
+                        "payload": json.dumps(
+                            conversion, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                    },
+                ],
+            )
+
+        self.assertEqual(
+            [member["role"] for member in validate(_typed_v2_pool_payload())],
+            ["dex_market_rules", "dex_pool_state", "dex_usd_conversion"],
+        )
+        mismatched_states = {
+            "pool-market": _typed_v2_pool_payload(
+                pool_address="0x" + "4" * 40
+            ),
+            "target-address": _typed_v2_pool_payload(
+                token0_address="0x" + "4" * 40
+            ),
+            "quote-decimals": _typed_v2_pool_payload(token1_decimals=8),
+            "observed-at": _typed_v2_pool_payload(
+                observed_at="2024-01-01T00:00:30+00:00"
+            ),
+            "raw-hash": _typed_v2_pool_payload(
+                raw_response_sha256="f" * 64
+            ),
+        }
+        for name, pool in mismatched_states.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, "typed-source worker inventory"
+            ):
+                validate(pool)
+
+    def test_attach_marks_missing_dex_directional_sources_unavailable_without_inference(self):
+        market_id = (
+            "dex:eth:uniswap_v2:"
+            "0x3333333333333333333333333333333333333333:AAVE"
+        )
+        raw = b'{"pool":1}'
+        cohort = _RouteCollectionResult({
+            "raw_evidence_run_id": "run-dex-missing-directional",
+            "legs": [{
+                "market_id": market_id,
+                "market_type": "dex",
+                "status": "observed",
+                "token_symbol": "AAVE",
+                "target_token_address": "0x" + "1" * 40,
+                "quote_token_address": "0x" + "2" * 40,
+                "quote_asset": "USDC",
+                "quote_to_usd": "999",
+                "raw_response_sha256": hashlib.sha256(raw).hexdigest(),
+            }],
+        }, {market_id: ()})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            accepted = (
+                Path(temporary) / "run-dex-missing-directional" / "accepted"
+                / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
+            )
+            accepted.mkdir(parents=True)
+            (accepted / "response.json").write_bytes(raw)
+            _install_attachment_authority_fixture(
+                accepted, cohort, market_id
+            )
+            normalized, publication = attach_typed_source_lineage(
+                cohort, raw_root=Path(temporary)
+            )
+
+        lineage = normalized["legs"][0]["typed_source_lineage"]
+        by_role = {member["role"]: member for member in lineage["members"]}
+        self.assertEqual(lineage["schema"], "route_leg_typed_source_lineage/v2")
+        self.assertEqual(publication["manifest"]["member_count"], 0)
+        self.assertEqual(by_role["dex_market_rules"]["status"], "unavailable")
+        self.assertEqual(by_role["dex_usd_conversion"]["status"], "unavailable")
 
     def test_fork_returned_dex_typed_inventory_is_sealed_then_physically_attached(self):
         left = (
@@ -634,8 +1939,20 @@ class TypedSourceProducerTests(unittest.TestCase):
         universe = {
             "candidate_source_generation": "generation-a",
             "selected_legs": [
-                {"market_id": left, "market_type": "dex", "chain": "eth"},
-                {"market_id": right, "market_type": "dex", "chain": "eth"},
+                {
+                    "market_id": left,
+                    "market_type": "dex",
+                    "chain": "eth",
+                    "token_symbol": "UNI",
+                    "target_token_address": "0x" + "1" * 40,
+                },
+                {
+                    "market_id": right,
+                    "market_type": "dex",
+                    "chain": "eth",
+                    "token_symbol": "UNI",
+                    "target_token_address": "0x" + "1" * 40,
+                },
             ],
             "routes": [{
                 "route_id": "route:UNI:{}->{}:atomic_onchain".format(left, right),
@@ -719,10 +2036,22 @@ class TypedSourceProducerTests(unittest.TestCase):
                 ).encode("utf-8"),
             })
             return {
+                "market_id": leg["market_id"],
+                "market_type": "dex",
                 "status": "observed",
+                "token_symbol": "UNI",
+                "chain": "eth",
+                "dex": "uniswap_v2",
+                "pool_address": pool_address,
                 "state_observed_at": fixed_block_timestamp,
                 "block_number": str(fixed_block_number),
                 "block_timestamp": fixed_block_timestamp,
+                "target_token_position": "token0",
+                "target_token_address": "0x" + "1" * 40,
+                "token0_address": "0x" + "1" * 40,
+                "token0_decimals": "18",
+                "token1_address": "0x" + "2" * 40,
+                "token1_decimals": "6",
                 "raw_response_sha256": raw_sha,
             }
 
@@ -759,7 +2088,36 @@ class TypedSourceProducerTests(unittest.TestCase):
                 ),
             )
             for directory in accepted.iterdir():
-                self.assertEqual([path.name for path in directory.iterdir()], ["response.json"])
+                self.assertEqual(
+                    sorted(path.name for path in directory.iterdir()),
+                    ["attachment-authority.json", "response.json"],
+                )
+
+            original_payloads = cohort._typed_source_payloads
+            cohort._typed_source_payloads = {
+                market_id: tuple(
+                    {
+                        **member,
+                        "payload": (
+                            b"{}"
+                            if market_id == left
+                            else member["payload"]
+                        ),
+                        "logical_generation": (
+                            hashlib.sha256(b"{}").hexdigest()
+                            if market_id == left
+                            else member["logical_generation"]
+                        ),
+                    }
+                    for member in members
+                )
+                for market_id, members in original_payloads.items()
+            }
+            with self.assertRaisesRegex(
+                ValueError, "typed-source.*invalid|payload capability"
+            ):
+                attach_typed_source_lineage(cohort, raw_root=raw_root)
+            cohort._typed_source_payloads = original_payloads
 
             normalized, publication = attach_typed_source_lineage(
                 cohort, raw_root=raw_root
@@ -967,6 +2325,118 @@ class TypedSourceProducerTests(unittest.TestCase):
                         for row in normalized["legs"]
                     ))
 
+    def test_attachment_authority_write_failure_never_promotes_half_entry(self):
+        universe = _strict_cex_universe()
+
+        def observed_cex(leg, *, raw_path, **_kwargs):
+            payload = ("raw:" + leg["market_id"]).encode("utf-8")
+            raw_path.write_bytes(payload)
+            return {
+                "status": "observed",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+                "raw_response_sha256": hashlib.sha256(payload).hexdigest(),
+            }
+
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "scripts.collect_route_cohort._write_regular_file_at",
+            side_effect=OSError("authority fsync failed"),
+        ):
+            raw_root = Path(temporary)
+            cohort = _collect_route_cohort(
+                universe,
+                cex_collector=observed_cex,
+                dex_collector=lambda *_args, **_kwargs: None,
+                raw_root=raw_root,
+                snapshot_id="authority-write-failure",
+                executor_factory=ThreadPoolExecutor,
+                source_generation_reader=lambda: "input-a",
+                expected_source_generation="input-a",
+            )
+            accepted = (
+                raw_root / cohort["raw_evidence_run_id"] / "accepted"
+            )
+            self.assertEqual(list(accepted.iterdir()), [])
+
+        self.assertEqual(cohort._typed_source_payloads, {})
+        self.assertTrue(all(
+            row["status"] == "failed"
+            and row["reason_code"] == "raw_evidence_path_unsafe"
+            for row in cohort["legs"]
+        ))
+
+    def test_authority_write_reread_swap_never_deletes_foreign_bytes(self):
+        from scripts.collect_route_cohort import (
+            _read_regular_file_at as real_read,
+            _write_regular_file_at,
+        )
+
+        name = "attachment-authority.json"
+        attempt_bytes = b'{"authority":"attempt"}'
+        foreign_bytes = b'{"authority":"foreign"}'
+        swapped = False
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            directory_descriptor = os.open(
+                str(directory),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+
+            def swap_before_reread(
+                descriptor, candidate_name, *, max_bytes=None
+            ):
+                nonlocal swapped
+                if not swapped and candidate_name == name:
+                    swapped = True
+                    os.rename(
+                        name,
+                        "rescued-attempt-authority.json",
+                        src_dir_fd=descriptor,
+                        dst_dir_fd=descriptor,
+                    )
+                    foreign_descriptor = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        os.write(foreign_descriptor, foreign_bytes)
+                        os.fsync(foreign_descriptor)
+                    finally:
+                        os.close(foreign_descriptor)
+                return real_read(
+                    descriptor, candidate_name, max_bytes=max_bytes
+                )
+
+            try:
+                with patch(
+                    "scripts.collect_route_cohort._read_regular_file_at",
+                    side_effect=swap_before_reread,
+                ), self.assertRaisesRegex(
+                    ValueError, "write changed|quarantine|unsafe"
+                ):
+                    _write_regular_file_at(
+                        directory_descriptor,
+                        name,
+                        attempt_bytes,
+                        max_bytes=1024,
+                    )
+            finally:
+                os.close(directory_descriptor)
+
+            self.assertTrue(swapped)
+            self.assertFalse((directory / name).exists())
+            self.assertEqual(
+                (directory / "rescued-attempt-authority.json").read_bytes(),
+                attempt_bytes,
+            )
+            quarantined = list(directory.glob(
+                ".raw-write-quarantine-*-attachment-authority.json"
+            ))
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual(quarantined[0].read_bytes(), foreign_bytes)
+
     def test_fixed_block_mismatch_discards_worker_typed_capability(self):
         left = "dex:eth:uniswap_v2:0x" + "3" * 40 + ":UNI"
         right = "dex:eth:uniswap_v2:0x" + "4" * 40 + ":UNI"
@@ -1117,6 +2587,414 @@ class TypedSourceProducerTests(unittest.TestCase):
             for row in manifest["members"]:
                 payload = (run_root / "typed" / row["filename"]).read_bytes()
                 self.assertEqual(hashlib.sha256(payload).hexdigest(), row["sha256"])
+
+    def test_postcommit_source_drift_rolls_back_new_typed_publication(self):
+        member = {
+            "market_id": "cex:okx:UNI/USDT",
+            "role": "cex_raw_book_response",
+            "payload": b'{"book":1}',
+            "logical_generation": "a" * 64,
+            "adapter_id": "fetch_cex_depth/parse_book/v1",
+            "content_schema": "route_bytes/v1",
+        }
+        validations = 0
+
+        def source_validator():
+            nonlocal validations
+            validations += 1
+            if validations == 2:
+                raise ValueError("accepted response changed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+            with self.assertRaisesRegex(ValueError, "response changed"):
+                publish_typed_source_manifest(
+                    run_root,
+                    raw_evidence_run_id="postcommit-drift",
+                    members=[member],
+                    source_validator=source_validator,
+                )
+            self.assertEqual(validations, 2)
+            self.assertFalse((run_root / "typed").exists())
+            self.assertFalse((run_root / "typed-manifest.json").exists())
+            quarantined_typed = list(
+                run_root.glob(".typed-quarantine-*-typed")
+            )
+            quarantined_manifests = list(
+                run_root.glob(
+                    ".typed-quarantine-*-typed-manifest.json"
+                )
+            )
+            self.assertEqual(len(quarantined_typed), 1)
+            self.assertEqual(len(quarantined_manifests), 1)
+            self.assertEqual(
+                (
+                    quarantined_typed[0]
+                    / "0000-cex_raw_book_response.json"
+                ).read_bytes(),
+                member["payload"],
+            )
+            self.assertEqual(
+                json.loads(quarantined_manifests[0].read_bytes())[
+                    "raw_evidence_run_id"
+                ],
+                "postcommit-drift",
+            )
+            self.assertEqual(
+                len(list(run_root.glob(".typed-stage-*"))), 1
+            )
+
+    def test_rollback_never_unlinks_same_name_foreign_member(self):
+        member = {
+            "market_id": "cex:okx:UNI/USDT",
+            "role": "cex_raw_book_response",
+            "payload": b'{"book":1}',
+            "logical_generation": "a" * 64,
+            "adapter_id": "fetch_cex_depth/parse_book/v1",
+            "content_schema": "route_bytes/v1",
+        }
+        validations = 0
+        foreign_bytes = b"FOREIGN-MEMBER-MUST-SURVIVE"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+
+            def source_validator():
+                nonlocal validations
+                validations += 1
+                if validations != 2:
+                    return
+                member_path = (
+                    run_root / "typed/0000-cex_raw_book_response.json"
+                )
+                member_path.rename(run_root / "rescued-attempt-member.json")
+                foreign = run_root / "foreign-member.json"
+                foreign.write_bytes(foreign_bytes)
+                foreign.rename(member_path)
+                raise ValueError("accepted response changed")
+
+            with self.assertRaisesRegex(ValueError, "response changed"):
+                publish_typed_source_manifest(
+                    run_root,
+                    raw_evidence_run_id="foreign-member-rollback",
+                    members=[member],
+                    source_validator=source_validator,
+                )
+
+            self.assertFalse((run_root / "typed").exists())
+            self.assertFalse((run_root / "typed-manifest.json").exists())
+            quarantined_typed = list(
+                run_root.glob(".typed-quarantine-*-typed")
+            )
+            self.assertEqual(len(quarantined_typed), 1)
+            self.assertEqual(
+                (
+                    quarantined_typed[0]
+                    / "0000-cex_raw_book_response.json"
+                ).read_bytes(),
+                foreign_bytes,
+            )
+            self.assertEqual(
+                (run_root / "rescued-attempt-member.json").read_bytes(),
+                member["payload"],
+            )
+            self.assertEqual(
+                len(list(run_root.glob(
+                    ".typed-quarantine-*-typed-manifest.json"
+                ))),
+                1,
+            )
+
+    def test_stage_cleanup_never_follows_replaced_stage_path(self):
+        member = {
+            "market_id": "cex:okx:UNI/USDT",
+            "role": "cex_raw_book_response",
+            "payload": b'{"book":1}',
+            "logical_generation": "a" * 64,
+            "adapter_id": "fetch_cex_depth/parse_book/v1",
+            "content_schema": "route_bytes/v1",
+        }
+        valuable_bytes = b"FOREIGN-STAGE-DATA-MUST-SURVIVE"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+
+            def replace_stage_then_fail():
+                stage = next(run_root.glob(".typed-stage-*"))
+                stage.rename(run_root / ".saved-attempt-stage")
+                stage.mkdir()
+                (stage / "typed").mkdir()
+                (stage / "typed/valuable.bin").write_bytes(valuable_bytes)
+                (stage / "typed-manifest.json").write_bytes(
+                    b"FOREIGN-MANIFEST-MUST-SURVIVE"
+                )
+                raise ValueError("accepted response changed")
+
+            with self.assertRaisesRegex(ValueError, "response changed"):
+                publish_typed_source_manifest(
+                    run_root,
+                    raw_evidence_run_id="foreign-stage-cleanup",
+                    members=[member],
+                    source_validator=replace_stage_then_fail,
+                )
+
+            foreign_stage = next(run_root.glob(".typed-stage-*"))
+            self.assertEqual(
+                (foreign_stage / "typed/valuable.bin").read_bytes(),
+                valuable_bytes,
+            )
+            self.assertEqual(
+                (foreign_stage / "typed-manifest.json").read_bytes(),
+                b"FOREIGN-MANIFEST-MUST-SURVIVE",
+            )
+            saved_stage = run_root / ".saved-attempt-stage"
+            self.assertEqual(
+                (
+                    saved_stage
+                    / "typed/0000-cex_raw_book_response.json"
+                ).read_bytes(),
+                member["payload"],
+            )
+            self.assertEqual(
+                json.loads(
+                    (saved_stage / "typed-manifest.json").read_bytes()
+                )["raw_evidence_run_id"],
+                "foreign-stage-cleanup",
+            )
+            self.assertFalse((run_root / "typed").exists())
+            self.assertFalse((run_root / "typed-manifest.json").exists())
+
+    def test_quarantine_detach_boundary_swap_preserves_all_bytes(self):
+        from scripts.collect_route_cohort import (
+            _rename_directory_entry as real_rename,
+        )
+
+        member_bytes = b'{"book":1}'
+        foreign_bytes = b"FOREIGN-TYPED-DIRECTORY-MUST-SURVIVE"
+        member = {
+            "market_id": "cex:okx:UNI/USDT",
+            "role": "cex_raw_book_response",
+            "payload": member_bytes,
+            "logical_generation": "a" * 64,
+            "adapter_id": "fetch_cex_depth/parse_book/v1",
+            "content_schema": "route_bytes/v1",
+        }
+        validations = 0
+        swapped = False
+        attempt_manifest_bytes = None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+
+            def fail_after_commit():
+                nonlocal validations, attempt_manifest_bytes
+                validations += 1
+                if validations == 2:
+                    attempt_manifest_bytes = (
+                        run_root / "typed-manifest.json"
+                    ).read_bytes()
+                    raise ValueError("accepted response changed")
+
+            def swap_at_detach(
+                source_name,
+                destination_name,
+                *,
+                source_directory_fd,
+                destination_directory_fd,
+            ):
+                nonlocal swapped
+                if (
+                    not swapped
+                    and source_name == "typed"
+                    and destination_name.startswith(".typed-quarantine-")
+                ):
+                    swapped = True
+                    real_rename(
+                        "typed",
+                        ".rescued-attempt-typed",
+                        source_directory_fd=source_directory_fd,
+                        destination_directory_fd=destination_directory_fd,
+                    )
+                    os.mkdir(
+                        "typed", mode=0o700, dir_fd=source_directory_fd
+                    )
+                    typed_descriptor = os.open(
+                        "typed",
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                        dir_fd=source_directory_fd,
+                    )
+                    try:
+                        foreign_descriptor = os.open(
+                            "valuable.bin",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=typed_descriptor,
+                        )
+                        try:
+                            os.write(foreign_descriptor, foreign_bytes)
+                            os.fsync(foreign_descriptor)
+                        finally:
+                            os.close(foreign_descriptor)
+                    finally:
+                        os.close(typed_descriptor)
+                return real_rename(
+                    source_name,
+                    destination_name,
+                    source_directory_fd=source_directory_fd,
+                    destination_directory_fd=destination_directory_fd,
+                )
+
+            with patch(
+                "scripts.collect_route_cohort._rename_directory_entry",
+                side_effect=swap_at_detach,
+            ), self.assertRaisesRegex(
+                ValueError, "quarantine|detach|changed|unsafe"
+            ):
+                publish_typed_source_manifest(
+                    run_root,
+                    raw_evidence_run_id="detach-boundary-swap",
+                    members=[member],
+                    source_validator=fail_after_commit,
+                )
+
+            self.assertTrue(swapped)
+            self.assertFalse((run_root / "typed-manifest.json").exists())
+            self.assertEqual(
+                (run_root / "typed/valuable.bin").read_bytes(),
+                foreign_bytes,
+            )
+            self.assertEqual(
+                (
+                    run_root
+                    / ".rescued-attempt-typed"
+                    / "0000-cex_raw_book_response.json"
+                ).read_bytes(),
+                member_bytes,
+            )
+            self.assertIsNotNone(attempt_manifest_bytes)
+            self.assertTrue(any(
+                path.is_file()
+                and path.read_bytes() == attempt_manifest_bytes
+                for path in run_root.glob(
+                    ".typed-quarantine-*-typed-manifest.json"
+                )
+            ))
+
+    def test_success_never_returns_after_run_root_path_is_replaced(self):
+        member_bytes = b'{"book":1}'
+        member = {
+            "market_id": "cex:okx:UNI/USDT",
+            "role": "cex_raw_book_response",
+            "payload": member_bytes,
+            "logical_generation": "a" * 64,
+            "adapter_id": "fetch_cex_depth/parse_book/v1",
+            "content_schema": "route_bytes/v1",
+        }
+        validations = 0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            run_root = parent / "run"
+            moved_root = parent / "moved-run"
+
+            def replace_root_after_commit():
+                nonlocal validations
+                validations += 1
+                if validations == 2:
+                    run_root.rename(moved_root)
+                    run_root.mkdir()
+
+            with self.assertRaisesRegex(
+                ValueError, "root|path|identity|unsafe|quarantine"
+            ):
+                publish_typed_source_manifest(
+                    run_root,
+                    raw_evidence_run_id="replaced-return-root",
+                    members=[member],
+                    source_validator=replace_root_after_commit,
+                )
+
+            self.assertEqual(validations, 2)
+            self.assertFalse((run_root / "typed-manifest.json").exists())
+            self.assertFalse((run_root / "typed").exists())
+            self.assertTrue(any(
+                path.is_file() and path.read_bytes() == member_bytes
+                for path in moved_root.rglob("*")
+            ))
+
+    def test_foreign_equal_bytes_manifest_is_never_restored_as_commit_marker(self):
+        member_bytes = b'{"book":1}'
+        member = {
+            "market_id": "cex:okx:UNI/USDT",
+            "role": "cex_raw_book_response",
+            "payload": member_bytes,
+            "logical_generation": "a" * 64,
+            "adapter_id": "fetch_cex_depth/parse_book/v1",
+            "content_schema": "route_bytes/v1",
+        }
+        validations = 0
+        manifest_bytes = None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+
+            def replace_publication_with_equal_bytes():
+                nonlocal validations, manifest_bytes
+                validations += 1
+                if validations != 2:
+                    return
+                manifest_path = run_root / "typed-manifest.json"
+                manifest_bytes = manifest_path.read_bytes()
+                manifest_path.rename(
+                    run_root / ".rescued-attempt-manifest.json"
+                )
+                (run_root / "typed").rename(
+                    run_root / ".rescued-attempt-typed"
+                )
+                (run_root / "typed").mkdir()
+                (
+                    run_root / "typed/0000-cex_raw_book_response.json"
+                ).write_bytes(member_bytes)
+                manifest_path.write_bytes(manifest_bytes)
+                raise ValueError("accepted response changed")
+
+            with self.assertRaisesRegex(
+                ValueError, "quarantine|foreign|changed|unsafe"
+            ):
+                publish_typed_source_manifest(
+                    run_root,
+                    raw_evidence_run_id="foreign-equal-bytes",
+                    members=[member],
+                    source_validator=replace_publication_with_equal_bytes,
+                )
+
+            self.assertIsNotNone(manifest_bytes)
+            self.assertFalse((run_root / "typed-manifest.json").exists())
+            self.assertEqual(
+                (
+                    run_root
+                    / ".rescued-attempt-typed"
+                    / "0000-cex_raw_book_response.json"
+                ).read_bytes(),
+                member_bytes,
+            )
+            self.assertEqual(
+                (run_root / ".rescued-attempt-manifest.json").read_bytes(),
+                manifest_bytes,
+            )
+            foreign_manifests = list(run_root.glob(
+                ".typed-quarantine-*-typed-manifest.json"
+            ))
+            self.assertEqual(len(foreign_manifests), 1)
+            self.assertEqual(
+                foreign_manifests[0].read_bytes(), manifest_bytes
+            )
+            self.assertEqual(
+                (
+                    run_root / "typed/0000-cex_raw_book_response.json"
+                ).read_bytes(),
+                member_bytes,
+            )
 
     def test_duplicate_role_market_and_postinstall_replacement_fail_closed(self):
         member = {
@@ -3266,7 +5144,10 @@ class RouteLegCollectionTests(unittest.TestCase):
         )
         self.assertTrue(all(call[1] == "cohort-test" for call in calls))
         self.assertEqual([row["status"] for row in result["legs"]], ["observed", "observed"])
-        self.assertEqual(result["legs"][0]["source_endpoint"], "https://example.test/depth")
+        self.assertEqual(
+            result["legs"][0]["source_endpoint"],
+            "https://example.test",
+        )
         self.assertNotIn("credential", result["legs"][0])
 
     def test_safe_leg_projection_recursively_drops_non_json_objects(self):

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 import argparse
+import base64
 import ctypes
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import errno
+import fcntl
 import hashlib
 import inspect
 import json
@@ -48,12 +50,15 @@ try:
         collect_dex_pool_observation,
         freeze_v2_pool_state,
         is_canonical_rpc_quantity,
+        protocol_model,
         rpc_url_for_chain,
         dex_market_id,
         load_pool_inventory,
     )
+    from scripts.execution_cost import USD_PRICE_SKEW_MAX_SECONDS
     from scripts.route_shadow_inputs import (
         TYPED_SOURCE_LINEAGE_SCHEMA,
+        TYPED_SOURCE_LINEAGE_SCHEMA_V2,
         TYPED_SOURCE_MANIFEST_FIELDS,
         TYPED_SOURCE_MANIFEST_MEMBER_FIELDS,
         TYPED_SOURCE_MANIFEST_SCHEMA,
@@ -61,7 +66,10 @@ try:
         typed_source_lineage_observed_members,
         validate_typed_source_lineage,
     )
-    from scripts.route_quantity import MarketRules
+    from scripts.route_quantity import (
+        MAX_DEX_QUANTITY_STATE_AGE_SECONDS,
+        MarketRules,
+    )
 except ModuleNotFoundError:
     from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
     from route_cohort import canonical_route_id, classify_route_timing
@@ -82,12 +90,15 @@ except ModuleNotFoundError:
         collect_dex_pool_observation,
         freeze_v2_pool_state,
         is_canonical_rpc_quantity,
+        protocol_model,
         rpc_url_for_chain,
         dex_market_id,
         load_pool_inventory,
     )
+    from execution_cost import USD_PRICE_SKEW_MAX_SECONDS
     from route_shadow_inputs import (  # type: ignore[no-redef]
         TYPED_SOURCE_LINEAGE_SCHEMA,
+        TYPED_SOURCE_LINEAGE_SCHEMA_V2,
         TYPED_SOURCE_MANIFEST_FIELDS,
         TYPED_SOURCE_MANIFEST_MEMBER_FIELDS,
         TYPED_SOURCE_MANIFEST_SCHEMA,
@@ -95,7 +106,7 @@ except ModuleNotFoundError:
         typed_source_lineage_observed_members,
         validate_typed_source_lineage,
     )
-    from route_quantity import MarketRules
+    from route_quantity import MAX_DEX_QUANTITY_STATE_AGE_SECONDS, MarketRules
 
 
 class _DaemonFutureExecutor:
@@ -150,7 +161,7 @@ class _DaemonFutureExecutor:
 
 
 class _RouteCollectionResult(dict):
-    """A normal JSON mapping plus one process-local sealed typed capability."""
+    """JSON cohort plus a transport copy checked against disk authority."""
 
     __slots__ = ("_typed_source_payloads",)
 
@@ -574,27 +585,482 @@ def _canonical_fingerprint(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _open_typed_publication_lock(
+    root_descriptor: int,
+) -> Tuple[int, Tuple[int, int]]:
+    name = ".typed-publication.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=root_descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        opened = os.fstat(descriptor)
+        named = os.stat(
+            name, dir_fd=root_descriptor, follow_symlinks=False
+        )
+        identity = (opened.st_dev, opened.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _attachment_file_fingerprint(opened)
+            != _attachment_file_fingerprint(named)
+        ):
+            raise _UnsafeRawEvidence(
+                "typed-source publication lock changed"
+            )
+        return descriptor, identity
+    except BaseException:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise
+
+
+def _require_typed_publication_lock(
+    root_descriptor: int,
+    lock_descriptor: int,
+    expected_identity: Tuple[int, int],
+) -> None:
+    opened = os.fstat(lock_descriptor)
+    named = os.stat(
+        ".typed-publication.lock",
+        dir_fd=root_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or (opened.st_dev, opened.st_ino) != expected_identity
+        or _attachment_file_fingerprint(opened)
+        != _attachment_file_fingerprint(named)
+    ):
+        raise _UnsafeRawEvidence("typed-source publication lock changed")
+
+
+def _require_typed_publication_root(
+    root: Path,
+    root_descriptor: int,
+    root_identity: Tuple[int, int],
+) -> None:
+    """Bind returned filesystem paths to the directory held during commit."""
+    _reject_symlink_ancestry(root)
+    _require_directory_identity(root, root_identity)
+    _descriptor_directory_identity(root_descriptor, root_identity)
+    _reject_symlink_ancestry(root)
+    _require_directory_identity(root, root_identity)
+
+
+def _typed_publication_file_evidence(
+    descriptor: int,
+    payload: bytes,
+) -> Dict[str, Any]:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size != len(payload)
+    ):
+        raise _UnsafeRawEvidence("typed-source publication file is unsafe")
+    return {
+        "fingerprint": _attachment_file_fingerprint(metadata),
+        "payload": payload,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _require_typed_publication_file(
+    parent_descriptor: int,
+    name: str,
+    descriptor: int,
+    evidence: Mapping[str, Any],
+    *,
+    changed_message: str,
+) -> None:
+    expected_payload = evidence.get("payload")
+    expected_fingerprint = evidence.get("fingerprint")
+    expected_sha256 = evidence.get("sha256")
+    if (
+        not isinstance(expected_payload, bytes)
+        or not isinstance(expected_fingerprint, tuple)
+        or len(expected_fingerprint) != 7
+        or not isinstance(expected_sha256, str)
+        or hashlib.sha256(expected_payload).hexdigest() != expected_sha256
+    ):
+        raise _UnsafeRawEvidence(changed_message)
+    try:
+        named_before = os.stat(
+            name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        opened_before = os.fstat(descriptor)
+        payload = _read_open_attachment_file(
+            descriptor, max_bytes=len(expected_payload)
+        )
+        opened_after = os.fstat(descriptor)
+        named_after = os.stat(
+            name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+    except (OSError, _UnsafeRawEvidence) as error:
+        raise _UnsafeRawEvidence(changed_message) from error
+    fingerprints = (
+        _attachment_file_fingerprint(named_before),
+        _attachment_file_fingerprint(opened_before),
+        _attachment_file_fingerprint(opened_after),
+        _attachment_file_fingerprint(named_after),
+    )
+    if (
+        any(value != expected_fingerprint for value in fingerprints)
+        or payload != expected_payload
+        or hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise _UnsafeRawEvidence(changed_message)
+
+
+def _open_typed_publication_file(
+    parent_descriptor: int,
+    name: str,
+    evidence: Mapping[str, Any],
+    *,
+    changed_message: str,
+) -> int:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise _UnsafeRawEvidence(changed_message)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise _UnsafeRawEvidence(changed_message) from error
+    try:
+        _require_typed_publication_file(
+            parent_descriptor,
+            name,
+            descriptor,
+            evidence,
+            changed_message=changed_message,
+        )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_typed_publication_inventory(
+    parent_descriptor: int,
+    name: str,
+    directory_identity: Tuple[int, int],
+    member_evidence: Mapping[str, Mapping[str, Any]],
+    *,
+    changed_message: str,
+) -> Tuple[int, Dict[str, int]]:
+    directory_descriptor = _open_directory_entry(
+        parent_descriptor, name, directory_identity
+    )
+    member_descriptors: Dict[str, int] = {}
+    try:
+        expected_names = sorted(member_evidence)
+        if sorted(os.listdir(directory_descriptor)) != expected_names:
+            raise _UnsafeRawEvidence(changed_message)
+        for member_name in expected_names:
+            member_descriptors[member_name] = _open_typed_publication_file(
+                directory_descriptor,
+                member_name,
+                member_evidence[member_name],
+                changed_message=changed_message,
+            )
+        if sorted(os.listdir(directory_descriptor)) != expected_names:
+            raise _UnsafeRawEvidence(changed_message)
+        return directory_descriptor, member_descriptors
+    except BaseException:
+        for descriptor in member_descriptors.values():
+            os.close(descriptor)
+        os.close(directory_descriptor)
+        raise
+
+
+def _capture_promoted_typed_file(
+    parent_descriptor: int,
+    name: str,
+    prior_evidence: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Refresh rename-mutated ctime while preserving inode and exact bytes."""
+    payload = prior_evidence["payload"]
+    prior_fingerprint = prior_evidence["fingerprint"]
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise _UnsafeRawEvidence(
+            "typed-source manifest changed during publication"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            (metadata.st_dev, metadata.st_ino)
+            != tuple(prior_fingerprint[:2])
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != len(payload)
+            or _read_open_attachment_file(
+                descriptor, max_bytes=len(payload)
+            ) != payload
+        ):
+            raise _UnsafeRawEvidence(
+                "typed-source manifest changed during publication"
+            )
+        evidence = _typed_publication_file_evidence(descriptor, payload)
+        _require_typed_publication_file(
+            parent_descriptor,
+            name,
+            descriptor,
+            evidence,
+            changed_message="typed-source manifest changed during publication",
+        )
+        return evidence
+    finally:
+        os.close(descriptor)
+
+
+def _detach_typed_publication_entry(
+    root_descriptor: int,
+    *,
+    canonical_name: str,
+    quarantine_name: str,
+    expected_identity: Tuple[int, int],
+    expected_kind: str,
+    restore_foreign: bool,
+) -> None:
+    """Move one public name aside without ever deleting its current target."""
+    _rename_directory_entry(
+        canonical_name,
+        quarantine_name,
+        source_directory_fd=root_descriptor,
+        destination_directory_fd=root_descriptor,
+    )
+    moved = _directory_entry_metadata(root_descriptor, quarantine_name)
+    moved_identity = (
+        None if moved is None else (moved.st_dev, moved.st_ino)
+    )
+    moved_kind_matches = (
+        moved is not None
+        and (
+            (expected_kind == "file" and stat.S_ISREG(moved.st_mode))
+            or (
+                expected_kind == "directory"
+                and stat.S_ISDIR(moved.st_mode)
+            )
+        )
+    )
+    if moved_identity == expected_identity and moved_kind_matches:
+        if _directory_entry_metadata(root_descriptor, canonical_name) is not None:
+            raise _UnsafeRawEvidence(
+                "typed-source canonical name changed during quarantine"
+            )
+        return
+
+    failure = _UnsafeRawEvidence(
+        "typed-source quarantine detached a foreign entry"
+    )
+    if not restore_foreign:
+        raise failure
+
+    restore_error = None
+    if (
+        moved is not None
+        and _directory_entry_metadata(root_descriptor, canonical_name) is None
+    ):
+        try:
+            _rename_directory_entry(
+                quarantine_name,
+                canonical_name,
+                source_directory_fd=root_descriptor,
+                destination_directory_fd=root_descriptor,
+            )
+            restored = _directory_entry_metadata(
+                root_descriptor, canonical_name
+            )
+            if (
+                restored is None
+                or (restored.st_dev, restored.st_ino) != moved_identity
+            ):
+                restore_error = _UnsafeRawEvidence(
+                    "typed-source foreign quarantine restore changed"
+                )
+        except BaseException as error:
+            restore_error = error
+    else:
+        restore_error = _UnsafeRawEvidence(
+            "typed-source foreign quarantine could not be restored"
+        )
+    if restore_error is not None:
+        raise failure from restore_error
+    raise failure
+
+
+def _quarantine_typed_source_publication(
+    root: Path,
+    *,
+    root_descriptor: int,
+    root_identity: Tuple[int, int],
+    lock_descriptor: int,
+    lock_identity: Tuple[int, int],
+    typed_identity: Optional[Tuple[int, int]],
+    manifest_evidence: Optional[Mapping[str, Any]],
+) -> None:
+    """Invalidate a failed publication by atomic no-replace detachment."""
+    token = uuid.uuid4().hex
+    failures: List[BaseException] = []
+    _descriptor_directory_identity(root_descriptor, root_identity)
+    try:
+        _require_typed_publication_root(
+            root, root_descriptor, root_identity
+        )
+    except BaseException as error:
+        failures.append(error)
+    try:
+        _require_typed_publication_lock(
+            root_descriptor, lock_descriptor, lock_identity
+        )
+    except BaseException as error:
+        failures.append(error)
+
+    # The manifest is the commit marker, so detach it before the data tree.
+    if manifest_evidence is not None:
+        try:
+            _detach_typed_publication_entry(
+                root_descriptor,
+                canonical_name="typed-manifest.json",
+                quarantine_name=(
+                    ".typed-quarantine-{}-typed-manifest.json".format(token)
+                ),
+                expected_identity=tuple(
+                    manifest_evidence["fingerprint"][:2]
+                ),
+                expected_kind="file",
+                restore_foreign=False,
+            )
+        except BaseException as error:
+            failures.append(error)
+    if typed_identity is not None:
+        try:
+            _detach_typed_publication_entry(
+                root_descriptor,
+                canonical_name="typed",
+                quarantine_name=(
+                    ".typed-quarantine-{}-typed".format(token)
+                ),
+                expected_identity=typed_identity,
+                expected_kind="directory",
+                restore_foreign=True,
+            )
+        except BaseException as error:
+            failures.append(error)
+    os.fsync(root_descriptor)
+
+    manifest_now = _directory_entry_metadata(
+        root_descriptor, "typed-manifest.json"
+    )
+    typed_now = _directory_entry_metadata(root_descriptor, "typed")
+    if (
+        manifest_evidence is not None
+        and manifest_now is not None
+        and (manifest_now.st_dev, manifest_now.st_ino)
+        == tuple(manifest_evidence["fingerprint"][:2])
+    ):
+        failures.append(_UnsafeRawEvidence(
+            "typed-source canonical manifest remains after quarantine"
+        ))
+    if (
+        typed_identity is not None
+        and typed_now is not None
+        and (typed_now.st_dev, typed_now.st_ino) == typed_identity
+    ):
+        failures.append(_UnsafeRawEvidence(
+            "typed-source canonical directory remains after quarantine"
+        ))
+    if not failures and (manifest_now is not None or typed_now is not None):
+        failures.append(_UnsafeRawEvidence(
+            "typed-source canonical publication changed during quarantine"
+        ))
+    try:
+        _require_typed_publication_root(
+            root, root_descriptor, root_identity
+        )
+    except BaseException as error:
+        failures.append(error)
+    try:
+        _require_typed_publication_lock(
+            root_descriptor, lock_descriptor, lock_identity
+        )
+    except BaseException as error:
+        failures.append(error)
+    if failures:
+        raise _UnsafeRawEvidence(
+            "typed-source publication quarantine failed"
+        ) from failures[0]
+
+
 def publish_typed_source_manifest(
     raw_run_root: Path,
     *,
     raw_evidence_run_id: str,
     members: Iterable[Mapping[str, Any]],
+    source_validator: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Atomically retain exact observed typed members and their manifest."""
     if not isinstance(raw_evidence_run_id, str) or not _SNAPSHOT_ID.fullmatch(
         raw_evidence_run_id
     ):
         raise ValueError("typed-source raw run ID is invalid")
+    if source_validator is not None and not callable(source_validator):
+        raise ValueError("typed-source source validator is invalid")
     root = _canonical_raw_path(Path(raw_run_root))
     _reject_symlink_ancestry(root)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stage = root / ".typed-stage-{}".format(uuid.uuid4().hex)
-    stage.mkdir(mode=0o700)
-    typed_stage = stage / "typed"
-    typed_stage.mkdir(mode=0o700)
+    root_identity = _directory_identity(root)
+    stage_name = ".typed-stage-{}".format(uuid.uuid4().hex)
+    root_descriptor = os.open(str(root), _directory_open_flags())
+    lock_descriptor = None
+    lock_identity = None
+    stage_descriptor = None
+    typed_stage_descriptor = None
+    stage_identity = None
+    typed_identity = None
+    member_evidence: Dict[str, Mapping[str, Any]] = {}
+    manifest_evidence: Optional[Mapping[str, Any]] = None
+    installed_typed = False
+    installed_manifest = False
+    expected_root_inventory: Tuple[str, ...] = ()
     records = []
     seen = set()
     try:
+        _descriptor_directory_identity(root_descriptor, root_identity)
+        lock_descriptor, lock_identity = _open_typed_publication_lock(
+            root_descriptor
+        )
+        os.mkdir(stage_name, mode=0o700, dir_fd=root_descriptor)
+        stage_identity = _directory_entry_identity(
+            root_descriptor, stage_name
+        )
+        stage_descriptor = _open_directory_entry(
+            root_descriptor, stage_name, stage_identity
+        )
+        os.mkdir("typed", mode=0o700, dir_fd=stage_descriptor)
+        typed_identity = _directory_entry_identity(
+            stage_descriptor, "typed"
+        )
+        typed_stage_descriptor = _open_directory_entry(
+            stage_descriptor, "typed", typed_identity
+        )
+
         normalized = []
         for raw in members:
             if not isinstance(raw, Mapping) or set(raw) != {
@@ -631,12 +1097,12 @@ def publish_typed_source_manifest(
         for index, raw in enumerate(normalized):
             filename = "{:04d}-{}.json".format(index, raw["role"])
             payload = raw["payload"]
-            target = typed_stage / filename
             descriptor = os.open(
-                str(target),
+                filename,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL
                 | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
+                dir_fd=typed_stage_descriptor,
             )
             try:
                 offset = 0
@@ -646,11 +1112,12 @@ def publish_typed_source_manifest(
                         raise OSError("short typed-source member write")
                     offset += written
                 os.fsync(descriptor)
-                metadata = os.fstat(descriptor)
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                    raise ValueError("typed-source member is unsafe")
+                evidence = _typed_publication_file_evidence(
+                    descriptor, payload
+                )
             finally:
                 os.close(descriptor)
+            member_evidence[filename] = evidence
             record = {
                 "market_id": raw["market_id"],
                 "role": raw["role"],
@@ -664,6 +1131,7 @@ def publish_typed_source_manifest(
             if set(record) != TYPED_SOURCE_MANIFEST_MEMBER_FIELDS:
                 raise AssertionError("typed-source manifest member schema drifted")
             records.append(record)
+        os.fsync(typed_stage_descriptor)
         manifest = {
             "schema": TYPED_SOURCE_MANIFEST_SCHEMA,
             "raw_evidence_run_id": raw_evidence_run_id,
@@ -675,32 +1143,144 @@ def publish_typed_source_manifest(
         manifest_bytes = json.dumps(
             manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        manifest_path = stage / "typed-manifest.json"
-        manifest_path.write_bytes(manifest_bytes)
-        with manifest_path.open("rb") as handle:
-            os.fsync(handle.fileno())
-        stage_fd = os.open(str(stage), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        manifest_descriptor = os.open(
+            "typed-manifest.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=stage_descriptor,
+        )
         try:
-            os.fsync(stage_fd)
+            offset = 0
+            while offset < len(manifest_bytes):
+                written = os.write(
+                    manifest_descriptor, manifest_bytes[offset:]
+                )
+                if written <= 0:
+                    raise OSError("short typed-source manifest write")
+                offset += written
+            os.fsync(manifest_descriptor)
+            manifest_evidence = _typed_publication_file_evidence(
+                manifest_descriptor, manifest_bytes
+            )
         finally:
-            os.close(stage_fd)
+            os.close(manifest_descriptor)
+        os.fsync(stage_descriptor)
         final_typed = root / "typed"
         final_manifest = root / "typed-manifest.json"
-        if final_typed.exists() or final_manifest.exists():
+        if (
+            _directory_entry_metadata(root_descriptor, "typed") is not None
+            or _directory_entry_metadata(
+                root_descriptor, "typed-manifest.json"
+            ) is not None
+        ):
             raise ValueError("immutable typed-source inventory already exists")
-        os.rename(typed_stage, final_typed)
-        os.rename(manifest_path, final_manifest)
-        root_fd = os.open(str(root), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        root_inventory_before_commit = tuple(
+            sorted(os.listdir(root_descriptor))
+        )
         try:
-            os.fsync(root_fd)
-        finally:
-            os.close(root_fd)
-        for record in records:
-            payload = (final_typed / record["filename"]).read_bytes()
-            if len(payload) != record["size"] or hashlib.sha256(payload).hexdigest() != record["sha256"]:
-                raise ValueError("typed-source member changed after publication")
-        if final_manifest.read_bytes() != manifest_bytes:
-            raise ValueError("typed-source manifest changed after publication")
+            if source_validator is not None:
+                source_validator()
+            if (
+                _directory_entry_identity(root_descriptor, stage_name)
+                != stage_identity
+                or sorted(os.listdir(stage_descriptor))
+                != ["typed", "typed-manifest.json"]
+            ):
+                raise _UnsafeRawEvidence(
+                    "typed-source stage changed before publication"
+                )
+            _rename_directory_entry(
+                "typed",
+                "typed",
+                source_directory_fd=stage_descriptor,
+                destination_directory_fd=root_descriptor,
+            )
+            installed_typed = True
+            expected_root_inventory = tuple(sorted(
+                root_inventory_before_commit + ("typed",)
+            ))
+            if sorted(os.listdir(root_descriptor)) != list(
+                expected_root_inventory
+            ):
+                raise _UnsafeRawEvidence(
+                    "typed-source publication root inventory changed"
+                )
+            _rename_directory_entry(
+                "typed-manifest.json",
+                "typed-manifest.json",
+                source_directory_fd=stage_descriptor,
+                destination_directory_fd=root_descriptor,
+            )
+            installed_manifest = True
+            expected_root_inventory = tuple(sorted(
+                root_inventory_before_commit
+                + ("typed", "typed-manifest.json")
+            ))
+            manifest_evidence = _capture_promoted_typed_file(
+                root_descriptor,
+                "typed-manifest.json",
+                manifest_evidence,
+            )
+            os.fsync(root_descriptor)
+            if source_validator is not None:
+                source_validator()
+            if sorted(os.listdir(root_descriptor)) != list(
+                expected_root_inventory
+            ):
+                raise _UnsafeRawEvidence(
+                    "typed-source publication root inventory changed"
+                )
+            verification_typed = None
+            verification_members: Dict[str, int] = {}
+            verification_manifest = None
+            try:
+                verification_typed, verification_members = (
+                    _open_typed_publication_inventory(
+                        root_descriptor,
+                        "typed",
+                        typed_identity,
+                        member_evidence,
+                        changed_message=(
+                            "typed-source member changed after publication"
+                        ),
+                    )
+                )
+                verification_manifest = _open_typed_publication_file(
+                    root_descriptor,
+                    "typed-manifest.json",
+                    manifest_evidence,
+                    changed_message=(
+                        "typed-source manifest changed after publication"
+                    ),
+                )
+            finally:
+                if verification_manifest is not None:
+                    os.close(verification_manifest)
+                for descriptor in verification_members.values():
+                    os.close(descriptor)
+                if verification_typed is not None:
+                    os.close(verification_typed)
+            _require_typed_publication_lock(
+                root_descriptor, lock_descriptor, lock_identity
+            )
+            _require_typed_publication_root(
+                root, root_descriptor, root_identity
+            )
+        except BaseException:
+            if installed_typed or installed_manifest:
+                _quarantine_typed_source_publication(
+                    root,
+                    root_descriptor=root_descriptor,
+                    root_identity=root_identity,
+                    lock_descriptor=lock_descriptor,
+                    lock_identity=lock_identity,
+                    typed_identity=(typed_identity if installed_typed else None),
+                    manifest_evidence=(
+                        manifest_evidence if installed_manifest else None
+                    ),
+                )
+            raise
         return {
             "manifest": manifest,
             "typed_source_manifest_sha256": hashlib.sha256(
@@ -710,15 +1290,14 @@ def publish_typed_source_manifest(
             "manifest_path": str(final_manifest),
         }
     finally:
-        if stage.exists():
-            if typed_stage.exists():
-                for path in typed_stage.iterdir():
-                    path.unlink()
-                typed_stage.rmdir()
-            manifest_path = stage / "typed-manifest.json"
-            if manifest_path.exists():
-                manifest_path.unlink()
-            stage.rmdir()
+        if typed_stage_descriptor is not None:
+            os.close(typed_stage_descriptor)
+        if stage_descriptor is not None:
+            os.close(stage_descriptor)
+        if lock_descriptor is not None:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            os.close(lock_descriptor)
+        os.close(root_descriptor)
 
 
 def _typed_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -757,8 +1336,545 @@ def _typed_member_spec(
     }
 
 
-def attach_typed_source_lineage(
-    cohort: Mapping[str, Any], *, raw_root: Path
+def _attachment_authority_bytes(
+    *,
+    market_id: str,
+    trusted_leg: Mapping[str, Any],
+    collector_row: Mapping[str, Any],
+    accepted_raw_sha256: str,
+    collection_input_generation: str,
+    validated_specs: Iterable[Mapping[str, Any]],
+) -> bytes:
+    """Seal only safe, parent-validated facts needed by later attachment."""
+    identity = _canonical_leg_identity(trusted_leg)
+    market_type = identity["market_type"]
+    if trusted_leg.get("market_id") != market_id:
+        raise ValueError("attachment authority identity is invalid")
+    generation_projection = _safe_leg_projection({
+        "collection_input_generation": collection_input_generation,
+    })
+    if generation_projection.get(
+        "collection_input_generation"
+    ) != collection_input_generation:
+        raise ValueError("attachment authority generation is invalid")
+    trusted_input = _safe_leg_projection({
+        **dict(trusted_leg),
+        **identity,
+    })
+    canonical_collector_row = _safe_leg_projection({
+        **dict(collector_row),
+        "market_id": market_id,
+        "market_type": market_type,
+    })
+    if not trusted_input or not canonical_collector_row:
+        raise ValueError("attachment authority projection is invalid")
+    final_leg = _final_route_leg_projection(
+        trusted_input,
+        canonical_collector_row,
+        market_id=market_id,
+    )
+    raw_values = []
+    expected_specs = []
+    for spec in validated_specs:
+        if not isinstance(spec, Mapping) or set(spec) != {
+            "market_id", "role", "payload", "logical_generation",
+            "adapter_id", "content_schema",
+        }:
+            raise ValueError("attachment authority typed member is invalid")
+        raw_values.append({
+            "role": spec.get("role"),
+            "payload": spec.get("payload"),
+        })
+        expected_specs.append(dict(spec))
+    canonical_specs = _validated_typed_payload_inventory(
+        trusted_leg=trusted_input,
+        collector_row=canonical_collector_row,
+        accepted_raw_sha256=accepted_raw_sha256,
+        values=raw_values,
+    )
+    if tuple(expected_specs) != canonical_specs:
+        raise ValueError("attachment authority typed inventory is invalid")
+    typed_members = []
+    for spec in canonical_specs:
+        payload = spec["payload"]
+        typed_members.append({
+            "market_id": market_id,
+            "role": spec["role"],
+            "logical_generation": spec["logical_generation"],
+            "adapter_id": spec["adapter_id"],
+            "content_schema": spec["content_schema"],
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "payload_base64": base64.b64encode(payload).decode("ascii"),
+        })
+    authority = {
+        "schema": _ATTACHMENT_AUTHORITY_SCHEMA,
+        "market_id": market_id,
+        "market_type": market_type,
+        "collection_input_generation": collection_input_generation,
+        "accepted_raw_response_sha256": accepted_raw_sha256,
+        "trusted_input": trusted_input,
+        "collector_row": canonical_collector_row,
+        "final_leg": final_leg,
+        "typed_members": typed_members,
+    }
+    payload = _typed_json_bytes(authority)
+    if not 0 < len(payload) <= _ATTACHMENT_AUTHORITY_MAX_BYTES:
+        raise ValueError("attachment authority is too large")
+    return payload
+
+
+def _validated_attachment_authority(
+    payload: bytes,
+    *,
+    market_id: str,
+    market_type: str,
+    accepted_raw_sha256: str,
+    collection_input_generation: Any,
+) -> Tuple[Dict[str, Any], Tuple[Mapping[str, Any], ...]]:
+    """Rebuild attachment facts solely from one canonical disk authority."""
+    if not 0 < len(payload) <= _ATTACHMENT_AUTHORITY_MAX_BYTES:
+        raise ValueError("attachment authority is invalid")
+    try:
+        authority = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("attachment authority is invalid") from error
+    if (
+        not isinstance(authority, Mapping)
+        or set(authority) != {
+            "schema", "market_id", "market_type",
+            "collection_input_generation",
+            "accepted_raw_response_sha256", "trusted_input",
+            "collector_row", "final_leg", "typed_members",
+        }
+        or payload != _typed_json_bytes(authority)
+        or authority.get("schema") != _ATTACHMENT_AUTHORITY_SCHEMA
+        or authority.get("market_id") != market_id
+        or authority.get("market_type") != market_type
+        or authority.get("accepted_raw_response_sha256")
+        != accepted_raw_sha256
+        or authority.get("collection_input_generation")
+        != collection_input_generation
+    ):
+        raise ValueError("attachment authority is invalid")
+    trusted_input = authority.get("trusted_input")
+    collector_row = authority.get("collector_row")
+    final_leg = authority.get("final_leg")
+    typed_members = authority.get("typed_members")
+    if (
+        not isinstance(trusted_input, Mapping)
+        or not isinstance(collector_row, Mapping)
+        or not isinstance(final_leg, Mapping)
+        or not isinstance(typed_members, list)
+        or _safe_leg_projection(trusted_input) != dict(trusted_input)
+        or _safe_leg_projection(collector_row) != dict(collector_row)
+        or _safe_leg_projection(final_leg) != dict(final_leg)
+    ):
+        raise ValueError("attachment authority is invalid")
+    if (
+        _market_type(trusted_input) != market_type
+        or trusted_input.get("market_id") != market_id
+        or collector_row.get("market_id") != market_id
+        or collector_row.get("market_type") != market_type
+        or collector_row.get("status") not in {"observed", "partial"}
+        or collector_row.get("raw_response_sha256")
+        != accepted_raw_sha256
+    ):
+        raise ValueError("attachment authority is invalid")
+    rebuilt_final_leg = _final_route_leg_projection(
+        trusted_input,
+        collector_row,
+        market_id=market_id,
+    )
+    if dict(final_leg) != rebuilt_final_leg:
+        raise ValueError("attachment authority final leg is invalid")
+    values = []
+    expected_specs = []
+    seen_roles = set()
+    for member in typed_members:
+        if (
+            not isinstance(member, Mapping)
+            or set(member) != {
+                "market_id", "role", "logical_generation", "adapter_id",
+                "content_schema", "size", "sha256", "payload_base64",
+            }
+            or member.get("market_id") != market_id
+            or member.get("role") in seen_roles
+            or type(member.get("size")) is not int
+            or member["size"] <= 0
+            or _TYPED_SHA256.fullmatch(str(member.get("sha256") or ""))
+            is None
+            or not isinstance(member.get("payload_base64"), str)
+        ):
+            raise ValueError("attachment authority typed member is invalid")
+        try:
+            member_payload = base64.b64decode(
+                member["payload_base64"].encode("ascii"), validate=True
+            )
+        except (UnicodeEncodeError, ValueError) as error:
+            raise ValueError(
+                "attachment authority typed member is invalid"
+            ) from error
+        if (
+            len(member_payload) != member["size"]
+            or hashlib.sha256(member_payload).hexdigest()
+            != member["sha256"]
+        ):
+            raise ValueError("attachment authority typed member is invalid")
+        seen_roles.add(member["role"])
+        values.append({"role": member["role"], "payload": member_payload})
+        expected_specs.append({
+            "market_id": market_id,
+            "role": member["role"],
+            "payload": member_payload,
+            "logical_generation": member.get("logical_generation"),
+            "adapter_id": member.get("adapter_id"),
+            "content_schema": member.get("content_schema"),
+        })
+    canonical_specs = _validated_typed_payload_inventory(
+        trusted_leg=trusted_input,
+        collector_row=collector_row,
+        accepted_raw_sha256=accepted_raw_sha256,
+        values=values,
+    )
+    if tuple(expected_specs) != canonical_specs:
+        raise ValueError("attachment authority typed inventory is invalid")
+    return dict(final_leg), canonical_specs
+
+
+def _attachment_file_fingerprint(metadata: os.stat_result) -> Tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_open_attachment_file(
+    descriptor: int,
+    *,
+    max_bytes: Optional[int],
+) -> bytes:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or (
+            max_bytes is not None
+            and (
+                type(max_bytes) is not int
+                or max_bytes <= 0
+                or metadata.st_size > max_bytes
+            )
+        )
+    ):
+        raise _UnsafeRawEvidence("accepted evidence file is unsafe")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise _UnsafeRawEvidence("accepted evidence file is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _open_held_attachment_file(
+    directory_descriptor: int,
+    name: str,
+    *,
+    max_bytes: Optional[int] = None,
+) -> Tuple[int, bytes, Tuple[int, ...]]:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise _UnsafeRawEvidence("accepted evidence filename is invalid")
+    try:
+        before = os.stat(
+            name, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+    except OSError as error:
+        raise _UnsafeRawEvidence(
+            "accepted evidence file is unavailable"
+        ) from error
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+    except OSError as error:
+        raise _UnsafeRawEvidence(
+            "accepted evidence file could not be opened safely"
+        ) from error
+    try:
+        payload = _read_open_attachment_file(
+            descriptor, max_bytes=max_bytes
+        )
+        opened = os.fstat(descriptor)
+        after = os.stat(
+            name, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+        fingerprint = _attachment_file_fingerprint(opened)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or _attachment_file_fingerprint(before) != fingerprint
+            or _attachment_file_fingerprint(after) != fingerprint
+            or len(payload) != opened.st_size
+        ):
+            raise _UnsafeRawEvidence(
+                "accepted evidence file identity changed"
+            )
+        return descriptor, payload, fingerprint
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+class _HeldAttachmentEvidence:
+    """Accepted evidence whose exact open files stay pinned to publication."""
+
+    __slots__ = (
+        "accepted_root", "accepted_identity", "accepted_descriptor",
+        "entry_name", "entry_identity", "entry_descriptor",
+        "response_descriptor", "response_payload", "response_fingerprint",
+        "authority_descriptor", "authority_payload", "authority_fingerprint",
+        "closed",
+    )
+
+    def __init__(
+        self,
+        *,
+        accepted_root: Path,
+        accepted_identity: Tuple[int, int],
+        accepted_descriptor: int,
+        entry_name: str,
+        entry_identity: Tuple[int, int],
+        entry_descriptor: int,
+        response_descriptor: int,
+        response_payload: bytes,
+        response_fingerprint: Tuple[int, ...],
+        authority_descriptor: int,
+        authority_payload: bytes,
+        authority_fingerprint: Tuple[int, ...],
+    ) -> None:
+        self.accepted_root = accepted_root
+        self.accepted_identity = accepted_identity
+        self.accepted_descriptor = accepted_descriptor
+        self.entry_name = entry_name
+        self.entry_identity = entry_identity
+        self.entry_descriptor = entry_descriptor
+        self.response_descriptor = response_descriptor
+        self.response_payload = response_payload
+        self.response_fingerprint = response_fingerprint
+        self.authority_descriptor = authority_descriptor
+        self.authority_payload = authority_payload
+        self.authority_fingerprint = authority_fingerprint
+        self.closed = False
+
+    @property
+    def response_sha256(self) -> str:
+        return hashlib.sha256(self.response_payload).hexdigest()
+
+    def _validate_file(
+        self,
+        *,
+        name: str,
+        descriptor: int,
+        expected_payload: bytes,
+        expected_fingerprint: Tuple[int, ...],
+        max_bytes: Optional[int],
+    ) -> None:
+        before_descriptor = os.fstat(descriptor)
+        before_name = os.stat(
+            name,
+            dir_fd=self.entry_descriptor,
+            follow_symlinks=False,
+        )
+        payload = _read_open_attachment_file(
+            descriptor, max_bytes=max_bytes
+        )
+        after_descriptor = os.fstat(descriptor)
+        after_name = os.stat(
+            name,
+            dir_fd=self.entry_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _attachment_file_fingerprint(before_descriptor)
+            != expected_fingerprint
+            or _attachment_file_fingerprint(before_name)
+            != expected_fingerprint
+            or _attachment_file_fingerprint(after_descriptor)
+            != expected_fingerprint
+            or _attachment_file_fingerprint(after_name)
+            != expected_fingerprint
+            or payload != expected_payload
+        ):
+            raise _UnsafeRawEvidence(
+                "accepted evidence file changed before publication"
+            )
+
+    def validate(self) -> None:
+        if self.closed:
+            raise _UnsafeRawEvidence("accepted evidence handle is closed")
+        _descriptor_directory_identity(
+            self.accepted_descriptor, self.accepted_identity
+        )
+        _descriptor_directory_identity(
+            self.entry_descriptor, self.entry_identity
+        )
+        if _directory_entry_identity(
+            self.accepted_descriptor, self.entry_name
+        ) != self.entry_identity:
+            raise _UnsafeRawEvidence(
+                "accepted evidence directory identity changed"
+            )
+        if sorted(os.listdir(self.entry_descriptor)) != [
+            _ATTACHMENT_AUTHORITY_FILENAME,
+            "response.json",
+        ]:
+            raise _UnsafeRawEvidence(
+                "accepted evidence file inventory changed"
+            )
+        self._validate_file(
+            name="response.json",
+            descriptor=self.response_descriptor,
+            expected_payload=self.response_payload,
+            expected_fingerprint=self.response_fingerprint,
+            max_bytes=None,
+        )
+        self._validate_file(
+            name=_ATTACHMENT_AUTHORITY_FILENAME,
+            descriptor=self.authority_descriptor,
+            expected_payload=self.authority_payload,
+            expected_fingerprint=self.authority_fingerprint,
+            max_bytes=_ATTACHMENT_AUTHORITY_MAX_BYTES,
+        )
+        _require_directory_identity(
+            self.accepted_root, self.accepted_identity
+        )
+        _reject_symlink_ancestry(self.accepted_root)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for descriptor in (
+            self.authority_descriptor,
+            self.response_descriptor,
+            self.entry_descriptor,
+            self.accepted_descriptor,
+        ):
+            os.close(descriptor)
+
+
+def _accepted_evidence_for_attachment(
+    raw_run_root: Path,
+    market_id: str,
+) -> _HeldAttachmentEvidence:
+    """Open one accepted response and authority and retain every handle."""
+    accepted_root = raw_run_root / "accepted"
+    _reject_symlink_ancestry(accepted_root)
+    accepted_identity = _directory_identity(accepted_root)
+    try:
+        accepted_descriptor = os.open(
+            str(accepted_root), _directory_open_flags()
+        )
+    except OSError as error:
+        raise _UnsafeRawEvidence(
+            "accepted raw evidence could not be opened safely"
+        ) from error
+    entry_descriptor = None
+    response_descriptor = None
+    authority_descriptor = None
+    try:
+        _descriptor_directory_identity(
+            accepted_descriptor, accepted_identity
+        )
+        entry_name = hashlib.sha256(market_id.encode("utf-8")).hexdigest()
+        entry_identity = _directory_entry_identity(
+            accepted_descriptor, entry_name
+        )
+        entry_descriptor = _open_directory_entry(
+            accepted_descriptor, entry_name, entry_identity
+        )
+        if sorted(os.listdir(entry_descriptor)) != [
+            _ATTACHMENT_AUTHORITY_FILENAME,
+            "response.json",
+        ]:
+            raise _UnsafeRawEvidence(
+                "accepted evidence file inventory is invalid"
+            )
+        (
+            response_descriptor,
+            response_payload,
+            response_fingerprint,
+        ) = _open_held_attachment_file(
+            entry_descriptor,
+            "response.json",
+        )
+        (
+            authority_descriptor,
+            authority_payload,
+            authority_fingerprint,
+        ) = _open_held_attachment_file(
+            entry_descriptor,
+            _ATTACHMENT_AUTHORITY_FILENAME,
+            max_bytes=_ATTACHMENT_AUTHORITY_MAX_BYTES,
+        )
+        if _directory_entry_identity(
+            accepted_descriptor, entry_name
+        ) != entry_identity:
+            raise _UnsafeRawEvidence(
+                "accepted evidence directory identity changed"
+            )
+        _descriptor_directory_identity(
+            accepted_descriptor, accepted_identity
+        )
+        _require_directory_identity(accepted_root, accepted_identity)
+        _reject_symlink_ancestry(accepted_root)
+        evidence = _HeldAttachmentEvidence(
+            accepted_root=accepted_root,
+            accepted_identity=accepted_identity,
+            accepted_descriptor=accepted_descriptor,
+            entry_name=entry_name,
+            entry_identity=entry_identity,
+            entry_descriptor=entry_descriptor,
+            response_descriptor=response_descriptor,
+            response_payload=response_payload,
+            response_fingerprint=response_fingerprint,
+            authority_descriptor=authority_descriptor,
+            authority_payload=authority_payload,
+            authority_fingerprint=authority_fingerprint,
+        )
+        evidence.validate()
+        return evidence
+    except BaseException:
+        for descriptor in (
+            authority_descriptor,
+            response_descriptor,
+            entry_descriptor,
+            accepted_descriptor,
+        ):
+            if descriptor is not None:
+                os.close(descriptor)
+        raise
+
+
+def _attach_typed_source_lineage_with_evidence(
+    cohort: Mapping[str, Any],
+    *,
+    raw_root: Path,
+    accepted_evidence: Mapping[str, _HeldAttachmentEvidence],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Install retained typed members and bind every leg to the manifest."""
     if not isinstance(cohort, Mapping):
@@ -792,6 +1908,7 @@ def attach_typed_source_lineage(
     ):
         raise ValueError("typed-source payload capability is invalid")
     pending: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    authoritative_legs: Dict[str, Dict[str, Any]] = {}
     for leg in legs:
         if not isinstance(leg, Mapping):
             raise ValueError("typed-source leg is invalid")
@@ -809,6 +1926,38 @@ def attach_typed_source_lineage(
             for role in contracts
         }
         available = leg.get("status") in {"observed", "partial"}
+        response = None
+        actual_raw_sha256 = None
+        authority_specs: Tuple[Mapping[str, Any], ...] = ()
+        if available:
+            try:
+                evidence = accepted_evidence[market_id]
+                evidence.validate()
+                response = evidence.response_payload
+                actual_raw_sha256 = evidence.response_sha256
+                authority_payload = evidence.authority_payload
+                authoritative_leg, authority_specs = (
+                    _validated_attachment_authority(
+                        authority_payload,
+                        market_id=market_id,
+                        market_type=market_type,
+                        accepted_raw_sha256=actual_raw_sha256,
+                        collection_input_generation=cohort.get(
+                            "collection_input_generation"
+                        ),
+                    )
+                )
+            except (
+                KeyError, FileNotFoundError, OSError, TypeError, ValueError,
+            ) as error:
+                raise ValueError(
+                    "typed-source accepted raw evidence is invalid"
+                ) from error
+            if dict(leg) != authoritative_leg:
+                raise ValueError(
+                    "typed-source attachment authority differs from cohort leg"
+                )
+            authoritative_legs[market_id] = authoritative_leg
         if market_type == "cex":
             venue = market_id.split(":", 2)[1]
             if venue not in STRICT_CEX_TYPED_RULE_VENUES:
@@ -826,27 +1975,36 @@ def attach_typed_source_lineage(
                 members["quote_usd_conversion"] = _typed_unavailable(
                     "quote_usd_conversion", "typed_source_failed"
                 )
-            response_path = (
-                raw_run_root / "accepted"
-                / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
-                / "response.json"
-            )
-            response, _identity = _read_regular_file(response_path)
-            raw_sha = hashlib.sha256(response).hexdigest()
-            if raw_sha != leg.get("raw_response_sha256"):
-                raise ValueError("typed-source CEX raw response lineage differs")
+            assert response is not None
+            assert actual_raw_sha256 is not None
             specs.append(_typed_member_spec(
-                market_id, "cex_raw_book_response", response, raw_sha
+                market_id,
+                "cex_raw_book_response",
+                response,
+                actual_raw_sha256,
             ))
         elif market_type == "dex":
-            context = leg.get("collector_context")
-            if isinstance(context, Mapping):
+            if available:
+                for role in ("dex_market_rules", "dex_usd_conversion"):
+                    members[role] = _typed_unavailable(
+                        role, "typed_source_failed"
+                    )
+            context = (
+                authoritative_legs[market_id].get("collector_context")
+                if available
+                else None
+            )
+            if available and isinstance(context, Mapping):
                 context_payload = _typed_json_bytes(context)
                 specs.append(_typed_member_spec(
                     market_id, "dex_usd_price_context", context_payload,
                     hashlib.sha256(context_payload).hexdigest(),
                 ))
-        for sealed in sealed_payloads.get(market_id, ()):
+        raw_sealed_members = sealed_payloads.get(market_id, ())
+        if not isinstance(raw_sealed_members, (list, tuple)):
+            raise ValueError("typed-source payload capability is invalid")
+        sealed_by_role = {}
+        for sealed in raw_sealed_members:
             if (
                 not isinstance(sealed, Mapping)
                 or set(sealed) != {
@@ -856,11 +2014,38 @@ def attach_typed_source_lineage(
                 or sealed.get("market_id") != market_id
             ):
                 raise ValueError("typed-source payload capability is invalid")
-            specs.append(dict(sealed))
+            role = sealed.get("role")
+            if role in sealed_by_role:
+                raise ValueError("typed-source payload capability is invalid")
+            sealed_by_role[role] = dict(sealed)
+        if available:
+            if (
+                set(sealed_by_role)
+                != {item["role"] for item in authority_specs}
+                or any(
+                    sealed_by_role[item["role"]] != dict(item)
+                    for item in authority_specs
+                )
+            ):
+                raise ValueError("typed-source payload capability is invalid")
+            specs.extend(dict(item) for item in authority_specs)
+        elif sealed_by_role:
+            raise ValueError("typed-source payload capability is invalid")
         pending[market_id] = members
 
+    def validate_accepted_sources() -> None:
+        if set(accepted_evidence) != eligible_market_ids:
+            raise _UnsafeRawEvidence(
+                "accepted evidence inventory differs from eligible legs"
+            )
+        for market_id in sorted(accepted_evidence):
+            accepted_evidence[market_id].validate()
+
     publication = publish_typed_source_manifest(
-        raw_run_root, raw_evidence_run_id=run_id, members=specs
+        raw_run_root,
+        raw_evidence_run_id=run_id,
+        members=specs,
+        source_validator=validate_accepted_sources,
     )
     for record in publication["manifest"]["members"]:
         member = {
@@ -877,11 +2062,16 @@ def attach_typed_source_lineage(
         pending[record["market_id"]][record["role"]] = member
     normalized_legs = []
     observed_inventory = []
-    for leg in legs:
-        market_id = leg["market_id"]
+    for untrusted_leg in legs:
+        market_id = untrusted_leg["market_id"]
+        leg = authoritative_legs.get(market_id, dict(untrusted_leg))
         market_type = leg["market_type"]
         lineage = validate_typed_source_lineage({
-            "schema": TYPED_SOURCE_LINEAGE_SCHEMA,
+            "schema": (
+                TYPED_SOURCE_LINEAGE_SCHEMA_V2
+                if market_type == "dex"
+                else TYPED_SOURCE_LINEAGE_SCHEMA
+            ),
             "members": sorted(
                 pending[market_id].values(), key=lambda row: row["role"]
             ),
@@ -903,6 +2093,77 @@ def attach_typed_source_lineage(
     )
     normalized["fingerprint"] = _canonical_fingerprint(normalized)
     return normalized, publication
+
+
+def attach_typed_source_lineage(
+    cohort: Mapping[str, Any], *, raw_root: Path
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Hold accepted evidence descriptors through the publication boundary."""
+    if not isinstance(cohort, Mapping):
+        raise ValueError("typed-source cohort is invalid")
+    run_id = cohort.get("raw_evidence_run_id")
+    legs = cohort.get("legs")
+    if (
+        not isinstance(run_id, str)
+        or _SNAPSHOT_ID.fullmatch(run_id) is None
+        or not isinstance(legs, list)
+    ):
+        raise ValueError("typed-source cohort is invalid")
+    sealed_payloads = getattr(cohort, "_typed_source_payloads", {})
+    eligible_market_ids = {
+        leg.get("market_id")
+        for leg in legs
+        if isinstance(leg, Mapping)
+        and leg.get("status") in {"observed", "partial"}
+    }
+    if (
+        not isinstance(sealed_payloads, Mapping)
+        or any(not isinstance(value, str) for value in eligible_market_ids)
+        or any(not isinstance(value, str) for value in sealed_payloads)
+        or set(sealed_payloads) - eligible_market_ids
+        or (
+            hasattr(cohort, "_typed_source_payloads")
+            and set(sealed_payloads) != eligible_market_ids
+        )
+    ):
+        raise ValueError("typed-source payload capability is invalid")
+    raw_run_root = _canonical_raw_path(Path(raw_root)) / run_id
+    accepted_evidence: Dict[str, _HeldAttachmentEvidence] = {}
+    try:
+        for leg in legs:
+            if (
+                not isinstance(leg, Mapping)
+                or leg.get("status") not in {"observed", "partial"}
+            ):
+                continue
+            market_id = leg.get("market_id")
+            market_type = leg.get("market_type")
+            if (
+                not isinstance(market_id, str)
+                or market_type not in {"cex", "dex"}
+                or market_id in accepted_evidence
+            ):
+                raise ValueError("typed-source leg identity is invalid")
+            try:
+                accepted_evidence[market_id] = (
+                    _accepted_evidence_for_attachment(
+                        raw_run_root, market_id
+                    )
+                )
+            except (
+                FileNotFoundError, OSError, TypeError, ValueError,
+            ) as error:
+                raise ValueError(
+                    "typed-source accepted raw evidence is invalid"
+                ) from error
+        return _attach_typed_source_lineage_with_evidence(
+            cohort,
+            raw_root=raw_root,
+            accepted_evidence=accepted_evidence,
+        )
+    finally:
+        for evidence in accepted_evidence.values():
+            evidence.close()
 
 
 _CEX_MARKET_ID = re.compile(
@@ -1072,14 +2333,490 @@ def _collector_accepts_typed_sink(collector: Callable[..., Any]) -> bool:
     )
 
 
+def _collector_accepts_degraded_usd_context(
+    collector: Callable[..., Any],
+) -> bool:
+    """Opt in only collectors that explicitly declare the route-only flag."""
+    try:
+        parameters = inspect.signature(collector).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        item.name == "allow_degraded_usd_context"
+        for item in parameters
+    )
+
+
+_TYPED_ASSET = re.compile(
+    r"[A-Z0-9][A-Z0-9._-]{0,63}\Z", flags=re.ASCII
+)
+_TYPED_EVM_ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z", flags=re.ASCII)
+_TYPED_SHA256 = re.compile(r"[0-9a-f]{64}\Z", flags=re.ASCII)
+_ZERO_EVM_ADDRESS = "0x" + "0" * 40
+_ATTACHMENT_AUTHORITY_SCHEMA = "route_attachment_authority/v1"
+_ATTACHMENT_AUTHORITY_FILENAME = "attachment-authority.json"
+_ATTACHMENT_AUTHORITY_MAX_BYTES = 40 * 1024 * 1024
+_DEX_COLLECTOR_CONTEXT_FIELDS = frozenset({
+    "schema", "snapshot_id", "request_started_at", "observed_at",
+    "response_received_at", "status", "reason_code", "pool_name",
+    "base_token_id", "quote_token_id", "base_token_price_usd",
+    "quote_token_price_usd", "tvl_method", "source", "source_endpoint",
+    "raw_response_sha256",
+})
+_DEX_MARKET_RULES_SOURCE_FIELDS = frozenset({
+    "schema", "market_id", "base_asset", "quote_asset",
+    "base_token_address", "quote_token_address",
+    "base_unit_decimals", "quote_unit_decimals",
+    "base_increment", "quote_increment",
+    "min_base_quantity", "min_quote_notional",
+    "increment_source", "minimum_source",
+    "observed_at", "valid_until", "raw_response_sha256",
+})
+_DEX_USD_CONVERSION_SOURCE_FIELDS = frozenset({
+    "schema", "market_id", "target_asset", "target_token_address",
+    "quote_asset", "quote_token_address", "usd_per_quote", "value_status",
+    "observed_at", "valid_until", "state_observed_at", "source",
+    "source_snapshot_id", "source_raw_response_sha256",
+    "state_raw_response_sha256",
+})
+
+
+def _typed_nonzero_evm_address(value: Any, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or _TYPED_EVM_ADDRESS.fullmatch(value) is None
+        or value == _ZERO_EVM_ADDRESS
+    ):
+        raise ValueError("{} is not a canonical nonzero EVM address".format(field))
+    return value
+
+
+def _typed_positive_decimal_text(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("{} is not a canonical positive Decimal".format(field))
+    try:
+        number = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(
+            "{} is not a canonical positive Decimal".format(field)
+        ) from error
+    canonical = format(number, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    if not number.is_finite() or number <= 0 or canonical != value:
+        raise ValueError("{} is not a canonical positive Decimal".format(field))
+    return value
+
+
+def _dex_context_token_address(value: Any, *, chain: str, field: str) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("{} is invalid".format(field))
+    prefix = chain + "_"
+    if not value.startswith(prefix):
+        raise ValueError("{} is invalid".format(field))
+    address = value[len(prefix):]
+    return _typed_nonzero_evm_address(address, field=field)
+
+
+def _strict_dex_collector_input(leg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Project a captured collector context without inventing pool facts."""
+    identity = _canonical_leg_identity(leg)
+    if identity["market_type"] != "dex":
+        raise ValueError("DEX collector leg is invalid")
+    context = leg.get("collector_context")
+    if not isinstance(context, Mapping):
+        return {**dict(leg), **identity}
+    context_status = context.get("status")
+    if (
+        set(context) != _DEX_COLLECTOR_CONTEXT_FIELDS
+        or context.get("schema") != "route_collector_context/v1"
+        or context_status not in {
+            "observed", "missing", "not_found", "source_no_observation",
+            "failed", "error", "collection_failed", "unavailable",
+            "not_cataloged_in_snapshot",
+        }
+    ):
+        raise ValueError("DEX collector context is invalid")
+    pool_address = _typed_nonzero_evm_address(
+        identity["pool_address"], field="pool_address"
+    )
+    if protocol_model(identity["dex"], identity["chain"], pool_address)[0] == "unsupported":
+        raise ValueError("DEX collector protocol is unsupported")
+    target_address = _typed_nonzero_evm_address(
+        leg.get("target_token_address"), field="target_token_address"
+    )
+    target_side = leg.get("target_token_side")
+    if context_status == "observed":
+        if target_side not in {"base", "quote"}:
+            raise ValueError("DEX target Token side is invalid")
+        base_address = _dex_context_token_address(
+            context.get("base_token_id"),
+            chain=identity["chain"],
+            field="base_token_id",
+        )
+        quote_address = _dex_context_token_address(
+            context.get("quote_token_id"),
+            chain=identity["chain"],
+            field="quote_token_id",
+        )
+        if base_address == quote_address or (
+            target_address != (
+                base_address if target_side == "base" else quote_address
+            )
+        ):
+            raise ValueError("DEX collector Token identity is invalid")
+        _typed_positive_decimal_text(
+            context.get("base_token_price_usd"), field="base_token_price_usd"
+        )
+        _typed_positive_decimal_text(
+            context.get("quote_token_price_usd"), field="quote_token_price_usd"
+        )
+    elif target_side is not None or any(
+        context.get(field) is not None
+        for field in (
+            "base_token_id", "quote_token_id",
+            "base_token_price_usd", "quote_token_price_usd",
+        )
+    ):
+        raise ValueError("non-observed DEX collector context is invalid")
+    request_started = _utc_datetime(
+        context.get("request_started_at"), field="request_started_at"
+    )
+    observed = _utc_datetime(context.get("observed_at"), field="observed_at")
+    response_received = _utc_datetime(
+        context.get("response_received_at"), field="response_received_at"
+    )
+    if not request_started <= observed <= response_received:
+        raise ValueError("DEX collector context timestamps are invalid")
+    for field in (
+        "snapshot_id", "reason_code", "pool_name", "tvl_method", "source",
+        "source_endpoint",
+    ):
+        value = context.get(field)
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError("DEX collector context is invalid")
+    if _TYPED_SHA256.fullmatch(
+        str(context.get("raw_response_sha256") or "")
+    ) is None:
+        raise ValueError("DEX collector context is invalid")
+    projected = {**dict(leg), **identity}
+    for field, expected in context.items():
+        if field == "schema":
+            continue
+        supplied = leg.get(field)
+        if supplied not in (None, "") and supplied != expected:
+            raise ValueError("DEX collector context conflicts with route leg")
+        projected[field] = expected
+    return projected
+
+
+def _trusted_dex_collector_projection(
+    leg: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Revalidate immutable DEX inputs without treating result fields as inputs."""
+    _canonical_leg_identity(leg)
+    return _strict_dex_collector_input({
+        key: leg[key]
+        for key in (
+            "market_id", "market_type", "token_symbol",
+            "target_token_address", "target_token_side", "collector_context",
+        )
+        if key in leg
+    })
+
+
+def _typed_unit_increment(decimals: int) -> str:
+    if type(decimals) is not int or not 0 <= decimals <= 255:
+        raise ValueError("typed asset decimals are invalid")
+    return "1" if decimals == 0 else "0." + "0" * (decimals - 1) + "1"
+
+
+def _typed_exact_window(
+    observed_at: Any,
+    valid_until: Any,
+    *,
+    duration_seconds: int,
+) -> Tuple[datetime, datetime]:
+    observed = _utc_datetime(observed_at, field="typed observed_at")
+    valid = _utc_datetime(valid_until, field="typed valid_until")
+    if valid - observed != timedelta(seconds=duration_seconds):
+        raise ValueError("typed validity window is invalid")
+    return observed, valid
+
+
+def _typed_row_decimals(value: Any, *, field: str) -> int:
+    if (
+        not isinstance(value, str)
+        or not value
+        or not value.isdigit()
+        or str(int(value)) != value
+    ):
+        raise ValueError("{} is invalid".format(field))
+    decimals = int(value)
+    if not 0 <= decimals <= 255:
+        raise ValueError("{} is invalid".format(field))
+    return decimals
+
+
+def _trusted_dex_directional_binding(
+    trusted_leg: Mapping[str, Any],
+    collector_row: Mapping[str, Any],
+    accepted_raw_sha256: str,
+    *,
+    require_usd_lineage: bool,
+) -> Dict[str, Any]:
+    identity = _canonical_leg_identity(trusted_leg)
+    if identity["market_type"] != "dex":
+        raise ValueError("DEX typed-source identity is invalid")
+    pool_address = _typed_nonzero_evm_address(
+        identity["pool_address"], field="pool_address"
+    )
+    if protocol_model(
+        identity["dex"], identity["chain"], pool_address
+    )[0] == "unsupported":
+        raise ValueError("DEX typed-source protocol is unsupported")
+    projected = _trusted_dex_collector_projection(trusted_leg)
+    context = trusted_leg.get("collector_context")
+    if require_usd_lineage and (
+        not isinstance(context, Mapping)
+        or context.get("status") != "observed"
+    ):
+        raise ValueError("DEX typed-source collector context is unavailable")
+    if (
+        collector_row.get("status") not in {"observed", "partial"}
+        or collector_row.get("token_symbol") != identity["token_symbol"]
+        or collector_row.get("chain") != identity["chain"]
+        or collector_row.get("dex") != identity["dex"]
+        or collector_row.get("pool_address") != identity["pool_address"]
+        or collector_row.get("raw_response_sha256") != accepted_raw_sha256
+    ):
+        raise ValueError("DEX typed-source collector row is invalid")
+    if require_usd_lineage:
+        assert isinstance(context, Mapping)
+        for field in (
+            "usd_price_source_snapshot_id", "usd_price_observed_at",
+            "usd_price_source", "usd_price_source_endpoint",
+            "usd_price_raw_response_sha256",
+        ):
+            context_field = {
+                "usd_price_source_snapshot_id": "snapshot_id",
+                "usd_price_observed_at": "observed_at",
+                "usd_price_source": "source",
+                "usd_price_source_endpoint": "source_endpoint",
+                "usd_price_raw_response_sha256": "raw_response_sha256",
+            }[field]
+            if collector_row.get(field) != context.get(context_field):
+                raise ValueError("DEX typed-source price lineage is invalid")
+
+    token_addresses = (
+        _typed_nonzero_evm_address(
+            collector_row.get("token0_address"), field="token0_address"
+        ),
+        _typed_nonzero_evm_address(
+            collector_row.get("token1_address"), field="token1_address"
+        ),
+    )
+    if token_addresses[0] == token_addresses[1]:
+        raise ValueError("DEX typed-source token identities are invalid")
+    if isinstance(context, Mapping) and context.get("status") == "observed":
+        context_addresses = {
+            _dex_context_token_address(
+                context["base_token_id"],
+                chain=identity["chain"],
+                field="base_token_id",
+            ),
+            _dex_context_token_address(
+                context["quote_token_id"],
+                chain=identity["chain"],
+                field="quote_token_id",
+            ),
+        }
+        if set(token_addresses) != context_addresses:
+            raise ValueError("DEX typed-source token identities are invalid")
+    position = collector_row.get("target_token_position")
+    if position not in {"token0", "token1"}:
+        raise ValueError("DEX typed-source target position is invalid")
+    target_index = int(position[-1])
+    quote_index = 1 - target_index
+    target_address = _typed_nonzero_evm_address(
+        trusted_leg.get("target_token_address"), field="target_token_address"
+    )
+    if (
+        token_addresses[target_index] != target_address
+        or collector_row.get("target_token_address") != target_address
+        or projected.get("target_token_address") != target_address
+    ):
+        raise ValueError("DEX typed-source target identity is invalid")
+    symbols = (
+        collector_row.get("token0_symbol"),
+        collector_row.get("token1_symbol"),
+    )
+    if any(
+        not isinstance(symbol, str)
+        or _TYPED_ASSET.fullmatch(symbol) is None
+        for symbol in symbols
+    ) or (
+        symbols[target_index] != identity["token_symbol"]
+        or symbols[quote_index] == identity["token_symbol"]
+    ):
+        raise ValueError("DEX typed-source assets are invalid")
+    decimals = (
+        _typed_row_decimals(
+            collector_row.get("token0_decimals"), field="token0_decimals"
+        ),
+        _typed_row_decimals(
+            collector_row.get("token1_decimals"), field="token1_decimals"
+        ),
+    )
+    state_observed_at = collector_row.get("block_timestamp")
+    _utc_datetime(state_observed_at, field="typed state observed_at")
+    binding = {
+        "market_id": trusted_leg["market_id"],
+        "target_asset": symbols[target_index],
+        "quote_asset": symbols[quote_index],
+        "target_token_address": target_address,
+        "quote_token_address": token_addresses[quote_index],
+        "target_unit_decimals": decimals[target_index],
+        "quote_unit_decimals": decimals[quote_index],
+        "state_observed_at": state_observed_at,
+        "state_raw_response_sha256": accepted_raw_sha256,
+        "token0_address": token_addresses[0],
+        "token1_address": token_addresses[1],
+        "token0_decimals": decimals[0],
+        "token1_decimals": decimals[1],
+    }
+    if require_usd_lineage:
+        assert isinstance(context, Mapping)
+        context_prices = {
+            _dex_context_token_address(
+                context["base_token_id"],
+                chain=identity["chain"],
+                field="base_token_id",
+            ): _typed_positive_decimal_text(
+                context["base_token_price_usd"],
+                field="base_token_price_usd",
+            ),
+            _dex_context_token_address(
+                context["quote_token_id"],
+                chain=identity["chain"],
+                field="quote_token_id",
+            ): _typed_positive_decimal_text(
+                context["quote_token_price_usd"],
+                field="quote_token_price_usd",
+            ),
+        }
+        prices = (
+            _typed_positive_decimal_text(
+                collector_row.get("token0_price_usd"), field="token0_price_usd"
+            ),
+            _typed_positive_decimal_text(
+                collector_row.get("token1_price_usd"), field="token1_price_usd"
+            ),
+        )
+        if any(
+            prices[index] != context_prices[token_addresses[index]]
+            for index in (0, 1)
+        ):
+            raise ValueError("DEX typed-source observed prices are invalid")
+        binding.update({
+            "usd_per_quote": prices[quote_index],
+            "source": context["source"],
+            "source_snapshot_id": context["snapshot_id"],
+            "source_raw_response_sha256": context["raw_response_sha256"],
+            "conversion_observed_at": context["observed_at"],
+        })
+    return binding
+
+
+def _validate_dex_pool_state_binding(
+    pool_state: Any,
+    trusted_leg: Mapping[str, Any],
+    collector_row: Mapping[str, Any],
+    accepted_raw_sha256: str,
+) -> None:
+    identity = _canonical_leg_identity(trusted_leg)
+    target_address = _typed_nonzero_evm_address(
+        trusted_leg.get("target_token_address"), field="target_token_address"
+    )
+    row_token0 = _typed_nonzero_evm_address(
+        collector_row.get("token0_address"), field="token0_address"
+    )
+    row_token1 = _typed_nonzero_evm_address(
+        collector_row.get("token1_address"), field="token1_address"
+    )
+    if (
+        pool_state.chain != identity["chain"]
+        or pool_state.dex != identity["dex"]
+        or pool_state.pool_address != identity["pool_address"]
+        or collector_row.get("chain") != identity["chain"]
+        or collector_row.get("dex") != identity["dex"]
+        or collector_row.get("pool_address") != identity["pool_address"]
+        or pool_state.token0_address != row_token0
+        or pool_state.token1_address != row_token1
+        or pool_state.token0_decimals != _typed_row_decimals(
+            collector_row.get("token0_decimals"), field="token0_decimals"
+        )
+        or pool_state.token1_decimals != _typed_row_decimals(
+            collector_row.get("token1_decimals"), field="token1_decimals"
+        )
+        or target_address not in {row_token0, row_token1}
+        or _utc_datetime(
+            pool_state.observed_at, field="typed pool observed_at"
+        ) != _utc_datetime(
+            collector_row.get("block_timestamp"),
+            field="typed collector block_timestamp",
+        )
+        or pool_state.raw_response_sha256 != accepted_raw_sha256
+        or collector_row.get("raw_response_sha256") != accepted_raw_sha256
+    ):
+        raise ValueError("DEX pool-state binding is invalid")
+    context = trusted_leg.get("collector_context")
+    if isinstance(context, Mapping) and context.get("status") == "observed":
+        context_addresses = {
+            _dex_context_token_address(
+                context.get("base_token_id"),
+                chain=identity["chain"],
+                field="base_token_id",
+            ),
+            _dex_context_token_address(
+                context.get("quote_token_id"),
+                chain=identity["chain"],
+                field="quote_token_id",
+            ),
+        }
+        if context_addresses != {row_token0, row_token1}:
+            raise ValueError("DEX pool-state context binding is invalid")
+
+
 def _validated_typed_payload_inventory(
-    market_id: str,
-    market_type: str,
+    trusted_leg: Mapping[str, Any],
+    collector_row: Mapping[str, Any],
+    accepted_raw_sha256: str,
     values: Iterable[Any],
 ) -> Tuple[Mapping[str, Any], ...]:
+    if not isinstance(trusted_leg, Mapping) or not isinstance(
+        collector_row, Mapping
+    ):
+        raise ValueError("typed-source worker inventory is invalid")
+    try:
+        identity = _canonical_leg_identity(trusted_leg)
+        market_id = trusted_leg["market_id"]
+        market_type = identity["market_type"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("typed-source worker inventory is invalid") from error
+    if (
+        _TYPED_SHA256.fullmatch(str(accepted_raw_sha256 or "")) is None
+        or not _collector_identity_matches(
+            market_id, market_type, trusted_leg, collector_row
+        )
+        or collector_row.get("raw_response_sha256")
+        not in (None, "", accepted_raw_sha256)
+    ):
+        raise ValueError("typed-source worker inventory is invalid")
     members = []
     seen = set()
     aggregate = 0
+    parsed_by_role: Dict[str, Any] = {}
     for raw in values:
         if not isinstance(raw, Mapping) or set(raw) != {"role", "payload"}:
             raise ValueError("typed-source worker inventory is invalid")
@@ -1112,26 +2849,27 @@ def _validated_typed_payload_inventory(
         if role == "dex_pool_state":
             try:
                 parsed = json.loads(payload.decode("utf-8"))
+                frozen_state = freeze_v2_pool_state({
+                    **dict(parsed),
+                    **{
+                        field: int(parsed[field])
+                        for field in (
+                            "chain_id", "token0_decimals", "token1_decimals",
+                            "reserve0_raw", "reserve1_raw",
+                            "reserve_timestamp_last_raw", "fee_bps",
+                            "fee_numerator", "fee_denominator", "block_number",
+                        )
+                    },
+                })
                 if (
                     not isinstance(parsed, Mapping)
                     or parsed.get("schema") != contract["content_schema"]
-                    or parsed.get("state_id")
-                    != freeze_v2_pool_state({
-                        **dict(parsed),
-                        **{
-                            field: int(parsed[field])
-                            for field in (
-                                "chain_id", "token0_decimals", "token1_decimals",
-                                "reserve0_raw", "reserve1_raw",
-                                "reserve_timestamp_last_raw", "fee_bps",
-                                "fee_numerator", "fee_denominator", "block_number",
-                            )
-                        },
-                    }).state_id
+                    or parsed.get("state_id") != frozen_state.state_id
                     or payload != _typed_json_bytes(parsed)
                 ):
                     raise ValueError("invalid state")
                 logical_generation = parsed["state_id"].split(":", 1)[1]
+                parsed_by_role[role] = frozen_state
             except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ValueError("typed-source worker inventory is invalid") from error
         elif role in {"cex_market_rules", "quote_usd_conversion"}:
@@ -1235,6 +2973,149 @@ def _validated_typed_payload_inventory(
                 UnicodeDecodeError, json.JSONDecodeError,
             ) as error:
                 raise ValueError("typed-source worker inventory is invalid") from error
+        elif role in {"dex_market_rules", "dex_usd_conversion"}:
+            try:
+                parsed = json.loads(payload.decode("utf-8"))
+                if (
+                    not isinstance(parsed, Mapping)
+                    or payload != _typed_json_bytes(parsed)
+                ):
+                    raise ValueError("invalid typed JSON")
+                identity = _canonical_leg_identity({
+                    "market_id": market_id,
+                    "market_type": "dex",
+                })
+                target_asset = identity["token_symbol"]
+                if role == "dex_market_rules":
+                    if (
+                        set(parsed) != _DEX_MARKET_RULES_SOURCE_FIELDS
+                        or parsed.get("schema") != contract["content_schema"]
+                        or parsed.get("market_id") != market_id
+                        or parsed.get("base_asset") != target_asset
+                        or _TYPED_ASSET.fullmatch(
+                            str(parsed.get("quote_asset") or "")
+                        ) is None
+                        or parsed.get("quote_asset") == target_asset
+                        or _TYPED_EVM_ADDRESS.fullmatch(
+                            str(parsed.get("base_token_address") or "")
+                        ) is None
+                        or parsed.get("base_token_address")
+                        == _ZERO_EVM_ADDRESS
+                        or _TYPED_EVM_ADDRESS.fullmatch(
+                            str(parsed.get("quote_token_address") or "")
+                        ) is None
+                        or parsed.get("quote_token_address")
+                        == _ZERO_EVM_ADDRESS
+                        or parsed.get("base_token_address")
+                        == parsed.get("quote_token_address")
+                        or parsed.get("increment_source")
+                        != "fixed_block_token_decimals"
+                        or parsed.get("minimum_source")
+                        != "dex_protocol_no_additional_order_minimum"
+                        or parsed.get("min_base_quantity") != "0"
+                        or parsed.get("min_quote_notional") != "0"
+                        or _TYPED_SHA256.fullmatch(
+                            str(parsed.get("raw_response_sha256") or "")
+                        ) is None
+                    ):
+                        raise ValueError("invalid DEX market rules")
+                    base_decimals = parsed.get("base_unit_decimals")
+                    quote_decimals = parsed.get("quote_unit_decimals")
+                    if (
+                        parsed.get("base_increment")
+                        != _typed_unit_increment(base_decimals)
+                        or parsed.get("quote_increment")
+                        != _typed_unit_increment(quote_decimals)
+                    ):
+                        raise ValueError("invalid DEX market increments")
+                    _typed_exact_window(
+                        parsed.get("observed_at"),
+                        parsed.get("valid_until"),
+                        duration_seconds=int(
+                            MAX_DEX_QUANTITY_STATE_AGE_SECONDS
+                        ),
+                    )
+                    MarketRules(
+                        market_id=market_id,
+                        base_asset=parsed["base_asset"],
+                        quote_asset=parsed["quote_asset"],
+                        base_unit_decimals=base_decimals,
+                        quote_unit_decimals=quote_decimals,
+                        base_increment=Decimal(parsed["base_increment"]),
+                        quote_increment=Decimal(parsed["quote_increment"]),
+                        min_base_quantity=Decimal(0),
+                        min_quote_notional=Decimal(0),
+                        observed_at=parsed["observed_at"],
+                        valid_until=parsed["valid_until"],
+                        source_record_sha256=hashlib.sha256(payload).hexdigest(),
+                    )
+                else:
+                    if (
+                        set(parsed) != _DEX_USD_CONVERSION_SOURCE_FIELDS
+                        or parsed.get("schema") != contract["content_schema"]
+                        or parsed.get("market_id") != market_id
+                        or parsed.get("target_asset") != target_asset
+                        or _TYPED_ASSET.fullmatch(
+                            str(parsed.get("quote_asset") or "")
+                        ) is None
+                        or parsed.get("quote_asset") == target_asset
+                        or _TYPED_EVM_ADDRESS.fullmatch(
+                            str(parsed.get("target_token_address") or "")
+                        ) is None
+                        or parsed.get("target_token_address")
+                        == _ZERO_EVM_ADDRESS
+                        or _TYPED_EVM_ADDRESS.fullmatch(
+                            str(parsed.get("quote_token_address") or "")
+                        ) is None
+                        or parsed.get("quote_token_address")
+                        == _ZERO_EVM_ADDRESS
+                        or parsed.get("target_token_address")
+                        == parsed.get("quote_token_address")
+                        or parsed.get("value_status") != "measured"
+                        or not isinstance(parsed.get("source"), str)
+                        or not parsed["source"]
+                        or parsed["source"] != parsed["source"].strip()
+                        or not isinstance(parsed.get("source_snapshot_id"), str)
+                        or not parsed["source_snapshot_id"]
+                        or parsed["source_snapshot_id"]
+                        != parsed["source_snapshot_id"].strip()
+                        or _TYPED_SHA256.fullmatch(str(
+                            parsed.get("source_raw_response_sha256") or ""
+                        )) is None
+                        or _TYPED_SHA256.fullmatch(str(
+                            parsed.get("state_raw_response_sha256") or ""
+                        )) is None
+                    ):
+                        raise ValueError("invalid DEX USD conversion")
+                    rate = parsed.get("usd_per_quote")
+                    if not isinstance(rate, str) or not rate or rate != rate.strip():
+                        raise ValueError("invalid DEX USD conversion")
+                    number = Decimal(rate)
+                    canonical = format(number, "f")
+                    if "." in canonical:
+                        canonical = canonical.rstrip("0").rstrip(".")
+                    if not number.is_finite() or number <= 0 or canonical != rate:
+                        raise ValueError("invalid DEX USD conversion")
+                    observed, _valid = _typed_exact_window(
+                        parsed.get("observed_at"),
+                        parsed.get("valid_until"),
+                        duration_seconds=USD_PRICE_SKEW_MAX_SECONDS,
+                    )
+                    state_observed = _utc_datetime(
+                        parsed.get("state_observed_at"),
+                        field="typed state_observed_at",
+                    )
+                    if abs(observed - state_observed) > timedelta(
+                        seconds=USD_PRICE_SKEW_MAX_SECONDS
+                    ):
+                        raise ValueError("invalid DEX USD conversion timing")
+                logical_generation = hashlib.sha256(payload).hexdigest()
+                parsed_by_role[role] = parsed
+            except (
+                KeyError, TypeError, ValueError, InvalidOperation,
+                UnicodeDecodeError, json.JSONDecodeError,
+            ) as error:
+                raise ValueError("typed-source worker inventory is invalid") from error
         else:
             logical_generation = hashlib.sha256(payload).hexdigest()
         members.append({
@@ -1245,6 +3126,196 @@ def _validated_typed_payload_inventory(
             "adapter_id": contract["adapter_id"],
             "content_schema": contract["content_schema"],
         })
+    rules = parsed_by_role.get("dex_market_rules")
+    conversion = parsed_by_role.get("dex_usd_conversion")
+    pool_state = parsed_by_role.get("dex_pool_state")
+    try:
+        if pool_state is not None:
+            _validate_dex_pool_state_binding(
+                pool_state,
+                trusted_leg,
+                collector_row,
+                accepted_raw_sha256,
+            )
+        rules_binding = (
+            _trusted_dex_directional_binding(
+                trusted_leg,
+                collector_row,
+                accepted_raw_sha256,
+                require_usd_lineage=False,
+            )
+            if rules is not None
+            else None
+        )
+        conversion_binding = (
+            _trusted_dex_directional_binding(
+                trusted_leg,
+                collector_row,
+                accepted_raw_sha256,
+                require_usd_lineage=True,
+            )
+            if conversion is not None
+            else None
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("typed-source worker inventory is invalid") from error
+    if rules is not None and rules_binding is not None:
+        if any(
+            rules[field] != expected
+            for field, expected in (
+                ("market_id", rules_binding["market_id"]),
+                ("base_asset", rules_binding["target_asset"]),
+                ("quote_asset", rules_binding["quote_asset"]),
+                (
+                    "base_token_address",
+                    rules_binding["target_token_address"],
+                ),
+                (
+                    "quote_token_address",
+                    rules_binding["quote_token_address"],
+                ),
+                (
+                    "base_unit_decimals",
+                    rules_binding["target_unit_decimals"],
+                ),
+                (
+                    "quote_unit_decimals",
+                    rules_binding["quote_unit_decimals"],
+                ),
+                (
+                    "raw_response_sha256",
+                    rules_binding["state_raw_response_sha256"],
+                ),
+            )
+        ) or _utc_datetime(
+            rules["observed_at"], field="typed rules observed_at"
+        ) != _utc_datetime(
+            rules_binding["state_observed_at"],
+            field="typed collector state_observed_at",
+        ):
+            raise ValueError("typed-source worker inventory is invalid")
+    if conversion is not None and conversion_binding is not None:
+        if any(
+            conversion[field] != expected
+            for field, expected in (
+                ("market_id", conversion_binding["market_id"]),
+                ("target_asset", conversion_binding["target_asset"]),
+                ("quote_asset", conversion_binding["quote_asset"]),
+                (
+                    "target_token_address",
+                    conversion_binding["target_token_address"],
+                ),
+                (
+                    "quote_token_address",
+                    conversion_binding["quote_token_address"],
+                ),
+                ("usd_per_quote", conversion_binding["usd_per_quote"]),
+                ("source", conversion_binding["source"]),
+                (
+                    "source_snapshot_id",
+                    conversion_binding["source_snapshot_id"],
+                ),
+                (
+                    "source_raw_response_sha256",
+                    conversion_binding["source_raw_response_sha256"],
+                ),
+                (
+                    "state_raw_response_sha256",
+                    conversion_binding["state_raw_response_sha256"],
+                ),
+            )
+        ) or _utc_datetime(
+            conversion["observed_at"], field="typed conversion observed_at"
+        ) != _utc_datetime(
+            conversion_binding["conversion_observed_at"],
+            field="typed collector conversion_observed_at",
+        ) or _utc_datetime(
+            conversion["state_observed_at"],
+            field="typed conversion state_observed_at",
+        ) != _utc_datetime(
+            conversion_binding["state_observed_at"],
+            field="typed collector state_observed_at",
+        ):
+            raise ValueError("typed-source worker inventory is invalid")
+    if pool_state is not None:
+        identity = _canonical_leg_identity({
+            "market_id": market_id,
+            "market_type": "dex",
+        })
+        if any(
+            actual != identity[field]
+            for field, actual in (
+                ("chain", pool_state.chain),
+                ("dex", pool_state.dex),
+                ("pool_address", pool_state.pool_address),
+            )
+        ):
+            raise ValueError("typed-source worker inventory is invalid")
+
+        def pool_direction(
+            target_address: str,
+            quote_address: str,
+        ) -> Optional[Tuple[int, int]]:
+            if (
+                target_address == pool_state.token0_address
+                and quote_address == pool_state.token1_address
+            ):
+                return pool_state.token0_decimals, pool_state.token1_decimals
+            if (
+                target_address == pool_state.token1_address
+                and quote_address == pool_state.token0_address
+            ):
+                return pool_state.token1_decimals, pool_state.token0_decimals
+            return None
+
+        if rules is not None:
+            rule_decimals = pool_direction(
+                rules["base_token_address"], rules["quote_token_address"]
+            )
+            if (
+                rule_decimals is None
+                or rule_decimals != (
+                    rules["base_unit_decimals"], rules["quote_unit_decimals"]
+                )
+                or _utc_datetime(
+                    rules["observed_at"], field="typed observed_at"
+                ) != _utc_datetime(
+                    pool_state.observed_at, field="typed pool observed_at"
+                )
+                or rules["raw_response_sha256"]
+                != pool_state.raw_response_sha256
+            ):
+                raise ValueError("typed-source worker inventory is invalid")
+        if conversion is not None:
+            if (
+                pool_direction(
+                    conversion["target_token_address"],
+                    conversion["quote_token_address"],
+                ) is None
+                or _utc_datetime(
+                    conversion["state_observed_at"],
+                    field="typed state_observed_at",
+                ) != _utc_datetime(
+                    pool_state.observed_at, field="typed pool observed_at"
+                )
+                or conversion["state_raw_response_sha256"]
+                != pool_state.raw_response_sha256
+            ):
+                raise ValueError("typed-source worker inventory is invalid")
+    if rules is not None and conversion is not None:
+        if any(
+            rules[left] != conversion[right]
+            for left, right in (
+                ("market_id", "market_id"),
+                ("base_asset", "target_asset"),
+                ("base_token_address", "target_token_address"),
+                ("quote_asset", "quote_asset"),
+                ("quote_token_address", "quote_token_address"),
+                ("observed_at", "state_observed_at"),
+                ("raw_response_sha256", "state_raw_response_sha256"),
+            )
+        ):
+            raise ValueError("typed-source worker inventory is invalid")
     members.sort(key=lambda item: item["role"])
     return tuple(members)
 
@@ -1404,6 +3475,26 @@ def _safe_url_projection(value: str) -> Any:
     )
 
 
+def _safe_source_endpoint_projection(value: Any) -> Any:
+    """Retain only a canonical public origin for endpoint lineage."""
+    if not isinstance(value, str):
+        return _DROP_PROJECTION
+    try:
+        value.encode("utf-8")
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeEncodeError, ValueError):
+        return _DROP_PROJECTION
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not hostname:
+        return _DROP_PROJECTION
+    safe_host = "[{}]".format(hostname) if ":" in hostname else hostname
+    if port is not None:
+        safe_host = "{}:{}".format(safe_host, port)
+    return urlunsplit((scheme, safe_host, "", "", ""))
+
+
 def _safe_projection_value(
     value: Any,
     *,
@@ -1439,10 +3530,14 @@ def _safe_projection_value(
             safe_key = _safe_url_projection(key)
             if safe_key is _DROP_PROJECTION or safe_key != key:
                 continue
-            safe_nested = _safe_projection_value(
-                nested,
-                seen=seen,
-                depth=depth + 1,
+            safe_nested = (
+                _safe_source_endpoint_projection(nested)
+                if key.endswith("source_endpoint")
+                else _safe_projection_value(
+                    nested,
+                    seen=seen,
+                    depth=depth + 1,
+                )
             )
             if safe_nested is not _DROP_PROJECTION:
                 projected[key] = safe_nested
@@ -1506,6 +3601,59 @@ def _safe_leg_projection(row: Mapping[str, Any]) -> Dict[str, Any]:
         return {}
     if _projection_contains_unsafe_evidence(projected):
         return {}
+    return projected
+
+
+def _final_route_leg_projection(
+    requested_leg: Mapping[str, Any],
+    collector_row: Mapping[str, Any],
+    *,
+    market_id: str,
+) -> Dict[str, Any]:
+    """Build the one deterministic public leg used by authority and cohort."""
+    market_type = _market_type(requested_leg)
+    row = {
+        **dict(collector_row),
+        "leg_id": market_id,
+        "market_id": market_id,
+        "market_type": market_type,
+        **{
+            key: requested_leg[key]
+            for key in (
+                "execution_adapter_supported", "execution_adapter_status",
+                "target_token_address", "target_token_side",
+            )
+            if key in requested_leg
+        },
+    }
+    context = requested_leg.get("collector_context")
+    if market_type == "dex" and isinstance(context, Mapping):
+        row.update({
+            "collector_context": dict(context),
+            "usd_price_source_snapshot_id": context["snapshot_id"],
+            "usd_price_observed_at": context["observed_at"],
+            "usd_price_source": context["source"],
+            "usd_price_source_endpoint": context["source_endpoint"],
+            "usd_price_raw_response_sha256": context[
+                "raw_response_sha256"
+            ],
+        })
+        if (
+            context.get("status") != "observed"
+            or collector_row.get("available") is False
+        ):
+            row.update({
+                "available": False,
+                "token0_price_usd": None,
+                "token1_price_usd": None,
+            })
+    projected = _safe_leg_projection(row)
+    if (
+        not projected
+        or projected.get("market_id") != market_id
+        or projected.get("market_type") != market_type
+    ):
+        raise ValueError("final route leg projection is invalid")
     return projected
 
 
@@ -1916,6 +4064,8 @@ def _read_regular_file(path: Path) -> Tuple[bytes, Tuple[int, int]]:
 def _read_regular_file_at(
     directory_descriptor: int,
     name: str,
+    *,
+    max_bytes: Optional[int] = None,
 ) -> Tuple[bytes, Tuple[int, int]]:
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise _UnsafeRawEvidence("raw evidence filename is invalid")
@@ -1929,7 +4079,18 @@ def _read_regular_file_at(
         raise FileNotFoundError("raw evidence is missing") from error
     except OSError as error:
         raise _UnsafeRawEvidence("raw evidence path is unavailable") from error
-    if not stat.S_ISREG(before.st_mode):
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or (
+            max_bytes is not None
+            and (
+                type(max_bytes) is not int
+                or max_bytes <= 0
+                or before.st_size > max_bytes
+                or before.st_nlink != 1
+            )
+        )
+    ):
         raise _UnsafeRawEvidence("raw evidence is not a real regular file")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -1956,6 +4117,8 @@ def _read_regular_file_at(
             raise _UnsafeRawEvidence("raw evidence identity changed")
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             payload = handle.read()
+        if max_bytes is not None and len(payload) > max_bytes:
+            raise _UnsafeRawEvidence("raw evidence is too large")
         after = os.stat(
             name,
             dir_fd=directory_descriptor,
@@ -1971,6 +4134,130 @@ def _read_regular_file_at(
         raise _UnsafeRawEvidence("raw evidence identity changed") from error
     finally:
         os.close(descriptor)
+
+
+def _quarantine_failed_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+    expected_identity: Tuple[int, int],
+) -> None:
+    """Detach a failed write without deleting whichever inode owns its name."""
+    metadata = _directory_entry_metadata(directory_descriptor, name)
+    if metadata is None:
+        return
+    quarantine_name = ".raw-write-quarantine-{}-{}".format(
+        uuid.uuid4().hex, name
+    )
+    _rename_directory_entry(
+        name,
+        quarantine_name,
+        source_directory_fd=directory_descriptor,
+        destination_directory_fd=directory_descriptor,
+    )
+    moved = _directory_entry_metadata(
+        directory_descriptor, quarantine_name
+    )
+    if moved is None:
+        raise _UnsafeRawEvidence(
+            "raw evidence write quarantine is unavailable"
+        )
+    moved_identity = (moved.st_dev, moved.st_ino)
+    if _directory_entry_metadata(directory_descriptor, name) is not None:
+        raise _UnsafeRawEvidence(
+            "raw evidence write canonical name changed during quarantine"
+        )
+    os.fsync(directory_descriptor)
+    if moved_identity != expected_identity:
+        raise _UnsafeRawEvidence(
+            "raw evidence write quarantine preserved a foreign file"
+        )
+
+
+def _write_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+    payload: bytes,
+    *,
+    max_bytes: int,
+) -> Tuple[Tuple[int, int], str]:
+    """Create, fsync, and re-read one bounded no-follow regular file."""
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or not isinstance(payload, bytes)
+        or type(max_bytes) is not int
+        or max_bytes <= 0
+        or not 0 < len(payload) <= max_bytes
+    ):
+        raise _UnsafeRawEvidence("raw evidence file write is invalid")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = None
+    created = False
+    identity = None
+    try:
+        descriptor = os.open(
+            name,
+            flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        created = True
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise _UnsafeRawEvidence(
+                "raw evidence file write is not regular"
+            )
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise _UnsafeRawEvidence("raw evidence file write failed")
+            written += count
+        os.fsync(descriptor)
+        written_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(written_metadata.st_mode)
+            or written_metadata.st_nlink != 1
+            or written_metadata.st_size != len(payload)
+            or (written_metadata.st_dev, written_metadata.st_ino)
+            != identity
+        ):
+            raise _UnsafeRawEvidence("raw evidence file write changed")
+    except (OSError, _UnsafeRawEvidence):
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        if created and identity is not None:
+            _quarantine_failed_regular_file_at(
+                directory_descriptor, name, identity
+            )
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
+        verified, verified_identity = _read_regular_file_at(
+            directory_descriptor,
+            name,
+            max_bytes=max_bytes,
+        )
+        if verified_identity != identity or verified != payload:
+            raise _UnsafeRawEvidence("raw evidence file write changed")
+        os.fsync(directory_descriptor)
+    except (OSError, FileNotFoundError, _UnsafeRawEvidence):
+        _quarantine_failed_regular_file_at(
+            directory_descriptor, name, identity
+        )
+        raise
+    return identity, hashlib.sha256(payload).hexdigest()
 
 
 def _validated_raw_evidence(
@@ -2016,6 +4303,8 @@ def _post_promotion_failure(
     stage_identity: Tuple[int, int],
     response_identity: Tuple[int, int],
     expected_sha256: str,
+    authority_identity: Tuple[int, int],
+    authority_sha256: str,
     staging_root: Path,
     accepted_root: Path,
     guards: Mapping[str, Tuple[int, int]],
@@ -2034,12 +4323,32 @@ def _post_promotion_failure(
             descriptors["accepted"], entry_name
         ) != stage_identity:
             raise _UnsafeRawEvidence("accepted evidence identity changed")
+        if sorted(os.listdir(entry_descriptor)) != [
+            _ATTACHMENT_AUTHORITY_FILENAME,
+            "response.json",
+        ]:
+            raise _UnsafeRawEvidence(
+                "accepted evidence file inventory changed"
+            )
         payload, actual_response_identity = _read_regular_file_at(
             entry_descriptor,
             "response.json",
         )
         if actual_response_identity != response_identity:
             raise _UnsafeRawEvidence("accepted response identity changed")
+        authority_payload, actual_authority_identity = _read_regular_file_at(
+            entry_descriptor,
+            _ATTACHMENT_AUTHORITY_FILENAME,
+            max_bytes=_ATTACHMENT_AUTHORITY_MAX_BYTES,
+        )
+        if (
+            actual_authority_identity != authority_identity
+            or hashlib.sha256(authority_payload).hexdigest()
+            != authority_sha256
+        ):
+            raise _UnsafeRawEvidence(
+                "accepted attachment authority changed"
+            )
         _require_raw_run_guards(staging_root, accepted_root, guards)
     except (FileNotFoundError, _UnsafeRawEvidence):
         return "raw_evidence_path_unsafe"
@@ -2267,10 +4576,6 @@ def collect_route_cohort(
         _validate_route_volume_lineage(routes, legs_by_market)
     has_dex = any(
         _market_type(legs_by_market[item]) == "dex"
-        and (
-            not isinstance(legs_by_market[item].get("collector_context"), Mapping)
-            or legs_by_market[item]["collector_context"].get("status") == "observed"
-        )
         for item in market_ids
     )
     if has_dex and dex_block_resolver is None:
@@ -2327,13 +4632,7 @@ def collect_route_cohort(
     for market_id in market_ids:
         leg = legs_by_market[market_id]
         if _market_type(leg) == "dex":
-            context = leg.get("collector_context")
-            if isinstance(context, Mapping) and context.get("status") != "observed":
-                terminal_reasons[market_id] = "usd_price_context_{}".format(
-                    context.get("status")
-                )
-            else:
-                dex_by_chain.setdefault(_source_key(leg)[1], []).append(market_id)
+            dex_by_chain.setdefault(_source_key(leg)[1], []).append(market_id)
     pending_by_source: Dict[Tuple[str, str], List[str]] = {}
     for market_id in market_ids:
         if _market_type(legs_by_market[market_id]) == "cex":
@@ -2410,6 +4709,12 @@ def collect_route_cohort(
                 )
                 else {}
             )
+            degraded_usd_keyword = (
+                {"allow_degraded_usd_context": True}
+                if kind == "dex"
+                and _collector_accepts_degraded_usd_context(dex_collector)
+                else {}
+            )
             if kind == "cex":
                 row = _row_from_collector(cex_collector(
                     dict(leg), snapshot_id=run_id, raw_path=raw_path,
@@ -2418,14 +4723,16 @@ def collect_route_cohort(
                 ))
             else:
                 block = fixed_blocks[source]
+                collector_leg = _strict_dex_collector_input(leg)
                 row = _row_from_collector(dex_collector(
-                    dict(leg), snapshot_id=run_id, raw_path=raw_path,
+                    collector_leg, snapshot_id=run_id, raw_path=raw_path,
                     fixed_block_number=block["block_number"],
                     fixed_block_timestamp=block.get("block_timestamp", ""),
                     fixed_chain_id=block.get("chain_id"),
                     fixed_block_header=block.get("block_header"),
                     deadline=active_deadline,
                     **typed_keyword,
+                    **degraded_usd_keyword,
                 ))
                 if (str(row.get("block_number")) != str(block["block_number"])
                         or str(row.get("block_timestamp") or "") != str(block.get("block_timestamp") or "")):
@@ -2452,8 +4759,16 @@ def collect_route_cohort(
                     (),
                 )
             active_deadline.require_remaining()
-            inventory = _validated_typed_payload_inventory(
-                market_id, kind, typed_payloads
+            if typed_payloads:
+                _validated_typed_payload_inventory(
+                    trusted_leg=leg,
+                    collector_row=row,
+                    accepted_raw_sha256=row.get("raw_response_sha256"),
+                    values=typed_payloads,
+                )
+            inventory = tuple(
+                {"role": item["role"], "payload": item["payload"]}
+                for item in typed_payloads
             )
             return (
                 market_id, row, None, stage_dir, stage_identity, inventory
@@ -2730,6 +5045,35 @@ def collect_route_cohort(
                         **dict(row),
                         "raw_response_sha256": actual_sha256,
                     }
+                    row = completed[market_id]
+                try:
+                    completed_typed_payloads[market_id] = (
+                        _validated_typed_payload_inventory(
+                            trusted_leg=legs_by_market[market_id],
+                            collector_row=row,
+                            accepted_raw_sha256=actual_sha256,
+                            values=completed_typed_payloads.get(market_id, ()),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    terminal_reasons[market_id] = "collection_failed"
+                    completed.pop(market_id, None)
+                    completed_typed_payloads.pop(market_id, None)
+                    continue
+                try:
+                    authority_payload = _attachment_authority_bytes(
+                        market_id=market_id,
+                        trusted_leg=legs_by_market[market_id],
+                        collector_row=row,
+                        accepted_raw_sha256=actual_sha256,
+                        collection_input_generation=expected_source_generation,
+                        validated_specs=completed_typed_payloads[market_id],
+                    )
+                except (TypeError, ValueError):
+                    terminal_reasons[market_id] = "collection_failed"
+                    completed.pop(market_id, None)
+                    completed_typed_payloads.pop(market_id, None)
+                    continue
                 entry_name = stage_dir.name
                 entry_descriptor = None
                 try:
@@ -2740,6 +5084,15 @@ def collect_route_cohort(
                         raw_run_descriptors["staging"],
                         entry_name,
                         stage_identity,
+                    )
+                    (
+                        authority_identity,
+                        authority_sha256,
+                    ) = _write_regular_file_at(
+                        entry_descriptor,
+                        _ATTACHMENT_AUTHORITY_FILENAME,
+                        authority_payload,
+                        max_bytes=_ATTACHMENT_AUTHORITY_MAX_BYTES,
                     )
                     _rename_directory_entry(
                         entry_name,
@@ -2765,6 +5118,8 @@ def collect_route_cohort(
                         stage_identity,
                         response_identity,
                         actual_sha256,
+                        authority_identity,
+                        authority_sha256,
                         staging_root,
                         accepted_root,
                         raw_run_guards,
@@ -2829,37 +5184,11 @@ def collect_route_cohort(
         fixed_blocks_by_market=fixed_blocks_by_market,
     )
     legs = [
-        _safe_leg_projection({
-            **row,
-            "market_type": _market_type(legs_by_market[row["market_id"]]),
-            **{
-                key: legs_by_market[row["market_id"]][key]
-                for key in ("execution_adapter_supported", "execution_adapter_status")
-                if key in legs_by_market[row["market_id"]]
-            },
-            **(
-                {
-                    "collector_context": legs_by_market[row["market_id"]]["collector_context"],
-                    "usd_price_source_snapshot_id": legs_by_market[row["market_id"]]["collector_context"]["snapshot_id"],
-                    "usd_price_observed_at": legs_by_market[row["market_id"]]["collector_context"]["observed_at"],
-                    "usd_price_source": legs_by_market[row["market_id"]]["collector_context"]["source"],
-                    "usd_price_source_endpoint": legs_by_market[row["market_id"]]["collector_context"]["source_endpoint"],
-                    "usd_price_raw_response_sha256": legs_by_market[row["market_id"]]["collector_context"]["raw_response_sha256"],
-                    **(
-                        {}
-                        if legs_by_market[row["market_id"]]["collector_context"].get("status") == "observed"
-                        else {
-                            "available": False,
-                            "token0_price_usd": None,
-                            "token1_price_usd": None,
-                        }
-                    ),
-                }
-                if _market_type(legs_by_market[row["market_id"]]) == "dex"
-                and isinstance(legs_by_market[row["market_id"]].get("collector_context"), Mapping)
-                else {}
-            ),
-        })
+        _final_route_leg_projection(
+            legs_by_market[row["market_id"]],
+            row,
+            market_id=row["market_id"],
+        )
         for row in legs
     ]
     eligible_market_ids = {

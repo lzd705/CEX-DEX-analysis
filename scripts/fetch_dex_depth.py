@@ -62,6 +62,7 @@ try:
         EXECUTION_COST_COLUMNS,
         EXECUTION_DIRECTIONS,
         EXECUTION_NOTIONALS_USD,
+        USD_PRICE_SKEW_MAX_SECONDS,
         execution_fact_row,
         status_counts as execution_status_counts,
         usd_price_timing,
@@ -82,6 +83,7 @@ try:
     )
     from scripts.route_quantity import (
         CommonTarget,
+        MAX_DEX_QUANTITY_STATE_AGE_SECONDS,
         MarketRules,
         QuantityQuote,
         V2_FEE_FORMULA,
@@ -89,7 +91,10 @@ try:
         quote_v2_pool_quantity,
         validate_v2_quantity_quote_against_state,
     )
-    from scripts.timestamp_contract import validate_observation_bounds
+    from scripts.timestamp_contract import (
+        canonical_rfc3339_utc,
+        validate_observation_bounds,
+    )
 except ModuleNotFoundError:
     from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
     from atomic_publication import atomic_replace_bundle, csv_payload
@@ -102,6 +107,7 @@ except ModuleNotFoundError:
         EXECUTION_COST_COLUMNS,
         EXECUTION_DIRECTIONS,
         EXECUTION_NOTIONALS_USD,
+        USD_PRICE_SKEW_MAX_SECONDS,
         execution_fact_row,
         status_counts as execution_status_counts,
         usd_price_timing,
@@ -122,6 +128,7 @@ except ModuleNotFoundError:
     )
     from route_quantity import (
         CommonTarget,
+        MAX_DEX_QUANTITY_STATE_AGE_SECONDS,
         MarketRules,
         QuantityQuote,
         V2_FEE_FORMULA,
@@ -129,7 +136,7 @@ except ModuleNotFoundError:
         quote_v2_pool_quantity,
         validate_v2_quantity_quote_against_state,
     )
-    from timestamp_contract import validate_observation_bounds
+    from timestamp_contract import canonical_rfc3339_utc, validate_observation_bounds
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -295,6 +302,48 @@ ROUTE_V2_POOL_STATE_FIELDS = (
     "state_id",
 )
 _ROUTE_BLOCK_HASH = re.compile(r"0x[0-9a-f]{64}\Z", flags=re.ASCII)
+_ROUTE_EVM_ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z", flags=re.ASCII)
+_ZERO_EVM_ADDRESS = "0x" + "0" * 40
+_ROUTE_ASSET = re.compile(
+    r"[A-Z0-9][A-Z0-9._-]{0,63}\Z", flags=re.ASCII
+)
+_ROUTE_SHA256 = re.compile(r"[0-9a-f]{64}\Z", flags=re.ASCII)
+ROUTE_DEX_MARKET_RULES_FIELDS = (
+    "schema",
+    "market_id",
+    "base_asset",
+    "quote_asset",
+    "base_token_address",
+    "quote_token_address",
+    "base_unit_decimals",
+    "quote_unit_decimals",
+    "base_increment",
+    "quote_increment",
+    "min_base_quantity",
+    "min_quote_notional",
+    "increment_source",
+    "minimum_source",
+    "observed_at",
+    "valid_until",
+    "raw_response_sha256",
+)
+ROUTE_DEX_USD_CONVERSION_FIELDS = (
+    "schema",
+    "market_id",
+    "target_asset",
+    "target_token_address",
+    "quote_asset",
+    "quote_token_address",
+    "usd_per_quote",
+    "value_status",
+    "observed_at",
+    "valid_until",
+    "state_observed_at",
+    "source",
+    "source_snapshot_id",
+    "source_raw_response_sha256",
+    "state_raw_response_sha256",
+)
 V3_DEXES = {
     "aerodrome-slipstream",
     "uniswap_v3",
@@ -305,6 +354,22 @@ V3_DEXES = {
     "sushiswap-v3-ethereum",
     "pancakeswap-v3-bsc",
     "velodrome-finance-slipstream",
+}
+DEX_PROTOCOL_MODELS = {
+    ("eth", "uniswap_v2"): "constant_product_v2",
+    ("eth", "sushiswap"): "constant_product_v2",
+    ("eth", "shibaswap"): "constant_product_v2",
+    ("bsc", "pancakeswap_v2"): "constant_product_v2",
+    ("zksync", "pancakeswap-v2-zksync"): "constant_product_v2",
+    ("eth", "uniswap_v3"): "concentrated_liquidity_v3",
+    ("eth", "sushiswap-v3-ethereum"): "concentrated_liquidity_v3",
+    ("arbitrum", "uniswap_v3_arbitrum"): "concentrated_liquidity_v3",
+    ("optimism", "uniswap_v3_optimism"): "concentrated_liquidity_v3",
+    ("optimism", "velodrome-finance-slipstream"): "concentrated_liquidity_v3",
+    ("base", "uniswap-v3-base"): "concentrated_liquidity_v3",
+    ("base", "aerodrome-slipstream"): "concentrated_liquidity_v3",
+    ("bsc", "pancakeswap-v3-bsc"): "concentrated_liquidity_v3",
+    ("zksync", "uniswap-v3-zksync"): "concentrated_liquidity_v3",
 }
 
 # Ethereum ABI selectors.  The signatures are documented in the protocol
@@ -431,6 +496,7 @@ def dex_unsupported_reason_code(reason: str) -> str:
     prefix = str(reason or "").strip().lower().split(":", 1)[0]
     return {
         "unsupported_chain": "unsupported_chain",
+        "unsupported_chain_protocol": "unsupported_protocol",
         "unsupported_pool_model": "unsupported_protocol",
         "pool_is_not_an_evm_contract_address": "unsupported_method",
         "missing_rpc_endpoint": "unsupported_source",
@@ -669,18 +735,26 @@ def rpc_url_for_chain(chain: str) -> str | None:
 
 def protocol_model(dex: str, chain: str, pool_address: str) -> tuple[str, str]:
     normalized = dex.lower()
-    if chain.lower() not in DEFAULT_RPC_URLS:
-        return "unsupported", f"unsupported_chain:{chain.lower()}"
+    normalized_chain = chain.lower()
+    if normalized_chain not in DEFAULT_RPC_URLS:
+        return "unsupported", f"unsupported_chain:{normalized_chain}"
     if not (
         pool_address.startswith("0x")
         and len(pool_address) == 42
         and all(character in "0123456789abcdefABCDEF" for character in pool_address[2:])
+        and pool_address.lower() != _ZERO_EVM_ADDRESS
     ):
         return "unsupported", "pool_is_not_an_evm_contract_address"
-    if normalized in V2_FEE_BPS:
-        return "constant_product_v2", ""
-    if normalized in V3_DEXES:
-        return "concentrated_liquidity_v3", ""
+    model = DEX_PROTOCOL_MODELS.get((normalized_chain, normalized))
+    if model is not None:
+        return model, ""
+    if normalized in V2_FEE_BPS or normalized in V3_DEXES:
+        return (
+            "unsupported",
+            "unsupported_chain_protocol:{}:{}".format(
+                normalized_chain, normalized
+            ),
+        )
     return "unsupported", f"unsupported_pool_model:{normalized}"
 
 
@@ -743,7 +817,7 @@ def pool_usd_price_timing(
     """Return the observable timing relationship for one pool's USD inputs."""
     return usd_price_timing(
         block_timestamp,
-        pool.get("response_received_at") or pool.get("observed_at") or "",
+        pool.get("observed_at") or "",
     )
 
 
@@ -1492,11 +1566,7 @@ def base_row(
             "depth_method": DEX_DEPTH_METHOD,
             "source": "fixed-block EVM JSON-RPC eth_call",
             "usd_price_source_snapshot_id": pool.get("snapshot_id", ""),
-            "usd_price_observed_at": (
-                pool.get("response_received_at")
-                or pool.get("observed_at")
-                or ""
-            ),
+            "usd_price_observed_at": pool.get("observed_at") or "",
             "usd_price_source": pool.get("source", ""),
             "usd_price_source_endpoint": pool.get("source_endpoint", ""),
             "usd_price_raw_response_sha256": pool.get(
@@ -1659,6 +1729,197 @@ def _route_typed_json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _route_typed_asset(value: Any) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("typed DEX asset is invalid")
+    normalized = value.upper()
+    if _ROUTE_ASSET.fullmatch(normalized) is None:
+        raise ValueError("typed DEX asset is invalid")
+    return normalized
+
+
+def _route_typed_window(value: Any, *, seconds: int) -> tuple[str, str]:
+    from datetime import datetime, timedelta
+
+    if type(seconds) is not int or seconds <= 0:
+        raise ValueError("typed DEX validity duration is invalid")
+    observed = canonical_rfc3339_utc(value)
+    parsed = datetime.fromisoformat(observed)
+    return observed, (parsed + timedelta(seconds=seconds)).isoformat()
+
+
+def _route_raw_unit(decimals: int) -> str:
+    if type(decimals) is not int or not 0 <= decimals <= 255:
+        raise ValueError("typed DEX asset decimals are invalid")
+    return "1" if decimals == 0 else "0." + "0" * (decimals - 1) + "1"
+
+
+def _route_dex_directional_facts(
+    pool: Mapping[str, Any],
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only source-observed directional facts shared by typed payloads."""
+    if row.get("status") not in {"observed", "partial"}:
+        raise ValueError("typed DEX row is unavailable")
+    chain = str(pool.get("chain") or "").lower()
+    dex = str(pool.get("dex") or "").lower()
+    pool_address = pool.get("pool_address")
+    if (
+        not isinstance(pool_address, str)
+        or _ROUTE_EVM_ADDRESS.fullmatch(pool_address) is None
+        or pool_address == _ZERO_EVM_ADDRESS
+        or protocol_model(dex, chain, pool_address)[0] == "unsupported"
+    ):
+        raise ValueError("typed DEX protocol identity is unsupported")
+    position = row.get("target_token_position")
+    if position not in {"token0", "token1"}:
+        raise ValueError("typed DEX target position is unavailable")
+    target_index = int(position[-1])
+    quote_index = 1 - target_index
+    target_asset = _route_typed_asset(row.get(f"token{target_index}_symbol"))
+    quote_asset = _route_typed_asset(row.get(f"token{quote_index}_symbol"))
+    if (
+        target_asset != _route_typed_asset(row.get("token_symbol"))
+        or target_asset == quote_asset
+    ):
+        raise ValueError("typed DEX directional assets are invalid")
+    target_address = row.get(f"token{target_index}_address")
+    quote_address = row.get(f"token{quote_index}_address")
+    if (
+        not isinstance(target_address, str)
+        or _ROUTE_EVM_ADDRESS.fullmatch(target_address) is None
+        or target_address == _ZERO_EVM_ADDRESS
+        or not isinstance(quote_address, str)
+        or _ROUTE_EVM_ADDRESS.fullmatch(quote_address) is None
+        or quote_address == _ZERO_EVM_ADDRESS
+        or target_address == quote_address
+        or row.get("target_token_address") != target_address
+    ):
+        raise ValueError("typed DEX directional addresses are invalid")
+    target_decimals = int(row[f"token{target_index}_decimals"])
+    quote_decimals = int(row[f"token{quote_index}_decimals"])
+    if not 0 <= target_decimals <= 255 or not 0 <= quote_decimals <= 255:
+        raise ValueError("typed DEX asset decimals are invalid")
+    state_hash = row.get("raw_response_sha256")
+    if (
+        not isinstance(state_hash, str)
+        or _ROUTE_SHA256.fullmatch(state_hash) is None
+    ):
+        raise ValueError("typed DEX state hash is invalid")
+    market_id = dex_market_id(dict(pool))
+    rules_observed, rules_valid_until = _route_typed_window(
+        row.get("block_timestamp"),
+        seconds=int(MAX_DEX_QUANTITY_STATE_AGE_SECONDS),
+    )
+    return {
+        "market_id": market_id,
+        "target_index": target_index,
+        "quote_index": quote_index,
+        "target_asset": target_asset,
+        "quote_asset": quote_asset,
+        "target_address": target_address,
+        "quote_address": quote_address,
+        "target_decimals": target_decimals,
+        "quote_decimals": quote_decimals,
+        "state_hash": state_hash,
+        "rules_observed": rules_observed,
+        "rules_valid_until": rules_valid_until,
+    }
+
+
+def _route_dex_market_rules_payload(facts: Mapping[str, Any]) -> bytes:
+    """Build rules solely from fixed-block token metadata and state lineage."""
+    rules = {
+        "schema": "route_dex_market_rules_source/v1",
+        "market_id": facts["market_id"],
+        "base_asset": facts["target_asset"],
+        "quote_asset": facts["quote_asset"],
+        "base_token_address": facts["target_address"],
+        "quote_token_address": facts["quote_address"],
+        "base_unit_decimals": facts["target_decimals"],
+        "quote_unit_decimals": facts["quote_decimals"],
+        "base_increment": _route_raw_unit(facts["target_decimals"]),
+        "quote_increment": _route_raw_unit(facts["quote_decimals"]),
+        "min_base_quantity": "0",
+        "min_quote_notional": "0",
+        "increment_source": "fixed_block_token_decimals",
+        "minimum_source": "dex_protocol_no_additional_order_minimum",
+        "observed_at": facts["rules_observed"],
+        "valid_until": facts["rules_valid_until"],
+        "raw_response_sha256": facts["state_hash"],
+    }
+    if tuple(rules) != ROUTE_DEX_MARKET_RULES_FIELDS:
+        raise AssertionError("typed DEX market-rules schema drifted")
+    rules_bytes = _route_typed_json_bytes(rules)
+    MarketRules(
+        market_id=facts["market_id"],
+        base_asset=facts["target_asset"],
+        quote_asset=facts["quote_asset"],
+        base_unit_decimals=facts["target_decimals"],
+        quote_unit_decimals=facts["quote_decimals"],
+        base_increment=Decimal(rules["base_increment"]),
+        quote_increment=Decimal(rules["quote_increment"]),
+        min_base_quantity=Decimal(0),
+        min_quote_notional=Decimal(0),
+        observed_at=facts["rules_observed"],
+        valid_until=facts["rules_valid_until"],
+        source_record_sha256=hashlib.sha256(rules_bytes).hexdigest(),
+    )
+    return rules_bytes
+
+
+def _route_dex_usd_conversion_payload(
+    facts: Mapping[str, Any],
+    row: Mapping[str, Any],
+) -> bytes:
+    """Build USD conversion independently from its captured price lineage."""
+    source = row.get("usd_price_source")
+    source_snapshot_id = row.get("usd_price_source_snapshot_id")
+    source_hash = row.get("usd_price_raw_response_sha256")
+    if (
+        not isinstance(source, str)
+        or not source
+        or source != source.strip()
+        or not isinstance(source_snapshot_id, str)
+        or not source_snapshot_id
+        or source_snapshot_id != source_snapshot_id.strip()
+        or not isinstance(source_hash, str)
+        or _ROUTE_SHA256.fullmatch(source_hash) is None
+    ):
+        raise ValueError("typed DEX USD source lineage is unavailable")
+    conversion_observed, conversion_valid_until = _route_typed_window(
+        row.get("usd_price_observed_at"),
+        seconds=USD_PRICE_SKEW_MAX_SECONDS,
+    )
+    timing = usd_price_timing(facts["rules_observed"], conversion_observed)
+    if not timing["usable"]:
+        raise ValueError("typed DEX USD source timing is unavailable")
+    usd_per_quote = decimal_text(finite_decimal(
+        row.get("token{}_price_usd".format(facts["quote_index"])),
+        positive=True,
+    ))
+    conversion = {
+        "schema": "route_dex_usd_conversion_source/v1",
+        "market_id": facts["market_id"],
+        "target_asset": facts["target_asset"],
+        "target_token_address": facts["target_address"],
+        "quote_asset": facts["quote_asset"],
+        "quote_token_address": facts["quote_address"],
+        "usd_per_quote": usd_per_quote,
+        "value_status": "measured",
+        "observed_at": conversion_observed,
+        "valid_until": conversion_valid_until,
+        "state_observed_at": facts["rules_observed"],
+        "source": source,
+        "source_snapshot_id": source_snapshot_id,
+        "source_raw_response_sha256": source_hash,
+        "state_raw_response_sha256": facts["state_hash"],
+    }
+    if tuple(conversion) != ROUTE_DEX_USD_CONVERSION_FIELDS:
+        raise AssertionError("typed DEX USD-conversion schema drifted")
+    return _route_typed_json_bytes(conversion)
+
+
 def _route_v2_pool_state_payload(
     pool: dict[str, str],
     row: dict[str, str],
@@ -1799,11 +2060,7 @@ def _execution_common(
         ),
         "reference_price_method": DEX_EXECUTION_REFERENCE,
         "usd_price_source_snapshot_id": pool.get("snapshot_id", ""),
-        "usd_price_observed_at": (
-            pool.get("response_received_at")
-            or pool.get("observed_at")
-            or ""
-        ),
+        "usd_price_observed_at": pool.get("observed_at") or "",
         "fee_status": "included_protocol_fee" if fee_bps is not None else "",
         "fee_rate_bps": decimal_text(fee_bps),
         "usd_conversion_status": (
@@ -2109,16 +2366,10 @@ def observed_pool_row(
     request_started_at: str,
     raw_response_sha256: str,
     protocol: str,
+    allow_degraded_usd_context: bool,
 ) -> tuple[dict[str, str], list[dict[str, str]], int | None]:
     block_tag = hex(block_number)
     pool_address = pool["pool_address"].lower()
-    price_timing = require_usable_pool_usd_price(
-        pool,
-        block_timestamp,
-    )
-    price_map = price_map_from_inventory(pool)
-    if len(price_map) < 2:
-        raise ValueError("TVL inventory is missing one or both token USD prices")
 
     if protocol == "constant_product_v2":
         token0_result, token1_result, reserves_result = client.eth_calls(
@@ -2183,17 +2434,13 @@ def observed_pool_row(
         (token0, token1),
         block_tag,
     )
+    token0_symbol = _route_typed_asset(token0_symbol)
+    token1_symbol = _route_typed_asset(token1_symbol)
     target_index = target_position(
         pool["token_symbol"],
         token0_symbol,
         token1_symbol,
     )
-    if token0 not in price_map or token1 not in price_map:
-        raise ValueError(
-            f"pool token addresses do not match TVL inventory:{token0}:{token1}"
-        )
-    token0_price = price_map[token0]
-    token1_price = price_map[token1]
 
     band_amounts: dict[int, dict[str, Any]] = {}
     if protocol == "constant_product_v2":
@@ -2271,6 +2518,91 @@ def observed_pool_row(
         request_started_at=request_started_at,
         response_received_at=response_received_at,
     )
+    row.update(
+        {
+            "protocol_model": protocol,
+            "block_number": str(block_number),
+            "block_timestamp": block_timestamp,
+            "target_token_address": token0 if target_index == 0 else token1,
+            "target_token_position": f"token{target_index}",
+            "token0_address": token0,
+            "token0_symbol": token0_symbol,
+            "token0_decimals": str(token0_decimals),
+            "token1_address": token1,
+            "token1_symbol": token1_symbol,
+            "token1_decimals": str(token1_decimals),
+            "fee_bps": decimal_text(fee_bps),
+            "source_endpoint": client.endpoint,
+            "raw_response_sha256": raw_response_sha256,
+        }
+    )
+    if protocol == "constant_product_v2":
+        row["_route_reserve0_raw"] = str(int(reserve0))
+        row["_route_reserve1_raw"] = str(int(reserve1))
+
+    try:
+        price_timing = require_usable_pool_usd_price(
+            pool,
+            block_timestamp,
+        )
+        price_map = price_map_from_inventory(pool)
+        if len(price_map) < 2:
+            raise ValueError(
+                "TVL inventory is missing one or both token USD prices"
+            )
+        if token0 not in price_map or token1 not in price_map:
+            raise ValueError(
+                "pool token addresses do not match TVL inventory:"
+                f"{token0}:{token1}"
+            )
+        token0_price = price_map[token0]
+        token1_price = price_map[token1]
+    except (ValueError, TypeError, KeyError, InvalidOperation) as usd_error:
+        if not allow_degraded_usd_context:
+            raise
+        try:
+            degraded_timing = pool_usd_price_timing(pool, block_timestamp)
+        except (ValueError, TypeError, InvalidOperation):
+            degraded_timing = {
+                "skew_seconds": None,
+                "status": "unavailable",
+            }
+        row.update(
+            {
+                "usd_price_skew_seconds": (
+                    str(degraded_timing["skew_seconds"])
+                    if degraded_timing.get("skew_seconds") is not None
+                    else ""
+                ),
+                "usd_price_freshness_status": (
+                    str(degraded_timing.get("status") or "unavailable")
+                    if pool.get("status") == "observed"
+                    else "unavailable"
+                ),
+                "status": "partial",
+                "reason_code": "measurement_limit",
+                "error": (
+                    "usd_price_conversion_stale_or_unavailable:"
+                    f"{type(usd_error).__name__}: {usd_error}"
+                ),
+                "available": False,
+            }
+        )
+        return row, terminal_execution_rows(
+            pool,
+            snapshot_id=snapshot_id,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+            protocol=protocol,
+            status="failed",
+            status_reason="usd_price_conversion_stale_or_unavailable",
+            error=f"{type(usd_error).__name__}: {usd_error}",
+            block_number=block_number,
+            block_timestamp=block_timestamp,
+            source_endpoint=client.endpoint,
+            raw_response_sha256=raw_response_sha256,
+        ), reserve_timestamp_last_raw
+
     source_target_price = (
         token0_price if target_index == 0 else token1_price
     )
@@ -2289,32 +2621,15 @@ def observed_pool_row(
         )
     row.update(
         {
-            "protocol_model": protocol,
-            "block_number": str(block_number),
-            "block_timestamp": block_timestamp,
-            "target_token_address": token0 if target_index == 0 else token1,
-            "target_token_position": f"token{target_index}",
-            "token0_address": token0,
-            "token0_symbol": token0_symbol,
-            "token0_decimals": str(token0_decimals),
             "token0_price_usd": decimal_text(token0_price),
-            "token1_address": token1,
-            "token1_symbol": token1_symbol,
-            "token1_decimals": str(token1_decimals),
             "token1_price_usd": decimal_text(token1_price),
-            "fee_bps": decimal_text(fee_bps),
             "pool_state_price_usd": decimal_text(state_price),
             "source_target_price_usd": decimal_text(source_target_price),
             "price_difference_bps": decimal_text(price_difference_bps),
             "usd_price_skew_seconds": str(price_timing["skew_seconds"]),
             "usd_price_freshness_status": str(price_timing["status"]),
-            "source_endpoint": client.endpoint,
-            "raw_response_sha256": raw_response_sha256,
         }
     )
-    if protocol == "constant_product_v2":
-        row["_route_reserve0_raw"] = str(int(reserve0))
-        row["_route_reserve1_raw"] = str(int(reserve1))
     row.update(
         depth_fields(
             target_position_index=target_index,
@@ -2447,6 +2762,7 @@ def collect_dex_pool_observation(
     fixed_chain_id: str | None = None,
     fixed_block_header: Mapping[str, Any] | None = None,
     typed_source_payload_sink: Callable[[Mapping[str, Any]], None] | None = None,
+    allow_degraded_usd_context: bool = False,
     deadline: CollectionDeadline | None = None,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     """Collect one DEX pool with isolated client state unless one is supplied."""
@@ -2536,6 +2852,7 @@ def collect_dex_pool_observation(
             request_started_at=request_started_at,
             raw_response_sha256="",
             protocol=protocol,
+            allow_degraded_usd_context=allow_degraded_usd_context,
         )
         transcript = raw_transcript_bytes(
             pool=pool,
@@ -2565,6 +2882,51 @@ def collect_dex_pool_observation(
                     "role": "dex_pool_state",
                     "payload": payload,
                 })
+            try:
+                directional_facts = _route_dex_directional_facts(pool, row)
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                InvalidOperation,
+                OverflowError,
+            ):
+                pass
+            else:
+                try:
+                    rules_payload = _route_dex_market_rules_payload(
+                        directional_facts
+                    )
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    InvalidOperation,
+                    OverflowError,
+                ):
+                    pass
+                else:
+                    typed_source_payload_sink({
+                        "role": "dex_market_rules",
+                        "payload": rules_payload,
+                    })
+                try:
+                    conversion_payload = _route_dex_usd_conversion_payload(
+                        directional_facts, row
+                    )
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    InvalidOperation,
+                    OverflowError,
+                ):
+                    pass
+                else:
+                    typed_source_payload_sink({
+                        "role": "dex_usd_conversion",
+                        "payload": conversion_payload,
+                    })
         row.pop("_route_reserve0_raw", None)
         row.pop("_route_reserve1_raw", None)
     except CollectionDeadlineExceeded:
@@ -2689,6 +3051,7 @@ def collect_dex_depth_with_execution(
             client=client,
             fixed_block_number=block_number,
             fixed_block_timestamp=block_timestamp,
+            allow_degraded_usd_context=False,
         )
         if row["block_number"] and row["block_timestamp"]:
             blocks[chain] = int(row["block_number"])
