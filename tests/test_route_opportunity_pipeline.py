@@ -475,6 +475,8 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
                 )
 
     def test_all_negative_cex_grid_is_fully_published(self):
+        from dashboard import server
+
         data_dir, fixture, joint = self._install_real_cex_run()
         (data_dir / "routes/shadow/latest.json").write_bytes(
             b'{"unrelated":"moving-shadow-pointer"}\n'
@@ -510,6 +512,23 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
             float(row["strict_net_edge_bps"]) < 0
             for row in loaded["opportunities"]
         ))
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(
+                server.os.environ,
+                {"MARKET_ROUTE_DATA_DIR": str(data_dir / "routes")},
+                clear=True,
+            ):
+                payload = server.build_route_opportunities(notional="1000")
+        finally:
+            server.clear_runtime_caches()
+        self.assertEqual(
+            payload["availability"], {"status": "available", "reason": None}
+        )
+        self.assertEqual(len(payload["routes"]), 1)
+        self.assertEqual(
+            payload["routes"][0]["opportunity_class"], "research_estimate"
+        )
 
     def test_incomplete_high_notional_is_published_as_unavailable(self):
         data_dir, fixture, joint = self._install_real_cex_run(
