@@ -7395,7 +7395,7 @@ def _opportunity_payload_requires_reprojection(
 
 def _build_deadline_safe_opportunity_response(
     query_items: tuple[tuple[str, str], ...],
-    source_signature: SourceSignature,
+    route_signature: SourceSignature,
     accepts_gzip: bool,
 ) -> tuple[bytes, bool]:
     """Serialize only a route projection that is current when assembly ends."""
@@ -7403,13 +7403,13 @@ def _build_deadline_safe_opportunity_response(
         payload = _build_public_api_payload(
             "opportunities",
             query_items,
-            source_signature=source_signature,
+            source_signature=route_signature,
         )
         response = encode_json_payload(
             payload,
             "gzip" if accepts_gzip else "",
         )
-        if api_source_signature() != source_signature:
+        if route_source_signature() != route_signature:
             raise SourceGenerationChanged
         completed_at = opportunity_response_clock()
         if not _opportunity_payload_requires_reprojection(
@@ -7433,6 +7433,22 @@ def build_public_api_response(
             return _build_stable_historical_opportunity_response(
                 query_items, accepts_gzip
             )
+        if route == "opportunities":
+            for _attempt in range(3):
+                route_signature = route_source_signature()
+                try:
+                    response = _build_deadline_safe_opportunity_response(
+                        query_items,
+                        route_signature,
+                        accepts_gzip,
+                    )
+                except SourceGenerationChanged:
+                    continue
+                if route_source_signature() == route_signature:
+                    return response
+            raise SourceGenerationChanged(
+                "Published route opportunities changed repeatedly during response assembly"
+            )
         for _attempt in range(3):
             source_signature = api_source_signature()
             freshness_bucket = api_freshness_bucket()
@@ -7445,12 +7461,6 @@ def build_public_api_response(
                 # These routes own second-level wall clocks.  Reusing the
                 # minute-bucket serialized cache could retain a route past
                 # its 120-second deadline or misclassify an Event clock.
-                if route == "opportunities":
-                    return _build_deadline_safe_opportunity_response(
-                        query_items,
-                        source_signature,
-                        accepts_gzip,
-                    )
                 if route == "events":
                     payload = _build_public_api_payload(
                         route,
@@ -8413,7 +8423,11 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 self.send_public_api("opportunities", query)
             except PublicClientRequestError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
-            except OpportunityBundleInvalid:
+            except (
+                OpportunityBundleInvalid,
+                OpportunityResponseUnstable,
+                SourceGenerationChanged,
+            ):
                 self.send_opportunity_data_validation_error()
             except FileNotFoundError:
                 self.send_json(

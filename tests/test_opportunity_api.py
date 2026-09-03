@@ -1493,6 +1493,54 @@ class OpportunityServerTests(unittest.TestCase):
         })
         self.assertEqual(payload["routes"], [])
 
+    def test_missing_pointer_is_http_200_when_market_facts_are_unavailable(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / "routes"
+        root.mkdir()
+        handler = object.__new__(server.MarketMonitorHandler)
+        handler.path = "/api/markets/opportunities?token=AAVE&class=strict"
+        handler.headers = {}
+
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(
+                server.os.environ,
+                {"MARKET_ROUTE_DATA_DIR": str(root)},
+                clear=True,
+            ), patch.object(
+                server,
+                "resolve_database_path",
+                return_value=None,
+            ), patch.object(
+                server,
+                "resolve_data_paths",
+                side_effect=FileNotFoundError("market facts unavailable"),
+            ), patch.object(
+                server,
+                "api_freshness_bucket",
+                return_value=100,
+            ), patch.object(
+                server.MarketMonitorHandler,
+                "send_encoded_json",
+            ) as send_encoded, patch.object(
+                server.MarketMonitorHandler,
+                "send_json",
+            ) as send_json:
+                handler.do_GET()
+        finally:
+            server.clear_runtime_caches()
+
+        send_json.assert_not_called()
+        body, compressed = send_encoded.call_args.args
+        self.assertFalse(compressed)
+        payload = json.loads(body)
+        self.assertEqual(payload["availability"], {
+            "status": "unavailable",
+            "reason": "complete_pointer_absent",
+        })
+        self.assertEqual(payload["routes"], [])
+
     def test_corrupt_publication_is_fixed_http_503_without_private_details(self):
         handler = object.__new__(server.MarketMonitorHandler)
         handler.path = "/api/markets/opportunities"
@@ -1519,6 +1567,100 @@ class OpportunityServerTests(unittest.TestCase):
             },
             503,
         )
+
+    def test_opportunity_rebuilds_after_route_generation_changes_once(self):
+        old_signature = (("routes/latest.json", 1, 10, 11, 12),)
+        new_signature = (("routes/latest.json", 2, 10, 11, 12),)
+        old_payload = {
+            "metadata": {"data_generation": "old-generation"},
+            "routes": [],
+        }
+        new_payload = {
+            "metadata": {"data_generation": "new-generation"},
+            "routes": [],
+        }
+
+        with patch.object(
+            server,
+            "route_source_signature",
+            side_effect=(
+                old_signature,
+                old_signature,
+                new_signature,
+                new_signature,
+                new_signature,
+                new_signature,
+            ),
+        ), patch.object(
+            server,
+            "_build_public_api_payload",
+            side_effect=(old_payload, new_payload),
+        ) as build_payload:
+            body, compressed = server.build_public_api_response(
+                "opportunities",
+                (),
+                False,
+            )
+
+        self.assertFalse(compressed)
+        self.assertEqual(
+            json.loads(body)["metadata"]["data_generation"],
+            "new-generation",
+        )
+        self.assertEqual(
+            [
+                invocation.kwargs["source_signature"]
+                for invocation in build_payload.call_args_list
+            ],
+            [old_signature, new_signature],
+        )
+
+    def test_opportunity_fails_closed_after_three_route_generation_changes(self):
+        signatures = tuple(
+            (("routes/latest.json", value, 10, 11, 12),)
+            for value in range(1, 7)
+        )
+        payload = {"metadata": {}, "routes": []}
+
+        with patch.object(
+            server,
+            "route_source_signature",
+            side_effect=signatures,
+        ), patch.object(
+            server,
+            "_build_public_api_payload",
+            return_value=payload,
+        ) as build_payload:
+            with self.assertRaises(server.SourceGenerationChanged):
+                server.build_public_api_response("opportunities", (), False)
+
+        self.assertEqual(build_payload.call_count, 3)
+
+    def test_opportunity_generation_failures_are_fixed_validation_503(self):
+        handler = object.__new__(server.MarketMonitorHandler)
+        handler.path = "/api/markets/opportunities"
+        expected = {
+            "code": "opportunity_bundle_validation_failed",
+            "message": (
+                "Published route opportunity data failed validation. "
+                "Retry after the next complete publication."
+            ),
+        }
+        for error in (
+            server.SourceGenerationChanged(),
+            server.OpportunityResponseUnstable("route generation unstable"),
+        ):
+            with self.subTest(error=type(error).__name__), patch.object(
+                server.MarketMonitorHandler,
+                "send_public_api",
+                side_effect=error,
+            ), patch.object(
+                server.MarketMonitorHandler,
+                "send_json",
+            ) as send_json:
+                handler.do_GET()
+
+            send_json.assert_called_once_with(expected, 503)
 
     def test_source_signature_tracks_pointer_manifest_and_complete_members(self):
         root = self._publish()
