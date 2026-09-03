@@ -503,6 +503,226 @@ class FetchCexDepthTest(unittest.TestCase):
                     originals,
                 )
 
+    def test_full_publication_streams_history_instead_of_loading_all_rows(self):
+        baseline_depth = [
+            observed_row(
+                market(),
+                complete_book(),
+                snapshot_id="baseline-1",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+        ]
+        baseline_execution = execution_rows_for_book(
+            market(),
+            complete_book(),
+            snapshot_id="baseline-1",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+        candidate_depth = [
+            observed_row(
+                market(),
+                complete_book(),
+                snapshot_id="candidate-2",
+                request_started_at="2026-07-27T01:00:00+00:00",
+                response_received_at="2026-07-27T01:00:01+00:00",
+            )
+        ]
+        candidate_execution = execution_rows_for_book(
+            market(),
+            complete_book(),
+            snapshot_id="candidate-2",
+            request_started_at="2026-07-27T01:00:00+00:00",
+            response_received_at="2026-07-27T01:00:01+00:00",
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            processed = root / "processed"
+            publish_snapshot(
+                baseline_depth,
+                output_dir=processed,
+                publish_dir=published,
+            )
+            publish_execution_snapshot(
+                baseline_execution,
+                expected_market_ids={"cex:binance:UNI/USDT"},
+                output_dir=processed,
+                publish_dir=published,
+            )
+            reports = preflight_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                published,
+            )
+
+            from scripts import fetch_cex_depth
+
+            real_read_csv_rows = fetch_cex_depth.read_csv_rows
+
+            def reject_bulk_history_read(path):
+                if Path(path).name == HISTORY_FILENAME:
+                    raise AssertionError("history must be streamed")
+                return real_read_csv_rows(path)
+
+            with patch(
+                "scripts.fetch_cex_depth.read_csv_rows",
+                side_effect=reject_bulk_history_read,
+            ):
+                result, _execution_result = publish_full_publication_bundle(
+                    candidate_depth,
+                    candidate_execution,
+                    output_dir=processed,
+                    publish_dir=published,
+                    preflight_reports=reports,
+                )
+
+            with (published / HISTORY_FILENAME).open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                history = list(csv.DictReader(handle))
+
+        self.assertEqual(result["history_row_count"], 2)
+        self.assertEqual(
+            [row["snapshot_id"] for row in history],
+            ["baseline-1", "candidate-2"],
+        )
+
+    def test_streaming_history_resorts_and_keeps_last_duplicate_identity(self):
+        baseline_depth = [
+            observed_row(
+                market(),
+                complete_book(),
+                snapshot_id="baseline-latest",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+        ]
+        baseline_execution = execution_rows_for_book(
+            market(),
+            complete_book(),
+            snapshot_id="baseline-latest",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+        candidate_depth = [
+            {
+                **baseline_depth[0],
+                "snapshot_id": "candidate",
+                "observed_at": "2026-07-27T03:00:00+00:00",
+            }
+        ]
+        candidate_execution = [
+            {
+                **row,
+                "snapshot_id": "candidate",
+                "source_snapshot_id": "candidate",
+            }
+            for row in baseline_execution
+        ]
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "local"
+            processed = root / "processed"
+            publish_snapshot(
+                baseline_depth,
+                output_dir=processed,
+                publish_dir=published,
+            )
+            publish_execution_snapshot(
+                baseline_execution,
+                expected_market_ids={"cex:binance:UNI/USDT"},
+                output_dir=processed,
+                publish_dir=published,
+            )
+            duplicate_first = {
+                **baseline_depth[0],
+                "snapshot_id": "duplicate",
+                "observed_at": "2026-07-27T02:00:00+00:00",
+                "best_bid": "98",
+            }
+            other = {
+                **baseline_depth[0],
+                "snapshot_id": "other",
+                "observed_at": "2026-07-27T01:00:00+00:00",
+            }
+            duplicate_last = {
+                **duplicate_first,
+                "observed_at": "2026-07-27T00:00:00+00:00",
+                "best_bid": "97",
+            }
+            write_snapshot_rows(
+                published / HISTORY_FILENAME,
+                [duplicate_first, other, duplicate_last],
+            )
+            reports = preflight_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                published,
+            )
+
+            result, _execution_result = publish_full_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                output_dir=processed,
+                publish_dir=published,
+                preflight_reports=reports,
+            )
+            with (published / HISTORY_FILENAME).open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                history = list(csv.DictReader(handle))
+
+        self.assertEqual(result["history_row_count"], 3)
+        self.assertEqual(
+            [row["snapshot_id"] for row in history],
+            ["duplicate", "other", "candidate"],
+        )
+        self.assertEqual(history[0]["best_bid"], "97")
+
+    def test_full_publication_creates_a_missing_publish_directory(self):
+        candidate_depth = [
+            observed_row(
+                market(),
+                complete_book(),
+                snapshot_id="first",
+                request_started_at="2026-07-27T00:00:00+00:00",
+                response_received_at="2026-07-27T00:00:01+00:00",
+            )
+        ]
+        candidate_execution = execution_rows_for_book(
+            market(),
+            complete_book(),
+            snapshot_id="first",
+            request_started_at="2026-07-27T00:00:00+00:00",
+            response_received_at="2026-07-27T00:00:01+00:00",
+        )
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            root = Path(directory_name)
+            published = root / "missing" / "local"
+            reports = preflight_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                published,
+            )
+            result, execution_result = publish_full_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                output_dir=root / "processed",
+                publish_dir=published,
+                preflight_reports=reports,
+            )
+
+            self.assertTrue(Path(result["history_path"]).is_file())
+            self.assertTrue(Path(result["latest_path"]).is_file())
+            self.assertTrue(Path(execution_result["latest_path"]).is_file())
+
     def test_full_publication_bundle_rejects_resolved_private_public_path_overlap_before_write(self):
         baseline_depth = [
             observed_row(

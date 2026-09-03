@@ -43,7 +43,7 @@ try:
         CollectionDeadline,
         CollectionDeadlineExceeded,
     )
-    from scripts.atomic_publication import atomic_replace_bundle, csv_payload
+    from scripts.atomic_publication import atomic_replace_prepared_bundle
     from scripts.bounded_snapshot_merge import (
         merge_exact_market_snapshot,
         require_aligned_depth_execution_lineage,
@@ -99,7 +99,7 @@ try:
     )
 except ModuleNotFoundError:
     from collection_deadline import CollectionDeadline, CollectionDeadlineExceeded
-    from atomic_publication import atomic_replace_bundle, csv_payload
+    from atomic_publication import atomic_replace_prepared_bundle
     from bounded_snapshot_merge import (
         merge_exact_market_snapshot,
         require_aligned_depth_execution_lineage,
@@ -2241,6 +2241,259 @@ def atomic_write_execution_csv(
         temporary.unlink(missing_ok=True)
 
 
+def _history_identity(row: dict[str, str]) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("snapshot_id") or ""),
+        str(row.get("token_symbol") or ""),
+        str(row.get("exchange") or ""),
+        str(row.get("cex_symbol") or ""),
+    )
+
+
+def _history_sort_key(row: dict[str, str]) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("observed_at") or ""),
+        str(row.get("token_symbol") or ""),
+        str(row.get("exchange") or ""),
+        str(row.get("cex_symbol") or ""),
+    )
+
+
+def _prepare_csv_file(
+    destination: Path,
+    fieldnames: Iterable[str],
+    rows: Iterable[dict[str, str]],
+) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    prepared = destination.with_name(
+        ".{}.{}.prepared".format(destination.name, uuid.uuid4().hex)
+    )
+    fields = list(fieldnames)
+    try:
+        with prepared.open("x", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=fields,
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(
+                {field: row.get(field, "") for field in fields}
+                for row in rows
+            )
+        return prepared
+    except BaseException:
+        prepared.unlink(missing_ok=True)
+        raise
+
+
+def _prepare_merged_history_file(
+    history_path: Path,
+    rows_to_append: Iterable[dict[str, str]],
+) -> tuple[Path, int]:
+    """Build sorted, de-duplicated history through a disk-backed index."""
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    prepared = history_path.with_name(
+        ".{}.{}.prepared".format(history_path.name, uuid.uuid4().hex)
+    )
+    index_path = history_path.with_name(
+        ".{}.{}.sqlite3".format(history_path.name, uuid.uuid4().hex)
+    )
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(index_path))
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("PRAGMA temp_store=FILE")
+        connection.execute("PRAGMA cache_size=-4096")
+        connection.execute("PRAGMA mmap_size=0")
+        connection.execute(
+            """
+            CREATE TABLE history_rows (
+                snapshot_id TEXT NOT NULL,
+                token_symbol TEXT NOT NULL,
+                exchange_name TEXT NOT NULL,
+                cex_symbol TEXT NOT NULL,
+                sort_observed_at TEXT NOT NULL,
+                sort_token_symbol TEXT NOT NULL,
+                sort_exchange_name TEXT NOT NULL,
+                sort_cex_symbol TEXT NOT NULL,
+                insertion_order INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (
+                    snapshot_id,
+                    token_symbol,
+                    exchange_name,
+                    cex_symbol
+                )
+            )
+            """
+        )
+        insertion_order = 0
+
+        def store(row: dict[str, str]) -> None:
+            nonlocal insertion_order
+            identity = _history_identity(row)
+            sort_key = _history_sort_key(row)
+            payload = json.dumps(
+                {
+                    field: row.get(field, "")
+                    for field in DEPTH_COLUMNS_ALL
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO history_rows (
+                    snapshot_id,
+                    token_symbol,
+                    exchange_name,
+                    cex_symbol,
+                    sort_observed_at,
+                    sort_token_symbol,
+                    sort_exchange_name,
+                    sort_cex_symbol,
+                    insertion_order,
+                    payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                identity + sort_key + (insertion_order, payload),
+            )
+            if cursor.rowcount:
+                insertion_order += 1
+                return
+            connection.execute(
+                """
+                UPDATE history_rows
+                SET sort_observed_at = ?,
+                    sort_token_symbol = ?,
+                    sort_exchange_name = ?,
+                    sort_cex_symbol = ?,
+                    payload = ?
+                WHERE snapshot_id = ?
+                  AND token_symbol = ?
+                  AND exchange_name = ?
+                  AND cex_symbol = ?
+                """,
+                sort_key + (payload,) + identity,
+            )
+
+        if history_path.exists():
+            with history_path.open(
+                "r",
+                newline="",
+                encoding="utf-8",
+            ) as source:
+                for existing in csv.DictReader(source):
+                    store(existing)
+        for addition in rows_to_append:
+            store(addition)
+        connection.commit()
+        row_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM history_rows"
+            ).fetchone()[0]
+        )
+        with prepared.open("x", newline="", encoding="utf-8") as output:
+            writer = csv.DictWriter(
+                output,
+                fieldnames=DEPTH_COLUMNS_ALL,
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            payloads = connection.execute(
+                """
+                SELECT payload
+                FROM history_rows
+                ORDER BY sort_observed_at,
+                         sort_token_symbol,
+                         sort_exchange_name,
+                         sort_cex_symbol,
+                         insertion_order
+                """
+            )
+            for (payload,) in payloads:
+                row = json.loads(payload)
+                writer.writerow(
+                    {
+                        field: row.get(field, "")
+                        for field in DEPTH_COLUMNS_ALL
+                    }
+                )
+        return prepared, row_count
+    except BaseException:
+        prepared.unlink(missing_ok=True)
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+        index_path.unlink(missing_ok=True)
+        index_path.with_name(index_path.name + "-journal").unlink(
+            missing_ok=True
+        )
+        index_path.with_name(index_path.name + "-wal").unlink(
+            missing_ok=True
+        )
+        index_path.with_name(index_path.name + "-shm").unlink(
+            missing_ok=True
+        )
+
+
+def _replace_publication_csv_bundle(
+    *,
+    history_path: Path,
+    history_rows_to_append: Iterable[dict[str, str]],
+    latest_path: Path,
+    public_current_path: Path,
+    depth_rows: Iterable[dict[str, str]],
+    execution_latest_path: Path,
+    execution_rows: Iterable[dict[str, str]],
+) -> int:
+    prepared_items: list[tuple[Path, Path]] = []
+    try:
+        prepared_history, history_row_count = _prepare_merged_history_file(
+            history_path,
+            history_rows_to_append,
+        )
+        prepared_items.append((history_path, prepared_history))
+        prepared_items.append(
+            (
+                latest_path,
+                _prepare_csv_file(
+                    latest_path,
+                    DEPTH_COLUMNS_ALL,
+                    depth_rows,
+                ),
+            )
+        )
+        prepared_items.append(
+            (
+                public_current_path,
+                _prepare_csv_file(
+                    public_current_path,
+                    DEPTH_COLUMNS_ALL,
+                    depth_rows,
+                ),
+            )
+        )
+        prepared_items.append(
+            (
+                execution_latest_path,
+                _prepare_csv_file(
+                    execution_latest_path,
+                    EXECUTION_COST_COLUMNS,
+                    execution_rows,
+                ),
+            )
+        )
+        atomic_replace_prepared_bundle(prepared_items)
+        return history_row_count
+    finally:
+        for _destination, prepared in prepared_items:
+            prepared.unlink(missing_ok=True)
+
+
 def publish_snapshot(
     rows: list[dict[str, str]],
     *,
@@ -2440,49 +2693,14 @@ def publish_full_publication_bundle(
     atomic_write_csv(current_path, depth_rows)
     atomic_write_execution_csv(execution_current_path, execution_rows)
 
-    merged_history = {
-        (
-            row.get("snapshot_id", ""),
-            row.get("token_symbol", ""),
-            row.get("exchange", ""),
-            row.get("cex_symbol", ""),
-        ): row
-        for row in read_csv_rows(history_path)
-    }
-    for row in depth_rows:
-        merged_history[
-            (
-                row["snapshot_id"],
-                row["token_symbol"],
-                row["exchange"],
-                row["cex_symbol"],
-            )
-        ] = row
-    history_rows = sorted(
-        merged_history.values(),
-        key=lambda row: (
-            row.get("observed_at", ""),
-            row.get("token_symbol", ""),
-            row.get("exchange", ""),
-            row.get("cex_symbol", ""),
-        ),
-    )
-    atomic_replace_bundle(
-        (
-            (history_path, csv_payload(DEPTH_COLUMNS_ALL, history_rows)),
-            (
-                latest_path,
-                csv_payload(DEPTH_COLUMNS_ALL, depth_rows),
-            ),
-            (
-                public_current_path,
-                csv_payload(DEPTH_COLUMNS_ALL, depth_rows),
-            ),
-            (
-                execution_latest_path,
-                csv_payload(EXECUTION_COST_COLUMNS, execution_rows),
-            ),
-        )
+    history_row_count = _replace_publication_csv_bundle(
+        history_path=history_path,
+        history_rows_to_append=depth_rows,
+        latest_path=latest_path,
+        public_current_path=public_current_path,
+        depth_rows=depth_rows,
+        execution_latest_path=execution_latest_path,
+        execution_rows=execution_rows,
     )
     return (
         {
@@ -2490,7 +2708,7 @@ def publish_full_publication_bundle(
             "row_count": len(depth_rows),
             "latest_path": str(latest_path),
             "history_path": str(history_path),
-            "history_row_count": len(history_rows),
+            "history_row_count": history_row_count,
             "publication_gate": depth_gate,
         },
         {
@@ -2589,49 +2807,14 @@ def publish_exact_publication_bundle(
     atomic_write_csv(current_path, depth_rows)
     atomic_write_execution_csv(execution_current_path, execution_rows)
 
-    merged_history = {
-        (
-            row.get("snapshot_id", ""),
-            row.get("token_symbol", ""),
-            row.get("exchange", ""),
-            row.get("cex_symbol", ""),
-        ): row
-        for row in read_csv_rows(history_path)
-    }
-    for row in history_rows_to_append:
-        merged_history[
-            (
-                row["snapshot_id"],
-                row["token_symbol"],
-                row["exchange"],
-                row["cex_symbol"],
-            )
-        ] = row
-    history_rows = sorted(
-        merged_history.values(),
-        key=lambda row: (
-            row.get("observed_at", ""),
-            row.get("token_symbol", ""),
-            row.get("exchange", ""),
-            row.get("cex_symbol", ""),
-        ),
-    )
-    atomic_replace_bundle(
-        (
-            (history_path, csv_payload(DEPTH_COLUMNS_ALL, history_rows)),
-            (
-                latest_path,
-                csv_payload(DEPTH_COLUMNS_ALL, depth_rows),
-            ),
-            (
-                public_current_path,
-                csv_payload(DEPTH_COLUMNS_ALL, depth_rows),
-            ),
-            (
-                execution_latest_path,
-                csv_payload(EXECUTION_COST_COLUMNS, execution_rows),
-            ),
-        )
+    history_row_count = _replace_publication_csv_bundle(
+        history_path=history_path,
+        history_rows_to_append=history_rows_to_append,
+        latest_path=latest_path,
+        public_current_path=public_current_path,
+        depth_rows=depth_rows,
+        execution_latest_path=execution_latest_path,
+        execution_rows=execution_rows,
     )
     return (
         {
@@ -2639,7 +2822,7 @@ def publish_exact_publication_bundle(
             "row_count": len(depth_rows),
             "latest_path": str(latest_path),
             "history_path": str(history_path),
-            "history_row_count": len(history_rows),
+            "history_row_count": history_row_count,
             "publication_gate": depth_gate,
         },
         {

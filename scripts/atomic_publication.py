@@ -169,3 +169,100 @@ def atomic_replace_bundle(items: Iterable[BundleItem]) -> None:
         for backup_path in backups.values():
             if backup_path is not None:
                 backup_path.unlink(missing_ok=True)
+
+
+def atomic_replace_prepared_bundle(
+    items: Iterable[Tuple[Path, Path]],
+) -> None:
+    """Replace a bundle from prepared same-directory files.
+
+    The prepared files are streamed by the caller instead of materialized as
+    in-memory byte payloads.  This function takes ownership of every prepared
+    file after validation and removes any uncommitted files on success or
+    failure.  Commit and rollback semantics match ``atomic_replace_bundle``.
+    """
+    normalized: List[Tuple[Path, Path]] = []
+    destinations = set()
+    prepared_paths = set()
+    for raw_path, raw_prepared_path in items:
+        path = Path(raw_path)
+        prepared_path = Path(raw_prepared_path)
+        if path in destinations:
+            raise ValueError("publication bundle contains duplicate destination")
+        if prepared_path in prepared_paths:
+            raise ValueError("publication bundle contains duplicate prepared file")
+        if path.exists() and (path.is_symlink() or not path.is_file()):
+            raise ValueError("publication destination is not a regular file")
+        if (
+            not prepared_path.exists()
+            or prepared_path.is_symlink()
+            or not prepared_path.is_file()
+        ):
+            raise ValueError("prepared publication payload is not a regular file")
+        if prepared_path.parent.resolve() != path.parent.resolve():
+            raise ValueError(
+                "prepared publication payload must share destination directory"
+            )
+        destinations.add(path)
+        prepared_paths.add(prepared_path)
+        normalized.append((path, prepared_path))
+    if not normalized:
+        raise ValueError("publication bundle is empty")
+    if destinations & prepared_paths:
+        raise ValueError(
+            "publication destinations and prepared files must be disjoint"
+        )
+
+    backups: dict[Path, Optional[Path]] = {}
+    committed: List[Path] = []
+    transaction_id = uuid.uuid4().hex
+    try:
+        for path, prepared_path in normalized:
+            mode = (
+                stat.S_IMODE(path.stat().st_mode)
+                if path.exists()
+                else stat.S_IMODE(prepared_path.stat().st_mode) & 0o644
+            )
+            os.chmod(prepared_path, mode)
+            descriptor = os.open(str(prepared_path), os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            if path.exists():
+                backup_path = path.with_name(
+                    ".{}.{}.backup".format(path.name, transaction_id)
+                )
+                _copy_backup(path, backup_path)
+                backups[path] = backup_path
+            else:
+                backups[path] = None
+
+        for path, prepared_path in normalized:
+            os.replace(prepared_path, path)
+            committed.append(path)
+        _fsync_directories(path for path, _prepared_path in normalized)
+    except BaseException:
+        rollback_errors = []
+        for path in reversed(committed):
+            backup_path = backups[path]
+            try:
+                if backup_path is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    os.replace(backup_path, path)
+                    backups[path] = None
+            except OSError as error:
+                rollback_errors.append(error)
+        _fsync_directories(path for path, _prepared_path in normalized)
+        if rollback_errors:
+            raise RuntimeError(
+                "publication failed and rollback could not restore every file"
+            ) from rollback_errors[0]
+        raise
+    finally:
+        for _path, prepared_path in normalized:
+            prepared_path.unlink(missing_ok=True)
+        for backup_path in backups.values():
+            if backup_path is not None:
+                backup_path.unlink(missing_ok=True)
