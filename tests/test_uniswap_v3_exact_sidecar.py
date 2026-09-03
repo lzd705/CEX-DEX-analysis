@@ -305,7 +305,6 @@ class UniswapV3ExactSidecarTest(unittest.TestCase):
         def fail_sidecar_once(source, destination):
             if (
                 Path(destination) == sidecar
-                and ".stage" in Path(source).name
                 and not failed["value"]
             ):
                 failed["value"] = True

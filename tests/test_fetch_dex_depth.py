@@ -1286,18 +1286,32 @@ class DexDepthCollectionTest(unittest.TestCase):
                 originals,
             )
 
-        publish_exact_publication_bundle(
-            merged_depth,
-            merged_execution,
-            target_market_id=(
-                "dex:eth:uniswap_v2:"
-                "0x3333333333333333333333333333333333333333:AAVE"
-            ),
-            history_rows_to_append=candidate_depth,
-            output_dir=self.root / "processed",
-            publish_dir=published,
-            preflight_reports=reports,
-        )
+        from scripts import fetch_dex_depth
+
+        real_read_csv_rows = fetch_dex_depth.read_csv_rows
+
+        def reject_bulk_history_read(path):
+            if Path(path).name == HISTORY_FILENAME:
+                raise AssertionError("DEX history must be streamed from disk")
+            return real_read_csv_rows(path)
+
+        with patch.object(
+            fetch_dex_depth,
+            "read_csv_rows",
+            side_effect=reject_bulk_history_read,
+        ):
+            publish_exact_publication_bundle(
+                merged_depth,
+                merged_execution,
+                target_market_id=(
+                    "dex:eth:uniswap_v2:"
+                    "0x3333333333333333333333333333333333333333:AAVE"
+                ),
+                history_rows_to_append=candidate_depth,
+                output_dir=self.root / "processed",
+                publish_dir=published,
+                preflight_reports=reports,
+            )
         with (published / HISTORY_FILENAME).open(
             newline="",
             encoding="utf-8",
@@ -1521,6 +1535,154 @@ class DexDepthCollectionTest(unittest.TestCase):
         self.assertEqual(
             {row["reason_code"] for row in history},
             {"observed"},
+        )
+
+    def test_full_bundle_streams_existing_history_without_bulk_read(self):
+        from scripts import fetch_dex_depth
+
+        _baseline_id, baseline_depth, baseline_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-stream-baseline",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        _candidate_id, candidate_depth, candidate_execution = (
+            collect_dex_depth_with_execution(
+                [self.pool],
+                raw_root=self.root / "raw-stream-candidate",
+                sleep_seconds=0,
+                rpc_factory=FakeV2Rpc,
+            )
+        )
+        published = self.root / "stream-published"
+        processed = self.root / "stream-processed"
+        publish_snapshot(
+            baseline_depth,
+            output_dir=processed,
+            publish_dir=published,
+        )
+        publish_execution_snapshot(
+            baseline_execution,
+            expected_market_ids={
+                row["market_id"] for row in baseline_execution
+            },
+            output_dir=processed,
+            publish_dir=published,
+        )
+        reports = preflight_publication_bundle(
+            candidate_depth,
+            candidate_execution,
+            published,
+        )
+        real_read_csv_rows = fetch_dex_depth.read_csv_rows
+
+        def reject_bulk_history_read(path):
+            if Path(path).name == HISTORY_FILENAME:
+                raise AssertionError("DEX history must be streamed from disk")
+            return real_read_csv_rows(path)
+
+        with patch.object(
+            fetch_dex_depth,
+            "read_csv_rows",
+            side_effect=reject_bulk_history_read,
+        ):
+            depth_result, execution_result = publish_full_publication_bundle(
+                candidate_depth,
+                candidate_execution,
+                output_dir=processed,
+                publish_dir=published,
+                preflight_reports=reports,
+            )
+
+        self.assertEqual(depth_result["history_row_count"], 2)
+        self.assertEqual(execution_result["execution_row_count"], 10)
+        with (published / HISTORY_FILENAME).open(
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            history = list(csv.DictReader(handle))
+        self.assertEqual(len(history), 2)
+        self.assertEqual(
+            [row["snapshot_id"] for row in history],
+            [baseline_depth[0]["snapshot_id"], candidate_depth[0]["snapshot_id"]],
+        )
+
+    def test_streaming_history_preserves_last_value_and_stable_sort(self):
+        from scripts import fetch_dex_depth
+
+        _snapshot_id, rows, _execution_rows = collect_dex_depth_with_execution(
+            [self.pool],
+            raw_root=self.root / "raw-stream-semantics",
+            sleep_seconds=0,
+            rpc_factory=FakeV2Rpc,
+        )
+        template = rows[0]
+        common_sort_values = {
+            "observed_at": "2026-09-03T00:00:00+00:00",
+            "token_symbol": "AAVE",
+            "chain": "eth",
+            "pool_address": template["pool_address"],
+        }
+        tie_first = {
+            **template,
+            **common_sort_values,
+            "snapshot_id": "tie-first",
+            "pool_name": "tie first",
+        }
+        duplicate_first = {
+            **template,
+            "snapshot_id": "duplicate",
+            "observed_at": "2026-09-01T00:00:00+00:00",
+            "token_symbol": "AAVE",
+            "chain": " ETH ",
+            "pool_address": (
+                "0x" + template["pool_address"][2:].upper()
+            ),
+            "pool_name": "superseded",
+        }
+        tie_last = {
+            **template,
+            **common_sort_values,
+            "snapshot_id": "tie-last",
+            "pool_name": "tie last",
+        }
+        duplicate_last = {
+            **template,
+            **common_sort_values,
+            "snapshot_id": "duplicate",
+            "pool_name": "last value wins",
+        }
+        history_path = self.root / "stream-semantics" / HISTORY_FILENAME
+        history_path.parent.mkdir(parents=True)
+        with history_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=DEX_DEPTH_COLUMNS,
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(
+                (tie_first, duplicate_first, tie_last)
+            )
+
+        prepared, row_count = fetch_dex_depth._prepare_merged_history_file(
+            history_path,
+            [duplicate_last],
+        )
+        self.addCleanup(prepared.unlink, missing_ok=True)
+        with prepared.open(newline="", encoding="utf-8") as handle:
+            merged = list(csv.DictReader(handle))
+
+        self.assertEqual(row_count, 3)
+        self.assertEqual(
+            [row["snapshot_id"] for row in merged],
+            ["tie-first", "duplicate", "tie-last"],
+        )
+        self.assertEqual(merged[1]["pool_name"], "last value wins")
+        self.assertFalse(
+            any(history_path.parent.glob(".*.sqlite3*"))
         )
 
     def test_exact_publication_bundle_rejects_resolved_private_public_path_overlap_before_write(self):
