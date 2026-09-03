@@ -7337,6 +7337,292 @@ class ManifestValidationTests(unittest.TestCase):
                     )
 
 
+class RouteCostCoverageOutcomeTests(unittest.TestCase):
+    @staticmethod
+    def _replay(manifest, universe, retained=None, **expected_overrides):
+        expected = {
+            "expected_run_id": RUN_ID,
+            "expected_route_cohort_id": COHORT_ID,
+            "expected_phase": PHASE,
+            "expected_candidate_source_generation": GENERATION,
+            "expected_route_universe_sha256": physical_sha(universe),
+        }
+        expected.update(expected_overrides)
+        return route_cost_evidence.replay_route_cost_coverage_outcomes(
+            manifest,
+            universe=universe,
+            retained_typed_pool_state_members=retained,
+            **expected,
+        )
+
+    @staticmethod
+    def _partial_scope_fixture():
+        markets = []
+        routes = []
+        for index in range(9):
+            pool = "0x{:040x}".format(index + 100)
+            market_id = "dex:eth:uniswap_v2:{}:AAA".format(pool)
+            leg = copy.deepcopy(universe_for()["selected_legs"][0])
+            leg["market_id"] = market_id
+            leg["selection_rank"] = index + 1
+            leg["selection_inputs"]["dex_24h_usd"] = str(1000 - index)
+            leg["selection_inputs"]["dex_tvl_usd"] = str(2000 - index)
+            markets.append(leg)
+            routes.append({
+                "route_id": "route-scope-{:02d}".format(index),
+                "token_symbol": "AAA",
+                "buy_market_id": market_id,
+                "sell_market_id": "cex:x:AAA/USDT",
+                "route_mode": "prepositioned_inventory",
+                "route_class": "candidate",
+                "settlement_reason": None,
+                "requested_notionals_usd": list(NOTIONALS),
+                "candidate_source_generation": GENERATION,
+                "buy_reference_volume_usd": str(1000 - index),
+                "sell_reference_volume_usd": "3000",
+                "route_volume_usd": str(1000 - index),
+                "route_volume_basis": "minimum_leg_source_horizon_usd",
+            })
+
+        selected_supported = markets[0]["market_id"]
+        unselected_supported = markets[-1]["market_id"]
+        partial_route_id = "route-scope-partial"
+        routes.append({
+            "route_id": partial_route_id,
+            "token_symbol": "AAA",
+            "buy_market_id": selected_supported,
+            "sell_market_id": unselected_supported,
+            "route_mode": "atomic_onchain",
+            "route_class": "candidate",
+            "settlement_reason": None,
+            "requested_notionals_usd": list(NOTIONALS),
+            "candidate_source_generation": GENERATION,
+            "buy_reference_volume_usd": "1000",
+            "sell_reference_volume_usd": "992",
+            "route_volume_usd": "992",
+            "route_volume_basis": "minimum_leg_source_horizon_usd",
+        })
+        routes.sort(key=lambda row: row["route_id"])
+        universe = universe_for(markets=markets, routes=routes)
+        universe_sha = physical_sha(universe)
+        registry = {
+            "schema": "route_cost_adapter_registry/v1",
+            "registry_version": "scope-gap-v1",
+            "adapters": [adapter(pairs=[
+                pair_descriptor(markets[0]["market_id"].split(":")[3]),
+                pair_descriptor(markets[-1]["market_id"].split(":")[3]),
+            ])],
+        }
+        retained = {
+            selected_supported: retained_v2_pool_state(
+                market_id=selected_supported,
+                pool_address=markets[0]["market_id"].split(":")[3],
+            )
+        }
+        manifest = (
+            route_cost_evidence.build_trace_profile_missing_route_cost_evidence_manifest(
+                universe=universe,
+                run_id=RUN_ID,
+                route_cohort_id=COHORT_ID,
+                phase=PHASE,
+                candidate_source_generation=GENERATION,
+                route_universe_sha256=universe_sha,
+                evaluated_at=EVALUATED_AT,
+                adapter_registry=registry,
+                connector_key_registry=connector_registry(),
+                retained_typed_pool_state_members=retained,
+            )
+        )
+        return manifest, universe, retained, partial_route_id, unselected_supported
+
+    def test_replays_selected_binding_status_for_every_notional(self):
+        manifest, retained = supported_core_manifest()
+        universe = universe_for()
+
+        outcomes = self._replay(
+            manifest,
+            universe,
+            {MARKET_ID: retained},
+        )
+
+        self.assertEqual(len(outcomes), 5)
+        self.assertEqual(
+            [row["requested_notional_usd"] for row in outcomes],
+            [str(value) for value in NOTIONALS],
+        )
+        self.assertTrue(all(row["status"] == "unavailable" for row in outcomes))
+        self.assertTrue(
+            all(row["reason_code"] == "transcript_unavailable" for row in outcomes)
+        )
+        self.assertTrue(all(row["coverage_kind"] == "binding" for row in outcomes))
+        self.assertTrue(all(row["uncovered_dex_market_ids"] == [] for row in outcomes))
+        self.assertTrue(
+            all(row["route_cost_evidence_sha256"] == physical_sha(manifest) for row in outcomes)
+        )
+        expected_binding_hashes = [
+            typed_sha(b"route-cost-evidence-binding/v1\n", row)
+            for row in manifest["bindings"]
+        ]
+        self.assertEqual(
+            [row["scoped_binding_sha256"] for row in outcomes],
+            expected_binding_hashes,
+        )
+
+    def test_partial_binding_cannot_masquerade_as_complete_route_coverage(self):
+        (
+            manifest,
+            universe,
+            retained,
+            partial_route_id,
+            unselected_supported,
+        ) = self._partial_scope_fixture()
+
+        outcomes = self._replay(
+            manifest,
+            universe,
+            retained,
+        )
+        partial = [row for row in outcomes if row["route_id"] == partial_route_id]
+
+        self.assertEqual(len(partial), 5)
+        self.assertTrue(all(row["status"] == "unavailable" for row in partial))
+        self.assertTrue(
+            all(row["reason_code"] == "not_collected_by_cost_scope" for row in partial)
+        )
+        self.assertTrue(
+            all(row["coverage_kind"] == "terminal_scope_replay" for row in partial)
+        )
+        self.assertTrue(
+            all(row["uncovered_dex_market_ids"] == [unselected_supported] for row in partial)
+        )
+        # The legacy v1 sidecar does contain a one-sided scoped binding here;
+        # the full-route outcome must retain its hash without inheriting status.
+        self.assertTrue(all(row["scoped_binding_sha256"] is not None for row in partial))
+
+    def test_structurally_unsupported_dex_route_is_terminal_not_absent(self):
+        manifest = unsupported_manifest()
+        universe = universe_for()
+
+        outcomes = self._replay(
+            manifest,
+            universe,
+        )
+
+        self.assertEqual(len(outcomes), 5)
+        self.assertTrue(all(row["status"] == "unavailable" for row in outcomes))
+        self.assertTrue(
+            all(row["reason_code"] == "strict_cost_adapter_unsupported" for row in outcomes)
+        )
+        self.assertTrue(all(row["uncovered_dex_market_ids"] == [MARKET_ID] for row in outcomes))
+
+    def test_research_only_route_marks_selected_dex_leg_binding_uncovered(self):
+        candidate = copy.deepcopy(universe_for()["routes"][0])
+        route = copy.deepcopy(candidate)
+        route.update({
+            "route_id": "route-research-only",
+            "route_mode": "research_only",
+            "route_class": "research_only",
+            "settlement_reason": "unsupported_cross_chain_settlement",
+        })
+        universe = universe_for(routes=[candidate, route])
+        retained = {MARKET_ID: retained_v2_pool_state()}
+        manifest = (
+            route_cost_evidence.build_trace_profile_missing_route_cost_evidence_manifest(
+                universe=universe,
+                run_id=RUN_ID,
+                route_cohort_id=COHORT_ID,
+                phase=PHASE,
+                candidate_source_generation=GENERATION,
+                route_universe_sha256=physical_sha(universe),
+                evaluated_at=EVALUATED_AT,
+                adapter_registry=adapter_registry(supported=True),
+                connector_key_registry=connector_registry(),
+                retained_typed_pool_state_members=retained,
+            )
+        )
+
+        outcomes = [
+            row for row in self._replay(manifest, universe, retained)
+            if row["route_id"] == route["route_id"]
+        ]
+
+        self.assertEqual(len(outcomes), 5)
+        self.assertTrue(all(row["status"] == "unavailable" for row in outcomes))
+        self.assertTrue(
+            all(row["reason_code"] == "not_collected_by_cost_scope" for row in outcomes)
+        )
+        self.assertTrue(
+            all(row["covered_dex_market_ids"] == [MARKET_ID] for row in outcomes)
+        )
+        self.assertTrue(
+            all(row["uncovered_dex_market_ids"] == [MARKET_ID] for row in outcomes)
+        )
+        self.assertTrue(all(row["scoped_binding_sha256"] is None for row in outcomes))
+
+    def test_cex_only_route_is_not_applicable_for_all_five_notionals(self):
+        candidate = copy.deepcopy(universe_for()["routes"][0])
+        route = copy.deepcopy(candidate)
+        route.update({
+            "route_id": "route-cex-only",
+            "buy_market_id": "cex:x:AAA/USDT",
+            "sell_market_id": "cex:y:AAA/USDT",
+        })
+        universe = universe_for(routes=[candidate, route])
+        manifest = unsupported_manifest(universe)
+
+        outcomes = [
+            row for row in self._replay(manifest, universe)
+            if row["route_id"] == route["route_id"]
+        ]
+
+        self.assertEqual(len(outcomes), 5)
+        self.assertEqual(
+            [row["requested_notional_usd"] for row in outcomes],
+            [str(value) for value in NOTIONALS],
+        )
+        self.assertTrue(all(row["status"] == "not_applicable" for row in outcomes))
+        self.assertTrue(all(row["reason_code"] is None for row in outcomes))
+        self.assertTrue(all(row["coverage_kind"] == "not_applicable" for row in outcomes))
+
+    def test_external_run_anchor_is_not_taken_from_sidecar(self):
+        manifest = unsupported_manifest()
+        universe = universe_for()
+
+        with self.assertRaisesRegex(
+            route_cost_evidence.RouteCostEvidenceError,
+            "route-cost outer lineage differs",
+        ):
+            self._replay(
+                manifest,
+                universe,
+                expected_run_id="shadow-run-cost-other",
+            )
+
+    def test_top_level_notional_denominator_tampering_is_rejected(self):
+        universe = universe_for()
+        universe["requested_notionals_usd"][-1] = 99999
+        manifest = unsupported_manifest(universe)
+
+        with self.assertRaisesRegex(
+            route_cost_evidence.RouteCostEvidenceError,
+            "route-cost coverage top-level notional denominator differs",
+        ):
+            self._replay(manifest, universe)
+
+    def test_route_notional_grid_type_tampering_is_rejected(self):
+        universe = universe_for()
+        universe["routes"][0]["requested_notionals_usd"] = [
+            str(value) for value in NOTIONALS
+        ]
+        manifest = unsupported_manifest(universe)
+
+        with self.assertRaisesRegex(
+            route_cost_evidence.RouteCostEvidenceError,
+            "route-cost coverage route notional denominator differs",
+        ):
+            self._replay(manifest, universe)
+
+
 class V2PrimitiveTests(unittest.TestCase):
     @staticmethod
     def _target_and_state(raw_quantity="100"):

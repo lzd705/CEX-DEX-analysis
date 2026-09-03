@@ -79,6 +79,7 @@ ROUTE_COST_PAIR_AUTHORITY_SCHEMA = "route_cost_pair_authority_record/v1"
 ROUTE_COST_TOKEN_FUNDING_AUTHORITY_SCHEMA = (
     "route_cost_token_funding_authority_record/v1"
 )
+ROUTE_COST_COVERAGE_OUTCOME_SCHEMA = "route_cost_coverage_outcome/v1"
 
 MAX_ROUTE_COST_EVIDENCE_BYTES = 32 * 1024 * 1024
 MAX_ADAPTER_REGISTRY_BYTES = 64 * 1024
@@ -9042,3 +9043,223 @@ def validate_route_cost_evidence_manifest_for_publication(
         _authenticated_snapshot_verified=authenticated,
         _retained_typed_pool_state_members=retained_typed_pool_state_members,
     )
+
+
+def replay_route_cost_coverage_outcomes(
+    value: Mapping[str, Any],
+    *,
+    universe: Mapping[str, Any],
+    expected_run_id: str,
+    expected_route_cohort_id: str,
+    expected_phase: str,
+    expected_candidate_source_generation: str,
+    expected_route_universe_sha256: str,
+    retained_typed_pool_state_members: Optional[
+        Mapping[str, Mapping[str, Any]]
+    ] = None,
+) -> List[Dict[str, Any]]:
+    """Project full-universe route coverage from one authenticated v1 sidecar.
+
+    The v1 binding inventory is intentionally scoped to routes that intersect
+    the selected supported DEX cohort.  In particular, a one-sided binding can
+    exist when another DEX leg fell outside that cohort.  This projection keeps
+    the v1 bytes and meaning unchanged while refusing to treat such a partial
+    binding as complete route-cost coverage.
+
+    The expected lineage arguments must come from the caller's independently
+    trusted core; accepting the sidecar's own identifiers would prove only
+    internal consistency.  ``reason_code`` is local to this coverage-outcome
+    schema.  In particular, ``not_collected_by_cost_scope`` is not a v1
+    transcript, binding, or execution-cost-component reason and must not be
+    copied into those contracts without a separately specified adapter.
+
+    ``covered_dex_market_ids`` means selected/supported transcript-cohort
+    membership.  ``uncovered_dex_market_ids`` means the DEX legs for which no
+    complete route binding may be inherited.  The sets intentionally overlap
+    for a non-candidate route: its market transcript can be in the cohort while
+    its route-level binding was never collected.
+    """
+    if not isinstance(value, Mapping) or not isinstance(universe, Mapping):
+        raise RouteCostEvidenceError("route-cost coverage inputs are invalid")
+    validated = validate_route_cost_evidence_manifest_for_publication(
+        value,
+        universe=universe,
+        expected_run_id=expected_run_id,
+        expected_route_cohort_id=expected_route_cohort_id,
+        expected_phase=expected_phase,
+        expected_candidate_source_generation=(
+            expected_candidate_source_generation
+        ),
+        expected_route_universe_sha256=expected_route_universe_sha256,
+        retained_typed_pool_state_members=retained_typed_pool_state_members,
+    )
+    routes = universe.get("routes")
+    legs = universe.get("selected_legs")
+    if not isinstance(routes, list) or not isinstance(legs, list):
+        raise RouteCostEvidenceError("route-cost coverage universe is invalid")
+
+    production_notional_grid = tuple(
+        int(value) for value in REQUESTED_NOTIONALS_USD
+    )
+
+    def exact_production_notional_grid(candidate: Any) -> bool:
+        return (
+            isinstance(candidate, list)
+            and len(candidate) == len(production_notional_grid)
+            and all(
+                type(actual) is int and actual == expected
+                for actual, expected in zip(
+                    candidate, production_notional_grid
+                )
+            )
+        )
+
+    top_level_notionals = universe.get("requested_notionals_usd")
+    if not exact_production_notional_grid(top_level_notionals):
+        raise RouteCostEvidenceError(
+            "route-cost coverage top-level notional denominator differs"
+        )
+
+    dex_legs: Dict[str, Mapping[str, Any]] = {}
+    for leg in legs:
+        if not isinstance(leg, Mapping):
+            raise RouteCostEvidenceError("route-cost coverage leg is invalid")
+        market_id = leg.get("market_id")
+        if not isinstance(market_id, str) or not market_id:
+            raise RouteCostEvidenceError("route-cost coverage market ID is invalid")
+        if leg.get("market_type") != "dex":
+            continue
+        if not market_id.startswith("dex:") or market_id in dex_legs:
+            raise RouteCostEvidenceError("route-cost coverage DEX inventory differs")
+        dex_legs[market_id] = leg
+
+    registry = validated["adapter_registry"]
+    structurally_supported = {
+        market_id
+        for market_id, leg in dex_legs.items()
+        if _adapter_supports_leg(leg, registry)
+    }
+    selected_supported = {
+        row["market_id"]
+        for row in validated["selected_markets"]
+        if row["structural_support_status"] == "supported"
+    }
+    bindings = {
+        (row["route_id"], row["requested_notional_usd"]): row
+        for row in validated["bindings"]
+    }
+    sidecar_sha = physical_sha256(validated)
+    selected_sha = validated["selected_market_set_sha256"]
+
+    outcomes: List[Dict[str, Any]] = []
+    seen_route_ids = set()
+    for route in routes:
+        if not isinstance(route, Mapping):
+            raise RouteCostEvidenceError("route-cost coverage route is invalid")
+        route_id = route.get("route_id")
+        if (
+            not isinstance(route_id, str)
+            or not route_id
+            or route_id in seen_route_ids
+        ):
+            raise RouteCostEvidenceError("route-cost coverage route ID is invalid")
+        seen_route_ids.add(route_id)
+        route_notionals = route.get("requested_notionals_usd")
+        if (
+            not exact_production_notional_grid(route_notionals)
+            or route_notionals != top_level_notionals
+        ):
+            raise RouteCostEvidenceError(
+                "route-cost coverage route notional denominator differs"
+            )
+        route_market_ids = []
+        for direction in ("buy", "sell"):
+            market_id = route.get(direction + "_market_id")
+            if not isinstance(market_id, str) or not market_id:
+                raise RouteCostEvidenceError(
+                    "route-cost coverage route market ID is invalid"
+                )
+            if market_id.startswith("dex:"):
+                if market_id not in dex_legs:
+                    raise RouteCostEvidenceError(
+                        "route-cost coverage DEX leg does not resolve"
+                    )
+                route_market_ids.append(market_id)
+            elif not market_id.startswith("cex:"):
+                raise RouteCostEvidenceError(
+                    "route-cost coverage route market type is invalid"
+                )
+        if len(route_market_ids) != len(set(route_market_ids)):
+            raise RouteCostEvidenceError(
+                "route-cost coverage route repeats one DEX market"
+            )
+
+        unsupported = sorted(
+            market_id
+            for market_id in route_market_ids
+            if market_id not in structurally_supported
+        )
+        outside_scope = sorted(
+            market_id
+            for market_id in route_market_ids
+            if market_id in structurally_supported
+            and market_id not in selected_supported
+        )
+        covered = sorted(set(route_market_ids) & selected_supported)
+        for notional in REQUESTED_NOTIONALS_USD:
+            binding = bindings.get((route_id, notional))
+            binding_sha = (
+                None
+                if binding is None
+                else typed_sha256(
+                    b"route-cost-evidence-binding/v1\n", binding
+                )
+            )
+            if not route_market_ids:
+                status = "not_applicable"
+                reason = None
+                coverage_kind = "not_applicable"
+                uncovered = []
+            elif unsupported:
+                status = "unavailable"
+                reason = "strict_cost_adapter_unsupported"
+                coverage_kind = "terminal_scope_replay"
+                uncovered = sorted(set(unsupported + outside_scope))
+            elif route.get("route_class") != "candidate":
+                status = "unavailable"
+                reason = "not_collected_by_cost_scope"
+                coverage_kind = "terminal_scope_replay"
+                uncovered = sorted(route_market_ids)
+            elif outside_scope:
+                status = "unavailable"
+                reason = "not_collected_by_cost_scope"
+                coverage_kind = "terminal_scope_replay"
+                uncovered = outside_scope
+            else:
+                if binding is None:
+                    raise RouteCostEvidenceError(
+                        "complete route-cost binding is absent"
+                    )
+                status = binding["status"]
+                reason = binding["reason_code"]
+                coverage_kind = "binding"
+                uncovered = []
+            outcomes.append({
+                "schema": ROUTE_COST_COVERAGE_OUTCOME_SCHEMA,
+                "route_id": route_id,
+                "requested_notional_usd": notional,
+                "status": status,
+                "reason_code": reason,
+                "coverage_kind": coverage_kind,
+                "covered_dex_market_ids": covered,
+                "uncovered_dex_market_ids": uncovered,
+                "scoped_binding_sha256": binding_sha,
+                "route_cost_evidence_sha256": sidecar_sha,
+                "selected_market_set_sha256": selected_sha,
+            })
+    outcomes.sort(
+        key=lambda row: (
+            row["route_id"], Decimal(row["requested_notional_usd"])
+        )
+    )
+    return _canonical_copy(outcomes)
