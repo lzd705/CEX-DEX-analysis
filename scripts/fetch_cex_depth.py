@@ -194,6 +194,8 @@ EXACT_COVERAGE_POLICY = {
 DEPTH_BANDS_BPS = (10, 25, 50, 100)
 REQUEST_SLEEP_SECONDS = 0.15
 MAX_RETRIES = 3
+MAX_SOURCE_STATE_AGE_SECONDS = Decimal(2 * 60 * 60)
+MAX_SOURCE_STATE_FUTURE_SKEW_SECONDS = Decimal(5 * 60)
 
 # Public REST limits differ by venue.  A completeness flag prevents a limited
 # response from being represented as the venue's complete depth.
@@ -1611,6 +1613,7 @@ def collect_cex_market_observation(
     if deadline is not None:
         deadline.require_remaining()
     request_started_at = utc_now_text()
+    response_received_at = ""
     effective_request = request
     if deadline is not None:
         effective_request = lambda url: request(url, deadline=deadline)
@@ -1626,6 +1629,35 @@ def collect_cex_market_observation(
             raw_path.with_name(raw_path.stem + "-quote-conversion.json").write_bytes(
                 book["quote_conversion_raw"]
             )
+        source_observed_at = book.get("source_observed_at")
+        if source_observed_at:
+            source_epoch = exact_rfc3339_epoch_seconds(source_observed_at)
+            received_epoch = exact_rfc3339_epoch_seconds(response_received_at)
+            source_age_seconds = received_epoch - source_epoch
+            if source_age_seconds > MAX_SOURCE_STATE_AGE_SECONDS:
+                raise SourceBookError(
+                    "source order-book state is stale: observed {} at receipt {}".format(
+                        source_observed_at,
+                        response_received_at,
+                    ),
+                    raw=book["raw"],
+                    endpoint=book["source_endpoint"],
+                    source_instrument=book["source_instrument"],
+                    source_quote_asset=book["source_quote_asset"],
+                    reason_code="source_unavailable",
+                )
+            if source_age_seconds < -MAX_SOURCE_STATE_FUTURE_SKEW_SECONDS:
+                raise SourceBookError(
+                    "source order-book state is in the future: observed {} at receipt {}".format(
+                        source_observed_at,
+                        response_received_at,
+                    ),
+                    raw=book["raw"],
+                    endpoint=book["source_endpoint"],
+                    source_instrument=book["source_instrument"],
+                    source_quote_asset=book["source_quote_asset"],
+                    reason_code="source_unavailable",
+                )
         row = observed_row(
             market,
             book,
@@ -1658,7 +1690,8 @@ def collect_cex_market_observation(
     except CollectionDeadlineExceeded:
         raise
     except Exception as error:
-        response_received_at = utc_now_text()
+        if not response_received_at:
+            response_received_at = utc_now_text()
         reason_code = depth_failure_reason_code(error)
         source_endpoint = ""
         source_instrument = ""

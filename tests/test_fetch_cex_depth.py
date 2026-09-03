@@ -79,6 +79,23 @@ def complete_book():
     }
 
 
+def upbit_payload(timestamp):
+    return [
+        {
+            "market": "USDT-LDO",
+            "timestamp": timestamp,
+            "orderbook_units": [
+                {
+                    "bid_price": 1.0,
+                    "bid_size": 2.0,
+                    "ask_price": 1.1,
+                    "ask_size": 3.0,
+                }
+            ],
+        }
+    ]
+
+
 def write_snapshot_rows(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -1822,6 +1839,132 @@ class FetchCexDepthTest(unittest.TestCase):
             ).exists()
 
         self.assertFalse(current_exists)
+
+    def test_one_market_with_http_200_stale_source_state_is_unavailable(self):
+        from scripts.fetch_cex_depth import collect_cex_market_observation
+
+        payload = upbit_payload(1785578399999)
+        response = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+        def fake_request(_url):
+            return payload, response
+
+        request_started_at = "2026-08-01T11:59:59+00:00"
+        received_at = "2026-08-01T12:00:00+00:00"
+        catch_time = "2026-08-01T12:00:01+00:00"
+        with tempfile.TemporaryDirectory() as directory_name:
+            raw_path = Path(directory_name) / "upbit-ldo.json"
+            with patch(
+                "scripts.fetch_cex_depth.utc_now_text",
+                side_effect=[request_started_at, received_at, catch_time],
+            ):
+                depth, execution = collect_cex_market_observation(
+                    market(token="LDO", exchange="upbit", symbol="LDO/USDT"),
+                    snapshot_id="stale-upbit-1",
+                    raw_path=raw_path,
+                    request=fake_request,
+                )
+            retained_raw = raw_path.read_bytes()
+
+        self.assertEqual(
+            (depth["status"], depth["reason_code"], depth["observed_at"]),
+            ("failed", "source_unavailable", received_at),
+        )
+        self.assertEqual(depth["source_instrument"], "USDT-LDO")
+        self.assertEqual(depth["source_quote_asset"], "USDT")
+        self.assertEqual(depth["raw_response_sha256"], hashlib.sha256(response).hexdigest())
+        self.assertIn("source order-book state is stale", depth["error"])
+        self.assertEqual(retained_raw, response)
+        for field in (
+            "best_bid",
+            "best_ask",
+            "midpoint",
+            "spread_bps",
+            "total_depth_100bps_usd",
+        ):
+            self.assertEqual(depth[field], "")
+        self.assertEqual(len(execution), 10)
+        self.assertEqual({row["status"] for row in execution}, {"failed"})
+        self.assertEqual(
+            {row["status_reason"] for row in execution},
+            {"source_unavailable"},
+        )
+        self.assertEqual({row["observed_at"] for row in execution}, {received_at})
+        self.assertEqual({row["state_observed_at"] for row in execution}, {""})
+        self.assertEqual(
+            {row["reference_price_usd_per_token"] for row in execution},
+            {""},
+        )
+        self.assertEqual(
+            {row["quoted_execution_cost_usd"] for row in execution},
+            {""},
+        )
+
+    def test_one_market_accepts_source_state_at_five_minute_future_boundary(self):
+        from scripts.fetch_cex_depth import collect_cex_market_observation
+
+        payload = upbit_payload(1785585900000)
+        response = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory_name, patch(
+            "scripts.fetch_cex_depth.utc_now_text",
+            return_value="2026-08-01T12:00:00+00:00",
+        ):
+            depth, execution = collect_cex_market_observation(
+                market(token="LDO", exchange="upbit", symbol="LDO/USDT"),
+                snapshot_id="future-boundary-upbit-1",
+                raw_path=Path(directory_name) / "upbit-ldo.json",
+                request=lambda _url: (payload, response),
+            )
+
+        self.assertIn(depth["status"], {"observed", "partial"})
+        self.assertEqual(depth["observed_at"], "2026-08-01T12:05:00+00:00")
+        self.assertTrue(all(row["status"] != "failed" for row in execution))
+
+    def test_one_market_accepts_source_state_at_two_hour_boundary(self):
+        from scripts.fetch_cex_depth import collect_cex_market_observation
+
+        payload = upbit_payload(1785578400000)
+        response = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory_name, patch(
+            "scripts.fetch_cex_depth.utc_now_text",
+            return_value="2026-08-01T12:00:00+00:00",
+        ):
+            depth, execution = collect_cex_market_observation(
+                market(token="LDO", exchange="upbit", symbol="LDO/USDT"),
+                snapshot_id="boundary-upbit-1",
+                raw_path=Path(directory_name) / "upbit-ldo.json",
+                request=lambda _url: (payload, response),
+            )
+
+        self.assertIn(depth["status"], {"observed", "partial"})
+        self.assertEqual(depth["observed_at"], "2026-08-01T10:00:00+00:00")
+        self.assertTrue(all(row["status"] != "failed" for row in execution))
+
+    def test_one_market_with_source_state_over_five_minutes_future_is_unavailable(self):
+        from scripts.fetch_cex_depth import collect_cex_market_observation
+
+        payload = upbit_payload(1785585900001)
+        response = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory_name, patch(
+            "scripts.fetch_cex_depth.utc_now_text",
+            return_value="2026-08-01T12:00:00+00:00",
+        ):
+            depth, execution = collect_cex_market_observation(
+                market(token="LDO", exchange="upbit", symbol="LDO/USDT"),
+                snapshot_id="future-upbit-1",
+                raw_path=Path(directory_name) / "upbit-ldo.json",
+                request=lambda _url: (payload, response),
+            )
+
+        self.assertEqual(
+            (depth["status"], depth["reason_code"]),
+            ("failed", "source_unavailable"),
+        )
+        self.assertIn("source order-book state is in the future", depth["error"])
+        self.assertEqual({row["status_reason"] for row in execution}, {"source_unavailable"})
 
     def test_one_market_primitive_matches_independent_golden_rows_and_raw_hash(self):
         from scripts.fetch_cex_depth import collect_cex_market_observation
