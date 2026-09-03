@@ -29,7 +29,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 try:
@@ -4092,6 +4092,7 @@ def _strict_cex_replay(
     fee_profile_path: Path,
     fee_profile_id: str,
     inventory_rows: Sequence[Mapping[str, Any]],
+    issue_attestation: bool = True,
 ) -> Dict[str, Any]:
     route = build_inputs["route"]
     if not _strict_cex_route_identity(route):
@@ -4202,46 +4203,75 @@ def _strict_cex_replay(
             label=direction + " USD conversion source",
         )
         projection = build_inputs[direction + "_usd_projection"]
+        quote_cash = (
+            quote.quote_debit_quantity
+            if direction == "buy"
+            else quote.quote_received_quantity
+        )
         if (
             set(usd_payload) != _USD_SOURCE_FIELDS
             or usd_payload.get("schema") != "route_usd_conversion_source/v1"
-            or projection.get("source_record_sha256") != usd_sha256
-            or projection.get("quote_asset") != usd_payload.get("quote_asset")
-            or projection.get("usd_per_quote") != usd_payload.get("usd_per_quote")
-            or projection.get("observed_at") != usd_payload.get("observed_at")
-            or projection.get("valid_until") != usd_payload.get("valid_until")
-            or projection.get("source") != usd_payload.get("source")
-            or projection.get("core_manifest_sha256") != core_manifest_sha256
+            or (quote_cash is None) != (projection is None)
+            or (
+                projection is not None
+                and (
+                    not isinstance(projection, Mapping)
+                    or projection.get("source_record_sha256") != usd_sha256
+                    or projection.get("quote_asset")
+                    != usd_payload.get("quote_asset")
+                    or projection.get("usd_per_quote")
+                    != usd_payload.get("usd_per_quote")
+                    or projection.get("observed_at")
+                    != usd_payload.get("observed_at")
+                    or projection.get("valid_until")
+                    != usd_payload.get("valid_until")
+                    or projection.get("source") != usd_payload.get("source")
+                    or projection.get("core_manifest_sha256")
+                    != core_manifest_sha256
+                )
+            )
         ):
             raise RoutePublicationError("typed USD conversion does not reproduce projection")
 
     buy_quote = replayed_quotes["buy"]
     sell_quote = replayed_quotes["sell"]
-    inventory = inventory_capacity_for_route(
-        route,
-        inventory_rows,
-        buy_quote_asset=buy_quote.quote_debit_asset,
-        buy_quote_quantity=buy_quote.quote_debit_quantity,
-        sell_token_asset=sell_quote.target_base_asset,
-        sell_net_token_quantity=sell_quote.base_debit_quantity,
-        now=build_inputs["now"],
-    )
-    expected_request = {
-        key: inventory[key]
-        for key in (
-            "route_id", "buy_market_id", "sell_market_id",
-            "buy_quote_asset", "buy_quote_quantity", "sell_token_asset",
-            "sell_net_token_quantity", "target_asset", "target_quantity",
+    if buy_quote.calculation_complete and sell_quote.calculation_complete:
+        inventory = inventory_capacity_for_route(
+            route,
+            inventory_rows,
+            buy_quote_asset=buy_quote.quote_debit_asset,
+            buy_quote_quantity=buy_quote.quote_debit_quantity,
+            sell_token_asset=sell_quote.target_base_asset,
+            sell_net_token_quantity=sell_quote.base_debit_quantity,
+            now=build_inputs["now"],
         )
-    }
-    mode = classify_route_mode_evidence(
-        route,
-        expected_request=expected_request,
-        inventory_evidence=inventory,
-        now=build_inputs["now"],
-    )
-    if mode != build_inputs["mode_evidence"] or not mode.get("mode_evidence_eligible"):
+        expected_request = {
+            key: inventory[key]
+            for key in (
+                "route_id", "buy_market_id", "sell_market_id",
+                "buy_quote_asset", "buy_quote_quantity", "sell_token_asset",
+                "sell_net_token_quantity", "target_asset", "target_quantity",
+            )
+        }
+        mode = classify_route_mode_evidence(
+            route,
+            expected_request=expected_request,
+            inventory_evidence=inventory,
+            now=build_inputs["now"],
+        )
+    else:
+        mode = classify_route_mode_evidence(
+            route,
+            now=build_inputs["now"],
+        )
+    if (
+        mode != build_inputs["mode_evidence"]
+        or (issue_attestation and not mode.get("mode_evidence_eligible"))
+    ):
         raise RoutePublicationError("inventory profile does not reproduce mode evidence")
+
+    if not issue_attestation:
+        return dict(classified)
 
     attestation = _issue_publication_attestation(
         cohort_id=classified["cohort_id"],
@@ -4392,29 +4422,29 @@ def build_complete_route_bundle(
                 raise RoutePublicationError("duplicate route notional scenario")
             scenario_keys.add(scenario_key)
             source_members = raw.get("source_members")
-            if classified.get("strict_ready_for_publication"):
-                if (
-                    source_fd is None
-                    or fee_profile_path is None
-                    or fee_profile_id is None
-                    or inventory_profile_path is None
-                ):
-                    final = dict(classified)
-                else:
-                    final = _strict_cex_replay(
-                        classified=classified,
-                        build_inputs=build_inputs,
-                        costs=costs,
-                        source_members=source_members,
-                        source_fd=source_fd,
-                        raw_members=raw_members,
-                        core_manifest_sha256=loaded["manifest_sha256"],
-                        fee_profile_path=fee_profile_path,
-                        fee_profile_id=fee_profile_id,
-                        inventory_rows=inventory_rows,
-                    )
-            else:
+            if (
+                source_fd is None
+                or fee_profile_path is None
+                or fee_profile_id is None
+                or inventory_profile_path is None
+            ):
                 final = dict(classified)
+            else:
+                final = _strict_cex_replay(
+                    classified=classified,
+                    build_inputs=build_inputs,
+                    costs=costs,
+                    source_members=source_members,
+                    source_fd=source_fd,
+                    raw_members=raw_members,
+                    core_manifest_sha256=loaded["manifest_sha256"],
+                    fee_profile_path=fee_profile_path,
+                    fee_profile_id=fee_profile_id,
+                    inventory_rows=inventory_rows,
+                    issue_attestation=bool(
+                        classified.get("strict_ready_for_publication")
+                    ),
+                )
             final_rows.append(final)
             all_costs.extend(costs)
             quote_inputs.extend([
@@ -5801,8 +5831,13 @@ def publish_complete_route_bundle(
     fee_profile_path: Optional[Path] = None,
     fee_profile_id: Optional[str] = None,
     inventory_profile_path: Optional[Path] = None,
+    precommit_validator: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
-    """Build, stage, validate, atomically install, reread, then move latest."""
+    """Build, stage, validate, then validate auxiliaries and move latest.
+
+    ``precommit_validator`` runs under the routes lock immediately before the
+    public pointer commit.  Its result is deliberately absent from the bundle.
+    """
     inputs = list(opportunity_inputs)
     bundle = build_complete_route_bundle(
         core_root=core_root,
@@ -5901,6 +5936,8 @@ def publish_complete_route_bundle(
         _verify_open_path_identity(routes, routes_details, "complete routes root")
         pointer_bytes = _pointer_payload_bytes(pointer)
         try:
+            if precommit_validator is not None:
+                precommit_validator()
             _commit_complete_pointer_at_locked(routes_fd, routes, pointer_bytes)
         except BaseException:
             _restore_pointer_after_failure(
