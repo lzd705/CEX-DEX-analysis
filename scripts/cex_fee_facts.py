@@ -9,8 +9,10 @@ scenario bounds only and can never become strict fee facts.
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 import fnmatch
 import hashlib
+import io
 import json
 import os
 import re
@@ -64,6 +66,19 @@ PUBLIC_FEE_SCHEDULE_COLUMNS = (
     "valid_until",
     "source_url",
 )
+
+
+@dataclass(frozen=True)
+class _PublicFeeScheduleSnapshot:
+    """One immutable normalized view of exact securely opened CSV bytes."""
+
+    raw_bytes: bytes
+    file_device: int
+    file_inode: int
+    normalized_rows: Tuple[Tuple[Tuple[str, str], ...], ...]
+
+    def rows(self) -> List[Dict[str, str]]:
+        return [dict(row) for row in self.normalized_rows]
 
 OFFICIAL_AUTHENTICATED_FEE_ENDPOINTS = {
     "binance": "GET /api/v3/account/commission",
@@ -697,21 +712,22 @@ def load_validated_fee_profile(
     return inventory
 
 
-def _load_public_fee_schedules(
-    path: os.PathLike,
+def _parse_public_fee_schedule_bytes(
+    raw_bytes: bytes,
     *,
     now: str,
 ) -> List[Dict[str, str]]:
-    schedule_path = Path(path)
     now_text = _validate_timestamp(now, "now")
     now_epoch = exact_rfc3339_epoch_seconds(now_text)
     try:
-        with schedule_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            if tuple(reader.fieldnames or ()) != PUBLIC_FEE_SCHEDULE_COLUMNS:
-                raise ValueError("public fee schedule columns are invalid")
-            raw_rows = list(reader)
-    except (OSError, UnicodeError, csv.Error):
+        if not isinstance(raw_bytes, bytes):
+            raise ValueError("public fee schedule bytes are invalid")
+        text = raw_bytes.decode("utf-8")
+        reader = csv.DictReader(io.StringIO(text, newline=""))
+        if tuple(reader.fieldnames or ()) != PUBLIC_FEE_SCHEDULE_COLUMNS:
+            raise ValueError("public fee schedule columns are invalid")
+        raw_rows = list(reader)
+    except (UnicodeError, csv.Error):
         raise ValueError("public fee schedule could not be read") from None
     inventory: List[Dict[str, str]] = []
     keys = set()
@@ -767,6 +783,93 @@ def _load_public_fee_schedules(
         keys.add(key)
         inventory.append(row)
     return inventory
+
+
+def _normalized_public_fee_rows(
+    rows: Sequence[Mapping[str, str]],
+) -> Tuple[Tuple[Tuple[str, str], ...], ...]:
+    return tuple(
+        tuple((column, row[column]) for column in PUBLIC_FEE_SCHEDULE_COLUMNS)
+        for row in rows
+    )
+
+
+def _load_public_fee_schedule_snapshot(
+    path: os.PathLike,
+    *,
+    now: str,
+) -> _PublicFeeScheduleSnapshot:
+    schedule_path = Path(path)
+    try:
+        path_metadata = os.lstat(str(schedule_path))
+        if not stat.S_ISREG(path_metadata.st_mode):
+            raise ValueError("public fee schedule must be a regular file")
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise ValueError("public fee schedule secure open is unavailable")
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+        file_descriptor = os.open(str(schedule_path), flags)
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("public fee schedule could not be read") from None
+    try:
+        opened_metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(opened_metadata.st_mode):
+            raise ValueError("public fee schedule must be a regular file")
+        if (
+            opened_metadata.st_dev != path_metadata.st_dev
+            or opened_metadata.st_ino != path_metadata.st_ino
+        ):
+            raise ValueError("public fee schedule changed during open")
+        chunks = []
+        while True:
+            chunk = os.read(file_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw_bytes = b"".join(chunks)
+    except OSError:
+        raise ValueError("public fee schedule could not be read") from None
+    finally:
+        os.close(file_descriptor)
+    inventory = _parse_public_fee_schedule_bytes(raw_bytes, now=now)
+    normalized_rows = _normalized_public_fee_rows(inventory)
+    return _PublicFeeScheduleSnapshot(
+        raw_bytes=raw_bytes,
+        file_device=opened_metadata.st_dev,
+        file_inode=opened_metadata.st_ino,
+        normalized_rows=normalized_rows,
+    )
+
+
+def _load_public_fee_schedules(
+    path: os.PathLike,
+    *,
+    now: str,
+) -> List[Dict[str, str]]:
+    return _load_public_fee_schedule_snapshot(path, now=now).rows()
+
+
+def _validated_public_fee_snapshot_rows(
+    snapshot: _PublicFeeScheduleSnapshot,
+    *,
+    now: str,
+) -> List[Dict[str, str]]:
+    if (
+        type(snapshot) is not _PublicFeeScheduleSnapshot
+        or isinstance(snapshot.file_device, bool)
+        or not isinstance(snapshot.file_device, int)
+        or snapshot.file_device <= 0
+        or isinstance(snapshot.file_inode, bool)
+        or not isinstance(snapshot.file_inode, int)
+        or snapshot.file_inode <= 0
+    ):
+        raise ValueError("public fee schedule snapshot identity is invalid")
+    rows = _parse_public_fee_schedule_bytes(snapshot.raw_bytes, now=now)
+    if _normalized_public_fee_rows(rows) != snapshot.normalized_rows:
+        raise ValueError("public fee schedule snapshot rows differ from its bytes")
+    return rows
 
 
 def _terminal_component(
@@ -870,7 +973,7 @@ def _component_from_evidence(
     )
 
 
-def collect_cex_fee_snapshot(
+def _collect_cex_fee_snapshot(
     *,
     cohort_id: str,
     opportunity_id: str,
@@ -891,6 +994,7 @@ def collect_cex_fee_snapshot(
     discount_asset_funded: Optional[bool] = None,
     allow_public_estimate: bool = False,
     public_schedule_path: Optional[os.PathLike] = None,
+    _public_schedule_rows: Optional[Sequence[Mapping[str, str]]] = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Collect one CEX fee component without accepting credential material.
@@ -1144,14 +1248,22 @@ def collect_cex_fee_snapshot(
         return row
 
     if allow_public_estimate:
+        if public_schedule_path is not None and _public_schedule_rows is not None:
+            raise ValueError(
+                "public schedule path and internal rows are mutually exclusive"
+            )
         schedule = public_schedule_path
-        if schedule is None:
+        if schedule is None and _public_schedule_rows is None:
             schedule = (
                 Path(__file__).resolve().parents[1]
                 / "config"
                 / "cex_public_fee_schedules.csv"
             )
-        schedules = _load_public_fee_schedules(schedule, now=now)
+        schedules = (
+            list(_public_schedule_rows)
+            if _public_schedule_rows is not None
+            else _load_public_fee_schedules(schedule, now=now)
+        )
         matches = [
             row
             for row in schedules
@@ -1239,3 +1351,49 @@ def collect_cex_fee_snapshot(
         .format(canonical_venue, row["reason_code"]),
     )
     return row
+
+
+def collect_cex_fee_snapshot(
+    *,
+    cohort_id: str,
+    opportunity_id: str,
+    leg: str,
+    market_id: str,
+    venue: str,
+    instrument: str,
+    side: str,
+    requested_notional_usd: Any,
+    target_token_quantity: Any,
+    now: str,
+    client: Optional[Any] = None,
+    private_profile_path: Optional[os.PathLike] = None,
+    profile_id: Optional[str] = None,
+    observed_at: Optional[str] = None,
+    valid_until: Optional[str] = None,
+    fee_asset: Optional[str] = None,
+    discount_asset_funded: Optional[bool] = None,
+    allow_public_estimate: bool = False,
+    public_schedule_path: Optional[os.PathLike] = None,
+    logger: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """Collect one fee component from authenticated evidence or a CSV path."""
+    return _collect_cex_fee_snapshot(**locals())
+
+
+def _collect_cex_fee_snapshot_from_schedule_snapshot(
+    *,
+    public_schedule_snapshot: _PublicFeeScheduleSnapshot,
+    **kwargs: Any
+) -> Dict[str, Any]:
+    """Resolve one public component from revalidated authoritative bytes."""
+    if "public_schedule_path" in kwargs or "allow_public_estimate" in kwargs:
+        raise ValueError("internal public snapshot arguments are invalid")
+    rows = _validated_public_fee_snapshot_rows(
+        public_schedule_snapshot,
+        now=kwargs.get("now"),
+    )
+    return _collect_cex_fee_snapshot(
+        **kwargs,
+        allow_public_estimate=True,
+        _public_schedule_rows=rows
+    )

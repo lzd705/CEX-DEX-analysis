@@ -6051,11 +6051,16 @@ def publish_complete_route_bundle(
     fee_profile_id: Optional[str] = None,
     inventory_profile_path: Optional[Path] = None,
     precommit_validator: Optional[Callable[[], None]] = None,
+    postcommit_validator: Optional[
+        Callable[[Mapping[str, Any]], None]
+    ] = None,
 ) -> Dict[str, Any]:
     """Build, stage, validate, then validate auxiliaries and move latest.
 
     ``precommit_validator`` runs under the routes lock immediately before the
     public pointer commit.  Its result is deliberately absent from the bundle.
+    ``postcommit_validator`` runs under the same lock after the commit; a
+    failure rolls back only when the attempted pointer is still current.
     """
     inputs = list(opportunity_inputs)
     bundle = build_complete_route_bundle(
@@ -6216,6 +6221,8 @@ def publish_complete_route_bundle(
                 expected_manifest_sha256=bundle["core_manifest_sha256"],
                 expected_pointer_sha256=bundle["core_pointer_sha256"],
             )
+            if postcommit_validator is not None:
+                postcommit_validator(pointer)
         except BaseException:
             _restore_pointer_after_failure(
                 routes_fd, routes, old_pointer, pointer_bytes

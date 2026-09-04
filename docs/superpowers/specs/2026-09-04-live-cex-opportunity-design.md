@@ -108,7 +108,8 @@ fixed UNI/USDT research universe
        -> derive one exact common UNI quantity per route/notional
        -> walk both books for that same quantity
        -> attach public fee upper-bound components when available
-       -> mark inventory/rebalancing evidence unavailable
+       -> keep inventory evidence unavailable and mark immediate transfer cost
+          as an explicit non-strict zero-cost research assumption
   -> existing complete-bundle publication and cold reload validation
   -> existing Current Opportunity API and page
 ```
@@ -171,10 +172,12 @@ fee-record hash. The matching cost component carries the identical rate and
 hash, so the existing opportunity validator recognizes the fee as already
 reflected in the leg cash flow and does not subtract it twice.
 
-When no current public fee bound exists, the book can still be replayed with an
-explicit zero-rate mechanics object solely to expose gross price/slippage. The
-fee component remains `unavailable`, scenario cost completeness is incomplete,
-and research net is null. Zero is never presented as the venue fee.
+When no current public fee bound exists, the book is still replayed with an
+explicit zero-rate mechanics object so the retained book/rule evidence remains
+auditable. The fee component remains `unavailable`, the published opportunity
+row is unavailable with research net and economic fields suppressed, and zero
+is never presented as the venue fee. The normal UI does not display gross
+economics for this failure case.
 
 ### Public taker-fee bounds
 
@@ -192,9 +195,11 @@ source-backed gross book results, but research net remains unavailable.
 
 No account inventory is inspected. `classify_route_mode_evidence(route,
 now=...)` supplies an ineligible research-mode projection. The
-`rebalancing_or_transfer` component is unavailable, with a stable reason that
-pre-positioned balances were not evidenced. It is never marked
-`not_applicable`.
+`rebalancing_or_transfer` component is a scenario-only `assumed` zero with the
+stable reason `inventory_not_observed_for_public_research`. Its basis and source
+state that zero immediate transfer cost is a hypothetical pre-positioned-
+inventory assumption and that no account inventory was observed. It is never
+strict eligible or marked `not_applicable`.
 
 ### Direction and ranking
 
@@ -214,10 +219,23 @@ The existing collector and publisher remain the authority for:
 - complete manifest and atomic `routes/latest.json` pointer;
 - cold reload validation after publication.
 
-The public fee schedule bytes are read before calculation, their exact record
-hash is included in every fee component, and the schedule is reread before the
-complete pointer commit. A changed schedule aborts publication and preserves
-the prior current pointer.
+The public fee schedule is securely opened and parsed once before calculation.
+Every fee component uses that same immutable bytes/device/inode snapshot, its
+exact record hash is included in the component, and the path identity and bytes
+are reverified before the complete pointer commit. Transient content changes or
+even a same-byte inode replacement abort publication and preserve the prior
+current pointer. The snapshot and parsed-row resolver are private finalizer
+plumbing: the public fee collector accepts only a schedule path and never trusts
+caller-supplied parsed rows. The private resolver reparses and validates the
+snapshot's authoritative raw bytes before using its normalized rows.
+
+The finalizer requires the expected route cohort ID and core manifest hash from
+the just-published core, rejects any stale or different current core, and
+independently enforces the exact fixed UNI/USDT Binance/Bybit generation,
+window, notionals, routes, and legs. Cold reload runs inside the complete
+publisher's postcommit validation transaction. Failure restores the prior
+pointer only if the attempted pointer is still current; a concurrent pointer is
+never overwritten.
 
 The command prints a receipt containing only schema/status, route cohort ID,
 complete pointer identity, source venues, token pair, row counts, and optional

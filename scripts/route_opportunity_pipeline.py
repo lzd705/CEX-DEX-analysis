@@ -16,6 +16,9 @@ if __package__ in {None, ""}:  # Support ``python scripts/<name>.py``.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.cex_fee_facts import (
+    _PublicFeeScheduleSnapshot,
+    _collect_cex_fee_snapshot_from_schedule_snapshot,
+    _load_public_fee_schedule_snapshot,
     collect_cex_fee_snapshot,
     load_validated_fee_profile,
 )
@@ -26,6 +29,11 @@ from scripts.fetch_cex_depth import (
     route_quantity_quote_for_book,
 )
 from scripts.fetch_dex_depth import freeze_v2_pool_state
+from scripts.live_cex_research import (
+    build_live_cex_research_universe,
+    live_cex_research_generation,
+    public_fee_semantics,
+)
 from scripts.route_cost_evidence import (
     RouteCostEvidenceError,
     network_gas_usd,
@@ -564,31 +572,13 @@ def _fee_semantics(
         ) from error
 
 
-def _build_inputs(
+def _load_cex_sources(
     *,
     root: Path,
     cohort: Mapping[str, Any],
-    core_manifest_sha256: str,
     source_root: Path,
-    fee_profile_path: Path,
-    inventory_profile_path: Path,
     now: str,
-) -> tuple[List[Dict[str, Any]], str]:
-    try:
-        fee_rows = load_validated_fee_profile(fee_profile_path, now=now)
-        inventory_rows = load_validated_inventory_profile(
-            inventory_profile_path, now=now
-        )
-    except (TypeError, ValueError) as error:
-        raise RouteOpportunityPipelineError(
-            "private fee or inventory profile is invalid"
-        ) from error
-    profile_ids = {row["profile_id"] for row in fee_rows}
-    if len(profile_ids) != 1:
-        raise RouteOpportunityPipelineError(
-            "private fee profile identity is not exact"
-        )
-    profile_id = next(iter(profile_ids))
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     members_by_market = _source_members_by_market(cohort)
     legs_by_market = {row["market_id"]: row for row in cohort["legs"]}
     if len(legs_by_market) != len(cohort["legs"]):
@@ -662,6 +652,40 @@ def _build_inputs(
         ) from error
     finally:
         os.close(source_fd)
+    return sources, legs_by_market
+
+
+def _build_inputs(
+    *,
+    root: Path,
+    cohort: Mapping[str, Any],
+    core_manifest_sha256: str,
+    source_root: Path,
+    fee_profile_path: Path,
+    inventory_profile_path: Path,
+    now: str,
+) -> tuple[List[Dict[str, Any]], str]:
+    try:
+        fee_rows = load_validated_fee_profile(fee_profile_path, now=now)
+        inventory_rows = load_validated_inventory_profile(
+            inventory_profile_path, now=now
+        )
+    except (TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "private fee or inventory profile is invalid"
+        ) from error
+    profile_ids = {row["profile_id"] for row in fee_rows}
+    if len(profile_ids) != 1:
+        raise RouteOpportunityPipelineError(
+            "private fee profile identity is not exact"
+        )
+    profile_id = next(iter(profile_ids))
+    sources, legs_by_market = _load_cex_sources(
+        root=root,
+        cohort=cohort,
+        source_root=source_root,
+        now=now,
+    )
 
     opportunities: List[Dict[str, Any]] = []
     cohort_now = cohort["collection_completed_at"]
@@ -883,6 +907,239 @@ def _build_inputs(
                     "CEX opportunity inputs cannot be reconstructed"
                 ) from error
     return opportunities, profile_id
+
+
+def _build_public_cex_research_inputs(
+    *,
+    data_dir: Path,
+    cohort: Mapping[str, Any],
+    core_manifest_sha256: str,
+    public_fee_schedule_snapshot: _PublicFeeScheduleSnapshot,
+) -> List[Dict[str, Any]]:
+    """Replay one current CEX core into non-strict public research inputs."""
+    root = Path(data_dir)
+    try:
+        cohort_now = cohort["collection_completed_at"]
+        source_root = (
+            root / "raw/route-cohort"
+            / cohort["raw_evidence_run_id"] / "typed"
+        )
+        sources, legs_by_market = _load_cex_sources(
+            root=root,
+            cohort=cohort,
+            source_root=source_root,
+            now=cohort_now,
+        )
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        if isinstance(error, RouteOpportunityPipelineError):
+            raise
+        raise RouteOpportunityPipelineError(
+            "public CEX source evidence is invalid"
+        ) from error
+
+    opportunities: List[Dict[str, Any]] = []
+    for route in cohort["routes"]:
+        try:
+            buy_source = sources[route["buy_market_id"]]
+            sell_source = sources[route["sell_market_id"]]
+            buy_reference = (
+                buy_source["book"]["asks"][0][0]
+                * buy_source["usd_rate"]
+            )
+            sell_reference = (
+                sell_source["book"]["bids"][0][0]
+                * sell_source["usd_rate"]
+            )
+            for raw_notional in cohort["requested_notionals_usd"]:
+                notional = Decimal(str(raw_notional))
+                target = common_target_quantity(
+                    requested_notional_usd=notional,
+                    buy_reference_price_usd=buy_reference,
+                    sell_reference_price_usd=sell_reference,
+                    buy_market_rules=buy_source["rules"],
+                    sell_market_rules=sell_source["rules"],
+                )
+                opportunity_id = route_opportunity_id(
+                    route["route_id"], notional
+                )
+                costs = [
+                    _collect_cex_fee_snapshot_from_schedule_snapshot(
+                        cohort_id=cohort["route_cohort_id"],
+                        opportunity_id=opportunity_id,
+                        leg=direction,
+                        market_id=route[direction + "_market_id"],
+                        venue=route[direction + "_market_id"].split(":", 2)[1],
+                        instrument=route[direction + "_market_id"].split(":", 2)[2],
+                        side=direction,
+                        requested_notional_usd=notional,
+                        target_token_quantity=target.quantity,
+                        now=cohort_now,
+                        public_schedule_snapshot=public_fee_schedule_snapshot,
+                    )
+                    for direction in ("buy", "sell")
+                ]
+                fee_components = {
+                    row["leg"]: row for row in costs
+                }
+                fees = {
+                    direction: public_fee_semantics(
+                        fee_components[direction],
+                        direction=direction,
+                        rules=sources[
+                            route[direction + "_market_id"]
+                        ]["rules"],
+                        now=cohort_now,
+                    )
+                    for direction in ("buy", "sell")
+                }
+
+                quotes: Dict[str, Any] = {}
+                quote_evidence: Dict[str, Any] = {}
+                build_legs: Dict[str, Dict[str, Any]] = {}
+                projections: Dict[str, Optional[Dict[str, Any]]] = {}
+                for direction in ("buy", "sell"):
+                    market_id = route[direction + "_market_id"]
+                    source = sources[market_id]
+                    leg = legs_by_market[market_id]
+                    state_id = cex_quantity_state_id(
+                        source["market"],
+                        source["book"],
+                        snapshot_id=leg["snapshot_id"],
+                        observed_at=leg["state_observed_at"],
+                        cohort_now=cohort_now,
+                        market_rules=source["rules"],
+                        fee_semantics=fees[direction],
+                    )
+                    quote = route_quantity_quote_for_book(
+                        source["market"],
+                        source["book"],
+                        direction=direction,
+                        target_token_quantity=target,
+                        market_rules=source["rules"],
+                        fee_semantics=fees[direction],
+                        snapshot_id=leg["snapshot_id"],
+                        observed_at=leg["state_observed_at"],
+                        cohort_now=cohort_now,
+                        expected_state_id=state_id,
+                    )
+                    quotes[direction] = quote
+                    build_legs[direction] = {**dict(leg), "state_id": state_id}
+                    quote_evidence[direction] = {
+                        "kind": "cex_book",
+                        "market": source["market"],
+                        "book": source["book"],
+                        "market_rules": source["rules"],
+                        "fee_semantics": fees[direction],
+                        "snapshot_id": leg["snapshot_id"],
+                        "observed_at": leg["state_observed_at"],
+                        "cohort_now": cohort_now,
+                        "expected_state_id": state_id,
+                        "assurance_status": "route_bundle_validated",
+                        "core_manifest_sha256": core_manifest_sha256,
+                    }
+                    cash = (
+                        quote.quote_debit_quantity
+                        if direction == "buy"
+                        else quote.quote_received_quantity
+                    )
+                    projections[direction] = (
+                        None
+                        if cash is None
+                        else usd_projection_evidence(
+                            market_id=market_id,
+                            state_id=state_id,
+                            direction=direction,
+                            quote_asset=source["rules"].quote_asset,
+                            quote_cash_quantity=cash,
+                            usd_per_quote=source["usd_rate"],
+                            value_status="authenticated",
+                            observed_at=source["usd"]["observed_at"],
+                            valid_until=source["usd"]["valid_until"],
+                            source=source["usd"]["source"],
+                            source_record_sha256=source["usd_sha"],
+                            core_manifest_sha256=core_manifest_sha256,
+                        )
+                    )
+
+                costs.append(cost_component_row(
+                    cohort_id=cohort["route_cohort_id"],
+                    opportunity_id=opportunity_id,
+                    leg="route",
+                    market_id="",
+                    direction="route",
+                    requested_notional_usd=notional,
+                    target_token_quantity=target.quantity,
+                    component_type="rebalancing_or_transfer",
+                    value_status="assumed",
+                    amount_usd=Decimal(0),
+                    rate_bps=Decimal(0),
+                    basis=(
+                        "zero immediate transfer cost is a public research "
+                        "scenario assumption; no account inventory was observed"
+                    ),
+                    strict_eligible=False,
+                    observed_at=None,
+                    valid_until=None,
+                    source=(
+                        "public research scenario without account inventory"
+                    ),
+                    source_record_sha256=None,
+                    reason_code="inventory_not_observed_for_public_research",
+                ))
+                mode = classify_route_mode_evidence(route, now=cohort_now)
+                build_inputs = {
+                    "cohort_id": cohort["route_cohort_id"],
+                    "route": route,
+                    "requested_notional_usd": notional,
+                    "common_target": target,
+                    "buy_leg": build_legs["buy"],
+                    "sell_leg": build_legs["sell"],
+                    "buy_quote": quotes["buy"],
+                    "sell_quote": quotes["sell"],
+                    "buy_quote_evidence": quote_evidence["buy"],
+                    "sell_quote_evidence": quote_evidence["sell"],
+                    "buy_usd_projection": projections["buy"],
+                    "sell_usd_projection": projections["sell"],
+                    "cost_components": costs,
+                    "mode_evidence": mode,
+                    "now": cohort_now,
+                }
+                classified = build_route_opportunity(**build_inputs)
+                if (
+                    classified.get("opportunity_class")
+                    not in {"research_estimate", "unavailable"}
+                    or classified.get("strict_eligible") is not False
+                    or classified.get("strict_ready_for_publication") is not False
+                    or classified.get("publication_attestation_sha256") is not None
+                ):
+                    raise RouteOpportunityPipelineError(
+                        "public CEX result exceeded its research claim boundary"
+                    )
+                opportunities.append({
+                    "classified_opportunity": classified,
+                    "build_inputs": build_inputs,
+                    "source_members": {
+                        "buy_market_rules": buy_source["filenames"][
+                            "cex_market_rules"
+                        ],
+                        "sell_market_rules": sell_source["filenames"][
+                            "cex_market_rules"
+                        ],
+                        "buy_usd_conversion": buy_source["filenames"][
+                            "quote_usd_conversion"
+                        ],
+                        "sell_usd_conversion": sell_source["filenames"][
+                            "quote_usd_conversion"
+                        ],
+                    },
+                })
+        except (KeyError, InvalidOperation, TypeError, ValueError) as error:
+            if isinstance(error, RouteOpportunityPipelineError):
+                raise
+            raise RouteOpportunityPipelineError(
+                "public CEX opportunity inputs cannot be reconstructed"
+            ) from error
+    return opportunities
 
 
 def _terminal_dex_cost_components(
@@ -1643,6 +1900,169 @@ def _build_dex_inputs(
                     "DEX opportunity inputs cannot be reconstructed"
                 ) from error
     return opportunities
+
+
+def finalize_public_cex_research_opportunities(
+    *,
+    data_dir: Path,
+    public_fee_schedule_path: Path,
+    expected_route_cohort_id: str,
+    expected_core_manifest_sha256: str,
+) -> Dict[str, Any]:
+    """Finalize the current CEX core as public, non-strict research."""
+    root = Path(data_dir)
+    schedule_path = Path(public_fee_schedule_path)
+    try:
+        current_core = load_latest_route_cohort(root / "routes/core")
+    except (OSError, TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "current public CEX inputs are invalid"
+        ) from error
+    cohort = current_core.get("cohort")
+    core_pointer = current_core.get("pointer")
+    core_manifest_sha256 = current_core.get("manifest_sha256")
+    if (
+        not isinstance(cohort, dict)
+        or not isinstance(core_pointer, dict)
+        or not isinstance(core_manifest_sha256, str)
+        or core_pointer.get("manifest_sha256") != core_manifest_sha256
+    ):
+        raise RouteOpportunityPipelineError(
+            "current public CEX core identity is invalid"
+        )
+    if (
+        cohort.get("route_cohort_id") != expected_route_cohort_id
+        or core_manifest_sha256 != expected_core_manifest_sha256
+    ):
+        raise RouteOpportunityPipelineError(
+            "current public CEX core differs from expected published identity"
+        )
+    legs = cohort.get("legs")
+    routes = cohort.get("routes")
+    if not isinstance(legs, list) or not isinstance(routes, list):
+        raise RouteOpportunityPipelineError(
+            "current public CEX core inventory is invalid"
+        )
+    leg_types = {
+        leg.get("market_id"): leg.get("market_type")
+        for leg in legs if isinstance(leg, dict)
+    }
+    if (
+        len(leg_types) != len(legs)
+        or any(market_type != "cex" for market_type in leg_types.values())
+        or any(
+            not isinstance(route, dict)
+            or leg_types.get(route.get("buy_market_id")) != "cex"
+            or leg_types.get(route.get("sell_market_id")) != "cex"
+            for route in routes
+        )
+    ):
+        raise RouteOpportunityPipelineError(
+            "public research finalization is CEX-only"
+        )
+    fixed_universe = build_live_cex_research_universe()
+    expected_leg_ids = {
+        leg["market_id"] for leg in fixed_universe["selected_legs"]
+    }
+    actual_leg_ids = set(leg_types)
+    actual_leg_tokens = {
+        leg.get("market_id"): leg.get("token_symbol")
+        for leg in legs if isinstance(leg, dict)
+    }
+    if (
+        cohort.get("candidate_source_generation")
+        != live_cex_research_generation()
+        or cohort.get("selection_window")
+        != fixed_universe["selection_window"]
+        or cohort.get("requested_notionals_usd")
+        != fixed_universe["requested_notionals_usd"]
+        or routes != fixed_universe["routes"]
+        or actual_leg_ids != expected_leg_ids
+        or set(actual_leg_tokens.values()) != {"UNI"}
+    ):
+        raise RouteOpportunityPipelineError(
+            "current public CEX core is outside the fixed UNI/USDT "
+            "Binance/Bybit research universe"
+        )
+
+    try:
+        schedule_snapshot = _load_public_fee_schedule_snapshot(
+            schedule_path,
+            now=cohort["collection_completed_at"],
+        )
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "current public CEX inputs are invalid"
+        ) from error
+
+    inputs = _build_public_cex_research_inputs(
+        data_dir=root,
+        cohort=cohort,
+        core_manifest_sha256=core_manifest_sha256,
+        public_fee_schedule_snapshot=schedule_snapshot,
+    )
+    source_root = (
+        root / "raw/route-cohort"
+        / cohort["raw_evidence_run_id"] / "typed"
+    )
+
+    def validate_public_inputs() -> None:
+        try:
+            confirmed_schedule = _load_public_fee_schedule_snapshot(
+                schedule_path,
+                now=cohort["collection_completed_at"],
+            )
+            confirmed_core = load_latest_route_cohort(root / "routes/core")
+        except (OSError, TypeError, ValueError) as error:
+            raise RouteOpportunityPipelineError(
+                "public CEX inputs changed before pointer commit"
+            ) from error
+        if (
+            confirmed_schedule != schedule_snapshot
+            or confirmed_core.get("pointer") != core_pointer
+            or confirmed_core.get("manifest_sha256")
+            != core_manifest_sha256
+            or confirmed_core.get("cohort") != cohort
+        ):
+            raise RouteOpportunityPipelineError(
+                "public CEX inputs changed before pointer commit"
+            )
+
+    validate_public_inputs()
+    cold_loaded: Dict[str, Any] = {}
+
+    def validate_committed_public_pointer(
+        committed_pointer: Mapping[str, Any],
+    ) -> None:
+        loaded = load_latest_complete_route_bundle(
+            root / "routes",
+            core_root=root / "routes/core",
+        )
+        if loaded.get("pointer") != committed_pointer:
+            raise RouteOpportunityPipelineError(
+                "published public CEX pointer failed cold reload"
+            )
+        cold_loaded["pointer"] = loaded["pointer"]
+
+    try:
+        pointer = publish_complete_route_bundle(
+            core_root=root / "routes/core",
+            routes_root=root / "routes",
+            raw_root=root / "raw/route-cohort",
+            opportunity_inputs=inputs,
+            source_root=source_root,
+            precommit_validator=validate_public_inputs,
+            postcommit_validator=validate_committed_public_pointer,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "public CEX opportunity publication failed"
+        ) from error
+    if cold_loaded.get("pointer") != pointer:
+        raise RouteOpportunityPipelineError(
+            "published public CEX pointer failed cold reload"
+        )
+    return pointer
 
 
 def finalize_cex_route_opportunities(

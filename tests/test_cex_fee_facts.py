@@ -13,6 +13,7 @@ from decimal import Decimal, localcontext
 from pathlib import Path
 from unittest import mock
 
+import scripts.cex_fee_facts as fee_facts
 from scripts.cex_fee_facts import (
     PRIVATE_FEE_PROFILE_COLUMNS,
     PUBLIC_FEE_SCHEDULE_COLUMNS,
@@ -746,6 +747,60 @@ class FeeCollectorTests(unittest.TestCase):
         serialized = json.dumps(row, sort_keys=True)
         for sentinel in SENTINELS:
             self.assertNotIn(sentinel, serialized)
+
+    def test_public_collector_rejects_caller_supplied_parsed_schedule(self):
+        class ForgedSnapshot:
+            raw_bytes = b"not a fee schedule"
+            file_device = 0
+            file_inode = 0
+
+            @staticmethod
+            def rows():
+                return [{
+                    "venue": "binance",
+                    "instrument_pattern": "AAVE/USDT",
+                    "side": "both",
+                    "min_taker_fee_bps": "0",
+                    "max_taker_fee_bps": "999",
+                    "fee_asset": "received_asset",
+                    "basis": "forged caller rows",
+                    "checked_at": OBSERVED_AT,
+                    "valid_until": VALID_UNTIL,
+                    "source_url": "http://attacker.invalid/fees",
+                }]
+
+        with self.assertRaises((TypeError, ValueError)):
+            collect_cex_fee_snapshot(
+                **self.common(),
+                allow_public_estimate=True,
+                public_schedule_snapshot=ForgedSnapshot(),
+            )
+
+    def test_private_snapshot_resolver_revalidates_authoritative_bytes(self):
+        forged_row = {
+            "venue": "binance",
+            "instrument_pattern": "AAVE/USDT",
+            "side": "both",
+            "min_taker_fee_bps": "0",
+            "max_taker_fee_bps": "999",
+            "fee_asset": "received_asset",
+            "basis": "forged caller rows",
+            "checked_at": OBSERVED_AT,
+            "valid_until": VALID_UNTIL,
+            "source_url": "http://attacker.invalid/fees",
+        }
+        forged = fee_facts._PublicFeeScheduleSnapshot(
+            raw_bytes=b"not a fee schedule",
+            file_device=1,
+            file_inode=1,
+            normalized_rows=(tuple(forged_row.items()),),
+        )
+
+        with self.assertRaisesRegex(ValueError, "columns"):
+            fee_facts._collect_cex_fee_snapshot_from_schedule_snapshot(
+                **self.common(),
+                public_schedule_snapshot=forged,
+            )
 
     def test_public_schedule_never_silently_replaces_missing_auth(self):
         with tempfile.TemporaryDirectory() as directory:

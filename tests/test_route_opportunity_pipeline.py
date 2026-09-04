@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
@@ -24,6 +25,9 @@ from scripts.route_cost_evidence import (
     physical_sha256,
     typed_sha256,
 )
+from scripts.cex_fee_facts import PUBLIC_FEE_SCHEDULE_COLUMNS
+from scripts.live_cex_research import build_live_cex_research_universe
+from scripts.route_cohort import canonical_route_id
 from scripts.fetch_dex_depth import ROUTE_V2_FEE_PROOF_SHA256
 from scripts.route_publication import (
     load_latest_complete_route_bundle,
@@ -493,7 +497,9 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
             dashboard_exec.call_args.args[1][-2:], ["--port", "43211"]
         )
 
-    def _install_real_cex_run(self, *, sell_quantity="10000"):
+    def _install_real_cex_run(
+        self, *, sell_quantity="10000", both_directions=False
+    ):
         data_dir = Path(self.temporary.name) / "real-data"
         core_root = data_dir / "routes/core"
         shadow_root = data_dir / "routes/shadow"
@@ -505,6 +511,23 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
         )
         cohort = copy.deepcopy(fixture["cohort"])
         run_id = cohort["raw_evidence_run_id"]
+
+        if both_directions:
+            forward = cohort["routes"][0]
+            reverse = copy.deepcopy(forward)
+            reverse["buy_market_id"] = forward["sell_market_id"]
+            reverse["sell_market_id"] = forward["buy_market_id"]
+            reverse["buy_reference_volume_usd"] = forward[
+                "sell_reference_volume_usd"
+            ]
+            reverse["sell_reference_volume_usd"] = forward[
+                "buy_reference_volume_usd"
+            ]
+            reverse["route_id"] = canonical_route_id(reverse)
+            reverse_row = copy.deepcopy(cohort["route_rows"][0])
+            reverse_row.update(reverse)
+            cohort["routes"].append(reverse)
+            cohort["route_rows"].append(reverse_row)
 
         sell_market = cohort["routes"][0]["sell_market_id"]
         sell_raw = _shadow_json_bytes({
@@ -2184,6 +2207,532 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
             path.write_bytes(path.read_bytes() + b"\n")
 
         self._assert_post_confirmation_mutation_fails(replace_sidecar)
+
+
+class PublicCexResearchFinalizerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.old_pointer_bytes = b'{"old":"public-research-pointer"}\n'
+
+    def _install_aave_core(self):
+        data_dir, fixture, _joint = (
+            RouteOpportunityPipelineTests._install_real_cex_run(
+                self,
+                both_directions=True,
+            )
+        )
+        latest = data_dir / "routes/latest.json"
+        latest.write_bytes(self.old_pointer_bytes)
+        return data_dir, fixture, latest
+
+    def _install_public_core(self):
+        data_dir, fixture, latest = self._install_aave_core()
+        core_root = data_dir / "routes/core"
+        raw_root = data_dir / "raw/route-cohort"
+        loaded = opportunity_pipeline.load_latest_route_cohort(core_root)
+        cohort = copy.deepcopy(loaded["cohort"])
+        universe = build_live_cex_research_universe()
+        run_id = cohort["raw_evidence_run_id"]
+        typed_root = raw_root / run_id / "typed"
+
+        old_legs = {
+            leg["market_id"].split(":", 2)[1]: leg
+            for leg in cohort["legs"]
+        }
+        fixed_legs = []
+        manifest_members = []
+        for selected in universe["selected_legs"]:
+            venue = selected["exchange"]
+            market_id = selected["market_id"]
+            old_leg = old_legs[venue]
+            old_market_id = old_leg["market_id"]
+            old_response = (
+                raw_root / run_id / "accepted"
+                / hashlib.sha256(old_market_id.encode("utf-8")).hexdigest()
+                / "response.json"
+            ).read_bytes()
+            response = old_response.replace(b"AAVEUSDT", b"UNIUSDT")
+            accepted = (
+                raw_root / run_id / "accepted"
+                / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
+            )
+            accepted.mkdir(parents=True)
+            (accepted / "response.json").write_bytes(response)
+
+            leg = copy.deepcopy(old_leg)
+            leg.update({
+                "leg_id": market_id,
+                "market_id": market_id,
+                "token_symbol": "UNI",
+                "raw_response_sha256": hashlib.sha256(response).hexdigest(),
+            })
+            members = []
+            for old_member in old_leg["typed_source_lineage"]["members"]:
+                member = copy.deepcopy(old_member)
+                filename = member["filename"]
+                payload = json.loads(
+                    (typed_root / filename).read_text(encoding="utf-8")
+                )
+                if member["role"] == "cex_market_rules":
+                    payload["market_id"] = market_id
+                    payload["base_asset"] = "UNI"
+                elif member["role"] == "cex_raw_book_response":
+                    result = payload.get("result")
+                    if isinstance(result, dict) and result.get("s") == "AAVEUSDT":
+                        result["s"] = "UNIUSDT"
+                payload_bytes = _shadow_json_bytes(payload)
+                (typed_root / filename).write_bytes(payload_bytes)
+                digest = hashlib.sha256(payload_bytes).hexdigest()
+                member.update({
+                    "sha256": digest,
+                    "size": len(payload_bytes),
+                    "logical_generation": digest,
+                })
+                members.append(member)
+                manifest_members.append({
+                    "market_id": market_id,
+                    **{
+                        key: member[key]
+                        for key in (
+                            "role", "filename", "sha256", "size",
+                            "logical_generation", "adapter_id",
+                            "content_schema",
+                        )
+                    },
+                })
+            leg["typed_source_lineage"] = {
+                "schema": old_leg["typed_source_lineage"]["schema"],
+                "members": members,
+            }
+            fixed_legs.append(leg)
+
+        manifest_members.sort(key=lambda row: (row["market_id"], row["role"]))
+        (raw_root / run_id / "typed-manifest.json").write_bytes(
+            _shadow_json_bytes({
+                "schema": "route_typed_source_manifest/v1",
+                "raw_evidence_run_id": run_id,
+                "member_count": len(manifest_members),
+                "members": manifest_members,
+            })
+        )
+
+        old_rows = {
+            row["buy_market_id"].split(":", 2)[1]: row
+            for row in cohort["route_rows"]
+        }
+        cohort["candidate_source_generation"] = universe[
+            "candidate_source_generation"
+        ]
+        cohort["source_state"]["candidate_source_generation"] = universe[
+            "candidate_source_generation"
+        ]
+        cohort["selection_window"] = copy.deepcopy(universe["selection_window"])
+        cohort["requested_notionals_usd"] = copy.deepcopy(
+            universe["requested_notionals_usd"]
+        )
+        cohort["routes"] = copy.deepcopy(universe["routes"])
+        cohort["route_rows"] = []
+        for route in cohort["routes"]:
+            timing = old_rows[route["buy_market_id"].split(":", 2)[1]]
+            cohort["route_rows"].append({
+                **copy.deepcopy(route),
+                "validated_at": timing["validated_at"],
+                "skew_seconds": timing["skew_seconds"],
+                "timing_status": timing["timing_status"],
+                "reason_code": timing["reason_code"],
+            })
+        cohort["legs"] = fixed_legs
+        cohort = _rehash(cohort)
+        publish_route_cohort_bundle(cohort, core_root=core_root)
+        latest.write_bytes(self.old_pointer_bytes)
+        return data_dir, fixture, latest
+
+    def _write_schedule(self, rows=None):
+        schedule = Path(self.temporary.name) / "public-fees.csv"
+        if rows is None:
+            rows = [
+                self._schedule_row("binance", "10"),
+                self._schedule_row("bybit", "8"),
+            ]
+        with schedule.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=PUBLIC_FEE_SCHEDULE_COLUMNS,
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+        return schedule
+
+    @staticmethod
+    def _schedule_row(venue, maximum, **overrides):
+        row = {
+            "venue": venue,
+            "instrument_pattern": "UNI/USDT",
+            "side": "both",
+            "min_taker_fee_bps": "4",
+            "max_taker_fee_bps": maximum,
+            "fee_asset": "received_asset",
+            "basis": "official_spot_taker_fee_range",
+            "checked_at": "2026-08-01T11:55:00Z",
+            "valid_until": "2026-08-01T13:00:00Z",
+            "source_url": "https://{}.example.test/spot-fees".format(venue),
+        }
+        row.update(overrides)
+        return row
+
+    def _finalize_public(self, data_dir, schedule):
+        current = opportunity_pipeline.load_latest_route_cohort(
+            data_dir / "routes/core"
+        )
+        return opportunity_pipeline.finalize_public_cex_research_opportunities(
+            data_dir=data_dir,
+            public_fee_schedule_path=schedule,
+            expected_route_cohort_id=current["cohort"]["route_cohort_id"],
+            expected_core_manifest_sha256=current["manifest_sha256"],
+        )
+
+    def _assert_failure_preserves_pointer(self, *, schedule, mutate=None):
+        data_dir, _fixture, latest = self._install_public_core()
+        if mutate is not None:
+            mutate(data_dir)
+        with self.assertRaises(RouteOpportunityPipelineError):
+            self._finalize_public(data_dir, schedule)
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_stale_expected_core_identity_preserves_prior_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        current = opportunity_pipeline.load_latest_route_cohort(
+            data_dir / "routes/core"
+        )
+
+        with self.assertRaises(RouteOpportunityPipelineError):
+            opportunity_pipeline.finalize_public_cex_research_opportunities(
+                data_dir=data_dir,
+                public_fee_schedule_path=schedule,
+                expected_route_cohort_id="cohort:" + "0" * 64,
+                expected_core_manifest_sha256=current["manifest_sha256"],
+            )
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_stale_expected_core_manifest_preserves_prior_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        current = opportunity_pipeline.load_latest_route_cohort(
+            data_dir / "routes/core"
+        )
+
+        with self.assertRaises(RouteOpportunityPipelineError):
+            opportunity_pipeline.finalize_public_cex_research_opportunities(
+                data_dir=data_dir,
+                public_fee_schedule_path=schedule,
+                expected_route_cohort_id=current["cohort"]["route_cohort_id"],
+                expected_core_manifest_sha256="0" * 64,
+            )
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_matching_identity_aave_core_preserves_prior_pointer(self):
+        data_dir, _fixture, latest = self._install_aave_core()
+        schedule = self._write_schedule()
+        current = opportunity_pipeline.load_latest_route_cohort(
+            data_dir / "routes/core"
+        )
+
+        with self.assertRaises(RouteOpportunityPipelineError):
+            opportunity_pipeline.finalize_public_cex_research_opportunities(
+                data_dir=data_dir,
+                public_fee_schedule_path=schedule,
+                expected_route_cohort_id=current["cohort"]["route_cohort_id"],
+                expected_core_manifest_sha256=current["manifest_sha256"],
+            )
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_two_direction_public_grid_is_cold_loadable_and_research_only(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        captured = {}
+        actual_publish = opportunity_pipeline.publish_complete_route_bundle
+
+        def capture_and_publish(**kwargs):
+            captured["inputs"] = kwargs["opportunity_inputs"]
+            return actual_publish(**kwargs)
+
+        with patch(
+            "scripts.route_opportunity_pipeline.publish_complete_route_bundle",
+            side_effect=capture_and_publish,
+        ):
+            pointer = self._finalize_public(data_dir, schedule)
+
+        self.assertNotEqual(latest.read_bytes(), self.old_pointer_bytes)
+        loaded = load_latest_complete_route_bundle(
+            data_dir / "routes",
+            core_root=data_dir / "routes/core",
+        )
+        self.assertEqual(pointer, loaded["pointer"])
+        opportunities = loaded["bundle"]["opportunities"]
+        self.assertEqual(len(opportunities), 10)
+        self.assertEqual(
+            {row["requested_notional_usd"] for row in opportunities},
+            {"1000", "5000", "10000", "50000", "100000"},
+        )
+        for row in opportunities:
+            self.assertEqual(row["opportunity_class"], "research_estimate")
+            self.assertIs(row["strict_eligible"], False)
+            self.assertIs(row["strict_ready_for_publication"], False)
+            self.assertIsNone(row["publication_attestation_sha256"])
+            self.assertIs(row["mode_evidence_eligible"], False)
+            self.assertIsNone(row["inventory_profile_hash"])
+
+        self.assertEqual(len(captured["inputs"]), 10)
+        for item in captured["inputs"]:
+            build = item["build_inputs"]
+            target = build["common_target"].quantity
+            self.assertEqual(build["buy_quote"].target_base_quantity, target)
+            self.assertEqual(build["sell_quote"].target_base_quantity, target)
+            self.assertIs(build["mode_evidence"]["mode_evidence_eligible"], False)
+            fees = {
+                row["leg"]: row
+                for row in build["cost_components"]
+                if row["component_type"] == "venue_taker_fee"
+            }
+            self.assertEqual(
+                fees["buy"]["rate_bps"],
+                "10" if fees["buy"]["market_id"].startswith(
+                    "cex:binance:"
+                ) else "8",
+            )
+            self.assertEqual(
+                fees["sell"]["rate_bps"],
+                "10" if fees["sell"]["market_id"].startswith(
+                    "cex:binance:"
+                ) else "8",
+            )
+            for direction in ("buy", "sell"):
+                self.assertEqual(fees[direction]["value_status"], "bounded_estimate")
+                semantics = build[
+                    direction + "_quote_evidence"
+                ]["fee_semantics"]
+                self.assertEqual(
+                    str(semantics.rate_bps), fees[direction]["rate_bps"]
+                )
+                self.assertEqual(
+                    semantics.source_record_sha256,
+                    fees[direction]["source_record_sha256"],
+                )
+            rebalancing = next(
+                row for row in build["cost_components"]
+                if row["component_type"] == "rebalancing_or_transfer"
+            )
+            self.assertEqual(rebalancing["value_status"], "assumed")
+            self.assertEqual(rebalancing["amount_usd"], "0")
+            self.assertEqual(rebalancing["rate_bps"], "0")
+            self.assertIs(rebalancing["strict_eligible"], False)
+            self.assertEqual(
+                rebalancing["reason_code"],
+                "inventory_not_observed_for_public_research",
+            )
+
+    def test_missing_public_fee_row_stays_unavailable_and_never_becomes_zero(self):
+        data_dir, _fixture, _latest = self._install_public_core()
+        schedule = self._write_schedule([
+            self._schedule_row("binance", "10"),
+        ])
+        self._finalize_public(data_dir, schedule)
+        bundle = load_latest_complete_route_bundle(
+            data_dir / "routes",
+            core_root=data_dir / "routes/core",
+        )["bundle"]
+        missing = [
+            row for row in bundle["cost_components"]
+            if row["market_id"].startswith("cex:bybit:")
+            and row["component_type"] == "venue_taker_fee"
+        ]
+        self.assertEqual(len(missing), 10)
+        self.assertTrue(all(
+            row["value_status"] == "unavailable"
+            and row["rate_bps"] is None
+            and row["amount_usd"] is None
+            for row in missing
+        ))
+        self.assertTrue(all(
+            row["opportunity_class"] == "unavailable"
+            and row["strict_eligible"] is False
+            and row["publication_attestation_sha256"] is None
+            for row in bundle["opportunities"]
+        ))
+
+    def test_stale_public_schedule_preserves_prior_pointer(self):
+        schedule = self._write_schedule([
+            self._schedule_row(
+                "binance", "10", valid_until="2026-08-01T12:01:00Z"
+            ),
+            self._schedule_row("bybit", "8"),
+        ])
+        self._assert_failure_preserves_pointer(schedule=schedule)
+
+    def test_ambiguous_public_schedule_preserves_prior_pointer(self):
+        schedule = self._write_schedule([
+            self._schedule_row("binance", "10"),
+            self._schedule_row(
+                "binance", "12", instrument_pattern="UNI/*", side="buy"
+            ),
+            self._schedule_row("bybit", "8"),
+        ])
+        self._assert_failure_preserves_pointer(schedule=schedule)
+
+    def test_typed_source_mutation_preserves_prior_pointer(self):
+        schedule = self._write_schedule()
+
+        def mutate(data_dir):
+            member = next(
+                (data_dir / "raw/route-cohort/task7-source-run/typed").glob(
+                    "*-cex_market_rules.json"
+                )
+            )
+            member.write_bytes(member.read_bytes() + b"\n")
+
+        self._assert_failure_preserves_pointer(
+            schedule=schedule,
+            mutate=mutate,
+        )
+
+    def test_raw_book_mutation_preserves_prior_pointer(self):
+        schedule = self._write_schedule()
+
+        def mutate(data_dir):
+            member = next(
+                (data_dir / "raw/route-cohort/task7-source-run/accepted").glob(
+                    "*/response.json"
+                )
+            )
+            member.write_bytes(member.read_bytes() + b"\n")
+
+        self._assert_failure_preserves_pointer(
+            schedule=schedule,
+            mutate=mutate,
+        )
+
+    def test_schedule_replacement_during_precommit_preserves_prior_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        actual_publish = opportunity_pipeline.publish_complete_route_bundle
+
+        def replace_then_publish(**kwargs):
+            original_validator = kwargs["precommit_validator"]
+
+            def replace_then_validate():
+                schedule.write_bytes(schedule.read_bytes() + b"\n")
+                original_validator()
+
+            kwargs["precommit_validator"] = replace_then_validate
+            return actual_publish(**kwargs)
+
+        with patch(
+            "scripts.route_opportunity_pipeline.publish_complete_route_bundle",
+            side_effect=replace_then_publish,
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                self._finalize_public(data_dir, schedule)
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_transient_fee_schedule_swap_cannot_change_calculated_rates(self):
+        data_dir, _fixture, _latest = self._install_public_core()
+        schedule = self._write_schedule()
+        original_bytes = schedule.read_bytes()
+        transient_bytes = original_bytes.replace(b",10,", b",12,", 1)
+        self.assertNotEqual(transient_bytes, original_bytes)
+        actual_collect = (
+            opportunity_pipeline.
+            _collect_cex_fee_snapshot_from_schedule_snapshot
+        )
+
+        def collect_during_transient_swap(**kwargs):
+            schedule.write_bytes(transient_bytes)
+            try:
+                return actual_collect(**kwargs)
+            finally:
+                schedule.write_bytes(original_bytes)
+
+        with patch(
+            "scripts.route_opportunity_pipeline."
+            "_collect_cex_fee_snapshot_from_schedule_snapshot",
+            side_effect=collect_during_transient_swap,
+        ):
+            self._finalize_public(data_dir, schedule)
+
+        bundle = load_latest_complete_route_bundle(
+            data_dir / "routes",
+            core_root=data_dir / "routes/core",
+        )["bundle"]
+        binance_fees = [
+            row for row in bundle["cost_components"]
+            if row["market_id"].startswith("cex:binance:")
+            and row["component_type"] == "venue_taker_fee"
+        ]
+        self.assertEqual(len(binance_fees), 10)
+        self.assertEqual({row["rate_bps"] for row in binance_fees}, {"10"})
+
+    def test_same_bytes_fee_schedule_inode_swap_preserves_prior_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        actual_publish = opportunity_pipeline.publish_complete_route_bundle
+
+        def replace_then_publish(**kwargs):
+            original_validator = kwargs["precommit_validator"]
+
+            def replace_inode_then_validate():
+                replacement = schedule.with_name("replacement-fees.csv")
+                replacement.write_bytes(schedule.read_bytes())
+                os.replace(replacement, schedule)
+                original_validator()
+
+            kwargs["precommit_validator"] = replace_inode_then_validate
+            return actual_publish(**kwargs)
+
+        with patch(
+            "scripts.route_opportunity_pipeline.publish_complete_route_bundle",
+            side_effect=replace_then_publish,
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                self._finalize_public(data_dir, schedule)
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_cold_reload_failure_restores_prior_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+
+        with patch(
+            "scripts.route_opportunity_pipeline."
+            "load_latest_complete_route_bundle",
+            side_effect=ValueError("forced cold reload failure"),
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                self._finalize_public(data_dir, schedule)
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_cold_reload_failure_never_overwrites_concurrent_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        concurrent_pointer = b'{"concurrent":"writer"}\n'
+
+        def replace_pointer_then_fail(*_args, **_kwargs):
+            latest.write_bytes(concurrent_pointer)
+            raise ValueError("forced cold reload failure after concurrent write")
+
+        with patch(
+            "scripts.route_opportunity_pipeline."
+            "load_latest_complete_route_bundle",
+            side_effect=replace_pointer_then_fail,
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                self._finalize_public(data_dir, schedule)
+
+        self.assertEqual(latest.read_bytes(), concurrent_pointer)
 
 
 if __name__ == "__main__":

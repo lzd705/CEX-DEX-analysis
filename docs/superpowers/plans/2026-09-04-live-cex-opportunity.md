@@ -108,16 +108,19 @@ git push origin codex/historical-foundry-opportunity
 ### Task 2: Public-fee research input builder and finalizer
 
 **Files:**
+- Modify: `scripts/cex_fee_facts.py`
 - Modify: `scripts/live_cex_research.py`
 - Modify: `scripts/route_opportunity_pipeline.py`
+- Modify: `scripts/route_publication.py`
+- Modify: `tests/test_cex_fee_facts.py`
 - Modify: `tests/test_live_cex_research.py`
 - Modify: `tests/test_route_opportunity_pipeline.py`
 
 **Interfaces:**
 - Produces: `public_fee_semantics(component: Mapping[str, Any], *, direction: str, rules: MarketRules, now: str) -> FeeSemantics`.
-- Produces: `build_public_cex_research_inputs(*, data_dir: Path, cohort: Mapping[str, Any], core_manifest_sha256: str, public_fee_schedule_path: Path) -> List[Dict[str, Any]]`.
-- Produces: `finalize_public_cex_research_opportunities(*, data_dir: Path, public_fee_schedule_path: Path) -> Dict[str, Any]`.
-- The finalizer consumes only the current core just collected by the same command; it does not accept a Shadow run ID or private profile.
+- Internally uses `_build_public_cex_research_inputs(..., public_fee_schedule_snapshot: _PublicFeeScheduleSnapshot)`; neither the immutable snapshot nor parsed schedule rows are a public collector/builder input.
+- Produces: `finalize_public_cex_research_opportunities(*, data_dir: Path, public_fee_schedule_path: Path, expected_route_cohort_id: str, expected_core_manifest_sha256: str) -> Dict[str, Any]`.
+- The finalizer consumes only the current core just collected by the same command, binds it to the expected cohort and manifest identity, and enforces the exact fixed UNI/USDT Binance/Bybit universe. It does not accept a Shadow run ID or private profile.
 
 - [ ] **Step 1: Write failing public-fee semantics tests**
 
@@ -152,7 +155,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Write failing end-to-end finalizer tests**
 
-Reuse the real core/raw/typed-source fixture builders from `tests.test_route_publication`. Use a literal public schedule whose Binance and Bybit rows exactly match that fixture's pair; Task 1 separately locks the live command to `UNI/USDT`. Assert ten scenarios are published and cold-loadable, and every row has:
+Reuse the real core/raw/typed-source fixture builders from `tests.test_route_publication`, adapted to publish the exact fixed UNI/USDT Binance/Bybit universe. Use a literal public schedule whose Binance and Bybit rows exactly match `UNI/USDT`. Assert ten scenarios are published and cold-loadable, and every row has:
 
 ```python
 row["opportunity_class"] == "research_estimate"
@@ -161,9 +164,9 @@ row["strict_ready_for_publication"] is False
 row["publication_attestation_sha256"] is None
 ```
 
-Assert the buy and sell quotes carry the exact same target base-token quantity, fee components are `bounded_estimate`, the maximum fee rates are used, inventory mode evidence is ineligible, and rebalancing is `unavailable` with `inventory_not_observed_for_public_research`.
+Assert the buy and sell quotes carry the exact same target base-token quantity, fee components are `bounded_estimate`, the maximum fee rates are used, inventory mode evidence is ineligible, and rebalancing is an explicit scenario-only `assumed` zero with `inventory_not_observed_for_public_research`.
 
-Add separate cases for missing fee rows, stale schedules, ambiguous schedules, typed-source mutation, raw-book mutation, and schedule replacement during precommit. Preserve a sentinel prior `routes/latest.json` on each failure.
+Add separate cases for missing fee rows, stale schedules, ambiguous schedules, typed-source mutation, raw-book mutation, transient fee-schedule replacement during calculation, same-byte schedule inode replacement, stale expected core identity, an identity-matching AAVE core, and cold-reload failure. Preserve a sentinel prior `routes/latest.json` on each failure, while proving a concurrent third-party pointer is never overwritten.
 
 - [ ] **Step 6: Run the finalizer tests and verify RED**
 
@@ -188,15 +191,16 @@ The second return value is the core leg map. Keep all existing descriptor, ident
 For each route and notional:
 
 1. derive `CommonTarget` with `common_target_quantity()`;
-2. call `collect_cex_fee_snapshot(..., allow_public_estimate=True)` for each leg;
+2. resolve each leg with the private immutable-schedule-snapshot fee helper;
 3. derive matching `FeeSemantics`;
 4. replay each retained book with `route_quantity_quote_for_book()`;
 5. build authenticated USDT=USD projections from retained typed sources;
-6. add an unavailable route-level rebalancing component;
+6. add a scenario-only assumed-zero route-level rebalancing component whose
+   basis says prepositioned inventory is hypothetical and unobserved;
 7. call `classify_route_mode_evidence(route, now=now)` without inventory;
 8. call `build_route_opportunity()` and assert the claim boundary before returning the input.
 
-Pass `source_root` but no private fee or inventory paths to `publish_complete_route_bundle()`. Before the public pointer commit, reread the fee schedule bytes and current core identity; abort on drift. Cold reload and compare the exact pointer.
+Securely open and parse the public fee schedule once, bind every fee calculation to that immutable bytes/device/inode snapshot, and verify the same path identity and bytes immediately before commit. Pass `source_root` but no private fee or inventory paths to `publish_complete_route_bundle()`. Cold reload through a postcommit validator inside the publisher's CAS-safe rollback transaction, compare the exact pointer, and restore the prior pointer on failure only when the attempted pointer remains current.
 
 - [ ] **Step 9: Run finalizer and authenticated-path regressions and verify GREEN**
 
@@ -247,7 +251,7 @@ load_latest_complete_route_bundle
 optional serve_current_dashboard
 ```
 
-Assert the finalizer receives the cohort just published, a collector failure never calls it, a reload mismatch never serves, and a failure leaves prior complete-pointer bytes unchanged.
+Assert the finalizer receives the cohort ID and core manifest hash just published, a collector failure never calls it, a reload mismatch never serves, and a failure leaves prior complete-pointer bytes unchanged.
 
 - [ ] **Step 2: Run orchestration tests and verify RED**
 
@@ -257,7 +261,7 @@ Expected: FAIL because the runner does not exist.
 
 - [ ] **Step 3: Implement collection and publication orchestration**
 
-Call `collect_route_cohort()` with the fixed universe, generation reader, raw root, existing CEX collector, `max_workers=4`, `cex_workers_per_venue=2`, and the validated deadline. Require both legs observed and both route timing rows `within_sla` before publishing core. Then run the public finalizer and cold loader.
+Call `collect_route_cohort()` with the fixed universe, generation reader, raw root, existing CEX collector, `max_workers=4`, `cex_workers_per_venue=2`, and the validated deadline. Require both legs observed and both route timing rows `within_sla` before publishing core. Then pass the returned cohort ID and manifest hash to the public finalizer and cold loader.
 
 Return a receipt with exactly:
 
