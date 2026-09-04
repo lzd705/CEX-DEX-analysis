@@ -833,6 +833,7 @@ def _validated_quote_evidence(
                     target_token_address=evidence.get("target_token_address"),
                     quote_token_address=evidence.get("quote_token_address"),
                     cohort_now=evidence.get("cohort_now"),
+                    snapshot_id=evidence.get("snapshot_id"),
                 )
             except (TypeError, ValueError):
                 return False, False, None, pool_fee, core_hash

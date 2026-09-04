@@ -1540,6 +1540,49 @@ class V2PoolQuantityQuoteTests(unittest.TestCase):
             self.assertEqual(result.raw_response_sha256, "f" * 64)
             self.assertEqual(result.levels_binding_sha256, result.state_id.split(":", 1)[1])
 
+    def test_snapshot_id_is_preserved_and_replayed_for_published_dex_lineage(self):
+        state = v2_state()
+        target = dex_target()
+        current_rules = dex_rules()
+        quote = quote_v2_pool_quantity(
+            state,
+            target,
+            current_rules,
+            direction="sell",
+            target_token_address=TOKEN0,
+            quote_token_address=TOKEN1,
+            cohort_now="2026-08-01T12:02:00.0000005Z",
+            snapshot_id="shadow-run-001",
+        )
+
+        self.assertEqual(quote.snapshot_id, "shadow-run-001")
+        self.assertIs(
+            validate_v2_quantity_quote_against_state(
+                quote,
+                state,
+                target,
+                current_rules,
+                direction="sell",
+                target_token_address=TOKEN0,
+                quote_token_address=TOKEN1,
+                cohort_now="2026-08-01T12:02:00.0000005Z",
+                snapshot_id="shadow-run-001",
+            ),
+            quote,
+        )
+        with self.assertRaisesRegex(ValueError, "V2 quote evidence"):
+            validate_v2_quantity_quote_against_state(
+                quote,
+                state,
+                target,
+                current_rules,
+                direction="sell",
+                target_token_address=TOKEN0,
+                quote_token_address=TOKEN1,
+                cohort_now="2026-08-01T12:02:00.0000005Z",
+                snapshot_id="shadow-run-002",
+            )
+
     def test_token1_direction_uses_addresses_not_symbols(self):
         state = v2_state(
             token0_address=TOKEN1,
@@ -2116,9 +2159,10 @@ class V2ExactInputIntegerMathTests(unittest.TestCase):
                     "target_token_address",
                     "quote_token_address",
                     "cohort_now",
+                    "snapshot_id",
                 ),
                 3,
-                (),
+                ("snapshot_id",),
             ),
             validate_v2_quantity_quote_against_state: (
                 (
@@ -2130,9 +2174,10 @@ class V2ExactInputIntegerMathTests(unittest.TestCase):
                     "target_token_address",
                     "quote_token_address",
                     "cohort_now",
+                    "snapshot_id",
                 ),
                 4,
-                (),
+                ("snapshot_id",),
             ),
             build_route_opportunity: (
                 (

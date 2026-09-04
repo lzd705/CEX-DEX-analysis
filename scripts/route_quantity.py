@@ -1256,7 +1256,7 @@ def validate_quantity_quote(quote: QuantityQuote) -> QuantityQuote:
         or any(collector_fields)
     ):
         if quote.snapshot_id:
-            raise ValueError("DEX V2 quantity quote has unexpected CEX bindings")
+            _required_text(quote.snapshot_id, "snapshot_id")
         if not all(
             (
                 quote.state_observed_at,
@@ -2008,6 +2008,7 @@ def _v2_unavailable_quote(
     direction: str,
     reason_code: str,
     cohort_now: str,
+    snapshot_id: str,
 ) -> QuantityQuote:
     state_id = state.state_id
     binding = state_id.split(":", 1)[1]
@@ -2055,7 +2056,7 @@ def _v2_unavailable_quote(
         vwap_quote_numerator=None,
         vwap_quote_denominator=None,
         state_id=state_id,
-        snapshot_id="",
+        snapshot_id=snapshot_id,
         state_observed_at=state.observed_at,
         cohort_now=cohort_now,
         raw_response_sha256=state.raw_response_sha256,
@@ -2076,6 +2077,7 @@ def quote_v2_pool_quantity(
     target_token_address: str,
     quote_token_address: str,
     cohort_now: str,
+    snapshot_id: Optional[str] = None,
 ) -> QuantityQuote:
     """Quote one net base target against one immutable V2 pool state."""
     if not isinstance(pool_state, V2PoolState):
@@ -2096,6 +2098,11 @@ def quote_v2_pool_quantity(
         "quote_token_address",
     )
     cohort_text, cohort_epoch = _timestamp(cohort_now, "cohort_now")
+    snapshot = (
+        ""
+        if snapshot_id is None
+        else _required_text(snapshot_id, "snapshot_id")
+    )
 
     def unavailable(reason_code: str) -> QuantityQuote:
         return _v2_unavailable_quote(
@@ -2105,6 +2112,7 @@ def quote_v2_pool_quantity(
             direction=direction_text,
             reason_code=reason_code,
             cohort_now=cohort_text,
+            snapshot_id=snapshot,
         )
 
     if pool_state.state_id != v2_pool_state_id(pool_state):
@@ -2276,7 +2284,7 @@ def quote_v2_pool_quantity(
         vwap_quote_numerator=vwap_fraction.numerator,
         vwap_quote_denominator=vwap_fraction.denominator,
         state_id=pool_state.state_id,
-        snapshot_id="",
+        snapshot_id=snapshot,
         state_observed_at=pool_state.observed_at,
         cohort_now=cohort_text,
         raw_response_sha256=pool_state.raw_response_sha256,
@@ -2300,6 +2308,7 @@ def validate_v2_quantity_quote_against_state(
     target_token_address: str,
     quote_token_address: str,
     cohort_now: str,
+    snapshot_id: Optional[str] = None,
 ) -> QuantityQuote:
     """Recompute a V2 quote from frozen evidence and reject any mutation.
 
@@ -2318,6 +2327,7 @@ def validate_v2_quantity_quote_against_state(
         target_token_address=target_token_address,
         quote_token_address=quote_token_address,
         cohort_now=cohort_now,
+        snapshot_id=snapshot_id,
     )
     if quote != expected:
         raise ValueError("V2 quote evidence does not reproduce the quote")
